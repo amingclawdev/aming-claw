@@ -11,8 +11,20 @@ from typing import Any, Iterable, Mapping
 
 SCHEMA_VERSION = "doc_asset_state.v1"
 DOC_FILE_KINDS = {"doc", "index_doc"}
+ASSET_FILE_KINDS = {"doc", "index_doc", "test", "config"}
 ARCHIVE_STATUSES = {"archive"}
 IGNORED_STATUSES = {"ignored"}
+ROLE_TO_ASSET_KIND = {
+    "secondary": "doc",
+    "secondary_files": "doc",
+    "doc": "doc",
+    "docs": "doc",
+    "test": "test",
+    "tests": "test",
+    "test_files": "test",
+    "config": "config",
+    "config_files": "config",
+}
 
 
 def build_doc_asset_state(
@@ -23,7 +35,7 @@ def build_doc_asset_state(
     file_inventory: Iterable[Mapping[str, Any]],
     graph_nodes: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Project doc file binding state from inventory plus graph nodes.
+    """Project doc/test/config file binding state from inventory plus graph nodes.
 
     The projection is replayable: rows come from committed file inventory and
     candidate/active graph node metadata.  AI or scanner proposals remain
@@ -32,30 +44,33 @@ def build_doc_asset_state(
     """
 
     nodes = [dict(node) for node in graph_nodes if isinstance(node, Mapping)]
-    accepted_by_path = _accepted_doc_bindings(nodes)
-    candidates_by_path = _doc_binding_candidates(nodes)
-    docs: list[dict[str, Any]] = []
+    accepted_by_kind_path = _accepted_asset_bindings(nodes)
+    candidates_by_kind_path = _asset_binding_candidates(nodes)
+    assets: list[dict[str, Any]] = []
 
     for raw_row in file_inventory:
         if not isinstance(raw_row, Mapping):
             continue
         row = dict(raw_row)
-        doc_kind = str(row.get("file_kind") or "")
-        if doc_kind not in DOC_FILE_KINDS:
+        file_kind = str(row.get("file_kind") or "")
+        if file_kind not in ASSET_FILE_KINDS:
             continue
+        asset_kind = _asset_kind_for_file_kind(file_kind)
         path = _norm_path(row.get("path"))
         if not path:
             continue
-        accepted = accepted_by_path.get(path, [])
-        candidates = [] if accepted else candidates_by_path.get(path, [])
+        accepted = accepted_by_kind_path.get(asset_kind, {}).get(path, [])
+        candidates = [] if accepted else candidates_by_kind_path.get(path, [])
         status = _binding_status(row, accepted=accepted, candidates=candidates)
-        docs.append({
+        asset = {
             "schema_version": SCHEMA_VERSION,
             "project_id": project_id,
             "run_id": run_id,
             "commit_sha": commit_sha,
+            "asset_kind": asset_kind,
             "path": path,
-            "doc_kind": doc_kind,
+            "doc_kind": file_kind if asset_kind == "doc" else "",
+            "file_kind": file_kind,
             "sha256": str(row.get("sha256") or ""),
             "file_hash": str(row.get("file_hash") or ""),
             "size_bytes": int(row.get("size_bytes") or 0),
@@ -65,20 +80,29 @@ def build_doc_asset_state(
             "accepted_bindings": accepted,
             "binding_candidates": candidates,
             "impact_scope_policy": "accepted_bindings_only",
-        })
+        }
+        assets.append(asset)
 
-    docs = sorted(docs, key=lambda item: item["path"])
+    assets = sorted(assets, key=lambda item: (item["asset_kind"], item["path"]))
+    docs = [item for item in assets if item["asset_kind"] == "doc"]
+    tests = [item for item in assets if item["asset_kind"] == "test"]
+    configs = [item for item in assets if item["asset_kind"] == "config"]
     counts = Counter(str(row.get("binding_status") or "unbound") for row in docs)
+    all_counts = Counter(str(row.get("binding_status") or "unbound") for row in assets)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
         "run_id": run_id,
         "commit_sha": commit_sha,
         "doc_count": len(docs),
+        "test_count": len(tests),
+        "config_count": len(configs),
+        "asset_count": len(assets),
         "accepted_count": counts.get("accepted", 0),
         "candidate_count": counts.get("candidate", 0),
         "unbound_count": counts.get("unbound", 0),
         "by_status": dict(sorted(counts.items())),
+        "asset_by_status": dict(sorted(all_counts.items())),
         "impact_scope_policy": "accepted_bindings_only",
     }
     return {
@@ -87,7 +111,10 @@ def build_doc_asset_state(
         "run_id": run_id,
         "commit_sha": commit_sha,
         "summary": summary,
+        "assets": assets,
         "docs": docs,
+        "tests": tests,
+        "configs": configs,
     }
 
 
@@ -109,22 +136,42 @@ def _binding_status(
     return "unbound"
 
 
-def _accepted_doc_bindings(nodes: Iterable[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    out: dict[str, list[dict[str, Any]]] = defaultdict(list)
+def _accepted_asset_bindings(
+    nodes: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    out: dict[str, dict[str, list[dict[str, Any]]]] = {
+        "doc": defaultdict(list),
+        "test": defaultdict(list),
+        "config": defaultdict(list),
+    }
     for node in nodes:
         node_id = str(node.get("id") or node.get("node_id") or "")
         title = str(node.get("title") or node.get("module") or node_id)
-        for path in _path_list(node.get("secondary")):
-            out[path].append({
-                "node_id": node_id,
-                "title": title,
-                "role": "doc",
-                "source": "graph_node",
-            })
-    return {path: sorted(values, key=lambda item: item["node_id"]) for path, values in out.items()}
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), Mapping) else {}
+        raw_paths_by_kind = {
+            "doc": _path_list(node.get("secondary")) + _path_list(node.get("secondary_files")),
+            "test": _path_list(node.get("test")) + _path_list(node.get("tests")) + _path_list(node.get("test_files")),
+            "config": (
+                _path_list(node.get("config"))
+                + _path_list(node.get("config_files"))
+                + _path_list(metadata.get("config_files") if isinstance(metadata, Mapping) else [])
+            ),
+        }
+        for asset_kind, paths in raw_paths_by_kind.items():
+            for path in sorted(set(paths)):
+                out[asset_kind][path].append({
+                    "node_id": node_id,
+                    "title": title,
+                    "role": asset_kind,
+                    "source": "graph_node",
+                })
+    return {
+        kind: {path: sorted(values, key=lambda item: item["node_id"]) for path, values in paths.items()}
+        for kind, paths in out.items()
+    }
 
 
-def _doc_binding_candidates(nodes: Iterable[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _asset_binding_candidates(nodes: Iterable[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for node in nodes:
         metadata = node.get("metadata") if isinstance(node.get("metadata"), Mapping) else {}
@@ -132,7 +179,7 @@ def _doc_binding_candidates(nodes: Iterable[Mapping[str, Any]]) -> dict[str, lis
         for raw_candidate in candidates or []:
             if not isinstance(raw_candidate, Mapping):
                 continue
-            if str(raw_candidate.get("asset_kind") or "") != "doc":
+            if str(raw_candidate.get("asset_kind") or "") not in {"doc", "test", "config"}:
                 continue
             path = _norm_path(raw_candidate.get("asset_path"))
             if not path:
@@ -167,6 +214,16 @@ def _path_list(raw: Any) -> list[str]:
     else:
         values = []
     return sorted({path for item in values if (path := _norm_path(item))})
+
+
+def _asset_kind_for_file_kind(file_kind: str) -> str:
+    if file_kind in {"doc", "index_doc"}:
+        return "doc"
+    if file_kind == "test":
+        return "test"
+    if file_kind == "config":
+        return "config"
+    return file_kind
 
 
 def _norm_path(raw: Any) -> str:

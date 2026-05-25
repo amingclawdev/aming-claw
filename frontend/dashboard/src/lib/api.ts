@@ -21,6 +21,7 @@ import type {
   ProjectionResponse,
   StatusResponse,
   TaskTimelineResponse,
+  UnbindFileHintResponse,
 } from "../types";
 
 const DEFAULT_PROJECT_ID = (import.meta.env.VITE_PROJECT_ID as string | undefined) || "aming-claw";
@@ -407,6 +408,25 @@ export const api = {
   ) {
     return postJSON<AttachFileHintResponse>(
       `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}/file-hygiene/hints/attach`,
+      { ...payload, actor: payload.actor ?? "dashboard_user" },
+      signal,
+    );
+  },
+  unbindFileGovernanceHintFor(
+    projectId: string,
+    snapshotId: string,
+    payload: {
+      path: string;
+      target_node_id: string;
+      role?: "doc" | "test" | "config";
+      reason: string;
+      actor?: string;
+      dry_run?: boolean;
+    },
+    signal?: AbortSignal,
+  ) {
+    return postJSON<UnbindFileHintResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}/file-hygiene/hints/unbind`,
       { ...payload, actor: payload.actor ?? "dashboard_user" },
       signal,
     );

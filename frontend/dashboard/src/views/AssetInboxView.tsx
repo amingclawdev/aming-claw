@@ -8,6 +8,7 @@ import type {
   AssetInboxMountRelation,
   AssetInboxResponse,
   AssetInboxStatus,
+  FileHygieneActionResponse,
   NodeRecord,
 } from "../types";
 
@@ -45,6 +46,12 @@ interface ActionResult {
   state: ActionState;
   message: string;
   followUpId?: string;
+  reviewQueueHref?: string;
+  requiresCommit?: boolean;
+  updateGraphAfterCommit?: boolean;
+  sourceControlled?: boolean;
+  auditOnly?: boolean;
+  operationLabel?: string;
 }
 
 interface RemoveConfirmState {
@@ -297,13 +304,45 @@ export default function AssetInboxView({
     reason: string,
   ) => {
     const key = `${relation.relation_id}:${action}`;
-    setActionResults((current) => ({ ...current, [key]: { state: "writing", message: "Recording proposal..." } }));
+    const sourceControlledUnbind = action === "remove_binding" && isSourceControlledUnbindCandidate(item, relation);
+    setActionResults((current) => ({
+      ...current,
+      [key]: {
+        state: "writing",
+        message: sourceControlledUnbind ? "Writing source-controlled unbind hint..." : "Recording proposal...",
+        sourceControlled: sourceControlledUnbind,
+        operationLabel: relationOperationLabel(action, sourceControlledUnbind),
+      },
+    }));
     try {
+      if (sourceControlledUnbind) {
+        const result = await api.unbindFileGovernanceHintFor(projectId, snapshotId, {
+          path: item.path,
+          target_node_id: relation.target_node_id,
+          role: relationRoleForAction(item, relation),
+          reason,
+          actor: "dashboard_user",
+          dry_run: false,
+        });
+        setActionResults((current) => ({
+          ...current,
+          [key]: {
+            state: "written",
+            message: sourceControlledUnbindMessage(result.message),
+            reviewQueueHref: reviewQueueHref(projectId),
+            requiresCommit: result.requires_commit ?? result.written_uncommitted ?? result.state === "written_uncommitted",
+            updateGraphAfterCommit: result.update_graph_after_commit ?? true,
+            sourceControlled: true,
+            operationLabel: relationOperationLabel(action, true),
+          },
+        }));
+        return;
+      }
       const result = await api.fileHygieneActionFor(projectId, snapshotId, {
         action,
         path: item.path,
         target_node_id: relation.target_node_id,
-        role: roleForAsset(item),
+        role: relationRoleForAction(item, relation),
         reason,
         actor: "dashboard_user",
       });
@@ -311,10 +350,19 @@ export default function AssetInboxView({
         ...current,
         [key]: {
           state: "written",
-          message: `Proposal event recorded: ${String(result.event?.event_id || result.action)}`,
+          message: auditActionMessage(action, result),
+          reviewQueueHref: reviewQueueHref(projectId),
+          requiresCommit: false,
+          updateGraphAfterCommit: false,
+          auditOnly: action === "remove_binding",
+          operationLabel: relationOperationLabel(action, false),
         },
       }));
     } catch (error) {
+      if (sourceControlledUnbind && error instanceof ApiError) {
+        await recordAuditOnlyRemoveFallback(item, relation, reason, key, error);
+        return;
+      }
       const isKnownRemoveDrift = action === "remove_binding" && error instanceof ApiError;
       const msg = isKnownRemoveDrift ? removeBindingRuntimeDriftMessage(error) : error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
       setActionResults((current) => ({
@@ -328,9 +376,54 @@ export default function AssetInboxView({
     }
   };
 
+  const recordAuditOnlyRemoveFallback = async (
+    item: AssetInboxItem,
+    relation: RelationView,
+    reason: string,
+    key: string,
+    sourceError: ApiError,
+  ) => {
+    try {
+      const result = await api.fileHygieneActionFor(projectId, snapshotId, {
+        action: "remove_binding",
+        path: item.path,
+        target_node_id: relation.target_node_id,
+        role: relationRoleForAction(item, relation),
+        reason: `${reason}\n\nSource-controlled unbind endpoint rejected; audit-only fallback used. ${compactErrorDetail(sourceError.body || sourceError.message)}`,
+        actor: "dashboard_user",
+      });
+      setActionResults((current) => ({
+        ...current,
+        [key]: {
+          state: "blocked",
+          message: `Audit-only fallback recorded after source-controlled unbind rejected (${sourceError.status}). ${auditActionMessage("remove_binding", result)} Commit/update graph materialization is not guaranteed until ${REMOVE_BINDING_RUNTIME_DRIFT_ID} is resolved.`,
+          reviewQueueHref: reviewQueueHref(projectId),
+          followUpId: REMOVE_BINDING_RUNTIME_DRIFT_ID,
+          requiresCommit: false,
+          updateGraphAfterCommit: false,
+          auditOnly: true,
+          operationLabel: relationOperationLabel("remove_binding", false),
+        },
+      }));
+    } catch (fallbackError) {
+      const fallbackDetail = fallbackError instanceof ApiError ? `${fallbackError.message} ${fallbackError.body}` : String(fallbackError);
+      setActionResults((current) => ({
+        ...current,
+        [key]: {
+          state: "blocked",
+          message: `${removeBindingRuntimeDriftMessage(sourceError)} Audit-only fallback also failed: ${fallbackDetail}`,
+          followUpId: REMOVE_BINDING_RUNTIME_DRIFT_ID,
+          sourceControlled: true,
+          operationLabel: relationOperationLabel("remove_binding", true),
+        },
+      }));
+    }
+  };
+
   const confirmRemoveBinding = async () => {
     if (!removeConfirm) return;
-    const reason = removeConfirm.reason.trim() || "Proposal-safe binding removal from Asset Inbox.";
+    const reason = removeConfirm.reason.trim();
+    if (!reason) return;
     const pending = removeConfirm;
     setRemoveConfirm(null);
     await recordRelationAction(pending.item, pending.relation, "remove_binding", reason);
@@ -644,6 +737,9 @@ function AssetRelationGraph(props: {
                     <MetaPill label="Role" value={relation.role || "n/a"} />
                     <MetaPill label="Evidence" value={relation.evidence_kind || "n/a"} />
                     <MetaPill label="Scope" value={formatImpactScope(relation.impact_scope)} />
+                    {action ? (
+                      <MetaPill label="Operation" value={relationOperationLabel(action, isSourceControlledUnbindCandidate(props.item, relation))} />
+                    ) : null}
                   </div>
                   <div className="asset-relation-map-actions">
                     {action ? (
@@ -827,31 +923,43 @@ function RemoveBindingDialog(props: {
   onCancel(): void;
   onConfirm(): void;
 }) {
+  const sourceControlled = isSourceControlledUnbindCandidate(props.state.item, props.state.relation);
+  const reason = props.state.reason.trim();
   return (
     <div className="modal-backdrop asset-confirm-backdrop" role="presentation">
       <div className="asset-confirm-dialog" role="dialog" aria-modal="true" aria-label="Confirm binding removal proposal">
-        <div className="asset-detail-block-title">Confirm remove binding proposal</div>
+        <div className="asset-detail-block-title">Confirm unbind operation</div>
         <p>
-          This records a proposal-safe removal for <span className="mono">{props.state.relation.target_node_id}</span>. It enters
-          Review Queue and becomes effective only after the corresponding commit/apply flow.
+          This queues unbind for <span className="mono">{props.state.relation.target_node_id}</span>. It enters Review Queue,
+          and graph truth changes only after the source file is committed and Update Graph runs.
         </p>
+        <div className="asset-browser-muted">
+          Operation path: {sourceControlled ? "source-controlled hint unbind" : "audit-only remove_binding fallback"}.
+          {sourceControlled ? " If the backend endpoint rejects it, the fallback is visibly marked audit-only." : ""}
+        </div>
         <label className="asset-confirm-reason">
           <span>Operator reason</span>
           <textarea
             value={props.state.reason}
             onChange={(event) => props.onReasonChange(event.target.value)}
-            placeholder="Why should this binding be removed?"
+            placeholder="Required: why should this binding be removed?"
           />
         </label>
         <div className="asset-browser-muted">
-          Backend dependency: if the queue endpoint rejects remove_binding, the UI surfaces follow-up {REMOVE_BINDING_RUNTIME_DRIFT_ID}.
+          Backend dependency: if source-controlled unbind is unavailable, the UI surfaces follow-up {REMOVE_BINDING_RUNTIME_DRIFT_ID}.
         </div>
         <div className="asset-confirm-actions">
           <button type="button" className="action-btn" onClick={props.onCancel}>
             Cancel
           </button>
-          <button type="button" className="action-btn action-btn-primary" onClick={props.onConfirm}>
-            Queue proposal
+          <button
+            type="button"
+            className="action-btn action-btn-primary"
+            disabled={!reason}
+            title={!reason ? "Operator reason is required." : "Queue unbind for Review Queue handling."}
+            onClick={props.onConfirm}
+          >
+            Queue unbind
           </button>
         </div>
       </div>
@@ -880,6 +988,11 @@ function SelectedRelationOperation(props: {
         <span className="asset-browser-muted">
           {RELATION_LABELS[props.relation.status] ?? props.relation.status} - {props.relation.target_title || "title n/a"}
         </span>
+        {action ? (
+          <span className="asset-browser-muted">
+            Operation: {relationOperationLabel(action, isSourceControlledUnbindCandidate(props.item, props.relation))}
+          </span>
+        ) : null}
       </div>
       <div className="asset-selected-relation-actions">
         {action ? (
@@ -937,6 +1050,44 @@ function ActionResultLine(props: { result?: ActionResult | null; projectId: stri
   return (
     <span className={`attach-state attach-state-${props.result.state}${props.compact ? " attach-state-compact" : ""}`}>
       {props.result.message}
+      {props.result.operationLabel ? (
+        <>
+          {" "}
+          <span className="mono">[{props.result.operationLabel}]</span>
+        </>
+      ) : null}
+      {props.result.sourceControlled ? (
+        <>
+          {" "}
+          <span className="mono">source-controlled</span>
+        </>
+      ) : null}
+      {props.result.auditOnly ? (
+        <>
+          {" "}
+          <span className="mono">audit-only fallback</span>
+        </>
+      ) : null}
+      {props.result.requiresCommit ? (
+        <>
+          {" "}
+          <span className="mono">commit required</span>
+        </>
+      ) : null}
+      {props.result.updateGraphAfterCommit ? (
+        <>
+          {" "}
+          <span className="mono">Update Graph required</span>
+        </>
+      ) : null}
+      {props.result.reviewQueueHref ? (
+        <>
+          {" "}
+          <a className="asset-followup-link" href={props.result.reviewQueueHref}>
+            Review Queue
+          </a>
+        </>
+      ) : null}
       {props.result.followUpId ? (
         <>
           {" "}
@@ -969,6 +1120,45 @@ function relationActionLabel(action: "attach_to_node" | "remove_binding"): strin
   return action === "attach_to_node" ? "Add relation" : "Propose remove";
 }
 
+function relationOperationLabel(
+  action: "attach_to_node" | "remove_binding" | null,
+  sourceControlled = false,
+): string {
+  if (action === "attach_to_node") return "bind review";
+  if (action === "remove_binding") return sourceControlled ? "source unbind" : "audit remove";
+  return "n/a";
+}
+
+function isSourceControlledUnbindCandidate(item: AssetInboxItem, relation: RelationView): boolean {
+  const role = relationRoleForAction(item, relation);
+  return (
+    ["accepted", "impact_pending", "stale_drift"].includes(relation.status) &&
+    ["doc", "test", "config"].includes(role) &&
+    canDirectWriteHint(item.path) &&
+    Boolean(relation.target_node_id)
+  );
+}
+
+function relationRoleForAction(item: AssetInboxItem, relation: RelationView): AttachRole {
+  const role = normalizeAssetKind(relation.role);
+  if (role === "test" || role === "config" || role === "doc") return role;
+  return roleForAsset(item);
+}
+
+function sourceControlledUnbindMessage(message?: string): string {
+  const suffix = message ? ` ${message}` : "";
+  return `Source-controlled unbind written for Review Queue. Commit the changed file, then run Update Graph before trusting graph materialization.${suffix}`;
+}
+
+function auditActionMessage(action: "attach_to_node" | "remove_binding", result: FileHygieneActionResponse): string {
+  const eventId = String(result.event?.event_id || result.action || action);
+  const queued = result.review_queue?.queued ? " Review Queue item created." : " Review Queue status not reported.";
+  if (action === "remove_binding") {
+    return `Audit-only remove_binding event recorded: ${eventId}.${queued}`;
+  }
+  return `Proposal event recorded: ${eventId}.${queued} Accepted graph truth still depends on Review Queue handling.`;
+}
+
 function removeBindingRuntimeDriftMessage(error: ApiError): string {
   const detail = compactErrorDetail(error.body || error.message);
   return `Known remove_binding runtime drift. Backend returned ${error.status}; follow-up ${REMOVE_BINDING_RUNTIME_DRIFT_ID} tracks the server fix.${detail ? ` ${detail}` : ""}`;
@@ -995,6 +1185,10 @@ function backlogFollowUpHref(projectId: string, backlogId: string): string {
     backlog: backlogId,
   });
   return `?${query.toString()}`;
+}
+
+function reviewQueueHref(projectId: string): string {
+  return `?${new URLSearchParams({ project_id: projectId, view: "review" }).toString()}`;
 }
 
 function DriftControls(props: {
@@ -1150,6 +1344,12 @@ function RelationGroup(props: {
               <MetaPill label="Scope" value={formatImpactScope(relation.impact_scope)} />
               <MetaPill label="Review" value={relation.review_required ? "required" : "not required"} />
               <MetaPill label="Drift" value={relation.drift_state || "not_drifted"} />
+              {primaryRelationAction(relation) ? (
+                <MetaPill
+                  label="Operation"
+                  value={relationOperationLabel(primaryRelationAction(relation), isSourceControlledUnbindCandidate(props.item, relation))}
+                />
+              ) : null}
             </div>
             {relation.proposal_hash ? <div className="asset-relation-hash mono">{relation.proposal_hash}</div> : null}
             <div className="asset-relation-actions">

@@ -130,6 +130,35 @@ def test_source_controlled_hint_promotes_doc_asset_state_to_accepted() -> None:
     assert row["impact_scope_policy"] == "accepted_bindings_only"
 
 
+def test_asset_state_includes_doc_test_and_config_bindings() -> None:
+    state = build_doc_asset_state(
+        project_id=PID,
+        run_id="asset-state",
+        commit_sha="abc1234",
+        file_inventory=[
+            {"path": "docs/ref.md", "file_kind": "doc", "scan_status": "secondary_attached"},
+            {"path": "tests/test_mymod.py", "file_kind": "test", "scan_status": "secondary_attached"},
+            {"path": "config/mymod.yml", "file_kind": "config", "scan_status": "secondary_attached"},
+        ],
+        graph_nodes=[
+            {
+                "id": "L7.mymod",
+                "title": "agent.mymod",
+                "secondary": ["docs/ref.md"],
+                "test": ["tests/test_mymod.py"],
+                "metadata": {"config_files": ["config/mymod.yml"]},
+            }
+        ],
+    )
+
+    assert [row["path"] for row in state["docs"]] == ["docs/ref.md"]
+    assert [row["path"] for row in state["tests"]] == ["tests/test_mymod.py"]
+    assert [row["path"] for row in state["configs"]] == ["config/mymod.yml"]
+    assert {row["asset_kind"] for row in state["assets"]} == {"doc", "test", "config"}
+    assert all(row["binding_status"] == "accepted" for row in state["assets"])
+    assert state["summary"]["asset_count"] == 3
+
+
 def test_governance_index_persists_doc_asset_state_artifact(tmp_path) -> None:
     conn = _conn()
     project = _tmp_project({

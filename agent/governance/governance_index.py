@@ -22,7 +22,7 @@ from agent.governance.external_project_governance import (
     build_symbol_index,
 )
 from agent.governance.checkout_provenance import describe_checkout
-from agent.governance.asset_projection import upsert_doc_asset_projection
+from agent.governance.asset_projection import upsert_graph_asset_projection
 from agent.governance.doc_asset_state import build_doc_asset_state
 from agent.governance.graph_snapshot_store import (
     ensure_schema as ensure_graph_snapshot_schema,
@@ -333,13 +333,22 @@ def _choose_attachment_role(file_kind: str, roles_by_node: dict[str, set[str]]) 
 def _enrich_file_inventory_attachments(
     file_inventory: list[dict[str, Any]],
     nodes: Iterable[dict[str, Any]],
+    *,
+    governance_hint_bindings: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Attach inventory rows to current graph nodes using explicit file roles."""
     attachment_index = _node_attachment_index(nodes)
+    removed_by_path = {
+        str(item.get("path") or "").replace("\\", "/").strip("/"): dict(item)
+        for item in ((governance_hint_bindings or {}).get("removed") or [])
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    }
     enriched: list[dict[str, Any]] = []
     for row in file_inventory:
         item = dict(row)
         path = str(item.get("path") or "").replace("\\", "/").strip("/")
+        item.setdefault("raw_scan_status", str(item.get("scan_status") or ""))
+        item.setdefault("raw_graph_status", str(item.get("graph_status") or ""))
         roles_by_node = attachment_index.get(path) or {}
         if roles_by_node:
             node_ids = sorted(roles_by_node)
@@ -355,6 +364,31 @@ def _enrich_file_inventory_attachments(
             item.setdefault("attached_node_ids", [])
             item.setdefault("attachment_role", "")
             item.setdefault("attachment_source", "")
+        if path in removed_by_path and not item.get("attached_node_ids"):
+            removed = removed_by_path[path]
+            item["scan_status"] = "binding_removed"
+            item["graph_status"] = "detached"
+            item["decision"] = "binding_removed"
+            item["attachment_role"] = {
+                "secondary": "doc",
+                "test": "test",
+                "config": "config",
+            }.get(str(removed.get("field") or ""), str(removed.get("field") or ""))
+            item["attachment_source"] = "governance_hint_unbind"
+            item["candidate_node_id"] = str(removed.get("target_node_id") or "")
+            item["attached_to"] = ""
+            item["reason"] = "source-controlled governance hint removed this graph binding"
+        item["effective_attachment_status"] = "attached" if item.get("attached_node_ids") else "unattached"
+        item["effective_binding_status"] = (
+            "removed"
+            if path in removed_by_path and not item.get("attached_node_ids")
+            else "accepted"
+            if item.get("attached_node_ids")
+            and str(item.get("attachment_role") or "") in {"doc", "test", "config", "secondary"}
+            else "not_applicable"
+            if str(item.get("file_kind") or "") not in {"doc", "index_doc", "test", "config"}
+            else "unbound"
+        )
         enriched.append(item)
     return enriched
 
@@ -578,7 +612,11 @@ def build_governance_index(
         )
     else:
         file_inventory = [dict(row) for row in file_inventory if isinstance(row, dict)]
-    file_inventory = _enrich_file_inventory_attachments(file_inventory, source_nodes)
+    file_inventory = _enrich_file_inventory_attachments(
+        file_inventory,
+        source_nodes,
+        governance_hint_bindings=governance_hint_bindings,
+    )
     symbol_index = build_symbol_index(
         project_root=root,
         file_inventory=file_inventory,
@@ -699,11 +737,11 @@ def persist_governance_index(
             index.get("file_inventory") or [],
             replace_run=True,
         )
-        projection_summary = upsert_doc_asset_projection(
+        projection_summary = upsert_graph_asset_projection(
             conn,
             project_id=project_id,
             snapshot_id=(index.get("active_snapshot") or {}).get("snapshot_id", ""),
-            doc_asset_state=index.get("doc_asset_state") or {},
+            asset_state=index.get("doc_asset_state") or {},
         )
         asset_projection_count = int(projection_summary.get("projection_count") or 0)
         asset_binding_count = int(projection_summary.get("binding_count") or 0)

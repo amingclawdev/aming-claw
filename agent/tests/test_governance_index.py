@@ -330,3 +330,55 @@ def test_build_governance_index_attaches_orphan_doc_from_governance_hint(conn, t
     assert rows["docs/orphan.md"]["attachment_role"] == "doc"
     feature = index["feature_index"]["features"][0]
     assert any(ref["path"] == "docs/orphan.md" for ref in feature["doc_refs"])
+
+
+def test_build_governance_index_marks_source_controlled_unbind_effective_status(conn, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_project(project)
+    (project / "docs" / "usage.md").write_text(
+        "# Usage\n\nCall the service from a route.\n\n"
+        "<!-- governance-hint "
+        '{"asset_binding_event":{"operation":"unbind","path":"docs/usage.md",'
+        '"role":"doc","target_node_id":"L7.service","reason":"wrong feature"}}'
+        " -->\n",
+        encoding="utf-8",
+    )
+    candidate_graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.service",
+                    "layer": "L7",
+                    "title": "Demo Service",
+                    "kind": "feature",
+                    "primary": ["src/demo_app/service.py"],
+                    "secondary": ["docs/usage.md"],
+                    "test": ["tests/test_service.py"],
+                    "metadata": {"module": "src.demo_app.service"},
+                }
+            ],
+            "edges": [],
+        }
+    }
+
+    index = build_governance_index(
+        conn,
+        PID,
+        project,
+        run_id="index-unbind-test",
+        commit_sha="def5678",
+        candidate_graph=candidate_graph,
+        snapshot_id="full-def5678-unbind",
+        snapshot_kind="full",
+    )
+
+    node = candidate_graph["deps_graph"]["nodes"][0]
+    assert node["secondary"] == []
+    assert index["governance_hint_bindings"]["removed_count"] == 1
+    rows = {row["path"]: row for row in index["file_inventory"]}
+    assert rows["docs/usage.md"]["raw_scan_status"] == "orphan"
+    assert rows["docs/usage.md"]["scan_status"] == "binding_removed"
+    assert rows["docs/usage.md"]["graph_status"] == "detached"
+    assert rows["docs/usage.md"]["effective_binding_status"] == "removed"
+    assert rows["docs/usage.md"]["candidate_node_id"] == "L7.service"

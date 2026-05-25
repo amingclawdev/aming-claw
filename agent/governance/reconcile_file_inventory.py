@@ -58,6 +58,10 @@ class FileInventoryRow:
     attached_node_ids: list[str] = field(default_factory=list)
     attachment_role: str = ""
     attachment_source: str = ""
+    raw_scan_status: str = ""
+    raw_graph_status: str = ""
+    effective_attachment_status: str = ""
+    effective_binding_status: str = ""
     cluster_id: str = ""
     candidate_node_id: str = ""
     attached_to: str = ""
@@ -459,7 +463,7 @@ def build_file_inventory(
             decision = "govern"
             graph_status = "mapped"
             reason = "source covered by candidate graph fallback node"
-        elif kind in {"test", "doc", "index_doc"} and mapped_node_ids:
+        elif kind in {"test", "doc", "index_doc", "config"} and mapped_node_ids:
             scan_status = "secondary_attached"
             candidate_node_id = mapped_node_ids[0]
             attached_to = candidate_node_id
@@ -499,6 +503,17 @@ def build_file_inventory(
             scan_status = "pending_decision"
             reason = f"{kind} file needs PM classification"
 
+        raw_scan_status = scan_status
+        raw_graph_status = graph_status
+        effective_attachment_status = "attached" if attached_node_ids or attached_to else "unattached"
+        effective_binding_status = (
+            "accepted"
+            if attachment_role in {"doc", "test", "config", "secondary"} and effective_attachment_status == "attached"
+            else "not_applicable"
+            if kind not in {"doc", "index_doc", "test", "config"}
+            else "unbound"
+        )
+
         abs_path = Path(project_root) / rel
         try:
             digest, file_hash, size_bytes = _file_facts(abs_path)
@@ -524,6 +539,10 @@ def build_file_inventory(
             attached_node_ids=attached_node_ids,
             attachment_role=attachment_role,
             attachment_source=attachment_source,
+            raw_scan_status=raw_scan_status,
+            raw_graph_status=raw_graph_status,
+            effective_attachment_status=effective_attachment_status,
+            effective_binding_status=effective_binding_status,
             scan_status=scan_status,
             cluster_id=cluster_id,
             candidate_node_id=candidate_node_id,

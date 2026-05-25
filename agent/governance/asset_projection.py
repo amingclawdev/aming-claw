@@ -274,6 +274,53 @@ def upsert_doc_asset_projection(
     )
 
 
+def upsert_graph_asset_projection(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    asset_state: Mapping[str, Any],
+    source_projection: str = "doc_asset_state",
+) -> dict[str, Any]:
+    """Persist accepted/candidate doc/test/config asset projection rows."""
+    assets = asset_state.get("assets") if isinstance(asset_state, Mapping) else []
+    if not isinstance(assets, list):
+        assets = []
+    commit_sha = _text(asset_state.get("commit_sha") if isinstance(asset_state, Mapping) else "")
+    run_id = _text(asset_state.get("run_id") if isinstance(asset_state, Mapping) else "")
+    summaries: list[dict[str, Any]] = []
+    projection_count = 0
+    binding_count = 0
+    for asset_kind in ("doc", "test", "config"):
+        rows = [
+            row for row in assets
+            if isinstance(row, Mapping) and _text(row.get("asset_kind")) == asset_kind
+        ]
+        summary = upsert_asset_projection_rows(
+            conn,
+            project_id=project_id,
+            snapshot_id=snapshot_id,
+            commit_sha=commit_sha,
+            asset_kind=asset_kind,
+            rows=rows,
+            run_id=run_id,
+            source_projection=source_projection,
+            replace_existing=True,
+        )
+        summaries.append(summary)
+        projection_count += int(summary.get("projection_count") or 0)
+        binding_count += int(summary.get("binding_count") or 0)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "project_id": _text(project_id),
+        "snapshot_id": _text(snapshot_id),
+        "commit_sha": commit_sha,
+        "projection_count": projection_count,
+        "binding_count": binding_count,
+        "by_asset_kind": summaries,
+    }
+
+
 def list_asset_projection(
     conn: sqlite3.Connection,
     *,
@@ -346,4 +393,5 @@ __all__ = [
     "list_asset_projection",
     "upsert_asset_projection_rows",
     "upsert_doc_asset_projection",
+    "upsert_graph_asset_projection",
 ]

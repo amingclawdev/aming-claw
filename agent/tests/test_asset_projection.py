@@ -7,6 +7,7 @@ from agent.governance.asset_projection import (
     list_asset_bindings_for_node,
     list_asset_projection,
     upsert_doc_asset_projection,
+    upsert_graph_asset_projection,
 )
 from agent.governance.db import _ensure_schema
 from agent.governance import graph_snapshot_store as store
@@ -166,6 +167,66 @@ def test_doc_asset_projection_replaces_same_snapshot_commit_kind() -> None:
         asset_kind="doc",
     )
     assert [row["asset_path"] for row in rows] == ["docs/new.md"]
+
+
+def test_graph_asset_projection_persists_doc_test_and_config_rows() -> None:
+    conn = _conn()
+    asset_state = {
+        "run_id": "run-assets",
+        "commit_sha": "abc1234",
+        "assets": [
+            {
+                "asset_kind": "doc",
+                "path": "docs/ref.md",
+                "file_kind": "doc",
+                "binding_status": "accepted",
+                "accepted_bindings": [{"node_id": "L7.1", "title": "Service", "role": "doc"}],
+                "binding_candidates": [],
+            },
+            {
+                "asset_kind": "test",
+                "path": "tests/test_service.py",
+                "file_kind": "test",
+                "binding_status": "accepted",
+                "accepted_bindings": [{"node_id": "L7.1", "title": "Service", "role": "test"}],
+                "binding_candidates": [],
+            },
+            {
+                "asset_kind": "config",
+                "path": "config/service.yml",
+                "file_kind": "config",
+                "binding_status": "candidate",
+                "accepted_bindings": [],
+                "binding_candidates": [
+                    {"target_node_id": "L7.2", "target_title": "Other", "role": "config"}
+                ],
+            },
+        ],
+    }
+
+    summary = upsert_graph_asset_projection(
+        conn,
+        project_id="proj",
+        snapshot_id="scope-abc1234",
+        asset_state=asset_state,
+    )
+
+    assert summary["projection_count"] == 3
+    assert summary["binding_count"] == 3
+    rows = list_asset_projection(conn, project_id="proj", snapshot_id="scope-abc1234")
+    assert [(row["asset_kind"], row["asset_path"], row["binding_status"]) for row in rows] == [
+        ("config", "config/service.yml", "candidate"),
+        ("doc", "docs/ref.md", "accepted"),
+        ("test", "tests/test_service.py", "accepted"),
+    ]
+    test_bindings = list_asset_bindings_for_node(
+        conn,
+        project_id="proj",
+        snapshot_id="scope-abc1234",
+        node_id="L7.1",
+        asset_kind="test",
+    )
+    assert [row["asset_path"] for row in test_bindings] == ["tests/test_service.py"]
 
 
 def test_status_observations_use_db_doc_projection_for_drift_scope() -> None:

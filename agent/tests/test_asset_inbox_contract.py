@@ -17,7 +17,7 @@ from agent.governance.asset_inbox_contract import (
     build_asset_inbox_response,
     validate_asset_inbox_payload,
 )
-from agent.governance.asset_projection import upsert_doc_asset_projection
+from agent.governance.asset_projection import upsert_doc_asset_projection, upsert_graph_asset_projection
 from agent.governance.db import _ensure_schema
 from agent.governance.reconcile_semantic_enrichment import _ensure_semantic_state_schema
 
@@ -74,8 +74,8 @@ def test_asset_inbox_fixture_covers_every_status_and_batch_action() -> None:
     assert payload["impact_scope_policy"] == "accepted_bindings_only"
     assert payload["summary"]["relation_count"] == len(payload["items"])
     assert payload["summary"]["mount_relation_count"] == payload["summary"]["relation_count"]
-    assert payload["summary"]["impact_scope_count"] == 2
-    assert payload["summary"]["review_required_count"] == 5
+    assert payload["summary"]["impact_scope_count"] == 7
+    assert payload["summary"]["review_required_count"] == 8
     assert payload["backlog_policy"] == {
         "default_container": False,
         "create_from_selected_assets_only": True,
@@ -170,12 +170,17 @@ def test_asset_groups_are_navigation_ready_without_table_parsing() -> None:
 
     assert set(by_group) == ASSET_GROUPS
     assert sorted(all_group_ids) == sorted(item["asset_id"] for item in payload["items"])
-    assert by_group["doc"]["count"] == 4
+    assert by_group["doc"]["count"] == 9
     assert by_group["doc"]["status_counts"] == {
         "accepted": 1,
         "archive": 1,
         "doc_candidate": 1,
         "doc_unbound": 1,
+        "drift_confirmed": 1,
+        "drift_resolved": 1,
+        "drift_suspected": 1,
+        "drift_waived": 1,
+        "impact_pending": 1,
     }
     assert by_group["test"]["items"] == [
         {
@@ -208,7 +213,7 @@ def test_no_relation_assets_are_explicit_mount_relation_none() -> None:
     assert config["mount_relations"] == [
         {
             "relation_id": "none:file_config_runtime.yaml",
-            "status": "none",
+            "status": "unbound",
             "role": "config",
             "target_node_id": "",
             "target_title": "",
@@ -238,13 +243,15 @@ def test_backlog_is_created_from_selected_assets_not_orphan_container() -> None:
         if action["action"] == "write_governance_hint"
     )
 
-    assert sorted(eligible) == ["config_pending_decision", "source_orphan", "stale"]
+    assert sorted(eligible) == ["config_pending_decision", "drift_confirmed", "impact_pending", "source_orphan", "stale"]
     assert action["creates_backlog"] is True
     assert action["requires_selection"] is True
     assert action["allowed_statuses"] == [
         "source_orphan",
         "config_pending_decision",
         "stale",
+        "impact_pending",
+        "drift_confirmed",
     ]
     assert hint_action["mutates_source"] is True
     assert hint_action["requires_review"] is True
@@ -461,7 +468,7 @@ def test_live_asset_inbox_response_materializes_from_snapshot_state(asset_inbox_
     assert by_path["docs/runtime.md"]["binding_candidates"][0]["precheck"]["decision"] == "review_required"
     assert by_path["docs/runtime.md"]["mount_relations"][0]["status"] == "candidate"
     assert by_path["docs/runtime.md"]["mount_relations"][0]["review_required"] is True
-    assert by_path["config/runtime.yaml"]["mount_relations"][0]["status"] == "none"
+    assert by_path["config/runtime.yaml"]["mount_relations"][0]["status"] == "unbound"
     assert by_path["tests/test_runtime_bridge.py"]["asset_status"] == "test_candidate"
     assert by_path["docs/accepted-runtime.md"]["asset_status"] == "accepted"
     assert by_path["docs/accepted-runtime.md"]["mount_relations"][0]["impact_scope"] is True
@@ -526,6 +533,64 @@ def test_asset_inbox_uses_db_doc_asset_projection_before_json_artifact(asset_inb
     assert by_path["docs/service.md"]["binding_candidates"][0]["source"] == "db_projection_test"
     assert by_path["docs/service.md"]["mount_relations"][0]["source"] == "db_projection_test"
     assert by_path["docs/service.md"]["relation_summary"]["candidate_count"] == 1
+
+
+def test_asset_inbox_uses_db_graph_asset_projection_for_test_assets(asset_inbox_conn) -> None:
+    snapshot_id = _create_asset_inbox_snapshot(asset_inbox_conn)
+    upsert_graph_asset_projection(
+        asset_inbox_conn,
+        project_id="asset-inbox-live-test",
+        snapshot_id=snapshot_id,
+        asset_state={
+            "run_id": "asset-inbox-live",
+            "commit_sha": "livecommit",
+            "assets": [
+                {
+                    "asset_kind": "test",
+                    "path": "tests/test_runtime_bridge.py",
+                    "file_kind": "test",
+                    "file_hash": "sha256:555",
+                    "sha256": "555",
+                    "binding_status": "candidate",
+                    "accepted_bindings": [],
+                    "binding_candidates": [
+                        {
+                            "schema_version": "asset_binding_proposal.v1",
+                            "operation": "propose_binding",
+                            "asset_kind": "test",
+                            "asset_path": "tests/test_runtime_bridge.py",
+                            "target_node_id": "L7.runtime",
+                            "target_title": "src.runtime",
+                            "evidence_kind": "test_import_fanin",
+                            "source": "graph_asset_projection_test",
+                            "proposal_hash": "sha256:test-asset-candidate",
+                            "precheck": {
+                                "schema_version": "asset_binding_precheck.v1",
+                                "ok": True,
+                                "mode": "deterministic_precheck",
+                                "decision": "review_required",
+                                "binding_strength": "weak",
+                                "proposal_hash": "sha256:test-asset-candidate",
+                                "errors": [],
+                                "warnings": [],
+                            },
+                        }
+                    ],
+                    "impact_scope_policy": "accepted_bindings_only",
+                }
+            ],
+        },
+    )
+    asset_inbox_conn.commit()
+
+    payload = build_asset_inbox_response(asset_inbox_conn, "asset-inbox-live-test", snapshot_id)
+    by_path = {item["path"]: item for item in payload["items"]}
+
+    assert payload["ok"] is True
+    assert payload["source_artifacts"]["doc_asset_projection_source"] == "db_projection"
+    assert by_path["tests/test_runtime_bridge.py"]["asset_status"] == "test_candidate"
+    assert by_path["tests/test_runtime_bridge.py"]["binding_candidates"][0]["source"] == "graph_asset_projection_test"
+    assert by_path["tests/test_runtime_bridge.py"]["mount_relations"][0]["source"] == "graph_asset_projection_test"
 
 
 def test_asset_inbox_api_supports_active_snapshot(asset_inbox_conn) -> None:

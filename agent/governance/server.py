@@ -7299,6 +7299,61 @@ def _snapshot_node_stable_hint_fields(node: dict) -> dict[str, str]:
     return out
 
 
+def _snapshot_node_asset_paths(node: dict, role: str) -> set[str]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    aliases = {
+        "doc": ("secondary", "secondary_files", "docs", "doc_files"),
+        "test": ("test", "tests", "test_files"),
+        "config": ("config", "config_files"),
+    }.get(role, ())
+    paths: set[str] = set()
+    for key in aliases:
+        paths.update(_server_path_list(node.get(key)))
+    if role == "config":
+        paths.update(_server_path_list(metadata.get("config_files")))
+    return paths
+
+
+def _server_path_list(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        values = []
+    return sorted({
+        str(item or "").replace("\\", "/").strip("/")
+        for item in values
+        if str(item or "").strip()
+    })
+
+
+def _file_inventory_row_has_current_binding(
+    row: dict,
+    target_node: dict,
+    *,
+    path: str,
+    node_id: str,
+    role: str,
+) -> bool:
+    node_ids: set[str] = set()
+    for key in ("attached_node_ids", "mapped_node_ids"):
+        node_ids.update(_server_path_list(row.get(key)))
+    attached_to = str(row.get("attached_to") or "").strip()
+    if attached_to:
+        node_ids.add(attached_to)
+    row_role = str(row.get("attachment_role") or "").strip().lower()
+    role_aliases = {
+        "doc": {"doc", "secondary"},
+        "test": {"test"},
+        "config": {"config"},
+    }.get(role, {role})
+    if node_id in node_ids and (not row_role or row_role in role_aliases):
+        return True
+    rel = str(path or "").replace("\\", "/").strip("/")
+    return rel in _snapshot_node_asset_paths(target_node, role)
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/hints/attach")
 def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContext):
     """Write a source-controlled governance hint into an orphan file.
@@ -7448,6 +7503,182 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
             "requires_commit": True,
             "update_graph_after_commit": True,
             "message": "Governance hint written. Commit the file, then run Update graph.",
+            "hint": comment,
+            "review_queue": {
+                "queued": True,
+                "feedback": (feedback.get("items") or [{}])[0],
+                "operation_type": "graph_structure",
+                "subtype": "governance_hint",
+            },
+            "file": row,
+            "target_node": target_node,
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/hints/unbind")
+def handle_graph_governance_snapshot_file_hygiene_hint_unbind(ctx: RequestContext):
+    """Append a source-controlled asset binding unbind command.
+
+    The old bind evidence remains in source. Reconcile replays the command log
+    and materializes the effective removal after the operator commits the file
+    and runs Update Graph.
+    """
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from . import reconcile_feedback
+    from .errors import ValidationError
+    from .governance_hints import parse_governance_hint_bindings, render_governance_hint_comment
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.file-hygiene.hint.unbind")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        root = _graph_governance_project_root(project_id, body)
+        path = str(body.get("path") or body.get("file_path") or "").strip().replace("\\", "/").strip("/")
+        node_id = str(body.get("node_id") or body.get("target_node_id") or "").strip()
+        reason = str(body.get("reason") or "").strip()
+        actor = str(body.get("actor") or "dashboard-user")
+        dry_run = bool(body.get("dry_run")) if body.get("dry_run") is not None else False
+        if not path:
+            raise ValidationError("path is required")
+        if not node_id:
+            raise ValidationError("target_node_id is required")
+        if not reason:
+            raise ValidationError("reason is required")
+
+        files_result = store.list_graph_snapshot_files(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=1000,
+            path_contains=path,
+        )
+        row = _find_file_inventory_row(files_result, path)
+        if not row:
+            raise ValidationError(
+                f"file inventory row not found: {path}. "
+                "Run Update graph/reconcile first so the file appears in the "
+                "snapshot file inventory before writing a governance hint."
+            )
+        role = _hint_role_for_file_kind(str(row.get("file_kind") or ""), str(body.get("role") or ""))
+        if not role:
+            raise ValidationError(f"file kind is not supported for hint unbind: {row.get('file_kind') or 'unknown'}")
+        target_node = _snapshot_node_by_id(store, conn, project_id, snapshot_id, node_id)
+        if not target_node:
+            raise ValidationError(f"target node not found: {node_id}")
+        if not _file_inventory_row_has_current_binding(
+            row,
+            target_node,
+            path=path,
+            node_id=node_id,
+            role=role,
+        ):
+            raise ValidationError(
+                "source-controlled unbind requires an existing accepted binding "
+                f"between {path} and {node_id}; run Update Graph first if the "
+                "dashboard snapshot is stale."
+            )
+
+        abs_path = _resolve_project_child(root, path)
+        if not abs_path.exists() or not abs_path.is_file():
+            raise ValidationError(f"file does not exist: {path}")
+        try:
+            text = abs_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(f"file is not utf-8 text: {path}") from exc
+
+        payload = {
+            "asset_binding_event": {
+                "schema_version": "asset_binding_event.v1",
+                "operation": "unbind",
+                "path": path,
+                "role": role,
+                "target_node_id": node_id,
+                "reason": reason,
+                "actor": actor,
+                **_snapshot_node_stable_hint_fields(target_node),
+            }
+        }
+        comment = render_governance_hint_comment(path, payload)
+        if not comment:
+            raise ValidationError(f"file type does not support direct governance-hint comments: {path}")
+        already_present = any(
+            hint.operation == "unbind"
+            and hint.path == path
+            and hint.target_node_id == node_id
+            and hint.field in {"secondary", "test", "config"}
+            for hint in parse_governance_hint_bindings(text, source_path=path)
+        )
+        changed = not already_present
+        if changed and not dry_run:
+            separator = "\n\n" if text and not text.endswith("\n\n") else ""
+            newline = "" if text.endswith("\n") else "\n"
+            abs_path.write_text(text + newline + separator + comment.rstrip() + "\n", encoding="utf-8")
+
+        feedback = reconcile_feedback.submit_feedback_item(
+            project_id,
+            snapshot_id,
+            feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+            issue={
+                "type": f"{role}_binding_unbind",
+                "category": "asset_binding",
+                "reason": reason,
+                "summary": "Source-controlled unbind command is waiting for commit/apply and Update Graph.",
+                "target": node_id,
+                "target_type": role,
+                "paths": [path],
+                "changed_files": [path] if changed and not dry_run else [],
+                "intent": str(body.get("intent") or body.get("operator_intent") or "unbind_asset_from_node"),
+                "operation_type": "graph_structure",
+                "subtype": "governance_hint",
+                "file_backed": True,
+                "priority": "P1",
+                "requires_human_signoff": True,
+            },
+            actor=actor,
+            source_round="graph_structure_lifecycle",
+        )
+        audit_service.record(
+            conn,
+            project_id,
+            "governance_hint_unbind",
+            actor=actor,
+            request_id=ctx.request_id,
+            details=json.dumps({
+                "snapshot_id": snapshot_id,
+                "path": path,
+                "target_node_id": node_id,
+                "role": role,
+                "dry_run": dry_run,
+                "changed": changed,
+                "already_present": already_present,
+            }, ensure_ascii=False, sort_keys=True),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "path": path,
+            "target_node_id": node_id,
+            "role": role,
+            "state": "planned" if dry_run else "written_uncommitted",
+            "dry_run": dry_run,
+            "hint_written": bool(changed and not dry_run),
+            "already_present": already_present,
+            "requires_commit": bool(changed and not dry_run),
+            "update_graph_after_commit": bool(changed and not dry_run),
+            "message": (
+                "Governance unbind hint written. Commit the file, then run Update graph."
+                if changed and not dry_run
+                else "Governance unbind hint planned; no source file was changed."
+                if dry_run
+                else "Governance unbind hint already exists. Commit the file, then run Update graph."
+            ),
             "hint": comment,
             "review_queue": {
                 "queued": True,

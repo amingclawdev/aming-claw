@@ -228,11 +228,11 @@ def build_asset_inbox_response(
     node_by_title = {str(node.get("title") or ""): node for node in nodes if node.get("title")}
     stale_paths = _stale_source_paths(conn, project_id, snapshot_id, nodes)
     doc_asset_state_path = _doc_asset_state_path(project_id, files)
-    doc_assets = _doc_assets_by_path_from_db(conn, project_id, snapshot_id)
-    doc_asset_source = "db_projection" if doc_assets else "json_artifact"
-    if not doc_assets:
+    asset_projection = _doc_assets_by_path_from_db(conn, project_id, snapshot_id)
+    doc_asset_source = "db_projection" if asset_projection else "json_artifact"
+    if not asset_projection:
         doc_asset_state = _read_json_file(doc_asset_state_path, {}) if doc_asset_state_path else {}
-        doc_assets = _doc_assets_by_path(doc_asset_state)
+        asset_projection = _doc_assets_by_path(doc_asset_state)
     drift_states: dict[tuple[str, str], dict[str, Any]] = {}
     drift_proposals: dict[tuple[str, str], dict[str, Any]] = {}
     impact_reminders: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -253,7 +253,7 @@ def build_asset_inbox_response(
             row,
             node_by_id=node_by_id,
             node_by_title=node_by_title,
-            doc_asset=doc_assets.get(str(row.get("path") or "")),
+            doc_asset=asset_projection.get(str(row.get("path") or "")),
             drift_state=drift_states.get((_asset_kind(row), str(row.get("path") or "").replace("\\", "/").strip("/"))),
             drift_proposal=drift_proposals.get((_asset_kind(row), str(row.get("path") or "").replace("\\", "/").strip("/"))),
             impact_reminders=impact_reminders.get((_asset_kind(row), str(row.get("path") or "").replace("\\", "/").strip("/")), []),
@@ -367,7 +367,7 @@ def asset_inbox_batch_actions() -> list[dict[str, Any]]:
         {
             "action": "create_backlog_from_selection",
             "label": "Create backlog from selected assets",
-            "allowed_statuses": ["source_orphan", "config_pending_decision", "stale"],
+            "allowed_statuses": ["source_orphan", "config_pending_decision", "stale", "impact_pending", "drift_confirmed"],
             "requires_selection": True,
             "requires_review": False,
             "mutates_source": False,
@@ -1172,12 +1172,14 @@ def _doc_asset_state_path(project_id: str, files: list[dict[str, Any]]) -> Path 
 def _doc_assets_by_path(doc_asset_state: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(doc_asset_state, Mapping):
         return {}
-    docs = doc_asset_state.get("docs")
-    if not isinstance(docs, list):
+    assets = doc_asset_state.get("assets")
+    if not isinstance(assets, list):
+        assets = doc_asset_state.get("docs")
+    if not isinstance(assets, list):
         return {}
     return {
         str(item.get("path") or ""): dict(item)
-        for item in docs
+        for item in assets
         if isinstance(item, Mapping) and item.get("path")
     }
 
@@ -1190,13 +1192,7 @@ def _doc_assets_by_path_from_db(
     try:
         from .asset_projection import list_asset_projection
 
-        rows = list_asset_projection(
-            conn,
-            project_id=project_id,
-            snapshot_id=snapshot_id,
-            asset_kind="doc",
-            limit=5000,
-        )
+        rows = list_asset_projection(conn, project_id=project_id, snapshot_id=snapshot_id, limit=5000)
     except Exception:
         return {}
     out: dict[str, dict[str, Any]] = {}

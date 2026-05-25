@@ -950,6 +950,31 @@ export interface AttachFileHintResponse {
   target_node?: NodeRecord;
 }
 
+export interface UnbindFileHintResponse {
+  ok: boolean;
+  project_id: string;
+  snapshot_id: string;
+  path: string;
+  target_node_id: string;
+  role: "doc" | "test" | "config" | string;
+  state?: "written_uncommitted" | "planned" | string;
+  written_uncommitted?: boolean;
+  requires_commit?: boolean;
+  update_graph_after_commit?: boolean;
+  source_controlled?: boolean;
+  operation_type?: string;
+  changed_files?: string[];
+  message?: string;
+  review_queue?: {
+    queued?: boolean;
+    feedback?: Record<string, unknown> | Record<string, unknown>[];
+    operation_type?: string;
+    subtype?: string;
+  };
+  file?: FileInventoryRow;
+  target_node?: NodeRecord;
+}
+
 export interface AssetDriftStateResponse {
   ok: boolean;
   project_id: string;
@@ -972,11 +997,13 @@ export interface FileHygieneActionResponse {
   snapshot_id: string;
   action: string;
   event: Record<string, unknown>;
+  message?: string;
   review_queue?: {
     queued?: boolean;
     feedback?: Record<string, unknown> | Record<string, unknown>[];
     operation_type?: string;
     subtype?: string;
+    changed_files?: string[];
   };
   file?: FileInventoryRow;
 }

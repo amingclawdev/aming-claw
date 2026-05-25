@@ -34,6 +34,7 @@ type CategoryFilter = "ALL" | string;
 type AssetKindFilter = "ALL" | string;
 
 interface GraphStructureLifecycle {
+  operation_type?: string;
   subtype?: string;
   subtype_label?: string;
   changed_files?: string[];
@@ -140,15 +141,15 @@ export default function ReviewQueueView({
     if (!files.length) return;
     const reason = window.prompt(
       action === "cancel"
-        ? "Cancel reason. This will enter the Review Queue audit trail and discard only the listed operation files."
-        : "Apply reason. This will commit only the listed operation files; graph changes become effective after Update Graph.",
+        ? "Cancel reason. This will enter the Review Queue audit trail and discard only the listed source-controlled operation files."
+        : "Apply reason. This will commit only the listed source-controlled operation files; graph changes become effective after Update Graph.",
       "",
     );
     if (reason === null) return;
     const confirmed = window.confirm(
       action === "cancel"
-        ? `Cancel this graph-structure operation and discard ${files.length} operation file${files.length === 1 ? "" : "s"}?`
-        : `Commit/apply ${files.length} graph-structure operation file${files.length === 1 ? "" : "s"}? Run Update Graph after commit before trusting the binding.`,
+        ? `Cancel this source-controlled graph operation and discard ${files.length} operation file${files.length === 1 ? "" : "s"}?`
+        : `Commit/apply ${files.length} source-controlled graph operation file${files.length === 1 ? "" : "s"}? Run Update Graph after commit before trusting the binding.`,
     );
     if (!confirmed) return;
     setBusyId(group.queue_id);
@@ -351,18 +352,18 @@ export default function ReviewQueueView({
                             <button
                               className="action-btn"
                               disabled={busy || !lifecycle.changed_files?.length}
-                              title="Commit/apply only the graph-structure operation files; run Update Graph after commit."
+                              title="Commit/apply only the listed source-controlled operation files; run Update Graph after commit."
                               onClick={() => dispatchGraphLifecycle(g, "commit")}
                             >
-                              {busy ? "…" : "Apply"}
+                              {busy ? "…" : "Apply commit"}
                             </button>
                             <button
                               className="action-btn action-btn-danger"
                               disabled={busy || !lifecycle.changed_files?.length}
-                              title="Cancel by discarding only the graph-structure operation files."
+                              title="Cancel by discarding only the listed source-controlled operation files."
                               onClick={() => dispatchGraphLifecycle(g, "cancel")}
                             >
-                              Cancel
+                              Cancel files
                             </button>
                           </div>
                         ) : (
@@ -848,18 +849,33 @@ function GraphStructureLifecycleSummary({ lifecycle }: { lifecycle: GraphStructu
   const files = lifecycle.changed_files ?? [];
   const reason = lifecycle.reasons?.[0] ?? lifecycle.evidence?.find((item) => item.reason)?.reason ?? "";
   const intent = lifecycle.evidence?.find((item) => item.intent)?.intent ?? "";
+  const operationType = lifecycle.operation_type || lifecycle.subtype || "graph_structure";
   return (
     <div style={{ marginTop: 6, display: "grid", gap: 4 }}>
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
         <span className="status-badge status-pending">{lifecycle.subtype_label ?? titleize(lifecycle.subtype ?? "graph_structure")}</span>
         <span className="mono" style={{ color: "var(--ink-500)" }}>
+          {operationType}
+        </span>
+        <span className="mono" style={{ color: "var(--ink-500)" }}>
+          source-controlled
+        </span>
+        <span className="mono" style={{ color: "var(--ink-500)" }}>
           {files.length} file{files.length === 1 ? "" : "s"}
         </span>
+        {lifecycle.requires_commit ? (
+          <span className="mono" style={{ color: "var(--ink-500)" }}>
+            Commit/apply required
+          </span>
+        ) : null}
         {lifecycle.update_graph_after_commit ? (
           <span className="mono" style={{ color: "var(--ink-500)" }}>
             Update Graph required
           </span>
         ) : null}
+      </div>
+      <div style={{ fontSize: 10.5, color: "var(--ink-500)" }}>
+        Apply commits only these operation files; Cancel discards only these operation files.
       </div>
       {files.length ? (
         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>

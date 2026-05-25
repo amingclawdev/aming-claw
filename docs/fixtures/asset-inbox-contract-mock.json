@@ -18,21 +18,26 @@
     "reason": "Asset Inbox tracks graph/file hygiene state. Backlog rows are created only for selected actionable work."
   },
   "summary": {
-    "total": 9,
+    "total": 14,
     "by_status": {
       "accepted": 1,
       "archive": 1,
       "config_pending_decision": 1,
       "doc_candidate": 1,
       "doc_unbound": 1,
+      "drift_confirmed": 1,
+      "drift_resolved": 1,
+      "drift_suspected": 1,
+      "drift_waived": 1,
       "ignored": 1,
+      "impact_pending": 1,
       "source_orphan": 1,
       "stale": 1,
       "test_candidate": 1
     },
     "by_kind": {
       "config": 1,
-      "doc": 4,
+      "doc": 9,
       "generated": 1,
       "source": 2,
       "test": 1
@@ -40,12 +45,12 @@
     "candidate_count": 2,
     "accepted_count": 1,
     "unbound_count": 1,
-    "backlog_eligible_count": 3,
-    "operator_review_count": 5,
-    "relation_count": 9,
-    "mount_relation_count": 9,
-    "impact_scope_count": 2,
-    "review_required_count": 5
+    "backlog_eligible_count": 5,
+    "operator_review_count": 8,
+    "relation_count": 14,
+    "mount_relation_count": 14,
+    "impact_scope_count": 7,
+    "review_required_count": 8
   },
   "items": [
     {
@@ -83,7 +88,7 @@
       "mount_relations": [
         {
           "relation_id": "none:file_src_newFeature.ts",
-          "status": "none",
+          "status": "unbound",
           "role": "source",
           "target_node_id": "",
           "target_title": "",
@@ -138,7 +143,7 @@
       "mount_relations": [
         {
           "relation_id": "none:file_docs_service.md",
-          "status": "none",
+          "status": "unbound",
           "role": "doc",
           "target_node_id": "",
           "target_title": "",
@@ -406,7 +411,7 @@
       "mount_relations": [
         {
           "relation_id": "none:file_config_runtime.yaml",
-          "status": "none",
+          "status": "unbound",
           "role": "config",
           "target_node_id": "",
           "target_title": "",
@@ -455,7 +460,7 @@
       "mount_relations": [
         {
           "relation_id": "none:file_dist_bundle.js",
-          "status": "none",
+          "status": "unbound",
           "role": "generated",
           "target_node_id": "",
           "target_title": "",
@@ -506,7 +511,7 @@
       "mount_relations": [
         {
           "relation_id": "none:file_docs_dev_session-handoff.md",
-          "status": "none",
+          "status": "unbound",
           "role": "doc",
           "target_node_id": "",
           "target_title": "",
@@ -592,6 +597,376 @@
         "impact_scope_count": 1,
         "review_required_count": 0
       }
+    },
+    {
+      "asset_id": "file:docs/impact-pending-runtime.md",
+      "path": "docs/impact-pending-runtime.md",
+      "asset_kind": "doc",
+      "language": "markdown",
+      "asset_status": "impact_pending",
+      "scan_status": "secondary_attached",
+      "graph_status": "attached",
+      "doc_kind": "doc",
+      "binding_status": "accepted_with_drift_state",
+      "file_hash": "sha256:impactpe00000000000000000000000000000000000000000000000000000000",
+      "sha256": "impactpe00000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 1010,
+      "accepted_bindings": [
+        {
+          "node_id": "L7.runtime",
+          "title": "src.runtime",
+          "role": "doc",
+          "source": "graph_node"
+        }
+      ],
+      "binding_candidates": [],
+      "drift": {
+        "schema_version": "asset_drift_state.v1",
+        "state": "suspected",
+        "source": "fixture",
+        "impact_pending": true,
+        "impact_reminders": [
+          {
+            "reminder_id": "asset-impact-fixture-001",
+            "node_id": "L7.runtime",
+            "node_title": "src.runtime",
+            "status": "pending"
+          }
+        ]
+      },
+      "recommended_actions": [
+        "mark_drift_state",
+        "resolve_drift",
+        "propose_remove_binding"
+      ],
+      "batch_eligible_actions": [
+        "mark_drift_state",
+        "resolve_drift",
+        "propose_remove_binding"
+      ],
+      "risk": "high",
+      "evidence": [
+        {
+          "kind": "asset_drift_state",
+          "message": "impact_pending fixture coverage."
+        }
+      ],
+      "backlog": {
+        "eligible": true,
+        "reason": "Fixture drift status coverage for Asset Inbox contract."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file:docs/impact-pending-runtime.md:L7.runtime:doc:graph_node:0",
+          "status": "impact_pending",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "graph_node",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": true,
+          "drift_state": "suspected",
+          "impact_reminder_id": "asset-impact-fixture-001"
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 1
+      }
+    },
+    {
+      "asset_id": "file:docs/drift-suspected-runtime.md",
+      "path": "docs/drift-suspected-runtime.md",
+      "asset_kind": "doc",
+      "language": "markdown",
+      "asset_status": "drift_suspected",
+      "scan_status": "secondary_attached",
+      "graph_status": "attached",
+      "doc_kind": "doc",
+      "binding_status": "accepted_with_drift_state",
+      "file_hash": "sha256:driftsus00000000000000000000000000000000000000000000000000000000",
+      "sha256": "driftsus00000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 1010,
+      "accepted_bindings": [
+        {
+          "node_id": "L7.runtime",
+          "title": "src.runtime",
+          "role": "doc",
+          "source": "graph_node"
+        }
+      ],
+      "binding_candidates": [],
+      "drift": {
+        "schema_version": "asset_drift_state.v1",
+        "state": "suspected",
+        "source": "fixture",
+        "impact_pending": false,
+        "impact_reminders": []
+      },
+      "recommended_actions": [
+        "mark_drift_state",
+        "resolve_drift",
+        "propose_remove_binding"
+      ],
+      "batch_eligible_actions": [
+        "mark_drift_state",
+        "resolve_drift",
+        "propose_remove_binding"
+      ],
+      "risk": "medium",
+      "evidence": [
+        {
+          "kind": "asset_drift_state",
+          "message": "drift_suspected fixture coverage."
+        }
+      ],
+      "backlog": {
+        "eligible": false,
+        "reason": "Fixture drift status coverage for Asset Inbox contract."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file:docs/drift-suspected-runtime.md:L7.runtime:doc:graph_node:0",
+          "status": "stale_drift",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "graph_node",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": true,
+          "drift_state": "suspected"
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 1
+      }
+    },
+    {
+      "asset_id": "file:docs/drift-confirmed-runtime.md",
+      "path": "docs/drift-confirmed-runtime.md",
+      "asset_kind": "doc",
+      "language": "markdown",
+      "asset_status": "drift_confirmed",
+      "scan_status": "secondary_attached",
+      "graph_status": "attached",
+      "doc_kind": "doc",
+      "binding_status": "accepted_with_drift_state",
+      "file_hash": "sha256:driftcon00000000000000000000000000000000000000000000000000000000",
+      "sha256": "driftcon00000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 1010,
+      "accepted_bindings": [
+        {
+          "node_id": "L7.runtime",
+          "title": "src.runtime",
+          "role": "doc",
+          "source": "graph_node"
+        }
+      ],
+      "binding_candidates": [],
+      "drift": {
+        "schema_version": "asset_drift_state.v1",
+        "state": "confirmed",
+        "source": "fixture",
+        "impact_pending": false,
+        "impact_reminders": []
+      },
+      "recommended_actions": [
+        "mark_drift_state",
+        "resolve_drift",
+        "propose_remove_binding"
+      ],
+      "batch_eligible_actions": [
+        "mark_drift_state",
+        "resolve_drift",
+        "propose_remove_binding"
+      ],
+      "risk": "high",
+      "evidence": [
+        {
+          "kind": "asset_drift_state",
+          "message": "drift_confirmed fixture coverage."
+        }
+      ],
+      "backlog": {
+        "eligible": true,
+        "reason": "Fixture drift status coverage for Asset Inbox contract."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file:docs/drift-confirmed-runtime.md:L7.runtime:doc:graph_node:0",
+          "status": "stale_drift",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "graph_node",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": true,
+          "drift_state": "confirmed"
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 1
+      }
+    },
+    {
+      "asset_id": "file:docs/drift-resolved-runtime.md",
+      "path": "docs/drift-resolved-runtime.md",
+      "asset_kind": "doc",
+      "language": "markdown",
+      "asset_status": "drift_resolved",
+      "scan_status": "secondary_attached",
+      "graph_status": "attached",
+      "doc_kind": "doc",
+      "binding_status": "accepted_with_drift_state",
+      "file_hash": "sha256:driftres00000000000000000000000000000000000000000000000000000000",
+      "sha256": "driftres00000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 1010,
+      "accepted_bindings": [
+        {
+          "node_id": "L7.runtime",
+          "title": "src.runtime",
+          "role": "doc",
+          "source": "graph_node"
+        }
+      ],
+      "binding_candidates": [],
+      "drift": {
+        "schema_version": "asset_drift_state.v1",
+        "state": "resolved",
+        "source": "fixture",
+        "impact_pending": false,
+        "impact_reminders": []
+      },
+      "recommended_actions": [
+        "mark_drift_state"
+      ],
+      "batch_eligible_actions": [
+        "mark_drift_state"
+      ],
+      "risk": "low",
+      "evidence": [
+        {
+          "kind": "asset_drift_state",
+          "message": "drift_resolved fixture coverage."
+        }
+      ],
+      "backlog": {
+        "eligible": false,
+        "reason": "Fixture drift status coverage for Asset Inbox contract."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file:docs/drift-resolved-runtime.md:L7.runtime:doc:graph_node:0",
+          "status": "accepted",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "graph_node",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": false,
+          "drift_state": "resolved"
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 0
+      }
+    },
+    {
+      "asset_id": "file:docs/drift-waived-runtime.md",
+      "path": "docs/drift-waived-runtime.md",
+      "asset_kind": "doc",
+      "language": "markdown",
+      "asset_status": "drift_waived",
+      "scan_status": "secondary_attached",
+      "graph_status": "attached",
+      "doc_kind": "doc",
+      "binding_status": "accepted_with_drift_state",
+      "file_hash": "sha256:driftwai00000000000000000000000000000000000000000000000000000000",
+      "sha256": "driftwai00000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 1010,
+      "accepted_bindings": [
+        {
+          "node_id": "L7.runtime",
+          "title": "src.runtime",
+          "role": "doc",
+          "source": "graph_node"
+        }
+      ],
+      "binding_candidates": [],
+      "drift": {
+        "schema_version": "asset_drift_state.v1",
+        "state": "waived",
+        "source": "fixture",
+        "impact_pending": false,
+        "impact_reminders": []
+      },
+      "recommended_actions": [
+        "mark_drift_state"
+      ],
+      "batch_eligible_actions": [
+        "mark_drift_state"
+      ],
+      "risk": "low",
+      "evidence": [
+        {
+          "kind": "asset_drift_state",
+          "message": "drift_waived fixture coverage."
+        }
+      ],
+      "backlog": {
+        "eligible": false,
+        "reason": "Fixture drift status coverage for Asset Inbox contract."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file:docs/drift-waived-runtime.md:L7.runtime:doc:graph_node:0",
+          "status": "accepted",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "graph_node",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": false,
+          "drift_state": "waived"
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 0
+      }
     }
   ],
   "batch_actions": [
@@ -654,7 +1029,9 @@
       "allowed_statuses": [
         "source_orphan",
         "config_pending_decision",
-        "stale"
+        "stale",
+        "impact_pending",
+        "drift_confirmed"
       ],
       "requires_selection": true,
       "requires_review": false,
@@ -673,9 +1050,7 @@
       "action": "write_governance_hint",
       "label": "Write governance hint",
       "allowed_statuses": [
-        "doc_candidate",
-        "test_candidate",
-        "config_pending_decision"
+        "doc_unbound"
       ],
       "requires_selection": true,
       "requires_review": true,
@@ -686,24 +1061,91 @@
         "role": "doc",
         "actor": "observer"
       }
+    },
+    {
+      "action": "propose_remove_binding",
+      "label": "Propose remove binding",
+      "allowed_statuses": [
+        "accepted",
+        "impact_pending",
+        "drift_suspected",
+        "drift_confirmed"
+      ],
+      "requires_selection": true,
+      "requires_review": true,
+      "mutates_source": false,
+      "payload_example": {
+        "asset_id": "file:docs/runtime.md",
+        "target_node_id": "L7.runtime",
+        "reason": "Binding appears stale; review before materialization."
+      }
+    },
+    {
+      "action": "resolve_drift",
+      "label": "Resolve drift",
+      "allowed_statuses": [
+        "impact_pending",
+        "drift_suspected",
+        "drift_confirmed",
+        "stale"
+      ],
+      "requires_selection": true,
+      "requires_review": true,
+      "mutates_source": false,
+      "payload_example": {
+        "asset_id": "file:docs/runtime.md",
+        "mode": "ai_assisted_proposal",
+        "self_precheck_required": true
+      }
+    },
+    {
+      "action": "mark_drift_state",
+      "label": "Mark drift state",
+      "allowed_statuses": [
+        "accepted",
+        "impact_pending",
+        "drift_suspected",
+        "drift_confirmed",
+        "stale"
+      ],
+      "requires_selection": true,
+      "requires_review": false,
+      "mutates_source": false,
+      "payload_example": {
+        "asset_id": "file:docs/runtime.md",
+        "drift_state": "suspected",
+        "evidence": {
+          "source": "observer_review"
+        }
+      }
     }
   ],
   "asset_groups": [
     {
       "group_id": "doc",
       "label": "Docs",
-      "count": 4,
+      "count": 9,
       "status_counts": {
         "accepted": 1,
         "archive": 1,
         "doc_candidate": 1,
-        "doc_unbound": 1
+        "doc_unbound": 1,
+        "drift_confirmed": 1,
+        "drift_resolved": 1,
+        "drift_suspected": 1,
+        "drift_waived": 1,
+        "impact_pending": 1
       },
       "item_ids": [
         "file:docs/service.md",
         "file:docs/runtime.md",
         "file:docs/accepted-runtime.md",
-        "file:docs/dev/session-handoff.md"
+        "file:docs/dev/session-handoff.md",
+        "file:docs/impact-pending-runtime.md",
+        "file:docs/drift-suspected-runtime.md",
+        "file:docs/drift-confirmed-runtime.md",
+        "file:docs/drift-resolved-runtime.md",
+        "file:docs/drift-waived-runtime.md"
       ],
       "items": [
         {
@@ -741,6 +1183,51 @@
           "relation_count": 1,
           "review_required_count": 0,
           "impact_scope_count": 0
+        },
+        {
+          "asset_id": "file:docs/impact-pending-runtime.md",
+          "path": "docs/impact-pending-runtime.md",
+          "asset_status": "impact_pending",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 1
+        },
+        {
+          "asset_id": "file:docs/drift-suspected-runtime.md",
+          "path": "docs/drift-suspected-runtime.md",
+          "asset_status": "drift_suspected",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 1
+        },
+        {
+          "asset_id": "file:docs/drift-confirmed-runtime.md",
+          "path": "docs/drift-confirmed-runtime.md",
+          "asset_status": "drift_confirmed",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 1
+        },
+        {
+          "asset_id": "file:docs/drift-resolved-runtime.md",
+          "path": "docs/drift-resolved-runtime.md",
+          "asset_status": "drift_resolved",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 0,
+          "impact_scope_count": 1
+        },
+        {
+          "asset_id": "file:docs/drift-waived-runtime.md",
+          "path": "docs/drift-waived-runtime.md",
+          "asset_status": "drift_waived",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 0,
+          "impact_scope_count": 1
         }
       ]
     },

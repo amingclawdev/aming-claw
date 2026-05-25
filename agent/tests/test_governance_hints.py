@@ -40,6 +40,7 @@ def test_governance_hint_attaches_unbound_doc_to_target_node(tmp_path):
     assert nodes[0]["secondary"] == ["docs/orphan.md"]
     assert nodes[0]["metadata"]["governance_hint_bindings"] == [
         {
+            "operation": "bind",
             "path": "docs/orphan.md",
             "field": "secondary",
             "source_path": "docs/orphan.md",
@@ -66,6 +67,55 @@ def test_governance_hint_does_not_rebind_existing_doc(tmp_path):
     assert nodes[0]["secondary"] == ["docs/bound.md"]
     assert nodes[1]["secondary"] == []
     assert summary["skipped"][0]["reason"] == "already_bound"
+
+
+def test_governance_hint_unbind_is_append_only_tombstone(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        project / "docs" / "bound.md",
+        "<!-- governance-hint "
+        '{"asset_binding_event":{"operation":"unbind","path":"docs/bound.md",'
+        '"role":"doc","target_node_id":"L7.target","reason":"stale binding"}}'
+        " -->\n# Bound Elsewhere\n",
+    )
+    nodes = [
+        {"id": "L7.target", "title": "Target", "secondary": ["docs/bound.md"]},
+    ]
+
+    summary = apply_binding_hints_to_graph_nodes(project, nodes)
+
+    assert summary["removed_count"] == 1
+    assert nodes[0]["secondary"] == []
+    assert nodes[0]["metadata"]["governance_hint_bindings"] == [
+        {
+            "operation": "unbind",
+            "path": "docs/bound.md",
+            "field": "secondary",
+            "source_path": "docs/bound.md",
+        }
+    ]
+
+
+def test_governance_hint_replays_bind_then_unbind_deterministically(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        project / "docs" / "service.md",
+        "<!-- governance-hint "
+        '{"asset_binding_event":{"operation":"bind","path":"docs/service.md",'
+        '"role":"doc","target_node_id":"L7.target"}}'
+        " -->\n"
+        "<!-- governance-hint "
+        '{"asset_binding_event":{"operation":"unbind","path":"docs/service.md",'
+        '"role":"doc","target_node_id":"L7.target","reason":"wrong node"}}'
+        " -->\n# Service\n",
+    )
+    nodes = [{"id": "L7.target", "title": "Target", "secondary": []}]
+
+    summary = apply_binding_hints_to_graph_nodes(project, nodes)
+
+    assert summary["applied_count"] == 1
+    assert summary["removed_count"] == 1
+    assert nodes[0]["secondary"] == []
 
 
 def test_governance_hint_defers_index_doc_container_binding(tmp_path):

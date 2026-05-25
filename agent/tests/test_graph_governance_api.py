@@ -5032,6 +5032,157 @@ def test_graph_governance_file_hygiene_hint_attach_writes_source_hint(conn, monk
     assert doc.read_text(encoding="utf-8").count("governance-hint") == 1
 
 
+def test_graph_governance_file_hygiene_hint_unbind_appends_source_event(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    project = tmp_path / "project"
+    doc = project / "docs" / "bound.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text(
+        "<!-- governance-hint "
+        '{"attach_to_node":{"path":"docs/bound.md","role":"doc","target_node_id":"L7.1"}}'
+        " -->\n\n# Bound\n",
+        encoding="utf-8",
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-hygiene-hint-unbind",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.write_companion_files(
+        PID,
+        snapshot["snapshot_id"],
+        graph_json=_graph(),
+        file_inventory=[
+            {
+                "path": "docs/bound.md",
+                "file_kind": "doc",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+                "decision": "attach_to_node",
+                "attached_node_ids": ["L7.1"],
+                "size_bytes": 123,
+            },
+        ],
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_snapshot_file_hygiene_hint_unbind(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "docs/bound.md",
+                "target_node_id": "L7.1",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+                "reason": "Wrong feature binding.",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "written_uncommitted"
+    assert result["requires_commit"] is True
+    assert result["update_graph_after_commit"] is True
+    assert result["review_queue"]["queued"] is True
+    text = doc.read_text(encoding="utf-8")
+    assert '"attach_to_node"' in text
+    assert '"asset_binding_event"' in text
+    assert '"operation": "unbind"' in text
+    assert text.index('"attach_to_node"') < text.index('"asset_binding_event"')
+
+    second = server.handle_graph_governance_snapshot_file_hygiene_hint_unbind(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "docs/bound.md",
+                "target_node_id": "L7.1",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+                "reason": "Wrong feature binding.",
+            },
+        )
+    )
+    assert second["already_present"] is True
+    assert doc.read_text(encoding="utf-8").count("governance-hint") == 2
+
+
+def test_graph_governance_file_hygiene_hint_unbind_requires_current_binding(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    project = tmp_path / "project"
+    doc = project / "docs" / "bound.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("# Bound\n", encoding="utf-8")
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-hygiene-hint-unbind-guard",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    store.write_companion_files(
+        PID,
+        snapshot["snapshot_id"],
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "docs/bound.md",
+                "file_kind": "doc",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+                "decision": "attach_to_node",
+                "attached_node_ids": ["L7.2"],
+                "size_bytes": 123,
+            },
+        ],
+    )
+    conn.commit()
+
+    with pytest.raises(ValidationError, match="existing accepted binding"):
+        server.handle_graph_governance_snapshot_file_hygiene_hint_unbind(
+            _ctx(
+                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+                method="POST",
+                body={
+                    "path": "docs/bound.md",
+                    "target_node_id": "L7.1",
+                    "project_root": str(project),
+                    "actor": "dashboard-user",
+                    "reason": "Wrong feature binding.",
+                },
+            )
+        )
+    assert "asset_binding_event" not in doc.read_text(encoding="utf-8")
+
+
 def test_graph_governance_file_hygiene_hint_repair_stabilizes_and_withdraws_source_hint(
     conn,
     monkeypatch,

@@ -46,6 +46,7 @@ class BindingHint:
     source_path: str
     path: str
     field: str
+    operation: str = "bind"
     target_node_id: str = ""
     target_module: str = ""
     target_title: str = ""
@@ -67,6 +68,7 @@ def binding_hint_to_dict(hint: BindingHint) -> dict[str, str]:
         "source_path": hint.source_path,
         "path": hint.path,
         "field": hint.field,
+        "operation": hint.operation,
         "target_node_id": hint.target_node_id,
         "target_module": hint.target_module,
         "target_title": hint.target_title,
@@ -372,6 +374,20 @@ def load_governance_hint_bindings(project_root: str | Path) -> list[BindingHint]
             ".yaml",
             ".yml",
             ".json",
+            ".py",
+            ".pyw",
+            ".sh",
+            ".bash",
+            ".ps1",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".mjs",
+            ".cjs",
         }:
             continue
         try:
@@ -390,15 +406,18 @@ def apply_binding_hints_to_graph_nodes(
 ) -> dict[str, Any]:
     """Mutate nodes by applying orphan-only binding hints.
 
-    A path is eligible only when it exists and is not already present in any
-    node's primary/secondary/test/config fields. This keeps the MVP from
-    moving or overwriting existing bindings.
+    Bind/unbind hints are replayed in source order. Bind remains conservative:
+    a path is eligible only when it exists and is not already present in any
+    node's primary/secondary/test/config fields. Unbind is a tombstone command:
+    it removes only the targeted materialized binding from the replay result
+    and leaves the source-controlled command as durable evidence.
     """
     root = Path(project_root).resolve()
     binding_hints = list(hints) if hints is not None else load_governance_hint_bindings(root)
     by_id, by_module, by_title, all_nodes = _node_indexes(nodes)
     already_bound = _bound_paths(nodes)
     applied: list[dict[str, str]] = []
+    removed: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
 
     for hint in binding_hints:
@@ -408,15 +427,6 @@ def apply_binding_hints_to_graph_nodes(
             continue
         if hint.field not in {"secondary", "test", "config"}:
             skipped.append({"path": rel, "reason": "unsupported_role", "source_path": hint.source_path})
-            continue
-        if rel in already_bound:
-            skipped.append({"path": rel, "reason": "already_bound", "source_path": hint.source_path})
-            continue
-        if DEFAULT_LANGUAGE_POLICY.is_index_doc_path(rel):
-            skipped.append({"path": rel, "reason": "index_doc_deferred", "source_path": hint.source_path})
-            continue
-        if not (root / rel).exists():
-            skipped.append({"path": rel, "reason": "file_missing", "source_path": hint.source_path})
             continue
         target = _resolve_target(
             hint,
@@ -428,6 +438,52 @@ def apply_binding_hints_to_graph_nodes(
         if target is None:
             skipped.append({"path": rel, "reason": "target_missing", "source_path": hint.source_path})
             continue
+        if hint.operation == "unbind":
+            target_node_id = str(target.get("id") or target.get("node_id") or "")
+            if _remove_node_binding_path(target, rel, hint.field):
+                already_bound = _bound_paths(nodes)
+                metadata = target.setdefault("metadata", {})
+                if isinstance(metadata, dict):
+                    entries = metadata.setdefault("governance_hint_bindings", [])
+                    if isinstance(entries, list):
+                        entries.append({
+                            "operation": "unbind",
+                            "path": rel,
+                            "field": hint.field,
+                            "source_path": hint.source_path,
+                        })
+                removed.append({
+                    "path": rel,
+                    "field": hint.field,
+                    "target_node_id": target_node_id,
+                    "source_path": hint.source_path,
+                })
+            else:
+                skipped.append({
+                    "path": rel,
+                    "field": hint.field,
+                    "target_node_id": target_node_id,
+                    "reason": "binding_not_present",
+                    "source_path": hint.source_path,
+                })
+            continue
+        if hint.operation != "bind":
+            skipped.append({
+                "path": rel,
+                "field": hint.field,
+                "reason": "unsupported_operation",
+                "source_path": hint.source_path,
+            })
+            continue
+        if rel in already_bound:
+            skipped.append({"path": rel, "reason": "already_bound", "source_path": hint.source_path})
+            continue
+        if DEFAULT_LANGUAGE_POLICY.is_index_doc_path(rel):
+            skipped.append({"path": rel, "reason": "index_doc_deferred", "source_path": hint.source_path})
+            continue
+        if not (root / rel).exists():
+            skipped.append({"path": rel, "reason": "file_missing", "source_path": hint.source_path})
+            continue
         values = _path_list(target.get(hint.field))
         if rel not in values:
             values.append(rel)
@@ -437,6 +493,7 @@ def apply_binding_hints_to_graph_nodes(
             entries = metadata.setdefault("governance_hint_bindings", [])
             if isinstance(entries, list):
                 entries.append({
+                    "operation": "bind",
                     "path": rel,
                     "field": hint.field,
                     "source_path": hint.source_path,
@@ -453,8 +510,10 @@ def apply_binding_hints_to_graph_nodes(
     return {
         "hint_count": len(binding_hints),
         "applied_count": len(applied),
+        "removed_count": len(removed),
         "skipped_count": len(skipped),
         "applied": applied,
+        "removed": removed,
         "skipped": skipped[:50],
     }
 
@@ -466,8 +525,9 @@ def _binding_hint_key(hint: BindingHint) -> tuple[str, str]:
     )
 
 
-def _binding_hint_signature(hint: BindingHint) -> tuple[str, str, str, str, str, str, str]:
+def _binding_hint_signature(hint: BindingHint) -> tuple[str, str, str, str, str, str, str, str]:
     return (
+        hint.operation,
         hint.field,
         hint.target_node_id,
         hint.target_module,
@@ -494,8 +554,14 @@ def _bindings_from_payload(payload: Any, *, source_path: str) -> list[BindingHin
     candidates: list[Any] = []
     if isinstance(payload.get("bindings"), list):
         candidates.extend(payload.get("bindings") or [])
+    if isinstance(payload.get("asset_binding_events"), list):
+        candidates.extend(payload.get("asset_binding_events") or [])
+    if isinstance(payload.get("asset_binding_event"), dict):
+        candidates.append(payload.get("asset_binding_event"))
     if isinstance(payload.get("attach_to_node"), dict):
-        candidates.append(payload.get("attach_to_node"))
+        item = dict(payload.get("attach_to_node") or {})
+        item.setdefault("operation", "bind")
+        candidates.append(item)
     if isinstance(payload.get("binding"), dict):
         candidates.append(payload.get("binding"))
     if _looks_like_binding(payload):
@@ -663,6 +729,24 @@ def _rewrite_payload_value(
             elif rewritten != out[key]:
                 out[key] = rewritten
                 changed = True
+    if isinstance(out.get("asset_binding_event"), dict):
+        rewritten = _rewrite_binding_dict(
+            out["asset_binding_event"],
+            source_path=source_path,
+            by_id=by_id,
+            by_module=by_module,
+            by_title=by_title,
+            nodes=nodes,
+            action=action,
+            matcher=matcher,
+            stats=stats,
+        )
+        if rewritten is None:
+            out.pop("asset_binding_event", None)
+            changed = True
+        elif rewritten != out["asset_binding_event"]:
+            out["asset_binding_event"] = rewritten
+            changed = True
     if isinstance(out.get("bindings"), list):
         original = list(out["bindings"])
         rewritten_items = [
@@ -685,7 +769,32 @@ def _rewrite_payload_value(
         else:
             out.pop("bindings", None)
         changed = changed or kept != original
-    if not changed and not any(key in value for key in ("attach_to_node", "binding", "bindings")):
+    if isinstance(out.get("asset_binding_events"), list):
+        original = list(out["asset_binding_events"])
+        rewritten_items = [
+            _rewrite_payload_value(
+                item,
+                source_path=source_path,
+                by_id=by_id,
+                by_module=by_module,
+                by_title=by_title,
+                nodes=nodes,
+                action=action,
+                matcher=matcher,
+                stats=stats,
+            )
+            for item in original
+        ]
+        kept = [item for item in rewritten_items if not _payload_is_empty(item)]
+        if kept:
+            out["asset_binding_events"] = kept
+        else:
+            out.pop("asset_binding_events", None)
+        changed = changed or kept != original
+    if not changed and not any(
+        key in value
+        for key in ("attach_to_node", "binding", "bindings", "asset_binding_event", "asset_binding_events")
+    ):
         stats["unchanged"] += 1
     return None if _payload_is_empty(out) else out
 
@@ -759,6 +868,11 @@ def _rewrite_binding_dict(
 
 
 def _binding_hint_from_item(item: dict[str, Any], *, source_path: str) -> BindingHint | None:
+    operation = str(item.get("operation") or item.get("action") or "bind").strip().lower()
+    if operation in {"attach", "add", "bind_to_node"}:
+        operation = "bind"
+    if operation in {"remove", "detach", "withdraw"}:
+        operation = "unbind"
     role = str(
         item.get("role") or item.get("binding") or item.get("attachment_role") or "doc"
     ).strip().lower()
@@ -789,6 +903,7 @@ def _binding_hint_from_item(item: dict[str, Any], *, source_path: str) -> Bindin
             source_path=source_path,
             path=path,
             field=field,
+            operation=operation,
             target_node_id=target_node_id,
             target_module=target_module,
             target_title=target_title,
@@ -992,6 +1107,30 @@ def _prune_asset_binding_candidate(metadata: dict[str, Any], path: str, field: s
     elif asset_kind == "test":
         tests = [item for item in _path_list(metadata.get("weak_test_files")) if item != rel]
         metadata["weak_test_files"] = tests
+
+
+def _remove_node_binding_path(node: dict[str, Any], path: str, field: str) -> bool:
+    rel = normalize_relpath("", path)
+    if not rel:
+        return False
+    changed = False
+    aliases = {
+        "secondary": ("secondary", "secondary_files"),
+        "test": ("test", "tests", "test_files"),
+        "config": ("config", "config_files"),
+    }.get(field, (field,))
+    for alias in aliases:
+        values = _path_list(node.get(alias))
+        if rel in values:
+            node[alias] = [item for item in values if item != rel]
+            changed = True
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    if field == "config" and isinstance(metadata, dict):
+        values = _path_list(metadata.get("config_files"))
+        if rel in values:
+            metadata["config_files"] = [item for item in values if item != rel]
+            changed = True
+    return changed
 
 
 def _path_list(value: Any) -> list[str]:
