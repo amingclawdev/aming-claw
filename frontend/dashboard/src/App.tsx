@@ -1222,6 +1222,8 @@ export default function App() {
               projectId={currentProjectId}
               snapshotId={data.status?.active_snapshot_id ?? data.summary?.snapshot_id ?? ""}
               nodes={data.nodes}
+              onSelectNode={handleSelectNode}
+              workspaceRoot={activeWorkspaceRoot}
             />
           ) : null}
           {view === "backlog" && data ? (
