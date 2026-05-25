@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
+import FileLink from "../components/FileLink";
 import { api, ApiError } from "../lib/api";
 import type {
   AssetInboxBatchAction,
@@ -14,6 +15,8 @@ interface Props {
   projectId: string;
   snapshotId: string;
   nodes: NodeRecord[];
+  onSelectNode?: (nodeId: string) => void;
+  workspaceRoot?: string;
 }
 
 type AssetGroupId = "ALL" | "doc" | "test" | "config" | "source" | "generated" | "other";
@@ -35,6 +38,7 @@ interface AttachResult {
 interface ActionResult {
   state: ActionState;
   message: string;
+  followUpId?: string;
 }
 
 interface RelationView extends AssetInboxMountRelation {
@@ -96,7 +100,9 @@ const DRIFT_LABELS: Record<DriftStateName, string> = {
   waived: "Waived",
 };
 
-export default function AssetInboxView({ assetInbox, projectId, snapshotId, nodes }: Props) {
+const REMOVE_BINDING_RUNTIME_DRIFT_ID = "HN-ASSET-REMOVE-BINDING-RUNTIME-DRIFT-20260525";
+
+export default function AssetInboxView({ assetInbox, projectId, snapshotId, nodes, onSelectNode, workspaceRoot }: Props) {
   const [groupFilter, setGroupFilter] = useState<AssetGroupId>("ALL");
   const [query, setQuery] = useState("");
   const [selectedAssetId, setSelectedAssetId] = useState("");
@@ -270,8 +276,16 @@ export default function AssetInboxView({ assetInbox, projectId, snapshotId, node
         },
       }));
     } catch (error) {
-      const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
-      setActionResults((current) => ({ ...current, [key]: { state: "error", message: msg } }));
+      const isKnownRemoveDrift = action === "remove_binding" && error instanceof ApiError;
+      const msg = isKnownRemoveDrift ? removeBindingRuntimeDriftMessage(error) : error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
+      setActionResults((current) => ({
+        ...current,
+        [key]: {
+          state: isKnownRemoveDrift ? "blocked" : "error",
+          message: msg,
+          followUpId: isKnownRemoveDrift ? REMOVE_BINDING_RUNTIME_DRIFT_ID : undefined,
+        },
+      }));
     }
   };
 
@@ -371,7 +385,9 @@ export default function AssetInboxView({ assetInbox, projectId, snapshotId, node
                   <div className="asset-detail-kicker">
                     {labelForKind(selectedItem.asset_kind)} - {selectedItem.language || "language n/a"}
                   </div>
-                  <h3 className="asset-detail-title mono">{selectedItem.path}</h3>
+                  <h3 className="asset-detail-title">
+                    <FileLink path={selectedItem.path} workspaceRoot={workspaceRoot} />
+                  </h3>
                 </div>
                 <span className={`status-badge ${assetStatusClass(selectedItem.asset_status)}`}>
                   {STATUS_LABELS[selectedItem.asset_status] ?? selectedItem.asset_status}
@@ -393,6 +409,10 @@ export default function AssetInboxView({ assetInbox, projectId, snapshotId, node
                 relations={selectedRelations}
                 selectedRelationId={selectedRelation?.relation_id || ""}
                 onSelect={setSelectedRelationId}
+                onSelectNode={onSelectNode}
+                actionResults={actionResults}
+                projectId={projectId}
+                onPropose={proposeRelationAction}
               />
 
               <div className="asset-detail-grid">
@@ -482,7 +502,9 @@ export default function AssetInboxView({ assetInbox, projectId, snapshotId, node
               selectedRelationId={selectedRelation?.relation_id || ""}
               actionResults={actionResults}
               onSelect={setSelectedRelationId}
+              onSelectNode={onSelectNode}
               onPropose={proposeRelationAction}
+              projectId={projectId}
             />
           ) : (
             <div className="asset-browser-empty">Select an asset to inspect graph bindings.</div>
@@ -538,67 +560,97 @@ function AssetRelationGraph(props: {
   relations: RelationView[];
   selectedRelationId: string;
   onSelect(relationId: string): void;
+  onSelectNode?: (nodeId: string) => void;
+  actionResults: Record<string, ActionResult>;
+  projectId: string;
+  onPropose(item: AssetInboxItem, relation: RelationView, action: "attach_to_node" | "remove_binding"): void;
 }) {
-  const relationSlots = props.relations.slice(0, 8);
-  const centerX = 180;
-  const centerY = 128;
-  const radius = 92;
+  const relationSlots = props.relations.slice(0, 10);
+  const selectedRelation =
+    props.relations.find((relation) => relation.relation_id === props.selectedRelationId) ?? props.relations[0] ?? null;
   return (
     <section className="asset-one-hop-graph" aria-label="Asset relation graph">
       <div className="asset-graph-head">
         <div>
-          <div className="asset-detail-block-title">One-hop relation graph</div>
-          <div className="asset-panel-meta">Selected asset root with related graph nodes</div>
+          <div className="asset-detail-block-title">Relation map</div>
+          <div className="asset-panel-meta">Jump to graph nodes and record relation operations from this surface</div>
         </div>
         <RelationLegend />
       </div>
-      <div className="asset-graph-canvas">
-        <svg viewBox="0 0 360 256" role="img" aria-label={`One-hop graph for ${props.item.path}`}>
-          {relationSlots.map((relation, index) => {
-            const angle = (Math.PI * 2 * index) / Math.max(relationSlots.length, 1) - Math.PI / 2;
-            const x = centerX + Math.cos(angle) * radius;
-            const y = centerY + Math.sin(angle) * radius;
-            return (
-              <g key={`${relation.relation_id}-edge`}>
-                <line
-                  x1={centerX}
-                  y1={centerY}
-                  x2={x}
-                  y2={y}
-                  className={`asset-graph-edge ${relationStatusClass(relation.status)}`}
-                />
-              </g>
-            );
-          })}
-          <g>
-            <circle cx={centerX} cy={centerY} r="38" className="asset-graph-root" />
-            <text x={centerX} y={centerY - 4} textAnchor="middle" className="asset-graph-root-label">
-              Asset
-            </text>
-            <text x={centerX} y={centerY + 12} textAnchor="middle" className="asset-graph-root-kind">
-              {labelForKind(props.item.asset_kind)}
-            </text>
-          </g>
-          {relationSlots.map((relation, index) => {
-            const angle = (Math.PI * 2 * index) / Math.max(relationSlots.length, 1) - Math.PI / 2;
-            const x = centerX + Math.cos(angle) * radius;
-            const y = centerY + Math.sin(angle) * radius;
-            const active = props.selectedRelationId === relation.relation_id;
-            return (
-              <g
-                key={relation.relation_id}
-                className={`asset-graph-node-wrap${active ? " active" : ""}`}
-                onClick={() => props.onSelect(relation.relation_id)}
-              >
-                <circle cx={x} cy={y} r="28" className={`asset-graph-node ${relationStatusClass(relation.status)}`} />
-                <text x={x} y={y + 4} textAnchor="middle" className="asset-graph-node-label">
-                  {graphNodeLabel(relation)}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
+      <div className="asset-relation-map" aria-label={`Operation-first relation map for ${props.item.path}`}>
+        <div className="asset-relation-map-root">
+          <span className="asset-map-root-label">Asset root</span>
+          <strong>{shortPathLabel(props.item.path)}</strong>
+          <span>{labelForKind(props.item.asset_kind)} - {STATUS_LABELS[props.item.asset_status] ?? props.item.asset_status}</span>
+        </div>
+        <div className="asset-relation-map-branches">
+          {relationSlots.length === 0 ? (
+            <div className="asset-browser-empty">No relation branches are available for this asset.</div>
+          ) : (
+            relationSlots.map((relation) => {
+              const active = props.selectedRelationId === relation.relation_id;
+              const action = primaryRelationAction(relation);
+              const result = relationActionResult(props.actionResults, relation);
+              return (
+                <div
+                  key={relation.relation_id}
+                  className={`asset-relation-map-node ${relationStatusClass(relation.status)}${active ? " active" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={active}
+                  onClick={() => props.onSelect(relation.relation_id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      props.onSelect(relation.relation_id);
+                    }
+                  }}
+                >
+                  <div className="asset-relation-map-node-head">
+                    <TargetNodeButton nodeId={relation.target_node_id} onSelectNode={props.onSelectNode} />
+                    <span className={`asset-relation-state ${relationStatusClass(relation.status)}`}>
+                      {RELATION_LABELS[relation.status] ?? relation.status}
+                    </span>
+                  </div>
+                  {relation.target_title ? <div className="asset-relation-title">{relation.target_title}</div> : null}
+                  <div className="asset-relation-map-meta">
+                    <MetaPill label="Role" value={relation.role || "n/a"} />
+                    <MetaPill label="Evidence" value={relation.evidence_kind || "n/a"} />
+                    <MetaPill label="Scope" value={formatImpactScope(relation.impact_scope)} />
+                  </div>
+                  <div className="asset-relation-map-actions">
+                    {action ? (
+                      <button
+                        type="button"
+                        className="action-btn"
+                        disabled={relationActionResult(props.actionResults, relation, action)?.state === "writing"}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          props.onSelect(relation.relation_id);
+                          props.onPropose(props.item, relation, action);
+                        }}
+                      >
+                        {relationActionLabel(action)}
+                      </button>
+                    ) : (
+                      <span className="asset-browser-muted">No relation operation</span>
+                    )}
+                    <ActionResultLine result={result} projectId={props.projectId} compact />
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
       </div>
+      <SelectedRelationOperation
+        item={props.item}
+        relation={selectedRelation}
+        result={selectedRelation ? relationActionResult(props.actionResults, selectedRelation) : null}
+        projectId={props.projectId}
+        onSelectNode={props.onSelectNode}
+        onPropose={props.onPropose}
+      />
     </section>
   );
 }
@@ -613,6 +665,144 @@ function RelationLegend() {
       ))}
     </div>
   );
+}
+
+function SelectedRelationOperation(props: {
+  item: AssetInboxItem;
+  relation: RelationView | null;
+  result: ActionResult | null;
+  projectId: string;
+  onSelectNode?: (nodeId: string) => void;
+  onPropose(item: AssetInboxItem, relation: RelationView, action: "attach_to_node" | "remove_binding"): void;
+}) {
+  if (!props.relation) {
+    return <div className="asset-selected-relation-op asset-browser-muted">Select a relation branch to inspect its operation state.</div>;
+  }
+  const action = primaryRelationAction(props.relation);
+  const result = props.result ?? { state: "idle", message: "No relation action recorded." };
+  return (
+    <div className="asset-selected-relation-op" aria-label="Selected relation operation result">
+      <div className="asset-selected-relation-main">
+        <span className="asset-map-root-label">Selected relation</span>
+        <TargetNodeButton nodeId={props.relation.target_node_id} onSelectNode={props.onSelectNode} />
+        <span className="asset-browser-muted">
+          {RELATION_LABELS[props.relation.status] ?? props.relation.status} - {props.relation.target_title || "title n/a"}
+        </span>
+      </div>
+      <div className="asset-selected-relation-actions">
+        {action ? (
+          <button
+            type="button"
+            className="action-btn action-btn-primary"
+            disabled={result.state === "writing"}
+            onClick={() => props.onPropose(props.item, props.relation as RelationView, action)}
+          >
+            {result.state === "writing" ? "Recording..." : relationActionLabel(action)}
+          </button>
+        ) : (
+          <span className="asset-browser-muted">No direct add/remove operation is available for this relation.</span>
+        )}
+        <ActionResultLine result={result} projectId={props.projectId} />
+      </div>
+    </div>
+  );
+}
+
+function TargetNodeButton(props: { nodeId?: string; onSelectNode?: (nodeId: string) => void }) {
+  const nodeId = props.nodeId?.trim();
+  if (!nodeId) return <span className="mono asset-unbound-target">unbound</span>;
+  const content = (
+    <>
+      <span className="target-link-id">{nodeId}</span>
+      <span className="target-link-arrow">→</span>
+      <span className="target-link-hint">Graph</span>
+    </>
+  );
+  if (!props.onSelectNode) {
+    return (
+      <span className="target-link target-link-static" aria-label={`Target node ${nodeId}`}>
+        {content}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="target-link asset-target-link"
+      aria-label={`Open ${nodeId} in graph view`}
+      onClick={(event) => {
+        event.stopPropagation();
+        props.onSelectNode?.(nodeId);
+      }}
+    >
+      {content}
+    </button>
+  );
+}
+
+function ActionResultLine(props: { result?: ActionResult | null; projectId: string; compact?: boolean }) {
+  if (!props.result?.message) return null;
+  return (
+    <span className={`attach-state attach-state-${props.result.state}${props.compact ? " attach-state-compact" : ""}`}>
+      {props.result.message}
+      {props.result.followUpId ? (
+        <>
+          {" "}
+          <a className="asset-followup-link" href={backlogFollowUpHref(props.projectId, props.result.followUpId)}>
+            {props.result.followUpId}
+          </a>
+        </>
+      ) : null}
+    </span>
+  );
+}
+
+function primaryRelationAction(relation: RelationView): "attach_to_node" | "remove_binding" | null {
+  if (relation.status === "candidate" && relation.target_node_id) return "attach_to_node";
+  if (["accepted", "impact_pending", "stale_drift"].includes(relation.status)) return "remove_binding";
+  return null;
+}
+
+function relationActionResult(
+  actionResults: Record<string, ActionResult>,
+  relation: RelationView,
+  actionOverride?: "attach_to_node" | "remove_binding" | null,
+): ActionResult | null {
+  const action = actionOverride ?? primaryRelationAction(relation);
+  if (!action) return null;
+  return actionResults[`${relation.relation_id}:${action}`] ?? null;
+}
+
+function relationActionLabel(action: "attach_to_node" | "remove_binding"): string {
+  return action === "attach_to_node" ? "Add relation" : "Propose remove";
+}
+
+function removeBindingRuntimeDriftMessage(error: ApiError): string {
+  const detail = compactErrorDetail(error.body || error.message);
+  return `Known remove_binding runtime drift. Backend returned ${error.status}; follow-up ${REMOVE_BINDING_RUNTIME_DRIFT_ID} tracks the server fix.${detail ? ` ${detail}` : ""}`;
+}
+
+function compactErrorDetail(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
+}
+
+function shortPathLabel(path: string): string {
+  if (path.length <= 96) return path;
+  const parts = path.split("/");
+  const fileName = parts.pop() || path;
+  const parent = parts.pop();
+  return parent ? `.../${parent}/${fileName}` : `.../${fileName}`;
+}
+
+function backlogFollowUpHref(projectId: string, backlogId: string): string {
+  const query = new URLSearchParams({
+    project_id: projectId,
+    view: "backlog",
+    backlog: backlogId,
+  });
+  return `?${query.toString()}`;
 }
 
 function DriftControls(props: {
@@ -664,7 +854,9 @@ function RelationPanel(props: {
   selectedRelationId: string;
   actionResults: Record<string, ActionResult>;
   onSelect(relationId: string): void;
+  onSelectNode?: (nodeId: string) => void;
   onPropose(item: AssetInboxItem, relation: RelationView, action: "attach_to_node" | "remove_binding"): void;
+  projectId: string;
 }) {
   const accepted = props.relations.filter((relation) =>
     ["accepted", "impact_pending", "stale_drift"].includes(relation.status),
@@ -688,7 +880,9 @@ function RelationPanel(props: {
         selectedRelationId={props.selectedRelationId}
         actionResults={props.actionResults}
         onSelect={props.onSelect}
+        onSelectNode={props.onSelectNode}
         onPropose={props.onPropose}
+        projectId={props.projectId}
       />
       <RelationGroup
         title="Candidates"
@@ -698,7 +892,9 @@ function RelationPanel(props: {
         selectedRelationId={props.selectedRelationId}
         actionResults={props.actionResults}
         onSelect={props.onSelect}
+        onSelectNode={props.onSelectNode}
         onPropose={props.onPropose}
+        projectId={props.projectId}
       />
       <RelationGroup
         title="Unbound"
@@ -708,7 +904,9 @@ function RelationPanel(props: {
         selectedRelationId={props.selectedRelationId}
         actionResults={props.actionResults}
         onSelect={props.onSelect}
+        onSelectNode={props.onSelectNode}
         onPropose={props.onPropose}
+        projectId={props.projectId}
       />
     </div>
   );
@@ -722,7 +920,9 @@ function RelationGroup(props: {
   selectedRelationId: string;
   actionResults: Record<string, ActionResult>;
   onSelect(relationId: string): void;
+  onSelectNode?: (nodeId: string) => void;
   onPropose(item: AssetInboxItem, relation: RelationView, action: "attach_to_node" | "remove_binding"): void;
+  projectId: string;
 }) {
   return (
     <section className="asset-relation-group">
@@ -744,7 +944,7 @@ function RelationGroup(props: {
             onClick={() => props.onSelect(relation.relation_id)}
           >
             <div className="asset-relation-card-head">
-              <span className="mono">{relation.target_node_id || "unbound"}</span>
+              <TargetNodeButton nodeId={relation.target_node_id} onSelectNode={props.onSelectNode} />
               <span className={`asset-relation-state ${relationStatusClass(relation.status)}`}>
                 {RELATION_LABELS[relation.status] ?? relation.status}
               </span>
@@ -787,16 +987,8 @@ function RelationGroup(props: {
                   Propose remove
                 </button>
               ) : null}
-              {props.actionResults[addKey]?.message ? (
-                <span className={`attach-state attach-state-${props.actionResults[addKey].state}`}>
-                  {props.actionResults[addKey].message}
-                </span>
-              ) : null}
-              {props.actionResults[removeKey]?.message ? (
-                <span className={`attach-state attach-state-${props.actionResults[removeKey].state}`}>
-                  {props.actionResults[removeKey].message}
-                </span>
-              ) : null}
+              <ActionResultLine result={props.actionResults[addKey]} projectId={props.projectId} />
+              <ActionResultLine result={props.actionResults[removeKey]} projectId={props.projectId} />
             </div>
           </div>
           );
@@ -1113,12 +1305,6 @@ function relationStatusClass(status?: string): string {
   if (status === "stale_drift") return "stale-drift";
   if (status === "unbound") return "unbound";
   return "unbound";
-}
-
-function graphNodeLabel(relation: RelationView): string {
-  if (!relation.target_node_id) return "Unbound";
-  const value = relation.target_node_id.replace(/^L\d+\./, "L");
-  return value.length > 9 ? `${value.slice(0, 8)}...` : value;
 }
 
 function normalizeGroupId(kind?: string, status?: string, path?: string): AssetGroupId {

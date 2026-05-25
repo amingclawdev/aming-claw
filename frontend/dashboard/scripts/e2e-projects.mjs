@@ -510,6 +510,38 @@ function verifyEditorJumpWorkspaceContract() {
   ok("editor jump resolves through active project workspace contract");
 }
 
+function verifyAssetRelationGraphOpsContract() {
+  phase("asset relation graph operation contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const assetSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/AssetInboxView.tsx"), "utf8");
+  const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
+  assert(
+    /<AssetInboxView[\s\S]*onSelectNode=\{handleSelectNode\}[\s\S]*workspaceRoot=\{activeWorkspaceRoot\}/.test(appSource),
+    "App should pass graph navigation and active workspace root into AssetInboxView",
+  );
+  assert(assetSource.includes('import FileLink from "../components/FileLink"'), "Asset inbox should reuse FileLink");
+  assert(
+    assetSource.includes("<FileLink path={selectedItem.path} workspaceRoot={workspaceRoot} />"),
+    "Asset path should use FileLink with the active workspace root",
+  );
+  assert(assetSource.includes("function TargetNodeButton"), "Asset relation targets should have a graph-jump target button");
+  assert(assetSource.includes('className="target-link asset-target-link"'), "Target node jump should reuse target-link visual language");
+  assert(assetSource.includes("function AssetRelationGraph"), "Asset relation graph component should exist");
+  assert(assetSource.includes("asset-relation-map"), "Asset relation graph should render the operation-first relation map");
+  assert(assetSource.includes("Selected relation operation result"), "Selected relation action result should be visible from graph surface");
+  assert(assetSource.includes("primaryRelationAction"), "Asset relation graph should choose add/remove actions by relation status");
+  assert(assetSource.includes("Add relation"), "Candidate relation should expose Add relation");
+  assert(assetSource.includes("Propose remove"), "Accepted/impact/stale relation should expose Propose remove");
+  assert(
+    assetSource.includes("HN-ASSET-REMOVE-BINDING-RUNTIME-DRIFT-20260525"),
+    "Remove-binding runtime drift should surface the linked follow-up backlog id",
+  );
+  assert(!assetSource.includes("editorUrl("), "AssetInboxView should not create a new editor URI helper");
+  assert(cssSource.includes(".asset-relation-map"), "CSS should style the asset relation mind-map surface");
+  assert(cssSource.includes(".asset-selected-relation-op"), "CSS should keep selected relation operation result readable");
+  ok("asset relation graph exposes navigation, FileLink, add/remove operations, and known drift follow-up");
+}
+
 function verifyBacklogEvidenceContract() {
   phase("backlog evidence contract");
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
@@ -564,6 +596,7 @@ async function main() {
     verifyTreeLayerFilterContract();
     verifyVisualCollaborationPanelsContract();
     verifyEditorJumpWorkspaceContract();
+    verifyAssetRelationGraphOpsContract();
     verifyBacklogEvidenceContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();
