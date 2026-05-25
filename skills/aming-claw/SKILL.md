@@ -23,6 +23,11 @@ tell the user you can help with:
 ## Operating Contract
 
 Treat the active graph as the project map and the backlog as the work ledger. Before editing code, docs, config, dashboard assets, or runtime state, establish current graph/runtime status, identify the owning nodes/modules, and record the work item.
+The V1 implementation default is observer-led Manual Fix with local Codex
+subagents as bounded `mf_sub` workers when parallel help is needed. Governance
+chain/executor dev/test/qa/merge automation is advanced and experimental in V1,
+not the V1 default implementation entrypoint; use it only when the user
+explicitly asks to test chain automation.
 For new features or user-visible behavior changes, treat E2E impact as part of the work ledger: run/update the relevant suite and evidence, or file an explicit follow-up backlog row when the E2E is deferred.
 For dashboard/graph E2E work, update repo-owned fixture artifacts first and materialize them into isolated temporary projects; do not hand-edit generated example projects as the source of truth.
 
@@ -40,7 +45,9 @@ Stable MVP capabilities:
 
 Limited or deferred capabilities:
 
-- Chain dev/test/qa/merge automation is experimental in MVP. Prefer Manual Fix for ordinary MVP implementation unless the user explicitly asks for chain execution.
+- Chain dev/test/qa/merge automation is experimental in MVP. Prefer
+  observer-led Manual Fix for ordinary MVP implementation unless the user
+  explicitly asks for chain execution.
 - Function-level call graph queries are available for supported adapters through
   `function_callees`, `function_callers`, and `high_function_degree`; dashboard
   visualization is still evolving.
@@ -222,16 +229,19 @@ not yet materialized into the graph.
 
 ## Manual Fix SOP
 
-Use the manual-fix SOP for observer-hotfix, chain rescue, and other bypass
-work where normal chain execution is not the right path. The canonical SOP is
-`docs/governance/manual-fix-sop.md`; the compact session checklist is
-`aming-claw://mf-sop`.
+Use the manual-fix SOP for ordinary V1 implementation, observer-hotfix, chain
+rescue, and other bounded work that should stay under observer control. The
+canonical SOP is `docs/governance/manual-fix-sop.md`; the compact session
+checklist is `aming-claw://mf-sop`.
 
-During MVP, Chain is not the default path for routine implementation. Use MF
-for ordinary MVP fixes/features when needed, but do not treat MF as a bypass of
-governance: backlog, graph discovery, tests, explicit commit files, Chain
-trailers, post-commit scope reconcile, and backlog close still apply. This is a
-temporary MVP mode; when Chain is stable, return to Chain-first development.
+During MVP, Chain is not the default path for routine implementation. The V1
+implementation default is observer-led Manual Fix: backlog row, graph
+discovery, local Codex `mf_sub` workers when useful, focused tests, explicit
+commit files, Chain trailers, post-commit scope reconcile, and backlog close.
+Chain trailers are MF audit anchors and do not mean auto-chain execution is
+active. Future releases may revise the default, but V1 sessions should not
+enter governance task_create dev/test/qa/merge or executor release flows unless
+the user explicitly asks to test chain automation.
 Some API responses may normalize observer-hotfix/manual-fix work to the
 internal `chain_rescue` MF type. During MVP, treat that value as the audited MF
 bucket, not as a requirement that ordinary implementation must use chain.
@@ -292,7 +302,8 @@ Before editing:
 6. Record the E2E decision: run it, defer it with a follow-up backlog row, or
    mark it `e2e_not_applicable` with a reason.
 
-Commit explicit files only, and use Chain trailers for true MF commits:
+Commit explicit files only, and use Chain trailers as MF audit anchors. Chain
+trailers do not indicate that auto-chain execution was active:
 
 ```text
 Chain-Source-Stage: observer-hotfix
@@ -470,7 +481,8 @@ remains an explicit MCP/CLI action.
 - Never write directly to `governance.db` for normal operations.
 - Use existing graph-owned modules/adapters before creating a new abstraction.
 - Keep manual fixes small and tied to one backlog row.
-- Commit with Chain trailers:
+- Commit MF changes with Chain trailers as audit anchors, not as evidence that
+  auto-chain execution was active:
 
 ```text
 Chain-Source-Stage: observer-hotfix

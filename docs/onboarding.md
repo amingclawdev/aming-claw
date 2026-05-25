@@ -110,20 +110,24 @@ After graph build:
    and bounded source excerpts.
 4. File backlog rows with node ids, target files, tests, risk, and acceptance
    criteria.
-5. For implementation, use Manual Fix in V1 unless the user explicitly asks to
-   test experimental chain automation. The MF checklist
+5. For implementation, the V1 implementation default is observer-led Manual
+   Fix unless the user explicitly asks to test experimental chain automation.
+   The MF checklist
    (predeclare backlog → graph-first discovery → focused tests → Chain trailer
    commit → Update Graph → backlog close) lives in
    [skills/aming-claw/references/mf-sop.md](../skills/aming-claw/references/mf-sop.md).
 
 Parallel MF uses observer-only coordination by default. The observer writes the
-backlog row and `mf_parallel.v1` contract, starts bounded implementation agents
-only when the user explicitly asks or an approved contract calls for it, and
-reviews their `review_ready` or `waiting_merge` evidence. Agents do not merge,
-push, release gates, activate graph refs, close backlog, delete worktrees, or
-mutate merge queues. The observer also does not wait, merge, or push by default
-unless the user explicitly asks or a documented governance transition requires
-it.
+backlog row and `mf_parallel.v1` contract, starts bounded local Codex
+subagents as `mf_sub` workers only when the user explicitly asks or an approved
+contract calls for it, and reviews their `review_ready` or `waiting_merge`
+evidence. Subagents are governed by the MF backlog row, contract,
+file/worktree fence, and timeline evidence; governance `task_create`
+dev/test/qa/merge is not the V1 default implementation entrypoint. Agents do
+not merge, push, release gates, activate graph refs, close backlog, delete
+worktrees, or mutate merge queues. The observer also does not wait, merge, or
+push by default unless the user explicitly asks or a documented governance
+transition requires it.
 
 Worker final evidence should name the branch/worktree, owned changed files,
 tests run, graph query trace ids, precheck evidence, generated assets policy,
@@ -132,6 +136,8 @@ and E2E evidence, docs/test/config impact, generated assets policy,
 graph/reconcile plan, Chain trailers, and backlog close policy. If changed docs
 or templates are not graph-bound, add an Asset Inbox binding or Governance Hint
 follow-up so auditability can be materialized.
+Chain trailers are MF audit anchors on commits; they do not mean auto-chain
+execution is active.
 
 ## 5. AI Enrich
 
@@ -172,7 +178,8 @@ dependency/function-call relations.
 
 ## 7. What Is Not The V1 Default
 
-- Auto-chain PM -> Dev -> Test -> QA -> Merge is experimental in V1.
+- Auto-chain PM -> Dev -> Test -> QA -> Merge is experimental in V1 and is
+  not the V1 default implementation route.
 - ServiceManager/executor are advanced chain/ops surfaces. They are not
   required for governance, dashboard, graph query, backlog, AI Enrich Review
   Queue, or Manual Fix.

@@ -1,16 +1,34 @@
 # Observer Operation Standards
 
+## V1 Default Implementation Mode
+
+The V1 implementation default is observer-led Manual Fix. Ordinary
+implementation starts from an MF backlog row and, when parallel help is needed,
+uses local Codex subagents as bounded `mf_sub` workers under an
+`mf_parallel.v1` contract.
+
+Subagents are governed by the MF backlog row, contract, file/worktree fence,
+and timeline evidence. They stop at `review_ready` or `waiting_merge` with
+structured evidence; they do not merge, push, release gates, activate graph
+refs, close backlog, delete worktrees, or mutate merge queues.
+
+Governance `task_create` dev/test/qa/merge and executor release are not the V1
+default implementation entrypoint. Use the chain flow below only when the user
+explicitly asks to test chain automation or a documented experiment requires
+it. Chain trailers are MF audit anchors on commits; they do not mean
+auto-chain execution is active.
+
 ## Principles
 
-1. **Observer is a participant in the governance chain, not a bypasser**: All operations go through MCP tools or the REST API — do not read or write the DB directly.
+1. **Observer uses the governance control plane, not direct DB access**: All operations go through MCP tools or the REST API — do not read or write the DB directly.
 2. **Look before you act at every step**: Before claiming, you must inspect first (search memory + context + queue), then decide.
-3. **Only `complete` triggers progression**: Do not use `release` as a substitute for `complete`. `release` only puts the task back in the queue for the executor; `complete` triggers the next auto-chain stage.
+3. **For explicit chain operation, only `complete` triggers progression**: Do not use `release` as a substitute for `complete`. `release` only puts the task back in the queue for the executor; `complete` triggers the next auto-chain stage.
 4. **`complete` status can only be `succeeded`**: Do not use `failed` to cancel a task (it triggers a retry). If you truly need to abandon a task, use `complete(succeeded)` with a note.
 5. **Observer recovery powers are limited to governance repair**: Observer may repair graph runtime state through governance APIs, but must not directly mark nodes as `testing`, `t2_pass`, or `qa_pass` outside the normal chain.
 
 ---
 
-## Standard Flow: Coordinator Takeover
+## Advanced Chain Flow: Coordinator Takeover
 
 ### Prerequisites
 
@@ -93,7 +111,7 @@ Every recovery action must include:
 
 ---
 
-## Standard Flow: PM Stage Takeover
+## Advanced Chain Flow: PM Stage Takeover
 
 ### Step 4 — PM task inspect
 
@@ -133,7 +151,7 @@ task_complete(status="succeeded", result={
 
 ---
 
-## Standard Flow: Dev Stage Takeover
+## Advanced Chain Flow: Dev Stage Takeover
 
 ### Step 7 — Dev task inspect
 
@@ -149,8 +167,8 @@ task_list() → find Dev task (observer_hold)
 ### Step 8 — User confirms Dev start
 
 Options:
-- **A. Release to executor**: `task_release(task_id)` + `executor_scale(1)` → auto-execute
-- **B. Observer manually implements**: `task_claim` → modify code yourself → `task_complete(result={changed_files:[...]})`
+- **A. Release to executor**: explicit chain test only; `task_release(task_id)` + `executor_scale(1)` → auto-execute
+- **B. Observer manually implements inside chain**: explicit chain test only; `task_claim` → modify code yourself → `task_complete(result={changed_files:[...]})`
 
 ### Step 9 — Dev complete (when implementing manually)
 
@@ -168,7 +186,7 @@ task_complete(status="succeeded", result={
 
 ---
 
-## Standard Flow: Test / QA / Merge Stages
+## Advanced Chain Flow: Test / QA / Merge Stages
 
 ### Step 10 — Test task
 

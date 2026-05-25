@@ -6,7 +6,12 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 
 ## Before Editing
 
-1. Confirm chain/MF route is justified. Routine feature work should use the normal chain when possible.
+1. Confirm the V1 implementation default: ordinary V1 implementation uses
+   observer-led Manual Fix, with local Codex subagents as bounded `mf_sub`
+   workers when parallel help is needed. Governance chain/executor
+   dev/test/qa/merge execution is not the V1 default route; reserve it for
+   explicit user requests to test chain automation or for documented
+   experiments.
 2. Ensure a backlog row exists with target files, acceptance criteria, and details.
 3. Predeclare/start the MF row with an MF id.
    - In MVP, API/storage may show `mf_type=chain_rescue` for observer-hotfix or
@@ -31,6 +36,10 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 7. For parallel MF or subagent work, instantiate a source-controlled contract template before delegation:
    - start from `agent/governance/contract_templates/mf_parallel.v1.json`;
    - write the instance to `chain_trigger_json.parallel_contract`;
+   - treat subagents as local Codex workers governed by the MF backlog row,
+     contract, file/worktree fence, and timeline evidence; do not use
+     governance `task_create` dev/test/qa/merge as the default implementation
+     entrypoint;
    - use observer-only coordination by default: the observer clarifies scope,
      checks runtime/graph/backlog state, creates the contract, may start agents
      only when the user explicitly asks or an approved contract calls for it,
@@ -90,7 +99,8 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 
 ## Commit
 
-Stage explicit files only. Use Chain trailers:
+Stage explicit files only. Use Chain trailers as MF audit anchors. Chain
+trailers do not mean auto-chain execution is active:
 
 ```text
 Chain-Source-Stage: observer-hotfix
