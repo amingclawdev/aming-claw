@@ -271,19 +271,70 @@ graph reconcile/activation, backlog close, ServiceManager/governance restarts,
 worktree cleanup, and other privileged state changes. Do not tell a subagent to
 identify as observer to get graph access.
 
-Observer-only collaboration mode is the default for parallel MF work. The
-observer clarifies requirements, checks runtime/graph/backlog state, writes the
-backlog row and `mf_parallel.v1` task contract, runs audited graph lookups and
-the dispatch gate, starts implementation agents only when the user explicitly
-asks or an approved contract calls for it, and treats the handoff as
-non-blocking after the gate passes. The
-observer does not implement, wait on agents, merge, push, or release gates by
-default; those actions require an explicit user request or a documented
-governance transition. Implementation agents must be assigned bounded
-branches/worktrees and files, then stop at `review_ready` or `waiting_merge`
-with structured evidence:
+## Observer Operating Modes
+
+Use an explicit observer mode so requirement design does not accidentally turn
+into long-running execution, and execution supervision does not stop at a
+planning artifact.
+
+### Design Alignment Mode
+
+Design Alignment Mode is the default when the user is discussing requirements,
+asking for prioritization, evaluating tradeoffs, designing test scenarios,
+filing a backlog row, creating a contract, or saying to start a subagent and
+continue the conversation. Typical trigger phrases include "先调研", "设计
+contract", "提进 backlog", "启动 subagent 后停止", "我们继续对齐需求", and
+"不用等待完成".
+
+In this mode the observer may:
+
+- check runtime, graph, backlog, and worktree state;
+- run graph-first discovery and impact analysis;
+- design the test-scenario policy and contract;
+- upsert backlog rows and append planning/dispatch timeline evidence;
+- dispatch a bounded `mf_sub` worker only when the user explicitly asks or an
+  approved contract calls for it.
+
+Design Alignment Mode is dispatch-and-stop. After a subagent handoff, do not
+wait for completion, implement locally, merge, close backlog rows, push, or
+release gates unless the user explicitly switches to execution supervision or
+the governance contract already documents that transition.
+
+### Execution Supervisor Mode
+
+Execution Supervisor Mode is used only after explicit user intent to execute or
+supervise work to completion. Typical trigger phrases include "推进实施",
+"进入执行模式", "监视任务完成", "等待完成审计", "merge", "retry", "批量推进",
+and "我睡了你接管".
+
+In this mode the observer may:
+
+- select and order a batch of backlog rows, then check priority and file-scope
+  conflicts before dispatch;
+- start bounded `mf_sub` workers with audited dispatch evidence;
+- wait for subagent completion and review candidate diffs;
+- run focused tests, browser/E2E checks, preflight checks, timeline precheck,
+  contract gates, and merge gates;
+- file follow-up backlog rows or retry on gaps instead of treating failed or
+  missing evidence as success;
+- merge or accept completed work, queue reconcile, close backlog rows, and
+  record close-ready evidence when gates pass.
+
+Execution Supervisor Mode still cannot bypass contract, precheck, timeline, or
+merge gates. Stop for a human decision when priorities conflict, the worktree
+is unsafe, required evidence is missing, generated assets are unexplained, or a
+merge/reconcile action would overwrite unrelated user work.
+
+Implementation agents must be assigned bounded branches/worktrees and files,
+then stop at `review_ready` or `waiting_merge` with structured evidence:
 branch/worktree, owned changed files, tests run, graph query trace ids,
 precheck evidence, generated assets policy, and risks/open questions.
+
+For both modes, timeline evidence must reflect what actually happened:
+dispatch events for worker starts, implementation evidence for code changes,
+verification evidence for tests/browser/prechecks, retry evidence for failed
+attempts, merge evidence for accepted candidates, and `close_ready` only when
+the backlog contract and MF close gate are satisfied.
 
 Observer merge review must check contract fit, diff scope, focused test and E2E
 evidence, docs/test/config impact, generated assets policy, graph/reconcile
