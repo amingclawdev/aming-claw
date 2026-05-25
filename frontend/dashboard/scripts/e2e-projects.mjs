@@ -415,7 +415,7 @@ function verifyProjectContextFallbackContract() {
   const seedSource = readFileSync(path.join(REPO_ROOT, "agent/mcp/resources/seed-graph-summary.json"), "utf8");
   assert(appSource.includes("DASHBOARD_WORKSPACE_PARAM"), "Dashboard URL should accept workspace prefill for bootstrap fallback");
   assert(appSource.includes("shouldFallbackToProjects"), "Dashboard should fallback to Projects for missing/unbuilt graphs");
-  assert(appSource.includes("Project ${requestProjectId} is not registered yet"), "Unknown project should guide the operator to bootstrap");
+  assert(appSource.includes("Open Projects to bootstrap or build graph"), "Unknown project should guide the operator to bootstrap");
   assert(appSource.includes("Graph is not ready for ${requestProjectId}"), "Missing graph should guide the operator to build graph");
   assert(viewSource.includes("initialWorkspacePath"), "Projects bootstrap form should accept URL/workspace prefill");
   assert(mcpSource.includes("default_project_id"), "MCP current-context should expose the configured default project id");
@@ -522,13 +522,27 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("GateSummary"), "Backlog row expansion should render close gate and contract state");
   assert(viewSource.includes("buildTimelineLanes"), "Backlog row expansion should group execution events into one-hop lanes");
   assert(viewSource.includes("One-hop agent lanes"), "Backlog lane grid should be accessible as one-hop agent lanes");
+  assert(viewSource.includes("BacklogDetailModal"), "Backlog rows should open a detail modal");
+  assert(viewSource.includes("BACKLOG_URL_PARAM"), "Backlog detail modal should be URL addressable");
+  assert(viewSource.includes("buildTimelineDag"), "Backlog detail should derive a timeline DAG");
+  assert(viewSource.includes("EvidenceInspector"), "Backlog DAG nodes should open an evidence inspector");
+  assert(viewSource.includes("relatedIdsFromBug"), "Backlog detail should discover related backlog ids");
+  assert(viewSource.includes("BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS"), "Backlog detail should include a deterministic parallel-lane fixture");
+  assert(viewSource.includes("contract_missing_visualization"), "Backlog fixture should model missing contract evidence");
+  assert(viewSource.includes("no_false_evidence_gate"), "Backlog fixture should assert missing evidence is never rendered as passed");
+  assert(viewSource.includes("missing.has(requirementId) ? \"missing\""), "Missing contract requirements must render as missing, not passed");
   assert(viewSource.includes("contract {contract.template_id"), "Backlog compact rows should scan contract metadata");
+  assert(apiSource.includes("backlogBugFor"), "Backlog API client should fetch full row detail for the modal");
   assert(typeSource.includes("BacklogTimelineGateResponse"), "Dashboard types should model timeline gate response");
   assert(typeSource.includes("BacklogContractSummary"), "Dashboard types should model compact backlog contract summary");
+  assert(typeSource.includes("chain_trigger_json"), "Dashboard types should expose full backlog contract JSON for related-id discovery");
   assert(cssSource.includes(".backlog-gate-grid"), "Backlog gate UI should have stable layout CSS");
   assert(cssSource.includes(".backlog-lane-grid"), "Backlog lane UI should have stable layout CSS");
+  assert(cssSource.includes(".backlog-modal"), "Backlog modal should have stable layout CSS");
+  assert(cssSource.includes(".backlog-dag-node.status-missing"), "Backlog DAG should visibly distinguish missing evidence");
+  assert(cssSource.includes(".backlog-evidence-inspector"), "Backlog evidence inspector should have stable layout CSS");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
-  ok("backlog evidence row exposes timeline gate, contract, and one-hop lanes");
+  ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }
 
 async function main() {
