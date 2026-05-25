@@ -158,6 +158,7 @@ ALLOWED_EVENT_TYPES = {
     "graph_correction_accepted",
     "graph_correction_rejected",
     "backlog_candidate_requested",
+    "asset_binding_remove_requested",
     "file_attach_requested",
     "file_node_create_requested",
     "file_delete_candidate",

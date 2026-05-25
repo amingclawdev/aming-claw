@@ -4640,6 +4640,27 @@ def test_graph_governance_file_hygiene_actions_create_auditable_events(conn, mon
     assert attached["event"]["payload"]["files"] == ["docs/orphan.md"]
     assert attached["event"]["payload"]["destructive_mutation_performed"] is False
 
+    status, remove_binding = server.handle_graph_governance_snapshot_file_hygiene_action(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "action": "remove_binding",
+                "path": "docs/orphan.md",
+                "target_node_id": "L7.1",
+                "actor": "dashboard-user",
+                "reason": "Proposal-safe binding removal test.",
+            },
+        )
+    )
+    assert status == 201
+    assert remove_binding["event"]["event_type"] == "asset_binding_remove_requested"
+    assert remove_binding["event"]["target_type"] == "file"
+    assert remove_binding["event"]["target_id"] == "docs/orphan.md"
+    assert remove_binding["event"]["risk_level"] == "high"
+    assert remove_binding["event"]["payload"]["target_node_id"] == "L7.1"
+    assert remove_binding["event"]["payload"]["destructive_mutation_performed"] is False
+
     with pytest.raises(ValidationError, match="confirm_delete_candidate"):
         server.handle_graph_governance_snapshot_file_hygiene_action(
             _ctx(
