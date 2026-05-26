@@ -219,6 +219,11 @@ MERGE_GATE_DEFERABLE_EVIDENCE = {"semantic_projection"}
 MERGE_GATE_DEFERRED_STATUSES = {"deferred", "intentionally_deferred"}
 
 TERMINAL_NON_BLOCKING_STATES = {"merged", "abandoned", "cleaned"}
+ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
+    STATE_ALLOCATED,
+    STATE_WORKTREE_READY,
+    STATE_RUNNING,
+}
 MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
 MERGE_REVALIDATION_BLOCKING_STATES = {
@@ -1460,6 +1465,56 @@ def _require_current_fence(context: BranchTaskRuntimeContext, fence_token: str) 
         raise BranchRuntimeFenceError("Fence token mismatch: branch context was reclaimed")
 
 
+def validate_mf_subagent_graph_query_identity(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    fence_token: str,
+    parent_task_id: str = "",
+    worker_role: str = "",
+) -> BranchTaskRuntimeContext:
+    """Validate the task/fence identity an mf_sub worker presents for graph reads."""
+    ensure_branch_runtime_schema(conn)
+    task = str(task_id or "").strip()
+    fence = str(fence_token or "").strip()
+    role = str(worker_role or "").strip().lower().replace("-", "_")
+    if role and role != "mf_sub":
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if not task or not fence:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    context = get_branch_context(conn, project_id, task)
+    if context is None or not context.fence_token:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    try:
+        _require_current_fence(context, fence)
+    except BranchRuntimeFenceError as exc:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+
+    if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.lease_expires_at and context.lease_expires_at < utc_now():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    parent = str(parent_task_id or "").strip()
+    if parent:
+        allowed_parent_ids = {
+            value
+            for value in (
+                context.root_task_id,
+                context.chain_id,
+                context.stage_task_id,
+                context.task_id,
+                context.backlog_id,
+            )
+            if value
+        }
+        if allowed_parent_ids and parent not in allowed_parent_ids:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    return context
+
+
 def record_branch_checkpoint(
     conn: sqlite3.Connection,
     *,
@@ -1630,6 +1685,10 @@ def plan_branch_runtime_context(
     workspace_root: str = "",
     batch_id: str = "",
     backlog_id: str = "",
+    chain_id: str = "",
+    root_task_id: str = "",
+    stage_task_id: str = "",
+    stage_type: str = "",
     agent_id: str = "",
     worker_id: str = "",
     attempt: int = 1,
@@ -1660,6 +1719,10 @@ def plan_branch_runtime_context(
         task_id=task_id,
         batch_id=batch_id,
         backlog_id=backlog_id,
+        chain_id=chain_id,
+        root_task_id=root_task_id,
+        stage_task_id=stage_task_id or task_id,
+        stage_type=stage_type,
         agent_id=agent_id,
         worker_id=worker_id,
         attempt=attempt_num,

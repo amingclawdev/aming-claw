@@ -139,6 +139,30 @@ def test_mf_close_without_timeline_evidence_is_blocked(_mock_subprocess, _mock_d
 
 
 @patch("agent.governance.server.subprocess.run")
+def test_mf_like_policy_alias_close_cannot_skip_timeline_gate(_mock_subprocess, _mock_db, _mock_audit):
+    """MF-like observer-hotfix policy rows must not close as ordinary backlog rows."""
+    from agent.governance.errors import GovernanceError
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    _mock_db.execute.return_value.fetchone.return_value = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "mf_type": "",
+        "bypass_policy_json": '{"mf_type": "observer-hotfix"}',
+        "chain_stage": "",
+    }
+    ctx = _make_ctx(commit="abc123")
+
+    with patch("agent.governance.task_timeline.list_events", return_value=[]):
+        with pytest.raises(GovernanceError) as exc_info:
+            handle_backlog_close(ctx)
+
+    assert exc_info.value.code == "mf_timeline_gate_failed"
+    assert exc_info.value.status == 422
+
+
+@patch("agent.governance.server.subprocess.run")
 def test_mf_close_with_required_timeline_evidence_passes(_mock_subprocess, _mock_db, _mock_audit):
     """Required observer/MF timeline evidence is returned in the close response."""
     from agent.governance.server import handle_backlog_close

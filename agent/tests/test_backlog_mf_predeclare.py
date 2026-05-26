@@ -170,6 +170,25 @@ def test_start_planned_to_in_progress(_mock_db_mf_planned, _mock_audit):
     assert result["bypass_policy"]["bypass_graph_governance"] is False
 
 
+def test_start_observer_hotfix_alias_normalizes_to_chain_rescue(_mock_db_mf_planned, _mock_audit):
+    """Observer-hotfix aliases stay in the audited graph-governed MF bucket."""
+    from agent.governance.server import handle_backlog_start_mf
+
+    ctx = _make_ctx(
+        mf_id="MF-2026-04-26-001",
+        actor="test-user",
+        mf_type="observer-hotfix",
+        reason="Observer hotfix alias must not create a non-MF backlog row",
+    )
+
+    result = handle_backlog_start_mf(ctx)
+
+    assert result["ok"] is True
+    assert result["mf_type"] == "chain_rescue"
+    assert result["bypass_policy"]["mf_type"] == "chain_rescue"
+    assert result["bypass_policy"]["graph_governance"] == "enforce"
+
+
 def test_start_system_recovery_bypasses_graph(_mock_db_mf_planned, _mock_audit):
     """System-recovery MF is the explicit graph-bypass profile."""
     from agent.governance.server import handle_backlog_start_mf

@@ -3142,14 +3142,43 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         return _require_graph_governance_operator(ctx, conn, action)
 
     session = _require_graph_governance_mf_subagent(ctx, conn, action)
-    parent_task_id = str(body.get("parent_task_id") or body.get("task_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    parent_task_id = str(body.get("parent_task_id") or "").strip()
+    validation_task_id = task_id or parent_task_id
     fence_token = str(body.get("fence_token") or "").strip()
-    if not parent_task_id:
+    if not validation_task_id:
         raise ValidationError("parent_task_id or task_id is required for mf_subagent graph query")
     if not fence_token:
         raise ValidationError("fence_token is required for mf_subagent graph query")
-    body["parent_task_id"] = parent_task_id
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        validate_mf_subagent_graph_query_identity,
+    )
+    try:
+        context = validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=ctx.get_project_id(),
+            task_id=validation_task_id,
+            parent_task_id=parent_task_id,
+            worker_role=str(body.get("worker_role") or ""),
+            fence_token=fence_token,
+        )
+    except BranchRuntimeFenceError as exc:
+        raise GovernanceError(
+            "fence_invalidated_or_unknown",
+            "mf_subagent graph query fence is invalidated or unknown",
+            403,
+            {
+                "task_id": validation_task_id,
+                "parent_task_id": parent_task_id,
+                "reason": "fence_invalidated_or_unknown",
+            },
+        ) from exc
+    fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+    body["task_id"] = context.task_id
+    body["parent_task_id"] = parent_task_id or context.root_task_id or context.task_id
     body["query_source"] = "mf_subagent"
+    body["run_id"] = str(body.get("run_id") or "") or f"mf_subagent:{context.task_id}:fence:{fence_hash}"
     return session
 
 
@@ -3650,6 +3679,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         workspace_root=workspace_root,
         batch_id=str(ctx.body.get("batch_id") or ""),
         backlog_id=str(ctx.body.get("backlog_id") or ""),
+        chain_id=str(ctx.body.get("chain_id") or ""),
+        root_task_id=str(ctx.body.get("root_task_id") or ctx.body.get("parent_task_id") or ""),
+        stage_task_id=str(ctx.body.get("stage_task_id") or task_id),
+        stage_type=str(ctx.body.get("stage_type") or "mf_sub"),
         agent_id=str(ctx.body.get("agent_id") or ctx.body.get("actor") or ""),
         worker_id=str(ctx.body.get("worker_id") or ""),
         attempt=_query_int(ctx.body, "attempt", 1),
@@ -18282,7 +18315,14 @@ def handle_backlog_upsert(ctx: RequestContext):
         bypass_policy.update(backlog_runtime.parse_json_object(body.get("bypass_policy")))
         if body.get("mf_type"):
             bypass_policy["mf_type"] = backlog_runtime.normalize_mf_type(body.get("mf_type"), bypass_policy)
+        elif bypass_policy.get("mf_type"):
+            bypass_policy["mf_type"] = backlog_runtime.normalize_mf_type(bypass_policy.get("mf_type"), bypass_policy)
         bypass_policy_raw = backlog_runtime.policy_json(bypass_policy)
+        mf_type_value = (
+            backlog_runtime.normalize_mf_type(body.get("mf_type") or bypass_policy.get("mf_type"), bypass_policy)
+            if body.get("mf_type") or bypass_policy.get("mf_type")
+            else ""
+        )
         takeover_raw = backlog_runtime.policy_json(backlog_runtime.parse_json_object(body.get("takeover_json")))
         conn.execute(
             """INSERT INTO backlog_bugs
@@ -18337,7 +18377,7 @@ def handle_backlog_upsert(ctx: RequestContext):
                 _json_value("required_docs", []),
                 _json_value("provenance_paths", []),
                 bypass_policy_raw,
-                backlog_runtime.normalize_mf_type(body.get("mf_type"), bypass_policy) if body.get("mf_type") else "",
+                mf_type_value,
                 takeover_raw,
                 now,
                 now,
@@ -18739,20 +18779,22 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
 
 def _mf_close_timeline_applicability(row) -> dict:
     policy = backlog_runtime.parse_json_object(_row_get(row, "bypass_policy_json", "{}"))
-    mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
+    raw_mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
+    mf_type = backlog_runtime.normalize_mf_type(raw_mf_type, policy) if raw_mf_type else ""
     chain_stage = str(_row_get(row, "chain_stage", "") or "").strip()
+    chain_stage_key = chain_stage.lower().replace("_", "-")
     prior_status = str(_row_get(row, "status", "") or "").strip()
     is_mf = bool(
         prior_status == "MF_IN_PROGRESS"
         or mf_type
-        or chain_stage in {"manual-fix", "observer-hotfix", "chain_rescue"}
+        or chain_stage_key in {"manual-fix", "observer-hotfix", "chain-rescue"}
     )
     reasons = []
     if prior_status == "MF_IN_PROGRESS":
         reasons.append("status=MF_IN_PROGRESS")
     if mf_type:
         reasons.append(f"mf_type={mf_type}")
-    if chain_stage in {"manual-fix", "observer-hotfix", "chain_rescue"}:
+    if chain_stage_key in {"manual-fix", "observer-hotfix", "chain-rescue"}:
         reasons.append(f"chain_stage={chain_stage}")
     return {
         "is_mf": is_mf,

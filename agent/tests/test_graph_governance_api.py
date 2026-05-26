@@ -22,7 +22,7 @@ from agent.governance import reconcile_semantic_enrichment as semantic_enrichmen
 from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance.db import _ensure_schema
-from agent.governance.errors import PermissionDeniedError, ValidationError
+from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 from agent.governance.mf_subagent_contract import MfSubagentContractError
 from agent.governance.parallel_branch_runtime import (
@@ -32,6 +32,7 @@ from agent.governance.parallel_branch_runtime import (
     BatchMergeItem,
     BatchMergeRuntime,
     MergeQueueItem,
+    STATE_MERGE_FAILED,
     upsert_batch_merge_runtime,
     upsert_branch_context,
     upsert_merge_queue_items,
@@ -143,6 +144,26 @@ def _graph(node_id: str = "L7.1") -> dict:
             ],
         }
     }
+
+
+def _activate_basic_graph(conn, snapshot_id: str = "full-query-test") -> None:
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
 
 
 def _graph_with_dependency() -> dict:
@@ -5439,23 +5460,7 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
 
 
 def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
-    snapshot = store.create_graph_snapshot(
-        conn,
-        PID,
-        snapshot_id="full-query-mf-sub",
-        commit_sha="head",
-        snapshot_kind="full",
-        graph_json=_graph(),
-    )
-    store.index_graph_snapshot(
-        conn,
-        PID,
-        snapshot["snapshot_id"],
-        nodes=_graph()["deps_graph"]["nodes"],
-        edges=_graph()["deps_graph"]["edges"],
-    )
-    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
-    conn.commit()
+    _activate_basic_graph(conn, "full-query-mf-sub")
 
     with pytest.raises(ValidationError, match="fence_token is required"):
         server.handle_graph_governance_query(
@@ -5472,6 +5477,21 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
             )
         )
 
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="subtask-1",
+            root_task_id="parent-task-1",
+            stage_task_id="subtask-1",
+            worker_id="mf-worker-1",
+            branch_ref="refs/heads/codex/subtask-1",
+            status="worktree_ready",
+            fence_token="fence-subtask-1",
+        ),
+    )
+    conn.commit()
+
     queried = server.handle_graph_governance_query(
         _ctx_with_role(
             {"project_id": PID},
@@ -5482,7 +5502,9 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
                 "tool": "query_schema",
                 "query_source": "mf_subagent",
                 "query_purpose": "subagent_context_build",
-                "parent_task_id": "subtask-1",
+                "task_id": "subtask-1",
+                "parent_task_id": "parent-task-1",
+                "worker_role": "mf_sub",
                 "fence_token": "fence-subtask-1",
             },
         )
@@ -5497,7 +5519,223 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
         )
     )
     assert fetched["trace"]["query_source"] == "mf_subagent"
-    assert fetched["trace"]["parent_task_id"] == "subtask-1"
+    assert fetched["trace"]["parent_task_id"] == "parent-task-1"
+
+
+def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):
+    _activate_basic_graph(conn, "full-query-mf-sub-unknown")
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "task_id": "ghost-subtask",
+                    "parent_task_id": "ghost-parent",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fake-fence-token",
+                },
+            )
+        )
+
+    assert exc_info.value.code == "fence_invalidated_or_unknown"
+    assert exc_info.value.status == 403
+
+
+def test_mf_sub_graph_query_rejects_cross_fence_mismatch(conn):
+    _activate_basic_graph(conn, "full-query-mf-sub-cross-fence")
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="worker-a",
+            root_task_id="parent-a",
+            stage_task_id="worker-a",
+            worker_id="worker-a",
+            branch_ref="refs/heads/codex/worker-a",
+            status="worktree_ready",
+            fence_token="fence-worker-a",
+        ),
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="worker-b",
+            root_task_id="parent-b",
+            stage_task_id="worker-b",
+            worker_id="worker-b",
+            branch_ref="refs/heads/codex/worker-b",
+            status="worktree_ready",
+            fence_token="fence-worker-b",
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "task_id": "worker-a",
+                    "parent_task_id": "parent-a",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-worker-b",
+                },
+            )
+        )
+
+    assert exc_info.value.code == "fence_invalidated_or_unknown"
+    assert exc_info.value.status == 403
+
+
+def test_mf_sub_graph_query_valid_active_identity_succeeds_and_records_trace_context(conn):
+    _activate_basic_graph(conn, "full-query-mf-sub-valid-context")
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="worker-valid",
+            root_task_id="parent-valid",
+            stage_task_id="worker-valid",
+            worker_id="worker-valid",
+            branch_ref="refs/heads/codex/worker-valid",
+            status="worktree_ready",
+            fence_token="fence-worker-valid",
+            merge_queue_id="mergeq-valid",
+        ),
+    )
+    conn.commit()
+
+    queried = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "query_schema",
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "task_id": "worker-valid",
+                "parent_task_id": "parent-valid",
+                "worker_role": "mf_sub",
+                "fence_token": "fence-worker-valid",
+            },
+        )
+    )
+
+    assert queried["ok"] is True
+    fetched = server.handle_graph_governance_query_trace_get(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": queried["trace_id"]},
+            "mf_sub",
+        )
+    )
+    trace = fetched["trace"]
+    assert trace["query_source"] == "mf_subagent"
+    assert trace["parent_task_id"] == "parent-valid"
+    assert trace["run_id"].startswith("mf_subagent:worker-valid:")
+    assert "fence-worker-valid" not in json.dumps(trace, sort_keys=True)
+
+
+def test_mf_sub_graph_query_accepts_context_allocated_by_parallel_branch_api(conn):
+    _activate_basic_graph(conn, "full-query-mf-sub-allocated-context")
+
+    status_code, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "task_id": "worker-allocated",
+                "parent_task_id": "parent-allocated",
+                "worker_id": "worker-allocated",
+                "fence_token": "fence-worker-allocated",
+                "base_commit": "base-sha",
+                "target_head_commit": "target-sha",
+                "merge_queue_id": "mergeq-allocated",
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status_code == 201
+    assert allocated["ok"] is True
+    assert allocated["context"]["task_id"] == "worker-allocated"
+    assert allocated["context"]["root_task_id"] == "parent-allocated"
+
+    queried = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "query_schema",
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "task_id": "worker-allocated",
+                "parent_task_id": "parent-allocated",
+                "worker_role": "mf_sub",
+                "fence_token": "fence-worker-allocated",
+            },
+        )
+    )
+
+    assert queried["ok"] is True
+
+
+def test_mf_sub_graph_query_rejects_inactive_runtime_context(conn):
+    _activate_basic_graph(conn, "full-query-mf-sub-inactive-context")
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="worker-failed",
+            root_task_id="parent-failed",
+            stage_task_id="worker-failed",
+            worker_id="worker-failed",
+            branch_ref="refs/heads/codex/worker-failed",
+            status=STATE_MERGE_FAILED,
+            fence_token="fence-worker-failed",
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "task_id": "worker-failed",
+                    "parent_task_id": "parent-failed",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-worker-failed",
+                },
+            )
+        )
+
+    assert exc_info.value.code == "fence_invalidated_or_unknown"
+    assert exc_info.value.status == 403
 
 
 def test_graph_governance_query_api_exposes_graph_native_discovery(conn):

@@ -835,6 +835,41 @@ class TestTaskTimeline(unittest.TestCase):
             ["close_ready", "implementation", "verification"],
         )
 
+    def test_observer_hotfix_aliases_upsert_as_mf_applicable_rows(self):
+        from agent.governance import server
+
+        for index, alias in enumerate(("observer_hotfix", "observer-hotfix"), start=1):
+            bug_id = f"BUG-MF-ALIAS-{index}"
+            server.handle_backlog_upsert(
+                _ctx(
+                    path_params={"bug_id": bug_id},
+                    body={
+                        "title": "MF alias precheck",
+                        "status": "OPEN",
+                        "mf_type": alias,
+                        "force_admit": True,
+                    },
+                    method="POST",
+                )
+            )
+
+            row = self.conn.execute(
+                "SELECT mf_type, bypass_policy_json FROM backlog_bugs WHERE bug_id = ?",
+                (bug_id,),
+            ).fetchone()
+            self.assertEqual(row["mf_type"], "chain_rescue")
+            self.assertIn("chain_rescue", row["bypass_policy_json"])
+
+            precheck = server.handle_backlog_timeline_gate(
+                _ctx(path_params={"bug_id": bug_id})
+            )
+            self.assertTrue(precheck["applicable"], precheck)
+            self.assertFalse(precheck["can_close"])
+            self.assertEqual(
+                precheck["timeline_gate"]["missing_event_kinds"],
+                ["close_ready", "implementation", "verification"],
+            )
+
     def test_backlog_timeline_gate_precheck_uses_instantiated_contract(self):
         from agent.governance import server, task_timeline
 

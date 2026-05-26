@@ -66,15 +66,22 @@ CREATING demo data, not reading existing data. Mandatory rules:
    Per-worker events use the worker's task_id; observer events can use
    parent_task_id.
 
-4. For each mf_sub graph_query: query_source="mf_subagent" + the worker's
+4. Before the first mf_sub graph_query, create or verify server-side worker
+   runtime identity through governance
+   `/api/graph-governance/<pid>/parallel-branches/allocate` using the worker's
+   task_id, parent_task_id, fence_token, base_commit, target_head_commit, and
+   merge_queue_id. Local `aming-claw mf dispatch-gate` validates dispatch
+   evidence but does not by itself register the fence for graph-query auth.
+
+5. For each mf_sub graph_query: query_source="mf_subagent" + the worker's
    task_id, parent_task_id, worker_role="mf_sub", fence_token as top-level
    params.
 
-5. Capture the returned trace_id and write into payload.graph_query_trace_ids
+6. Capture the returned trace_id and write into payload.graph_query_trace_ids
    in the timeline event. NEVER fabricate trace_id strings -- anyone can GET
    /api/graph-governance/<pid>/query-traces/<trace_id> to verify.
 
-6. mf_type=chain_rescue in mf_timeline_precheck output is the MVP MF storage
+7. mf_type=chain_rescue in mf_timeline_precheck output is the MVP MF storage
    bucket label, not an error. See aming-claw://mf-sop.
 
 ## Role and Mode

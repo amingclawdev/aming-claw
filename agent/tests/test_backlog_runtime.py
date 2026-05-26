@@ -89,6 +89,21 @@ def test_chain_rescue_policy_keeps_graph_governance_enforced():
     assert backlog_runtime.is_graph_governance_bypassed({"backlog_bypass_policy": policy}) is False
 
 
+def test_observer_hotfix_aliases_normalize_to_graph_governed_mf_bucket():
+    for alias in ("observer_hotfix", "observer-hotfix"):
+        policy = backlog_runtime.build_mf_policy(
+            alias,
+            mf_id="MF-2026-05-02-003",
+            observer_authorized=True,
+            reason="observer hotfix must stay in the audited MF close gate",
+        )
+
+        assert backlog_runtime.normalize_mf_type(alias) == "chain_rescue"
+        assert policy["mf_type"] == "chain_rescue"
+        assert policy["graph_governance"] == "enforce"
+        assert policy["bypass_graph_governance"] is False
+
+
 def test_system_recovery_policy_bypasses_graph_governance():
     policy = backlog_runtime.build_mf_policy(
         "system_recovery",

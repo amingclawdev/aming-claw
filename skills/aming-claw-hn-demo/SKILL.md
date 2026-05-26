@@ -57,11 +57,17 @@ AI provider for the demo.
   `request_id`, then create or inspect a backlog contract with target files,
   tests/docs, acceptance criteria, and file/worktree fence evidence.
 - During Work acceptance: timeline, lane, dispatch/startup gate, and evidence
-  inspector claims come from real `task_timeline_append`, precheck, and
-  `graph_query` results. Capture returned ids and trace ids exactly; never
-  fabricate `graph_query_trace_ids`. If `mf_timeline_precheck` reports
-  `mf_type=chain_rescue`, describe it as the MVP MF storage bucket, not a chain
-  requirement.
+  inspector claims come from real `task_timeline_append`, precheck, server-side
+  parallel branch runtime allocation, and `graph_query` results. Local
+  `aming-claw mf dispatch-gate` validates the payload; it does not by itself
+  register the worker fence with governance. Before the first `mf_subagent`
+  `graph_query`, create or verify the runtime context through
+  `/api/graph-governance/<pid>/parallel-branches/allocate` with the worker's
+  `task_id`, `parent_task_id`, `fence_token`, `base_commit`,
+  `target_head_commit`, and `merge_queue_id`. Capture returned ids and trace
+  ids exactly; never fabricate `graph_query_trace_ids`. If
+  `mf_timeline_precheck` reports `mf_type=chain_rescue`, describe it as the MVP
+  MF storage bucket, not a chain requirement.
 - After Work acceptance: Asset Inbox, binding state, drift, impact scope, and
   Review Queue claims are inspected from the current demo project snapshot via
   dashboard/MCP/governance evidence. Candidate or weak path evidence must stay
