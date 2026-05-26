@@ -178,8 +178,10 @@ Bad:
 ```
 - Direct Update graph is the preferred MVP path when HEAD and the active graph diverge:
   call governance `POST /api/graph-governance/{project_id}/reconcile/pending-scope`
-  with `target_commit_sha`, `activate=true`, and `semantic_use_ai=false`. The
-  backend creates and consumes transient pending-scope bookkeeping in one
+  with `activate=true` and `semantic_use_ai=false`. Pass `target_commit_sha`
+  when available; if omitted, governance infers the project git HEAD or returns
+  an actionable `target_commit_sha_required` response with a recommended body.
+  The backend creates and consumes transient pending-scope bookkeeping in one
   request, so operators should not see a stale queued `scope_reconcile` row.
 - `graph_pending_scope_queue`: legacy/debug helper for explicitly queueing a
   pending scope row. Do not use it as the default dashboard/plugin Update graph

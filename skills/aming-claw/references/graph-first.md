@@ -13,7 +13,9 @@ evidence in that fallback mode.
 1. Call `graph_status` for the active snapshot and graph stale state.
 2. Call `graph_operations_queue` for pending scope reconcile, semantic jobs, review queue, and drift.
    If graph is stale, prefer direct Update graph (`/reconcile/pending-scope`
-   with `activate=true`) over explicit pending-scope queueing.
+   with `activate=true`) over explicit pending-scope queueing. Pass
+   `target_commit_sha` when available; otherwise governance infers the project
+   git HEAD or returns an actionable `target_commit_sha_required` response.
 3. Use `graph_query` before editing:
    - `query_schema` first, so the session learns the live tool list, valid `query_source`, and valid `query_purpose` values.
    - `find_node_by_path` to resolve a file path to graph node ids.

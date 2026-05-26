@@ -8609,6 +8609,30 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope")
         target_commit = str(body.get("target_commit_sha") or "").strip()
+        target_commit_inferred = False
+        if not target_commit:
+            try:
+                from . import batch_jobs
+                target_commit = batch_jobs.git_commit(root)
+                target_commit_inferred = bool(target_commit)
+            except Exception:
+                target_commit = ""
+        if not target_commit:
+            return 400, {
+                "ok": False,
+                "project_id": project_id,
+                "reason": "target_commit_sha_required",
+                "message": (
+                    "target_commit_sha is required when governance cannot infer "
+                    "the target git HEAD from the project root"
+                ),
+                "recommended_body": {
+                    "target_commit_sha": "<git HEAD commit sha>",
+                    "activate": True,
+                    "semantic_use_ai": False,
+                },
+                **identity,
+            }
         target_pending_for_failure = False
         if target_commit and bool(body.get("ensure_pending_scope", True)):
             pending = store.list_pending_scope_reconcile(
@@ -8665,6 +8689,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         "status": "already_current",
                         "reason": "already_current",
                         "target_commit_sha": target_commit,
+                        "target_commit_inferred": target_commit_inferred,
                         **identity,
                         "snapshot_id": active.get("snapshot_id") or "",
                         "active_snapshot_id": active.get("snapshot_id") or "",
@@ -8756,6 +8781,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         "status": "already_current",
                         "reason": "already_current",
                         "target_commit_sha": target_commit,
+                        "target_commit_inferred": target_commit_inferred,
                         **identity,
                         "snapshot_id": active.get("snapshot_id") or "",
                         "active_snapshot_id": active.get("snapshot_id") or "",

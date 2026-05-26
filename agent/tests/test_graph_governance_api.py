@@ -5939,6 +5939,103 @@ def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monk
     assert final_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
 
 
+def test_pending_scope_materialize_infers_head_when_target_commit_missing(conn, tmp_path, monkeypatch):
+    """New-user Update graph calls should not dead-end when target_commit_sha is omitted."""
+    from agent.governance import batch_jobs, state_reconcile
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+    monkeypatch.setattr(batch_jobs, "git_commit", lambda root: "head")
+
+    active = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-old-missing-target",
+        commit_sha="old",
+        snapshot_kind="scope",
+        graph_json=_graph("L7.1"),
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"])
+    conn.commit()
+
+    captured = {}
+
+    def fake_run_pending_scope(conn_arg, project_id, root, **kwargs):
+        rows = store.list_pending_scope_reconcile(
+            conn_arg,
+            project_id,
+            commit_shas=["head"],
+            statuses=[store.PENDING_STATUS_RUNNING],
+        )
+        captured["rows"] = rows
+        captured["kwargs"] = kwargs
+        conn_arg.execute(
+            """
+            UPDATE pending_scope_reconcile
+            SET status = ?, snapshot_id = ?
+            WHERE project_id = ? AND commit_sha = ?
+            """,
+            (store.PENDING_STATUS_MATERIALIZED, "scope-head-inferred", project_id, "head"),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": "scope-head-inferred",
+            "covered_pending_count": 1,
+            "pending_rows_bound": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_pending_scope_reconcile_candidate", fake_run_pending_scope)
+
+    code, result = server.handle_graph_governance_pending_scope_materialize(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "parent_commit_sha": "old",
+                "actor": "dashboard",
+                "activate": True,
+            },
+        )
+    )
+
+    assert code == 201
+    assert result["ok"] is True
+    assert captured["kwargs"]["target_commit_sha"] == "head"
+    assert captured["rows"], "handler should infer HEAD and create a running pending row"
+    assert captured["rows"][0]["status"] == store.PENDING_STATUS_RUNNING
+
+
+def test_pending_scope_materialize_missing_target_commit_returns_actionable_error(
+    conn, tmp_path, monkeypatch
+):
+    from agent.governance import batch_jobs
+
+    project_root = tmp_path / "not-git"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+
+    def fail_git_commit(_root):
+        raise batch_jobs.BatchJobError("not a git repository")
+
+    monkeypatch.setattr(batch_jobs, "git_commit", fail_git_commit)
+
+    code, result = server.handle_graph_governance_pending_scope_materialize(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"actor": "dashboard", "activate": True},
+        )
+    )
+
+    assert code == 400
+    assert result["ok"] is False
+    assert result["reason"] == "target_commit_sha_required"
+    assert result["recommended_body"]["target_commit_sha"] == "<git HEAD commit sha>"
+    assert result["recommended_body"]["activate"] is True
+
+
 def test_pending_scope_queue_allows_same_commit_on_different_refs(conn):
     code_main, main = server.handle_graph_governance_pending_scope_queue(
         _ctx(
