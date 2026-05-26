@@ -98,11 +98,11 @@ class TestMigrationV17ToV18:
 
 
 class TestSchemaVersion:
-    """SCHEMA_VERSION is 18 and MIGRATIONS dict contains key 18."""
+    """SCHEMA_VERSION reflects the current governance DB schema."""
 
-    def test_schema_version_is_18(self):
+    def test_schema_version_is_current(self):
         from governance.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 18
+        assert SCHEMA_VERSION == 44
 
     def test_ddl_contains_provenance_paths(self):
         from governance.db import SCHEMA_SQL

@@ -24,7 +24,8 @@ def _make_graph(nodes_dict):
 @pytest.fixture(autouse=True)
 def mock_graph_load():
     """Patch project_service.load_project_graph for all tests."""
-    with patch("agent.governance.project_service.load_project_graph") as mock_lpg:
+    with patch("agent.governance.project_service.load_project_graph") as mock_lpg, \
+         patch("agent.governance.auto_chain._file_deleted_in_worktree", return_value=False):
         # Default: empty graph
         mock_lpg.return_value = _make_graph({})
         yield mock_lpg
@@ -205,7 +206,7 @@ class TestRuleJ_SrcModuleBinding:
 
         # Mock file read for Rule B @route detection
         rel_path = "agent/governance/routed_module.py"
-        route_content = '@app.route("/api/test")\ndef test_endpoint(): pass\n'
+        route_content = '@app.get("/api/test")\ndef test_endpoint(): pass\n'
 
         import builtins
         original_open = builtins.open

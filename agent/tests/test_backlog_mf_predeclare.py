@@ -290,7 +290,12 @@ def test_close_from_mf_in_progress(_mock_subprocess, _mock_db_mf_in_progress, _m
 
     _mock_subprocess.return_value = MagicMock(returncode=0)
 
-    ctx = _make_ctx(commit="abc123", actor="test-user")
+    ctx = _make_ctx(
+        commit="abc123",
+        actor="test-user",
+        bypass_timeline_gate=True,
+        timeline_bypass_reason="Unit test covers MF_IN_PROGRESS close transition only.",
+    )
 
     result = handle_backlog_close(ctx)
 

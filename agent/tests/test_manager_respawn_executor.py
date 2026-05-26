@@ -6,7 +6,7 @@ from unittest import mock
 
 
 def test_respawn_executor_writes_signal_file(tmp_path):
-    """Handler must write manager_signal.json with action='respawn_executor'."""
+    """Handler must write restart signal with respawn_executor request alias."""
     from agent.manager_http_server import ManagerHTTPHandler
 
     body = json.dumps({"chain_version": "abc123"}).encode()
@@ -29,7 +29,8 @@ def test_respawn_executor_writes_signal_file(tmp_path):
     signal_path = state_dir / "manager_signal.json"
     assert signal_path.exists(), "manager_signal.json must be created"
     data = json.loads(signal_path.read_text(encoding="utf-8"))
-    assert data["action"] == "respawn_executor"
+    assert data["action"] == "restart"
+    assert data["requested_action"] == "respawn_executor"
     assert data["chain_version"] == "abc123"
 
 

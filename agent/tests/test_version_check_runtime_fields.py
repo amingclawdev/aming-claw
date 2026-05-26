@@ -2,16 +2,7 @@
 
 import json
 import sqlite3
-import sys
 from unittest import mock
-
-# Pre-mock governance submodules using Python 3.10+ syntax for 3.9 compat
-for _m in ("evidence", "state_service", "gate_policy", "project_service",
-           "memory_service", "idempotency", "impact_analyzer", "role_service",
-           "session_context", "session_persistence", "doc_generator",
-           "gatekeeper", "task_registry", "failure_classifier", "reconcile",
-           "chain_context", "graph"):
-    sys.modules.setdefault(f"agent.governance.{_m}", mock.MagicMock())
 
 from agent.governance.server import handle_version_check  # noqa: E402
 

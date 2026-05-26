@@ -30,9 +30,9 @@ def _get_test_files():
 
 def test_no_hardcoded_project_id_in_sql_mutations():
     """Scan agent/tests/*.py for 'aming-claw' appearing in INSERT/UPDATE/DELETE SQL."""
-    # Pattern: a SQL mutation keyword followed (possibly with intervening text) by 'aming-claw'
-    # We check each line that contains a SQL mutation keyword for the literal project id.
-    sql_mutation_re = re.compile(r"\b(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+    # Pattern: a SQL mutation keyword followed by SQL whitespace, not URL pieces
+    # such as "/node-update".
+    sql_mutation_re = re.compile(r"\b(INSERT|UPDATE|DELETE)\s+", re.IGNORECASE)
     violations = []
 
     for filepath in _get_test_files():

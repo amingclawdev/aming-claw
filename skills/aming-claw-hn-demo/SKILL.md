@@ -3,6 +3,26 @@ name: aming-claw-hn-demo
 description: Guided operator for the full Aming Claw HN three-fear demo. Use when a user asks to run, preview, present, or collect evidence for the HN demo covering before-work project understanding, during-work subagent observability, and after-work docs/tests/config drift.
 ---
 
+## REQUIRED FIRST READ
+
+Before any response that uses this skill, in this exact order:
+
+  ListMcpResourcesTool()
+  ReadMcpResourceTool(uri="aming-claw://current-context")
+  ReadMcpResourceTool(uri="aming-claw://skill")
+  ReadMcpResourceTool(uri="aming-claw://graph-first")
+
+current-context anchors project_id, governance URLs, and 3 guardrails.
+skill is the operating contract (Start Sequence, Observer Operating Modes).
+graph-first has copy-pasteable graph_query payload examples.
+
+Common failures when these are skipped:
+- Bootstrapping the wrong project (workspace_match auto-detected aming-claw)
+- Calling task_create dev/pm (V1 default is observer-led mf_parallel.v1)
+- Using Grep on the aming-claw codebase instead of graph_query
+- Fabricating trace_id strings (audit ledger is server-resolvable, will fail)
+- Running Execution Supervisor mode by default (Design Alignment is default)
+
 # Aming Claw HN Demo
 
 Run this as a guided operator flow, not a mandatory replay engine. Prefer

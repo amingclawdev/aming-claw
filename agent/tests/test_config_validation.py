@@ -36,6 +36,10 @@ class TestMcpJsonConfig(unittest.TestCase):
         self.assertEqual(self.env.get("MEMORY_BACKEND"), "docker",
                          "MEMORY_BACKEND should be 'docker' in .mcp.json")
 
+    @unittest.skipUnless(
+        os.environ.get("AMING_CLAW_VALIDATE_SECRETS") == "1",
+        "Secret-bearing local config audit is opt-in.",
+    )
     def test_telegram_bot_token_present(self):
         """TELEGRAM_BOT_TOKEN must be set (non-empty)."""
         token = self.env.get("TELEGRAM_BOT_TOKEN", "")

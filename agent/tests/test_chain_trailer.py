@@ -63,16 +63,17 @@ def git_repo_with_legacy_trailer(git_repo):
 @pytest.fixture
 def git_repo_with_branch(git_repo):
     """Create a repo with a feature branch."""
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=git_repo, capture_output=True, text=True,
+    ).stdout.strip()
     subprocess.run(["git", "checkout", "-b", "feature-test"], cwd=git_repo, capture_output=True)
     fpath = os.path.join(git_repo, "feature.txt")
     with open(fpath, "w") as f:
         f.write("feature\n")
     subprocess.run(["git", "add", "."], cwd=git_repo, capture_output=True)
     subprocess.run(["git", "commit", "-m", "Feature work"], cwd=git_repo, capture_output=True)
-    subprocess.run(["git", "checkout", "master"], cwd=git_repo, capture_output=True)
-    result = subprocess.run(["git", "branch", "--show-current"], cwd=git_repo, capture_output=True, text=True)
-    if not result.stdout.strip():
-        subprocess.run(["git", "checkout", "main"], cwd=git_repo, capture_output=True)
+    subprocess.run(["git", "checkout", base_branch], cwd=git_repo, capture_output=True)
     return git_repo
 
 

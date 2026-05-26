@@ -44,6 +44,7 @@ def _make_conn(tmp_path=None) -> sqlite3.Connection:
             merged_into       INTEGER,
             merge_status      TEXT,
             merge_evidence_json TEXT,
+            mutations_sha256  TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (project_id, baseline_id)
         );
         CREATE TABLE IF NOT EXISTS baseline_mutations (
@@ -692,9 +693,9 @@ class TestComputePostState:
 # ---------------------------------------------------------------------------
 
 class TestSchemaVersion:
-    def test_schema_version_is_22(self):
+    def test_schema_version_is_current(self):
         from agent.governance.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 22
+        assert SCHEMA_VERSION == 44
 
 
 # ---------------------------------------------------------------------------

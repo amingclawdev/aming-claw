@@ -2055,10 +2055,13 @@ def handle_context_log_append(ctx: RequestContext):
     """Append entry to session log."""
     project_id = ctx.get_project_id()
     from . import session_context
+    content = ctx.body.get("content")
+    if not isinstance(content, dict):
+        content = {key: value for key, value in ctx.body.items() if key != "type"}
     return session_context.append_log(
         project_id,
         entry_type=ctx.body.get("type", "action"),
-        content=ctx.body.get("content", {}),
+        content=content,
     )
 
 
@@ -16043,7 +16046,17 @@ def handle_task_create(ctx: RequestContext):
         if task_type in _PARENT_REQUIRED_TYPES and not _force_bypass:
             _parent_task_id = metadata.get("parent_task_id") or ""
             if not _parent_task_id:
-                _msg = "parent_task_id required for code-change type from non-auto-chain creator"
+                _msg = (
+                    "This task_create entrypoint creates a chain task "
+                    "(pm->dev->test->qa->merge). For V1 observer-led Manual "
+                    "Fix work, do NOT use this entrypoint. Instead: "
+                    "1) backlog_upsert with chain_trigger_json.parallel_contract "
+                    "using the mf_parallel.v1 template; 2) task_timeline_append "
+                    "events tied to mf_id. See aming-claw://mf-sop and "
+                    "skills/aming-claw/SKILL.md 'Observer Operating Modes'. "
+                    "If you genuinely need to test chain automation, pass "
+                    "metadata.parent_task_id pointing to an existing pm task_id."
+                )
                 log.warning("backlog_gate: %s (type=%s, mode=%s)", _msg, task_type, _enforce_mode)
                 if _enforce_mode == "strict":
                     raise GovernanceError("parent_task_id missing", _msg, status=422)
@@ -18118,6 +18131,15 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "timeline_gate": verification,
             "event_count": len(events),
         }
+        reason_human = _MF_TIMELINE_REASON_HUMAN.get(applicable["reason"])
+        if not reason_human:
+            reason_parts = {part.strip() for part in applicable["reason"].split(",")}
+            for reason_code, human_text in _MF_TIMELINE_REASON_HUMAN.items():
+                if reason_code in reason_parts:
+                    reason_human = human_text
+                    break
+        if reason_human:
+            result["reason_human"] = reason_human
         if include_events:
             result["events"] = events
         return result
@@ -18736,6 +18758,14 @@ def _mf_close_timeline_applicability(row) -> dict:
         "is_mf": is_mf,
         "reason": ", ".join(reasons) if reasons else "not an MF/observer backlog row",
     }
+
+
+_MF_TIMELINE_REASON_HUMAN = {
+    "mf_type=chain_rescue": (
+        "chain_rescue is the MVP internal storage label for observer-hotfix "
+        "and manual-fix work, not an error or limitation. See aming-claw://mf-sop."
+    ),
+}
 
 
 @route("GET", "/api/docs")

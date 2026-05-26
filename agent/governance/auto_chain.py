@@ -7178,7 +7178,12 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
                 "WHERE spawned_task_id = ? AND spawn_status = 'running'",
                 (now_ph, spawned_task_id),
             )
+            conn.commit()
         except Exception as exc_ph:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             # Table may not exist yet (pre-migration); swallow gracefully
             log.debug("_finalize_chain: phase_h status update skipped: %s", exc_ph)
 

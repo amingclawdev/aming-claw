@@ -455,6 +455,22 @@ TOOLS: list[dict] = [
                 "query_purpose": {"type": "string"},
                 "repo_root": {"type": "string"},
                 "project_root": {"type": "string"},
+                "task_id": {
+                    "type": "string",
+                    "description": "Required when query_source=mf_subagent: the calling worker's task_id.",
+                },
+                "parent_task_id": {
+                    "type": "string",
+                    "description": "Required when query_source=mf_subagent: the parent observer/MF task_id.",
+                },
+                "worker_role": {
+                    "type": "string",
+                    "description": "When query_source=mf_subagent: 'mf_sub'.",
+                },
+                "fence_token": {
+                    "type": "string",
+                    "description": "Required when query_source=mf_subagent: the worker's fence_token.",
+                },
             },
             "required": ["project_id", "tool"],
         },

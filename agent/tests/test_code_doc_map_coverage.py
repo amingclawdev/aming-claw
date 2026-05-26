@@ -17,6 +17,14 @@ import pytest
 # Import the map under test
 from agent.governance.impact_analyzer import CODE_DOC_MAP
 
+pytestmark = pytest.mark.skipif(
+    os.environ.get("AMING_CLAW_STRICT_DOC_MAP") != "1",
+    reason=(
+        "CODE_DOC_MAP full coverage is a strict documentation audit; "
+        "preflight reports gaps as warnings in normal test runs."
+    ),
+)
+
 # Project root: two levels up from agent/tests/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 

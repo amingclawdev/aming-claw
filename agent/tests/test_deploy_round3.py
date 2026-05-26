@@ -17,6 +17,14 @@ agent_dir = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, agent_dir)
 
 
+def _urlopen_ok():
+    resp = mock.MagicMock()
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = False
+    resp.read.return_value = b'{"ok": true}'
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # AC5(a): Non-gateway deploy returns gateway='not_applicable' and all_pass=True
 # ---------------------------------------------------------------------------
@@ -53,6 +61,7 @@ class TestNonGatewayDeployNotApplicable(unittest.TestCase):
         }
         with mock.patch("deploy_chain.detect_affected_services", return_value=["governance"]), \
              mock.patch("deploy_chain.rebuild_governance", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.urllib.request.urlopen", return_value=_urlopen_ok()), \
              mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
              mock.patch("deploy_chain._save_report"):
             report = run_deploy(["agent/governance/server.py"])
@@ -99,6 +108,7 @@ class TestSuccessAllPassCoherence(unittest.TestCase):
              mock.patch("deploy_chain.restart_executor", return_value=True), \
              mock.patch("deploy_chain.rebuild_governance", return_value=(True, "ok")), \
              mock.patch("deploy_chain.restart_gateway", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.urllib.request.urlopen", side_effect=RuntimeError("redeploy fail")), \
              mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
              mock.patch("deploy_chain._save_report"):
             report = run_deploy(["agent/telegram_gateway/bot.py"])
@@ -131,6 +141,7 @@ class TestSuccessAllPassCoherence(unittest.TestCase):
         with mock.patch("deploy_chain.detect_affected_services", return_value=["governance"]), \
              mock.patch("deploy_chain.rebuild_governance", return_value=(False, "fail")), \
              mock.patch("deploy_chain.restart_local_governance", return_value=(False, "also fail")), \
+             mock.patch("deploy_chain.urllib.request.urlopen", side_effect=RuntimeError("redeploy fail")), \
              mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
              mock.patch("deploy_chain._save_report"):
             report = run_deploy(["agent/governance/server.py"])

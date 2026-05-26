@@ -129,6 +129,10 @@ def append_log(project_id: str, entry_type: str, content: dict) -> dict:
     else:
         length = 0
 
+    _append_log_to_sqlite(project_id, entry)
+    if not length:
+        length = _count_log_from_sqlite(project_id)
+
     return {"ok": True, "log_length": length}
 
 
@@ -139,7 +143,7 @@ def read_log(project_id: str, limit: int = 50) -> list[dict]:
     key = _log_key(project_id)
 
     if not rc.available:
-        return []
+        return _read_log_from_sqlite(project_id, limit=limit)
 
     raw_entries = rc._safe(lambda: rc._client.lrange(key, -limit, -1), [])
     entries = []
@@ -148,7 +152,7 @@ def read_log(project_id: str, limit: int = 50) -> list[dict]:
             entries.append(json.loads(raw))
         except (json.JSONDecodeError, TypeError):
             continue
-    return entries
+    return entries or _read_log_from_sqlite(project_id, limit=limit)
 
 
 def archive_context(project_id: str) -> dict:
@@ -257,3 +261,69 @@ def _load_from_sqlite(project_id: str) -> dict | None:
     except Exception:
         log.debug("SQLite context load failed")
     return None
+
+
+def _append_log_to_sqlite(project_id: str, entry: dict) -> None:
+    """Persist a log entry to SQLite so conversation history survives no-Redis runs."""
+    try:
+        from .db import get_connection
+        conn = get_connection(project_id)
+        now = entry.get("ts") or _utc_iso()
+        conn.execute(
+            """INSERT INTO session_context
+               (project_id, entry_type, content, created_at, created_by)
+               VALUES (?, ?, ?, ?, 'session_context')""",
+            (
+                project_id,
+                str(entry.get("type", "action")),
+                json.dumps(entry, ensure_ascii=False),
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        log.debug("SQLite context log persist failed", exc_info=True)
+
+
+def _read_log_from_sqlite(project_id: str, limit: int = 50) -> list[dict]:
+    """Read recent log entries from SQLite in chronological order."""
+    try:
+        from .db import get_connection
+        conn = get_connection(project_id)
+        rows = conn.execute(
+            """SELECT content FROM session_context
+               WHERE project_id = ? AND entry_type != 'snapshot'
+               ORDER BY created_at DESC, id DESC
+               LIMIT ?""",
+            (project_id, int(limit)),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        log.debug("SQLite context log load failed", exc_info=True)
+        return []
+
+    entries: list[dict] = []
+    for row in reversed(rows):
+        try:
+            entries.append(json.loads(row["content"]))
+        except (json.JSONDecodeError, TypeError, KeyError):
+            continue
+    return entries
+
+
+def _count_log_from_sqlite(project_id: str) -> int:
+    """Count persisted log entries for append responses when Redis is unavailable."""
+    try:
+        from .db import get_connection
+        conn = get_connection(project_id)
+        row = conn.execute(
+            """SELECT COUNT(*) AS count FROM session_context
+               WHERE project_id = ? AND entry_type != 'snapshot'""",
+            (project_id,),
+        ).fetchone()
+        conn.close()
+        return int(row["count"] if row else 0)
+    except Exception:
+        log.debug("SQLite context log count failed", exc_info=True)
+        return 0

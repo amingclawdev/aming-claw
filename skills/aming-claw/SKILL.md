@@ -3,6 +3,26 @@ name: aming-claw
 description: Use when working in the Aming Claw repo or any governance, dashboard, MCP, backlog, graph, semantic reconcile, scope/full reconcile, chain/executor advanced ops, or manual-fix/observer-hotfix task. Enforces graph-first discovery, backlog/MF tracking before mutations, MCP-first operations, Chain trailers on commits, and post-commit runtime/graph checks.
 ---
 
+## REQUIRED FIRST READ
+
+Before any response that uses this skill, in this exact order:
+
+  ListMcpResourcesTool()
+  ReadMcpResourceTool(uri="aming-claw://current-context")
+  ReadMcpResourceTool(uri="aming-claw://skill")
+  ReadMcpResourceTool(uri="aming-claw://graph-first")
+
+current-context anchors project_id, governance URLs, and 3 guardrails.
+skill is the operating contract (Start Sequence, Observer Operating Modes).
+graph-first has copy-pasteable graph_query payload examples.
+
+Common failures when these are skipped:
+- Bootstrapping the wrong project (workspace_match auto-detected aming-claw)
+- Calling task_create dev/pm (V1 default is observer-led mf_parallel.v1)
+- Using Grep on the aming-claw codebase instead of graph_query
+- Fabricating trace_id strings (audit ledger is server-resolvable, will fail)
+- Running Execution Supervisor mode by default (Design Alignment is default)
+
 # Aming Claw
 
 ## Capabilities

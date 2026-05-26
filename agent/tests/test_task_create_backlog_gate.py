@@ -388,7 +388,8 @@ def test_r4_warn_mode_bug_status_closed_allows() -> None:
 def test_grep_verify_parent_task_id_required_in_server() -> None:
     server_py = Path(__file__).resolve().parents[1] / "governance" / "server.py"
     content = server_py.read_text(encoding="utf-8")
-    assert "parent_task_id required" in content
+    assert "This task_create entrypoint creates a chain task" in content
+    assert "mf_parallel.v1" in content
 
 
 def test_grep_verify_parent_task_id_not_found_in_server() -> None:

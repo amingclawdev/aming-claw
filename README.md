@@ -51,7 +51,7 @@ bindings are derived state.
 
 ## Contents
 
-- [Quick Start](#quick-start)
+- [Get Started](#get-started)
 - [HN Demo](#hn-demo)
 - [Review-Scope Challenge](#review-scope-challenge)
 - [Key Terms](#key-terms)
@@ -68,11 +68,12 @@ bindings are derived state.
 - [CLI](#cli)
 - [Packaging](#packaging)
 - [Governance Contract](#governance-contract)
+- [Deep Dive](#deep-dive)
 - [Status & Contributing](#status--contributing)
 - [Documentation](#documentation)
 - [License](#license)
 
-## Quick Start
+## Get Started
 
 Start with the AI host you use. The longer requirements, raw installer commands,
 and troubleshooting notes are in [Install Details](#install-details).
@@ -114,7 +115,7 @@ Install aming-claw end-to-end from https://github.com/amingclawdev/aming-claw:
 ```
 
 Steps 1–2 only copy the skill files; pip install adds the Python runtime,
-`aming-claw start` boots governance on port `40000`, `aming-claw open`
+`aming-claw start` boots the local governance service, and `aming-claw open`
 launches the dashboard. After reloading, phrases like "install and start
 aming-claw" or "one-shot install" trigger the launcher skill's one-shot
 mode for re-bootstrap in future sessions. First-run troubleshooting and
@@ -129,9 +130,8 @@ changes apply only to **new** sessions.
 **Works immediately (no new session needed):**
 
 - The `aming-claw` CLI on your `PATH`
-- `aming-claw start` brings up governance on port `40000`
-- The dashboard at `http://localhost:40000/dashboard`
-- `aming-claw open` to launch a browser to it
+- `aming-claw start` brings up local governance
+- `aming-claw open` launches the dashboard
 
 **Requires a new session:**
 
@@ -521,16 +521,11 @@ Best-fit V1 use cases:
 
 ### First Run And Verify
 
-Start governance in a separate terminal:
+Start governance in a separate terminal, then open the dashboard:
 
 ```bash
 aming-claw start
-```
-
-Then open:
-
-```text
-http://localhost:40000/dashboard
+aming-claw open
 ```
 
 Run the read-only check when you want to confirm the local install:
@@ -567,10 +562,9 @@ OpenAI. As a consequence:
 - The CLI must be **logged in**. Aming Claw probes `--version` to confirm the
   binary exists, but cannot verify auth — `runtime_status` / `plugin doctor`
   report `auth unknown` until a real model call succeeds.
-- Each project's AI config must declare a `semantic` provider/model
-  (`GET /api/projects/{project_id}/ai-config`). `openai` routes use the Codex
-  CLI; `anthropic` routes use the Claude Code CLI. AI Enrich is blocked if
-  the semantic route is unset.
+- Each project's AI config must declare a `semantic` provider/model. `openai`
+  routes use the Codex CLI; `anthropic` routes use the Claude Code CLI. AI
+  Enrich is blocked if the semantic route is unset.
 - `.env` `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are **not** consumed by AI
   Enrich — the local CLI's own auth is the source of truth.
 
@@ -580,7 +574,7 @@ graph queries, backlog, and Manual Fix still work without any AI CLI. See
 [Runtime Boundaries](#runtime-boundaries) for the full state model.
 
 If you are starting from Codex and want the full first-run experience, use the
-one-shot prompt from [Quick Start](#quick-start):
+one-shot prompt from [Get Started](#get-started):
 
 ```text
 One-shot install and open dashboard for Aming Claw from https://github.com/amingclawdev/aming-claw
@@ -593,8 +587,8 @@ plugin assets, but it should not start governance or open the dashboard:
 Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
 ```
 
-When you need the raw bootstrap script verbatim - Windows PowerShell or
-macOS/Linux `curl` - see
+When you need the raw bootstrap script verbatim for Windows PowerShell or
+macOS/Linux shells, see
 [`docs/install/codex-bootstrap.md`](docs/install/codex-bootstrap.md).
 
 ### Claude Code install detail
@@ -631,10 +625,12 @@ cd aming-claw
 pip install -e .
 ```
 
-Then start governance in a separate terminal and leave it running:
+Then start governance in a separate terminal and leave it running, then open
+the dashboard:
 
 ```bash
 aming-claw start
+aming-claw open
 ```
 
 If the `aming-claw` console script is not on `PATH` yet, run the same CLI
@@ -674,7 +670,7 @@ Expected checks:
 - Local Codex/Claude CLI commands are detected when available; detection still
   reports AI auth as unknown.
 - Governance health is reachable after services are started.
-- `/dashboard` returns `200` when governance is running and static assets exist.
+- The dashboard route responds when governance is running and static assets exist.
 - A new Codex or Claude Code session can see the Aming Claw skill and MCP tools.
 
 ServiceManager/executor health is intentionally not a default V1 doctor gate;
@@ -690,15 +686,9 @@ aming-claw launcher --open-browser
 aming-claw open
 ```
 
-Dashboard URL:
-
-```text
-http://localhost:40000/dashboard
-```
-
-The root path `http://localhost:40000/` is not the dashboard and may return
-`404`. If `/api/health` is OK but `/dashboard` returns `503`, governance is up
-but dashboard static assets are missing. No build is needed when either
+The root path is not the dashboard and may return `404`. If governance health
+is OK but the dashboard route is unavailable, governance is up but dashboard
+static assets are missing. No build is needed when either
 `agent/governance/dashboard_dist/index.html` or
 `frontend/dashboard/dist/index.html` exists. For a raw checkout missing both:
 
@@ -714,8 +704,8 @@ Keep these states separate when troubleshooting:
 
 - Plugin assets installed on disk.
 - Codex or Claude Code loaded the skill/MCP in the current session.
-- Governance `/api/health` is running on port `40000`.
-- Dashboard static assets are present and `/dashboard` returns `200`.
+- Governance health is reachable.
+- Dashboard static assets are present and the dashboard route responds.
 - Local AI CLIs are detected and the project has AI routing.
 - Packaged self graph bundle compatibility is current for the installed runtime.
 - Optional advanced chain/ops readiness: ServiceManager on port `40101` and
@@ -887,11 +877,10 @@ no-query calls, but supports `view=compact`, `limit`, `offset`,
 `include_closed`, `status`, and `priority`.
 
 Project bootstrap is explicit. Do not silently register a workspace just
-because `/api/projects` is empty. Bootstrap writes Aming Claw registry/DB state,
-scans the workspace, and builds a commit-bound graph snapshot through
-`POST http://127.0.0.1:40000/api/project/bootstrap`; ServiceManager on `40101`
-is not the bootstrap API. If the target workspace is a dirty git repo,
-commit/stash first.
+because the projects registry is empty. Bootstrap writes Aming Claw registry/DB
+state, scans the workspace, and builds a commit-bound graph snapshot through
+the governance project-bootstrap API; ServiceManager is not the bootstrap API.
+If the target workspace is a dirty git repo, commit/stash first.
 
 Install/startup state belongs to the plugin/runtime checkout, not the target
 project. Bootstrap now refuses obvious Aming Claw self-artifacts in an external
@@ -995,6 +984,15 @@ When working on Aming Claw itself, follow the project governance contract:
 3. Query the graph before creating new modules or changing behavior.
 4. Follow `skills/aming-claw/references/mf-sop.md` for manual fixes.
 5. Evaluate whether E2E evidence is needed for dashboard or graph behavior.
+
+## Deep Dive
+
+- [Architecture](docs/architecture.md)
+- [Deployment](docs/deployment.md)
+- [Roles](docs/roles/README.md)
+- [Governance](docs/governance/README.md)
+- [Configuration](docs/config/README.md)
+- [API](docs/api/README.md)
 
 ## Status & Contributing
 

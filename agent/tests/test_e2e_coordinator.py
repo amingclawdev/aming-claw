@@ -31,6 +31,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 GOV_URL = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
 PROJECT_ID = "aming-claw-test"
 
+pytestmark = pytest.mark.skipif(
+    os.getenv("AMING_CLAW_RUN_LIVE_E2E") != "1",
+    reason="live coordinator E2E requires AMING_CLAW_RUN_LIVE_E2E=1",
+)
+
 
 def _api(method: str, path: str, body: dict = None) -> dict:
     """Call governance REST API."""

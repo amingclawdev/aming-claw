@@ -37,7 +37,7 @@ class TestE2EFullChain(unittest.TestCase):
         with mock.patch.object(auto_chain, "_gate_version_check", return_value=(True, "ok")), \
              mock.patch.object(auto_chain, "_publish_event"), \
              mock.patch.object(auto_chain, "_write_chain_memory"), \
-             mock.patch.object(auto_chain, "_try_verify_update"):
+             mock.patch.object(auto_chain, "_try_verify_update", return_value=(True, "ok")):
             out_pm = auto_chain._do_chain(conn, project_id, "task-pm-root", "pm", pm_result, {})
             dev_task = task_registry.get_task(conn, out_pm["task_id"])
             dev_meta = json.loads(dev_task["metadata_json"])
@@ -60,7 +60,15 @@ class TestE2EFullChain(unittest.TestCase):
 
             out_qa = auto_chain._do_chain(
                 conn, project_id, qa_task["task_id"], "qa",
-                {"recommendation": "qa_pass", "review_summary": "ok", "issues": [], "doc_updates_applied": []},
+                {
+                    "recommendation": "qa_pass",
+                    "review_summary": "ok",
+                    "issues": [],
+                    "doc_updates_applied": [],
+                    "criteria_results": [
+                        {"criterion": "AC1", "passed": True, "evidence": "synthetic full-chain pass"}
+                    ],
+                },
                 qa_meta,
             )
             gate_task = task_registry.get_task(conn, out_qa["task_id"])
