@@ -94,6 +94,11 @@ with the HN demo evidence work in commit
 `dcb0f1f350218e224222af890ef6e1c1c6300f1d`. Parallel agent work is not
 reviewable unless the lanes and evidence survive the UI.
 
+This case shares its commit with the before-work case because Aming Claw lands
+concurrent backlog rows atomically. See
+[One commit, many backlog rows](../article.md#one-commit-many-backlog-rows) in
+the article for why.
+
 Related dogfood story:
 
 [I told my AI to build a feature. Did it? I had no

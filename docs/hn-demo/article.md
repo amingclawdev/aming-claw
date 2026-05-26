@@ -55,6 +55,12 @@ drift state -- are the protocol between you and your agent. The agent already
 knows them from the skill files. You only need to recognize their visual forms on
 the dashboard.
 
+The model also assumes concurrency, not just inversion. The human reviewer is
+not just reviewing one agent at a time -- in real use it's three to five agent
+contracts running in parallel against the same target. The "operator" role is
+plural. The human's role stays singular because review and arbitration
+parallelize where implementation does not.
+
 ## The three fears
 
 After six months of shipping with AI coding agents, the work splits cleanly
@@ -212,6 +218,35 @@ GitHub shows the source diff. The backlog row, timeline events, close gate, and
 graph snapshot are local governance records unless you run the demo yourself.
 That boundary matters: public source history is not the same thing as the local
 audit trail that produced and verified it.
+
+## One commit, many backlog rows
+
+You may notice the same commit referenced from multiple case pages. That isn't
+an accident or a shortcut. It's how concurrent work lands in Aming Claw.
+
+The system supports what I think of as one-hop concurrent development. Multiple
+independent backlog rows can be contracted against the same target commit,
+dispatched to bounded workers in parallel, and landed together as a single
+atomic change. Each backlog row keeps its own contract, target files, evidence
+timeline, and close-ready state. The commit is the shared landing point, not the
+unit of work.
+
+The HN demo itself is one such commit. `dcb0f1f3` closed multiple backlog rows
+together: the demo's fear surface (`HN-FEAR-DEMO-GOAL-20260526`), the timeline
+lane readability work (`HN-BACKLOG-TIMELINE-LANE-READABILITY-20260526`), and the
+demo skill files themselves. Each row has its own evidence trail. They all land
+atomically.
+
+Without this, parallel agent work either serializes -- slow, defeats the point
+of having agents at all -- or creates merge conflicts no one can untangle. The
+one-hop boundary is what makes concurrent landing safe: branch-local evidence is
+candidate evidence, target ref reconcile happens after merge, and stale fences
+are rejected before they can corrupt anything.
+
+This is also why the human stays in the review role. Reviewing five concurrent
+agent contracts at once is feasible. Running five concurrent agent
+implementations is not. Concurrency is what makes AI-as-operator economically
+useful; one-hop boundary is what makes it safe.
 
 ## What this changes for coding agents
 

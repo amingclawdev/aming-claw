@@ -52,6 +52,7 @@ bindings are derived state.
 ## Contents
 
 - [Quick Start](#quick-start)
+- [HN Demo](#hn-demo)
 - [Review-Scope Challenge](#review-scope-challenge)
 - [Key Terms](#key-terms)
 - [Architecture Contracts](#architecture-contracts)
@@ -134,7 +135,8 @@ changes apply only to **new** sessions.
 
 **Requires a new session:**
 
-- The `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher` skills
+- The `/aming-claw:aming-claw`, `/aming-claw:aming-claw-launcher`, and
+  `/aming-claw:aming-claw-hn-demo*` skills
 - The `mcp__plugin_aming-claw_aming-claw__*` MCP tools (`health`,
   `runtime_status`, `task_*`, `backlog_*`, `graph_*`, etc.)
 
@@ -144,6 +146,27 @@ changes apply only to **new** sessions.
 
 This is a Claude Code framework behavior, not specific to Aming Claw — but it
 surprises users often enough that we call it out.
+
+## HN Demo
+
+The HN demo article starts here:
+[Hope is not an engineering control for AI coding agents](docs/hn-demo/article.md).
+It is the no-install reading path for the three-fear story, with case pages and
+architecture notes linked from the article.
+
+After installing the plugin and opening a new AI host session, invoke the HN
+demo skill:
+
+```text
+Run the Aming Claw HN demo
+```
+
+The skill walks through the before-work, during-work, and after-work cases and
+opens the local dashboard views that back the story. The case pages are also
+readable directly:
+[before work](docs/hn-demo/cases/before-work.md),
+[during work](docs/hn-demo/cases/during-work.md), and
+[after work](docs/hn-demo/cases/after-work.md).
 
 ## Review-Scope Challenge
 

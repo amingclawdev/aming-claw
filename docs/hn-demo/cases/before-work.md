@@ -87,6 +87,11 @@ landed in commit `dcb0f1f350218e224222af890ef6e1c1c6300f1d`. The useful part for
 this case is the ordering: the system recorded the intended surface and evidence
 before the implementation changed the docs and demo skill files.
 
+This case shares its commit with the during-work case because Aming Claw lands
+concurrent backlog rows atomically. See
+[One commit, many backlog rows](../article.md#one-commit-many-backlog-rows) in
+the article for why.
+
 Related dogfood story:
 
 [AI proposed 5 components for my parallel system. After walking one scenario,
