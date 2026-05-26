@@ -643,6 +643,9 @@ Expected checks:
 
 ServiceManager/executor health is intentionally not a default V1 doctor gate;
 check it only when exercising advanced chain automation or host redeploy flows.
+For Claude Code, use `claude mcp list` or an actual new-session tool check for
+MCP visibility. `claude plugin details` may show `MCP servers (0)` even when the
+plugin-declared server connects successfully.
 
 Open the local launcher or dashboard:
 
@@ -702,6 +705,7 @@ Aming Claw ships these assets in the repo:
 - `.mcp.json` — MCP server contract (read when the repo is opened as a workspace; the CLI installer also generates cache-aware overrides for plugin-mode loading)
 - `skills/aming-claw/` — main governance skill
 - `skills/aming-claw-launcher/` — onboarding/launcher skill
+- `skills/aming-claw-hn-demo*/` — HN demo operator skills for the three-fear walkthrough
 - `agent/mcp/resources/seed-graph-summary.json` — lightweight packaged context
   for fresh sessions
 - `agent/mcp/resources/self-graph-bundle-manifest.json` — read-only compatibility
@@ -709,10 +713,14 @@ Aming Claw ships these assets in the repo:
 - `agent/mcp/resources/self-graph-bundle/` — sealed structure and semantic
   projection resources for fresh-session orientation and smoke checks
 
-After install, the plugin exposes two skills (Claude Code namespacing shown):
+After install, the plugin exposes six skills (Claude Code namespacing shown):
 
 - `/aming-claw:aming-claw`
 - `/aming-claw:aming-claw-launcher`
+- `/aming-claw:aming-claw-hn-demo`
+- `/aming-claw:aming-claw-hn-demo-before-work`
+- `/aming-claw:aming-claw-hn-demo-during-work`
+- `/aming-claw:aming-claw-hn-demo-after-work`
 
 ### What `aming-claw plugin install` writes
 

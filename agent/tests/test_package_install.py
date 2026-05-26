@@ -91,6 +91,10 @@ class TestPackagedDashboardAssets:
         assert "recursive-include agent/governance/dashboard_dist *" in manifest
         assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
+        assert "recursive-include skills/aming-claw-hn-demo *" in manifest
+        assert "recursive-include skills/aming-claw-hn-demo-before-work *" in manifest
+        assert "recursive-include skills/aming-claw-hn-demo-during-work *" in manifest
+        assert "recursive-include skills/aming-claw-hn-demo-after-work *" in manifest
         assert "recursive-include skills/aming-claw-launcher *" in manifest
         assert "recursive-include docs/assets *.png" in manifest
         assert "include LICENSE" in manifest
@@ -195,6 +199,10 @@ class TestLocalPluginPackaging:
         assert DEFAULT_REPO_URL == "https://github.com/amingclawdev/aming-claw"
         assert ".codex-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
         assert ".claude-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-hn-demo/SKILL.md" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-hn-demo-before-work/SKILL.md" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-hn-demo-during-work/SKILL.md" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-hn-demo-after-work/SKILL.md" in REQUIRED_PLUGIN_FILES
 
     def test_codex_repo_marketplace_path_is_a_compatibility_path(self):
         marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
@@ -250,6 +258,10 @@ class TestClaudePluginPackaging:
         # so the manifest itself does not have to point at them. We assert they
         # exist where the runtime expects them.
         assert (ROOT / "skills" / "aming-claw" / "SKILL.md").is_file()
+        assert (ROOT / "skills" / "aming-claw-hn-demo" / "SKILL.md").is_file()
+        assert (ROOT / "skills" / "aming-claw-hn-demo-before-work" / "SKILL.md").is_file()
+        assert (ROOT / "skills" / "aming-claw-hn-demo-during-work" / "SKILL.md").is_file()
+        assert (ROOT / "skills" / "aming-claw-hn-demo-after-work" / "SKILL.md").is_file()
         assert (ROOT / "skills" / "aming-claw-launcher" / "SKILL.md").is_file()
         assert (ROOT / ".mcp.json").is_file()
         assert (ROOT / "CLAUDE.md").is_file()
@@ -299,7 +311,7 @@ class TestClaudePluginPackaging:
         assert (ROOT / plugin["source"] / ".claude-plugin" / "plugin.json").is_file()
 
     def test_claude_plugin_declares_mcp_servers(self):
-        """Claude plugin manifest must declare mcpServers so plugin install exposes the MCP server (otherwise Claude Code reports MCP servers (0))."""
+        """Claude plugin manifest must declare mcpServers so `claude mcp list` can load the server."""
         manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         servers = manifest.get("mcpServers")
         assert servers, "Claude plugin manifest must declare mcpServers"

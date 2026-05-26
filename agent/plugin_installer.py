@@ -29,6 +29,10 @@ REQUIRED_PLUGIN_FILES = (
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
     "skills/aming-claw/SKILL.md",
+    "skills/aming-claw-hn-demo/SKILL.md",
+    "skills/aming-claw-hn-demo-after-work/SKILL.md",
+    "skills/aming-claw-hn-demo-before-work/SKILL.md",
+    "skills/aming-claw-hn-demo-during-work/SKILL.md",
     "skills/aming-claw-launcher/SKILL.md",
     ".mcp.json",
 )

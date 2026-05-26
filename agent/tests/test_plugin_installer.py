@@ -114,7 +114,14 @@ def _write_plugin_fixture(root: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(text), encoding="utf-8")
 
-    for rel in ("skills/aming-claw/SKILL.md", "skills/aming-claw-launcher/SKILL.md"):
+    for rel in (
+        "skills/aming-claw/SKILL.md",
+        "skills/aming-claw-hn-demo/SKILL.md",
+        "skills/aming-claw-hn-demo-after-work/SKILL.md",
+        "skills/aming-claw-hn-demo-before-work/SKILL.md",
+        "skills/aming-claw-hn-demo-during-work/SKILL.md",
+        "skills/aming-claw-launcher/SKILL.md",
+    ):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("---\nname: test\n---\n", encoding="utf-8")
@@ -556,6 +563,10 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     assert target == codex_home / "plugins" / "cache" / "aming-claw-local" / "aming-claw" / "0.1.0"
     assert (target / ".codex-plugin" / "plugin.json").is_file()
     assert (target / "skills" / "aming-claw" / "SKILL.md").is_file()
+    assert (target / "skills" / "aming-claw-hn-demo" / "SKILL.md").is_file()
+    assert (target / "skills" / "aming-claw-hn-demo-before-work" / "SKILL.md").is_file()
+    assert (target / "skills" / "aming-claw-hn-demo-during-work" / "SKILL.md").is_file()
+    assert (target / "skills" / "aming-claw-hn-demo-after-work" / "SKILL.md").is_file()
     assert not (target / "agent" / "mcp" / "server.py").exists()
 
     mcp = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))

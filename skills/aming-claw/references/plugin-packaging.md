@@ -5,11 +5,11 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 ## MVP Status
 
 - Codex local plugin shape is present: `.codex-plugin/plugin.json`,
-  `skills/aming-claw/`, and `.mcp.json`.
+  `skills/`, and `.mcp.json`.
 - Claude Code local plugin shape is present: `.claude-plugin/plugin.json`
   and `.claude-plugin/marketplace.json` at the repo root; `skills/` and
   `.mcp.json` are auto-discovered. Skills are namespaced
-  `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher`.
+  `/aming-claw:<skill-name>`.
 - MCP runs through the stdio module entrypoint:
   `python -m agent.mcp.server --project aming-claw --workers 0`.
 - Governance stays host-owned. Plugin MCP sessions should query/control
@@ -69,6 +69,8 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   semantic, and chain work.
 - `skills/aming-claw-launcher/`: onboarding skill loaded for preview, start,
   status, and dashboard flows.
+- `skills/aming-claw-hn-demo*/`: HN demo operator skills for the three-fear
+  walkthrough and its before/during/after-work cases.
 - `.mcp.json`: active MCP server config using `agent.mcp.server`.
 - `agent/plugin_installer.py` + `scripts/install_from_git.py`: Git URL plugin
   installer used by the CLI and first-run fallback flows.
@@ -82,8 +84,9 @@ The Codex manifest points to:
 }
 ```
 
-The Claude Code manifest relies on auto-discovery — no explicit pointers
-needed for skills or MCP. Sample shape:
+The Claude Code manifest relies on auto-discovery for `skills/`; it declares
+the MCP server directly so plugin-mode sessions can expose the same stdio
+server as `.mcp.json`. Sample shape:
 
 ```json
 {
@@ -91,7 +94,13 @@ needed for skills or MCP. Sample shape:
   "version": "0.1.0",
   "description": "Graph-first governance workflow guard ...",
   "author": { "name": "Aming Claw" },
-  "keywords": ["governance", "graph", "mcp"]
+  "keywords": ["governance", "graph", "mcp"],
+  "mcpServers": {
+    "aming-claw": {
+      "command": "python",
+      "args": ["-m", "agent.mcp.server"]
+    }
+  }
 }
 ```
 
@@ -116,7 +125,9 @@ developer-machine paths such as `C:\Users\...`; package tests enforce this.
 Claude Code can read project-scoped MCP servers from `.mcp.json` when the
 workspace/plugin host loads that file. Treat MCP visibility as a separate
 runtime check: plugin skill install does not by itself prove Claude Code loaded
-`mcpServers`. Codex local plugin packaging reads the plugin manifest's
+`mcpServers`. Prefer `claude mcp list` or a new-session tool visibility check;
+`claude plugin details` can report `MCP servers (0)` even when the plugin
+server connects. Codex local plugin packaging reads the plugin manifest's
 `mcpServers` pointer. Keeping the same stdio entrypoint at `.mcp.json` lets both
 surfaces reuse one MCP contract.
 

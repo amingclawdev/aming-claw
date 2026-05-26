@@ -86,7 +86,14 @@ def _write_cli_plugin_fixture(root):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(text), encoding="utf-8")
-    for rel in ("skills/aming-claw/SKILL.md", "skills/aming-claw-launcher/SKILL.md"):
+    for rel in (
+        "skills/aming-claw/SKILL.md",
+        "skills/aming-claw-hn-demo/SKILL.md",
+        "skills/aming-claw-hn-demo-after-work/SKILL.md",
+        "skills/aming-claw-hn-demo-before-work/SKILL.md",
+        "skills/aming-claw-hn-demo-during-work/SKILL.md",
+        "skills/aming-claw-launcher/SKILL.md",
+    ):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("---\nname: test\n---\n", encoding="utf-8")
