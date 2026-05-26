@@ -449,13 +449,20 @@ def _copy_plugin_payload(plugin_root: Path, target_root: Path, *, dry_run: bool 
         if not source.exists():
             continue
         destination = target / rel
+        _remove_payload_destination(destination)
         if source.is_dir():
-            if destination.exists():
-                shutil.rmtree(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(source, destination)
         else:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+
+
+def _remove_payload_destination(destination: Path) -> None:
+    if destination.is_symlink() or destination.is_file():
+        destination.unlink()
+    elif destination.exists():
+        shutil.rmtree(destination)
 
 
 def _cache_runtime_mcp_config(plugin_root: Path, *, python_executable: Optional[str] = None) -> dict:
@@ -1716,16 +1723,33 @@ def _check_codex_cache(plugin_root: Path, *, codex_home: Optional[Union[Path, st
     except Exception as exc:
         return _doctor_check("codex_plugin_cache", "fail", f"cannot compute cache path: {exc}")
     manifest = cache_root / ".codex-plugin" / "plugin.json"
-    if manifest.is_file():
-        mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(cache_root / ".mcp.json")
-        if not mcp_ok:
-            return _doctor_check("codex_plugin_cache", "fail", mcp_detail)
-        return _doctor_check("codex_plugin_cache", "ok", f"{manifest}; {mcp_detail}")
+    if cache_root.exists():
+        missing = [
+            rel
+            for rel in CODEX_PLUGIN_PAYLOAD
+            if (plugin_root / rel).exists()
+            and not _cache_payload_entry_present(cache_root / rel)
+        ]
+        if missing:
+            return _doctor_check(
+                "codex_plugin_cache",
+                "fail",
+                f"{cache_root}: missing payload {', '.join(missing)}; rerun `aming-claw plugin install`",
+            )
+        if manifest.is_file():
+            mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(cache_root / ".mcp.json")
+            if not mcp_ok:
+                return _doctor_check("codex_plugin_cache", "fail", mcp_detail)
+            return _doctor_check("codex_plugin_cache", "ok", f"{manifest}; {mcp_detail}")
     return _doctor_check(
         "codex_plugin_cache",
         "fail",
         f"missing installed plugin cache at {cache_root}; run `aming-claw plugin install`",
     )
+
+
+def _cache_payload_entry_present(path: Path) -> bool:
+    return path.exists() and not path.is_symlink()
 
 
 def _check_governance(governance_url: str) -> DoctorCheck:

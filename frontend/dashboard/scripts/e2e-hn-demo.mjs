@@ -213,8 +213,20 @@ async function loadPlaywright() {
     // Handled below with a clear message.
   }
   throw new Error(
-    "Playwright is not installed in this checkout. Install/use the repo's existing browser tooling, then rerun; this script does not modify package.json.",
+    "Playwright is not installed in this checkout. Run `cd frontend/dashboard && npm install`, then rerun `npm run e2e:hn-demo`.",
   );
+}
+
+async function launchChromium(chromium) {
+  try {
+    return await chromium.launch({ headless: HEADLESS });
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (message.includes("Executable doesn't exist") || message.includes("playwright install")) {
+      throw new Error(`${message}\nRun: cd frontend/dashboard && npx playwright install chromium`);
+    }
+    throw error;
+  }
 }
 
 async function waitForDashboardReady(page, expectedText) {
@@ -293,7 +305,7 @@ async function main() {
     mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
     phase("browser");
-    browser = await chromium.launch({ headless: HEADLESS });
+    browser = await launchChromium(chromium);
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 1 });
     const page = await context.newPage();
     page.setDefaultTimeout(NAV_TIMEOUT_MS);

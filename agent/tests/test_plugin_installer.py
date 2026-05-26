@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -575,6 +576,69 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     assert server["cwd"] == str(tmp_path.resolve())
     assert str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(":") or str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(";")
     assert server["args"][:2] == ["-m", "agent.mcp.server"]
+
+
+def test_install_codex_plugin_cache_replaces_existing_symlink_payload(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    target = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    linked_payload = tmp_path / "linked-payload"
+    linked_payload.mkdir()
+    (target / "skills").rename(target / "skills-old")
+    try:
+        (target / "skills").symlink_to(linked_payload, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    refreshed = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+
+    assert refreshed == target
+    assert not (target / "skills").is_symlink()
+    assert (target / "skills" / "aming-claw" / "SKILL.md").is_file()
+
+
+def test_install_codex_marketplace_replaces_existing_symlink_payload(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    marketplace_root = install_codex_marketplace(tmp_path, marketplace_root=tmp_path / "marketplace-root")
+    plugin_target = marketplace_root / ".agents" / "plugins" / "aming-claw"
+    linked_payload = tmp_path / "linked-marketplace-payload"
+    linked_payload.mkdir()
+    (plugin_target / "skills").rename(plugin_target / "skills-old")
+    try:
+        (plugin_target / "skills").symlink_to(linked_payload, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    refreshed = install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+
+    assert refreshed == marketplace_root
+    assert not (plugin_target / "skills").is_symlink()
+    assert (plugin_target / "skills" / "aming-claw" / "SKILL.md").is_file()
+
+
+def test_doctor_plugin_fails_when_cache_payload_is_partial(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    marketplace_root = tmp_path / "marketplace-root"
+    cache_target = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+    codex_config = configure_codex_plugin(
+        codex_config=codex_home / "config.toml",
+        marketplace_root=marketplace_root,
+    )
+    shutil.rmtree(cache_target / "skills")
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        codex_home=codex_home,
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_plugin_cache"].status == "fail"
+    assert "missing payload skills" in checks["codex_plugin_cache"].detail
 
 
 def test_codex_install_surfaces_do_not_write_external_project_cwd(tmp_path, monkeypatch):

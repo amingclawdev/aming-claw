@@ -993,8 +993,10 @@ def _resolve_target(
         return stable_target
     if hint.target_node_id and hint.target_node_id in by_id:
         return by_id[hint.target_node_id]
-    if hint.target_node_id and hint.target_node_id in by_module:
-        return by_module[hint.target_node_id]
+    if hint.target_node_id:
+        module_target, _module_state = _unique_node_by_module(nodes, hint.target_node_id)
+        if module_target is not None:
+            return module_target
     if hint.target_node_id and hint.target_node_id in by_title:
         return by_title[hint.target_node_id]
     return None
@@ -1016,8 +1018,18 @@ def _resolve_stable_target(
     }
     if not any(stable_fields.values()):
         return None, "none"
-    if hint.target_module and hint.target_module in by_module:
-        return by_module[hint.target_module], "matched"
+    if hint.target_module:
+        module_target, module_state = _unique_node_by_module(nodes, hint.target_module)
+        if module_target is not None:
+            return module_target, "matched"
+        if module_state == "ambiguous":
+            candidates = [
+                node for node in nodes
+                if _node_matches_stable_fields(node, stable_fields)
+            ]
+            if len(candidates) == 1:
+                return candidates[0], "matched"
+            return None, "ambiguous"
 
     candidates = [
         node for node in nodes
@@ -1037,6 +1049,23 @@ def _resolve_stable_target(
             return title_candidates[0], "matched"
         if len(title_candidates) > 1:
             return None, "ambiguous"
+    return None, "missing"
+
+
+def _unique_node_by_module(
+    nodes: Iterable[dict[str, Any]],
+    module: str,
+) -> tuple[dict[str, Any] | None, str]:
+    if not module:
+        return None, "none"
+    candidates = [
+        node for node in nodes
+        if _node_module(node) == module
+    ]
+    if len(candidates) == 1:
+        return candidates[0], "matched"
+    if len(candidates) > 1:
+        return None, "ambiguous"
     return None, "missing"
 
 

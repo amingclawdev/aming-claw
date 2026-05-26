@@ -185,6 +185,40 @@ def test_governance_hint_prefers_stable_module_over_stale_node_id(tmp_path):
     assert summary["applied"][0]["target_node_id"] == "L7.new"
 
 
+def test_governance_hint_uses_exact_node_id_when_stable_module_is_duplicate(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        project / "docs" / "widget.md",
+        "<!-- governance-hint "
+        '{"attach_to_node":{"path":"docs/widget.md","role":"doc",'
+        '"target_node_id":"L7.ts","target_module":"web.widget","target_title":"web.widget"}}'
+        " -->\n# Widget\n",
+    )
+    nodes = [
+        {
+            "id": "L7.ts",
+            "title": "web.widget",
+            "primary": ["web/widget.ts"],
+            "secondary": [],
+            "metadata": {"module": "web.widget"},
+        },
+        {
+            "id": "L7.js",
+            "title": "web.widget",
+            "primary": ["web/widget.js"],
+            "secondary": [],
+            "metadata": {"module": "web.widget"},
+        },
+    ]
+
+    summary = apply_binding_hints_to_graph_nodes(project, nodes)
+
+    assert summary["applied_count"] == 1
+    assert nodes[0]["secondary"] == ["docs/widget.md"]
+    assert nodes[1]["secondary"] == []
+    assert summary["applied"][0]["target_node_id"] == "L7.ts"
+
+
 def test_governance_hint_audit_reports_node_id_only_and_target_conflict():
     hints = parse_governance_hint_bindings(
         "\n".join([
