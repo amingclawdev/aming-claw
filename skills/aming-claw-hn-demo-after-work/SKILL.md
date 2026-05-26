@@ -80,16 +80,17 @@ CREATING demo data, not reading existing data. Mandatory rules:
 6. mf_type=chain_rescue in mf_timeline_precheck output is the MVP MF storage
    bucket label, not an error. See aming-claw://mf-sop.
 
-## Observer Mode Reminder
+## Role and Mode
 
-This skill is Design Alignment Mode by default: scope, design contract,
-dispatch, STOP. Do not append implementation/verification/close_ready events
-yourself unless the user explicitly said one of: "推进实施", "进入执行模式",
-"监视任务完成", "我睡了你接管", or equivalent Execution Supervisor trigger
-phrase.
+This subskill inherits the observer-mode operator role, mode boundaries, and
+acceptance criteria from the umbrella `aming-claw-hn-demo` skill loaded by the
+Skill tool.
+Do not invent an `aming-claw://skill-hn-demo` MCP resource.
 
-For demos that need to populate timeline events showing the gate flow, declare
-"entering Execution Supervisor for demo populate" explicitly before doing it.
+This subskill covers only After Work operator steps for Asset Inbox, binding
+state, drift, impact scope, Review Queue evidence, and review-boundary checks.
+Use Design Alignment by default; enter Execution Supervisor only when the
+umbrella mode gate is explicitly satisfied.
 
 ## Operator Steps
 

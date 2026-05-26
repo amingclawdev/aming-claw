@@ -37,6 +37,9 @@ creates duplicate work.
 
 - Graph discovery: node, file, function, or neighbor evidence for the target
   area before reading broad source files.
+- Backlog duplicate/overlap probe: real `backlog_list` or governance API
+  response for the proposed work title/files before `backlog_upsert`, recorded
+  exactly with `count`, `bugs`, and `request_id`.
 - Backlog contract: row with title, details, target files, tests, required
   docs, and acceptance criteria.
 - Target file fence: exact files or worktree boundary assigned to the worker.
@@ -78,16 +81,17 @@ CREATING demo data, not reading existing data. Mandatory rules:
 6. mf_type=chain_rescue in mf_timeline_precheck output is the MVP MF storage
    bucket label, not an error. See aming-claw://mf-sop.
 
-## Observer Mode Reminder
+## Role and Mode
 
-This skill is Design Alignment Mode by default: scope, design contract,
-dispatch, STOP. Do not append implementation/verification/close_ready events
-yourself unless the user explicitly said one of: "推进实施", "进入执行模式",
-"监视任务完成", "我睡了你接管", or equivalent Execution Supervisor trigger
-phrase.
+This subskill inherits the observer-mode operator role, mode boundaries, and
+acceptance criteria from the umbrella `aming-claw-hn-demo` skill loaded by the
+Skill tool.
+Do not invent an `aming-claw://skill-hn-demo` MCP resource.
 
-For demos that need to populate timeline events showing the gate flow, declare
-"entering Execution Supervisor for demo populate" explicitly before doing it.
+This subskill covers only Before Work operator steps for graph-first discovery,
+backlog duplicate/overlap probing, backlog contract evidence, target fence
+evidence, and acceptance criteria. Use Design Alignment by default; enter
+Execution Supervisor only when the umbrella mode gate is explicitly satisfied.
 
 ## Operator Steps
 
@@ -96,11 +100,14 @@ For demos that need to populate timeline events showing the gate flow, declare
 2. Confirm the project and graph commit with `graph_status` or the dashboard.
 3. Inspect the Graph view for the target area. Prefer node inspector, related
    files, functions, and neighbors over broad source search.
-4. Inspect the Backlog row. Verify target files and acceptance criteria are
-   present before implementation.
-5. Inspect or state the fence: branch/worktree, owned files, base commit, and
+4. Run a real backlog duplicate/overlap probe for the proposed work title and
+   target files before creating or updating the backlog row. Record the exact
+   governance response body, including `count`, `bugs`, and `request_id`.
+5. Inspect or create the Backlog row. Verify target files and acceptance
+   criteria are present before implementation.
+6. Inspect or state the fence: branch/worktree, owned files, base commit, and
    any merge queue/fence token if this is a subagent demo.
-6. Capture screenshots or links for Graph, Backlog, and fence evidence.
+7. Capture screenshots or links for Graph, Backlog, and fence evidence.
 
 ## Evidence Summary
 
@@ -108,6 +115,7 @@ For demos that need to populate timeline events showing the gate flow, declare
 Before-work evidence
 - Fear: project structure misunderstanding and duplicate work
 - Graph: <snapshot/link/screenshot/node evidence>
+- Backlog duplicate/overlap probe: <exact governance response/request_id>
 - Backlog contract: <bug id/link/screenshot>
 - Fence: <branch/worktree/files/base commit>
 - Acceptance criteria: <summary or link>

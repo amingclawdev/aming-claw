@@ -31,6 +31,42 @@ AI provider for the demo.
 
 ## Guardrails
 
+### Role + Mode + Acceptance
+
+- Role: the AI session is the observer-mode demo operator for the HN demo
+  umbrella skill loaded by the Skill tool. The human reviews dashboard output
+  and audit evidence. Do not look up or invent `aming-claw://skill-hn-demo`;
+  use MCP resources only for the real runtime, graph, backlog, and evidence
+  calls listed in REQUIRED FIRST READ.
+- Fixture mode: `--ensure-fixture --no-browser` provides only a bootstrapped
+  `aming-claw-hn-demo` project, an active graph, and an empty backlog. It must
+  not seed demo backlog rows, timeline rows, contracts, or fabricated
+  graph-query trace ids.
+- Evidence mode: the AI observer-mode operator produces the demo contract,
+  backlog rows, timeline events, graph-query trace evidence, and evidence
+  summaries through real MCP calls against governance. Screenshots and
+  dashboard links are references to that server-verifiable evidence.
+- Mode boundary: Design Alignment is the default. Execution Supervisor mode is
+  allowed only after an explicit operator/user decision to populate or supervise
+  demo evidence; chain `task_create` dev/test/qa/merge remains out of scope for
+  the HN demo.
+- Before Work acceptance: after fixture setup, prove the project graph exists
+  and the backlog/timeline start empty, then run a real backlog
+  duplicate/overlap probe before creating or updating the demo backlog row.
+  Record the exact governance response body, including `count`, `bugs`, and
+  `request_id`, then create or inspect a backlog contract with target files,
+  tests/docs, acceptance criteria, and file/worktree fence evidence.
+- During Work acceptance: timeline, lane, dispatch/startup gate, and evidence
+  inspector claims come from real `task_timeline_append`, precheck, and
+  `graph_query` results. Capture returned ids and trace ids exactly; never
+  fabricate `graph_query_trace_ids`. If `mf_timeline_precheck` reports
+  `mf_type=chain_rescue`, describe it as the MVP MF storage bucket, not a chain
+  requirement.
+- After Work acceptance: Asset Inbox, binding state, drift, impact scope, and
+  Review Queue claims are inspected from the current demo project snapshot via
+  dashboard/MCP/governance evidence. Candidate or weak path evidence must stay
+  untrusted until accepted by the review boundary or source-controlled hint.
+
 - Do not silently start services. If governance is offline, tell the user to
   run `aming-claw start` in a separate terminal.
 - Use governance on `http://127.0.0.1:40000`; the dashboard is
