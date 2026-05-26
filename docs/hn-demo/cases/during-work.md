@@ -53,6 +53,14 @@ implementation, verification, merge readiness, and backlog close are separate
 state transitions. The contract, source head, dirty scope, and evidence timeline
 make those transitions reviewable.
 
+Observer mode also protects the developer's thinking time. The human can keep
+writing requirements and contracts, then dispatch several bounded workers in
+parallel instead of waiting for one agent at a time.
+
+The graph boundary is one-hop: branch/worktree graph artifacts are candidate
+evidence against the target commit, not canonical project memory. Only the
+target ref graph advances after ordered merge and target reconcile.
+
 Related dogfood story:
 
 [I told my AI to build a feature. Did it? I had no
@@ -64,6 +72,5 @@ queryable ledger that both the human and AI can read.
 
 Architecture references:
 
+- [During Work Architecture](../architecture/during-work-architecture.md)
 - [Manual Fix SOP](../../governance/manual-fix-sop.md)
-- [Parallel Agent Multibranch Runtime Design](../../dev/parallel-agent-multibranch-design.md)
-- [Parallel Agent Multibranch Test Scenarios](../../dev/parallel-agent-multibranch-test-scenarios.md)

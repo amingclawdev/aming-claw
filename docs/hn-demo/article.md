@@ -57,7 +57,10 @@ and accepted review events. The graph is not a mutable memory blob that the AI
 edits directly. If the graph is wrong, the repair path is source-controlled
 evidence or a reconcile run, not a silent database edit.
 
-Case: [Fear Before Work](../hn-demo/cases/before-work.md)
+Case: [Fear Before Work](cases/before-work.md)
+
+Architecture note:
+[Before Work Architecture](architecture/before-work-architecture.md)
 
 Related deeper story:
 [AI proposed 5 components for my parallel system. After walking one scenario, only 3 were real.](https://dev.to/amingin_ai/ai-proposed-5-components-for-my-parallel-system-after-walking-one-scenario-only-3-were-real-12nd)
@@ -87,7 +90,26 @@ close-ready events. The interesting part is not that a timeline exists. The
 interesting part is that "I implemented it", "it passed verification", "it is
 ready to merge", and "the backlog is closed" are different facts.
 
-Case: [Fear During Work](../hn-demo/cases/during-work.md)
+The workflow change I feel most in practice is observer mode. I can stay in
+requirements and review mode, file several contracts, tighten boundaries, and
+then dispatch bounded workers in parallel instead of waiting for one agent to
+finish before I can think about the next task. The agents do execution work. The
+observer keeps merge authority.
+
+The graph policy matters here. A branch graph is not project truth. A worker can
+produce one-hop candidate evidence against the target commit, but it cannot chain
+graph reconcile from its own branch, activate a branch-local projection, or carry
+that projection into another branch. The target ref's graph remains the only
+canonical project memory. After an ordered merge lands, the target ref is
+reconciled and the next graph snapshot becomes current.
+
+Without that rule, parallel AI work creates multiple plausible versions of the
+project in memory, not just multiple diffs in Git.
+
+Case: [Fear During Work](cases/during-work.md)
+
+Architecture note:
+[During Work Architecture](architecture/during-work-architecture.md)
 
 Related deeper story:
 [I told my AI to build a feature. Did it? I had no idea.](https://dev.to/amingin_ai/i-told-my-ai-to-build-a-feature-did-it-i-had-no-idea-1f1)
@@ -117,7 +139,10 @@ A changed doc first becomes a commit-bound asset with status and provenance. It
 becomes graph impact scope only after a reviewed binding, not because an AI or a
 path heuristic guessed it belonged there.
 
-Case: [Fear After Work](../hn-demo/cases/after-work.md)
+Case: [Fear After Work](cases/after-work.md)
+
+Architecture note:
+[After Work Architecture](architecture/after-work-architecture.md)
 
 Related deeper story:
 [AI's tech debt is invisible - even to AI. I solved it at the architecture layer.](https://dev.to/amingin_ai/ais-tech-debt-is-invisible-even-to-ai-i-solved-it-at-the-architecture-layer-1nh1)
@@ -184,13 +209,19 @@ ownership, work scope, and execution history.
 ## Links for readers
 
 Demo entry point:
-[HN Fear Demo](../hn-demo/README.md)
+[HN Fear Demo](README.md)
 
 The three case pages:
 
-- [Before work: project understanding and contract](../hn-demo/cases/before-work.md)
-- [During work: timeline, evidence, and merge boundary](../hn-demo/cases/during-work.md)
-- [After work: asset review, drift, and reconcile](../hn-demo/cases/after-work.md)
+- [Before work: project understanding and contract](cases/before-work.md)
+- [During work: timeline, evidence, and merge boundary](cases/during-work.md)
+- [After work: asset review, drift, and reconcile](cases/after-work.md)
+
+Architecture notes:
+
+- [Before Work Architecture](architecture/before-work-architecture.md)
+- [During Work Architecture](architecture/during-work-architecture.md)
+- [After Work Architecture](architecture/after-work-architecture.md)
 
 Deeper background stories:
 

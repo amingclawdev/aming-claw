@@ -63,5 +63,6 @@ contract.
 
 Architecture references:
 
+- [Before Work Architecture](../architecture/before-work-architecture.md)
 - [System Architecture](../../architecture.md)
 - [Manual Fix SOP](../../governance/manual-fix-sop.md)

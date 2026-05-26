@@ -14,6 +14,9 @@ Live AI execution is not required to understand or replay the article flow; the
 HN demo skill guides deterministic setup where possible and points to the exact
 dashboard surfaces to inspect.
 
+Main article draft:
+[Hope is not an engineering control for AI coding agents](article.md).
+
 ## Installed-User Prompt
 
 After installing the Aming Claw plugin, ask Codex or Claude:
@@ -27,11 +30,11 @@ possible, do not require live AI, and show me the dashboard URLs for each case.
 The skill should leave you with dashboard states that correspond to the three
 case pages:
 
-| Case | Page | Dashboard URL pattern |
-| --- | --- | --- |
-| Before work | [Fear Before Work](cases/before-work.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=graph` |
-| During work | [Fear During Work](cases/during-work.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=backlog&backlog=<backlog_id>` |
-| After work | [Fear After Work](cases/after-work.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=assets` |
+| Case | Page | Architecture note | Dashboard URL pattern |
+| --- | --- | --- | --- |
+| Before work | [Fear Before Work](cases/before-work.md) | [Before Work Architecture](architecture/before-work-architecture.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=graph` |
+| During work | [Fear During Work](cases/during-work.md) | [During Work Architecture](architecture/during-work-architecture.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=backlog&backlog=<backlog_id>` |
+| After work | [Fear After Work](cases/after-work.md) | [After Work Architecture](architecture/after-work-architecture.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=assets` |
 
 Each case also has a longer dogfood writeup:
 
@@ -69,13 +72,15 @@ architecture layer directly.
 ## Architecture Map
 
 - The before-work case is about the local graph-first control plane described in
-  [System Architecture](../architecture.md) and the scoped work ledger described
-  in [Manual Fix SOP](../governance/manual-fix-sop.md).
-- The during-work case is about bounded manual fixes plus branch-isolated
-  parallel work, covered by [Manual Fix SOP](../governance/manual-fix-sop.md),
-  [Parallel Agent Multibranch Runtime Design](../dev/parallel-agent-multibranch-design.md),
-  and [Parallel Agent Multibranch Test Scenarios](../dev/parallel-agent-multibranch-test-scenarios.md).
+  [Before Work Architecture](architecture/before-work-architecture.md),
+  [System Architecture](../architecture.md), and the scoped work ledger
+  described in [Manual Fix SOP](../governance/manual-fix-sop.md).
+- The during-work case is about observer-led parallel work, contract-bound
+  dispatch, timeline evidence, merge authority, and one-hop branch graph policy,
+  covered by [During Work Architecture](architecture/during-work-architecture.md)
+  and [Manual Fix SOP](../governance/manual-fix-sop.md).
 - The after-work case is about asset review and reconcile, covered by
+  [After Work Architecture](architecture/after-work-architecture.md),
   [Asset Inbox API Contract](../api/asset-inbox-contract.md),
   [Reconcile Workflow](../governance/reconcile-workflow.md), and
   [Manual Fix SOP](../governance/manual-fix-sop.md).

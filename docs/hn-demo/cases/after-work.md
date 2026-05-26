@@ -73,6 +73,7 @@ config, weak bindings, and review impact scope.
 
 Architecture references:
 
+- [After Work Architecture](../architecture/after-work-architecture.md)
 - [Asset Inbox API Contract](../../api/asset-inbox-contract.md)
 - [Reconcile Workflow](../../governance/reconcile-workflow.md)
 - [Manual Fix SOP](../../governance/manual-fix-sop.md)
