@@ -16,9 +16,14 @@ AI provider for the demo.
 - Use governance on `http://127.0.0.1:40000`; the dashboard is
   `http://127.0.0.1:40000/dashboard`.
 - Check or ask for the target `project_id` before using project-scoped
-  dashboard links.
+  dashboard links. If no target project exists and the user asked to run or
+  preview the HN demo, use the isolated demo fixture path below instead of
+  asking the user to invent a project id.
 - Do not mutate a user's real project by default. Use read-only evidence unless
   the user explicitly asks for a governed action.
+- Creating the isolated HN demo fixture is allowed for this skill: it writes a
+  generated project under the OS temp directory, bootstraps that fixture through
+  governance, and leaves the user's active app untouched.
 - If browser automation is available, open the dashboard and capture
   screenshots of each case. Otherwise provide exact links and ask the user to
   capture screenshots.
@@ -34,6 +39,12 @@ AI provider for the demo.
      link; say MCP is not loaded in this session.
    - If dashboard assets are missing, say the demo cannot show dashboard
      evidence until assets exist or the dashboard build runs.
+   - If `/api/projects` is empty, or the user has not selected a real project,
+     run `node frontend/dashboard/scripts/e2e-hn-demo.mjs --ensure-fixture --no-browser`
+     from the Aming Claw plugin checkout or installed plugin payload. This
+     runner is packaged with the plugin and does not require a dashboard npm
+     install for the `--no-browser` path. Use the returned
+     `project_id="aming-claw-hn-demo"` for dashboard links.
 2. Run the three cases in order:
    - Before work: use `aming-claw-hn-demo-before-work`.
    - During work: use `aming-claw-hn-demo-during-work`.

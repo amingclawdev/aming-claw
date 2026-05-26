@@ -7,8 +7,10 @@
 //   node scripts/e2e-hn-demo.mjs --dashboard http://127.0.0.1:40000/dashboard --project aming-claw
 //   node scripts/e2e-hn-demo.mjs --headed --keep-open
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import { exit } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -18,6 +20,8 @@ const require = createRequire(import.meta.url);
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "../../..");
 const DEFAULT_BACKEND = "http://127.0.0.1:40000";
 const DEFAULT_SCREENSHOT_DIR = path.join(REPO_ROOT, "docs", "hn-demo", "screenshots");
+const DEFAULT_FIXTURE_PROJECT = "aming-claw-hn-demo";
+const DEFAULT_FIXTURE_ROOT = path.join(os.tmpdir(), "ac-hn-demo-fixture");
 const DEFAULT_BACKLOG_ID = "HN-FEAR-DEMO-SMOKE-SCREENSHOTS-20260526";
 
 const FLAGS = parseFlags(process.argv.slice(2));
@@ -25,11 +29,18 @@ const BACKEND = trimTrailingSlash(FLAGS.backend || process.env.VITE_BACKEND_URL 
 const DASHBOARD = trimTrailingSlash(
   FLAGS.dashboard || process.env.DASHBOARD_URL || process.env.VITE_DASHBOARD_URL || `${BACKEND}/dashboard`,
 );
-const PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || "aming-claw";
+const EXPLICIT_PROJECT = Boolean(FLAGS.project || process.env.VITE_PROJECT_ID);
+let PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || DEFAULT_FIXTURE_PROJECT;
+const FIXTURE_PROJECT = FLAGS["fixture-project"] || DEFAULT_FIXTURE_PROJECT;
+const FIXTURE_ROOT = path.resolve(FLAGS["fixture-root"] || process.env.AMING_CLAW_HN_DEMO_FIXTURE_ROOT || DEFAULT_FIXTURE_ROOT);
 const BACKLOG_ID = FLAGS.backlog || DEFAULT_BACKLOG_ID;
 const SCREENSHOT_DIR = path.resolve(FLAGS.screenshots || DEFAULT_SCREENSHOT_DIR);
 const HEADLESS = FLAGS.headed !== true;
 const KEEP_OPEN = FLAGS["keep-open"] === true || FLAGS.interactive === true || FLAGS.headed === true;
+const ENSURE_FIXTURE = FLAGS["ensure-fixture"] === true || (!EXPLICIT_PROJECT && FLAGS["no-fixture"] !== true);
+if (ENSURE_FIXTURE) PROJECT = FIXTURE_PROJECT;
+const RESET_FIXTURE = FLAGS["reset-fixture"] === true;
+const NO_BROWSER = FLAGS["no-browser"] === true;
 const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 const NAV_TIMEOUT_MS = Number(FLAGS["nav-timeout-ms"] || 30000);
 
@@ -93,7 +104,7 @@ const fail = (text) => say("red", "  fail", text);
 const info = (text) => say("dim", "  -", text);
 
 function parseFlags(args) {
-  const bool = new Set(["headed", "keep-open", "interactive"]);
+  const bool = new Set(["headed", "keep-open", "interactive", "ensure-fixture", "reset-fixture", "no-browser", "no-fixture"]);
   const out = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -141,11 +152,17 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-async function http(method, route) {
+async function http(method, route, body = undefined) {
   let response;
   for (let attempt = 0; attempt <= HTTP_RETRIES; attempt++) {
     try {
-      response = await fetch(`${BACKEND}${route}`, { method, headers: { Accept: "application/json" } });
+      const headers = { Accept: "application/json" };
+      const init = { method, headers };
+      if (body !== undefined) {
+        headers["Content-Type"] = "application/json";
+        init.body = JSON.stringify(body);
+      }
+      response = await fetch(`${BACKEND}${route}`, init);
       break;
     } catch (error) {
       if (attempt >= HTTP_RETRIES) throw new HttpError(method, route, 0, String(error));
@@ -163,8 +180,285 @@ async function http(method, route) {
   return json;
 }
 
+function isInside(child, parent) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function writeFixtureFile(relativePath, content) {
+  const file = path.join(FIXTURE_ROOT, relativePath);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `${content.trim()}\n`, "utf8");
+}
+
+function runGit(args, cwd, allowFail = false) {
+  try {
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch (error) {
+    if (allowFail) return "";
+    throw error;
+  }
+}
+
+function materializeFixtureWorkspace() {
+  assert(!isInside(FIXTURE_ROOT, REPO_ROOT), `refusing to create HN demo fixture inside plugin checkout: ${FIXTURE_ROOT}`);
+  assert(
+    !FIXTURE_ROOT.replaceAll("\\", "/").includes("aming-claw"),
+    `refusing unsafe HN demo fixture path because legacy config fallback treats it as the self project: ${FIXTURE_ROOT}`,
+  );
+  if (RESET_FIXTURE && existsSync(FIXTURE_ROOT)) rmSync(FIXTURE_ROOT, { recursive: true, force: true });
+  mkdirSync(FIXTURE_ROOT, { recursive: true });
+  writeFixtureFile(
+    "package.json",
+    JSON.stringify(
+      {
+        name: "aming-claw-hn-demo-fixture",
+        version: "0.0.0",
+        private: true,
+        type: "module",
+        scripts: { test: "node tests/order-router.test.mjs" },
+      },
+      null,
+      2,
+    ),
+  );
+  writeFixtureFile(
+    "README.md",
+    `# Aming Claw HN Demo Fixture
+
+This generated project exists only so a first-run user can see Aming Claw
+without bootstrapping their real application. The files are small on purpose:
+one feature, one config file, one doc, and one test surface.
+`,
+  );
+  writeFixtureFile(
+    "src/order-router.js",
+    `import { readFeatureFlag } from "./runtime-config.js";
+
+export function routeOrder(order) {
+  if (!order || !order.id) return { queue: "manual-review", reason: "missing id" };
+  if (readFeatureFlag("priorityCheckout") && order.total > 500) {
+    return { queue: "priority", reason: "large order" };
+  }
+  return { queue: "standard", reason: "default" };
+}
+`,
+  );
+  writeFixtureFile(
+    "src/runtime-config.js",
+    `import { readFileSync } from "node:fs";
+
+const flags = JSON.parse(readFileSync(new URL("../config/feature-flags.json", import.meta.url), "utf8"));
+
+export function readFeatureFlag(name) {
+  return Boolean(flags[name]);
+}
+`,
+  );
+  writeFixtureFile("config/feature-flags.json", JSON.stringify({ priorityCheckout: true }, null, 2));
+  writeFixtureFile(
+    "docs/order-routing.md",
+    `# Order Routing
+
+Large orders should enter the priority queue when priority checkout is enabled.
+Orders without an id must stay in manual review.
+`,
+  );
+  writeFixtureFile(
+    "tests/order-router.test.mjs",
+    `import assert from "node:assert/strict";
+import { routeOrder } from "../src/order-router.js";
+
+assert.equal(routeOrder({ id: "o-1", total: 100 }).queue, "standard");
+assert.equal(routeOrder({ id: "o-2", total: 900 }).queue, "priority");
+assert.equal(routeOrder({ total: 900 }).queue, "manual-review");
+console.log("hn demo fixture ok");
+`,
+  );
+
+  const hasGit = runGit(["--version"], FIXTURE_ROOT, true);
+  if (!hasGit) {
+    warn("git is unavailable; fixture will bootstrap without a git commit");
+    return { workspace: FIXTURE_ROOT, commit: "" };
+  }
+  if (!existsSync(path.join(FIXTURE_ROOT, ".git"))) {
+    runGit(["init"], FIXTURE_ROOT);
+  }
+  runGit(["config", "user.email", "fixture@example.invalid"], FIXTURE_ROOT);
+  runGit(["config", "user.name", "HN Demo Fixture"], FIXTURE_ROOT);
+  runGit(["add", "."], FIXTURE_ROOT);
+  const dirty = runGit(["status", "--porcelain"], FIXTURE_ROOT);
+  if (dirty) runGit(["commit", "-m", "baseline hn demo fixture"], FIXTURE_ROOT);
+  const commit = runGit(["rev-parse", "HEAD"], FIXTURE_ROOT, true);
+  return { workspace: FIXTURE_ROOT, commit };
+}
+
+async function ensureFixtureProject() {
+  phase("isolated demo fixture");
+  PROJECT = FIXTURE_PROJECT;
+  const fixture = materializeFixtureWorkspace();
+  const projects = await http("GET", "/api/projects");
+  assert(Array.isArray(projects.projects), "/api/projects did not return projects[]");
+  const existing = projects.projects.find((project) => project.project_id === PROJECT);
+  const shouldBootstrap = !existing || RESET_FIXTURE || !existing.active_snapshot_id;
+  if (shouldBootstrap) {
+    const result = await http("POST", "/api/project/bootstrap", {
+      workspace_path: fixture.workspace,
+      project_name: PROJECT,
+      scan_depth: 3,
+      exclude_patterns: ["node_modules", "dist", "build", "coverage", ".aming-claw/e2e-artifacts"],
+      config_override: {
+        graph: { exclude_paths: ["node_modules", "dist", "build", "coverage", ".aming-claw/e2e-artifacts"] },
+      },
+    });
+    const returnedProject = result.project_id || PROJECT;
+    assert(
+      returnedProject === PROJECT,
+      `fixture bootstrap returned project_id=${returnedProject}, expected ${PROJECT}; refusing to seed demo data into the wrong project`,
+    );
+    PROJECT = returnedProject;
+    ok(`bootstrapped fixture project=${PROJECT} workspace=${fixture.workspace}`);
+  } else {
+    if (existing.workspace_path) {
+      const existingWorkspace = path.resolve(existing.workspace_path);
+      assert(
+        !isInside(existingWorkspace, REPO_ROOT),
+        `registered HN demo fixture points inside plugin checkout; refusing to use ${existingWorkspace}`,
+      );
+    }
+    ok(`fixture project already registered: ${PROJECT}`);
+  }
+  await seedFixtureBacklog(fixture.commit);
+}
+
+async function seedFixtureBacklog(commit) {
+  const chainTrigger = {
+    template_id: "hn_demo_fixture_contract.v1",
+    contract_instance_id: BACKLOG_ID,
+    mode: "isolated_demo_fixture",
+    evidence_requirements: [
+      { id: "project_structure", label: "Graph-first project structure", required: true },
+      { id: "timeline_lanes", label: "Observer and subagent lane evidence", required: true },
+      { id: "asset_review", label: "Docs/tests/config review surface", required: true },
+    ],
+  };
+  await http("POST", `/api/backlog/${pid(PROJECT)}/${pid(BACKLOG_ID)}`, {
+    force_admit: true,
+    actor: "hn_demo_fixture",
+    title: "HN demo fixture: contract, timeline, and asset review",
+    status: "OPEN",
+    priority: "P1",
+    target_files: ["src/order-router.js", "src/runtime-config.js"],
+    test_files: ["tests/order-router.test.mjs"],
+    required_docs: ["docs/order-routing.md"],
+    acceptance_criteria: [
+      "Show project structure before work starts.",
+      "Show observer and subagent evidence while work executes.",
+      "Show docs, tests, and config as reviewable assets after work lands.",
+    ],
+    details_md:
+      "Generated first-run HN demo fixture. It is isolated from the user's active app and exists only to make the demo usable before any real project is bootstrapped.",
+    chain_trigger_json: chainTrigger,
+    provenance_paths: ["HN-DEMO-FIRST-RUN-FIXTURE"],
+    commit,
+    mf_type: "manual_fix",
+  });
+
+  const timeline = await http("GET", `/api/task/${pid(PROJECT)}/timeline?backlog_id=${pid(BACKLOG_ID)}`);
+  if (Number(timeline.count || 0) > 0) {
+    ok(`fixture backlog already has ${timeline.count} timeline event(s)`);
+    return;
+  }
+  const base = {
+    backlog_id: BACKLOG_ID,
+    mf_id: BACKLOG_ID,
+    task_id: "hn-demo-fixture-task",
+    attempt_num: 1,
+    correlation_id: "hn-demo-first-run-fixture",
+    commit_sha: commit,
+  };
+  const events = [
+    {
+      event_type: "mf_dispatch",
+      event_kind: "implementation",
+      actor: "observer",
+      phase: "dispatch",
+      status: "accepted",
+      payload: { lane: "observer", orchestration: true, contract_evidence: [{ requirement_id: "project_structure", status: "passed" }] },
+    },
+    {
+      event_type: "subagent_result",
+      event_kind: "implementation",
+      actor: "mf_sub_graph",
+      phase: "graph_lookup",
+      status: "passed",
+      payload: {
+        lane: "frontend",
+        graph_query_trace_ids: ["gqt-hn-demo-fixture-structure"],
+        inspected_node_titles: ["src/order-router.js", "src/runtime-config.js"],
+        contract_evidence: [{ requirement_id: "project_structure", status: "passed" }],
+      },
+    },
+    {
+      event_type: "subagent_result",
+      event_kind: "implementation",
+      actor: "mf_sub_worker",
+      phase: "implementation",
+      status: "passed",
+      payload: {
+        lane: "backend",
+        changed_files: ["src/order-router.js", "src/runtime-config.js", "config/feature-flags.json"],
+        required_docs: ["docs/order-routing.md"],
+        contract_evidence: [{ requirement_id: "timeline_lanes", status: "passed" }],
+      },
+    },
+    {
+      event_type: "verification",
+      event_kind: "verification",
+      actor: "observer",
+      phase: "verification",
+      status: "passed",
+      verification: {
+        tests_run: ["npm test"],
+        passed: true,
+        contract_evidence: [{ requirement_id: "timeline_lanes", status: "passed" }],
+      },
+    },
+    {
+      event_type: "asset_review",
+      event_kind: "verification",
+      actor: "observer",
+      phase: "asset_review",
+      status: "passed",
+      payload: {
+        docs_updated: ["docs/order-routing.md"],
+        test_files: ["tests/order-router.test.mjs"],
+        config_files: ["config/feature-flags.json"],
+        contract_evidence: [{ requirement_id: "asset_review", status: "passed" }],
+      },
+    },
+    {
+      event_type: "close_ready",
+      event_kind: "close_ready",
+      actor: "observer",
+      phase: "close_ready",
+      status: "passed",
+      verification: {
+        contract_evidence: [
+          { requirement_id: "project_structure", status: "passed" },
+          { requirement_id: "timeline_lanes", status: "passed" },
+          { requirement_id: "asset_review", status: "passed" },
+        ],
+      },
+    },
+  ];
+  for (const event of events) await http("POST", `/api/task/${pid(PROJECT)}/timeline`, { ...base, ...event });
+  ok(`seeded fixture backlog=${BACKLOG_ID} timeline=${events.length} events`);
+}
+
 async function checkGovernance() {
   phase("governance and dashboard");
+  if (ENSURE_FIXTURE) await ensureFixtureProject();
   const [health, projects, status, backlog, feedback] = await Promise.all([
     http("GET", "/api/health"),
     http("GET", "/api/projects"),
@@ -296,11 +590,17 @@ async function captureScenario(page, scenario) {
 async function main() {
   console.log(c("bold", "hn-fear-demo-smoke"));
   console.log(c("dim", `backend=${BACKEND} dashboard=${DASHBOARD} project=${PROJECT}`));
+  if (ENSURE_FIXTURE) console.log(c("dim", `fixture=${FIXTURE_ROOT} fixture_project=${FIXTURE_PROJECT}`));
   console.log(c("dim", `screenshots=${SCREENSHOT_DIR}`));
 
   let browser = null;
   try {
     await checkGovernance();
+    if (NO_BROWSER) {
+      console.log("");
+      console.log(c("green", "HN DEMO FIXTURE OK"));
+      return;
+    }
     const { chromium } = await loadPlaywright();
     mkdirSync(SCREENSHOT_DIR, { recursive: true });
 

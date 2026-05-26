@@ -115,6 +115,21 @@ workspace. If `GET /api/projects` is empty or does not include the active
 workspace, ask before bootstrap unless the user explicitly requested
 initialize/register/bootstrap.
 
+HN demo is the safe exception. If the user asks to try, preview, or run the HN
+demo and there is no registered target project, do not ask them for a
+`project_id` and do not bootstrap their current app. From the Aming Claw plugin
+checkout, run:
+
+```text
+node frontend/dashboard/scripts/e2e-hn-demo.mjs --ensure-fixture --no-browser
+```
+
+That command creates an isolated fixture project under the OS temp directory,
+bootstraps it through governance as `aming-claw-hn-demo`, seeds the demo backlog
+row and timeline evidence, and returns a project-scoped dashboard target. The
+runner is included in the plugin payload, so the first-run `--no-browser` path
+does not require a dashboard npm install.
+
 Use governance on port `40000`, not the ServiceManager sidecar on `40101`:
 
 ```text

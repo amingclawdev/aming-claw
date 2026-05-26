@@ -34,11 +34,13 @@ REQUIRED_PLUGIN_FILES = (
     "skills/aming-claw-hn-demo-before-work/SKILL.md",
     "skills/aming-claw-hn-demo-during-work/SKILL.md",
     "skills/aming-claw-launcher/SKILL.md",
+    "frontend/dashboard/scripts/e2e-hn-demo.mjs",
     ".mcp.json",
 )
 CODEX_PLUGIN_PAYLOAD = (
     ".codex-plugin",
     "skills",
+    "frontend/dashboard/scripts/e2e-hn-demo.mjs",
     ".mcp.json",
     "README.md",
 )

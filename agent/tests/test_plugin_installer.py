@@ -122,10 +122,14 @@ def _write_plugin_fixture(root: Path) -> None:
         "skills/aming-claw-hn-demo-before-work/SKILL.md",
         "skills/aming-claw-hn-demo-during-work/SKILL.md",
         "skills/aming-claw-launcher/SKILL.md",
+        "frontend/dashboard/scripts/e2e-hn-demo.mjs",
     ):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("---\nname: test\n---\n", encoding="utf-8")
+        if rel.endswith(".mjs"):
+            path.write_text("#!/usr/bin/env node\nconsole.log('hn demo fixture ok');\n", encoding="utf-8")
+        else:
+            path.write_text("---\nname: test\n---\n", encoding="utf-8")
     server_path = root / "agent" / "mcp" / "server.py"
     server_path.parent.mkdir(parents=True, exist_ok=True)
     server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
@@ -568,6 +572,7 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     assert (target / "skills" / "aming-claw-hn-demo-before-work" / "SKILL.md").is_file()
     assert (target / "skills" / "aming-claw-hn-demo-during-work" / "SKILL.md").is_file()
     assert (target / "skills" / "aming-claw-hn-demo-after-work" / "SKILL.md").is_file()
+    assert (target / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs").is_file()
     assert not (target / "agent" / "mcp" / "server.py").exists()
 
     mcp = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))
@@ -661,6 +666,10 @@ def test_codex_install_surfaces_do_not_write_external_project_cwd(tmp_path, monk
 
     assert (cache_target / ".mcp.json").is_file()
     assert (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".mcp.json").is_file()
+    assert (cache_target / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs").is_file()
+    assert (
+        marketplace_target / ".agents" / "plugins" / "aming-claw" / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs"
+    ).is_file()
     for rel in (
         ".mcp.json",
         "shared-volume",

@@ -93,10 +93,14 @@ def _write_cli_plugin_fixture(root):
         "skills/aming-claw-hn-demo-before-work/SKILL.md",
         "skills/aming-claw-hn-demo-during-work/SKILL.md",
         "skills/aming-claw-launcher/SKILL.md",
+        "frontend/dashboard/scripts/e2e-hn-demo.mjs",
     ):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("---\nname: test\n---\n", encoding="utf-8")
+        if rel.endswith(".mjs"):
+            path.write_text("#!/usr/bin/env node\nconsole.log('hn demo fixture ok');\n", encoding="utf-8")
+        else:
+            path.write_text("---\nname: test\n---\n", encoding="utf-8")
     server_path = root / "agent" / "mcp" / "server.py"
     server_path.parent.mkdir(parents=True, exist_ok=True)
     server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")

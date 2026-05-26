@@ -140,6 +140,16 @@ initialization, registration, or bootstrap. Use governance, not ServiceManager:
 - Do not use `http://127.0.0.1:40101/` for project bootstrap; port `40101` is
   the ServiceManager sidecar.
 
+HN demo first-run is a narrow exception because it uses a generated isolated
+fixture, not the user's active workspace. When a user asks to try, preview, or
+run the HN demo and no project is registered, run
+`node frontend/dashboard/scripts/e2e-hn-demo.mjs --ensure-fixture --no-browser`
+from the Aming Claw plugin checkout. Use the returned
+`project_id="aming-claw-hn-demo"` for demo dashboard links. The runner is
+included in the plugin payload, so the first-run `--no-browser` path does not
+require a dashboard npm install. Do not scan the plugin checkout or bootstrap
+the current app just to obtain a project id.
+
 For an explicit "initialize this project" request, infer `project_id` from the
 folder name, `workspace_path` from the current workspace root, language from
 project files when obvious, and common excludes such as `node_modules`, `dist`,

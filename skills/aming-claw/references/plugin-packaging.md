@@ -71,6 +71,9 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   status, and dashboard flows.
 - `skills/aming-claw-hn-demo*/`: HN demo operator skills for the three-fear
   walkthrough and its before/during/after-work cases.
+- `frontend/dashboard/scripts/e2e-hn-demo.mjs`: packaged first-run HN demo
+  runner. It can create the isolated fixture with `--ensure-fixture
+  --no-browser` without requiring the full dashboard source tree or npm install.
 - `.mcp.json`: active MCP server config using `agent.mcp.server`.
 - `agent/plugin_installer.py` + `scripts/install_from_git.py`: Git URL plugin
   installer used by the CLI and first-run fallback flows.

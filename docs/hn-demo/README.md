@@ -30,6 +30,14 @@ possible, do not require live AI, and show me the dashboard URLs for each case.
 The skill should leave you with dashboard states that correspond to the three
 case pages:
 
+If this is your first run and governance has no registered project yet, the demo
+uses an isolated local fixture instead of asking you for a `project_id`. The
+fixture is created under the OS temp directory, bootstrapped as
+`aming-claw-hn-demo`, and seeded with demo backlog/timeline evidence so your
+real app is not touched. The first-run runner is packaged with the plugin at
+`frontend/dashboard/scripts/e2e-hn-demo.mjs`, so the `--no-browser` setup path
+does not require a dashboard npm install.
+
 | Case | Page | Architecture note | Dashboard URL pattern |
 | --- | --- | --- | --- |
 | Before work | [Fear Before Work](cases/before-work.md) | [Before Work Architecture](architecture/before-work-architecture.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=graph` |

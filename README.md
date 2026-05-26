@@ -168,6 +168,19 @@ readable directly:
 [during work](docs/hn-demo/cases/during-work.md), and
 [after work](docs/hn-demo/cases/after-work.md).
 
+First-run users do not need an existing `project_id`. The HN demo smoke creates
+an isolated local fixture under the OS temp directory, bootstraps it as
+`aming-claw-hn-demo`, and seeds the demo backlog/timeline evidence without
+touching the current app. The runner is packaged with the plugin, so this
+first-run path does not require a dashboard npm install:
+
+```bash
+node frontend/dashboard/scripts/e2e-hn-demo.mjs --ensure-fixture --no-browser
+```
+
+For repository dogfood screenshots, pass the real project explicitly:
+`cd frontend/dashboard && npm run e2e:hn-demo -- --project aming-claw`.
+
 ## Review-Scope Challenge
 
 This regression case is a small local E2E. The fixture creates a temporary
