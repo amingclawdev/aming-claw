@@ -3,8 +3,11 @@
 import json
 import os
 import sqlite3
+import subprocess
+import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 # Ensure agent/ is on sys.path
 import sys
@@ -14,7 +17,8 @@ if _agent_dir not in sys.path:
 
 from governance.preflight import (
     check_system, check_version, check_graph,
-    check_coverage, check_queue, check_plugin_update_state, run_preflight,
+    check_coverage, check_queue, check_plugin_update_state,
+    check_pending_governance_hints, run_preflight,
 )
 
 
@@ -256,6 +260,34 @@ class TestCheckPluginUpdateState(unittest.TestCase):
         self.assertIn("governance", result["details"]["blockers"][0])
 
 
+class TestCheckPendingGovernanceHints(unittest.TestCase):
+    def test_warns_when_tracked_governance_hint_file_is_dirty(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+
+            doc = root / "docs" / "order-routing.md"
+            doc.parent.mkdir()
+            doc.write_text("# Order routing\n", encoding="utf-8")
+            subprocess.run(["git", "add", "docs/order-routing.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "baseline"], cwd=root, check=True, capture_output=True)
+
+            doc.write_text(
+                "<!-- governance-hint {\"attach_to_node\":{\"target_node_id\":\"L7.1\"}} -->\n"
+                "# Order routing\n",
+                encoding="utf-8",
+            )
+
+            result = check_pending_governance_hints(root)
+
+        self.assertEqual(result["status"], "warn")
+        self.assertEqual(result["details"]["pending_count"], 1)
+        self.assertEqual(result["details"]["pending_governance_hints"][0]["path"], "docs/order-routing.md")
+        self.assertIn("commit the governance hint", result["details"]["recommended_action"])
+
+
 class TestRunPreflight(unittest.TestCase):
     def setUp(self):
         self.conn = _create_test_db()
@@ -264,6 +296,7 @@ class TestRunPreflight(unittest.TestCase):
 
         self._preflight_module = preflight
         self._old_check_plugin_update_state = preflight.check_plugin_update_state
+        self._old_check_pending_governance_hints = preflight.check_pending_governance_hints
         preflight.check_plugin_update_state = lambda state_path=None: {
             "status": "pass",
             "details": {
@@ -274,6 +307,13 @@ class TestRunPreflight(unittest.TestCase):
                 "warnings": [],
             },
         }
+        preflight.check_pending_governance_hints = lambda repo_root_path=None: {
+            "status": "pass",
+            "details": {
+                "pending_count": 0,
+                "pending_governance_hints": [],
+            },
+        }
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             "INSERT INTO project_version VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -282,6 +322,7 @@ class TestRunPreflight(unittest.TestCase):
 
     def tearDown(self):
         self._preflight_module.check_plugin_update_state = self._old_check_plugin_update_state
+        self._preflight_module.check_pending_governance_hints = self._old_check_pending_governance_hints
 
     def test_full_report_structure(self):
         report = run_preflight(self.conn, self.pid)
@@ -290,7 +331,10 @@ class TestRunPreflight(unittest.TestCase):
         self.assertIn("blockers", report)
         self.assertIn("warnings", report)
         self.assertIn("auto_fixed", report)
-        for category in ("system", "version", "graph", "coverage", "queue", "plugin_update_state"):
+        for category in (
+            "system", "version", "graph", "coverage", "queue",
+            "plugin_update_state", "pending_governance_hints",
+        ):
             self.assertIn(category, report["checks"])
 
     def test_ok_true_when_all_pass(self):

@@ -15,6 +15,7 @@ import logging
 import os
 import glob as _glob
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -489,6 +490,115 @@ def check_plugin_update_state(state_path: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 9. Governance hint check — source hints must be committed before reconcile
+# ---------------------------------------------------------------------------
+
+def _git_repo_root(repo_root_path: str | os.PathLike | None = None) -> Path | None:
+    """Return the Git root for a path, or None when the path is not in Git."""
+    try:
+        import subprocess
+
+        start = Path(repo_root_path or os.getcwd()).resolve()
+        cwd = start if start.is_dir() else start.parent
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        root = proc.stdout.strip()
+        return Path(root).resolve() if root else None
+    except Exception:
+        return None
+
+
+def _dirty_tracked_files(repo_root: Path) -> tuple[list[dict], str | None]:
+    """Return tracked dirty files from porcelain status output."""
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "status", "--porcelain=1", "-z", "--untracked-files=no"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return [], proc.stderr.strip() or "git status failed"
+
+        files = []
+        parts = proc.stdout.split("\0")
+        idx = 0
+        while idx < len(parts):
+            item = parts[idx]
+            idx += 1
+            if not item:
+                continue
+            status = item[:2]
+            rel_path = item[3:]
+            if not rel_path:
+                continue
+            if status[0] in {"R", "C"} and idx < len(parts):
+                # Porcelain -z includes the source path as the next field for
+                # renames/copies.  The current path is the one that can carry
+                # a newly written governance hint.
+                idx += 1
+            files.append({"path": rel_path, "status": status})
+        return files, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def check_pending_governance_hints(repo_root_path: str | os.PathLike | None = None) -> dict:
+    """Warn when source-controlled governance-hint comments are dirty.
+
+    Governance Hint writes source comments that only become durable graph input
+    after commit + reconcile.  A dirty tracked file containing such a hint is a
+    pending operator action, not just ordinary workspace noise.
+    """
+    root = _git_repo_root(repo_root_path)
+    empty = {"pending_count": 0, "pending_governance_hints": []}
+    if root is None:
+        return _pass({**empty, "skipped": True, "reason": "not_git_repo"})
+
+    dirty_files, error = _dirty_tracked_files(root)
+    if error:
+        return _warn({**empty, "error": error})
+
+    pending = []
+    for item in dirty_files:
+        status = item.get("status", "")
+        rel_path = item.get("path", "")
+        if "D" in status or not rel_path:
+            continue
+        path = root / rel_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "governance-hint" in text:
+            pending.append({"path": rel_path, "status": status.strip() or status})
+
+    if not pending:
+        return _pass(empty)
+
+    return _warn({
+        "pending_count": len(pending),
+        "pending_governance_hints": pending,
+        "recommended_action": (
+            "commit the governance hint file(s) and run Update Graph/reconcile, "
+            "or intentionally revert the hint before continuing"
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Auto-fix actions
 # ---------------------------------------------------------------------------
 
@@ -567,6 +677,7 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
     checks["queue"] = check_queue(conn, project_id)
     checks["batch_worktrees"] = check_batch_worktrees(conn, project_id)
     checks["plugin_update_state"] = check_plugin_update_state()
+    checks["pending_governance_hints"] = check_pending_governance_hints()
 
     # Collect warnings and blockers
     for name, result in checks.items():
@@ -589,6 +700,10 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
                 warnings.extend(
                     f"plugin update state: {item}"
                     for item in details.get("warnings", [])
+                )
+            elif name == "pending_governance_hints" and details.get("pending_count"):
+                warnings.append(
+                    f"{details['pending_count']} uncommitted governance hint file(s)"
                 )
             else:
                 warnings.append(f"{name}: {result['status']}")
