@@ -33,10 +33,23 @@ case pages:
 If this is your first run and governance has no registered project yet, the demo
 uses an isolated local fixture instead of asking you for a `project_id`. The
 fixture is created under the OS temp directory, bootstrapped as
-`aming-claw-hn-demo`, and seeded with demo backlog/timeline evidence so your
-real app is not touched. The first-run runner is packaged with the plugin at
+`aming-claw-hn-demo`, and left with an active graph plus empty backlog/timeline
+so the observer has to create evidence for real. Your real app is not touched.
+The first-run runner is packaged with the plugin at
 `frontend/dashboard/scripts/e2e-hn-demo.mjs`, so the `--no-browser` setup path
 does not require a dashboard npm install.
+
+For launch rehearsal, use the repeatable sandbox audit runner:
+
+```bash
+node frontend/dashboard/scripts/e2e-hn-demo.mjs --sandbox-audit --no-browser
+```
+
+That path creates an isolated fixture project, runs install/package smoke
+checks, drives the three demo fears through real governance calls, and writes
+`docs/hn-demo/audits/latest.md` plus `latest.json`. Browser capture is optional:
+add `--browser --port <port> --project-id <isolated-id>` to record screenshots
+against a non-conflicting dashboard session.
 
 | Case | Page | Architecture note | Dashboard URL pattern |
 | --- | --- | --- | --- |

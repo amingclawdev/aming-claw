@@ -125,10 +125,23 @@ node frontend/dashboard/scripts/e2e-hn-demo.mjs --ensure-fixture --no-browser
 ```
 
 That command creates an isolated fixture project under the OS temp directory,
-bootstraps it through governance as `aming-claw-hn-demo`, seeds the demo backlog
-row and timeline evidence, and returns a project-scoped dashboard target. The
+bootstraps it through governance as `aming-claw-hn-demo`, and verifies that the
+fixture starts with an active graph plus empty backlog/timeline. It does not
+seed demo backlog rows, timeline evidence, or fabricated graph trace ids. The
 runner is included in the plugin payload, so the first-run `--no-browser` path
 does not require a dashboard npm install.
+
+For a full launch rehearsal, run the repeatable sandbox audit:
+
+```text
+node frontend/dashboard/scripts/e2e-hn-demo.mjs --sandbox-audit --no-browser
+```
+
+That mode adds install/package smoke checks, creates a run-specific fixture
+project, drives the before/during/after demo through real governance calls, and
+writes `docs/hn-demo/audits/latest.md` plus `latest.json`. Use `--browser` only
+when dashboard screenshots are needed; the default no-browser path is the
+fastest onboarding gate.
 
 Use governance on port `40000`, not the ServiceManager sidecar on `40101`:
 

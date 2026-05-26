@@ -42,6 +42,11 @@ AI provider for the demo.
   `aming-claw-hn-demo` project, an active graph, and an empty backlog. It must
   not seed demo backlog rows, timeline rows, contracts, or fabricated
   graph-query trace ids.
+- Sandbox audit mode: `--sandbox-audit --no-browser` is the repeatable launch
+  gate. It creates a run-specific isolated fixture, runs install/package smoke
+  checks, drives before/during/after evidence through real governance calls,
+  and writes `docs/hn-demo/audits/latest.md` plus `latest.json`. Add
+  `--browser` only when screenshots are part of the review.
 - Evidence mode: the AI observer-mode operator produces the demo contract,
   backlog rows, timeline events, graph-query trace evidence, and evidence
   summaries through real MCP calls against governance. Screenshots and
@@ -109,6 +114,11 @@ AI provider for the demo.
      runner is packaged with the plugin and does not require a dashboard npm
      install for the `--no-browser` path. Use the returned
      `project_id="aming-claw-hn-demo"` for dashboard links.
+   - If the user asks whether the demo is ready for HN/public launch, run
+     `node frontend/dashboard/scripts/e2e-hn-demo.mjs --sandbox-audit --no-browser`
+     instead. Treat the generated Same-Observer Self-Review as the semantic
+     evaluation: the operator that ran the evidence writes why it trusts or
+     hesitates on the result.
 2. Run the three cases in order:
    - Before work: use `aming-claw-hn-demo-before-work`.
    - During work: use `aming-claw-hn-demo-during-work`.
