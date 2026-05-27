@@ -150,32 +150,39 @@ surprises users often enough that we call it out.
 ## HN Demo
 
 The HN demo article starts here:
-[Hope is not an engineering control for AI coding agents](docs/hn-demo/article.md).
-It is the no-install reading path for the three-fear story, with case pages and
-architecture notes linked from the article.
+[Show HN: Aming Claw - A new multi-agent coding architecture (zero
+orchestration, commit-bound)](docs/hn-demo/article.md).
+
+The runnable demo is the multi-agent challenge:
+[HN Multi-Agent Challenge Demo](docs/hn-demo/README.md). It shows one observer
+coordinating two contracted workers against the same commit-bound project graph:
+one worker passes, one fails or is interrupted, the observer replays the failed
+worker from the same contract lineage, and accepted work reconciles once against
+the target graph.
+
+More cases, audit trails, and the longer design story are here:
+[Hope is not an engineering control for AI coding agents](docs/hn-demo/design-story.md).
 
 After installing the plugin and opening a new AI host session, invoke the HN
 demo skill:
 
 ```text
-Run the Aming Claw HN demo
+Run the Aming Claw HN multi-agent challenge demo
 ```
 
-The skill walks through the before-work, during-work, and after-work cases and
-opens the local dashboard views that back the story. The case pages are also
-readable directly:
-[before work](docs/hn-demo/cases/before-work.md),
-[during work](docs/hn-demo/cases/during-work.md), and
-[after work](docs/hn-demo/cases/after-work.md).
+The skill should create or reuse an isolated fixture, produce fresh backlog
+rows, timeline events, graph traces, worker fences, tests, replay evidence,
+reconcile evidence, and a generated audit report. It should not treat
+pre-existing fixture data as proof.
 
 First-run users do not need an existing `project_id`. The HN demo smoke creates
 an isolated local fixture under the OS temp directory, bootstraps it as
-`aming-claw-hn-demo`, and seeds the demo backlog/timeline evidence without
-touching the current app. The runner is packaged with the plugin, so this
-first-run path does not require a dashboard npm install:
+`aming-claw-hn-demo`, and leaves the observer to create evidence during the run
+without touching the current app. The runner is packaged with the plugin, so
+this first-run path does not require a dashboard npm install:
 
 ```bash
-node frontend/dashboard/scripts/e2e-hn-demo.mjs --ensure-fixture --no-browser
+node frontend/dashboard/scripts/e2e-hn-demo.mjs --sandbox-audit --no-browser
 ```
 
 For repository dogfood screenshots, pass the real project explicitly:
@@ -731,7 +738,7 @@ Aming Claw ships these assets in the repo:
 - `.mcp.json` — MCP server contract (read when the repo is opened as a workspace; the CLI installer also generates cache-aware overrides for plugin-mode loading)
 - `skills/aming-claw/` — main governance skill
 - `skills/aming-claw-launcher/` — onboarding/launcher skill
-- `skills/aming-claw-hn-demo*/` — HN demo operator skills for the three-fear walkthrough
+- `skills/aming-claw-hn-demo*/` — HN demo operator skills for the multi-agent challenge and supporting case walkthroughs
 - `agent/mcp/resources/seed-graph-summary.json` — lightweight packaged context
   for fresh sessions
 - `agent/mcp/resources/self-graph-bundle-manifest.json` — read-only compatibility

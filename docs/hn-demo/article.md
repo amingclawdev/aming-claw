@@ -84,7 +84,7 @@ against.
 
 Repo: https://github.com/amingclawdev/aming-claw
 
-How to run the demo: [HN Fear Demo README](README.md)
+How to run the demo: [HN multi-agent challenge demo](README.md)
 
 More cases, audit trails, and the design story: [Hope is not an engineering
 control for AI coding agents](design-story.md)

@@ -1,6 +1,6 @@
 ---
 name: aming-claw-hn-demo
-description: Guided operator for the full Aming Claw HN three-fear demo. Use when a user asks to run, preview, present, or collect evidence for the HN demo covering before-work project understanding, during-work subagent observability, and after-work docs/tests/config drift.
+description: Guided operator for the Aming Claw HN multi-agent challenge demo. Use when a user asks to run, preview, present, or collect evidence for the HN demo showing one observer coordinating multiple commit-bound workers, failed/interrupted worker replay, graph traces, reconcile, and audit self-review.
 ---
 
 ## REQUIRED FIRST READ
@@ -23,7 +23,7 @@ Common failures when these are skipped:
 - Fabricating trace_id strings (audit ledger is server-resolvable, will fail)
 - Running Execution Supervisor mode by default (Design Alignment is default)
 
-# Aming Claw HN Demo
+# Aming Claw HN Multi-Agent Challenge Demo
 
 Run this as a guided operator flow, not a mandatory replay engine. Prefer
 deterministic dashboard, MCP, git, and fixture evidence. Do not require a live
@@ -44,9 +44,9 @@ AI provider for the demo.
   graph-query trace ids.
 - Sandbox audit mode: `--sandbox-audit --no-browser` is the repeatable launch
   gate. It creates a run-specific isolated fixture, runs install/package smoke
-  checks, drives before/during/after evidence through real governance calls,
-  and writes `docs/hn-demo/audits/latest.md` plus `latest.json`. Add
-  `--browser` only when screenshots are part of the review.
+  checks, drives the multi-agent challenge through real governance calls, and
+  writes `docs/hn-demo/audits/latest.md` plus `latest.json`. Add `--browser`
+  only when screenshots are part of the review.
 - Docker install audit mode: for true one-click install E2E, first run
   `docker/hn-install-audit/run-install-audit.sh --host both`. That produces
   separate Codex and Claude Code install reports from fresh container HOME
@@ -61,21 +61,21 @@ AI provider for the demo.
   allowed only after an explicit operator/user decision to populate or supervise
   demo evidence; chain `task_create` dev/test/qa/merge remains out of scope for
   the HN demo.
-- Before Work acceptance: after fixture setup, prove the project graph exists
+- Setup acceptance: after fixture setup, prove the project graph exists
   and the backlog/timeline start empty, then run a real backlog
   duplicate/overlap probe before creating or updating the demo backlog row.
   Record the exact governance response body, including `count`, `bugs`, and
   `request_id`, then create or inspect a backlog contract with target files,
   tests/docs, acceptance criteria, and file/worktree fence evidence.
-- During Work acceptance: timeline, lane, dispatch/startup gate, replay, and
-  evidence inspector claims come from real `task_timeline_append`, precheck,
-  server-side parallel branch runtime allocation, and `graph_query` results.
-  Populate at least two worker contexts with disjoint `owned_files`; a
-  one-worker timeline is not sufficient evidence for the parallel during-work
-  case. The launch demo should be replay-shaped: one worker passes, one worker
-  fails or is interrupted, and a replay attempt passes from the same contract
-  evidence with `attempt_num`, parent task/contract identity, owned files,
-  fence token, graph-query trace ids, and verification result preserved. Local
+- Parallel worker and replay acceptance: timeline, lane, dispatch/startup gate,
+  replay, and evidence inspector claims come from real `task_timeline_append`,
+  precheck, server-side parallel branch runtime allocation, and `graph_query`
+  results. Populate at least two worker contexts with disjoint `owned_files`; a
+  one-worker timeline is not sufficient evidence for the HN challenge. The
+  launch demo must be replay-shaped: one worker passes, one worker fails or is
+  interrupted, and a replay attempt passes from the same contract evidence with
+  `attempt_num`, parent task/contract identity, owned files, fence token,
+  graph-query trace ids, and verification result preserved. Local
   `aming-claw mf dispatch-gate` validates the payload; it does not by itself
   register the worker fence with governance. Before the first `mf_subagent`
   `graph_query`, create or verify each worker runtime context through
@@ -88,10 +88,11 @@ AI provider for the demo.
   users do not need two AI subscriptions. If `mf_timeline_precheck` reports
   `mf_type=chain_rescue`, describe it as the MVP MF storage bucket, not a chain
   requirement.
-- After Work acceptance: Asset Inbox, binding state, drift, impact scope, and
-  Review Queue claims are inspected from the current demo project snapshot via
-  dashboard/MCP/governance evidence. Candidate or weak path evidence must stay
-  untrusted until accepted by the review boundary or source-controlled hint.
+- Reconcile and review acceptance: accepted work reconciles once against the
+  target graph, graph status and operations queue evidence are captured, and
+  the generated audit report explains why the same observer trusts or hesitates
+  on the run. Candidate or weak path evidence must stay untrusted until accepted
+  by the review boundary or source-controlled hint.
 
 - Do not silently start services. If governance is offline, tell the user to
   run `aming-claw start` in a separate terminal.
@@ -107,7 +108,8 @@ AI provider for the demo.
   generated project under the OS temp directory, bootstraps that fixture through
   governance, and leaves the user's active app untouched.
 - If browser automation is available, open the dashboard and capture
-  screenshots of each case. Otherwise provide exact links and ask the user to
+  screenshots of the challenge surfaces: graph, backlog timeline, operations,
+  review, and audit report. Otherwise provide exact links and ask the user to
   capture screenshots.
 - Treat screenshots as evidence references: record filename, view, project id,
   and what claim the screenshot supports.
@@ -136,17 +138,31 @@ AI provider for the demo.
      run `docker/hn-install-audit/run-install-audit.sh --host both` first, then
      rerun `--sandbox-audit` with the two generated `--codex-install-report`
      and `--claude-install-report` paths plus `--require-install-gates`.
-2. Run the three cases in order:
-   - Before work: use `aming-claw-hn-demo-before-work`.
-   - During work: use `aming-claw-hn-demo-during-work`.
-   - After work: use `aming-claw-hn-demo-after-work`.
-3. For each case, collect:
-   - fear being addressed;
+2. Run the multi-agent challenge:
+   - Prove the fixture has an active commit-bound graph and an empty
+     backlog/timeline before evidence creation.
+   - Create or inspect one backlog row with an `mf_parallel.v1` contract for at
+     least two disjoint workers.
+   - Allocate or verify per-worker runtime contexts and fence tokens before any
+     `mf_subagent` graph query.
+   - Record Worker A passing, Worker B failing or being interrupted, and Worker
+     B replay passing from the same contract lineage and frozen commit.
+   - Capture real graph trace ids, test output, ordered merge/reconcile
+     evidence, and close/precheck status.
+   - Write or point to the generated audit report and quote the same-observer
+     evaluation.
+3. Collect the evidence index:
    - dashboard or MCP views inspected;
-   - screenshots or links;
-   - architecture reason;
-   - any limitation, such as offline services or missing fixture data.
-4. End with a compact evidence index.
+   - graph trace ids and whether they resolve;
+   - worker task ids, fences, owned files, and replay lineage;
+   - tests and reconcile evidence;
+   - screenshots or dashboard links;
+   - limitations, such as offline services, missing install-gate reports, or no
+     live AI provider.
+4. Optional: if the user explicitly asks for the older before/during/after story,
+   use the supporting sub-skills `aming-claw-hn-demo-before-work`,
+   `aming-claw-hn-demo-during-work`, and `aming-claw-hn-demo-after-work`.
+5. End with a compact evidence index.
 
 ## Suggested Dashboard Links
 
@@ -167,8 +183,10 @@ sidebar and record the actual URL.
 ```text
 HN demo evidence
 - Runtime: governance=<ok/offline>, dashboard=<ok/missing>, MCP=<ok/missing>, project_id=<id>
-- Before work: graph=<link/screenshot>, backlog=<link/screenshot>, fence=<evidence>, result=<claim>
-- During work: timeline=<link/screenshot>, lanes=<link/screenshot>, gate=<evidence>, result=<claim>
-- After work: asset_inbox=<link/screenshot>, drift=<link/screenshot>, review_queue=<link/screenshot>, result=<claim>
+- Graph: snapshot=<id>, graph=<link/screenshot>, result=<claim>
+- Workers: A=<pass evidence>, B=<failed/interrupted evidence>, replay=<pass evidence>
+- Timeline: backlog=<link/screenshot>, lanes=<link/screenshot>, trace_ids=<resolvable ids>
+- Merge/reconcile: commit=<sha>, operations=<link/screenshot>, result=<claim>
+- Audit report: path=<latest.md/report>, same_observer_score=<score>, hesitation=<reason>
 - Limitations: <offline services, missing fixture, manual screenshots, no live AI provider needed>
 ```
