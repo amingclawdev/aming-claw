@@ -91,11 +91,13 @@ project asking the agent to reason from stale structure?
 This matters because AI can make plausible architecture mistakes that are not
 syntax errors.
 
-One of my earlier failures was a service-pattern miss. A project already had a
-standard HTTP service pattern, but the AI introduced a parallel WebSocket-style
-service that looked coherent in isolation and wrong in context. The code could
-compile. The problem was that the agent did not see the existing project shape
-before writing.
+One of my earlier failures was a StateService refactor. The AI proposed a
+plausible five-component architecture around the existing HTTP/SSE state flow.
+Walking one concrete scenario showed that only three components were actually
+load-bearing; the rest were plausible scaffolding that would have created a
+second path to maintain. The problem was not that the code could not compile.
+The problem was that the agent optimized for architectural plausibility before
+seeing which project structures already carried the state flow.
 
 Aming Claw treats the graph as a commit-bound projection of source, hints, config,
 and accepted review events. The graph is not a mutable memory blob that the AI
