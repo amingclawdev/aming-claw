@@ -577,9 +577,14 @@ async function runInstallSmoke(audit) {
   const codexManifest = existsSync(path.join(REPO_ROOT, ".codex-plugin", "plugin.json"))
     ? readJsonFile(path.join(REPO_ROOT, ".codex-plugin", "plugin.json"))
     : {};
-  const python = FLAGS.python || process.env.PYTHON || "python3";
-  let cliHelp = runCommand(python, ["-m", "agent.cli", "--help"], { timeout: 30000 });
-  if (!cliHelp.ok && python !== "python") cliHelp = runCommand("python", ["-m", "agent.cli", "--help"], { timeout: 30000 });
+  const pythonCandidates = [FLAGS.python, process.env.PYTHON, "python3", "python"]
+    .filter(Boolean)
+    .filter((item, index, values) => values.indexOf(item) === index);
+  let cliHelp = { ok: false, command: "", stderr: "no Python candidates" };
+  for (const python of pythonCandidates) {
+    cliHelp = runCommand(python, ["-m", "agent.cli", "--help"], { timeout: 30000 });
+    if (cliHelp.ok) break;
+  }
   const dashboardRoute = await httpText("GET", "/dashboard").catch((error) => ({
     ok: false,
     status: 0,

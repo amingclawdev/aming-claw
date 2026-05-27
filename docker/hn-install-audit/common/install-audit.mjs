@@ -152,7 +152,7 @@ function installRuntime() {
 
 function installCodexPlugin() {
   return run(
-    "python3",
+    PYTHON_BIN,
     [
       "-m",
       "agent.cli",
