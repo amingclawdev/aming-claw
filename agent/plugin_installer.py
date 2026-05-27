@@ -254,6 +254,7 @@ def _run(
     cwd: Optional[Path] = None,
     dry_run: bool = False,
     commands: Optional[list[CommandRecord]] = None,
+    quiet: bool = False,
 ) -> None:
     record = CommandRecord(args=[str(part) for part in args], cwd=str(cwd or ""), skipped=dry_run)
     if commands is not None:
@@ -261,12 +262,23 @@ def _run(
     if dry_run:
         return
     try:
-        subprocess.run([str(part) for part in args], cwd=str(cwd) if cwd else None, check=True)
+        run_kwargs: dict[str, Any] = {
+            "cwd": str(cwd) if cwd else None,
+            "check": True,
+        }
+        if quiet:
+            run_kwargs.update({"capture_output": True, "text": True})
+        subprocess.run([str(part) for part in args], **run_kwargs)
     except FileNotFoundError as exc:
         raise PluginInstallError(f"command not found: {args[0]}") from exc
     except subprocess.CalledProcessError as exc:
+        detail = ""
+        if quiet:
+            detail_text = (exc.stderr or exc.stdout or "").strip()
+            if detail_text:
+                detail = f": {detail_text[-1000:]}"
         raise PluginInstallError(
-            f"command failed ({exc.returncode}): {_command_text(record.args)}"
+            f"command failed ({exc.returncode}): {_command_text(record.args)}{detail}"
         ) from exc
 
 
@@ -1060,6 +1072,7 @@ def _apply_plugin_commit(
     *,
     commands: list[CommandRecord],
     dry_run: bool,
+    quiet: bool = False,
 ) -> None:
     branch = _current_git_branch(plugin_root)
     if branch and branch != "HEAD":
@@ -1068,6 +1081,7 @@ def _apply_plugin_commit(
             cwd=plugin_root,
             dry_run=dry_run,
             commands=commands,
+            quiet=quiet,
         )
     else:
         _run(
@@ -1075,6 +1089,7 @@ def _apply_plugin_commit(
             cwd=plugin_root,
             dry_run=dry_run,
             commands=commands,
+            quiet=quiet,
         )
 
 
@@ -1114,6 +1129,7 @@ def update_plugin_from_git(
     codex_config: Optional[Union[Path, str]] = None,
     codex_marketplace_root: Optional[Union[Path, str]] = None,
     state_path: Optional[Union[Path, str]] = None,
+    suppress_command_output: bool = False,
     dry_run: bool = False,
 ) -> PluginUpdateResult:
     """Check or apply a Git-backed plugin update and refresh local state."""
@@ -1137,6 +1153,7 @@ def update_plugin_from_git(
             cwd=plugin_root,
             dry_run=dry_run,
             commands=commands,
+            quiet=suppress_command_output,
         )
         if dry_run:
             status = "dry_run"
@@ -1214,7 +1231,13 @@ def update_plugin_from_git(
                 next_steps=["Run `aming-claw plugin update --apply` to fast-forward the local plugin checkout."],
             )
 
-        _apply_plugin_commit(plugin_root, remote_commit, commands=commands, dry_run=dry_run)
+        _apply_plugin_commit(
+            plugin_root,
+            remote_commit,
+            commands=commands,
+            dry_run=dry_run,
+            quiet=suppress_command_output,
+        )
         validated = validate_plugin_root(plugin_root)
         installed_package = False
         if install_package:
@@ -1223,6 +1246,7 @@ def update_plugin_from_git(
                 [python, "-m", "pip", "install", "-e", str(plugin_root)],
                 dry_run=False,
                 commands=commands,
+                quiet=suppress_command_output,
             )
             installed_package = True
 
@@ -1943,14 +1967,15 @@ def clone_or_update(
     ref: str = "",
     dry_run: bool = False,
     commands: Optional[list[CommandRecord]] = None,
+    quiet: bool = False,
 ) -> None:
     root = plugin_root.expanduser().resolve()
     git_dir = root / ".git"
     if git_dir.is_dir():
-        _run(["git", "fetch", "--all", "--prune"], cwd=root, dry_run=dry_run, commands=commands)
+        _run(["git", "fetch", "--all", "--prune"], cwd=root, dry_run=dry_run, commands=commands, quiet=quiet)
         if ref:
-            _run(["git", "checkout", ref], cwd=root, dry_run=dry_run, commands=commands)
-        _run(["git", "pull", "--ff-only"], cwd=root, dry_run=dry_run, commands=commands)
+            _run(["git", "checkout", ref], cwd=root, dry_run=dry_run, commands=commands, quiet=quiet)
+        _run(["git", "pull", "--ff-only"], cwd=root, dry_run=dry_run, commands=commands, quiet=quiet)
         return
 
     if root.exists() and any(root.iterdir()):
@@ -1958,9 +1983,9 @@ def clone_or_update(
 
     if not dry_run:
         root.parent.mkdir(parents=True, exist_ok=True)
-    _run(["git", "clone", repo_url, str(root)], dry_run=dry_run, commands=commands)
+    _run(["git", "clone", repo_url, str(root)], dry_run=dry_run, commands=commands, quiet=quiet)
     if ref:
-        _run(["git", "checkout", ref], cwd=root, dry_run=dry_run, commands=commands)
+        _run(["git", "checkout", ref], cwd=root, dry_run=dry_run, commands=commands, quiet=quiet)
 
 
 def build_next_steps(plugin_root: Path, python_executable: str) -> list[str]:
@@ -2034,6 +2059,7 @@ def install_from_git(
     start: bool = False,
     dry_run: bool = False,
     validate_only: bool = False,
+    suppress_command_output: bool = False,
 ) -> InstallResult:
     """Clone/update a plugin checkout, validate it, and optionally install runtime."""
 
@@ -2043,7 +2069,14 @@ def install_from_git(
     commands: list[CommandRecord] = []
 
     if not validate_only:
-        clone_or_update(repo_url, plugin_root, ref=ref, dry_run=dry_run, commands=commands)
+        clone_or_update(
+            repo_url,
+            plugin_root,
+            ref=ref,
+            dry_run=dry_run,
+            commands=commands,
+            quiet=suppress_command_output,
+        )
 
     validated: list[str] = []
     if dry_run and not plugin_root.exists():
@@ -2061,6 +2094,7 @@ def install_from_git(
             [python, "-m", "pip", "install", "-e", str(plugin_root)],
             dry_run=dry_run,
             commands=commands,
+            quiet=suppress_command_output,
         )
         installed_package = not dry_run
 

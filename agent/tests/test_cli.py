@@ -152,6 +152,30 @@ def _git_commit_all(repo: Path, message: str) -> str:
     return _git(["rev-parse", "HEAD"], repo)
 
 
+def _write_noisy_fake_python(tmp_path: Path) -> Path:
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import sys",
+                "if sys.argv[1:] == ['--version']:",
+                "    print('Python 3.11.0')",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:4] == ['-m', 'pip', 'install']:",
+                "    print('PIP NOISE THAT MUST NOT POLLUTE JSON')",
+                "    raise SystemExit(0)",
+                "print('unexpected fake-python args: ' + repr(sys.argv), file=sys.stderr)",
+                "raise SystemExit(1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    return fake_python
+
+
 class TestCliHelp:
     """AC1: aming-claw --help contains subcommands."""
 
@@ -258,6 +282,37 @@ class TestCliStart:
 
 
 class TestCliPlugin:
+    def test_plugin_install_json_suppresses_subprocess_stdout(self, tmp_path):
+        runner = CliRunner()
+        remote = _make_cli_remote_plugin_repo(tmp_path)
+        fake_python = _write_noisy_fake_python(tmp_path)
+        install_root = tmp_path / "install"
+        codex_home = tmp_path / "codex-home"
+        marketplace_root = tmp_path / "marketplace-root"
+
+        result = runner.invoke(main, [
+            "plugin",
+            "install",
+            str(remote),
+            "--install-root",
+            str(install_root),
+            "--python",
+            str(fake_python),
+            "--codex-home",
+            str(codex_home),
+            "--codex-config",
+            str(codex_home / "config.toml"),
+            "--codex-marketplace-root",
+            str(marketplace_root),
+            "--json-output",
+        ], env={"AMING_CLAW_PLUGIN_STATE_HOME": str(tmp_path / "state-home")})
+
+        assert result.exit_code == 0
+        assert "PIP NOISE" not in result.output
+        payload = json.loads(result.output)
+        assert payload["installed_package"] is True
+        assert payload["installed_codex_plugin"] is True
+
     def test_plugin_install_dry_run_prints_plan(self, tmp_path):
         runner = CliRunner()
 
@@ -405,6 +460,51 @@ class TestCliPlugin:
             "agent/mcp/resources",
         ):
             assert not (external_project / rel).exists(), f"unexpected target-local plugin artifact: {rel}"
+
+    def test_plugin_update_apply_json_suppresses_subprocess_stdout(self, tmp_path):
+        runner = CliRunner()
+        remote, source = _make_cli_remote_plugin_repo_with_source(tmp_path)
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        plugin_root = plugin_root_for(str(remote), install_root)
+        _git(["clone", str(remote), str(plugin_root)], install_root)
+        _git(["checkout", "main"], plugin_root)
+
+        skill = source / "skills" / "aming-claw" / "SKILL.md"
+        skill.write_text("---\nname: test\n---\nupdated\n", encoding="utf-8")
+        _git_commit_all(source, "update skill")
+        _git(["push", "origin", "main"], source)
+
+        fake_python = _write_noisy_fake_python(tmp_path)
+        codex_home = tmp_path / "codex-home"
+        marketplace_root = tmp_path / "marketplace-root"
+        result = runner.invoke(main, [
+            "plugin",
+            "update",
+            str(remote),
+            "--apply",
+            "--install-root",
+            str(install_root),
+            "--python",
+            str(fake_python),
+            "--plugin-state",
+            str(tmp_path / "state.json"),
+            "--codex-home",
+            str(codex_home),
+            "--codex-config",
+            str(codex_home / "config.toml"),
+            "--codex-marketplace-root",
+            str(marketplace_root),
+            "--json-output",
+        ])
+
+        assert result.exit_code == 0
+        assert "PIP NOISE" not in result.output
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        assert payload["applied"] is True
+        assert payload["installed_package"] is True
+        assert payload["installed_codex_plugin"] is True
 
     def test_plugin_update_missing_checkout_exits_nonzero(self, tmp_path):
         runner = CliRunner()

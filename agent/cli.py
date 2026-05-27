@@ -416,6 +416,7 @@ def plugin_install(repo_url, install_root, ref, python_executable, no_pip, no_co
             start=start,
             dry_run=dry_run,
             validate_only=validate_only,
+            suppress_command_output=json_output,
         )
     except PluginInstallError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -462,6 +463,7 @@ def plugin_update(repo_url, check_only, apply_update, install_root, ref, python_
         codex_config=codex_config or None,
         codex_marketplace_root=codex_marketplace_root or None,
         state_path=plugin_state or None,
+        suppress_command_output=json_output,
         dry_run=dry_run,
     )
     if json_output:
