@@ -64,8 +64,8 @@ Repo: https://github.com/amingclawdev/aming-claw
 
 Demo: [HN Fear Demo README](README.md)
 
-Detailed design story: [Hope is not an engineering control for AI coding
-agents](design-story.md)
+More cases, audit trails, and the design story: [Hope is not an engineering
+control for AI coding agents](design-story.md)
 
 Case pages:
 
