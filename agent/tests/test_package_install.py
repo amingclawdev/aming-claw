@@ -205,6 +205,9 @@ class TestLocalPluginPackaging:
         assert "skills/aming-claw-hn-demo-during-work/SKILL.md" in REQUIRED_PLUGIN_FILES
         assert "skills/aming-claw-hn-demo-after-work/SKILL.md" in REQUIRED_PLUGIN_FILES
         assert "frontend/dashboard/scripts/e2e-hn-demo.mjs" in REQUIRED_PLUGIN_FILES
+        assert "docker/hn-install-audit/run-install-audit.sh" in REQUIRED_PLUGIN_FILES
+        assert "docker/hn-install-audit/codex/Dockerfile" in REQUIRED_PLUGIN_FILES
+        assert "docker/hn-install-audit/claude/Dockerfile" in REQUIRED_PLUGIN_FILES
 
     def test_codex_repo_marketplace_path_is_a_compatibility_path(self):
         marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"

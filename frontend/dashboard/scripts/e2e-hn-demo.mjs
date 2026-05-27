@@ -52,6 +52,9 @@ const FIXTURE_ROOT = path.resolve(
 const STATE_DIR = path.resolve(FLAGS["state-dir"] || path.join(os.tmpdir(), "ac-hn-demo-state", RUN_ID));
 const REPORT_PATH = path.resolve(FLAGS.report || path.join(REPO_ROOT, "docs", "hn-demo", "audits", `${RUN_ID}.md`));
 const JSON_REPORT_PATH = path.resolve(FLAGS["json-report"] || REPORT_PATH.replace(/\.md$/i, ".json"));
+const CODEX_INSTALL_REPORT = FLAGS["codex-install-report"] ? path.resolve(FLAGS["codex-install-report"]) : "";
+const CLAUDE_INSTALL_REPORT = FLAGS["claude-install-report"] ? path.resolve(FLAGS["claude-install-report"]) : "";
+const REQUIRE_INSTALL_GATES = FLAGS["require-install-gates"] === true;
 const WORKER_COUNT = Math.max(2, Number(FLAGS.workers || 2));
 const OBSERVER_MODE = FLAGS.observer || "scripted";
 let BACKLOG_ID = FLAGS.backlog || DEFAULT_BACKLOG_ID;
@@ -135,6 +138,7 @@ function parseFlags(args) {
     "no-fixture",
     "sandbox-audit",
     "browser",
+    "require-install-gates",
   ]);
   const out = {};
   for (let i = 0; i < args.length; i++) {
@@ -214,6 +218,11 @@ function runCommand(command, args, options = {}) {
 
 function readJsonFile(file) {
   return JSON.parse(readFileSync(file, "utf8"));
+}
+
+function readOptionalJsonFile(file) {
+  if (!file || !existsSync(file)) return null;
+  return readJsonFile(file);
 }
 
 function shortSha(value) {
@@ -525,6 +534,7 @@ function createAudit() {
       backlog_ids: [],
       timeline_event_ids: [],
       screenshots: [],
+      install_gates: {},
     },
     machine_audit: {
       checks: [],
@@ -591,7 +601,55 @@ async function runInstallSmoke(audit) {
   auditCheck(audit, "dashboard packaged assets present", dashboardAssets.length > 0, { dashboardAssets });
   auditCheck(audit, "CLI help is callable from checkout", cliHelp.ok, { command: cliHelp.command, stderr: cliHelp.stderr || "" });
   auditCheck(audit, "dashboard /dashboard route serves", dashboardRoute.ok, { status: dashboardRoute.status });
+  importDockerInstallGate(audit, "codex", CODEX_INSTALL_REPORT);
+  importDockerInstallGate(audit, "claude", CLAUDE_INSTALL_REPORT);
   ok(`install smoke checked ${requiredFiles.length} files`);
+}
+
+function importDockerInstallGate(audit, host, reportPath) {
+  const label = `${host} Docker Install Gate`;
+  const report = readOptionalJsonFile(reportPath);
+  if (!report) {
+    const status = "SKIPPED";
+    audit.raw_evidence.install_gates[host] = {
+      host,
+      status,
+      report_path: reportPath || "",
+      reason: reportPath ? "report_path_missing" : "report_not_provided",
+    };
+    auditCheck(
+      audit,
+      label,
+      false,
+      { status, report_path: reportPath || "", reason: audit.raw_evidence.install_gates[host].reason },
+      REQUIRE_INSTALL_GATES ? "blocker" : "warning",
+    );
+    return;
+  }
+  audit.raw_evidence.install_gates[host] = {
+    host,
+    status: report.status || "UNKNOWN",
+    auth_mode: report.auth_mode || "",
+    report_path: reportPath,
+    skills_seen: report.skills_seen || [],
+    resources_read: report.resources_read || [],
+    dashboard_health: report.dashboard_health || {},
+    demo_fixture_result: report.demo_fixture_result || {},
+    limitations: report.limitations || [],
+  };
+  auditCheck(
+    audit,
+    label,
+    report.status === "PASS",
+    {
+      status: report.status || "UNKNOWN",
+      auth_mode: report.auth_mode || "",
+      report_path: reportPath,
+      self_rating: report.self_rating,
+      why_rating: report.why_rating || "",
+    },
+    report.status === "PASS" ? "blocker" : "blocker",
+  );
 }
 
 async function runBeforeWorkCase(audit) {
@@ -1036,6 +1094,10 @@ async function captureSandboxAuditScreenshots(audit) {
 function addSameObserverReview(audit) {
   const check = (name) => audit.machine_audit.checks.find((item) => item.name === name);
   const workerCheck = check("during-work worker traces resolve");
+  const installGates = audit.raw_evidence.install_gates || {};
+  const installGateStatuses = ["codex", "claude"].map((host) => installGates[host]?.status || "SKIPPED");
+  const anyDockerInstallPass = installGateStatuses.includes("PASS");
+  const bothDockerInstallMissing = installGateStatuses.every((status) => status !== "PASS");
   const installOk = ["plugin package files present", "dashboard packaged assets present", "CLI help is callable from checkout", "dashboard /dashboard route serves"].every(
     (name) => check(name)?.passed,
   );
@@ -1052,8 +1114,10 @@ function addSameObserverReview(audit) {
         ? "The package, CLI, dashboard route, and skill files were all visible from the same checkout."
         : "Install smoke found at least one packaging or dashboard readiness issue.",
       personally_observed_evidence: audit.install_smoke,
-      hesitation: "This is a local checkout smoke, not a full fresh-machine marketplace reinstall.",
-      suggested_fix: "Add a Docker or temp-HOME marketplace install lane later if clean-user reproduction still varies.",
+      hesitation: anyDockerInstallPass
+        ? "At least one Docker host lane passed; the remaining concern is cross-host parity."
+        : "This is still only a local checkout preflight until a Docker Codex or Claude install gate passes.",
+      suggested_fix: "Run docker/hn-install-audit/run-install-audit.sh and pass the generated host reports into --sandbox-audit.",
     },
     {
       category: "Evidence Credibility",
@@ -1100,6 +1164,9 @@ function addSameObserverReview(audit) {
     },
   ];
   audit.launch_recommendation = audit.machine_audit.blockers.length === 0 ? "CONDITIONAL_PASS" : "BLOCK";
+  if (bothDockerInstallMissing && REQUIRE_INSTALL_GATES) {
+    audit.launch_recommendation = "BLOCK";
+  }
 }
 
 function markdownReport(audit) {
@@ -1122,6 +1189,18 @@ function markdownReport(audit) {
   if (audit.raw_evidence.after_work?.snapshot_id) lines.push(`- Post-reconcile snapshot: \`${audit.raw_evidence.after_work.snapshot_id}\``);
   if (audit.raw_evidence.screenshots.length) {
     lines.push(`- Screenshots: ${audit.raw_evidence.screenshots.map((shot) => `\`${shot}\``).join(", ")}`);
+  }
+  const installGates = audit.raw_evidence.install_gates || {};
+  if (Object.keys(installGates).length) {
+    lines.push("");
+    lines.push("## Docker Install Gates");
+    lines.push("");
+    lines.push("| Host | Status | Auth Mode | Report | Reason |");
+    lines.push("|---|---:|---|---|---|");
+    for (const host of ["codex", "claude"]) {
+      const gate = installGates[host] || { status: "SKIPPED", auth_mode: "", report_path: "", reason: "not_checked" };
+      lines.push(`| ${host} | ${gate.status || "UNKNOWN"} | ${gate.auth_mode || ""} | \`${gate.report_path || ""}\` | ${gate.reason || gate.why_rating || ""} |`);
+    }
   }
   lines.push("");
   lines.push("## Machine Audit");

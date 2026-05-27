@@ -47,6 +47,12 @@ AI provider for the demo.
   checks, drives before/during/after evidence through real governance calls,
   and writes `docs/hn-demo/audits/latest.md` plus `latest.json`. Add
   `--browser` only when screenshots are part of the review.
+- Docker install audit mode: for true one-click install E2E, first run
+  `docker/hn-install-audit/run-install-audit.sh --host both`. That produces
+  separate Codex and Claude Code install reports from fresh container HOME
+  directories with host auth mounted read-only. Pass those reports back to
+  `--sandbox-audit --require-install-gates`; local package smoke alone is only
+  preflight evidence, not an install PASS.
 - Evidence mode: the AI observer-mode operator produces the demo contract,
   backlog rows, timeline events, graph-query trace evidence, and evidence
   summaries through real MCP calls against governance. Screenshots and
@@ -119,6 +125,10 @@ AI provider for the demo.
      instead. Treat the generated Same-Observer Self-Review as the semantic
      evaluation: the operator that ran the evidence writes why it trusts or
      hesitates on the result.
+   - If the user asks whether one-click install works for Codex and Claude,
+     run `docker/hn-install-audit/run-install-audit.sh --host both` first, then
+     rerun `--sandbox-audit` with the two generated `--codex-install-report`
+     and `--claude-install-report` paths plus `--require-install-gates`.
 2. Run the three cases in order:
    - Before work: use `aming-claw-hn-demo-before-work`.
    - During work: use `aming-claw-hn-demo-during-work`.

@@ -9,6 +9,7 @@ recursive-include skills/aming-claw-launcher *
 recursive-include docs/assets *.png
 include LICENSE
 include frontend/dashboard/scripts/e2e-hn-demo.mjs
+recursive-include docker/hn-install-audit *
 include .codex-plugin/plugin.json
 include .claude-plugin/plugin.json
 include .claude-plugin/marketplace.json

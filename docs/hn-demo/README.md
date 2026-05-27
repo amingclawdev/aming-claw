@@ -51,6 +51,17 @@ checks, drives the three demo fears through real governance calls, and writes
 add `--browser --port <port> --project-id <isolated-id>` to record screenshots
 against a non-conflicting dashboard session.
 
+For full one-click install E2E, run the Docker host lanes first:
+
+```bash
+docker/hn-install-audit/run-install-audit.sh --host both
+```
+
+Those lanes build separate Codex and Claude Code containers, reuse host auth
+read-only at runtime, feed the README install prompt, then feed the HN demo
+prompt. Their JSON reports can be passed back into `--sandbox-audit` with
+`--require-install-gates`.
+
 | Case | Page | Architecture note | Dashboard URL pattern |
 | --- | --- | --- | --- |
 | Before work | [Fear Before Work](cases/before-work.md) | [Before Work Architecture](architecture/before-work-architecture.md) | `http://localhost:40000/dashboard?project_id=<project_id>&view=graph` |

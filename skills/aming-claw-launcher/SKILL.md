@@ -143,6 +143,17 @@ writes `docs/hn-demo/audits/latest.md` plus `latest.json`. Use `--browser` only
 when dashboard screenshots are needed; the default no-browser path is the
 fastest onboarding gate.
 
+For true Codex and Claude Code one-click install E2E, use Docker so the host's
+already-installed plugin state cannot create a false pass:
+
+```text
+docker/hn-install-audit/run-install-audit.sh --host both
+```
+
+The Docker lanes mount host auth read-only at runtime and label the result
+`AUTH_REUSED_FROM_HOST`. They do not bake tokens into images or count local
+package smoke as an install pass.
+
 Use governance on port `40000`, not the ServiceManager sidecar on `40101`:
 
 ```text

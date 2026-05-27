@@ -94,11 +94,19 @@ def _write_cli_plugin_fixture(root):
         "skills/aming-claw-hn-demo-during-work/SKILL.md",
         "skills/aming-claw-launcher/SKILL.md",
         "frontend/dashboard/scripts/e2e-hn-demo.mjs",
+        "docker/hn-install-audit/run-install-audit.sh",
+        "docker/hn-install-audit/validate-report.mjs",
+        "docker/hn-install-audit/codex/Dockerfile",
+        "docker/hn-install-audit/claude/Dockerfile",
     ):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         if rel.endswith(".mjs"):
             path.write_text("#!/usr/bin/env node\nconsole.log('hn demo fixture ok');\n", encoding="utf-8")
+        elif rel.endswith(".sh"):
+            path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        elif rel.endswith("Dockerfile"):
+            path.write_text("FROM scratch\n", encoding="utf-8")
         else:
             path.write_text("---\nname: test\n---\n", encoding="utf-8")
     server_path = root / "agent" / "mcp" / "server.py"
