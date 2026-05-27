@@ -17,6 +17,27 @@ and replay logic as live worker mode.
 The shared object is not the chat. It is not the workflow state. It is the
 project graph.
 
+```text
+                  observer
+                     |
+           commit-bound project graph
+                     |
+        +------------+------------+
+        |                         |
+   Worker A contract         Worker B contract
+   scope A, fence A          scope B, fence B
+        |                         |
+      pass                 fail / interrupted
+        |                         |
+ candidate diff A          replay B against X
+        |                         |
+        +------------+------------+
+                     |
+              ordered Git merge
+                     |
+          target graph reconcile once
+```
+
 The case I want you to challenge:
 
 1. Worker A and Worker B both receive contracts bound to commit hash X.

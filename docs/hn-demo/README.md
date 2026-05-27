@@ -15,8 +15,8 @@ HN demo skill guides deterministic setup where possible and points to the exact
 dashboard surfaces to inspect.
 
 HN entry article:
-[Show HN: I built a new multi-agent coding architecture: graph-bound
-contracts](article.md).
+[Show HN: Aming Claw - A new multi-agent coding architecture (zero
+orchestration, commit-bound)](article.md).
 
 Longer design story:
 [Hope is not an engineering control for AI coding agents](design-story.md).
