@@ -67,20 +67,27 @@ AI provider for the demo.
   Record the exact governance response body, including `count`, `bugs`, and
   `request_id`, then create or inspect a backlog contract with target files,
   tests/docs, acceptance criteria, and file/worktree fence evidence.
-- During Work acceptance: timeline, lane, dispatch/startup gate, and evidence
-  inspector claims come from real `task_timeline_append`, precheck, server-side
-  parallel branch runtime allocation, and `graph_query` results. Populate at
-  least two worker contexts with disjoint `owned_files`; a one-worker timeline
-  is not sufficient evidence for the parallel during-work case. Local
+- During Work acceptance: timeline, lane, dispatch/startup gate, replay, and
+  evidence inspector claims come from real `task_timeline_append`, precheck,
+  server-side parallel branch runtime allocation, and `graph_query` results.
+  Populate at least two worker contexts with disjoint `owned_files`; a
+  one-worker timeline is not sufficient evidence for the parallel during-work
+  case. The launch demo should be replay-shaped: one worker passes, one worker
+  fails or is interrupted, and a replay attempt passes from the same contract
+  evidence with `attempt_num`, parent task/contract identity, owned files,
+  fence token, graph-query trace ids, and verification result preserved. Local
   `aming-claw mf dispatch-gate` validates the payload; it does not by itself
   register the worker fence with governance. Before the first `mf_subagent`
   `graph_query`, create or verify each worker runtime context through
   `/api/graph-governance/<pid>/parallel-branches/allocate` with the worker's
   `task_id`, `parent_task_id`, `fence_token`, `base_commit`,
   `target_head_commit`, and `merge_queue_id`. Capture returned ids and trace
-  ids exactly; never fabricate `graph_query_trace_ids`. If
-  `mf_timeline_precheck` reports `mf_type=chain_rescue`, describe it as the MVP
-  MF storage bucket, not a chain requirement.
+  ids exactly; never fabricate `graph_query_trace_ids`. Worker runtime is
+  generic: Claude, Codex, scripted workers, or any compatible local process can
+  produce the evidence. The default demo uses deterministic scripted workers so
+  users do not need two AI subscriptions. If `mf_timeline_precheck` reports
+  `mf_type=chain_rescue`, describe it as the MVP MF storage bucket, not a chain
+  requirement.
 - After Work acceptance: Asset Inbox, binding state, drift, impact scope, and
   Review Queue claims are inspected from the current demo project snapshot via
   dashboard/MCP/governance evidence. Candidate or weak path evidence must stay

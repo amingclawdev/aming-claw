@@ -28,13 +28,16 @@ http://localhost:40000/dashboard?project_id=<project_id>&view=backlog&backlog=<b
 ## What you would see
 
 The backlog modal shows a timeline DAG for one work item, grouped by phase
-columns and lanes: observer plus two or more workers. The bundled screenshot
-shows three worker lanes, which is more than the minimum needed to prove the
-control. Timeline cards expose dispatch, implementation, and review-ready
-checkpoints, while the evidence inspector shows actor, phase, status, commit,
-task id, and attempt metadata for the selected node. The point is not that the
-agent wrote a confident final answer; the point is that each worker's work is
-attached to lane structure, phase transitions, and evidence records.
+columns and lanes: observer plus two or more workers. The current launch demo is
+replay-shaped: Worker A passes, Worker B fails or is interrupted, and the
+observer dispatches a replay attempt for B from the same contract evidence. The
+bundled screenshot shows three worker lanes, which is more than the minimum
+needed to prove the control. Timeline cards expose dispatch, implementation,
+failure, replay, verification, and review-ready checkpoints, while the evidence
+inspector shows actor, phase, status, commit, task id, attempt number, and trace
+metadata for the selected node. The point is not that the agent wrote a
+confident final answer; the point is that each worker's work is attached to lane
+structure, phase transitions, replay linkage, and evidence records.
 
 ![During-work timeline](../screenshots/03-during-work-timeline.png)
 
@@ -64,8 +67,11 @@ coordination state:
 - two or more worker scopes with disjoint `owned_files`;
 - per-worker fence tokens and graph-query trace ids that resolve in the audit
   ledger;
-- dispatch, implementation, verification, and close-ready checkpoints;
+- dispatch, implementation, failed/interrupted attempt, replay, verification,
+  and close-ready checkpoints;
 - evidence inspector details that show actor, phase, status, and artifacts.
+- attempt metadata showing that a replay is tied to the same contract lineage
+  instead of being an unstructured "try again" chat message.
 
 The fixture can bootstrap a small demo project, but the during-work evidence
 should come from real observer-mode MCP/governance calls. Do not present a
@@ -82,8 +88,11 @@ rejected instead of trusted.
 Two workers are enough to make the architecture visible: if Worker A and Worker
 B have separate owned files, fence tokens, trace ids, and lane events, the human
 reviewer can audit concurrency without running either implementation manually.
-The current screenshot uses three workers because it was generated from a richer
-demo row; the architectural point is the same.
+The replay case adds the missing edge: when Worker B fails, the observer can
+dispatch attempt 2 from the same contract evidence, with a new fence and new
+trace ids, instead of relying on chat memory. The current screenshot uses three
+workers because it was generated from a richer demo row; the architectural point
+is the same.
 
 The important boundary is that the worker does not accept its own work. Dispatch,
 implementation, verification, merge readiness, and backlog close are separate
@@ -108,10 +117,17 @@ with the HN demo evidence work in commit
 `dcb0f1f350218e224222af890ef6e1c1c6300f1d`. Parallel agent work is not
 reviewable unless the lanes and evidence survive the UI.
 
-The screenshot attached to this case shows the resulting shape: one observer
-lane, three worker lanes, five phases, and six timeline nodes. That is stronger
-than the minimum two-worker demo, but it proves the same thing: worker count is
-not hidden in prose; it is visible in the review surface.
+The repeatable launch sandbox now creates a second real instance for this case:
+one worker passes, another worker records a failed or interrupted attempt, and a
+replay attempt passes with its own graph trace and fence token. That makes the
+case sharper than a happy-path parallel timeline because the audit surface has
+to preserve attempt history, not just final success.
+
+The screenshot attached to this case shows the general shape: one observer lane,
+three worker lanes, five phases, and six timeline nodes. The replay sandbox adds
+the failure/retry edge that a static screenshot cannot fully explain: worker
+count and attempt history are not hidden in prose; they are visible in the
+review surface and audit report.
 
 This case shares its commit with the before-work case because Aming Claw lands
 concurrent backlog rows atomically. See

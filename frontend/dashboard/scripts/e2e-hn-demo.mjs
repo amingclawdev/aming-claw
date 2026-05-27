@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // hn-fear-demo-smoke
 //
-// Lightweight dashboard smoke and screenshot capture for the HN fear demo.
-// It intentionally does not replay code workflows or call live AI providers.
+// Lightweight dashboard smoke, fixture setup, and launch audit for the HN fear demo.
+// Screenshot mode stays UI-focused; sandbox-audit mode drives governance evidence.
+// It does not call live AI providers by default.
 //
 //   node scripts/e2e-hn-demo.mjs --dashboard http://127.0.0.1:40000/dashboard --project aming-claw
 //   node scripts/e2e-hn-demo.mjs --project aming-claw --headed --keep-open
@@ -740,11 +741,12 @@ async function runBeforeWorkCase(audit) {
   return { bugId, mfId, traces, nodeId: firstGraphNodeId(structure) };
 }
 
-async function allocateWorker({ bugId, workerIndex, ownedFiles, baseCommit }) {
-  const label = String.fromCharCode(65 + workerIndex);
-  const taskId = `${bugId}-worker-${label.toLowerCase()}`;
+async function allocateWorker({ bugId, workerIndex, ownedFiles, baseCommit, labelOverride = "", taskSuffix = "", attemptNum = 1 }) {
+  const label = labelOverride || String.fromCharCode(65 + workerIndex);
+  const slug = taskSuffix || label.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  const taskId = `${bugId}-worker-${slug}`;
   const response = await http("POST", `/api/graph-governance/${pid(PROJECT)}/parallel-branches/allocate`, {
-    actor: `observer:hn-sandbox-worker-${label.toLowerCase()}`,
+    actor: `observer:hn-sandbox-worker-${slug}`,
     task_id: taskId,
     parent_task_id: `${bugId}-observer`,
     root_task_id: `${bugId}-observer`,
@@ -754,12 +756,13 @@ async function allocateWorker({ bugId, workerIndex, ownedFiles, baseCommit }) {
     target_head_commit: baseCommit,
     merge_queue_id: `mq-${RUN_ID}`,
     branch_prefix: `hn-sbx-${RUN_ID.toLowerCase()}`,
-    worker_id: `worker-${label.toLowerCase()}`,
+    worker_id: `worker-${slug}`,
     create_worktree: false,
   });
   const context = response.context || {};
   return {
     label,
+    attempt_num: attemptNum,
     task_id: taskId,
     parent_task_id: `${bugId}-observer`,
     owned_files: ownedFiles,
@@ -845,10 +848,33 @@ async function runDuringWorkCase(audit) {
     const query = await runWorkerGraphQuery(worker, "find_node_by_path", { path: targetPath });
     workerQueries.push({ worker, query, trace_id: getQueryTraceId(query), resolved: await resolveTrace(getQueryTraceId(query)) });
   }
-  const traces = workerQueries.map((item) => item.trace_id).filter(Boolean);
+  const failedWorker = workers[1] || workers[0];
+  const failedWorkerQuery = workerQueries.find((item) => item.worker.task_id === failedWorker.task_id);
+  const failedAttemptRun = runCommand("node", [
+    "-e",
+    "console.error('scripted worker interrupted: missing replay evidence, observer must replay from contract'); process.exit(1)",
+  ], { cwd: FIXTURE_ROOT, timeout: 30000 });
+  const replayWorker = await allocateWorker({
+    bugId,
+    workerIndex: WORKER_COUNT,
+    labelOverride: `${failedWorker.label}2`,
+    taskSuffix: `${failedWorker.label.toLowerCase()}-replay-2`,
+    ownedFiles: failedWorker.owned_files,
+    baseCommit,
+    attemptNum: 2,
+  });
+  const replayQuery = await runWorkerGraphQuery(replayWorker, "find_node_by_path", { path: replayWorker.owned_files[0] });
+  const replayQueryEvidence = {
+    worker: replayWorker,
+    query: replayQuery,
+    trace_id: getQueryTraceId(replayQuery),
+    resolved: await resolveTrace(getQueryTraceId(replayQuery)),
+  };
+  const allWorkerQueries = [...workerQueries, replayQueryEvidence];
+  const traces = allWorkerQueries.map((item) => item.trace_id).filter(Boolean);
   await upsertBacklog(bugId, {
     actor: "observer:hn-sandbox-during",
-    title: "HN sandbox during-work execution: two-plus worker evidence",
+    title: "HN sandbox during-work execution: worker failure and replay evidence",
     status: "OPEN",
     priority: "P2",
     mf_type: "chain_rescue",
@@ -859,17 +885,26 @@ async function runDuringWorkCase(audit) {
     acceptance_criteria: [
       "At least two workers receive disjoint owned_files.",
       "Each worker has a server-allocated fence_token and resolvable mf_subagent graph trace.",
+      "One worker records a failed or interrupted attempt with attempt_num=1.",
+      "A replay attempt passes from the same contract lineage with attempt_num=2.",
       "A real test subprocess runs and its exit code is recorded.",
       "The committed diff carries Chain trailers.",
     ],
     chain_trigger_json: {
       template_id: "mf_parallel.v1",
-      requirement_ids: ["worker_fences", "mf_subagent_traces", "real_tests", "chain_trailers"],
+      requirement_ids: ["worker_fences", "mf_subagent_traces", "worker_failure_replay", "replay_trace", "real_tests", "chain_trailers"],
       workers: workers.map((worker) => ({
         task_id: worker.task_id,
         owned_files: worker.owned_files,
         fence_token_present: Boolean(worker.fence_token),
       })),
+      replay: {
+        original_task_id: failedWorker.task_id,
+        replay_task_id: replayWorker.task_id,
+        attempt_num: replayWorker.attempt_num,
+        owned_files: replayWorker.owned_files,
+        fence_token_present: Boolean(replayWorker.fence_token),
+      },
     },
     details_md: "Created by sandbox audit scripted observer. The fixture did not pre-create this timeline.",
   });
@@ -891,6 +926,52 @@ async function runDuringWorkCase(audit) {
         merge_queue_id: worker.merge_queue_id,
       })),
       graph_query_trace_ids: traces,
+    },
+  });
+  const failureEvent = await appendTimeline({
+    backlog_id: bugId,
+    mf_id: mfId,
+    task_id: failedWorker.task_id,
+    actor: `mf_sub:${failedWorker.task_id}`,
+    event_type: "during_work_worker_interrupted",
+    event_kind: "verification",
+    phase: "worker_attempt_1_interrupted",
+    status: "failed",
+    attempt_num: 1,
+    payload: {
+      worker_task_id: failedWorker.task_id,
+      attempt_num: 1,
+      owned_files: failedWorker.owned_files,
+      fence_token: failedWorker.fence_token,
+      graph_query_trace_ids: [failedWorkerQuery?.trace_id].filter(Boolean),
+      failure_reason: "scripted worker interrupted before producing complete evidence; observer must replay from contract",
+    },
+    verification: {
+      tests_run: [failedAttemptRun.command],
+      tests_exit_code: failedAttemptRun.ok ? 0 : 1,
+      stderr: failedAttemptRun.stderr || "",
+    },
+  });
+  const replayEvent = await appendTimeline({
+    backlog_id: bugId,
+    mf_id: mfId,
+    task_id: replayWorker.task_id,
+    actor: "observer:hn-sandbox-during",
+    event_type: "during_work_worker_replay_dispatch",
+    event_kind: "implementation",
+    phase: "replay_dispatch",
+    status: "accepted",
+    attempt_num: replayWorker.attempt_num,
+    payload: {
+      replay_of_task_id: failedWorker.task_id,
+      replay_task_id: replayWorker.task_id,
+      attempt_num: replayWorker.attempt_num,
+      owned_files: replayWorker.owned_files,
+      fence_token: replayWorker.fence_token,
+      base_commit: replayWorker.base_commit,
+      target_head_commit: replayWorker.target_head_commit,
+      merge_queue_id: replayWorker.merge_queue_id,
+      graph_query_trace_ids: [replayQueryEvidence.trace_id].filter(Boolean),
     },
   });
   applyDuringWorkChange();
@@ -920,6 +1001,11 @@ async function runDuringWorkCase(audit) {
       graph_query_trace_ids: traces,
       commit,
       changed_files: ["src/order-router.js", "tests/order-router.test.mjs", "docs/observer-routing-note.md"],
+      replay: {
+        original_task_id: failedWorker.task_id,
+        replay_task_id: replayWorker.task_id,
+        attempt_num: replayWorker.attempt_num,
+      },
     },
     verification: {
       tests_run: [testRun.command],
@@ -936,20 +1022,65 @@ async function runDuringWorkCase(audit) {
     event_kind: "close_ready",
     phase: "close_ready",
     status: testRun.ok ? "accepted" : "blocked",
-    payload: { commit, graph_query_trace_ids: traces },
+    payload: {
+      commit,
+      graph_query_trace_ids: traces,
+      replay_task_id: replayWorker.task_id,
+      replay_attempt_num: replayWorker.attempt_num,
+    },
   });
-  audit.raw_evidence.during_work = { bug_id: bugId, mf_id: mfId, workers, worker_queries: workerQueries, traces, test_run: testRun, commit };
+  audit.raw_evidence.during_work = {
+    bug_id: bugId,
+    mf_id: mfId,
+    workers,
+    replay_worker: replayWorker,
+    worker_queries: allWorkerQueries,
+    failed_attempt: {
+      worker: failedWorker,
+      command: failedAttemptRun.command,
+      exit_code: failedAttemptRun.ok ? 0 : 1,
+      trace_id: failedWorkerQuery?.trace_id || "",
+      event_id: failureEvent?.id || "",
+    },
+    replay_attempt: {
+      worker: replayWorker,
+      trace_id: replayQueryEvidence.trace_id,
+      trace_resolved: replayQueryEvidence.resolved.ok,
+      event_id: replayEvent?.id || "",
+    },
+    traces,
+    test_run: testRun,
+    commit,
+  };
   audit.raw_evidence.backlog_ids.push(bugId);
   audit.raw_evidence.trace_ids.push(...traces);
-  for (const event of [dispatchEvent, verificationEvent, closeReadyEvent]) {
+  for (const event of [dispatchEvent, failureEvent, replayEvent, verificationEvent, closeReadyEvent]) {
     if (event?.id) audit.raw_evidence.timeline_event_ids.push(event.id);
   }
   auditCheck(audit, "during-work has at least two workers", workers.length >= 2, { worker_count: workers.length });
   auditCheck(audit, "during-work workers have server-allocated fences", workers.every((worker) => worker.fence_token), {
     workers: workers.map((worker) => ({ task_id: worker.task_id, fence_token_present: Boolean(worker.fence_token) })),
   });
-  auditCheck(audit, "during-work worker traces resolve", workerQueries.every((item) => item.resolved.ok), {
-    traces: workerQueries.map((item) => ({ trace_id: item.trace_id, ok: item.resolved.ok })),
+  auditCheck(audit, "during-work worker traces resolve", allWorkerQueries.every((item) => item.resolved.ok), {
+    traces: allWorkerQueries.map((item) => ({ trace_id: item.trace_id, ok: item.resolved.ok, task_id: item.worker.task_id })),
+  });
+  auditCheck(audit, "during-work records failed worker attempt", !failedAttemptRun.ok && Boolean(failureEvent?.id), {
+    task_id: failedWorker.task_id,
+    attempt_num: 1,
+    event_id: failureEvent?.id || "",
+    command: failedAttemptRun.command,
+    stderr: failedAttemptRun.stderr || "",
+  });
+  auditCheck(audit, "during-work replay attempt passes", replayQueryEvidence.resolved.ok && Boolean(replayEvent?.id), {
+    original_task_id: failedWorker.task_id,
+    replay_task_id: replayWorker.task_id,
+    attempt_num: replayWorker.attempt_num,
+    trace_id: replayQueryEvidence.trace_id,
+    event_id: replayEvent?.id || "",
+  });
+  auditCheck(audit, "during-work replay keeps same owned_files", JSON.stringify(failedWorker.owned_files) === JSON.stringify(replayWorker.owned_files), {
+    original_owned_files: failedWorker.owned_files,
+    replay_owned_files: replayWorker.owned_files,
   });
   auditCheck(audit, "during-work real tests pass", testRun.ok, { command: testRun.command, stderr: testRun.stderr || "" });
   auditCheck(audit, "during-work commit has Chain trailers", Boolean(commit), { commit: shortSha(commit) });
@@ -1114,6 +1245,7 @@ function addSameObserverReview(audit) {
   audit.agent_behavior_audit = [
     "The fixture only bootstrapped a project and active graph; backlog and timeline started empty.",
     "The observer path created backlog rows, timeline events, graph query traces, worker fences, and test evidence during this run.",
+    "The during-work path recorded a failed worker attempt and a replay attempt instead of reporting only a happy-path parallel run.",
     "The same scripted observer that performed the run writes this evaluation, so the score cites operation artifacts instead of a second-hand review.",
   ];
   audit.same_observer_self_review = [
@@ -1137,7 +1269,7 @@ function addSameObserverReview(audit) {
       category: "Evidence Credibility",
       score: workerCheck?.passed ? 5 : 2,
       why: workerCheck?.passed
-        ? "Worker graph queries used server-validated mf_subagent identity and returned resolvable trace IDs."
+        ? "Worker and replay graph queries used server-validated mf_subagent identity and returned resolvable trace IDs."
         : "At least one worker trace did not resolve, so the report cannot support the audit claim.",
       personally_observed_evidence: audit.raw_evidence.during_work?.worker_queries || [],
       hesitation: "Timeline payloads can still include self-reported fields; trace resolution is the strongest evidence.",
@@ -1168,10 +1300,10 @@ function addSameObserverReview(audit) {
     },
     {
       category: "Claim Alignment",
-      score: audit.raw_evidence.during_work?.workers?.length >= 2 ? 5 : 2,
-      why: audit.raw_evidence.during_work?.workers?.length >= 2
-        ? "The demo exercises one observer with multiple bounded worker identities, matching the AI-as-operator claim."
-        : "Single-worker evidence would undercut the concurrency claim.",
+      score: audit.raw_evidence.during_work?.workers?.length >= 2 && audit.raw_evidence.during_work?.replay_attempt?.trace_resolved ? 5 : 2,
+      why: audit.raw_evidence.during_work?.workers?.length >= 2 && audit.raw_evidence.during_work?.replay_attempt?.trace_resolved
+        ? "The demo exercises one observer with multiple bounded worker identities plus a failed worker replay, matching the graph-bound contract claim."
+        : "Missing multi-worker or replay evidence would undercut the concurrency claim.",
       personally_observed_evidence: audit.raw_evidence.during_work?.workers || [],
       hesitation: "This runner validates the governance protocol, not true autonomous model quality.",
       suggested_fix: "Keep AI observer mode separate from scripted protocol smoke so both claims stay honest.",
@@ -1200,6 +1332,12 @@ function markdownReport(audit) {
   lines.push(`- Trace IDs: ${audit.raw_evidence.trace_ids.map((id) => `\`${id}\``).join(", ") || "none"}`);
   lines.push(`- Timeline event IDs: ${audit.raw_evidence.timeline_event_ids.map((id) => `\`${id}\``).join(", ") || "none"}`);
   if (audit.raw_evidence.during_work?.commit) lines.push(`- Fixture commit: \`${audit.raw_evidence.during_work.commit}\``);
+  if (audit.raw_evidence.during_work?.failed_attempt) {
+    lines.push(`- Failed worker attempt: \`${audit.raw_evidence.during_work.failed_attempt.worker.task_id}\` attempt 1 -> event \`${audit.raw_evidence.during_work.failed_attempt.event_id}\``);
+  }
+  if (audit.raw_evidence.during_work?.replay_attempt) {
+    lines.push(`- Replay worker attempt: \`${audit.raw_evidence.during_work.replay_attempt.worker.task_id}\` attempt ${audit.raw_evidence.during_work.replay_attempt.worker.attempt_num} -> trace \`${audit.raw_evidence.during_work.replay_attempt.trace_id}\``);
+  }
   if (audit.raw_evidence.after_work?.snapshot_id) lines.push(`- Post-reconcile snapshot: \`${audit.raw_evidence.after_work.snapshot_id}\``);
   if (audit.raw_evidence.screenshots.length) {
     lines.push(`- Screenshots: ${audit.raw_evidence.screenshots.map((shot) => `\`${shot}\``).join(", ")}`);

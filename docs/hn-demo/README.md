@@ -14,8 +14,12 @@ Live AI execution is not required to understand or replay the article flow; the
 HN demo skill guides deterministic setup where possible and points to the exact
 dashboard surfaces to inspect.
 
-Main article draft:
-[Hope is not an engineering control for AI coding agents](article.md).
+HN entry article:
+[Show HN: I built a new multi-agent coding architecture: graph-bound
+contracts](article.md).
+
+Longer design story:
+[Hope is not an engineering control for AI coding agents](design-story.md).
 
 ## Installed-User Prompt
 
@@ -26,7 +30,9 @@ Use the Aming Claw HN demo skill to run the three fear cases for this project:
 before work, during work, and after work. If needed, create an isolated fixture
 project, but produce the backlog rows, timeline events, graph traces, worker
 fences, tests, and reconcile evidence during this run. Do not treat pre-existing
-fixture data as proof. Show me the dashboard URLs for each case.
+fixture data as proof. In the during-work case, show one passing worker, one
+failed or interrupted worker, and a replay attempt that passes from the same
+contract evidence. Show me the dashboard URLs for each case.
 ```
 
 The skill should leave you with dashboard states that correspond to the three
@@ -52,6 +58,12 @@ checks, drives the three demo fears through real governance calls, and writes
 `docs/hn-demo/audits/latest.md` plus `latest.json`. Browser capture is optional:
 add `--browser --port <port> --project-id <isolated-id>` to record screenshots
 against a non-conflicting dashboard session.
+
+The during-work sandbox evidence is intentionally replay-shaped: one bounded
+worker passes, another fails or is interrupted, and a replay attempt is recorded
+with a new fence, new graph trace, and the same contract lineage. This is the
+smallest case that makes graph-bound contracts different from ordinary
+chat-based retry.
 
 For full one-click install E2E, run the Docker host lanes first:
 

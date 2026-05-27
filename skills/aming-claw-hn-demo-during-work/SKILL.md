@@ -42,6 +42,8 @@ operator cannot tell whether scope, identity, or evidence is trustworthy.
   merge queue id, fence token, and owned files were checked before handoff.
 - Evidence inspector: links or screenshots showing contract evidence,
   precheck ids, trace ids, or test results.
+- Replay edge: one bounded worker can fail or be interrupted, then a replay
+  attempt can pass from the same contract lineage with a new fence and trace.
 
 ## Architecture Reason
 
@@ -63,7 +65,9 @@ CREATING demo data, not reading existing data. Mandatory rules:
    DISJOINT owned_files. For the HN during-work case, create at least two
    worker entries; a single-worker timeline does not demonstrate parallel
    observability. The bundled screenshot currently shows three worker lanes,
-   which is acceptable but not required.
+   which is acceptable but not required. The launch demo should include one
+   passing worker, one failed or interrupted worker, and one replay attempt that
+   passes from the same contract lineage.
 
 3. Tie every task_timeline_append to the same mf_id (MF-<BACKLOG-ID>).
    Per-worker events use the worker's task_id; observer events can use
@@ -84,7 +88,12 @@ CREATING demo data, not reading existing data. Mandatory rules:
    in the timeline event. NEVER fabricate trace_id strings -- anyone can GET
    /api/graph-governance/<pid>/query-traces/<trace_id> to verify.
 
-7. mf_type=chain_rescue in mf_timeline_precheck output is the MVP MF storage
+7. For replay, record `attempt_num`, original worker task_id, replay task_id,
+   owned_files, fence_token, graph_query_trace_ids, verification result, and
+   why attempt 1 failed or was interrupted. Do not describe an unstructured chat
+   retry as replay evidence.
+
+8. mf_type=chain_rescue in mf_timeline_precheck output is the MVP MF storage
    bucket label, not an error. See aming-claw://mf-sop.
 
 ## Role and Mode
@@ -95,9 +104,9 @@ Skill tool.
 Do not invent an `aming-claw://skill-hn-demo` MCP resource.
 
 This subskill covers only During Work operator steps for timeline DAG, lanes,
-dispatch/startup gate evidence, evidence inspector details, and implementation
-observability. Use Design Alignment by default; enter Execution Supervisor only
-when the umbrella mode gate is explicitly satisfied.
+dispatch/startup gate evidence, replay evidence, evidence inspector details, and
+implementation observability. Use Design Alignment by default; enter Execution
+Supervisor only when the umbrella mode gate is explicitly satisfied.
 
 ## Operator Steps
 
@@ -105,7 +114,8 @@ when the umbrella mode gate is explicitly satisfied.
    the user to run `aming-claw start`; do not start it silently.
 2. Open the Backlog row and timeline for the demo work item.
 3. Find observer and `mf_sub` lane events. Identify dispatch, startup,
-   implementation, verification, and handoff or review-ready checkpoints.
+   implementation, failed/interrupted attempt, replay, verification, and handoff
+   or review-ready checkpoints.
 4. Inspect dispatch-gate evidence: assigned worktree, branch, base commit,
    target head, merge queue id, fence token, and owned files.
 5. Open evidence details for prechecks, graph query trace ids, tests, and
@@ -121,7 +131,7 @@ During-work evidence
 - Timeline DAG: <link/screenshot/event ids>
 - Lanes: <observer lane/subagent lane evidence>
 - Dispatch gate: <precheck id or gate evidence>
-- Evidence inspector: <link/screenshot/trace ids/tests>
+- Evidence inspector: <link/screenshot/trace ids/tests/attempt metadata>
 - Architecture reason: mf_sub gate + isolated worktrees + append-only timeline + contract evidence
 - Limitations: <none/offline dashboard/manual screenshot/etc>
 ```

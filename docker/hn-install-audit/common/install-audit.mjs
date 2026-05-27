@@ -389,7 +389,7 @@ function maybeRunAiPrompts(installPrompt, demoPrompt) {
 
 function isLoginRequired(result) {
   const text = `${result?.stdout || ""}\n${result?.stderr || ""}`;
-  return /not logged in|please run\s+\/login|run\s+claude\s+auth|authentication required|login required/i.test(text);
+  return /not logged in|please run\s+\/login|run\s+claude\s+auth|authentication required|login required|failed to authenticate|invalid authentication credentials|api error:\s*401/i.test(text);
 }
 
 function missing(required, seen) {
