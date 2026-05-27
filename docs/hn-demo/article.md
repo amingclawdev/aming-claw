@@ -1,10 +1,7 @@
 # Show HN: Aming Claw - A new multi-agent coding architecture (zero orchestration, commit-bound)
 
-Most multi-agent coding frameworks ask the user to write orchestration: a
-supervisor prompt, agent roles, a state schema, sometimes a graph definition.
-
-Aming Claw asks for zero user-written orchestration code. You install the
-plugin, give one requirement, and an observer takes over.
+If you've used LangGraph supervisor, AutoGen GroupChat, or CrewAI for coding
+work, you've written the orchestration. Aming Claw asks for zero.
 
 The observer holds the project's commit-bound code graph. It decides which
 worker gets which files using two signals together: the requirement itself
@@ -12,10 +9,10 @@ worker gets which files using two signals together: the requirement itself
 function scope.
 
 Each worker runs under its own contract: scoped files, fence token, trace
-ledger, close gate. In the full worker path, each worker can run in an isolated
-git worktree against a frozen commit hash. The default demo uses scripted
-workers and server-allocated fences so you can reproduce the full protocol
-without owning two AI subscriptions.
+ledger, close gate. The full worker path runs each worker in an isolated git
+worktree against a frozen commit hash. The HN demo ships with scripted workers
+for zero-setup reproducibility, but uses the same observer, contracts, fences,
+and replay logic as live worker mode.
 
 The shared object is not the chat. It is not the workflow state. It is the
 project graph.
@@ -27,7 +24,9 @@ The case I want you to challenge:
 3. Worker B fails mid-execution.
 4. The observer replays Worker B against commit hash X. Worker B sees the
    original code, not Worker A's in-progress changes.
-5. The replay passes, producing a clean diff against X.
+5. The replay passes, producing a clean diff against X — Worker B's contract
+   scope and Worker A's contract scope are disjoint by design, so B's replay
+   never touches files A already accepted.
 6. Both accepted diffs land through an ordered Git merge.
 7. The target project graph is reconciled once after the accepted change lands.
 8. The backlog row closes only after the timeline and contract gates pass.
