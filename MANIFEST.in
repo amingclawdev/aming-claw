@@ -1,6 +1,7 @@
 recursive-include agent/governance/dashboard_dist *
 recursive-include agent/mcp/resources *
 recursive-include skills/aming-claw *
+recursive-include skills/aming-claw-hn-challenge *
 recursive-include skills/aming-claw-hn-demo *
 recursive-include skills/aming-claw-hn-demo-after-work *
 recursive-include skills/aming-claw-hn-demo-before-work *

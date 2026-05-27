@@ -56,7 +56,8 @@ Each lane has two phases:
 
 1. Feed the README/launcher one-click install prompt to the CLI and verify
    install, skill discovery, MCP tool visibility, and required resource reads.
-2. Feed the HN demo prompt and verify the three-fear demo evidence path.
+2. Feed the HN challenge prompt and verify the multi-agent challenge evidence
+   path.
 
 The container also runs deterministic code checks so the final report cannot
 claim pass solely because the model said it passed.

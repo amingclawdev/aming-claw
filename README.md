@@ -136,7 +136,8 @@ changes apply only to **new** sessions.
 **Requires a new session:**
 
 - The `/aming-claw:aming-claw`, `/aming-claw:aming-claw-launcher`, and
-  `/aming-claw:aming-claw-hn-demo*` skills
+  `/aming-claw:aming-claw-hn-challenge` / `/aming-claw:aming-claw-hn-demo*`
+  skills
 - The `mcp__plugin_aming-claw_aming-claw__*` MCP tools (`health`,
   `runtime_status`, `task_*`, `backlog_*`, `graph_*`, etc.)
 
@@ -164,10 +165,11 @@ More cases, audit trails, and the longer design story are here:
 [Hope is not an engineering control for AI coding agents](docs/hn-demo/design-story.md).
 
 After installing the plugin and opening a new AI host session, invoke the HN
-demo skill:
+challenge skill:
 
 ```text
-Run the Aming Claw HN multi-agent challenge demo
+/aming-claw:aming-claw-hn-challenge
+Run the Aming Claw HN multi-agent challenge demo.
 ```
 
 The skill should create or reuse an isolated fixture, produce fresh backlog
@@ -738,7 +740,8 @@ Aming Claw ships these assets in the repo:
 - `.mcp.json` — MCP server contract (read when the repo is opened as a workspace; the CLI installer also generates cache-aware overrides for plugin-mode loading)
 - `skills/aming-claw/` — main governance skill
 - `skills/aming-claw-launcher/` — onboarding/launcher skill
-- `skills/aming-claw-hn-demo*/` — HN demo operator skills for the multi-agent challenge and supporting case walkthroughs
+- `skills/aming-claw-hn-challenge/` — public HN multi-agent challenge skill
+- `skills/aming-claw-hn-demo*/` — compatibility and supporting case walkthrough skills
 - `agent/mcp/resources/seed-graph-summary.json` — lightweight packaged context
   for fresh sessions
 - `agent/mcp/resources/self-graph-bundle-manifest.json` — read-only compatibility
@@ -746,10 +749,11 @@ Aming Claw ships these assets in the repo:
 - `agent/mcp/resources/self-graph-bundle/` — sealed structure and semantic
   projection resources for fresh-session orientation and smoke checks
 
-After install, the plugin exposes six skills (Claude Code namespacing shown):
+After install, the plugin exposes seven skills (Claude Code namespacing shown):
 
 - `/aming-claw:aming-claw`
 - `/aming-claw:aming-claw-launcher`
+- `/aming-claw:aming-claw-hn-challenge`
 - `/aming-claw:aming-claw-hn-demo`
 - `/aming-claw:aming-claw-hn-demo-before-work`
 - `/aming-claw:aming-claw-hn-demo-during-work`

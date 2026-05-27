@@ -91,6 +91,7 @@ class TestPackagedDashboardAssets:
         assert "recursive-include agent/governance/dashboard_dist *" in manifest
         assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
+        assert "recursive-include skills/aming-claw-hn-challenge *" in manifest
         assert "recursive-include skills/aming-claw-hn-demo *" in manifest
         assert "recursive-include skills/aming-claw-hn-demo-before-work *" in manifest
         assert "recursive-include skills/aming-claw-hn-demo-during-work *" in manifest
@@ -200,6 +201,7 @@ class TestLocalPluginPackaging:
         assert DEFAULT_REPO_URL == "https://github.com/amingclawdev/aming-claw"
         assert ".codex-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
         assert ".claude-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-hn-challenge/SKILL.md" in REQUIRED_PLUGIN_FILES
         assert "skills/aming-claw-hn-demo/SKILL.md" in REQUIRED_PLUGIN_FILES
         assert "skills/aming-claw-hn-demo-before-work/SKILL.md" in REQUIRED_PLUGIN_FILES
         assert "skills/aming-claw-hn-demo-during-work/SKILL.md" in REQUIRED_PLUGIN_FILES
@@ -263,6 +265,7 @@ class TestClaudePluginPackaging:
         # so the manifest itself does not have to point at them. We assert they
         # exist where the runtime expects them.
         assert (ROOT / "skills" / "aming-claw" / "SKILL.md").is_file()
+        assert (ROOT / "skills" / "aming-claw-hn-challenge" / "SKILL.md").is_file()
         assert (ROOT / "skills" / "aming-claw-hn-demo" / "SKILL.md").is_file()
         assert (ROOT / "skills" / "aming-claw-hn-demo-before-work" / "SKILL.md").is_file()
         assert (ROOT / "skills" / "aming-claw-hn-demo-during-work" / "SKILL.md").is_file()

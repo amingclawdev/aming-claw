@@ -57,13 +57,14 @@ skills and MCP tools are loaded before running the demo prompt below.
 After installing the Aming Claw plugin, ask Codex or Claude:
 
 ```text
-Use the Aming Claw HN demo skill to run the multi-agent challenge demo. If
-needed, create an isolated fixture project, but produce the backlog rows,
-timeline events, graph traces, worker fences, tests, replay evidence, reconcile
-evidence, and semantic evaluation during this run. Do not treat pre-existing
-fixture data as proof. Show one passing worker, one failed or interrupted
-worker, and a replay attempt that passes from the same contract evidence. Show
-me the dashboard URLs and the generated audit report.
+/aming-claw:aming-claw-hn-challenge
+Run the Aming Claw HN multi-agent challenge demo. If needed, create an isolated
+fixture project, but produce the backlog rows, timeline events, graph traces,
+worker fences, tests, replay evidence, reconcile evidence, and semantic
+evaluation during this run. Do not treat pre-existing fixture data as proof.
+Show one passing worker, one failed or interrupted worker, and a replay attempt
+that passes from the same contract evidence. Show me the dashboard URLs and the
+generated audit report.
 ```
 
 If this is your first run and governance has no registered project yet, the demo

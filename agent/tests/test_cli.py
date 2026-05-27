@@ -88,6 +88,7 @@ def _write_cli_plugin_fixture(root):
         path.write_text(json.dumps(text), encoding="utf-8")
     for rel in (
         "skills/aming-claw/SKILL.md",
+        "skills/aming-claw-hn-challenge/SKILL.md",
         "skills/aming-claw-hn-demo/SKILL.md",
         "skills/aming-claw-hn-demo-after-work/SKILL.md",
         "skills/aming-claw-hn-demo-before-work/SKILL.md",

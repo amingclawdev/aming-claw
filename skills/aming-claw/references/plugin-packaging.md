@@ -69,8 +69,9 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   semantic, and chain work.
 - `skills/aming-claw-launcher/`: onboarding skill loaded for preview, start,
   status, and dashboard flows.
-- `skills/aming-claw-hn-demo*/`: HN demo operator skills for the three-fear
-  walkthrough and its before/during/after-work cases.
+- `skills/aming-claw-hn-challenge/`: public HN multi-agent challenge skill.
+- `skills/aming-claw-hn-demo*/`: compatibility and supporting case walkthrough
+  skills for the older before/during/after-work narrative.
 - `frontend/dashboard/scripts/e2e-hn-demo.mjs`: packaged first-run HN demo
   runner. It can create the isolated fixture with `--ensure-fixture
   --no-browser` without requiring the full dashboard source tree or npm install.

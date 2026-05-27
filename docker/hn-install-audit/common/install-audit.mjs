@@ -40,6 +40,7 @@ const GOVERNANCE_URL = `http://127.0.0.1:${GOVERNANCE_PORT}`;
 const REQUIRED_SKILLS = [
   "aming-claw",
   "aming-claw-launcher",
+  "aming-claw-hn-challenge",
   "aming-claw-hn-demo",
   "aming-claw-hn-demo-before-work",
   "aming-claw-hn-demo-during-work",

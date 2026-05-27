@@ -557,6 +557,7 @@ async function runInstallSmoke(audit) {
   const skillFiles = [
     "skills/aming-claw/SKILL.md",
     "skills/aming-claw-launcher/SKILL.md",
+    "skills/aming-claw-hn-challenge/SKILL.md",
     "skills/aming-claw-hn-demo/SKILL.md",
     "skills/aming-claw-hn-demo-before-work/SKILL.md",
     "skills/aming-claw-hn-demo-during-work/SKILL.md",
