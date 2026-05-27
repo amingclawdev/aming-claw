@@ -325,6 +325,7 @@ function runDemoFixture() {
       env: {
         VITE_BACKEND_URL: GOVERNANCE_URL,
         GOVERNANCE_PORT,
+        PYTHON: PYTHON_BIN,
       },
     },
   );
