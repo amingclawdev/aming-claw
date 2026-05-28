@@ -788,6 +788,97 @@ TOOLS: list[dict] = [
             "required": ["payload"],
         },
     },
+    # --- Context Registry ---
+    {
+        "name": "context_pack_list",
+        "description": "List local role-scoped context packs for a project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "role": {"type": "string", "description": "Caller role, e.g. observer or mf_sub."},
+                "visibility": {"type": "string"},
+                "include_body": {"type": "boolean", "description": "Include pack body when role is allowed."},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "context_pack_get",
+        "description": "Get one local context pack by id, with role-aware body redaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "pack_id": {"type": "string"},
+                "role": {"type": "string"},
+                "include_body": {"type": "boolean"},
+            },
+            "required": ["project_id", "pack_id"],
+        },
+    },
+    {
+        "name": "context_pack_upsert",
+        "description": "Create or update a local context pack in governance DB.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "pack_id": {"type": "string"},
+                "title": {"type": "string"},
+                "visibility": {
+                    "type": "string",
+                    "description": "public_skill, internal_product, task_context, or private_founder.",
+                },
+                "allowed_roles": {"type": "array", "items": {"type": "string"}},
+                "mode_scope": {"type": "array", "items": {"type": "string"}},
+                "project_scope": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "source_type": {"type": "string"},
+                "source_path": {"type": "string"},
+                "summary": {"type": "string"},
+                "body": {"type": "string"},
+                "version": {"type": "string"},
+                "no_export": {"type": "boolean"},
+                "enabled": {"type": "boolean"},
+                "created_by": {"type": "string"},
+            },
+            "required": ["project_id", "pack_id"],
+        },
+    },
+    {
+        "name": "context_pack_resolve",
+        "description": "Resolve effective context for a role/mode/backlog with DB-first, docs-fallback behavior.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "role": {"type": "string", "description": "observer, mf_sub, dev, test, qa, merge, etc."},
+                "mode": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "requested_by": {"type": "string"},
+                "include_body": {"type": "boolean"},
+                "record_resolution": {"type": "boolean"},
+            },
+            "required": ["project_id", "role"],
+        },
+    },
+    {
+        "name": "context_pack_seed_private_file",
+        "description": "Import a local file into an observer-only private_founder context pack without committing the body.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "source_path": {"type": "string"},
+                "pack_id": {"type": "string"},
+                "title": {"type": "string"},
+                "summary": {"type": "string"},
+                "created_by": {"type": "string"},
+            },
+            "required": ["project_id", "source_path"],
+        },
+    },
     # --- System ---
     {
         "name": "health",
@@ -1329,6 +1420,91 @@ class ToolDispatcher:
             if not isinstance(payload, dict):
                 return {"ok": False, "errors": ["payload must be an object"]}
             return validate_ue_audit_payload(payload)
+
+        if name in {
+            "context_pack_list",
+            "context_pack_get",
+            "context_pack_upsert",
+            "context_pack_resolve",
+            "context_pack_seed_private_file",
+        }:
+            from agent.governance import context_registry
+            from agent.governance.db import get_connection, sqlite_write_lock
+
+            pid = str(args.get("project_id") or "")
+            if not pid:
+                return {"ok": False, "error": "project_id required"}
+            conn = get_connection(pid)
+            try:
+                if name == "context_pack_list":
+                    packs = context_registry.list_context_packs(
+                        conn,
+                        project_id=pid,
+                        role=str(args.get("role") or "observer"),
+                        visibility=args.get("visibility"),
+                        include_body=bool(args.get("include_body", False)),
+                    )
+                    return {"ok": True, "project_id": pid, "context_packs": packs, "count": len(packs)}
+                if name == "context_pack_get":
+                    pack = context_registry.get_context_pack(
+                        conn,
+                        project_id=pid,
+                        pack_id=str(args.get("pack_id") or ""),
+                        role=str(args.get("role") or "observer"),
+                        include_body=bool(args.get("include_body", False)),
+                    )
+                    if pack is None:
+                        return {"ok": False, "error": "context_pack_not_found", "pack_id": args.get("pack_id")}
+                    return {"ok": True, "project_id": pid, "context_pack": pack}
+                if name == "context_pack_upsert":
+                    with sqlite_write_lock():
+                        pack = context_registry.upsert_context_pack(
+                            conn,
+                            project_id=pid,
+                            pack_id=str(args.get("pack_id") or ""),
+                            title=str(args.get("title") or ""),
+                            visibility=str(args.get("visibility") or context_registry.VISIBILITY_PUBLIC_SKILL),
+                            allowed_roles=args.get("allowed_roles"),
+                            mode_scope=args.get("mode_scope"),
+                            project_scope=str(args.get("project_scope") or ""),
+                            backlog_id=str(args.get("backlog_id") or ""),
+                            source_type=str(args.get("source_type") or "local_db"),
+                            source_path=str(args.get("source_path") or ""),
+                            summary=str(args.get("summary") or ""),
+                            body=str(args.get("body") or ""),
+                            version=str(args.get("version") or "v1"),
+                            no_export=args.get("no_export"),
+                            enabled=args.get("enabled", True),
+                            created_by=str(args.get("created_by") or ""),
+                        )
+                    return {"ok": True, "project_id": pid, "context_pack": pack}
+                if name == "context_pack_seed_private_file":
+                    with sqlite_write_lock():
+                        pack = context_registry.seed_private_context_from_file(
+                            conn,
+                            project_id=pid,
+                            source_path=str(args.get("source_path") or ""),
+                            pack_id=str(args.get("pack_id") or "private_founder_paradigm.v1"),
+                            title=str(args.get("title") or "Private founder judgment context"),
+                            summary=str(
+                                args.get("summary")
+                                or "Private observer-only context imported from a local evidence file."
+                            ),
+                            created_by=str(args.get("created_by") or ""),
+                        )
+                    return {"ok": True, "project_id": pid, "context_pack": pack}
+                return context_registry.resolve_context(
+                    conn,
+                    project_id=pid,
+                    role=str(args.get("role") or ""),
+                    mode=str(args.get("mode") or ""),
+                    backlog_id=str(args.get("backlog_id") or ""),
+                    requested_by=str(args.get("requested_by") or ""),
+                    include_body=bool(args.get("include_body", True)),
+                    record_resolution=bool(args.get("record_resolution", True)),
+                )
+            except context_registry.ContextRegistryError as exc:
+                return {"ok": False, "error": str(exc)}
 
         # --- System ---
         if name == "health":

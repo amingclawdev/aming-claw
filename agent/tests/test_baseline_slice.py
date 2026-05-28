@@ -695,7 +695,7 @@ class TestComputePostState:
 class TestSchemaVersion:
     def test_schema_version_is_current(self):
         from agent.governance.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 44
+        assert SCHEMA_VERSION == 47
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from . import reconcile_session
 from . import backlog_runtime
 from . import raw_requirement
 from . import observer_session
+from . import context_registry
 from .idempotency import check_idempotency, store_idempotency
 from .redis_client import get_redis
 from .models import Evidence, MemoryEntry, NodeDef
@@ -2553,6 +2554,131 @@ def handle_context_archive(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import session_context
     return session_context.archive_context(project_id)
+
+
+# --- Context Registry ---
+
+def _context_registry_error(exc: Exception):
+    if isinstance(exc, context_registry.ContextRegistryError):
+        return 400, {"ok": False, "error": "context_registry_error", "message": str(exc)}
+    if isinstance(exc, LookupError):
+        return 404, {"ok": False, "error": "context_pack_not_found", "message": str(exc)}
+    return 500, {"ok": False, "error": "context_registry_failed", "message": str(exc)}
+
+
+@route("GET", "/api/projects/{project_id}/context-packs")
+def handle_context_pack_list(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    role = str(ctx.query.get("role") or "observer")
+    include_body = str(ctx.query.get("include_body") or "").lower() in {"1", "true", "yes"}
+    visibility = str(ctx.query.get("visibility") or "") or None
+    conn = get_connection(project_id)
+    try:
+        packs = context_registry.list_context_packs(
+            conn,
+            project_id=project_id,
+            role=role,
+            include_body=include_body,
+            visibility=visibility,
+        )
+    except Exception as exc:
+        return _context_registry_error(exc)
+    return {"ok": True, "project_id": project_id, "context_packs": packs, "count": len(packs)}
+
+
+@route("POST", "/api/projects/{project_id}/context-packs")
+def handle_context_pack_upsert(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        with sqlite_write_lock():
+            pack = context_registry.upsert_context_pack(
+                conn,
+                project_id=project_id,
+                pack_id=str(body.get("pack_id") or ""),
+                title=str(body.get("title") or ""),
+                visibility=str(body.get("visibility") or context_registry.VISIBILITY_PUBLIC_SKILL),
+                allowed_roles=body.get("allowed_roles"),
+                mode_scope=body.get("mode_scope"),
+                project_scope=str(body.get("project_scope") or ""),
+                backlog_id=str(body.get("backlog_id") or ""),
+                source_type=str(body.get("source_type") or "local_db"),
+                source_path=str(body.get("source_path") or ""),
+                summary=str(body.get("summary") or ""),
+                body=str(body.get("body") or ""),
+                version=str(body.get("version") or "v1"),
+                no_export=body.get("no_export"),
+                enabled=body.get("enabled", True),
+                created_by=str(body.get("created_by") or body.get("actor") or ""),
+            )
+    except Exception as exc:
+        return _context_registry_error(exc)
+    return 201, {"ok": True, "project_id": project_id, "context_pack": pack}
+
+
+@route("POST", "/api/projects/{project_id}/context-packs/seed-private-file")
+def handle_context_pack_seed_private_file(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        with sqlite_write_lock():
+            pack = context_registry.seed_private_context_from_file(
+                conn,
+                project_id=project_id,
+                source_path=str(body.get("source_path") or ""),
+                pack_id=str(body.get("pack_id") or "private_founder_paradigm.v1"),
+                title=str(body.get("title") or "Private founder judgment context"),
+                summary=str(body.get("summary") or "Private observer-only context imported from a local evidence file."),
+                created_by=str(body.get("created_by") or body.get("actor") or ""),
+            )
+    except Exception as exc:
+        return _context_registry_error(exc)
+    return 201, {"ok": True, "project_id": project_id, "context_pack": pack}
+
+
+@route("POST", "/api/projects/{project_id}/context-packs/resolve")
+def handle_context_pack_resolve(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        result = context_registry.resolve_context(
+            conn,
+            project_id=project_id,
+            role=str(body.get("role") or ""),
+            mode=str(body.get("mode") or ""),
+            backlog_id=str(body.get("backlog_id") or ""),
+            requested_by=str(body.get("requested_by") or body.get("actor") or ""),
+            include_body=bool(body.get("include_body", True)),
+            record_resolution=bool(body.get("record_resolution", True)),
+        )
+    except Exception as exc:
+        return _context_registry_error(exc)
+    return result
+
+
+@route("GET", "/api/projects/{project_id}/context-packs/{pack_id}")
+def handle_context_pack_get(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    pack_id = unquote(str(ctx.path_params.get("pack_id") or ""))
+    role = str(ctx.query.get("role") or "observer")
+    include_body = str(ctx.query.get("include_body") or "").lower() in {"1", "true", "yes"}
+    conn = get_connection(project_id)
+    try:
+        pack = context_registry.get_context_pack(
+            conn,
+            project_id=project_id,
+            pack_id=pack_id,
+            role=role,
+            include_body=include_body,
+        )
+    except Exception as exc:
+        return _context_registry_error(exc)
+    if pack is None:
+        return 404, {"ok": False, "error": "context_pack_not_found", "pack_id": pack_id}
+    return {"ok": True, "project_id": project_id, "context_pack": pack}
 
 
 # --- Workflow ---

@@ -264,6 +264,35 @@ rescue, and other bounded work that should stay under observer control. The
 canonical SOP is `docs/governance/manual-fix-sop.md`; the compact session
 checklist is `aming-claw://mf-sop`.
 
+## Context Registry
+
+Before starting observer-heavy work or dispatching bounded workers, resolve the
+role-scoped context packs for the active project:
+
+```text
+context_pack_resolve(project_id="<project_id>", role="observer", mode="<mode>")
+```
+
+The registry is DB-first with source-controlled fallback docs. It is the place
+for local product principles, expert review rules, task context, and private
+observer-only judgment that should not be shipped in public skills.
+
+Context boundaries are part of the contract:
+
+- Observer sessions may receive `private_founder` packs when the local operator
+  imported them into the governance DB.
+- `mf_sub`, chain dev/test/qa/merge, and other worker roles must receive only
+  packs explicitly allowed for that role.
+- Do not paste private observer context into worker prompts. Translate it into
+  scoped contracts, acceptance criteria, target files, and review gates.
+- Resolution evidence should record pack ids, versions, and hashes; do not log
+  private pack bodies as timeline evidence.
+
+If no local pack exists, fall back to
+`skills/aming-claw/references/observer-context-safe.md` for observer-safe
+expertise routing. Private strategy can be imported locally with
+`context_pack_seed_private_file`; its body must not be committed to git.
+
 During MVP, Chain is not the default path for routine implementation. The V1
 implementation default is observer-led Manual Fix: backlog row, graph
 discovery, local Codex `mf_sub` workers when useful, focused tests, explicit
@@ -610,4 +639,5 @@ Before closing a row:
 - [graph-first.md](references/graph-first.md): graph discovery playbook and reuse rule.
 - [mf-sop.md](references/mf-sop.md): short MF checklist; canonical SOP remains `docs/governance/manual-fix-sop.md`.
 - [mcp-tools.md](references/mcp-tools.md): MCP tool family guide and common payloads.
+- [observer-context-safe.md](references/observer-context-safe.md): source-controlled fallback for observer-safe expertise routing.
 - [plugin-packaging.md](references/plugin-packaging.md): repo-local plugin layout and publish cautions.
