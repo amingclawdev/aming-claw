@@ -669,6 +669,11 @@ export interface BacklogBug {
   worktree_branch?: string;
   worktree_path?: string;
   mf_type?: string;
+  source_raw_id?: string;
+  original_request_excerpt?: string;
+  original_request_source?: string;
+  original_request_missing?: boolean;
+  original_request_missing_reason?: string;
   target_file_count?: number;
   test_file_count?: number;
   acceptance_count?: number;

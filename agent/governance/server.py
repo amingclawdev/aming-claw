@@ -1387,15 +1387,29 @@ def handle_project_inbox(ctx: RequestContext):
     }
 
 
-def _project_inbox_backlog_ids(conn: sqlite3.Connection, *, project_id: str) -> set[str]:
-    """Return backlog ids explicitly associated with the ordinary Project Inbox path."""
+def _project_inbox_backlog_sources(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+) -> dict[str, dict]:
+    """Return source-backed request text for Project Inbox backlog rows.
+
+    Backlog title/details are implementation summaries, not the user's original
+    wording. Simple Mode can show a request excerpt only when it can trace the
+    backlog row back to a raw requirement or an inbox command payload.
+    """
+    sources: dict[str, dict] = {}
     ids: set[str] = set()
     pid = (project_id or "").strip()
     if not pid:
-        return ids
+        return sources
     try:
         rows = conn.execute(
-            "SELECT promoted_bug_id FROM raw_requirements WHERE project_id = ? AND promoted_bug_id <> ''",
+            """
+            SELECT raw_id, raw_text, source, promoted_bug_id
+            FROM raw_requirements
+            WHERE project_id = ? AND promoted_bug_id <> ''
+            """,
             (pid,),
         ).fetchall()
     except sqlite3.OperationalError as exc:
@@ -1404,9 +1418,18 @@ def _project_inbox_backlog_ids(conn: sqlite3.Connection, *, project_id: str) -> 
         else:
             raise
     for row in rows:
-        value = row["promoted_bug_id"] if isinstance(row, sqlite3.Row) else row[0]
-        if str(value or "").strip():
-            ids.add(str(value).strip())
+        data = dict(row)
+        bug_id = str(data.get("promoted_bug_id") or "").strip()
+        if not bug_id:
+            continue
+        ids.add(bug_id)
+        sources[bug_id] = {
+            "source_raw_id": str(data.get("raw_id") or ""),
+            "original_request_excerpt": _compact_preview(data.get("raw_text", ""), limit=240),
+            "original_request_source": str(data.get("source") or "raw_requirement"),
+            "original_request_missing": False,
+            "original_request_missing_reason": "",
+        }
 
     try:
         command_rows = conn.execute(
@@ -1433,7 +1456,66 @@ def _project_inbox_backlog_ids(conn: sqlite3.Connection, *, project_id: str) -> 
             value = str(payload.get(key) or "").strip()
             if value:
                 ids.add(value)
-    return ids
+                raw_id = str(payload.get("raw_id") or "").strip()
+                source_info = {
+                    "source_raw_id": raw_id,
+                    "original_request_excerpt": "",
+                    "original_request_source": source,
+                    "original_request_missing": True,
+                    "original_request_missing_reason": "No linked raw request text was found for this work item.",
+                }
+                if raw_id:
+                    try:
+                        raw_row = conn.execute(
+                            """
+                            SELECT raw_text, source
+                            FROM raw_requirements
+                            WHERE project_id = ? AND raw_id = ?
+                            """,
+                            (pid, raw_id),
+                        ).fetchone()
+                    except sqlite3.OperationalError as exc:
+                        if "no such table" in str(exc).lower():
+                            raw_row = None
+                        else:
+                            raise
+                    if raw_row:
+                        raw_data = dict(raw_row)
+                        source_info.update(
+                            {
+                                "original_request_excerpt": _compact_preview(
+                                    raw_data.get("raw_text", ""),
+                                    limit=240,
+                                ),
+                                "original_request_source": str(
+                                    raw_data.get("source") or source
+                                ),
+                                "original_request_missing": False,
+                                "original_request_missing_reason": "",
+                            }
+                        )
+                sources.setdefault(
+                    value,
+                    source_info,
+                )
+    if ids:
+        for bug_id in ids:
+            sources.setdefault(
+                bug_id,
+                {
+                    "source_raw_id": "",
+                    "original_request_excerpt": "",
+                    "original_request_source": "project_inbox",
+                    "original_request_missing": True,
+                    "original_request_missing_reason": "No linked raw request text was found for this work item.",
+                },
+            )
+    return sources
+
+
+def _project_inbox_backlog_ids(conn: sqlite3.Connection, *, project_id: str) -> set[str]:
+    """Return backlog ids explicitly associated with the ordinary Project Inbox path."""
+    return set(_project_inbox_backlog_sources(conn, project_id=project_id))
 
 
 def _project_inbox_backlog_lanes(
@@ -1449,7 +1531,8 @@ def _project_inbox_backlog_lanes(
         "review_needed": {"count": 0, "items": [], "source": "backlog"},
         "done": {"count": 0, "items": [], "source": "backlog"},
     }
-    associated_bug_ids = _project_inbox_backlog_ids(conn, project_id=project_id)
+    source_by_bug_id = _project_inbox_backlog_sources(conn, project_id=project_id)
+    associated_bug_ids = set(source_by_bug_id)
     if not associated_bug_ids:
         return lanes
     placeholders = ", ".join("?" for _ in associated_bug_ids)
@@ -1473,6 +1556,7 @@ def _project_inbox_backlog_lanes(
         raw = dict(row)
         bug = _backlog_compact_bug(row)
         bug["kind"] = "backlog"
+        bug.update(source_by_bug_id.get(str(raw.get("bug_id") or ""), {}))
         status = str(raw.get("status") or "OPEN").upper()
         runtime_state = str(raw.get("runtime_state") or "").strip().lower()
         chain_stage = str(raw.get("chain_stage") or "").strip().lower()

@@ -18,9 +18,9 @@ interface Props {
 type SimpleTab = "before" | "in_progress" | "completed";
 
 const TABS: Array<{ key: SimpleTab; label: string }> = [
-  { key: "before", label: "Before development" },
-  { key: "in_progress", label: "In progress" },
-  { key: "completed", label: "Completed" },
+  { key: "before", label: "Saved requests" },
+  { key: "in_progress", label: "Being worked on" },
+  { key: "completed", label: "Finished" },
 ];
 
 const WORKER_CONTROL_TYPES = {
@@ -87,7 +87,7 @@ function commandsForBacklog(bugId: string, commands: ObserverCommand[]): Observe
 function commandTypeLabel(type: string): string {
   if (type === "analyze_requirements") return "Analyze request";
   if (type === "confirm_requirement") return "Confirm request";
-  if (type === "move_to_execution_queue") return "Send to execution queue";
+  if (type === "move_to_execution_queue") return "Start work";
   if (type === "pause_worker") return "Pause";
   if (type === "continue_worker") return "Continue";
   if (type === "cancel_worker") return "Cancel";
@@ -102,8 +102,8 @@ function statusToneLabel(status: ObserverCommandStatus | null | undefined): {
   tone: "neutral" | "queued" | "running" | "complete" | "failed";
   label: string;
 } {
-  if (!status) return { tone: "neutral", label: "Not queued" };
-  if (status === "queued" || status === "notified") return { tone: "queued", label: "Queued" };
+  if (!status) return { tone: "neutral", label: "Not started" };
+  if (status === "queued" || status === "notified") return { tone: "queued", label: "Waiting" };
   if (status === "claimed" || status === "running") return { tone: "running", label: "Running" };
   if (status === "completed") return { tone: "complete", label: "Completed" };
   if (status === "failed") return { tone: "failed", label: "Failed" };
@@ -136,7 +136,7 @@ function observerStatusLine(
     return { tone: "running", label: `${actionCountLabel(counts.running)} running · ${assistantLabel}` };
   }
   if (counts.queued > 0) {
-    return { tone: "queued", label: `${actionCountLabel(counts.queued)} queued · ${assistantLabel}` };
+    return { tone: "queued", label: `${actionCountLabel(counts.queued)} waiting · ${assistantLabel}` };
   }
   if (!observer?.connected) {
     return { tone: "waiting", label: assistantLabel };
@@ -180,6 +180,60 @@ function plainTextPreview(value: unknown, max = 240): string {
   } catch {
     return String(value);
   }
+}
+
+function rawRequestNextLine(row: RawRequirement, commands: ObserverCommand[]): string {
+  const analyze = latestCommandOfType(commands, "analyze_requirements");
+  const move = latestCommandOfType(commands, "move_to_execution_queue");
+  if (commandIsActive(analyze)) return "Waiting: AI is reading this request.";
+  if (analyze?.status === "completed" && rawUiStatus(row) === "unconfirmed") {
+    return "Next: confirm this is the right request.";
+  }
+  if (commandIsActive(move)) return "Waiting: work is being started.";
+  if (rawUiStatus(row) === "unconfirmed") return "Next: ask AI to analyze it or confirm it yourself.";
+  return "Next: start work when this request is ready.";
+}
+
+function backlogRequestText(bug: BacklogBug): string {
+  const excerpt = (bug.original_request_excerpt || "").trim();
+  if (excerpt) return excerpt;
+  return bug.original_request_missing_reason || "Original request text is not linked yet.";
+}
+
+function backlogRequestState(
+  bug: BacklogBug,
+  lane: "ready" | "working" | "review" | "done",
+): { label: string; tone: "ready" | "working" | "review" | "done"; next: string } {
+  if (lane === "ready") {
+    return {
+      label: "Waiting to start",
+      tone: "ready",
+      next: "Waiting: this request is ready for work to begin.",
+    };
+  }
+  if (lane === "review") {
+    return {
+      label: "Needs review",
+      tone: "review",
+      next: "Next: review the result or the issue blocking it.",
+    };
+  }
+  if (lane === "done") {
+    return {
+      label: "Finished",
+      tone: "done",
+      next: bug.commit ? "Done: open details if you need proof." : "Done: recorded without a linked change.",
+    };
+  }
+  const runtimeState = (bug.runtime_state || "").trim().toLowerCase();
+  if (runtimeState === "paused") {
+    return { label: "Paused", tone: "working", next: "Next: continue when you are ready." };
+  }
+  return {
+    label: "In progress",
+    tone: "working",
+    next: "Working: progress will update here.",
+  };
 }
 
 export default function ProjectInboxView({ projectId, refreshKey = 0 }: Props) {
@@ -393,30 +447,42 @@ export default function ProjectInboxView({ projectId, refreshKey = 0 }: Props) {
         <div>
           <h2 className="view-title">Simple Mode</h2>
           <p className="view-subtitle">
-            Capture, confirm, track progress, and review completed work. Use Engineer Mode only when you need advanced project details.
+            Save requests in your own words, then follow each one from idea to finish.
           </p>
         </div>
-        <div className="project-inbox-stats">
-          <Kpi label="Drafts" value={draftRows.length} />
-          <Kpi label="Ready" value={readyToQueueRaw.length} />
-          <Kpi label="In progress" value={inProgressLane.length + reviewLane.length} />
-          <Kpi label="Completed" value={doneLane.length} />
-        </div>
       </div>
+
+      <RequestFirstOverview
+        rawRows={allRaw}
+        readyBacklog={readyLane.filter(isBacklogItem)}
+        inProgressBacklog={inProgressLane.filter(isBacklogItem)}
+        reviewBacklog={reviewLane.filter(isBacklogItem)}
+        doneBacklog={doneLane.filter(isBacklogItem)}
+        commands={commands}
+        onOpenRaw={(row) => setDetailRawId(row.raw_id)}
+        onOpenBacklog={(bug) => navigateToAudit(projectId, { bug_id: bug.bug_id })}
+      />
 
       <section className={`project-inbox-observer simple-mode-observer tone-${observerLine.tone}`}>
         <span className={`project-inbox-observer-pill ${observerConnected ? "connected" : "waiting"}`}>
           {observerLine.label}
         </span>
-        <span className="project-inbox-command-count">Queued {queuedCount}</span>
-        <span className="project-inbox-command-count">Running {runningCount}</span>
-        <span className="project-inbox-command-count">Completed {completedCount}</span>
-        <span className="project-inbox-command-count">Failed {failedCount}</span>
+        <span className="project-inbox-command-count">Waiting {queuedCount}</span>
+        <span className="project-inbox-command-count">Working {runningCount}</span>
+        <span className="project-inbox-command-count">Finished {completedCount}</span>
+        <span className="project-inbox-command-count">Needs attention {failedCount}</span>
         {!observerConnected ? (
           <span className="simple-mode-observer-hint">
-            AI actions and worker controls are disabled until an AI assistant connects.
+            Request actions are available once an AI assistant connects.
           </span>
         ) : null}
+      </section>
+
+      <section className="project-inbox-stats simple-mode-summary" aria-label="Request summary">
+        <Kpi label="Saved" value={draftRows.length} />
+        <Kpi label="Ready" value={readyToQueueRaw.length} />
+        <Kpi label="Working" value={inProgressLane.length + reviewLane.length} />
+        <Kpi label="Finished" value={doneLane.length} />
       </section>
 
       <nav className="simple-mode-tabs" role="tablist" aria-label="Simple Mode tabs">
@@ -492,6 +558,93 @@ export default function ProjectInboxView({ projectId, refreshKey = 0 }: Props) {
   );
 }
 
+function RequestFirstOverview({
+  rawRows,
+  readyBacklog,
+  inProgressBacklog,
+  reviewBacklog,
+  doneBacklog,
+  commands,
+  onOpenRaw,
+  onOpenBacklog,
+}: {
+  rawRows: RawRequirement[];
+  readyBacklog: BacklogBug[];
+  inProgressBacklog: BacklogBug[];
+  reviewBacklog: BacklogBug[];
+  doneBacklog: BacklogBug[];
+  commands: ObserverCommand[];
+  onOpenRaw: (row: RawRequirement) => void;
+  onOpenBacklog: (bug: BacklogBug) => void;
+}) {
+  const backlogCards = [
+    ...readyBacklog.map((bug) => ({ bug, lane: "ready" as const })),
+    ...inProgressBacklog.map((bug) => ({ bug, lane: "working" as const })),
+    ...reviewBacklog.map((bug) => ({ bug, lane: "review" as const })),
+    ...doneBacklog.map((bug) => ({ bug, lane: "done" as const })),
+  ];
+  const hasRequests = rawRows.length > 0 || backlogCards.length > 0;
+
+  return (
+    <section className="simple-request-first" aria-label="Your requests">
+      <header className="simple-request-first-head">
+        <div>
+          <h3>Your requests</h3>
+          <p>Each card keeps the original ask visible with the current state and next step.</p>
+        </div>
+        <span className="pill pill-mono">{rawRows.length + backlogCards.length}</span>
+      </header>
+      {!hasRequests ? (
+        <div className="project-inbox-empty">
+          No saved requests yet. Write one below to start from the exact words you want tracked.
+        </div>
+      ) : (
+        <div className="simple-request-grid">
+          {rawRows.map((row) => {
+            const commandsForRow = commandsForRaw(row.raw_id, commands);
+            const status = rawUiStatus(row);
+            return (
+              <article className={`simple-request-card tone-${status}`} key={`overview-raw-${row.raw_id}`}>
+                <div className="simple-request-card-head">
+                  <span className={`simple-raw-status simple-raw-status-${status}`}>
+                    {status === "unconfirmed" ? "Saved" : "Ready"}
+                  </span>
+                  <span className="simple-raw-time">{fmtTimestamp(row.updated_at || row.created_at)}</span>
+                </div>
+                <div className="simple-request-label">You asked</div>
+                <p className="simple-request-text">{row.raw_text}</p>
+                <p className="simple-request-next">{rawRequestNextLine(row, commandsForRow)}</p>
+                <button type="button" className="action-btn" onClick={() => onOpenRaw(row)}>
+                  Details
+                </button>
+              </article>
+            );
+          })}
+          {backlogCards.map(({ bug, lane }) => {
+            const state = backlogRequestState(bug, lane);
+            return (
+              <article className={`simple-request-card tone-${state.tone}`} key={`overview-bug-${bug.bug_id}`}>
+                <div className="simple-request-card-head">
+                  <span className={`simple-request-status tone-${state.tone}`}>{state.label}</span>
+                  <span className="simple-raw-time">{fmtTimestamp(bug.updated_at || bug.created_at)}</span>
+                </div>
+                <div className="simple-request-label">You asked</div>
+                <p className={`simple-request-text${bug.original_request_missing ? " is-missing" : ""}`}>
+                  {backlogRequestText(bug)}
+                </p>
+                <p className="simple-request-next">{state.next}</p>
+                <button type="button" className="action-btn" onClick={() => onOpenBacklog(bug)}>
+                  Details
+                </button>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Kpi({ label, value }: { label: string; value: number }) {
   return (
     <div className="project-inbox-kpi">
@@ -538,13 +691,13 @@ function BeforeDevelopmentTab({
         <textarea
           value={rawText}
           onChange={(event) => setRawText(event.target.value)}
-          placeholder="Describe what you need in your own words. This saves the exact text and does not dispatch work."
+          placeholder="Describe what you need in your own words. This saves the exact text before work begins."
           rows={5}
           aria-label="New request text"
         />
         <div className="project-inbox-capture-actions">
           <span>
-            Saves the request as written. AI runs only after you ask for analysis and an AI assistant picks it up.
+            Saves the request as written. AI runs only after you ask for analysis.
           </span>
           <button
             type="button"
@@ -588,12 +741,12 @@ function BeforeDevelopmentTab({
 
       <section className="simple-mode-section">
         <header className="simple-mode-section-head">
-          <h3>Ready to queue</h3>
+          <h3>Ready to start</h3>
           <span className="pill pill-mono">{readyToQueueRaw.length}</span>
         </header>
         {!readyToQueueRaw.length ? (
           <div className="project-inbox-empty">
-            Confirm a saved request when it is ready to send to execution.
+            Confirm a saved request when it is ready to begin.
           </div>
         ) : (
           <div className="simple-mode-cards">
@@ -627,10 +780,10 @@ function BeforeDevelopmentTab({
                       type="button"
                       className="action-btn"
                       disabled={busy || !observerConnected || commandIsActive(move)}
-                      onClick={() => onMoveToExecution(row)}
-                    >
-                      {commandIsActive(move) ? label : "Send to execution queue"}
-                    </button>
+	                      onClick={() => onMoveToExecution(row)}
+	                    >
+	                      {commandIsActive(move) ? label : "Start work"}
+	                    </button>
                     <button
                       type="button"
                       className="action-btn"
@@ -648,28 +801,34 @@ function BeforeDevelopmentTab({
 
       <section className="simple-mode-section">
         <header className="simple-mode-section-head">
-          <h3>Queued for execution</h3>
+          <h3>Waiting to start</h3>
           <span className="pill pill-mono">{readyBacklog.length}</span>
         </header>
         {!readyBacklog.length ? (
           <div className="project-inbox-empty">
-            Requests sent to execution appear here once they have an associated work item.
+            Requests appear here once they are ready for work to begin.
           </div>
         ) : (
           <div className="simple-mode-cards">
             {readyBacklog.map((bug) => (
               <article className="execution-queue-card backlog" key={`bug-${bug.bug_id}`}>
                 <div className="execution-queue-title">{bug.title || "Untitled requirement"}</div>
+                <p className={`simple-request-text${bug.original_request_missing ? " is-missing" : ""}`}>
+                  {backlogRequestText(bug)}
+                </p>
                 <div className="execution-queue-meta">
-                  <span>Queued {fmtTimestamp(bug.updated_at || bug.created_at)}</span>
+                  <span>Waiting since {fmtTimestamp(bug.updated_at || bug.created_at)}</span>
                 </div>
+                <p className="simple-request-next">
+                  {backlogRequestState(bug, "ready").next}
+                </p>
                 <div className="project-inbox-card-actions">
                   <button
                     type="button"
                     className="action-btn"
                     onClick={() => onOpenAudit({ bug_id: bug.bug_id })}
                   >
-                    View audit
+                    Details
                   </button>
                 </div>
               </article>
@@ -714,10 +873,12 @@ function RawRequirementCard({
         </span>
         <span className="simple-raw-time">{fmtTimestamp(row.created_at)}</span>
       </div>
+      <div className="simple-request-label">You asked</div>
       <div className="simple-raw-card-text">{row.raw_text}</div>
+      <p className="simple-request-next">{rawRequestNextLine(row, commands)}</p>
       <div className="project-inbox-command-row">
         <span className={`project-inbox-command-status tone-${analyzeTone}`}>
-          Analysis: {analyzeLabel}
+          AI reading: {analyzeLabel}
         </span>
         {analyze?.error ? (
           <span className="project-inbox-command-error">{analyze.error}</span>
@@ -751,7 +912,7 @@ function RawRequirementCard({
             disabled={busy || !observerConnected || commandIsActive(move)}
             onClick={() => onMoveToExecution(row)}
           >
-            {commandIsActive(move) ? statusToneLabel(move?.status).label : "Send to execution queue"}
+            {commandIsActive(move) ? statusToneLabel(move?.status).label : "Start work"}
           </button>
         )}
         <button
@@ -767,7 +928,7 @@ function RawRequirementCard({
             className="action-btn"
             onClick={() => onOpenAudit({ bug_id: row.promoted_bug_id, raw_id: row.raw_id })}
           >
-            View audit
+            Details
           </button>
         ) : null}
       </div>
@@ -794,7 +955,7 @@ function InProgressTab({
     return (
       <div className="simple-mode-tab-panel">
         <div className="project-inbox-empty">
-          No work is active. Queued requests show up here once execution starts.
+          No work is active. Started requests show up here.
         </div>
       </div>
     );
@@ -862,9 +1023,16 @@ function WorkerCard({
       <div className="worker-card-head">
         <div className="worker-card-title">{bug.title || "Untitled requirement"}</div>
       </div>
+      <div className="simple-request-label">You asked</div>
+      <p className={`simple-request-text${bug.original_request_missing ? " is-missing" : ""}`}>
+        {backlogRequestText(bug)}
+      </p>
       <div className="worker-card-meta">
         <span>{progressLabel}</span>
       </div>
+      <p className="simple-request-next">
+        {backlogRequestState(bug, isBlocked ? "review" : "working").next}
+      </p>
       <div className="worker-card-controls">
         {isRunning ? (
           <ControlButton
@@ -895,7 +1063,7 @@ function WorkerCard({
           className="action-btn"
           onClick={() => onOpenAudit({ bug_id: bug.bug_id })}
         >
-          {isBlocked ? "View issue" : "View audit"}
+          {isBlocked ? "View issue" : "Details"}
         </button>
       </div>
       {disabledReason ? (
@@ -941,7 +1109,7 @@ function CompletedTab({
     return (
       <div className="simple-mode-tab-panel">
         <div className="project-inbox-empty">
-          No completed requests yet. Finished work appears here with its outcome and commit.
+          No finished requests yet. Finished work appears here with its outcome.
         </div>
       </div>
     );
@@ -959,17 +1127,22 @@ function CompletedTab({
               {!bug.fixed_at && bug.updated_at ? <span>Updated {fmtTimestamp(bug.updated_at)}</span> : null}
               {bug.status ? <span>{bug.status}</span> : null}
             </div>
+            <div className="simple-request-label">You asked</div>
+            <p className={`simple-request-text${bug.original_request_missing ? " is-missing" : ""}`}>
+              {backlogRequestText(bug)}
+            </p>
+            <p className="simple-request-next">{backlogRequestState(bug, "done").next}</p>
             <p className="completed-summary">
-              {bug.details_preview || bug.details_md || "Completed work is recorded. Open the audit for full execution details."}
+              {bug.details_preview || bug.details_md || "Completed work is recorded. Open details for the full result."}
             </p>
             {bug.commit ? (
               <div className="completed-commit">
-                <span className="completed-commit-label">commit</span>
+                <span className="completed-commit-label">Change</span>
                 <span className="mono completed-commit-hash">{shortCommit(bug.commit)}</span>
               </div>
             ) : (
               <div className="completed-commit completed-commit-missing">
-                No commit recorded
+                No linked change recorded
               </div>
             )}
             <div className="project-inbox-card-actions">
@@ -978,7 +1151,7 @@ function CompletedTab({
                 className="action-btn"
                 onClick={() => onOpenAudit({ bug_id: bug.bug_id })}
               >
-                View audit
+                Details
               </button>
             </div>
           </article>
@@ -995,7 +1168,7 @@ function simpleAiStatus(
   if (command.status === "queued" || command.status === "notified") {
     return {
       tone: "queued",
-      message: "AI analysis is queued. It will start once an AI assistant picks it up.",
+      message: "AI analysis is waiting. It will start once an AI assistant is available.",
     };
   }
   if (command.status === "claimed" || command.status === "running") {
@@ -1119,7 +1292,7 @@ function RawDetailModal({
                 disabled={busy || !observerConnected || commandIsActive(move)}
                 onClick={() => onMoveToExecution(row)}
               >
-                {commandIsActive(move) ? statusToneLabel(move?.status).label : "Send to execution queue"}
+                {commandIsActive(move) ? statusToneLabel(move?.status).label : "Start work"}
               </button>
             ) : null}
             {!observerConnected ? (
@@ -1193,7 +1366,7 @@ function RawDetailModal({
               className="action-btn action-btn-primary"
               onClick={() => onOpenAudit({ bug_id: row.promoted_bug_id, raw_id: row.raw_id })}
             >
-              View audit
+              Details
             </button>
           </footer>
         ) : null}

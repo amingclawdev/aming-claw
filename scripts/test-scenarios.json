@@ -15,6 +15,13 @@
           "command": "{python}",
           "required": true,
           "remediation": "Install Python or set PYTHON/PYTHON_BIN to the interpreter used for this checkout."
+        },
+        {
+          "id": "node",
+          "kind": "command",
+          "command": "{node}",
+          "required": true,
+          "remediation": "Install Node.js so the focused dashboard E2E contract can run."
         }
       ],
       "commands": [
@@ -33,6 +40,18 @@
           "timeout_ms": 120000
         },
         {
+          "id": "simple_mode_request_first_desktop_contract",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "frontend/dashboard/scripts/e2e-projects.mjs",
+            "--only",
+            "simple-mode-request-first-desktop"
+          ],
+          "env": {},
+          "timeout_ms": 120000
+        },
+        {
           "id": "observer_session_command_queue",
           "cwd": "repo",
           "command": [
@@ -48,7 +67,14 @@
           "timeout_ms": 120000
         }
       ],
-      "artifacts": []
+      "artifacts": [
+        {
+          "id": "simple_mode_request_first_desktop_contract",
+          "kind": "e2e_contract",
+          "path": "frontend/dashboard/scripts/e2e-projects.mjs",
+          "description": "Desktop-only request-first Simple Mode check: request cards must render before helper status, counters, and tabs, and default visible copy must avoid operator terms."
+        }
+      ]
     },
     {
       "id": "ruby_graph_sinatra",

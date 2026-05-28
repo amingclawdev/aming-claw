@@ -1,185 +1,166 @@
 # Simple Requirement Workspace Design
 
-Status: High-fidelity written design, 2026-05-28
+Status: P0 desktop implementation contract, 2026-05-28
 
-Backlog: OBSERVER-COMMAND-QUEUE-SESSION-TOKEN-V1-20260528
+Backlog: SIMPLE-MODE-REQUEST-FIRST-UE-GATE-20260528
 
-## Design Principle
+## Goal
 
-Simple Mode is a requirement lifecycle, not a graph console. Ordinary users see
-captured requests, AI interpretation, execution state, and completion evidence.
-Graph, backlog, Review Queue, and raw audit details remain one click deeper in
-Engineer Mode or View audit.
+Simple Mode is a request workspace for ordinary users. The first screen answers:
 
-## Layout
+- What did I ask for?
+- What is happening with it?
+- What should I do next, or what am I waiting on?
 
-The first screen is the workspace itself. It uses a dense operational layout:
+Desktop web is the P0 validation target. Mobile first-viewport validation is out
+of scope for this P0 because there is no current mobile app usage scenario.
 
-- Left/top project selector inherited from the existing dashboard shell.
-- Main tab bar with Before development, In progress, Completed.
-- A compact observer status strip near the tab bar.
-- Content area for requirement cards, execution queue, worker cards, and
-  completed cards.
+## First Viewport
 
-There is no landing page, no marketing hero, and no graph by default.
+The first content block after the project shell must be Your requests. When at
+least one request exists, show request cards before helper status, counters,
+system health, or proof details.
 
-## Observer Status Strip
+Desktop order:
 
-The status strip shows one of:
+1. Project selector and page title.
+2. Your requests request-card grid/list.
+3. Compact helper status and request summary counters.
+4. Request capture input and detailed lane tabs.
+5. Secondary proof/details surfaces.
 
-- Connected: at least one active or idle observer session exists.
-- Waiting for observer: no connected session exists.
-- Command queued: dashboard wrote a command and is waiting for claim.
-- Running: a command is claimed or running.
-- Completed: last command completed.
-- Failed: last command failed and exposes retry or View audit.
+Do not make the user open a modal to see their saved requests, request status,
+or next step.
 
-The strip must not pretend that AI has run because a button was clicked. Button
-clicks create queue rows. AI work begins only when a registered observer claims
-the row.
+## Request Card Contract
 
-## Tab 1: Before Development
+Every visible request card must show these three fields:
 
-Before development contains the full intake and confirmation path.
+- Original request excerpt: a concise excerpt of the user's own wording.
+- User-facing status: one of the approved labels below.
+- Next-action or waiting line: one sentence that says what the user can do now
+  or what the product is waiting for.
 
-Primary sections:
+Optional card fields:
 
-- Large requirement input.
-- Raw requirement cards.
-- AI interpretation and proposed backlog mapping.
-- Execution queue.
+- saved time or completed time
+- friendly title generated from the request
+- Details action
+- retry action when the request needs attention
 
-The requirement input captures the user's exact words. Submitting creates a
-raw requirement row only. It does not create a backlog row, query the graph, or
-dispatch a worker.
+The card must never rely only on an interpreted title. Users need the original
+request wording visible so they can verify the work still maps to what they
+asked for.
 
-Raw requirement cards show:
+## Lifecycle Lanes
 
-- original request excerpt
-- capture time
-- status: unconfirmed or confirmed
-- latest command state when an AI analysis command exists
-- AI Analyze action
-- Confirm action after analysis or manual review
+Use request-centered lane names and copy:
 
-AI Analyze enqueues `analyze_requirements` with payload:
+- Saved requests: newly captured or manually reviewed requests.
+- Waiting to start: confirmed requests that are ready but not active yet.
+- Working: requests currently being handled.
+- Ready for review: requests that need the user's decision or acceptance.
+- Done: completed requests.
+- Needs attention: requests blocked by missing context or a failed helper step.
 
-```json
-{
-  "raw_id": "raw-...",
-  "source": "project_inbox"
-}
-```
+Queued, in-progress, ready-for-review, and done cards must carry one of:
 
-The dashboard then refreshes command state from governance. It does not send
-the payload through a hook and does not inject a message into an open chat.
+- `original_request_excerpt` from the raw request source; or
+- an explicit missing-source state: "Original request text is not linked yet."
 
-### Detail Modal
+Do not synthesize the original request from implementation notes, task details,
+or proof metadata. If the source is missing, show the missing-source state and
+keep the item visible.
 
-Opening a raw requirement card shows:
+## User-Facing Status Copy
 
-- Original request
-- AI interpretation
-- Proposed backlog mapping
-- Suggested acceptance criteria
-- Risk or missing context
-- Command history summary
-- Optional View audit link
+Approved default labels:
 
-The modal is the first place where richer detail appears. The card itself stays
-scan-friendly.
+- Saved
+- Needs review
+- Ready to start
+- Waiting to start
+- Working
+- Ready for your review
+- Done
+- Needs attention
 
-### Execution Queue
+Approved next-action and waiting-line patterns:
 
-Confirmed requirements may be moved to the execution queue. This enqueues
-`move_to_execution_queue`. The queue card shows:
+- "Review the summary before work starts."
+- "Add the missing details so this can continue."
+- "Waiting for a helper to pick this up."
+- "Work is underway. No action needed right now."
+- "Review the result and choose approve or request changes."
+- "Finished. You can open details for proof."
 
-- requirement title or concise interpretation
-- confirmation time
-- target backlog id if one exists
-- queued command status
-- disabled state when no observer is connected
+Avoid default Simple Mode copy that exposes operator vocabulary, including
+worker, execution queue, audit, backlog, commit, graph, reconcile, and chain.
+Those terms may appear only in secondary proof/details surfaces intended for
+operators or engineers.
 
-Backlog creation or update remains explicit and auditable.
+## Details And Proof Boundary
 
-## Tab 2: In Progress
+The Details surface opens from a request card and may show:
 
-In progress shows worker cards. Each worker card is tied to a requirement or
-backlog row.
+- full original request
+- interpreted summary
+- missing context
+- acceptance criteria
+- action history in friendly language
+- proof details for engineers
 
-Worker card fields:
+Secondary proof/details may include operator fields such as backlog id, commit
+hash, graph evidence, audit timeline, reconcile state, and chain trailers. These
+fields must not be required to understand the default request list.
 
-- requirement title
-- current state
-- assigned worker/session
-- branch or worktree when available
-- latest checkpoint or test signal
-- pause, continue, cancel controls
-- View audit
+## Helper Status
 
-Controls enqueue commands:
+The compact helper status near the top of the page uses ordinary-user copy:
 
-- Pause: `pause_worker`
-- Continue: `continue_worker`
-- Cancel: `cancel_worker`
+- Helper connected
+- Waiting for helper
+- Request saved
+- Waiting to start
+- Working
+- Done
+- Needs attention
 
-Button states:
+Button clicks only save or request an action. The UI must not claim work has
+started until the system confirms it is running.
 
-- Enabled when observer connected and target worker is controllable.
-- Queued after command enqueue.
-- Running after observer claim.
-- Completed after observer writes result.
-- Failed when observer writes error.
+## Empty And Error States
 
-The UI never assumes the worker paused or cancelled until governance state
-confirms the result.
+Empty state:
 
-## Tab 3: Completed
+- Keep the new request input available.
+- Use copy such as "No saved requests yet."
+- Do not introduce graph, backlog, queue, or audit language.
 
-Completed cards show finished requirements.
+Missing helper:
 
-Card fields:
+- Keep saved request cards visible.
+- Allow manual review where possible.
+- Disable helper-only actions with "Waiting for helper."
 
-- final requirement title
-- original request excerpt
-- commit short hash
-- completion time
-- outcome summary
-- View audit
+Failure:
 
-View audit opens Engineer Mode context or a modal with timeline evidence,
-backlog id, commit id, command ids, and verification evidence. It is optional
-for ordinary users and available for operators.
+- Keep the request card in its lane.
+- Show Needs attention.
+- Provide Retry and Details.
+- Explain the next user action in plain language.
 
-## Command State Copy
+## Desktop Success Checks
 
-Use compact operational labels:
+The P0 desktop screenshot should pass these checks:
 
-- Waiting for observer
-- Queued
-- Running
-- Completed
-- Failed
-
-Avoid hidden AI promises such as "Analyzing..." until a command is claimed.
-When a command is only queued, the UI must say queued.
-
-## Empty and Error States
-
-Before development empty state: input remains primary, with no graph language.
-
-Waiting for observer: show raw capture and manual confirmation, but disable
-AI Analyze and worker control actions that require observer execution.
-
-Command failure: keep the requirement card in place, show Failed, and offer
-Retry and View audit.
-
-Stale observer: show Waiting for observer unless another active or idle
-session exists.
-
-## Engineer Mode Boundary
-
-Engineer Mode is still present and unchanged. Simple Mode links to it through
-View audit, backlog ids, commit ids, and optional advanced controls. The
-ordinary path should not require graph concepts to capture, confirm, queue,
-pause, continue, cancel, or review completed work.
+- Your requests is the first content block when requests exist.
+- At least one request card is visible above helper status, counters, or proof
+  details.
+- Each visible card has original request excerpt, status, and next-action or
+  waiting line.
+- Waiting to start, Working, Ready for review, and Done cards preserve original
+  request wording or show the explicit missing-source state.
+- Default copy avoids worker, execution queue, audit, backlog, commit, graph,
+  reconcile, and chain outside Details/proof.
+- No mobile validation is claimed for this P0.

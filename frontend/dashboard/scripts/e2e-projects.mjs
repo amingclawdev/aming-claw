@@ -26,6 +26,7 @@ const PARENT_PROJECT = FLAGS.parent || DEFAULT_PARENT;
 const WORKSPACE = path.resolve(FLAGS.workspace || DEFAULT_WORKSPACE);
 const APPLY = FLAGS.apply === true;
 const SKIP_PARENT = FLAGS["skip-parent-isolation"] === true;
+const ONLY = String(FLAGS.only || "").trim();
 const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 
 const C = {
@@ -133,6 +134,121 @@ function relativeWorkspace() {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function extractFunctionBlock(source, name) {
+  const fnIndex = source.indexOf(`function ${name}`);
+  assert(fnIndex >= 0, `${name} function is missing`);
+  const paramsStart = source.indexOf("(", fnIndex);
+  assert(paramsStart >= 0, `${name} function parameters are missing`);
+  let paramsDepth = 0;
+  let paramsEnd = -1;
+  for (let index = paramsStart; index < source.length; index++) {
+    const char = source[index];
+    if (char === "(") paramsDepth++;
+    if (char === ")") {
+      paramsDepth--;
+      if (paramsDepth === 0) {
+        paramsEnd = index;
+        break;
+      }
+    }
+  }
+  assert(paramsEnd >= 0, `${name} function parameters are unterminated`);
+  const start = source.indexOf("{", paramsEnd);
+  assert(start >= 0, `${name} function body is missing`);
+  let depth = 0;
+  for (let index = start; index < source.length; index++) {
+    const char = source[index];
+    if (char === "{") depth++;
+    if (char === "}") {
+      depth--;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`${name} function body is unterminated`);
+}
+
+function visibleJsxText(source) {
+  const fragments = [];
+  for (const match of source.matchAll(/>\s*([^<>{}][^<>{}]*)\s*</g)) {
+    const text = match[1].replace(/\s+/g, " ").trim();
+    if (text) fragments.push(text);
+  }
+  for (const match of source.matchAll(/\b(?:placeholder|aria-label)=["']([^"']+)["']/g)) {
+    const text = match[1].replace(/\s+/g, " ").trim();
+    if (text) fragments.push(text);
+  }
+  return fragments.join("\n");
+}
+
+function assertNoOperatorTerms(label, text) {
+  const normalized = text.toLowerCase();
+  const forbidden = [
+    "worker controls",
+    "execution queue",
+    "audit",
+    "command count",
+    "command counts",
+    "backlog",
+    "commit",
+  ];
+  const found = forbidden.filter((term) => normalized.includes(term));
+  assert(
+    found.length === 0,
+    `${label} default visible copy uses operator term(s): ${found.join(", ")}`,
+  );
+}
+
+function verifySimpleModeRequestFirstDesktopContract() {
+  phase("simple mode request-first desktop contract");
+  const viewSource = readFileSync(
+    path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectInboxView.tsx"),
+    "utf8",
+  );
+  const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
+  const rootBlock = extractFunctionBlock(viewSource, "ProjectInboxView");
+  const overviewBlock = extractFunctionBlock(viewSource, "RequestFirstOverview");
+  const beforeBlock = extractFunctionBlock(viewSource, "BeforeDevelopmentTab");
+  const rawCardBlock = extractFunctionBlock(viewSource, "RawRequirementCard");
+
+  const requestFirstIndex = rootBlock.indexOf("<RequestFirstOverview");
+  const observerIndex = rootBlock.indexOf("project-inbox-observer");
+  const statsIndex = rootBlock.indexOf("project-inbox-stats");
+  const tabsIndex = rootBlock.indexOf("simple-mode-tabs");
+  assert(requestFirstIndex >= 0, "Simple Mode should render the request-first overview");
+  assert(observerIndex >= 0, "Simple Mode observer/status strip is missing");
+  assert(statsIndex >= 0, "Simple Mode request summary counters are missing");
+  assert(tabsIndex >= 0, "Simple Mode tabs are missing");
+  assert(
+    requestFirstIndex < observerIndex && requestFirstIndex < statsIndex && requestFirstIndex < tabsIndex,
+    "Desktop Simple Mode must render request cards before observer telemetry, counters, and tabs",
+  );
+
+  const cardsIndex = overviewBlock.indexOf("simple-request-card");
+  const originalTextIndex = overviewBlock.indexOf("You asked");
+  const nextLineIndex = overviewBlock.indexOf("simple-request-next");
+  assert(cardsIndex >= 0, "Request-first overview should render request cards");
+  assert(originalTextIndex >= 0, "Request cards must label the original user request");
+  assert(nextLineIndex >= 0, "Request cards must show a next-action or waiting line");
+
+  const captureIndex = beforeBlock.indexOf("project-inbox-capture");
+  assert(captureIndex >= 0, "Before-development panel should keep a request capture affordance");
+
+  const desktopCssIndex = cssSource.indexOf(".simple-shell .project-inbox-view");
+  const requestFirstCssIndex = cssSource.indexOf(".simple-request-first");
+  assert(desktopCssIndex >= 0, "Simple Mode desktop shell CSS is missing");
+  assert(requestFirstCssIndex >= 0, "Request-first card CSS is missing");
+
+  const defaultVisibleCopy = [
+    visibleJsxText(rootBlock),
+    visibleJsxText(overviewBlock),
+    visibleJsxText(beforeBlock),
+    visibleJsxText(rawCardBlock),
+  ].join("\n");
+  assertNoOperatorTerms("Simple Mode desktop first viewport", defaultVisibleCopy);
+  ok("request cards are source-ordered before telemetry, counters, and tabs for desktop");
+  ok("default first-viewport copy avoids operator terms");
 }
 
 async function ensureProjectRegistered() {
@@ -605,7 +721,17 @@ async function main() {
   console.log(c("dim", `backend=${BACKEND} project=${PROJECT} workspace=${WORKSPACE} apply=${APPLY}`));
 
   try {
+    if (ONLY) {
+      if (ONLY !== "simple-mode-request-first-desktop") {
+        throw new Error(`unknown --only target: ${ONLY}`);
+      }
+      verifySimpleModeRequestFirstDesktopContract();
+      console.log("");
+      console.log(c("green", "ACCEPTANCE OK"));
+      return;
+    }
     await http("GET", "/api/health");
+    verifySimpleModeRequestFirstDesktopContract();
     verifyProjectImportUiContract();
     verifyProjectProgressContract();
     verifyHeaderV1Contract();

@@ -326,12 +326,90 @@ def test_project_inbox_groups_backlog_rows_into_operator_lanes():
         inbox = server.handle_project_inbox(inbox_ctx)
 
     assert inbox["lanes"]["ready_backlog"]["items"][0]["bug_id"] == "READY-1"
+    assert inbox["lanes"]["ready_backlog"]["items"][0]["original_request_excerpt"] == "Request for READY-1"
+    assert inbox["lanes"]["ready_backlog"]["items"][0]["original_request_missing"] is False
     assert inbox["lanes"]["in_progress"]["items"][0]["bug_id"] == "WORK-1"
+    assert inbox["lanes"]["in_progress"]["items"][0]["original_request_excerpt"] == "Request for WORK-1"
     assert inbox["lanes"]["review_needed"]["items"][0]["bug_id"] == "REVIEW-1"
+    assert inbox["lanes"]["review_needed"]["items"][0]["original_request_excerpt"] == "Request for REVIEW-1"
     assert inbox["lanes"]["done"]["items"][0]["bug_id"] == "DONE-1"
+    assert inbox["lanes"]["done"]["items"][0]["original_request_excerpt"] == "Request for DONE-1"
     all_lane_ids = {
         item["bug_id"]
         for lane in ("ready_backlog", "in_progress", "review_needed", "done")
         for item in inbox["lanes"][lane]["items"]
     }
     assert "UNRELATED-1" not in all_lane_ids
+
+
+def test_project_inbox_backlog_lane_uses_command_raw_id_source_text():
+    from agent.governance import observer_session, server
+
+    conn = _conn()
+    conn.execute(
+        """
+        CREATE TABLE backlog_bugs (
+            bug_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            priority TEXT NOT NULL DEFAULT 'P2',
+            target_files TEXT NOT NULL DEFAULT '[]',
+            test_files TEXT NOT NULL DEFAULT '[]',
+            acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+            "commit" TEXT NOT NULL DEFAULT '',
+            fixed_at TEXT NOT NULL DEFAULT '',
+            details_md TEXT NOT NULL DEFAULT '',
+            chain_trigger_json TEXT NOT NULL DEFAULT '{}',
+            required_docs TEXT NOT NULL DEFAULT '[]',
+            provenance_paths TEXT NOT NULL DEFAULT '[]',
+            chain_stage TEXT NOT NULL DEFAULT '',
+            last_failure_reason TEXT NOT NULL DEFAULT '',
+            runtime_state TEXT NOT NULL DEFAULT '',
+            current_task_id TEXT NOT NULL DEFAULT '',
+            root_task_id TEXT NOT NULL DEFAULT '',
+            worktree_path TEXT NOT NULL DEFAULT '',
+            worktree_branch TEXT NOT NULL DEFAULT '',
+            mf_type TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (bug_id, title, status, priority, created_at, updated_at)
+        VALUES ('READY-CMD-1', 'Ready from command', 'OPEN', 'P2', '2026-05-28T00:00:00Z', '2026-05-28T00:00:00Z')
+        """
+    )
+    raw = raw_requirement.create_raw_requirement(
+        conn,
+        project_id="demo",
+        raw_text="Please add a visible onboarding checklist",
+    )
+    observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_MOVE_TO_EXECUTION_QUEUE,
+        payload={
+            "raw_id": raw["raw_id"],
+            "promoted_bug_id": "READY-CMD-1",
+            "source": "project_inbox",
+        },
+        created_by="dashboard",
+    )
+    conn.commit()
+
+    inbox_ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={},
+        body={},
+        get_project_id=lambda: "demo",
+    )
+    with patch("agent.governance.server.get_connection", return_value=conn):
+        inbox = server.handle_project_inbox(inbox_ctx)
+
+    item = inbox["lanes"]["ready_backlog"]["items"][0]
+    assert item["bug_id"] == "READY-CMD-1"
+    assert item["source_raw_id"] == raw["raw_id"]
+    assert item["original_request_excerpt"] == "Please add a visible onboarding checklist"
+    assert item["original_request_missing"] is False
