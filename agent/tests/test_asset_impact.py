@@ -8,6 +8,7 @@ from agent.governance.asset_impact import (
     EVENT_IMPACT_DETECTED,
     EVENT_RESOLUTION_RECORDED,
     STATUS_RECORDED,
+    build_backlog_close_impact_check,
     build_asset_impact_trace,
     build_asset_impact_reminder_projection,
     get_asset_impact_reminder_events,
@@ -23,6 +24,7 @@ from agent.governance.asset_impact import (
     resolve_asset_impact_reminder,
 )
 from agent.governance.asset_projection import upsert_asset_projection_rows, upsert_doc_asset_projection
+from agent.governance.db import SCHEMA_VERSION as DB_SCHEMA_VERSION
 from agent.governance.db import _ensure_schema
 
 
@@ -654,6 +656,155 @@ def test_scope_asset_impacts_cover_accepted_doc_test_config_bindings_only() -> N
     assert not any(row["asset_path"].startswith("candidate/") for row in reminders)
 
 
+def test_backlog_close_impact_check_surfaces_changed_orphan_skill_doc() -> None:
+    conn = _conn()
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.judgment",
+                    "layer": "L7",
+                    "title": "Judgment Brain MCP",
+                    "kind": "feature",
+                    "primary": ["scripts/judgment_brain_mcp.py"],
+                    "secondary": [],
+                    "test": ["tests/test_judgment_brain_mcp.py"],
+                    "metadata": {},
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-judgment-brain",
+        commit_sha="c-jb",
+        snapshot_kind="scope",
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "scripts/judgment_brain_mcp.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+                "attached_node_ids": ["L7.judgment"],
+                "mapped_node_ids": ["L7.judgment"],
+            },
+            {
+                "path": "skills/judgment-brain/SKILL.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "file_hash": "sha256:skill",
+            },
+            {
+                "path": "docs/historical-orphan.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "file_hash": "sha256:old",
+            },
+            {
+                "path": "config/judgment-brain.yaml",
+                "file_kind": "config",
+                "scan_status": "pending_decision",
+                "graph_status": "pending_decision",
+                "file_hash": "sha256:cfg",
+            },
+            {
+                "path": "tests/test_judgment_brain_mcp.py",
+                "file_kind": "test",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+                "attached_node_ids": ["L7.judgment"],
+                "mapped_node_ids": ["L7.judgment"],
+            },
+        ],
+        notes=json.dumps({"pending_scope_reconcile": {}}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "scope-judgment-brain",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    store.activate_graph_snapshot(
+        conn,
+        PID,
+        "scope-judgment-brain",
+        actor="test",
+        auto_rebuild_projection=False,
+    )
+    upsert_asset_projection_rows(
+        conn,
+        project_id=PID,
+        snapshot_id="scope-judgment-brain",
+        commit_sha="c-jb",
+        asset_kind="test",
+        rows=[
+            {
+                "path": "tests/test_judgment_brain_mcp.py",
+                "file_kind": "test",
+                "binding_status": "accepted",
+                "accepted_bindings": [
+                    {
+                        "node_id": "L7.judgment",
+                        "title": "Judgment Brain MCP",
+                        "role": "test",
+                        "source": "test_coverage",
+                    }
+                ],
+                "binding_candidates": [],
+                "impact_scope_policy": "accepted_bindings_only",
+            }
+        ],
+    )
+    record_scope_asset_impacts(
+        conn,
+        PID,
+        snapshot_id="scope-judgment-brain",
+        commit_sha="c-close",
+        scope_graph_delta={
+            "updated_nodes": ["L7.judgment"],
+            "file_inventory_delta": {
+                "hash_changed_files": [
+                    "scripts/judgment_brain_mcp.py",
+                    "skills/judgment-brain/SKILL.md",
+                ],
+                "impacted_files": ["scripts/judgment_brain_mcp.py"],
+            },
+        },
+        asset_kind="test",
+        actor="scope-reconcile",
+    )
+
+    check = build_backlog_close_impact_check(
+        conn,
+        PID,
+        snapshot_id="scope-judgment-brain",
+        commit_sha="c-close",
+        changed_files=[
+            "scripts/judgment_brain_mcp.py",
+            "skills/judgment-brain/SKILL.md",
+        ],
+        actor="test",
+    )
+
+    assert check["changed_file_count"] == 2
+    assert check["impacted_node_count"] == 1
+    assert check["pending_accepted_asset_drift_by_kind"] == {"doc": 0, "test": 1, "config": 0}
+    assert check["changed_untrusted_asset_counts_by_kind"] == {"doc": 1, "test": 0, "config": 0}
+    assert check["total_current_orphan_pending_assets_by_kind"] == {"doc": 2, "test": 0, "config": 1}
+    assert check["historical_orphan_pending_warning_only_by_kind"] == {"doc": 1, "test": 0, "config": 1}
+    assert check["coverage_claim_allowed_by_kind"]["doc"] is False
+    assert check["coverage_claim_allowed_by_kind"]["test"] is False
+    assert check["changed_untrusted_assets_sample"][0]["path"] == "skills/judgment-brain/SKILL.md"
+    assert "not trusted impact-scope coverage" in " ".join(check["required_actions"])
+    assert "warning-only" in " ".join(check["warnings"])
+
+
 def test_bidirectional_trace_for_node_change_covers_doc_test_config_assets() -> None:
     conn = _conn()
     _index_bidirectional_snapshot(conn)
@@ -906,4 +1057,4 @@ def test_db_migration_from_v43_adds_asset_impact_tables() -> None:
     row = conn.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()
-    assert row["value"] == "44"
+    assert row["value"] == str(DB_SCHEMA_VERSION)

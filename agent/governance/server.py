@@ -18848,6 +18848,17 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "timeline_gate": verification,
             "event_count": len(events),
         }
+        close_impact_check = _build_backlog_close_impact_check(
+            conn,
+            pid,
+            {
+                "commit": ctx.query.get("commit", ""),
+                "changed_files": ctx.query.get("changed_files", ""),
+                "actor": ctx.query.get("actor", "timeline-gate"),
+            },
+        )
+        if close_impact_check:
+            result["close_impact_check"] = close_impact_check
         reason_human = _MF_TIMELINE_REASON_HUMAN.get(applicable["reason"])
         if not reason_human:
             reason_parts = {part.strip() for part in applicable["reason"].split(",")}
@@ -18862,6 +18873,84 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         return result
     finally:
         conn.close()
+
+
+def _changed_files_from_close_body(body: dict) -> list[str]:
+    raw = body.get("changed_files")
+    if raw is None:
+        raw = body.get("changed_file_paths")
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.replace("\r", "\n").replace(",", "\n").split("\n")]
+    elif isinstance(raw, list):
+        values = [str(item or "").strip() for item in raw]
+    elif raw is None:
+        values = []
+    else:
+        values = [str(raw or "").strip()]
+    return sorted({item.replace("\\", "/").strip("/") for item in values if item.strip()})
+
+
+def _git_changed_files_for_close(project_id: str, commit_sha: str) -> list[str]:
+    commit = str(commit_sha or "").strip()
+    if not commit:
+        return []
+    cmd = ["git"]
+    try:
+        root = _graph_governance_project_root(project_id, {})
+        cmd.extend(["-C", str(root)])
+    except Exception:
+        pass
+    cmd.extend(["diff-tree", "--no-commit-id", "--name-only", "-r", commit])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return []
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        return []
+    return sorted({
+        line.replace("\\", "/").strip("/")
+        for line in result.stdout.splitlines()
+        if line.strip()
+    })
+
+
+def _build_backlog_close_impact_check(conn, project_id: str, body: dict) -> dict:
+    """Best-effort close-gate asset impact summary for backlog_close output."""
+
+    from . import asset_impact
+    from . import graph_snapshot_store as store
+
+    active_snapshot = {}
+    try:
+        active_snapshot = store.get_active_graph_snapshot(conn, project_id) or {}
+    except Exception:
+        active_snapshot = {}
+    snapshot_id = str(body.get("snapshot_id") or active_snapshot.get("snapshot_id") or "")
+    commit_sha = str(body.get("commit") or active_snapshot.get("commit_sha") or "")
+    changed_files = _changed_files_from_close_body(body)
+    if not changed_files and snapshot_id and body.get("commit"):
+        changed_files = _git_changed_files_for_close(project_id, str(body.get("commit") or ""))
+    try:
+        return asset_impact.build_backlog_close_impact_check(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            commit_sha=commit_sha,
+            changed_files=changed_files,
+            actor=str(body.get("actor") or "backlog_close"),
+        )
+    except Exception as exc:
+        return {
+            "schema_version": "backlog_close_impact_check.v1",
+            "ok": False,
+            "status": "error",
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "commit_sha": commit_sha,
+            "changed_file_count": len(changed_files),
+            "error": str(exc),
+            "messages": [f"Close impact check failed: {exc}"],
+        }
 
 
 @route("POST", "/api/backlog/{project_id}/{bug_id}")
@@ -19356,6 +19445,7 @@ def handle_backlog_close(ctx: RequestContext):
                 log.warning("git not found; skipping commit verification for %s", commit_sha)
 
         timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
+        close_impact_check = _build_backlog_close_impact_check(conn, pid, body)
 
         # Determine chain_stage based on prior status
         chain_stage = "manual-fix" if prior_status == "MF_IN_PROGRESS" else None
@@ -19401,6 +19491,8 @@ def handle_backlog_close(ctx: RequestContext):
             result["chain_stage"] = chain_stage
         if timeline_gate:
             result["timeline_gate"] = timeline_gate
+        if close_impact_check:
+            result["close_impact_check"] = close_impact_check
         return result
     finally:
         conn.close()

@@ -369,6 +369,97 @@ def test_graph_governance_asset_inbox_relation_drift_and_proposal_contract(conn)
     assert "write_governance_hint" not in config["batch_eligible_actions"]
 
 
+def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_doc(conn, monkeypatch):
+    graph = _graph("L7.judgment")
+    graph["deps_graph"]["nodes"][0]["title"] = "Judgment Brain MCP"
+    graph["deps_graph"]["nodes"][0]["primary"] = ["scripts/judgment_brain_mcp.py"]
+    graph["deps_graph"]["nodes"][0]["secondary"] = []
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="close-impact-jb",
+        commit_sha="c-jb-base",
+        snapshot_kind="scope",
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "scripts/judgment_brain_mcp.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+                "attached_node_ids": ["L7.judgment"],
+                "mapped_node_ids": ["L7.judgment"],
+            },
+            {
+                "path": "skills/judgment-brain/SKILL.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "file_hash": "sha256:skill",
+            },
+        ],
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    store.activate_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        actor="test",
+        auto_rebuild_projection=False,
+    )
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "BUG-CLOSE-ASSET",
+            "Close gate asset summary",
+            "MF_IN_PROGRESS",
+            "chain_rescue",
+            '{"mf_type":"chain_rescue"}',
+            "now",
+            "now",
+        ),
+    )
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    result = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": "BUG-CLOSE-ASSET"},
+            method="POST",
+            body={
+                "commit": "c-close",
+                "actor": "test",
+                "bypass_timeline_gate": True,
+                "timeline_bypass_reason": "Unit test focuses on close impact output contract.",
+                "changed_files": [
+                    "scripts/judgment_brain_mcp.py",
+                    "skills/judgment-brain/SKILL.md",
+                ],
+            },
+        )
+    )
+
+    check = result["close_impact_check"]
+    assert result["ok"] is True
+    assert check["changed_file_count"] == 2
+    assert check["impacted_node_count"] == 1
+    assert check["changed_untrusted_asset_counts_by_kind"]["doc"] == 1
+    assert check["coverage_claim_allowed_by_kind"]["doc"] is False
+    assert check["changed_untrusted_assets_sample"][0]["path"] == "skills/judgment-brain/SKILL.md"
+    assert "not trusted impact-scope coverage" in " ".join(check["required_actions"])
+
+
 def test_graph_governance_asset_drift_state_and_proposal_api_are_auditable(conn):
     code, recorded = server.handle_graph_governance_asset_drift_state_record(
         _ctx(

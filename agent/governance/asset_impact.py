@@ -183,6 +183,271 @@ def _path_list(raw: Any) -> list[str]:
     return sorted(out)
 
 
+def _kind_for_close_count(value: Any) -> str:
+    kind = _text(value)
+    if kind == "index_doc":
+        return "doc"
+    if kind in {"doc", "test", "config"}:
+        return kind
+    return ""
+
+
+def _infer_close_asset_kind_from_path(path: str) -> str:
+    normalized = _norm_path(path).lower()
+    name = normalized.rsplit("/", 1)[-1]
+    if not normalized:
+        return ""
+    if normalized.startswith(("docs/", "doc/", "skills/")) or name.endswith((".md", ".mdx", ".rst")):
+        return "doc"
+    if normalized.startswith(("tests/", "test/")) or name.startswith("test_") or name.endswith(("_test.py", ".test.ts", ".spec.ts")):
+        return "test"
+    if (
+        normalized.startswith(("config/", ".github/"))
+        or name in {"pyproject.toml", "package.json", "tsconfig.json", "ruff.toml", "mypy.ini"}
+        or name.endswith((".yaml", ".yml", ".toml", ".ini", ".json"))
+    ):
+        return "config"
+    return ""
+
+
+def _zero_kind_counts() -> dict[str, int]:
+    return {"doc": 0, "test": 0, "config": 0}
+
+
+def _file_inventory_node_ids(row: Mapping[str, Any]) -> set[str]:
+    node_ids: set[str] = set()
+    for key in ("mapped_node_ids", "attached_node_ids", "node_ids"):
+        for item in _path_list(row.get(key)):
+            if item:
+                node_ids.add(item)
+    for key in ("mapped_node_id", "attached_node_id", "node_id", "candidate_node_id"):
+        value = _text(row.get(key))
+        if value:
+            node_ids.add(value)
+    return node_ids
+
+
+def _read_snapshot_file_inventory(project_id: str, snapshot_id: str) -> list[dict[str, Any]]:
+    from . import graph_snapshot_store as store
+
+    path = store.snapshot_companion_dir(project_id, snapshot_id) / "file_inventory.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, Mapping)]
+
+
+def _accepted_asset_binding_paths(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> set[tuple[str, str]]:
+    from . import asset_projection
+
+    asset_projection.ensure_schema(conn)
+    rows = conn.execute(
+        """SELECT asset_kind, asset_path
+           FROM graph_asset_bindings
+           WHERE project_id = ?
+             AND snapshot_id = ?
+             AND binding_status = 'accepted'
+             AND asset_kind IN ('doc', 'index_doc', 'test', 'config')""",
+        (_text(project_id), _text(snapshot_id)),
+    ).fetchall()
+    return {
+        (_kind_for_close_count(row["asset_kind"]), _norm_path(row["asset_path"]))
+        for row in rows
+        if _kind_for_close_count(row["asset_kind"]) and _norm_path(row["asset_path"])
+    }
+
+
+def build_backlog_close_impact_check(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    snapshot_id: str = "",
+    commit_sha: str = "",
+    changed_files: Iterable[Any] | None = None,
+    actor: str = "",
+) -> dict[str, Any]:
+    """Summarize asset drift risk for a backlog close response.
+
+    This is a read-only close-gate view over existing graph asset state:
+    snapshot file inventory, accepted asset bindings, and pending impact
+    reminders.  It does not create a separate drift protocol.
+    """
+
+    ensure_schema(conn)
+    from . import graph_snapshot_store as store
+
+    pid = _text(project_id)
+    active = store.get_graph_snapshot(conn, pid, snapshot_id) if snapshot_id else None
+    if active is None:
+        active = store.get_active_graph_snapshot(conn, pid) or {}
+    sid = _text((active or {}).get("snapshot_id") or snapshot_id)
+    commit = _text(commit_sha or (active or {}).get("commit_sha") or "")
+    normalized_changed = _path_list(changed_files or [])
+    if not pid or not sid:
+        return {
+            "schema_version": "backlog_close_impact_check.v1",
+            "ok": True,
+            "status": "unavailable",
+            "project_id": pid,
+            "snapshot_id": sid,
+            "commit_sha": commit,
+            "changed_file_count": len(normalized_changed),
+            "impacted_node_count": 0,
+            "pending_accepted_asset_drift_by_kind": _zero_kind_counts(),
+            "changed_untrusted_asset_counts_by_kind": _zero_kind_counts(),
+            "total_current_orphan_pending_assets_by_kind": _zero_kind_counts(),
+            "messages": ["Close impact check unavailable: no active graph snapshot was found."],
+        }
+
+    inventory = _read_snapshot_file_inventory(pid, sid)
+    inventory_by_path = {
+        _norm_path(row.get("path")): row
+        for row in inventory
+        if _norm_path(row.get("path"))
+    }
+    changed_set = set(normalized_changed)
+    accepted_paths = _accepted_asset_binding_paths(conn, pid, sid)
+    impacted_node_ids: set[str] = set()
+    changed_untrusted_counts = _zero_kind_counts()
+    total_orphan_pending_counts = _zero_kind_counts()
+    changed_untrusted_assets: list[dict[str, Any]] = []
+
+    for path, row in inventory_by_path.items():
+        kind = _kind_for_close_count(row.get("file_kind"))
+        scan = _text(row.get("scan_status"))
+        graph = _text(row.get("graph_status"))
+        if kind and (scan in {"orphan", "pending_decision", "error"} or graph in {"unmapped", "pending_decision", "error"}):
+            total_orphan_pending_counts[kind] += 1
+        if path in changed_set:
+            impacted_node_ids.update(_file_inventory_node_ids(row))
+            if kind and (kind, path) not in accepted_paths:
+                changed_untrusted_counts[kind] += 1
+                changed_untrusted_assets.append({
+                    "path": path,
+                    "asset_kind": kind,
+                    "scan_status": scan,
+                    "graph_status": graph,
+                    "binding_status": "not_accepted",
+                    "trusted_impact_scope": False,
+                    "recommended_action": "Governance Hint, asset-binding proposal, follow-up backlog, or explicit waiver",
+                })
+
+    for path in sorted(changed_set - set(inventory_by_path)):
+        kind = _infer_close_asset_kind_from_path(path)
+        if not kind:
+            continue
+        changed_untrusted_counts[kind] += 1
+        changed_untrusted_assets.append({
+            "path": path,
+            "asset_kind": kind,
+            "scan_status": "not_in_snapshot_inventory",
+            "graph_status": "unmapped",
+            "binding_status": "not_accepted",
+            "trusted_impact_scope": False,
+            "recommended_action": "Update Graph, Governance Hint, asset-binding proposal, follow-up backlog, or explicit waiver",
+        })
+
+    for node in store.list_graph_snapshot_nodes(conn, pid, sid, limit=1000):
+        node_id = _text(node.get("node_id"))
+        if not node_id:
+            continue
+        candidate_paths = []
+        candidate_paths.extend(_path_list(node.get("primary_files")))
+        candidate_paths.extend(_path_list(node.get("secondary_files")))
+        candidate_paths.extend(_path_list(node.get("test_files")))
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), Mapping) else {}
+        candidate_paths.extend(_path_list(metadata.get("config_files")))
+        if changed_set.intersection(candidate_paths):
+            impacted_node_ids.add(node_id)
+
+    pending_counts = _zero_kind_counts()
+    pending_reminders: list[dict[str, Any]] = []
+    for node_id in sorted(impacted_node_ids):
+        for reminder in list_pending_asset_impact_reminders(conn, pid, node_id=node_id, limit=5000):
+            kind = _kind_for_close_count(reminder.get("asset_kind"))
+            if not kind:
+                continue
+            pending_counts[kind] += 1
+            pending_reminders.append({
+                "reminder_id": _text(reminder.get("reminder_id")),
+                "asset_kind": kind,
+                "asset_path": _norm_path(reminder.get("asset_path")),
+                "node_id": _text(reminder.get("node_id")),
+                "node_title": _text(reminder.get("node_title")),
+                "latest_commit_sha": _text(reminder.get("latest_commit_sha")),
+            })
+
+    historical_counts = {
+        kind: max(0, total_orphan_pending_counts[kind] - changed_untrusted_counts[kind])
+        for kind in ("doc", "test", "config")
+    }
+    coverage_claim_allowed = {
+        kind: changed_untrusted_counts[kind] == 0 and pending_counts[kind] == 0
+        for kind in ("doc", "test", "config")
+    }
+    required_actions: list[str] = []
+    if any(changed_untrusted_counts.values()):
+        required_actions.append(
+            "Changed doc/test/config assets without accepted graph bindings are not trusted "
+            "impact-scope coverage; use Governance Hint, asset-binding proposal, follow-up "
+            "backlog, or explicit waiver before claiming coverage is current."
+        )
+    if any(pending_counts.values()):
+        required_actions.append(
+            "Accepted asset impact reminders remain pending for touched nodes; resolve, "
+            "waive, or record follow-up evidence before claiming docs/tests/config coverage is current."
+        )
+    warnings: list[str] = []
+    if any(historical_counts.values()):
+        warnings.append(
+            "Historical orphan/pending assets not touched by this change are warning-only "
+            "and do not block close by themselves."
+        )
+    messages = [
+        (
+            "Close impact check: "
+            f"changed files {len(normalized_changed)}, "
+            f"impacted nodes {len(impacted_node_ids)}, "
+            f"pending accepted asset drift {pending_counts}, "
+            f"changed untrusted assets {changed_untrusted_counts}, "
+            f"project orphan/pending assets {total_orphan_pending_counts}."
+        )
+    ]
+    messages.extend(required_actions)
+    messages.extend(warnings)
+    return {
+        "schema_version": "backlog_close_impact_check.v1",
+        "ok": True,
+        "status": "checked",
+        "project_id": pid,
+        "snapshot_id": sid,
+        "commit_sha": commit,
+        "actor": _text(actor),
+        "changed_file_count": len(normalized_changed),
+        "changed_files_sample": normalized_changed[:25],
+        "impacted_node_count": len(impacted_node_ids),
+        "impacted_node_ids": sorted(impacted_node_ids)[:50],
+        "pending_accepted_asset_drift_by_kind": pending_counts,
+        "pending_accepted_asset_reminders_sample": pending_reminders[:25],
+        "changed_untrusted_asset_counts_by_kind": changed_untrusted_counts,
+        "changed_untrusted_assets_sample": changed_untrusted_assets[:25],
+        "total_current_orphan_pending_assets_by_kind": total_orphan_pending_counts,
+        "historical_orphan_pending_warning_only_by_kind": historical_counts,
+        "coverage_claim_allowed_by_kind": coverage_claim_allowed,
+        "required_actions": required_actions,
+        "warnings": warnings,
+        "messages": messages,
+        "impact_scope_policy": "accepted_bindings_only",
+    }
+
+
 def _impact_key(project_id: str, asset_kind: str, asset_path: str, node_id: str) -> str:
     payload = "\0".join([project_id, asset_kind, asset_path, node_id])
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -1463,6 +1728,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "STATUS_PENDING",
     "STATUS_RECORDED",
+    "build_backlog_close_impact_check",
     "build_asset_impact_trace",
     "build_asset_impact_reminder_projection",
     "ensure_schema",
