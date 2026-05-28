@@ -1261,15 +1261,22 @@ def handle_observer_command_enqueue(ctx: RequestContext):
                 target_session_id=str(ctx.body.get("target_session_id") or ""),
                 created_by=str(ctx.body.get("created_by") or ctx.body.get("actor") or ""),
                 command_id=str(ctx.body.get("command_id") or "") or None,
-                notify=bool(ctx.body.get("notify") or False),
+                notify=True,
             )
     except Exception as exc:
         return _observer_error(exc)
+    reminder = observer_session.command_pending_reminder(project_id)
+    try:
+        from . import event_bus
+
+        event_bus.publish("observer_command_pending", reminder)
+    except Exception:
+        log.exception("failed to publish observer command pending reminder")
     return 201, {
         "ok": True,
         "project_id": project_id,
         "observer_command": command,
-        "hook_reminder": observer_session.command_pending_reminder(project_id),
+        "hook_reminder": reminder,
     }
 
 

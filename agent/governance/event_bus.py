@@ -27,6 +27,7 @@ EVENTS = [
     "rollback.executed",
     "task.created",
     "task.updated",
+    "observer_command_pending",
     "memory.written",
     "baseline.applied",
 ]

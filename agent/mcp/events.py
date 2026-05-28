@@ -22,6 +22,7 @@ NOTIFY_EVENTS = frozenset({
     "task.created",
     "task.completed",
     "task.updated",
+    "observer_command_pending",
     "node.status_changed",
     "release.blocked",
     "release.approved",

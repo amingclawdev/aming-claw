@@ -218,11 +218,11 @@ def test_simple_mode_observer_command_flow_for_execution_and_worker_controls():
             code, ctrl_payload = server.handle_observer_command_enqueue(ctrl_ctx)
         assert code == 201, action
         assert ctrl_payload["observer_command"]["command_type"] == action
-        assert ctrl_payload["observer_command"]["status"] == observer_session.COMMAND_STATUS_QUEUED
+        assert ctrl_payload["observer_command"]["status"] == observer_session.COMMAND_STATUS_NOTIFIED
 
     summary = observer_session.command_summary(conn, project_id="demo")
     counts = summary["counts"]
-    assert counts["queued"] == 4
+    assert counts["notified"] == 4
     types = {item["command_type"] for item in summary["items"]}
     assert types == {
         "move_to_execution_queue",

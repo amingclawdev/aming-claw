@@ -202,6 +202,63 @@ def test_actor_self_report_does_not_authorize_command_claim():
     assert payload["error"] == "observer_auth_failed"
 
 
+def test_api_enqueue_publishes_reminder_only_event_and_preserves_command_payload():
+    from agent.governance import event_bus, server
+
+    conn = _conn()
+    captured: list[dict] = []
+
+    def on_pending(payload: dict) -> None:
+        captured.append(payload)
+
+    ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={},
+        body={
+            "command_type": observer_session.COMMAND_TYPE_ANALYZE_REQUIREMENTS,
+            "payload": {"raw_id": "raw-1", "source": "dashboard"},
+            "created_by": "dashboard",
+        },
+        get_project_id=lambda: "demo",
+    )
+
+    bus = event_bus.get_event_bus()
+    bus.subscribe("observer_command_pending", on_pending)
+    try:
+        with patch("agent.governance.server.get_connection", return_value=conn):
+            code, payload = server.handle_observer_command_enqueue(ctx)
+    finally:
+        bus.unsubscribe("observer_command_pending", on_pending)
+
+    expected_reminder = {
+        "kind": "observer_command_pending",
+        "project_id": "demo",
+        "message": "pending observer commands exist; call observer_command_next",
+        "payload_included": False,
+    }
+    command = payload["observer_command"]
+
+    assert code == 201
+    assert payload["hook_reminder"] == expected_reminder
+    assert captured == [expected_reminder]
+    assert set(captured[0]) == {"kind", "project_id", "message", "payload_included"}
+    assert "raw_id" not in captured[0]
+    assert "command_type" not in captured[0]
+    assert command["payload"] == {"raw_id": "raw-1", "source": "dashboard"}
+    assert command["status"] == observer_session.COMMAND_STATUS_NOTIFIED
+    assert command["notified_at"]
+
+    session = _register(conn)
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+
+
 def test_analyze_complete_projects_raw_requirement_to_confirmation():
     conn = _conn()
     session = _register(conn)
