@@ -20,16 +20,49 @@
   ],
   "observer_contract": {
     "mode": "observer_only",
+    "observer_direct_code": false,
     "default_state": "contract_draft",
+    "role_boundary": {
+      "default": "no_direct_implementation_code",
+      "applies_to": [
+        "governed_nontrivial_code",
+        "tests",
+        "dashboard_assets",
+        "runtime_config",
+        "governance_docs"
+      ],
+      "description": "Observer/judge coordinates intent, topology, dispatch, review, merge, reconcile, and close decisions. Governed nontrivial implementation is performed by bounded worker lanes, not by the same observer."
+    },
+    "judgment_preflight": {
+      "when_judgment_brain_available": true,
+      "protocol_registry_preflight": {
+        "tool": "protocol_list",
+        "required_before": "implementation_planning"
+      },
+      "topology_precheck": {
+        "tool": "judgment_plan_precheck",
+        "required_before": "implementation_planning",
+        "records": [
+          "precheck_run_id",
+          "decision",
+          "status",
+          "recommended_topology",
+          "required_lanes",
+          "evidence_hash"
+        ]
+      }
+    },
     "responsibilities": [
       "clarify_requirements",
       "check_runtime_graph_backlog",
+      "run_protocol_registry_preflight",
+      "run_topology_precheck",
       "write_backlog_and_contract",
       "start_agents_when_requested_or_contract_approved",
       "review_merge_candidates"
     ],
     "default_forbidden_actions": [
-      "implement",
+      "direct_implementation_code",
       "wait_for_agents",
       "merge",
       "push",
@@ -39,7 +72,27 @@
       "delete_worktrees",
       "mutate_merge_queues"
     ],
-    "exception_policy": "Observer implements, waits, merges, pushes, or performs privileged transitions only when the user explicitly asks or a documented governance transition requires it."
+    "direct_mutation_exception_policy": {
+      "schema_version": "observer_direct_mutation_exception.v1",
+      "allowed": true,
+      "default": "reject",
+      "allowed_only_for": "tiny_deterministic_same_observer_mutation",
+      "local_precheck": {
+        "function": "agent.governance.mf_subagent_contract.validate_observer_direct_mutation_exception",
+        "description": "Run and record this validator before any same-observer direct mutation. It is not valid for governed nontrivial implementation work."
+      },
+      "requires": [
+        "observer_direct_mutation=true",
+        "observer_role=observer",
+        "tiny_deterministic_scope",
+        "explicit_reason",
+        "allowed_files",
+        "dirty_scope_exact_match",
+        "timeline_evidence_before_mutation"
+      ],
+      "description": "Same-observer direct mutation is rejected unless the exception proves a tiny deterministic scope, an explicit reason, exact allowed files, exact dirty-scope evidence, and timeline evidence recorded before mutation."
+    },
+    "exception_policy": "Privileged observer transitions such as waiting, merge, close, reconcile, gate release, or merge queue mutation require explicit user intent or documented governance transition evidence. Direct implementation code remains forbidden for governed nontrivial work unless the direct_mutation_exception_policy passes before mutation."
   },
   "worker_contract": {
     "required_fields": [
@@ -48,13 +101,30 @@
       "worker_role",
       "fence_token",
       "owned_files",
+      "target_files",
+      "test_commands",
       "responsibility",
       "required_evidence",
+      "review_evidence",
       "graph_queries",
       "self_precheck",
       "gate_alignment",
       "final_output"
     ],
+    "nontrivial_implementation": {
+      "default_topology": "dispatch_to_bounded_worker_lane",
+      "required_lane_evidence": [
+        "target_files",
+        "test_commands",
+        "worktree_path",
+        "branch",
+        "fence_token",
+        "owned_files",
+        "dirty_scope_check",
+        "review_evidence"
+      ],
+      "description": "Governed nontrivial implementation must be assigned to bounded mf_sub/worker lanes with explicit target files, tests, worktree/fence evidence, and observer review evidence."
+    },
     "allowed_terminal_states": [
       "review_ready",
       "waiting_merge",

@@ -14,14 +14,17 @@ from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
 
 MF_SUB_ROLE = "mf_sub"
+OBSERVER_COORDINATOR_ROLE = "observer"
 INPUT_SCHEMA_VERSION = "mf_subagent_input.v1"
 RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
+OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
 FINISH_GATE_REPLAY_SOURCE = "mf_sub_finish_gate"
 BACKEND_CONTRACT = "parallel_branch_worker.v1"
 DISPATCH_DEFAULT = "non_blocking_after_gate"
 WORKTREE_POLICY_MODE = "isolated_worktree_required"
+OBSERVER_DIRECT_MUTATION_DEFAULT = "reject"
 
 MF_SUB_ALLOWED_CAPABILITIES = (
     "modify_code",
@@ -225,15 +228,18 @@ def _override_reason(payload: Mapping[str, Any], override: Mapping[str, Any]) ->
 def _timeline_evidence_present(
     payload: Mapping[str, Any],
     override: Mapping[str, Any],
+    *,
+    require_before_mutation: bool = False,
 ) -> bool:
     if _bool(payload.get("timeline_event_recorded")) or _bool(
         override.get("timeline_event_recorded")
     ):
-        return True
+        return not require_before_mutation
     for key in (
         "timeline_evidence",
         "observer_timeline_event",
         "dispatch_timeline_evidence",
+        "direct_mutation_timeline_evidence",
     ):
         value = payload.get(key) if key in payload else override.get(key)
         if isinstance(value, Mapping) and (
@@ -241,8 +247,164 @@ def _timeline_evidence_present(
             or _string(value.get("event_type"))
             or _string(value.get("recorded_at"))
         ):
+            if require_before_mutation and not (
+                _bool(value.get("recorded_before_mutation"))
+                or _bool(value.get("before_mutation"))
+                or _string(value.get("phase")).lower()
+                in {"pre_mutation", "before_mutation", "pre_implementation"}
+            ):
+                continue
             return True
     return False
+
+
+def _direct_mutation_exception(payload: Mapping[str, Any]) -> dict[str, Any]:
+    exception = _nested_mapping(payload, "observer_direct_mutation_exception")
+    if not exception:
+        exception = _nested_mapping(payload, "direct_mutation_exception")
+    return exception
+
+
+def validate_observer_direct_mutation_exception(
+    payload: Mapping[str, Any],
+    *,
+    allowed_files: Sequence[str] | None = None,
+    dirty_files: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Validate the narrow exception for observer-authored mutations.
+
+    Governed nontrivial implementation belongs in bounded `mf_sub` or worker
+    lanes. This validator is only for tiny deterministic same-observer edits
+    and is separate from worker dispatch so the observer role boundary is
+    machine-checkable.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise MfSubagentContractError(
+            "observer direct mutation exception payload must be a mapping"
+        )
+    payload = dict(payload)
+    direct_mutation = _bool(
+        payload.get("observer_direct_mutation")
+        or payload.get("same_observer_direct_mutation")
+        or payload.get("direct_mutation")
+    )
+    if not direct_mutation:
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires observer_direct_mutation=true"
+        )
+
+    exception = _direct_mutation_exception(payload)
+    role = _string(
+        payload.get("observer_role")
+        or payload.get("role")
+        or payload.get("actor")
+        or exception.get("observer_role")
+        or exception.get("role")
+        or exception.get("actor")
+    ).lower()
+    if role != OBSERVER_COORDINATOR_ROLE:
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires observer role evidence"
+        )
+
+    tiny_deterministic = _bool(
+        exception.get("tiny_deterministic")
+        or exception.get("tiny_deterministic_scope")
+        or payload.get("tiny_deterministic")
+        or payload.get("tiny_deterministic_scope")
+    )
+    if not tiny_deterministic:
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires tiny deterministic scope"
+        )
+
+    reason = _override_reason(payload, exception)
+    if not reason:
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires explicit reason"
+        )
+
+    exception_allowed_files = _string_list(
+        exception.get("allowed_files") or payload.get("allowed_files"),
+        field_name="allowed_files",
+    )
+    if not exception_allowed_files:
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires allowed_files"
+        )
+    expected_allowed_files = set(
+        _string_list(allowed_files, field_name="allowed_files")
+    )
+    if expected_allowed_files and not set(exception_allowed_files).issubset(
+        expected_allowed_files
+    ):
+        raise MfSubagentContractError(
+            "observer direct mutation exception allowed_files exceed owned scope"
+        )
+
+    dirty_scope_input = exception.get("dirty_scope_check") or payload.get(
+        "dirty_scope_check"
+    )
+    if not dirty_scope_input:
+        if dirty_files is None:
+            raise MfSubagentContractError(
+                "observer direct mutation exception requires dirty-scope evidence"
+            )
+        dirty_scope_input = {
+            "status": "passed",
+            "dirty_scope_exact_match": True,
+            "dirty_files": list(dirty_files),
+            "owned_files": exception_allowed_files,
+        }
+    dirty_scope = _dirty_scope_evidence(dirty_scope_input)
+    dirty_scope_mapping = _mapping(
+        dirty_scope_input,
+        field_name="dirty_scope_check",
+    )
+    if not dirty_scope["dirty_scope_exact_match"]:
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires dirty_scope_exact_match evidence"
+        )
+    scoped_dirty_files = set(
+        _string_list(
+            dirty_scope_mapping.get("dirty_files")
+            or dirty_scope_mapping.get("changed_files")
+            or dirty_files,
+            field_name="dirty_files",
+        )
+    )
+    if scoped_dirty_files and not scoped_dirty_files.issubset(
+        set(exception_allowed_files)
+    ):
+        raise MfSubagentContractError(
+            "observer direct mutation exception dirty files must match allowed_files"
+        )
+
+    if not _timeline_evidence_present(
+        payload,
+        exception,
+        require_before_mutation=True,
+    ):
+        raise MfSubagentContractError(
+            "observer direct mutation exception requires timeline evidence before mutation"
+        )
+
+    return {
+        "schema_version": OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION,
+        "role": OBSERVER_COORDINATOR_ROLE,
+        "policy_default": OBSERVER_DIRECT_MUTATION_DEFAULT,
+        "observer_direct_mutation": True,
+        "allowed": True,
+        "exception": {
+            "used": True,
+            "tiny_deterministic": True,
+            "reason": reason,
+            "allowed_files": exception_allowed_files,
+            "timeline_evidence_recorded_before_mutation": True,
+        },
+        "dirty_scope_check": dirty_scope,
+    }
 
 
 def validate_mf_subagent_dispatch_gate(

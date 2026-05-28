@@ -21,10 +21,13 @@ from agent.governance.mf_subagent_contract import (
     FINISH_GATE_SCHEMA_VERSION,
     MF_SUB_FORBIDDEN_ACTIONS,
     MF_SUB_ROLE,
+    OBSERVER_COORDINATOR_ROLE,
+    OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
     build_mf_subagent_input,
     normalize_mf_subagent_result,
+    validate_observer_direct_mutation_exception,
     validate_mf_subagent_dispatch_gate,
     validate_mf_subagent_finish_gate,
 )
@@ -49,6 +52,9 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
             "worker_role",
             "fence_token",
             "graph_queries",
+            "target_files",
+            "test_commands",
+            "review_evidence",
         }
     )
 
@@ -95,6 +101,65 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
             "explicit_operator_reason",
             "dirty_scope_exact_match",
             "observer_timeline_event_before_dispatch",
+        }
+    )
+
+
+def test_mf_parallel_template_exposes_observer_no_direct_code_boundary() -> None:
+    template_path = (
+        _repo_root
+        / "agent"
+        / "governance"
+        / "contract_templates"
+        / "mf_parallel.v1.json"
+    )
+    template = json.loads(template_path.read_text(encoding="utf-8"))
+
+    observer_contract = template["observer_contract"]
+    assert observer_contract["mode"] == "observer_only"
+    assert observer_contract["observer_direct_code"] is False
+    assert observer_contract["role_boundary"]["default"] == (
+        "no_direct_implementation_code"
+    )
+    assert "direct_implementation_code" in observer_contract["default_forbidden_actions"]
+
+    judgment_preflight = observer_contract["judgment_preflight"]
+    assert judgment_preflight["when_judgment_brain_available"] is True
+    assert judgment_preflight["protocol_registry_preflight"]["tool"] == "protocol_list"
+    assert judgment_preflight["topology_precheck"]["tool"] == "judgment_plan_precheck"
+    assert judgment_preflight["topology_precheck"]["required_before"] == (
+        "implementation_planning"
+    )
+
+    exception_policy = observer_contract["direct_mutation_exception_policy"]
+    assert exception_policy["schema_version"] == OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION
+    assert exception_policy["default"] == "reject"
+    assert set(exception_policy["requires"]).issuperset(
+        {
+            "observer_direct_mutation=true",
+            "observer_role=observer",
+            "tiny_deterministic_scope",
+            "explicit_reason",
+            "allowed_files",
+            "dirty_scope_exact_match",
+            "timeline_evidence_before_mutation",
+        }
+    )
+    assert exception_policy["local_precheck"]["function"] == (
+        "agent.governance.mf_subagent_contract."
+        "validate_observer_direct_mutation_exception"
+    )
+
+    nontrivial = template["worker_contract"]["nontrivial_implementation"]
+    assert nontrivial["default_topology"] == "dispatch_to_bounded_worker_lane"
+    assert set(nontrivial["required_lane_evidence"]).issuperset(
+        {
+            "target_files",
+            "test_commands",
+            "worktree_path",
+            "fence_token",
+            "dirty_scope_check",
+            "review_evidence",
         }
     )
 
@@ -219,6 +284,163 @@ def test_dispatch_gate_requires_complete_same_worktree_override() -> None:
     assert evidence["isolated_worktree"] is False
     assert evidence["override"]["used"] is True
     assert evidence["override"]["timeline_evidence_recorded"] is True
+
+
+def _observer_direct_mutation_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "role": "observer",
+        "observer_direct_mutation": True,
+        "direct_mutation_exception": {
+            "tiny_deterministic": True,
+            "reason": "Correct a deterministic one-line contract typo.",
+            "allowed_files": ["docs/governance/manual-fix-sop.md"],
+            "dirty_scope_check": {
+                "status": "passed",
+                "dirty_scope_exact_match": True,
+                "changed_files": ["docs/governance/manual-fix-sop.md"],
+                "owned_files": ["docs/governance/manual-fix-sop.md"],
+            },
+            "timeline_evidence": {
+                "event_id": 1001,
+                "event_type": "observer_direct_mutation_exception",
+                "recorded_before_mutation": True,
+            },
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_observer_direct_mutation_exception_accepts_tiny_deterministic_scope() -> None:
+    evidence = validate_observer_direct_mutation_exception(
+        _observer_direct_mutation_payload(),
+        allowed_files=["docs/governance/manual-fix-sop.md"],
+    )
+
+    assert evidence["schema_version"] == OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION
+    assert evidence["role"] == OBSERVER_COORDINATOR_ROLE
+    assert evidence["policy_default"] == "reject"
+    assert evidence["observer_direct_mutation"] is True
+    assert evidence["allowed"] is True
+    assert evidence["exception"]["used"] is True
+    assert evidence["exception"]["timeline_evidence_recorded_before_mutation"] is True
+    assert evidence["dirty_scope_check"]["dirty_scope_exact_match"] is True
+
+
+def test_observer_direct_mutation_exception_rejects_default_empty_payload() -> None:
+    with pytest.raises(MfSubagentContractError, match="observer_direct_mutation=true"):
+        validate_observer_direct_mutation_exception({})
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"observer_direct_mutation": False}, "observer_direct_mutation=true"),
+        ({"role": ""}, "observer role"),
+        (
+            {"direct_mutation_exception": {"tiny_deterministic": False}},
+            "tiny deterministic",
+        ),
+        (
+            {
+                "direct_mutation_exception": {
+                    "tiny_deterministic": True,
+                    "allowed_files": ["docs/governance/manual-fix-sop.md"],
+                }
+            },
+            "explicit reason",
+        ),
+        (
+            {
+                "direct_mutation_exception": {
+                    "tiny_deterministic": True,
+                    "reason": "Small typo.",
+                }
+            },
+            "allowed_files",
+        ),
+        (
+            {
+                "direct_mutation_exception": {
+                    "tiny_deterministic": True,
+                    "reason": "Small typo.",
+                    "allowed_files": ["docs/governance/manual-fix-sop.md"],
+                    "timeline_evidence": {
+                        "event_id": 1001,
+                        "recorded_before_mutation": True,
+                    },
+                }
+            },
+            "dirty-scope evidence",
+        ),
+        (
+            {
+                "direct_mutation_exception": {
+                    "tiny_deterministic": True,
+                    "reason": "Small typo.",
+                    "allowed_files": ["docs/governance/manual-fix-sop.md"],
+                    "dirty_scope_check": {
+                        "status": "passed",
+                        "dirty_scope_exact_match": False,
+                        "changed_files": ["docs/governance/manual-fix-sop.md"],
+                    },
+                    "timeline_evidence": {
+                        "event_id": 1001,
+                        "recorded_before_mutation": True,
+                    },
+                }
+            },
+            "dirty_scope_exact_match",
+        ),
+        (
+            {
+                "direct_mutation_exception": {
+                    "tiny_deterministic": True,
+                    "reason": "Small typo.",
+                    "allowed_files": ["docs/governance/manual-fix-sop.md"],
+                    "dirty_scope_check": {
+                        "status": "passed",
+                        "dirty_scope_exact_match": True,
+                        "changed_files": ["docs/governance/manual-fix-sop.md"],
+                    },
+                }
+            },
+            "timeline evidence before mutation",
+        ),
+    ],
+)
+def test_observer_direct_mutation_exception_rejects_missing_evidence(
+    override: dict[str, object],
+    match: str,
+) -> None:
+    with pytest.raises(MfSubagentContractError, match=match):
+        validate_observer_direct_mutation_exception(
+            _observer_direct_mutation_payload(**override),
+            allowed_files=["docs/governance/manual-fix-sop.md"],
+        )
+
+
+def test_observer_direct_mutation_exception_rejects_dirty_files_outside_scope() -> None:
+    with pytest.raises(MfSubagentContractError, match="dirty files"):
+        validate_observer_direct_mutation_exception(
+            _observer_direct_mutation_payload(
+                direct_mutation_exception={
+                    "tiny_deterministic": True,
+                    "reason": "Small typo.",
+                    "allowed_files": ["docs/governance/manual-fix-sop.md"],
+                    "dirty_scope_check": {
+                        "status": "passed",
+                        "dirty_scope_exact_match": True,
+                        "changed_files": ["agent/governance/server.py"],
+                    },
+                    "timeline_evidence": {
+                        "event_id": 1001,
+                        "recorded_before_mutation": True,
+                    },
+                }
+            ),
+            allowed_files=["docs/governance/manual-fix-sop.md"],
+        )
 
 
 def _context(**overrides: object) -> BranchTaskRuntimeContext:
