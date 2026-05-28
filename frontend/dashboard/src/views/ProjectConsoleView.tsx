@@ -155,6 +155,10 @@ export default function ProjectConsoleView({
     [currentProjectId, projects],
   );
   const currentProjectLabel = projectLabelFor(projects, currentProjectId);
+  const simpleEntryProject = rows.find((project) => project.project_id === currentProjectId) ?? rows[0];
+  const simpleEntryLabel = simpleEntryProject
+    ? projectLabelFor(projects, simpleEntryProject.project_id)
+    : currentProjectLabel;
 
   const stats = useMemo(() => {
     const runtimes = Object.values(runtime);
@@ -358,6 +362,29 @@ export default function ProjectConsoleView({
           ) : null}
         </span>
       </div>
+
+      {simpleEntryProject ? (
+        <section className="ordinary-entry-panel" aria-label="Ordinary user entry">
+          <div className="ordinary-entry-copy">
+            <span className="ordinary-entry-kicker">Simple Mode</span>
+            <h3>Start from a request</h3>
+            <p>
+              Write what you want built, then follow each request from saved to done in one quiet workspace.
+            </p>
+          </div>
+          <div className="ordinary-entry-action">
+            <button
+              type="button"
+              className="action-btn action-btn-primary ordinary-entry-primary"
+              data-testid="ordinary-user-open-requests"
+              onClick={() => onOpenProject(simpleEntryProject.project_id)}
+            >
+              Open requests
+            </button>
+            <span title={simpleEntryProject.project_id}>{simpleEntryLabel}</span>
+          </div>
+        </section>
+      ) : null}
 
       <div className="score-grid project-console-score-grid">
         <Kpi label="Registered" value={stats.total} tone="blue" />
@@ -620,9 +647,9 @@ function ProjectRow({
             className="action-btn"
             disabled={actionBusy}
             onClick={() => onOpenProject(project.project_id)}
-            title="Open this project in the dashboard"
+            title="Open the request workspace for this project"
           >
-            Open
+            Open requests
           </button>
           {lifecycle.action === "build" ? (
             <button

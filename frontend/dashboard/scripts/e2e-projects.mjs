@@ -251,6 +251,63 @@ function verifySimpleModeRequestFirstDesktopContract() {
   ok("default first-viewport copy avoids operator terms");
 }
 
+function verifyOrdinaryUserEntryContract() {
+  phase("ordinary user entry desktop contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const consoleSource = readFileSync(
+    path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"),
+    "utf8",
+  );
+  const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
+  const consoleBlock = extractFunctionBlock(consoleSource, "ProjectConsoleView");
+  const rowBlock = extractFunctionBlock(consoleSource, "ProjectRow");
+
+  assert(appSource.includes('DASHBOARD_MODE_PARAM = "mode"'), "App should define a simple mode query parameter");
+  assert(appSource.includes('DASHBOARD_SIMPLE_PARAM = "simple"'), "App should define a simple boolean query parameter");
+  assert(appSource.includes('mode === "simple"'), "App should recognize mode=simple as the ordinary entry URL");
+  assert(
+    /simpleEntry\s*\|\|\s*projectParam\s*\?\s*["']inbox["']\s*:\s*["']projects["']/.test(appSource),
+    "mode=simple should route directly to the Simple Mode inbox view",
+  );
+
+  const entryIndex = consoleBlock.indexOf("ordinary-entry-panel");
+  const statsIndex = consoleBlock.indexOf("project-console-score-grid");
+  const tableIndex = consoleBlock.indexOf("Project Registry");
+  assert(entryIndex >= 0, "Projects page should render an ordinary-user entry panel");
+  assert(statsIndex >= 0, "Projects page summary counters are missing");
+  assert(tableIndex >= 0, "Projects page registry table is missing");
+  assert(
+    entryIndex < statsIndex && entryIndex < tableIndex,
+    "Ordinary-user entry should appear before project counters and the registry table",
+  );
+  assert(consoleBlock.includes('data-testid="ordinary-user-open-requests"'), "Entry panel primary action needs a stable test id");
+  assert(consoleBlock.includes("Start from a request"), "Entry panel should start from a user's request");
+  assert(consoleBlock.includes("Open requests"), "Entry panel should expose Open requests");
+  assert(
+    consoleBlock.includes("onOpenProject(simpleEntryProject.project_id)"),
+    "Entry panel should open the selected request workspace",
+  );
+  assert(rowBlock.includes("Open requests"), "Project rows should expose Open requests");
+  assert(
+    rowBlock.includes("Open the request workspace for this project"),
+    "Project row request action should be distinct from engineer actions",
+  );
+
+  assert(cssSource.includes(".ordinary-entry-panel"), "Ordinary-user entry panel CSS is missing");
+  assert(cssSource.includes(".ordinary-entry-primary"), "Ordinary-user entry primary action CSS is missing");
+
+  const panelStart = consoleSource.indexOf('<section className="ordinary-entry-panel"');
+  const panelEnd = panelStart >= 0 ? consoleSource.indexOf("</section>", panelStart) : -1;
+  assert(panelStart >= 0 && panelEnd > panelStart, "Ordinary-user entry panel source block is missing");
+  const entryCopy = visibleJsxText(consoleSource.slice(panelStart, panelEnd));
+  const forbidden = ["graph", "backlog", "worker", "execution queue", "audit", "commit", "snapshot"];
+  const found = forbidden.filter((term) => entryCopy.toLowerCase().includes(term));
+  assert(found.length === 0, `Ordinary-user entry copy uses operator term(s): ${found.join(", ")}`);
+  ok("mode=simple opens the Simple Mode request workspace");
+  ok("Projects first viewport exposes an ordinary-user request entry");
+  ok("ordinary-user entry copy avoids operator terms");
+}
+
 async function ensureProjectRegistered() {
   phase("project registry");
   const projects = await http("GET", "/api/projects");
@@ -722,16 +779,20 @@ async function main() {
 
   try {
     if (ONLY) {
-      if (ONLY !== "simple-mode-request-first-desktop") {
+      if (ONLY === "simple-mode-request-first-desktop") {
+        verifySimpleModeRequestFirstDesktopContract();
+      } else if (ONLY === "ordinary-user-entry-desktop") {
+        verifyOrdinaryUserEntryContract();
+      } else {
         throw new Error(`unknown --only target: ${ONLY}`);
       }
-      verifySimpleModeRequestFirstDesktopContract();
       console.log("");
       console.log(c("green", "ACCEPTANCE OK"));
       return;
     }
     await http("GET", "/api/health");
     verifySimpleModeRequestFirstDesktopContract();
+    verifyOrdinaryUserEntryContract();
     verifyProjectImportUiContract();
     verifyProjectProgressContract();
     verifyHeaderV1Contract();

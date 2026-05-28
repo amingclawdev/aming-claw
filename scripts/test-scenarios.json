@@ -52,6 +52,18 @@
           "timeout_ms": 120000
         },
         {
+          "id": "ordinary_user_entry_desktop_contract",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "frontend/dashboard/scripts/e2e-projects.mjs",
+            "--only",
+            "ordinary-user-entry-desktop"
+          ],
+          "env": {},
+          "timeout_ms": 120000
+        },
+        {
           "id": "observer_session_command_queue",
           "cwd": "repo",
           "command": [
@@ -73,6 +85,12 @@
           "kind": "e2e_contract",
           "path": "frontend/dashboard/scripts/e2e-projects.mjs",
           "description": "Desktop-only request-first Simple Mode check: request cards must render before helper status, counters, and tabs, and default visible copy must avoid operator terms."
+        },
+        {
+          "id": "ordinary_user_entry_desktop_contract",
+          "kind": "e2e_contract",
+          "path": "frontend/dashboard/scripts/e2e-projects.mjs",
+          "description": "Desktop-only ordinary-user entry check: mode=simple opens Simple Mode, Projects shows an entry panel before operator registry details, and entry copy avoids operator terms."
         }
       ]
     },

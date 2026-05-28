@@ -48,6 +48,8 @@ const DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY = "aming-claw.dashboard.sidebarCol
 const DASHBOARD_PROJECT_ID_PARAM = "project_id";
 const DASHBOARD_LEGACY_PROJECT_PARAM = "project";
 const DASHBOARD_VIEW_PARAM = "view";
+const DASHBOARD_MODE_PARAM = "mode";
+const DASHBOARD_SIMPLE_PARAM = "simple";
 const DASHBOARD_WORKSPACE_PARAM = "workspace";
 const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "inbox", "overview", "graph", "operations", "review", "assets", "backlog"];
 
@@ -57,6 +59,12 @@ function normalizeProjectId(value: string | null | undefined): string {
 
 function normalizeViewName(value: string | null | undefined): ViewName {
   return DASHBOARD_VIEWS.includes(value as ViewName) ? (value as ViewName) : "projects";
+}
+
+function isSimpleEntryParam(params: URLSearchParams): boolean {
+  const mode = (params.get(DASHBOARD_MODE_PARAM) || "").trim().toLowerCase();
+  const simple = (params.get(DASHBOARD_SIMPLE_PARAM) || "").trim().toLowerCase();
+  return mode === "simple" || ["1", "true", "yes"].includes(simple);
 }
 
 function readStoredProjectId(): string {
@@ -77,9 +85,10 @@ function readDashboardLocation(): { projectId: string; view: ViewName; hasProjec
   const legacyProjectParam = params.get(DASHBOARD_LEGACY_PROJECT_PARAM);
   const projectParam = projectIdParam?.trim() ? projectIdParam : legacyProjectParam;
   const viewParam = params.get(DASHBOARD_VIEW_PARAM);
+  const simpleEntry = isSimpleEntryParam(params);
   return {
     projectId: normalizeProjectId(projectParam || readStoredProjectId()),
-    view: viewParam ? normalizeViewName(viewParam) : (projectParam ? "inbox" : "projects"),
+    view: viewParam ? normalizeViewName(viewParam) : (simpleEntry || projectParam ? "inbox" : "projects"),
     hasProjectParam: Boolean(projectParam && projectParam.trim()),
     workspacePath: (params.get(DASHBOARD_WORKSPACE_PARAM) || "").trim(),
   };
@@ -118,6 +127,8 @@ function writeDashboardLocation(projectId: string, view: ViewName, mode: "push" 
   const url = new URL(window.location.href);
   url.searchParams.set(DASHBOARD_PROJECT_ID_PARAM, nextProjectId);
   url.searchParams.delete(DASHBOARD_LEGACY_PROJECT_PARAM);
+  url.searchParams.delete(DASHBOARD_MODE_PARAM);
+  url.searchParams.delete(DASHBOARD_SIMPLE_PARAM);
   url.searchParams.set(DASHBOARD_VIEW_PARAM, view);
   const nextUrl = `${url.pathname}${url.search}${url.hash}`;
   const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
