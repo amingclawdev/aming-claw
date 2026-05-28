@@ -163,6 +163,75 @@ def test_server_create_and_project_inbox_handlers_do_not_promote_backlog():
     assert inbox["lanes"]["ready_backlog"]["source"] == "backlog"
 
 
+def test_simple_mode_observer_command_flow_for_execution_and_worker_controls():
+    """Simple Mode UI relies on the same observer command queue for execution and worker control.
+
+    The dashboard's three-tab UX issues `move_to_execution_queue`, `pause_worker`,
+    `continue_worker`, and `cancel_worker` commands and surfaces their lifecycle.
+    This guards against silent drift of the command-type allowlist.
+    """
+    from agent.governance import observer_session, server
+
+    conn = _conn()
+
+    raw = raw_requirement.create_raw_requirement(
+        conn,
+        project_id="demo",
+        raw_text="Polish the inbox CTA copy",
+    )
+    raw_requirement.update_status(
+        conn,
+        project_id="demo",
+        raw_id=raw["raw_id"],
+        new_status=raw_requirement.STATUS_NEEDS_CONFIRMATION,
+    )
+
+    move_ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={},
+        body={
+            "command_type": "move_to_execution_queue",
+            "payload": {"raw_id": raw["raw_id"], "source": "project_inbox"},
+            "created_by": "dashboard",
+        },
+        get_project_id=lambda: "demo",
+    )
+    with patch("agent.governance.server.get_connection", return_value=conn):
+        code, payload = server.handle_observer_command_enqueue(move_ctx)
+    assert code == 201
+    assert payload["observer_command"]["command_type"] == "move_to_execution_queue"
+    assert payload["observer_command"]["payload"]["raw_id"] == raw["raw_id"]
+    assert payload["hook_reminder"]["payload_included"] is False
+
+    for action in ("pause_worker", "continue_worker", "cancel_worker"):
+        ctrl_ctx = SimpleNamespace(
+            path_params={"project_id": "demo"},
+            query={},
+            body={
+                "command_type": action,
+                "payload": {"bug_id": "DEMO-1"},
+                "created_by": "dashboard",
+            },
+            get_project_id=lambda: "demo",
+        )
+        with patch("agent.governance.server.get_connection", return_value=conn):
+            code, ctrl_payload = server.handle_observer_command_enqueue(ctrl_ctx)
+        assert code == 201, action
+        assert ctrl_payload["observer_command"]["command_type"] == action
+        assert ctrl_payload["observer_command"]["status"] == observer_session.COMMAND_STATUS_QUEUED
+
+    summary = observer_session.command_summary(conn, project_id="demo")
+    counts = summary["counts"]
+    assert counts["queued"] == 4
+    types = {item["command_type"] for item in summary["items"]}
+    assert types == {
+        "move_to_execution_queue",
+        "pause_worker",
+        "continue_worker",
+        "cancel_worker",
+    }
+
+
 def test_project_inbox_groups_backlog_rows_into_operator_lanes():
     from agent.governance import server
 

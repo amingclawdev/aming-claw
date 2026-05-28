@@ -1097,6 +1097,72 @@ export default function App() {
     setActionPanelOpen(true);
   }, []);
 
+  if (view === "inbox") {
+    const projectLabel = projectDisplayName(projects, currentProjectId);
+    const handleEnterEngineerMode = () => {
+      writeDashboardLocation(currentProjectId, "overview", "push");
+      setView("overview");
+    };
+    return (
+      <div className="app simple-shell">
+        <header className="simple-shell-header" aria-label="Simple Mode header">
+          <div className="simple-shell-brand">
+            <div className="simple-shell-logo" aria-hidden="true">a</div>
+            <div className="simple-shell-identity">
+              <div className="simple-shell-title" title={currentProjectId}>{projectLabel}</div>
+              <select
+                className="simple-shell-project-select"
+                value={currentProjectId}
+                onChange={(event) => handleProjectChange(event.target.value)}
+                aria-label="Switch project"
+                title="Switch project"
+              >
+                {projects.length ? (
+                  projects.map((project) => (
+                    <option key={project.project_id} value={project.project_id}>
+                      {project.name?.trim() && project.name.trim() !== project.project_id
+                        ? `${project.name.trim()} · ${project.project_id}`
+                        : project.project_id}
+                    </option>
+                  ))
+                ) : (
+                  <option value={currentProjectId}>{currentProjectId}</option>
+                )}
+              </select>
+            </div>
+          </div>
+          <div className="simple-shell-actions">
+            <button
+              type="button"
+              className="simple-shell-refresh"
+              onClick={handleRefresh}
+              disabled={loading}
+              title="Refresh requirements"
+            >
+              {loading ? <span className="spinner" /> : "↻"} Refresh
+            </button>
+            <button
+              type="button"
+              className="simple-shell-engineer-link"
+              onClick={handleEnterEngineerMode}
+              title="Open engineer dashboard for graph, backlog, and details"
+            >
+              Engineer Mode →
+            </button>
+          </div>
+        </header>
+        <main className="simple-shell-main scrollbar-thin">
+          <ProjectInboxView projectId={currentProjectId} />
+        </main>
+        {toast ? (
+          <div className={`toast ${toast.kind}`} role="status">
+            {toast.msg}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <Header
@@ -1164,7 +1230,7 @@ export default function App() {
           onToggleCollapsed={() => setSidebarCollapsed((prev) => !prev)}
         />
         <main className="main scrollbar-thin">
-          {error && !data && view !== "projects" && view !== "inbox" ? (
+          {error && !data && view !== "projects" ? (
             <div className="view">
               <div className="empty">
                 Load failed. Check the governance service is reachable at{" "}
@@ -1183,9 +1249,6 @@ export default function App() {
               onOpenAiConfig={() => setAiConfigOpen(true)}
               onRefresh={handleRefresh}
             />
-          ) : null}
-          {view === "inbox" ? (
-            <ProjectInboxView projectId={currentProjectId} />
           ) : null}
           {view === "overview" && data ? (
             <OverviewView data={data} onSelectNode={handleSelectNode} />
@@ -1289,7 +1352,7 @@ export default function App() {
               projectId={currentProjectId}
             />
           ) : null}
-          {!data && !error && view !== "projects" && view !== "inbox" ? (
+          {!data && !error && view !== "projects" ? (
             <div className="view">
               <div className="empty">
                 <span className="spinner" /> Loading governance snapshot…
