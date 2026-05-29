@@ -324,6 +324,89 @@ def _trigger_matches(
     return False
 
 
+def _bool_from_suite(suite: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = suite.get(key)
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _suite_route_policy(
+    suite: dict[str, Any],
+    *,
+    project_id: str,
+    can_autorun: bool,
+) -> dict[str, Any]:
+    trigger = _suite_trigger(suite)
+    tags = {tag.lower().replace("_", "-") for tag in trigger["tags"]}
+    command = str(suite.get("command") or "")
+    command_lower = command.lower()
+    isolation_project = str(suite.get("isolation_project") or "").strip()
+    isolation_lower = isolation_project.lower()
+    project_lower = str(project_id or "").strip().lower()
+    live_ai = _bool_from_suite(suite, "live_ai")
+    requires_approval = _bool_from_suite(suite, "requires_human_approval")
+    manual_approval_required = live_ai or requires_approval
+    mutates_db = _bool_from_suite(suite, "mutates_db", True)
+
+    classes: list[str] = []
+
+    def add(name: str) -> None:
+        if name not in classes:
+            classes.append(name)
+
+    if "fixture" in tags or "fixture" in isolation_lower or "fixture" in command_lower:
+        add("fixture")
+    if (
+        "docker" in tags
+        or isinstance(suite.get("docker_ai_e2e"), dict)
+        or command_lower.startswith("docker ")
+        or " docker " in f" {command_lower} "
+        or "docker/" in command_lower
+        or "docker-compose" in command_lower
+    ):
+        add("docker")
+    if live_ai:
+        add("live_ai")
+    if manual_approval_required:
+        add("manual_approval")
+    if mutates_db:
+        add("mutating_governance")
+    static_route = (
+        bool(tags.intersection({"static", "static-route"}))
+        or "--static-route" in command_lower
+        or "--build-dashboard" in command_lower
+    )
+    if static_route:
+        add("static")
+    if "production" in tags or (static_route and project_lower and isolation_lower == project_lower):
+        add("production")
+    if "cleanup" in tags or "cleanup" in command_lower:
+        add("cleanup")
+    if tags.intersection({"focus", "focused"}) or "--focus" in command_lower or "--focused" in command_lower:
+        add("focused")
+    if (
+        "source-only" in tags
+        or "--source-only" in command_lower
+        or "--source_only" in command_lower
+        or "--skip-dashboard" in command_lower
+    ):
+        add("source_only")
+
+    if manual_approval_required:
+        execution_mode = "manual_approval"
+    elif can_autorun:
+        execution_mode = "autorun"
+    else:
+        execution_mode = "manual"
+
+    return {
+        "suite_classes": classes,
+        "execution_mode": execution_mode,
+        "manual_approval_required": manual_approval_required,
+    }
+
+
 def _compare_entry_to_snapshot(
     entry: dict[str, Any] | None,
     state: dict[str, Any],
@@ -400,14 +483,18 @@ def plan_e2e_impact(
         live_ai = bool(suite.get("live_ai"))
         approval = bool(suite.get("requires_human_approval"))
         auto_run = bool(suite.get("auto_run")) and global_auto and not live_ai and not approval
+        route_policy = _suite_route_policy(suite, project_id=project_id, can_autorun=auto_run)
         rows.append({
             "suite_id": suite_id,
             "label": str(suite.get("label") or suite_id),
             "status": status,
             "required": status in {"missing", "stale", "failed"} or trigger_match,
             "trigger_matched": trigger_match,
+            "live_ai": live_ai,
+            "requires_human_approval": approval,
             "can_autorun": auto_run,
             "blocked_reason": "live_ai_requires_manual_approval" if live_ai or approval else "",
+            **route_policy,
             "command": str(suite.get("command") or ""),
             "timeout_sec": int(suite.get("timeout_sec") or e2e_config.get("default_timeout_sec") or 900),
             "latest_evidence": {
@@ -431,4 +518,3 @@ def plan_e2e_impact(
         "suites": rows,
         "ledger_path": str(project_ledger_path(project_id)),
     }
-

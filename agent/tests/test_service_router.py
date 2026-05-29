@@ -77,6 +77,54 @@ def test_preview_route_allows_and_runs_default_handler():
     assert result["routes"][0]["side_effect_class"] == "read"
     assert result["routes"][0]["side_effect"] == "read"
     assert result["routes"][0]["result"]["service_id"] == "test_governance.preview"
+    assert result["routes"][0]["requirement_ids"] == []
+    assert result["routes"][0]["contract_evidence"] == []
+
+
+def test_ai_validated_event_route_exposes_declared_contract_evidence():
+    contract = _contract(
+        service_routes=[
+            _service_route(
+                requirement_ids=["service_route_evidence"],
+                contract_evidence=[{"id": "service_contract_evidence"}],
+            )
+        ],
+        event_routes=[
+            {
+                "route_id": "event.ai_structured_output.validated",
+                "event_kind": "ai.structured_output.validated",
+                "service_route_id": "service.test_governance.preview",
+                "required_evidence_ids": ["ai_output_validated"],
+                "enabled": True,
+            }
+        ],
+    )
+
+    result = route_event(
+        {
+            "event_id": "evt-ai-validated",
+            "event_kind": "ai.structured_output.validated",
+            "stage": "review_ready",
+            "task_id": "task-ai",
+            "backlog_id": "BUG-AI",
+        },
+        contract,
+    )
+
+    route = result["routes"][0]
+    assert result["decision"] == "allow"
+    assert route["status"] == "allowed"
+    assert route["requirement_ids"] == [
+        "service_route_evidence",
+        "service_contract_evidence",
+        "ai_output_validated",
+    ]
+    assert [item["requirement_id"] for item in route["contract_evidence"]] == route[
+        "requirement_ids"
+    ]
+    assert {item["status"] for item in route["contract_evidence"]} == {"passed"}
+    assert route["evidence"]["event_kind"] == "ai.structured_output.validated"
+    assert route["evidence"]["contract_evidence"] == route["contract_evidence"]
 
 
 def test_route_stages_array_matches_current_event_stage():

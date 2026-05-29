@@ -52,8 +52,8 @@ class TestTaskTimeline(unittest.TestCase):
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
 
-    def _insert_router_backlog(self, bug_id="BUG-SERVICE-ROUTER"):
-        contract = {
+    def _insert_router_backlog(self, bug_id="BUG-SERVICE-ROUTER", contract=None):
+        contract = contract or {
             "parallel_contract": {
                 "template_id": "mf_parallel.v1",
                 "contract_instance_id": bug_id,
@@ -227,6 +227,70 @@ class TestTaskTimeline(unittest.TestCase):
             {event["payload"]["service_id"] for event in routed},
         )
         self.assertEqual({event["event_type"] for event in routed}, {"service.route.completed"})
+
+    def test_ai_validated_timeline_route_persists_contract_evidence(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-AI-ROUTE-EVIDENCE"
+        route_requirement = "ai_output_validated"
+        self._insert_router_backlog(
+            bug_id=bug_id,
+            contract={
+                "parallel_contract": {
+                    "contract_instance_id": bug_id,
+                    "service_routes": [
+                        {
+                            "route_id": "service.test_governance.preview",
+                            "service_id": "test_governance.preview",
+                            "mode": "preview",
+                            "side_effect_class": "read",
+                            "requirement_ids": ["service_route_checked"],
+                        }
+                    ],
+                    "event_routes": [
+                        {
+                            "route_id": "event.ai_structured_output.validated",
+                            "event_kind": "ai.structured_output.validated",
+                            "service_route_id": "service.test_governance.preview",
+                            "required_evidence_ids": [route_requirement],
+                            "enabled": True,
+                        }
+                    ],
+                }
+            },
+        )
+
+        source = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-ai-route",
+            backlog_id=bug_id,
+            event_type="ai.structured_output.validated",
+            actor="ai-fixture",
+            status="passed",
+            payload={"producer": "fixture", "validated": True},
+        )
+        self.conn.commit()
+
+        routed = task_timeline.list_events(
+            self.conn,
+            "proj",
+            parent_event_id=source["id"],
+            event_kind="service_route",
+        )
+
+        self.assertEqual(len(routed), 1)
+        payload = routed[0]["payload"]
+        self.assertEqual(payload["route_id"], "event.ai_structured_output.validated")
+        self.assertEqual(payload["requirement_ids"], ["service_route_checked", route_requirement])
+        self.assertEqual(
+            [item["requirement_id"] for item in payload["contract_evidence"]],
+            ["service_route_checked", route_requirement],
+        )
+        self.assertEqual(
+            routed[0]["verification"]["contract_evidence"],
+            payload["contract_evidence"],
+        )
 
     def test_route_timeline_event_is_idempotent_for_same_source_event(self):
         from agent.governance import service_router, task_timeline

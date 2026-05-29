@@ -20,6 +20,11 @@ from agent.governance.service_registry import (
 )
 
 
+SERVICE_ROUTE_EVIDENCE_SCHEMA_VERSION = "service_route_evidence.v1"
+SERVICE_ROUTE_PASS_STATUS = "passed"
+SERVICE_ROUTE_BLOCK_STATUS = "blocked"
+
+
 def route_event(
     event: Mapping[str, Any],
     contract: Mapping[str, Any],
@@ -146,31 +151,33 @@ class ServiceRouter:
         descriptor = self.registry.get(service_id)
         if descriptor is None:
             idempotency_key = _fallback_idempotency_key(event, contract, route_id, service_id)
-            return {
+            return _with_route_evidence({
                 "route_id": route_id,
                 "service_id": service_id,
                 "decision": "block",
                 "status": "unknown_service",
                 "reason": f"unknown service: {service_id}",
                 "idempotency_key": idempotency_key,
-            }
+            }, event=event, event_route=event_route, service_route=service_route)
         event_kind = _event_kind(event)
         if descriptor.supported_events and event_kind not in descriptor.supported_events:
             idempotency_key = _fallback_idempotency_key(event, contract, route_id, service_id)
-            return {
+            return _with_route_evidence({
                 "route_id": route_id,
                 "service_id": service_id,
+                "mode": descriptor.mode,
+                "side_effect_class": descriptor.side_effect_class,
                 "decision": "block",
                 "status": "unsupported_event",
                 "reason": f"{service_id} does not support {event_kind}",
                 "idempotency_key": idempotency_key,
-            }
+            }, event=event, event_route=event_route, service_route=service_route)
 
         merged = _merge_descriptor_route(descriptor, service_route, event_route)
         idempotency_key = _idempotency_key(event, contract, merged, route_id, service_id)
         permission_check = _permission_check(event, contract, merged)
         if permission_check:
-            return {
+            return _with_route_evidence({
                 "route_id": route_id,
                 "service_id": service_id,
                 "mode": merged["mode"],
@@ -180,7 +187,7 @@ class ServiceRouter:
                 "status": "permission_blocked",
                 "reason": permission_check,
                 "idempotency_key": idempotency_key,
-            }
+            }, event=event, event_route=event_route, service_route=service_route)
 
         result_summary: dict[str, Any] | None = None
         if call_handlers:
@@ -203,7 +210,7 @@ class ServiceRouter:
                 "ok": True,
                 "summary": f"{service_id} allowed for {_event_kind(event)}",
             }
-        return {
+        return _with_route_evidence({
             "route_id": route_id,
             "service_id": service_id,
             "mode": merged["mode"],
@@ -213,7 +220,7 @@ class ServiceRouter:
             "status": "allowed",
             "idempotency_key": idempotency_key,
             "result": result_summary,
-        }
+        }, event=event, event_route=event_route, service_route=service_route)
 
 
 def _event_routes(contract: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -299,6 +306,117 @@ def _merge_descriptor_route(
         ),
         "idempotency_key_policy": idempotency_policy,
     }
+
+
+def _with_route_evidence(
+    route_result: dict[str, Any],
+    *,
+    event: Mapping[str, Any],
+    event_route: Mapping[str, Any],
+    service_route: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = _route_evidence(
+        event=event,
+        event_route=event_route,
+        service_route=service_route,
+        route_id=_string(route_result.get("route_id")),
+        service_id=_string(route_result.get("service_id")),
+        mode=_string(route_result.get("mode")),
+        side_effect_class=_string(
+            route_result.get("side_effect_class") or route_result.get("side_effect")
+        ),
+        decision=_string(route_result.get("decision")),
+        status=_string(route_result.get("status")),
+        idempotency_key=_string(route_result.get("idempotency_key")),
+        result=_mapping(route_result.get("result")),
+        reason=_string(route_result.get("reason")),
+    )
+    route_result["requirement_ids"] = evidence["requirement_ids"]
+    route_result["contract_evidence"] = evidence["contract_evidence"]
+    route_result["evidence"] = evidence
+    return route_result
+
+
+def _route_evidence(
+    *,
+    event: Mapping[str, Any],
+    event_route: Mapping[str, Any],
+    service_route: Mapping[str, Any],
+    route_id: str,
+    service_id: str,
+    mode: str,
+    side_effect_class: str,
+    decision: str,
+    status: str,
+    idempotency_key: str,
+    result: Mapping[str, Any] | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    requirement_ids = _route_requirement_ids(event_route, service_route)
+    evidence_status = (
+        SERVICE_ROUTE_PASS_STATUS if decision == "allow" else SERVICE_ROUTE_BLOCK_STATUS
+    )
+    contract_evidence = [
+        {
+            "schema_version": SERVICE_ROUTE_EVIDENCE_SCHEMA_VERSION,
+            "requirement_id": requirement_id,
+            "status": evidence_status,
+            "kind": "service_route",
+            "route_id": route_id,
+            "service_id": service_id,
+            "event_kind": _event_kind(event),
+            "mode": mode,
+            "side_effect_class": side_effect_class,
+            "decision": decision,
+            "idempotency_key": idempotency_key,
+        }
+        for requirement_id in requirement_ids
+    ]
+    return {
+        "schema_version": SERVICE_ROUTE_EVIDENCE_SCHEMA_VERSION,
+        "route_id": route_id,
+        "service_id": service_id,
+        "event_kind": _event_kind(event),
+        "mode": mode,
+        "side_effect_class": side_effect_class,
+        "decision": decision,
+        "status": evidence_status,
+        "route_status": status,
+        "idempotency_key": idempotency_key,
+        "requirement_ids": requirement_ids,
+        "contract_evidence": contract_evidence,
+        "result": _mapping(result),
+        "reason": reason,
+    }
+
+
+def _route_requirement_ids(
+    event_route: Mapping[str, Any],
+    service_route: Mapping[str, Any],
+) -> list[str]:
+    values: list[str] = []
+    for route in (service_route, event_route):
+        values.extend(_one_or_many(route, "requirement_id"))
+        values.extend(_one_or_many(route, "contract_requirement_id"))
+        values.extend(_one_or_many(route, "evidence_id"))
+        values.extend(_one_or_many(route, "required_evidence_id"))
+        values.extend(_list_of_strings(route.get("requirement_ids")))
+        values.extend(_list_of_strings(route.get("contract_requirement_ids")))
+        values.extend(_list_of_strings(route.get("evidence_ids")))
+        values.extend(_list_of_strings(route.get("required_evidence_ids")))
+        for item in _list_of_mappings(route.get("contract_evidence")):
+            values.extend(_one_or_many(item, "requirement_id"))
+            values.extend(_one_or_many(item, "contract_requirement_id"))
+            values.extend(_one_or_many(item, "evidence_id"))
+            values.extend(_one_or_many(item, "id"))
+    return _dedupe_strings(values)
+
+
+def _one_or_many(container: Mapping[str, Any], key: str) -> list[str]:
+    value = container.get(key)
+    if isinstance(value, str):
+        return [value] if value else []
+    return _list_of_strings(value)
 
 
 def _permission_check(
@@ -532,6 +650,12 @@ def _record_timeline_route_results(
                 "status": _string(route.get("status")),
                 "result": _mapping(route.get("result")),
                 "reason": _string(route.get("reason")),
+                "requirement_ids": _list_of_strings(route.get("requirement_ids")),
+                "contract_evidence": _list_of_mappings(route.get("contract_evidence")),
+                "route_evidence": _mapping(route.get("evidence")),
+            },
+            verification={
+                "contract_evidence": _list_of_mappings(route.get("contract_evidence")),
             },
         )
 
@@ -618,6 +742,23 @@ def _list_of_strings(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str) and item]
+
+
+def _list_of_mappings(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = _string(value)
+        if item and item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
 
 
 def _string(value: Any) -> str:

@@ -113,6 +113,245 @@
       ]
     },
     {
+      "id": "service_router_docker_fixture",
+      "title": "Service router Docker fixture lane",
+      "description": "Deterministic service-router fixture declaration for Docker-backed service routing checks. The manager records the lane and blocks execution unless Docker fixture approval is explicit.",
+      "target_project": "aming-claw",
+      "target_ref": "HEAD",
+      "runner": "commands",
+      "dependencies": [
+        {
+          "id": "node",
+          "kind": "command",
+          "command": "{node}",
+          "required": true,
+          "remediation": "Install Node.js so the deterministic fixture metadata check can run."
+        },
+        {
+          "id": "docker_fixture",
+          "kind": "capability",
+          "command": [
+            "docker",
+            "info",
+            "--format",
+            "{{json .ServerVersion}}"
+          ],
+          "required": true,
+          "remediation": "Re-run with --allow-docker only after approving Docker fixture setup for this isolated lane."
+        }
+      ],
+      "execution_policy": {
+        "lane": "docker_fixture",
+        "autorun": false,
+        "requires_flags": [
+          "--allow-docker"
+        ],
+        "live_ai": "disabled",
+        "model_calls": "forbidden"
+      },
+      "safety": {
+        "fixture_only": true,
+        "live_ai": false,
+        "calls_models": false,
+        "uses_docker_fixture": true,
+        "requires_human_approval": true
+      },
+      "coverage": {
+        "areas": [
+          "service_router",
+          "docker_fixture",
+          "route_permissions",
+          "side_effect_class"
+        ],
+        "test_files": [
+          "agent/tests/test_service_router.py"
+        ]
+      },
+      "route_context": {
+        "service_id": "service_router.docker_fixture",
+        "event_kind": "service.fixture.requested",
+        "mode": "preview",
+        "side_effect_class": "read"
+      },
+      "fixtures": [
+        {
+          "id": "service-router-docker-fixture",
+          "kind": "docker_fixture",
+          "deterministic": true,
+          "calls_models": false,
+          "description": "Fixture lane metadata for Docker-backed router/service checks; container startup is outside this manager unless --allow-docker is supplied."
+        }
+      ],
+      "evidence_requirements": [
+        {
+          "id": "docker_fixture_gate",
+          "kind": "dependency_decision",
+          "dependency_id": "docker_fixture",
+          "required_status": "allowed"
+        },
+        {
+          "id": "no_model_calls",
+          "kind": "safety_metadata",
+          "field": "safety.calls_models",
+          "expected": false
+        }
+      ],
+      "commands": [
+        {
+          "id": "service_router_docker_environment_probe",
+          "cwd": "repo",
+          "command": [
+            "docker",
+            "info",
+            "--format",
+            "{{json .ServerVersion}}"
+          ],
+          "env": {},
+          "timeout_ms": 30000
+        },
+        {
+          "id": "service_router_docker_fixture_metadata",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "-e",
+            "const assert = require('node:assert'); assert.strictEqual(process.env.AMING_CLAW_LIVE_AI, '0'); assert.strictEqual(process.env.AMING_CLAW_MODEL_CALLS, 'forbidden'); console.log('service router docker fixture metadata ok');"
+          ],
+          "env": {
+            "AMING_CLAW_LIVE_AI": "0",
+            "AMING_CLAW_MODEL_CALLS": "forbidden"
+          },
+          "timeout_ms": 30000
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "service_router_contract_tests",
+          "kind": "pytest_contract",
+          "path": "agent/tests/test_service_router.py",
+          "description": "Existing deterministic router contract coverage used by the Docker fixture lane declaration."
+        }
+      ]
+    },
+    {
+      "id": "service_router_ai_structured_output_fixture",
+      "title": "Service router AI structured-output fixture lane",
+      "description": "Deterministic structured-output fixture declaration for router/service coverage. It records live AI as manual/auth-unknown and uses only fixture JSON.",
+      "target_project": "aming-claw",
+      "target_ref": "HEAD",
+      "runner": "commands",
+      "dependencies": [
+        {
+          "id": "node",
+          "kind": "command",
+          "command": "{node}",
+          "required": true,
+          "remediation": "Install Node.js so the deterministic structured-output fixture check can run."
+        },
+        {
+          "id": "ai_structured_output_fixture",
+          "kind": "capability",
+          "required": true,
+          "remediation": "Keep the deterministic structured-output fixture available; this lane must not call a model."
+        },
+        {
+          "id": "live_ai_runtime",
+          "kind": "capability",
+          "required": false,
+          "remediation": "Live AI validation is manual only: verify project AI config, local CLI auth, and operator approval before using a separate live-AI runner."
+        }
+      ],
+      "execution_policy": {
+        "lane": "ai_structured_output_fixture",
+        "autorun": true,
+        "requires_flags": [],
+        "live_ai": "manual_auth_unknown",
+        "model_calls": "forbidden",
+        "manual_live_ai_flags": [
+          "--allow-live-ai"
+        ]
+      },
+      "safety": {
+        "fixture_only": true,
+        "live_ai": false,
+        "live_ai_manual": true,
+        "auth_status": "unknown",
+        "calls_models": false,
+        "requires_human_approval": false
+      },
+      "coverage": {
+        "areas": [
+          "service_router",
+          "ai_structured_output",
+          "fixture_routing",
+          "model_call_prevention"
+        ],
+        "test_files": [
+          "agent/tests/test_service_router.py",
+          "agent/tests/test_ai_output_intake.py"
+        ]
+      },
+      "route_context": {
+        "service_id": "service_router.ai_structured_output_fixture",
+        "event_kind": "ai.structured_output.received",
+        "mode": "preview",
+        "side_effect_class": "read"
+      },
+      "fixtures": [
+        {
+          "id": "service-router-structured-output-envelope",
+          "kind": "json_fixture",
+          "deterministic": true,
+          "calls_models": false,
+          "description": "Local structured-output envelope used to exercise router/service contracts without provider calls."
+        }
+      ],
+      "evidence_requirements": [
+        {
+          "id": "fixture_dependency_available",
+          "kind": "dependency_decision",
+          "dependency_id": "ai_structured_output_fixture",
+          "required_status": "available"
+        },
+        {
+          "id": "live_ai_manual_gate",
+          "kind": "dependency_decision",
+          "dependency_id": "live_ai_runtime",
+          "required_status": "blocked"
+        },
+        {
+          "id": "no_model_calls",
+          "kind": "safety_metadata",
+          "field": "safety.calls_models",
+          "expected": false
+        }
+      ],
+      "commands": [
+        {
+          "id": "service_router_ai_structured_output_fixture_metadata",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "-e",
+            "const assert = require('node:assert'); const envelope = {schema_version: 1, source: 'fixture', calls_models: false, payload: {recommendation: 'qa_pass'}}; assert.strictEqual(envelope.source, 'fixture'); assert.strictEqual(envelope.calls_models, false); assert.strictEqual(envelope.payload.recommendation, 'qa_pass'); console.log('service router ai structured-output fixture ok');"
+          ],
+          "env": {
+            "AMING_CLAW_LIVE_AI": "0",
+            "AMING_CLAW_MODEL_CALLS": "forbidden"
+          },
+          "timeout_ms": 30000
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "ai_output_intake_contract_tests",
+          "kind": "pytest_contract",
+          "path": "agent/tests/test_ai_output_intake.py",
+          "description": "Existing deterministic structured-output intake coverage referenced by the fixture lane."
+        }
+      ]
+    },
+    {
       "id": "ruby_graph_sinatra",
       "title": "Ruby graph validation against Sinatra",
       "description": "Clones or reuses a pinned Sinatra workspace outside this repo, bootstraps it through governance when explicitly allowed, and validates Ruby graph reasonableness.",

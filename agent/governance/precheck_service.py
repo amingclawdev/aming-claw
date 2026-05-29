@@ -912,7 +912,7 @@ def _missing_required_evidence(
     required = _required_evidence_ids(subject)
     if not include_close_ready:
         required = [item for item in required if item != "close_ready"]
-    present = _present_evidence_ids(subject.get("contract_evidence"))
+    present = _present_required_evidence_ids(subject)
     return sorted(item for item in required if item not in present)
 
 
@@ -926,6 +926,42 @@ def _required_evidence_ids(subject: Mapping[str, Any]) -> list[str]:
                 if evidence_id:
                     explicit.append(evidence_id)
     return _dedupe(explicit)
+
+
+def _present_required_evidence_ids(subject: Mapping[str, Any]) -> set[str]:
+    present = _present_evidence_ids(subject.get("contract_evidence"))
+    present.update(_present_route_evidence_ids(subject.get("route_evidence")))
+    present.update(_timeline_contract_evidence_ids(subject.get("timeline_evidence")))
+    return present
+
+
+def _present_route_evidence_ids(value: Any) -> set[str]:
+    present: set[str] = set()
+    if isinstance(value, Mapping):
+        present.update(_present_evidence_ids(value.get("contract_evidence")))
+        present.update(_present_evidence_ids([value]))
+        return present
+    for item in _iter_mappings(value):
+        present.update(_present_evidence_ids(item.get("contract_evidence")))
+        present.update(_present_evidence_ids([item]))
+    return present
+
+
+def _timeline_contract_evidence_ids(value: Any) -> set[str]:
+    present: set[str] = set()
+    for event in _iter_mappings(value):
+        event_status = _text(event.get("status") or event.get("decision")).lower()
+        event_passed = event_status in PASS_STATUSES
+        if event_passed:
+            present.update(_requirement_ids_from_container(event))
+        for key in ("payload", "verification", "artifact_refs"):
+            container = _mapping(event.get(key))
+            if event_passed:
+                present.update(_requirement_ids_from_container(container))
+            present.update(_present_evidence_ids(container.get("contract_evidence")))
+            route_evidence = _mapping(container.get("route_evidence"))
+            present.update(_present_evidence_ids(route_evidence.get("contract_evidence")))
+    return present
 
 
 def _present_evidence_ids(value: Any) -> set[str]:
@@ -951,6 +987,25 @@ def _present_evidence_ids(value: Any) -> set[str]:
         if evidence_id:
             present.add(evidence_id)
     return present
+
+
+def _requirement_ids_from_container(container: Mapping[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for key in ("requirement_id", "contract_requirement_id", "evidence_id"):
+        value = _text(container.get(key))
+        if value:
+            ids.add(value)
+    for key in ("requirement_ids", "contract_requirement_ids", "evidence_ids"):
+        ids.update(_string_list(container.get(key)))
+    return ids
+
+
+def _iter_mappings(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [item for item in value if isinstance(item, Mapping)]
+    return []
 
 
 def _has_pass_evidence(value: Any) -> bool:

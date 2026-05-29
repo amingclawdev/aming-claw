@@ -100,7 +100,7 @@ def default_service_descriptors() -> dict[str, ServiceDescriptor]:
             service_id="test_governance.preview",
             mode="preview",
             side_effect="read",
-            supported_events=("task.completed",),
+            supported_events=("task.completed", "ai.structured_output.validated"),
             idempotency_fields=common_idempotency,
             handler=deterministic_default_handler,
         ),

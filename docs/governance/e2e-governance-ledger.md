@@ -267,6 +267,22 @@ Hard safety rules:
 - Failed E2E may file or suggest backlog, but backlog creation is controlled by
   a separate policy.
 
+## 7.1 Scenario Manager Fixture Lanes
+
+`scripts/test-scenarios.json` declares two service-router fixture lanes:
+
+- `service_router_docker_fixture` is a deterministic Docker fixture lane. It is
+  blocked by default and requires `--allow-docker`; after approval the manager
+  probes Docker readiness before any command evidence is trusted.
+- `service_router_ai_structured_output_fixture` is a deterministic
+  structured-output lane. It uses fixture JSON only, declares model calls
+  forbidden, and records live AI as manual/auth-unknown rather than invoking a
+  provider.
+
+The scenario manager preserves lane metadata in `plan` and `run` reports.
+Live-AI validation remains outside this deterministic runner until project AI
+config, local CLI auth, and operator approval are verified.
+
 ## 8. API Sketch
 
 Read configuration:

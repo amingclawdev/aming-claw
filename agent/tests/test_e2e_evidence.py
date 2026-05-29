@@ -98,6 +98,10 @@ def _config() -> dict:
     }
 
 
+def _suite_row(impact: dict, suite_id: str) -> dict:
+    return next(row for row in impact["suites"] if row["suite_id"] == suite_id)
+
+
 def test_e2e_evidence_records_hashes_and_marks_later_snapshot_stale(conn):
     _snapshot(conn, "scope-old", "sha256:feature-old", "sha256:file-old")
     conn.commit()
@@ -121,6 +125,8 @@ def test_e2e_evidence_records_hashes_and_marks_later_snapshot_stale(conn):
     current = e2e_evidence.plan_e2e_impact(conn, PID, "scope-old", _config())
     assert current["summary"]["current"] == 1
     assert current["suites"][0]["status"] == "current"
+    assert current["suites"][0]["can_autorun"] is False
+    assert current["suites"][0]["blocked_reason"] == ""
 
     _snapshot(conn, "scope-new", "sha256:feature-new", "sha256:file-new")
     conn.commit()
@@ -148,3 +154,94 @@ def test_e2e_impact_marks_missing_suite_without_evidence(conn):
     assert impact["summary"]["missing"] == 1
     assert impact["suites"][0]["trigger_matched"] is True
     assert impact["suites"][0]["required"] is True
+
+
+def test_e2e_impact_classifies_docker_live_ai_manual_as_blocked_not_autorun(conn):
+    _snapshot(conn, "scope-docker", "sha256:feature", "sha256:file")
+    conn.commit()
+
+    impact = e2e_evidence.plan_e2e_impact(
+        conn,
+        PID,
+        "scope-docker",
+        {
+            "auto_run": True,
+            "default_timeout_sec": 900,
+            "suites": {
+                "docker.ai.install": {
+                    "label": "Docker AI install audit",
+                    "command": "docker/hn-install-audit/run-install-audit.sh --host both --cleanup",
+                    "auto_run": True,
+                    "live_ai": True,
+                    "requires_human_approval": True,
+                    "mutates_db": True,
+                    "isolation_project": "dashboard-e2e-fixture",
+                    "docker_ai_e2e": {"provider_id": "aming-claw-self-install"},
+                    "trigger": {"tags": ["docker", "cleanup"]},
+                }
+            },
+        },
+    )
+
+    row = _suite_row(impact, "docker.ai.install")
+    assert row["can_autorun"] is False
+    assert row["manual_approval_required"] is True
+    assert row["execution_mode"] == "manual_approval"
+    assert row["blocked_reason"] == "live_ai_requires_manual_approval"
+    assert row["live_ai"] is True
+    assert row["requires_human_approval"] is True
+    assert {
+        "docker",
+        "live_ai",
+        "manual_approval",
+        "mutating_governance",
+        "fixture",
+        "cleanup",
+    }.issubset(set(row["suite_classes"]))
+
+
+def test_e2e_impact_classifies_fixture_static_production_and_source_only(conn):
+    _snapshot(conn, "scope-route", "sha256:feature", "sha256:file")
+    conn.commit()
+
+    impact = e2e_evidence.plan_e2e_impact(
+        conn,
+        PID,
+        "scope-route",
+        {
+            "auto_run": True,
+            "default_timeout_sec": 900,
+            "suites": {
+                "dashboard.semantic.safe": {
+                    "command": "node frontend/dashboard/scripts/e2e-trunk.mjs --reset --skip-dashboard",
+                    "auto_run": False,
+                    "live_ai": False,
+                    "requires_human_approval": False,
+                    "mutates_db": True,
+                    "isolation_project": "dashboard-e2e-fixture",
+                    "trigger": {"tags": ["dashboard", "semantic"]},
+                },
+                "dashboard.static.production": {
+                    "command": "node frontend/dashboard/scripts/e2e-trunk.mjs --static-route --build-dashboard",
+                    "auto_run": True,
+                    "live_ai": False,
+                    "requires_human_approval": False,
+                    "mutates_db": False,
+                    "isolation_project": PID,
+                    "trigger": {"tags": ["dashboard", "static-route", "production"]},
+                },
+            },
+        },
+    )
+
+    fixture_row = _suite_row(impact, "dashboard.semantic.safe")
+    assert fixture_row["manual_approval_required"] is False
+    assert fixture_row["execution_mode"] == "manual"
+    assert {"fixture", "mutating_governance", "source_only"}.issubset(set(fixture_row["suite_classes"]))
+
+    static_row = _suite_row(impact, "dashboard.static.production")
+    assert static_row["manual_approval_required"] is False
+    assert static_row["can_autorun"] is True
+    assert static_row["execution_mode"] == "autorun"
+    assert {"static", "production"}.issubset(set(static_row["suite_classes"]))
+    assert "mutating_governance" not in static_row["suite_classes"]

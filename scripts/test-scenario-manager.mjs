@@ -28,6 +28,8 @@ function parseArgs(argv) {
     dryRun: false,
     allowNetwork: false,
     allowBootstrap: false,
+    allowDocker: false,
+    allowLiveAi: false,
     stateDir: DEFAULT_STATE_DIR,
     cacheDir: "",
     registry: DEFAULT_REGISTRY,
@@ -46,7 +48,7 @@ function parseArgs(argv) {
     }
     const [rawKey, inlineValue] = arg.slice(2).split(/=(.*)/s, 2);
     const key = rawKey.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
-    const boolKeys = new Set(["json", "dryRun", "allowNetwork", "allowBootstrap"]);
+    const boolKeys = new Set(["json", "dryRun", "allowNetwork", "allowBootstrap", "allowDocker", "allowLiveAi"]);
     if (boolKeys.has(key)) {
       options[key] = inlineValue === undefined ? true : inlineValue !== "false";
       continue;
@@ -146,6 +148,10 @@ function normalizeScenario(scenario, index) {
       }
     : undefined;
   const validation = scenario.validation || scenario.graph_expectations || undefined;
+  const safety = plainObject(scenario.safety);
+  const executionPolicy = plainObject(scenario.execution_policy);
+  const coverage = plainObject(scenario.coverage);
+  const routeContext = plainObject(scenario.route_context);
   return {
     title: scenario.title || scenario.id,
     description: scenario.description || "",
@@ -155,10 +161,21 @@ function normalizeScenario(scenario, index) {
     dependencies: Array.isArray(scenario.dependencies) ? scenario.dependencies : [],
     commands: Array.isArray(scenario.commands) ? scenario.commands : [],
     artifacts: Array.isArray(scenario.artifacts) ? scenario.artifacts : [],
+    fixtures: Array.isArray(scenario.fixtures) ? scenario.fixtures : [],
+    evidence_requirements: Array.isArray(scenario.evidence_requirements) ? scenario.evidence_requirements : [],
     ...scenario,
     repository,
     validation,
+    safety,
+    execution_policy: executionPolicy,
+    coverage,
+    route_context: routeContext,
   };
+}
+
+function plainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value;
 }
 
 function selectScenarios(registry, scenarioId) {
@@ -186,15 +203,23 @@ function resolveCwd(cwd, externalWorkspace = "") {
   return isAbsolute(cwd) ? cwd : resolve(REPO_ROOT, cwd);
 }
 
-function commandAvailable(binary) {
-  const resolved = expandToken(String(binary || ""));
-  if (!resolved) return false;
-  if (resolved.includes("/") || resolved.includes("\\")) return existsSync(resolved);
-  const result = spawnSync(resolved, ["--version"], {
+function commandParts(value) {
+  if (Array.isArray(value)) return expandCommand(value).filter(Boolean);
+  const resolved = expandToken(String(value || ""));
+  return resolved ? [resolved, "--version"] : [];
+}
+
+function commandAvailable(value) {
+  const command = commandParts(value);
+  if (!command.length) return false;
+  const [binary, ...args] = command;
+  if (!Array.isArray(value) && (binary.includes("/") || binary.includes("\\"))) return existsSync(binary);
+  const result = spawnSync(binary, args, {
     encoding: "utf8",
     timeout: 3000,
     stdio: "pipe",
   });
+  if (Array.isArray(value)) return !result.error && result.status === 0;
   return result.error?.code !== "ENOENT";
 }
 
@@ -266,17 +291,23 @@ function gitOutput(cwd, args) {
   return result.stdout.trim();
 }
 
-function commandVersion(binary) {
-  const resolved = expandToken(String(binary || ""));
-  if (!resolved) return "";
-  if (resolved === process.execPath) return process.version;
-  const result = spawnSync(resolved, ["--version"], {
+function commandVersion(value) {
+  const command = commandParts(value);
+  if (!command.length) return "";
+  const [binary, ...args] = command;
+  if (!Array.isArray(value) && binary === process.execPath) return process.version;
+  const result = spawnSync(binary, args, {
     encoding: "utf8",
     timeout: 3000,
     stdio: "pipe",
   });
   if (result.error || result.status !== 0) return "";
   return sanitizeText(`${result.stdout || result.stderr}`.trim().split(/\r?\n/, 1)[0] || "");
+}
+
+function dependencyCommandSummary(value) {
+  if (Array.isArray(value)) return sanitizeCommand(expandCommand(value));
+  return sanitizeArg(expandToken(value || ""));
 }
 
 function buildDependencyDecisions(scenario, options, { planning = false } = {}) {
@@ -289,12 +320,15 @@ function buildDependencyDecisions(scenario, options, { planning = false } = {}) 
       status: "not_checked",
       remediation: dependency.remediation || "",
     };
+    if (dependency.command) {
+      decision.command = dependencyCommandSummary(dependency.command);
+    }
     if (planning || options.dryRun) {
       decision.status = options.dryRun ? "skipped_by_dry_run" : "planned";
     } else if (dependency.kind === "command") {
       const available = commandAvailable(dependency.command);
       decision.status = available ? "available" : "blocked";
-      decision.command = sanitizeArg(expandToken(dependency.command || ""));
+      decision.command = dependencyCommandSummary(dependency.command);
       if (!available && !decision.remediation) {
         decision.remediation = `Install ${dependency.command} or adjust the scenario registry.`;
       }
@@ -304,6 +338,30 @@ function buildDependencyDecisions(scenario, options, { planning = false } = {}) 
     } else if (dependency.id === "governance_bootstrap") {
       decision.status = options.allowBootstrap ? "allowed" : "blocked";
       if (!options.allowBootstrap) decision.reason = "bootstrap mutates governance state and requires --allow-bootstrap";
+    } else if (dependency.id === "docker_fixture") {
+      if (!options.allowDocker) {
+        decision.status = "blocked";
+        decision.reason = "docker fixture checks are gated and require --allow-docker";
+      } else {
+        const command = dependency.command || ["docker", "info", "--format", "{{json .ServerVersion}}"];
+        const available = commandAvailable(command);
+        decision.status = available ? "allowed" : "blocked";
+        decision.command = dependencyCommandSummary(command);
+        if (!available) {
+          decision.reason = "docker fixture was approved but Docker is unavailable";
+          if (!decision.remediation) {
+            decision.remediation = "Start Docker and re-run the scenario with --allow-docker.";
+          }
+        }
+      }
+    } else if (dependency.id === "live_ai_runtime") {
+      decision.status = "blocked";
+      decision.reason = options.allowLiveAi
+        ? "live AI approval was supplied, but auth is still unknown; use a dedicated manual live-AI runner after AI config/auth is verified"
+        : "live AI is gated/manual/auth-unknown, requires --allow-live-ai for any manual live-AI lane, and is never invoked by the scenario manager";
+    } else if (dependency.id === "ai_structured_output_fixture") {
+      decision.status = "available";
+      decision.reason = "deterministic structured-output fixture; no model call";
     } else {
       decision.status = "planned";
     }
@@ -319,6 +377,12 @@ function planScenario(scenario, options) {
     target_project: scenario.target_project || "",
     target_ref: scenario.target_ref || "",
     runner: scenario.runner,
+    execution_policy: scenario.execution_policy || {},
+    safety: scenario.safety || {},
+    coverage: scenario.coverage || {},
+    route_context: scenario.route_context || {},
+    fixtures: scenario.fixtures || [],
+    evidence_requirements: scenario.evidence_requirements || [],
     dependency_decisions: buildDependencyDecisions(scenario, options, { planning: true }),
     artifacts: scenario.artifacts || [],
   };
@@ -377,11 +441,20 @@ function baseReport(scenario, options) {
     http_summaries: [],
     checks: [],
     blocked: null,
+    runner: scenario.runner,
+    execution_policy: scenario.execution_policy || {},
+    safety: scenario.safety || {},
+    coverage: scenario.coverage || {},
+    route_context: scenario.route_context || {},
+    fixtures: scenario.fixtures || [],
+    evidence_requirements: scenario.evidence_requirements || [],
     report_path: "",
     options: {
       dry_run: Boolean(options.dryRun),
       allow_network: Boolean(options.allowNetwork),
       allow_bootstrap: Boolean(options.allowBootstrap),
+      allow_docker: Boolean(options.allowDocker),
+      allow_live_ai: Boolean(options.allowLiveAi),
       governance_url: options.governanceUrl,
       backend_url: options.governanceUrl,
       state_dir: options.stateDir,

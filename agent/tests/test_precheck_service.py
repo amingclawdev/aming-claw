@@ -594,6 +594,72 @@ def test_scn_mf_wf_006_close_gate_requires_close_ready_merge_commit_and_evidence
     assert "missing_close_ready_timeline" in missing_result["evidence"]["errors"]
 
 
+def test_close_gate_recognizes_service_route_contract_evidence_from_timeline(
+    tmp_path: Path,
+) -> None:
+    route_requirement = "ai_output_validated"
+    contract = load_workflow_contract()
+    contract = {
+        **contract,
+        "evidence_requirements": [
+            *contract.get("evidence_requirements", []),
+            {
+                "id": route_requirement,
+                "required": True,
+                "phase": "verification",
+                "kind": "service_route",
+            },
+        ],
+    }
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(contract, merge_commit=source_commit, precheck_token=token)
+    subject["contract_evidence"] = [
+        item for item in subject["contract_evidence"] if item.get("id") != route_requirement
+    ]
+
+    blocked = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+    assert blocked["decision"] == "block"
+    assert blocked["evidence"]["missing_required_evidence"] == [route_requirement]
+
+    subject["timeline_evidence"].append(
+        {
+            "event_kind": "service_route",
+            "phase": "service_router",
+            "status": "allowed",
+            "payload": {
+                "route_evidence": {
+                    "schema_version": "service_route_evidence.v1",
+                    "contract_evidence": [
+                        {
+                            "requirement_id": route_requirement,
+                            "status": "passed",
+                            "kind": "service_route",
+                            "service_id": "test_governance.preview",
+                        }
+                    ],
+                }
+            },
+        }
+    )
+    allowed = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+    assert allowed["decision"] == "allow"
+    assert allowed["evidence"]["missing_required_evidence"] == []
+
+
 def _result_contract_fields_present(result: dict[str, object]) -> bool:
     required = {
         "precheck_run_id",
