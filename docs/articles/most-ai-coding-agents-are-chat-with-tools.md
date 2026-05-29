@@ -103,8 +103,19 @@ The surfaces are not a diagram. Each is backed by a runnable case.
 Longer implementation note:
 [How Aming Claw implements right context for AI-agent development](https://github.com/amingclawdev/aming-claw/blob/main/docs/articles/how-aming-claw-implements-right-context.md)
 
+Try the demo:
+[Vibe Queue Demo](https://github.com/amingclawdev/aming-claw/blob/main/docs/vibe-queue-demo/README.md)
+shows the ordinary-user version: keep describing requirements while the
+observer records, confirms, queues, executes, and reports progress through
+backlog and timeline state.
+
+Technical challenge:
+[HN Multi-Agent Challenge Demo](https://github.com/amingclawdev/aming-claw/blob/main/docs/hn-demo/README.md)
+shows the harder version: one observer coordinates multiple commit-bound
+workers, handles failed/interrupted worker replay, reconciles the target graph,
+and writes audit evidence.
+
 ## The challenge
 
 > Show me relationship, intent, process, contract, and constraint.
 > If your agent has none of them, why call it a development system?
-
