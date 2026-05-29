@@ -61,6 +61,12 @@ function normalizeViewName(value: string | null | undefined): ViewName {
   return DASHBOARD_VIEWS.includes(value as ViewName) ? (value as ViewName) : "projects";
 }
 
+function shouldOpenSimpleMode(params: URLSearchParams): boolean {
+  const modeParam = (params.get(DASHBOARD_MODE_PARAM) || "").trim().toLowerCase();
+  const simpleParam = (params.get(DASHBOARD_SIMPLE_PARAM) || "").trim();
+  return modeParam === "simple" || simpleParam === "1";
+}
+
 function readStoredProjectId(): string {
   if (typeof window === "undefined") return DEFAULT_PROJECT_ID;
   try {
@@ -72,16 +78,24 @@ function readStoredProjectId(): string {
 
 function readDashboardLocation(): { projectId: string; view: ViewName; hasProjectParam: boolean; workspacePath: string } {
   if (typeof window === "undefined") {
-    return { projectId: DEFAULT_PROJECT_ID, view: "inbox", hasProjectParam: false, workspacePath: "" };
+    return { projectId: DEFAULT_PROJECT_ID, view: "overview", hasProjectParam: false, workspacePath: "" };
   }
   const params = new URLSearchParams(window.location.search);
   const projectIdParam = params.get(DASHBOARD_PROJECT_ID_PARAM);
   const legacyProjectParam = params.get(DASHBOARD_LEGACY_PROJECT_PARAM);
   const projectParam = projectIdParam?.trim() ? projectIdParam : legacyProjectParam;
   const viewParam = params.get(DASHBOARD_VIEW_PARAM);
+  let view: ViewName;
+  if (viewParam) {
+    view = normalizeViewName(viewParam);
+  } else if (shouldOpenSimpleMode(params)) {
+    view = "inbox";
+  } else {
+    view = "overview";
+  }
   return {
     projectId: normalizeProjectId(projectParam || readStoredProjectId()),
-    view: viewParam ? normalizeViewName(viewParam) : "inbox",
+    view,
     hasProjectParam: Boolean(projectParam && projectParam.trim()),
     workspacePath: (params.get(DASHBOARD_WORKSPACE_PARAM) || "").trim(),
   };

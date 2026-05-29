@@ -252,7 +252,7 @@ function verifySimpleModeRequestFirstDesktopContract() {
 }
 
 function verifyOrdinaryUserEntryContract() {
-  phase("simple-first ordinary user entry desktop contract");
+  phase("temporary engineer-homepage ordinary user entry desktop contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
   const consoleSource = readFileSync(
     path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"),
@@ -270,17 +270,31 @@ function verifyOrdinaryUserEntryContract() {
   assert(appSource.includes('DASHBOARD_MODE_PARAM = "mode"'), "App should define a simple mode query parameter");
   assert(appSource.includes('DASHBOARD_SIMPLE_PARAM = "simple"'), "App should define a simple boolean query parameter");
   assert(
-    /view:\s*["']inbox["']/.test(readLocationBlock),
-    "Server-side/default dashboard state should prefer the Simple Mode inbox",
+    /return\s*\{\s*projectId:\s*DEFAULT_PROJECT_ID,\s*view:\s*["']overview["']/.test(readLocationBlock),
+    "Server-side/default dashboard state should prefer the temporary Engineer overview",
   );
   assert(
-    /view:\s*viewParam\s*\?\s*normalizeViewName\(viewParam\)\s*:\s*["']inbox["']/.test(readLocationBlock),
-    "Dashboard URLs without an explicit view should land in Simple Mode",
+    readLocationBlock.includes("if (viewParam)") && readLocationBlock.includes("view = normalizeViewName(viewParam)"),
+    "Explicit dashboard view params should be preserved",
   );
-  assert(!readLocationBlock.includes("|| true"), "Simple-first routing must not rely on an always-true condition");
+  assert(
+    readLocationBlock.includes("shouldOpenSimpleMode(params)") && readLocationBlock.includes('view = "inbox"'),
+    "Legacy Simple Mode query params should still land in the inbox",
+  );
+  assert(
+    readLocationBlock.includes('view = "overview"'),
+    "Dashboard URLs without an explicit view should land in the temporary Engineer overview",
+  );
+  assert(
+    appSource.includes("function shouldOpenSimpleMode") &&
+      appSource.includes('modeParam === "simple"') &&
+      appSource.includes('simpleParam === "1"'),
+    "Simple Mode should remain explicitly available via mode=simple or simple=1",
+  );
+  assert(!readLocationBlock.includes("|| true"), "Temporary homepage routing must not rely on an always-true condition");
   assert(
     !/projectParam\s*\?\s*["']inbox["']\s*:\s*["']projects["']/.test(readLocationBlock),
-    "Project-scoped URLs must not be the only Simple Mode entry",
+    "Project-scoped URLs must not be a hidden Simple Mode entry",
   );
   assert(
     appSource.includes("url.searchParams.delete(DASHBOARD_MODE_PARAM)") &&
@@ -335,7 +349,8 @@ function verifyOrdinaryUserEntryContract() {
   const forbidden = ["graph", "backlog", "worker", "execution queue", "audit", "commit", "snapshot"];
   const found = forbidden.filter((term) => entryCopy.toLowerCase().includes(term));
   assert(found.length === 0, `Ordinary-user entry copy uses operator term(s): ${found.join(", ")}`);
-  ok("/dashboard and project-scoped dashboard URLs default to Simple Mode");
+  ok("/dashboard and project-scoped dashboard URLs default to the temporary Engineer overview");
+  ok("explicit Simple Mode query params still enter the inbox");
   ok("Simple Mode exposes a secondary engineer-panel escape");
   ok("Projects still exposes an ordinary-user request entry when users enter the engineer panel");
   ok("ordinary-user entry copy avoids operator terms");
@@ -816,6 +831,7 @@ async function main() {
         verifySimpleModeRequestFirstDesktopContract();
       } else if (
         ONLY === "ordinary-user-entry-desktop" ||
+        ONLY === "engineer-homepage-entry-desktop" ||
         ONLY === "simple-first-entry-desktop" ||
         ONLY === "simple-first-entry-engineer-escape-desktop"
       ) {
