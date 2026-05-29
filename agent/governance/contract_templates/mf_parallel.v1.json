@@ -257,6 +257,130 @@
       "description": "Backlog close is deferred until merge, verification, reconcile/update, and close-ready evidence are complete."
     }
   ],
+  "service_routes": [
+    {
+      "route_id": "service.test_governance.preview",
+      "service_id": "test_governance.preview",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.review.recommendations",
+      "service_id": "review.recommendations",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.gate.close",
+      "service_id": "gate.close",
+      "mode": "gate",
+      "side_effect_class": "gate",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.cleanup.preview",
+      "service_id": "cleanup.preview",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.cleanup.apply",
+      "service_id": "cleanup.apply",
+      "mode": "apply",
+      "side_effect_class": "write",
+      "required_permissions": [
+        "cleanup.apply"
+      ],
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    }
+  ],
+  "event_routes": [
+    {
+      "route_id": "event.task_completed.test_preview",
+      "event_kind": "task.completed",
+      "stage": "review_ready",
+      "service_route_id": "service.test_governance.preview",
+      "enabled": true
+    },
+    {
+      "route_id": "event.task_completed.review_recommendations",
+      "event_kind": "task.completed",
+      "stage": "review_ready",
+      "service_route_id": "service.review.recommendations",
+      "enabled": true
+    },
+    {
+      "route_id": "event.backlog_close.gate",
+      "event_kind": "backlog.close.requested",
+      "service_route_id": "service.gate.close",
+      "enabled": true
+    },
+    {
+      "route_id": "event.cleanup.preview",
+      "event_kind": "cleanup.requested",
+      "service_route_id": "service.cleanup.preview",
+      "enabled": true
+    },
+    {
+      "route_id": "event.cleanup.apply",
+      "event_kind": "cleanup.requested",
+      "service_route_id": "service.cleanup.apply",
+      "enabled": true
+    }
+  ],
   "test_scenario_policy": {
     "mode": "observer_configured",
     "decision": "",

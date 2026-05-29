@@ -69,6 +69,202 @@ def test_malformed_template_raises_explicit_error(tmp_path):
         list_contract_templates(template_dir=tmp_path)
 
 
+def _write_template(tmp_path, payload):
+    path = tmp_path / "routes.v1.json"
+    base = {
+        "schema_version": "test_contract_template.v1",
+        "template_id": "routes.v1",
+        "task_types": ["task"],
+        "stages": ["review_ready"],
+    }
+    path.write_text(json.dumps({**base, **payload}), encoding="utf-8")
+    return path
+
+
+def _valid_service_route(**extra):
+    return {
+        "route_id": "service.preview",
+        "service_id": "test_governance.preview",
+        "mode": "preview",
+        "side_effect_class": "read",
+        "idempotency_key_policy": {"fields": ["event_id", "event_kind", "route_id"]},
+        **extra,
+    }
+
+
+def test_template_validation_accepts_event_and_service_routes(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [_valid_service_route()],
+            "event_routes": [
+                {
+                    "route_id": "event.task_completed.preview",
+                    "event_kind": "task.completed",
+                    "stage": "review_ready",
+                    "service_route_id": "service.preview",
+                    "enabled": True,
+                }
+            ],
+        },
+    )
+
+    templates = list_contract_templates(template_dir=tmp_path)
+
+    assert templates[0]["event_routes"][0]["route_id"] == "event.task_completed.preview"
+    assert templates[0]["service_routes"][0]["service_id"] == "test_governance.preview"
+
+
+def test_template_validation_accepts_service_routes_as_object(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": {
+                "service.preview": {
+                    "service_id": "test_governance.preview",
+                    "mode": "preview",
+                    "side_effect_class": "read",
+                    "idempotency_key_policy": {"fields": ["event_id"]},
+                }
+            },
+            "event_routes": [
+                {
+                    "route_id": "event.task_completed.preview",
+                    "event_kind": "task.completed",
+                    "service_route_id": "service.preview",
+                }
+            ],
+        },
+    )
+
+    template = list_contract_templates(template_dir=tmp_path)[0]
+
+    assert template["service_routes"][0]["route_id"] == "service.preview"
+
+
+def test_template_validation_accepts_legacy_side_effect_alias(tmp_path):
+    legacy_route = _valid_service_route()
+    legacy_route["side_effect"] = legacy_route.pop("side_effect_class")
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [legacy_route],
+            "event_routes": [
+                {
+                    "route_id": "event.task_completed.preview",
+                    "event_kind": "task.completed",
+                    "service_route_id": "service.preview",
+                }
+            ],
+        },
+    )
+
+    template = list_contract_templates(template_dir=tmp_path)[0]
+
+    assert template["service_routes"][0]["side_effect"] == "read"
+
+
+def test_template_validation_rejects_malformed_route_shape(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [_valid_service_route()],
+            "event_routes": "not a list",
+        },
+    )
+
+    with pytest.raises(MalformedContractTemplateError, match="event_routes must be a list or object"):
+        list_contract_templates(template_dir=tmp_path)
+
+
+def test_template_validation_rejects_invalid_event_route_stages(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [_valid_service_route()],
+            "event_routes": [
+                {
+                    "route_id": "event.task_completed.preview",
+                    "event_kind": "task.completed",
+                    "stages": [],
+                    "service_route_id": "service.preview",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(MalformedContractTemplateError, match="stages must be a non-empty"):
+        list_contract_templates(template_dir=tmp_path)
+
+
+def test_template_validation_rejects_unknown_service(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [
+                _valid_service_route(service_id="missing.service"),
+            ],
+            "event_routes": [
+                {
+                    "route_id": "event.task_completed.preview",
+                    "event_kind": "task.completed",
+                    "service_route_id": "service.preview",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(MalformedContractTemplateError, match="unknown service_id"):
+        list_contract_templates(template_dir=tmp_path)
+
+
+def test_template_validation_rejects_ai_route_fields(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [
+                _valid_service_route(ai_provider="openai"),
+            ],
+            "event_routes": [
+                {
+                    "route_id": "event.task_completed.preview",
+                    "event_kind": "task.completed",
+                    "service_route_id": "service.preview",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(MalformedContractTemplateError, match="forbidden AI field"):
+        list_contract_templates(template_dir=tmp_path)
+
+
+def test_template_validation_rejects_apply_without_permission(tmp_path):
+    _write_template(
+        tmp_path,
+        {
+            "service_routes": [
+                _valid_service_route(
+                    route_id="service.cleanup.apply",
+                    service_id="cleanup.apply",
+                    mode="apply",
+                    side_effect_class="write",
+                ),
+            ],
+            "event_routes": [
+                {
+                    "route_id": "event.cleanup.apply",
+                    "event_kind": "cleanup.requested",
+                    "service_route_id": "service.cleanup.apply",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(MalformedContractTemplateError, match="apply/write requires"):
+        list_contract_templates(template_dir=tmp_path)
+
+
 def test_mcp_contract_template_tools_resolve_in_process():
     assert {
         "contract_template_list",

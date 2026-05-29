@@ -7,8 +7,16 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent.governance.service_registry import (
+    ALLOWED_SERVICE_MODES,
+    ALLOWED_SIDE_EFFECTS,
+    WRITE_SIDE_EFFECTS,
+    default_service_registry,
+)
+
 
 DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent / "contract_templates"
+FORBIDDEN_ROUTE_KEYS = {"ai_provider", "model", "prompt", "llm", "ai_call"}
 
 
 class ContractTemplateError(ValueError):
@@ -76,7 +84,269 @@ def _validate_template(payload: Mapping[str, Any], *, file_name: str) -> dict[st
     normalized["task_types"] = task_types
     normalized["stages"] = stages
     normalized.setdefault("source", {"type": "source_controlled", "path": file_name})
+    event_routes, service_routes = _validate_routes(payload, file_name=file_name)
+    if "event_routes" in payload:
+        normalized["event_routes"] = event_routes
+    if "service_routes" in payload:
+        normalized["service_routes"] = service_routes
     return normalized
+
+
+def _validate_routes(
+    payload: Mapping[str, Any],
+    *,
+    file_name: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    event_routes = _route_list(
+        payload.get("event_routes"),
+        file_name=file_name,
+        field="event_routes",
+        allow_mapping=True,
+    )
+    service_routes = _route_list(
+        payload.get("service_routes"),
+        file_name=file_name,
+        field="service_routes",
+        allow_mapping=True,
+    )
+    if not event_routes and not service_routes:
+        return event_routes, service_routes
+
+    _reject_ai_route_fields(event_routes, file_name=file_name, field="event_routes")
+    _reject_ai_route_fields(service_routes, file_name=file_name, field="service_routes")
+
+    service_route_ids = _unique_route_ids(
+        service_routes,
+        file_name=file_name,
+        field="service_routes",
+        required=True,
+    )
+    _unique_route_ids(event_routes, file_name=file_name, field="event_routes", required=True)
+
+    known_services = default_service_registry().ids()
+    registry = default_service_registry()
+    services_declared_by_route_id: dict[str, str] = {}
+    for route in service_routes:
+        route_id = str(route["route_id"])
+        service_id = _required_str(route, "service_id", file_name=file_name, field="service_routes")
+        services_declared_by_route_id[route_id] = service_id
+        if service_id not in known_services:
+            raise MalformedContractTemplateError(
+                f"{file_name}: service_routes {route_id} unknown service_id {service_id!r}"
+            )
+        _validate_service_route(route, file_name=file_name, route_id=route_id)
+
+    for route in event_routes:
+        route_id = str(route["route_id"])
+        event_kind = _required_str(route, "event_kind", file_name=file_name, field="event_routes")
+        if not event_kind:
+            raise MalformedContractTemplateError(f"{file_name}: event_routes {route_id} missing event_kind")
+        _validate_event_route_stage_fields(route, file_name=file_name, route_id=route_id)
+        service_route_id = route.get("service_route_id")
+        service_id = route.get("service_id")
+        if service_route_id is not None and not isinstance(service_route_id, str):
+            raise MalformedContractTemplateError(
+                f"{file_name}: event_routes {route_id} service_route_id must be a string"
+            )
+        if isinstance(service_route_id, str) and service_route_id:
+            if service_route_id not in service_route_ids:
+                raise MalformedContractTemplateError(
+                    f"{file_name}: event_routes {route_id} unknown service_route_id {service_route_id!r}"
+                )
+            service_id = services_declared_by_route_id[service_route_id]
+            _validate_supported_event(file_name, route_id, event_kind, service_id, registry)
+            continue
+        if not isinstance(service_id, str) or not service_id:
+            raise MalformedContractTemplateError(
+                f"{file_name}: event_routes {route_id} must declare service_id or service_route_id"
+            )
+        if service_id not in known_services and service_id not in services_declared_by_route_id.values():
+            raise MalformedContractTemplateError(
+                f"{file_name}: event_routes {route_id} unknown service_id {service_id!r}"
+            )
+        _validate_supported_event(file_name, route_id, event_kind, service_id, registry)
+
+    return event_routes, service_routes
+
+
+def _validate_event_route_stage_fields(
+    route: Mapping[str, Any],
+    *,
+    file_name: str,
+    route_id: str,
+) -> None:
+    stage = route.get("stage")
+    if stage is not None and not isinstance(stage, str):
+        raise MalformedContractTemplateError(
+            f"{file_name}: event_routes {route_id} stage must be a string"
+        )
+    stages = route.get("stages")
+    if stages is not None:
+        if not isinstance(stages, list) or not stages or not all(
+            isinstance(item, str) and item for item in stages
+        ):
+            raise MalformedContractTemplateError(
+                f"{file_name}: event_routes {route_id} stages must be a non-empty list of strings"
+            )
+
+
+def _validate_supported_event(
+    file_name: str,
+    route_id: str,
+    event_kind: str,
+    service_id: str,
+    registry: Any,
+) -> None:
+    descriptor = registry.get(service_id)
+    if descriptor and descriptor.supported_events and event_kind not in descriptor.supported_events:
+        raise MalformedContractTemplateError(
+            f"{file_name}: event_routes {route_id} service {service_id!r} "
+            f"does not support event_kind {event_kind!r}"
+        )
+
+
+def _validate_service_route(route: Mapping[str, Any], *, file_name: str, route_id: str) -> None:
+    mode = _required_str(route, "mode", file_name=file_name, field=f"service_routes {route_id}")
+    side_effect_class = _route_side_effect_class(
+        route,
+        file_name=file_name,
+        route_id=route_id,
+    )
+    if mode not in ALLOWED_SERVICE_MODES:
+        raise MalformedContractTemplateError(
+            f"{file_name}: service_routes {route_id} unsupported mode {mode!r}"
+        )
+    if side_effect_class not in ALLOWED_SIDE_EFFECTS:
+        raise MalformedContractTemplateError(
+            f"{file_name}: service_routes {route_id} unsupported side_effect_class {side_effect_class!r}"
+        )
+    _validate_idempotency_policy(
+        route.get("idempotency_key_policy"),
+        file_name=file_name,
+        field=f"service_routes {route_id}.idempotency_key_policy",
+    )
+    if mode == "apply" or side_effect_class in WRITE_SIDE_EFFECTS:
+        permissions = route.get("required_permissions")
+        if not isinstance(permissions, list) or not all(
+            isinstance(permission, str) and permission for permission in permissions
+        ):
+            raise MalformedContractTemplateError(
+                f"{file_name}: service_routes {route_id} apply/write requires "
+                "required_permissions for side_effect_class"
+            )
+
+
+def _route_side_effect_class(route: Mapping[str, Any], *, file_name: str, route_id: str) -> str:
+    value = route.get("side_effect_class")
+    if value is None:
+        value = route.get("side_effect")
+    if not isinstance(value, str) or not value:
+        raise MalformedContractTemplateError(
+            f"{file_name}: service_routes {route_id} missing side_effect_class"
+        )
+    return value
+
+
+def _route_list(
+    value: Any,
+    *,
+    file_name: str,
+    field: str,
+    allow_mapping: bool = False,
+) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        routes: list[dict[str, Any]] = []
+        for index, route in enumerate(value):
+            if not isinstance(route, Mapping):
+                raise MalformedContractTemplateError(
+                    f"{file_name}: {field}[{index}] must be an object"
+                )
+            routes.append(dict(route))
+        return routes
+    if allow_mapping and isinstance(value, Mapping):
+        routes = []
+        for route_id, route in value.items():
+            if not isinstance(route_id, str) or not route_id:
+                raise MalformedContractTemplateError(f"{file_name}: {field} keys must be strings")
+            if not isinstance(route, Mapping):
+                raise MalformedContractTemplateError(f"{file_name}: {field}.{route_id} must be an object")
+            normalized = dict(route)
+            normalized.setdefault("route_id", route_id)
+            routes.append(normalized)
+        return routes
+    expected = "a list or object" if allow_mapping else "a list"
+    raise MalformedContractTemplateError(f"{file_name}: {field} must be {expected}")
+
+
+def _unique_route_ids(
+    routes: list[Mapping[str, Any]],
+    *,
+    file_name: str,
+    field: str,
+    required: bool,
+) -> set[str]:
+    seen: set[str] = set()
+    for index, route in enumerate(routes):
+        route_id = route.get("route_id")
+        if not isinstance(route_id, str) or not route_id:
+            if required:
+                raise MalformedContractTemplateError(
+                    f"{file_name}: {field}[{index}] missing route_id"
+                )
+            continue
+        if route_id in seen:
+            raise MalformedContractTemplateError(
+                f"{file_name}: {field} duplicate route_id {route_id!r}"
+            )
+        seen.add(route_id)
+    return seen
+
+
+def _required_str(route: Mapping[str, Any], key: str, *, file_name: str, field: str) -> str:
+    value = route.get(key)
+    if not isinstance(value, str) or not value:
+        raise MalformedContractTemplateError(f"{file_name}: {field} missing {key}")
+    return value
+
+
+def _validate_idempotency_policy(value: Any, *, file_name: str, field: str) -> None:
+    if isinstance(value, Mapping):
+        fields = value.get("fields")
+        if not isinstance(fields, list) or not all(isinstance(item, str) and item for item in fields):
+            raise MalformedContractTemplateError(f"{file_name}: {field}.fields must be a list of strings")
+        return
+    if isinstance(value, list) and all(isinstance(item, str) and item for item in value):
+        return
+    raise MalformedContractTemplateError(f"{file_name}: {field} must declare fields")
+
+
+def _reject_ai_route_fields(routes: list[Mapping[str, Any]], *, file_name: str, field: str) -> None:
+    for route in routes:
+        bad_key = _first_forbidden_key(route)
+        if bad_key:
+            route_id = str(route.get("route_id") or "<missing>")
+            raise MalformedContractTemplateError(
+                f"{file_name}: {field} {route_id} contains forbidden AI field {bad_key!r}"
+            )
+
+
+def _first_forbidden_key(value: Any) -> str:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_text = str(key).lower()
+            if key_text in FORBIDDEN_ROUTE_KEYS:
+                return key_text
+            found = _first_forbidden_key(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _first_forbidden_key(child)
+            if found:
+                return found
+    return ""
 
 
 def load_contract_templates(template_dir: str | Path = DEFAULT_TEMPLATE_DIR) -> list[dict[str, Any]]:
