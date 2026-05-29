@@ -283,6 +283,42 @@ The scenario manager preserves lane metadata in `plan` and `run` reports.
 Live-AI validation remains outside this deterministic runner until project AI
 config, local CLI auth, and operator approval are verified.
 
+### 7.2 Live-AI Environment Probe Lane
+
+Live-AI environment validation is a separate manual lane, not an extension of
+the deterministic structured-output fixture. The fixture lane proves local
+schema/router behavior with model calls forbidden. The live-AI environment lane
+proves whether the operator-approved local runtime matches project AI routing.
+
+The impact planner classifies an explicit live-AI environment suite as
+`manual`, `live_ai`, and `environment-check`. It must not become silent
+autorun, even when a suite entry sets `auto_run: true` or the project E2E
+policy enables autorun. Actual invocation requires an explicit operator command
+with `--allow-live-ai`.
+
+Readiness evidence and invocation evidence are distinct:
+
+- Readiness evidence may inspect project AI config, configured provider/model
+  for the requested role, CLI path/version, catalog membership, and auth state.
+  Version detection is only `auth unknown`; it does not prove a usable account.
+- Invocation evidence exists only when the approved command includes
+  `--allow-live-ai` and the probe records an actual provider call result.
+  Missing invocation evidence must not be treated as a passing live-AI check.
+
+Live-AI evidence must compare the expected route from project AI config with
+the observed local state:
+
+- expected role, provider, and model, for example `tester` -> `openai` /
+  `gpt-5.4`;
+- detected CLI path and version for the provider;
+- model catalog membership for the expected model;
+- auth or invocation result, reported separately from CLI detection.
+
+Evidence artifacts must be sanitized before they enter the ledger, timeline, or
+dashboard. Store provider, model, role, command shape, status, duration, and
+redacted diagnostics; do not store raw prompts, completions, API keys, bearer
+tokens, session tokens, or unredacted stderr/stdout from provider CLIs.
+
 ## 8. API Sketch
 
 Read configuration:

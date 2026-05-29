@@ -352,6 +352,164 @@
       ]
     },
     {
+      "id": "service_router_live_ai_environment_tester",
+      "title": "Service router live-AI environment tester",
+      "description": "Explicit operator-approved live-AI environment probe for the service router tester route. It verifies local provider/model/auth behavior only when --allow-live-ai is supplied.",
+      "target_project": "aming-claw",
+      "target_ref": "HEAD",
+      "runner": "commands",
+      "dependencies": [
+        {
+          "id": "node",
+          "kind": "command",
+          "command": "{node}",
+          "required": true,
+          "remediation": "Install Node.js so the live-AI environment probe command can run."
+        },
+        {
+          "id": "live_ai_environment_probe",
+          "kind": "capability",
+          "mode": "environment_probe",
+          "command": [
+            "{node}",
+            "scripts/live-ai-environment-probe.mjs",
+            "--role",
+            "tester",
+            "--allow-live-ai"
+          ],
+          "required": true,
+          "remediation": "Re-run with --allow-live-ai only after approving local provider/model/auth probing for the tester route."
+        }
+      ],
+      "execution_policy": {
+        "lane": "live_ai_environment_probe",
+        "autorun": false,
+        "requires_flags": [
+          "--allow-live-ai"
+        ],
+        "live_ai": "environment_probe",
+        "model_calls": "explicit_probe_only",
+        "route": "tester",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4",
+        "default_without_flag": "blocked"
+      },
+      "safety": {
+        "fixture_only": false,
+        "live_ai": true,
+        "environment_probe": true,
+        "calls_models": true,
+        "requires_human_approval": true,
+        "auth_status": "checked_by_probe",
+        "redacts_prompt_output": true,
+        "silent_quota_use": false
+      },
+      "coverage": {
+        "areas": [
+          "service_router",
+          "live_ai_environment",
+          "project_ai_config",
+          "provider_model_auth_probe"
+        ],
+        "test_files": [
+          "agent/tests/test_service_router.py",
+          "agent/tests/test_test_scenario_manager.py"
+        ]
+      },
+      "route_context": {
+        "service_id": "service_router.live_ai_environment_tester",
+        "event_kind": "ai.environment_probe.requested",
+        "mode": "environment_probe",
+        "route": "tester",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4",
+        "side_effect_class": "live_ai_probe"
+      },
+      "fixtures": [
+        {
+          "id": "service-router-live-ai-environment-probe",
+          "kind": "environment_probe",
+          "deterministic": false,
+          "calls_models": true,
+          "script": "scripts/live-ai-environment-probe.mjs",
+          "description": "Operator-approved probe command for comparing tester route AI config with local CLI/catalog/auth/invocation evidence."
+        }
+      ],
+      "evidence_requirements": [
+        {
+          "id": "live_ai_probe_gate",
+          "kind": "dependency_decision",
+          "dependency_id": "live_ai_environment_probe",
+          "required_status": "allowed"
+        },
+        {
+          "id": "expected_provider_model_match",
+          "kind": "probe_output",
+          "fields": [
+            "expected_provider",
+            "expected_model",
+            "actual_provider",
+            "actual_model",
+            "catalog_membership"
+          ]
+        },
+        {
+          "id": "cli_detected_version_path",
+          "kind": "probe_output",
+          "fields": [
+            "cli_path",
+            "cli_version",
+            "tool_health"
+          ]
+        },
+        {
+          "id": "auth_or_invocation_evidence",
+          "kind": "probe_output",
+          "fields": [
+            "auth_status",
+            "invocation_status"
+          ]
+        },
+        {
+          "id": "sanitized_prompt_output",
+          "kind": "redaction",
+          "required": true
+        },
+        {
+          "id": "no_silent_quota_use",
+          "kind": "safety_metadata",
+          "field": "safety.silent_quota_use",
+          "expected": false
+        }
+      ],
+      "commands": [
+        {
+          "id": "service_router_live_ai_environment_probe",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "scripts/live-ai-environment-probe.mjs",
+            "--role",
+            "tester",
+            "--allow-live-ai"
+          ],
+          "env": {
+            "AMING_CLAW_LIVE_AI": "1",
+            "AMING_CLAW_MODEL_CALLS": "explicit_probe_only"
+          },
+          "timeout_ms": 120000
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "live_ai_environment_probe_script",
+          "kind": "probe_script",
+          "path": "scripts/live-ai-environment-probe.mjs",
+          "description": "Integration-provided script that emits sanitized live-AI environment evidence for the tester route."
+        }
+      ]
+    },
+    {
       "id": "ruby_graph_sinatra",
       "title": "Ruby graph validation against Sinatra",
       "description": "Clones or reuses a pinned Sinatra workspace outside this repo, bootstraps it through governance when explicitly allowed, and validates Ruby graph reasonableness.",

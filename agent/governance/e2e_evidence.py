@@ -331,6 +331,74 @@ def _bool_from_suite(suite: dict[str, Any], key: str, default: bool = False) -> 
     return bool(value)
 
 
+def _dict_from_suite(suite: dict[str, Any], key: str) -> dict[str, Any]:
+    value = suite.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _suite_command_text(suite: dict[str, Any]) -> str:
+    command = suite.get("command")
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command)
+    return str(command or "")
+
+
+def _suite_live_ai_requested(suite: dict[str, Any]) -> bool:
+    if _bool_from_suite(suite, "live_ai"):
+        return True
+    command_lower = _suite_command_text(suite).lower()
+    if (
+        "--allow-live-ai" in command_lower
+        or "--allow_live_ai" in command_lower
+        or "--semantic-live" in command_lower
+        or "live-ai-environment-probe" in command_lower
+    ):
+        return True
+    return any(
+        isinstance(suite.get(key), dict)
+        for key in ("live_ai_environment", "live_ai_environment_probe", "ai_environment_probe")
+    )
+
+
+def _expected_ai_route(suite: dict[str, Any]) -> dict[str, str]:
+    env = (
+        _dict_from_suite(suite, "live_ai_environment")
+        or _dict_from_suite(suite, "live_ai_environment_probe")
+        or _dict_from_suite(suite, "ai_environment_probe")
+    )
+    expected = env.get("expected") if isinstance(env.get("expected"), dict) else {}
+    route = env.get("route") if isinstance(env.get("route"), dict) else {}
+    return {
+        "provider": str(
+            expected.get("provider")
+            or route.get("provider")
+            or env.get("expected_provider")
+            or env.get("provider")
+            or suite.get("expected_provider")
+            or suite.get("provider")
+            or ""
+        ).strip(),
+        "model": str(
+            expected.get("model")
+            or route.get("model")
+            or env.get("expected_model")
+            or env.get("model")
+            or suite.get("expected_model")
+            or suite.get("model")
+            or ""
+        ).strip(),
+        "role": str(
+            expected.get("role")
+            or route.get("role")
+            or env.get("expected_role")
+            or env.get("role")
+            or suite.get("expected_role")
+            or suite.get("role")
+            or ""
+        ).strip(),
+    }
+
+
 def _suite_route_policy(
     suite: dict[str, Any],
     *,
@@ -339,15 +407,55 @@ def _suite_route_policy(
 ) -> dict[str, Any]:
     trigger = _suite_trigger(suite)
     tags = {tag.lower().replace("_", "-") for tag in trigger["tags"]}
-    command = str(suite.get("command") or "")
+    command = _suite_command_text(suite)
     command_lower = command.lower()
     isolation_project = str(suite.get("isolation_project") or "").strip()
     isolation_lower = isolation_project.lower()
     project_lower = str(project_id or "").strip().lower()
-    live_ai = _bool_from_suite(suite, "live_ai")
+    live_ai = _suite_live_ai_requested(suite)
     requires_approval = _bool_from_suite(suite, "requires_human_approval")
     manual_approval_required = live_ai or requires_approval
     mutates_db = _bool_from_suite(suite, "mutates_db", True)
+    safety = _dict_from_suite(suite, "safety")
+    execution_policy = _dict_from_suite(suite, "execution_policy")
+    fixture_only = bool(safety.get("fixture_only"))
+    calls_models = safety.get("calls_models", suite.get("calls_models"))
+    model_calls_forbidden = (
+        str(execution_policy.get("model_calls") or "").lower() == "forbidden"
+        or calls_models is False
+    )
+    execution_lane = str(execution_policy.get("lane") or suite.get("lane") or "").strip().lower()
+    structured_output = (
+        bool(tags.intersection({"ai-structured-output", "structured-output", "structured-output-fixture"}))
+        or "structured-output" in command_lower
+        or "structured_output" in command_lower
+        or execution_lane == "ai_structured_output_fixture"
+    )
+    live_ai_env = (
+        _dict_from_suite(suite, "live_ai_environment")
+        or _dict_from_suite(suite, "live_ai_environment_probe")
+        or _dict_from_suite(suite, "ai_environment_probe")
+    )
+    environment_check = (
+        live_ai
+        and (
+            bool(live_ai_env)
+            or bool(tags.intersection({
+                "ai-environment",
+                "ai-runtime",
+                "environment",
+                "environment-check",
+                "live-ai-environment",
+                "probe",
+                "readiness",
+                "readiness-check",
+            }))
+            or "live-ai-environment-probe" in command_lower
+        )
+    )
+    allow_live_ai_flag_present = "--allow-live-ai" in command_lower or "--allow_live_ai" in command_lower
+    requires_allow_live_ai = environment_check or allow_live_ai_flag_present
+    expected_route = _expected_ai_route(suite)
 
     classes: list[str] = []
 
@@ -368,6 +476,19 @@ def _suite_route_policy(
         add("docker")
     if live_ai:
         add("live_ai")
+    if structured_output:
+        add("ai_structured_output")
+    if structured_output and (fixture_only or "fixture" in tags or "fixture" in command_lower) and not live_ai:
+        add("structured_output_fixture")
+    if model_calls_forbidden:
+        add("model_calls_forbidden")
+    if environment_check:
+        add("environment-check")
+        add("live_ai_environment")
+    if requires_allow_live_ai:
+        add("requires_allow_live_ai")
+    if allow_live_ai_flag_present:
+        add("explicit_allow_live_ai")
     if manual_approval_required:
         add("manual_approval")
     if mutates_db:
@@ -399,11 +520,34 @@ def _suite_route_policy(
         execution_mode = "autorun"
     else:
         execution_mode = "manual"
+    if execution_mode != "autorun":
+        add("manual")
+
+    if environment_check:
+        lane = "live_ai_environment"
+    elif structured_output and "structured_output_fixture" in classes:
+        lane = "structured_output_fixture"
+    elif structured_output:
+        lane = "ai_structured_output"
+    else:
+        lane = ""
 
     return {
         "suite_classes": classes,
         "execution_mode": execution_mode,
         "manual_approval_required": manual_approval_required,
+        "ai_evidence_policy": {
+            "lane": lane,
+            "readiness_check": bool(environment_check),
+            "invocation_evidence_required": bool(environment_check and allow_live_ai_flag_present),
+            "model_calls_forbidden": bool(model_calls_forbidden),
+            "requires_allow_live_ai": bool(requires_allow_live_ai),
+            "allow_live_ai_flag_present": bool(allow_live_ai_flag_present),
+            "sanitized_evidence_required": bool(environment_check),
+            "expected_provider": expected_route["provider"],
+            "expected_model": expected_route["model"],
+            "expected_role": expected_route["role"],
+        },
     }
 
 
@@ -480,7 +624,7 @@ def plan_e2e_impact(
             counts[status] = 0
         counts[status] += 1
         trigger_match = _trigger_matches(suite, changed_files=changed_files, changed_node_ids=changed_node_ids)
-        live_ai = bool(suite.get("live_ai"))
+        live_ai = _suite_live_ai_requested(suite)
         approval = bool(suite.get("requires_human_approval"))
         auto_run = bool(suite.get("auto_run")) and global_auto and not live_ai and not approval
         route_policy = _suite_route_policy(suite, project_id=project_id, can_autorun=auto_run)

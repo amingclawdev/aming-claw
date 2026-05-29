@@ -55,8 +55,10 @@ def test_doctor_json_reports_backend_blocker_without_failing_hard(tmp_path: Path
         "simple_user_entry",
         "service_router_docker_fixture",
         "service_router_ai_structured_output_fixture",
+        "service_router_live_ai_environment_tester",
         "ruby_graph_sinatra",
     }.issubset(set(payload["registry"]["scenario_ids"]))
+    assert payload["registry"]["scenario_count"] == 5
     assert payload["paths"]["cache_inside_repo"] is False
 
 
@@ -72,12 +74,15 @@ def test_plan_output_lists_scenarios_actions_and_fixture_metadata(tmp_path: Path
     scenario = scenarios["simple_user_entry"]
     docker = scenarios["service_router_docker_fixture"]
     ai_fixture = scenarios["service_router_ai_structured_output_fixture"]
+    live_probe = scenarios["service_router_live_ai_environment_tester"]
     ruby = scenarios["ruby_graph_sinatra"]
 
+    assert payload["selected_count"] == 5
     assert set(scenarios) == {
         "simple_user_entry",
         "service_router_docker_fixture",
         "service_router_ai_structured_output_fixture",
+        "service_router_live_ai_environment_tester",
         "ruby_graph_sinatra",
     }
     assert scenario["scenario_id"] == "simple_user_entry"
@@ -118,6 +123,34 @@ def test_plan_output_lists_scenarios_actions_and_fixture_metadata(tmp_path: Path
     assert ai_deps["ai_structured_output_fixture"]["required"] is True
     assert ai_deps["live_ai_runtime"]["required"] is False
     assert ai_deps["live_ai_runtime"]["status"] == "planned"
+    live_deps = {item["id"]: item for item in live_probe["dependency_decisions"]}
+    live_commands = {command["id"]: command for command in live_probe["commands"]}
+    assert live_probe["execution_policy"]["lane"] == "live_ai_environment_probe"
+    assert live_probe["execution_policy"]["requires_flags"] == ["--allow-live-ai"]
+    assert live_probe["execution_policy"]["model_calls"] == "explicit_probe_only"
+    assert live_probe["safety"]["environment_probe"] is True
+    assert live_probe["safety"]["calls_models"] is True
+    assert live_probe["route_context"]["service_id"] == "service_router.live_ai_environment_tester"
+    assert live_probe["fixtures"][0]["kind"] == "environment_probe"
+    assert live_probe["fixtures"][0]["script"] == "scripts/live-ai-environment-probe.mjs"
+    assert {item["id"] for item in live_probe["evidence_requirements"]} >= {
+        "live_ai_probe_gate",
+        "expected_provider_model_match",
+        "cli_detected_version_path",
+        "auth_or_invocation_evidence",
+        "sanitized_prompt_output",
+        "no_silent_quota_use",
+    }
+    assert live_deps["live_ai_environment_probe"]["status"] == "planned"
+    assert live_deps["live_ai_environment_probe"]["required"] is True
+    assert "scripts/live-ai-environment-probe.mjs" in live_deps["live_ai_environment_probe"]["command"]
+    assert "--role" in live_deps["live_ai_environment_probe"]["command"]
+    assert "--allow-live-ai" in live_deps["live_ai_environment_probe"]["command"]
+    assert (
+        "scripts/live-ai-environment-probe.mjs"
+        in live_commands["service_router_live_ai_environment_probe"]["command"]
+    )
+    assert "--allow-live-ai" in live_commands["service_router_live_ai_environment_probe"]["command"]
     assert ruby["target_project"] == "test-scenario-ruby-sinatra"
     assert ruby["repository"]["commit"] == "5236d3459b8b9015e5ce21ddd0c6beb0db4081d4"
     assert ruby["repository"]["workspace_path"] == str(tmp_path / "state" / "workspaces" / "sinatra")
@@ -171,6 +204,29 @@ def test_service_router_fixture_dependency_gating_shape(tmp_path: Path) -> None:
     assert ai_report["execution_policy"]["live_ai"] == "manual_auth_unknown"
     assert ai_report["fixtures"][0]["calls_models"] is False
     assert ai_report["command_summaries"][0]["status"] == "passed"
+
+    live_result = _run_manager(
+        "run",
+        "--scenario",
+        "service_router_live_ai_environment_tester",
+        "--json",
+        "--state-dir",
+        str(tmp_path / "live-state"),
+        check=False,
+    )
+    live_payload = _json(live_result)
+    [live_report] = live_payload["reports"]
+    live_deps = {item["id"]: item for item in live_report["dependency_decisions"]}
+
+    assert live_result.returncode == 2
+    assert live_payload["ok"] is False
+    assert live_report["status"] == "blocked"
+    assert live_report["blocked"]["reason_code"] == "dependency_live_ai_environment_probe_blocked"
+    assert live_deps["live_ai_environment_probe"]["status"] == "blocked"
+    assert "--allow-live-ai" in live_deps["live_ai_environment_probe"]["reason"]
+    assert live_report["safety"]["environment_probe"] is True
+    assert live_report["execution_policy"]["live_ai"] == "environment_probe"
+    assert live_report["command_summaries"] == []
 
 
 def test_required_live_ai_dependency_stays_manual_when_flag_supplied(tmp_path: Path) -> None:
@@ -228,6 +284,125 @@ def test_required_live_ai_dependency_stays_manual_when_flag_supplied(tmp_path: P
     assert report["blocked"]["reason_code"] == "dependency_live_ai_runtime_blocked"
     assert "auth is still unknown" in deps["live_ai_runtime"]["reason"]
     assert report["command_summaries"] == []
+
+
+def test_live_ai_environment_probe_mode_runs_fake_command_when_allowed(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scenarios": [
+                    {
+                        "id": "fake_live_ai_environment_probe",
+                        "title": "Fake live AI environment probe",
+                        "target_project": "aming-claw",
+                        "target_ref": "HEAD",
+                        "runner": "commands",
+                        "dependencies": [
+                            {
+                                "id": "node",
+                                "kind": "command",
+                                "command": "{node}",
+                                "required": True,
+                            },
+                            {
+                                "id": "live_ai_runtime",
+                                "kind": "capability",
+                                "mode": "environment_probe",
+                                "required": True,
+                            },
+                        ],
+                        "execution_policy": {
+                            "lane": "live_ai_environment_probe",
+                            "requires_flags": ["--allow-live-ai"],
+                            "live_ai": "environment_probe",
+                            "model_calls": "explicit_probe_only",
+                        },
+                        "safety": {
+                            "environment_probe": True,
+                            "live_ai": True,
+                            "calls_models": True,
+                            "requires_human_approval": True,
+                        },
+                        "route_context": {
+                            "service_id": "service_router.live_ai_environment_tester",
+                            "route": "tester",
+                        },
+                        "fixtures": [
+                            {
+                                "id": "fake-live-ai-probe",
+                                "kind": "environment_probe",
+                                "calls_models": False,
+                            }
+                        ],
+                        "evidence_requirements": [
+                            {
+                                "id": "live_ai_probe_gate",
+                                "kind": "dependency_decision",
+                                "dependency_id": "live_ai_runtime",
+                                "required_status": "allowed",
+                            }
+                        ],
+                        "commands": [
+                            {
+                                "id": "fake_probe",
+                                "cwd": "repo",
+                                "command": [
+                                    "{node}",
+                                    "-e",
+                                    "console.log('fake live ai environment probe ok')",
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    blocked_result = _run_manager(
+        "run",
+        "--scenario",
+        "fake_live_ai_environment_probe",
+        "--registry",
+        str(registry),
+        "--json",
+        "--state-dir",
+        str(tmp_path / "blocked-state"),
+        check=False,
+    )
+    blocked_payload = _json(blocked_result)
+    [blocked_report] = blocked_payload["reports"]
+    blocked_deps = {item["id"]: item for item in blocked_report["dependency_decisions"]}
+
+    assert blocked_result.returncode == 2
+    assert blocked_report["status"] == "blocked"
+    assert blocked_deps["live_ai_runtime"]["status"] == "blocked"
+    assert "--allow-live-ai" in blocked_deps["live_ai_runtime"]["reason"]
+    assert blocked_report["command_summaries"] == []
+
+    allowed_result = _run_manager(
+        "run",
+        "--scenario",
+        "fake_live_ai_environment_probe",
+        "--registry",
+        str(registry),
+        "--json",
+        "--state-dir",
+        str(tmp_path / "allowed-state"),
+        "--allow-live-ai",
+    )
+    allowed_payload = _json(allowed_result)
+    [allowed_report] = allowed_payload["reports"]
+    allowed_deps = {item["id"]: item for item in allowed_report["dependency_decisions"]}
+
+    assert allowed_report["status"] == "passed"
+    assert allowed_deps["live_ai_runtime"]["status"] == "allowed"
+    assert allowed_report["command_summaries"][0]["status"] == "passed"
+    assert "fake live ai environment probe ok" in allowed_report["command_summaries"][0]["stdout_tail"]
 
 
 def test_docker_fixture_dependency_can_be_approved_with_command_probe(tmp_path: Path) -> None:

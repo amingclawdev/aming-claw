@@ -245,3 +245,111 @@ def test_e2e_impact_classifies_fixture_static_production_and_source_only(conn):
     assert static_row["execution_mode"] == "autorun"
     assert {"static", "production"}.issubset(set(static_row["suite_classes"]))
     assert "mutating_governance" not in static_row["suite_classes"]
+
+
+def test_e2e_impact_distinguishes_structured_output_fixture_from_live_ai(conn):
+    _snapshot(conn, "scope-ai-fixture", "sha256:feature", "sha256:file")
+    conn.commit()
+
+    impact = e2e_evidence.plan_e2e_impact(
+        conn,
+        PID,
+        "scope-ai-fixture",
+        {
+            "auto_run": True,
+            "default_timeout_sec": 900,
+            "suites": {
+                "service_router_ai_structured_output_fixture": {
+                    "command": "node scripts/test-scenario-manager.mjs run service_router_ai_structured_output_fixture",
+                    "auto_run": True,
+                    "live_ai": False,
+                    "requires_human_approval": False,
+                    "mutates_db": False,
+                    "isolation_project": "router-fixture",
+                    "safety": {
+                        "fixture_only": True,
+                        "calls_models": False,
+                    },
+                    "execution_policy": {
+                        "lane": "ai_structured_output_fixture",
+                        "model_calls": "forbidden",
+                    },
+                    "trigger": {"tags": ["ai_structured_output", "fixture"]},
+                }
+            },
+        },
+    )
+
+    row = _suite_row(impact, "service_router_ai_structured_output_fixture")
+    assert row["live_ai"] is False
+    assert row["can_autorun"] is True
+    assert row["execution_mode"] == "autorun"
+    assert {
+        "ai_structured_output",
+        "structured_output_fixture",
+        "model_calls_forbidden",
+        "fixture",
+    }.issubset(set(row["suite_classes"]))
+    assert "environment-check" not in row["suite_classes"]
+    assert row["ai_evidence_policy"]["lane"] == "structured_output_fixture"
+    assert row["ai_evidence_policy"]["model_calls_forbidden"] is True
+    assert row["ai_evidence_policy"]["readiness_check"] is False
+    assert row["ai_evidence_policy"]["invocation_evidence_required"] is False
+
+
+def test_e2e_impact_classifies_live_ai_environment_as_manual_not_autorun(conn):
+    _snapshot(conn, "scope-live-ai-env", "sha256:feature", "sha256:file")
+    conn.commit()
+
+    impact = e2e_evidence.plan_e2e_impact(
+        conn,
+        PID,
+        "scope-live-ai-env",
+        {
+            "auto_run": True,
+            "default_timeout_sec": 900,
+            "suites": {
+                "live_ai.environment.tester": {
+                    "command": "node scripts/live-ai-environment-probe.mjs --role tester --allow-live-ai",
+                    "auto_run": True,
+                    "mutates_db": False,
+                    "isolation_project": PID,
+                    "live_ai_environment": {
+                        "expected": {
+                            "role": "tester",
+                            "provider": "openai",
+                            "model": "gpt-5.4",
+                        }
+                    },
+                    "trigger": {"tags": ["live-ai", "environment-check", "ai-runtime"]},
+                }
+            },
+        },
+    )
+
+    row = _suite_row(impact, "live_ai.environment.tester")
+    assert row["live_ai"] is True
+    assert row["can_autorun"] is False
+    assert row["execution_mode"] == "manual_approval"
+    assert row["manual_approval_required"] is True
+    assert row["blocked_reason"] == "live_ai_requires_manual_approval"
+    assert {
+        "manual",
+        "live_ai",
+        "environment-check",
+        "live_ai_environment",
+        "requires_allow_live_ai",
+        "explicit_allow_live_ai",
+    }.issubset(set(row["suite_classes"]))
+    assert row["ai_evidence_policy"] == {
+        "lane": "live_ai_environment",
+        "readiness_check": True,
+        "invocation_evidence_required": True,
+        "model_calls_forbidden": False,
+        "requires_allow_live_ai": True,
+        "allow_live_ai_flag_present": True,
+        "sanitized_evidence_required": True,
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4",
+        "expected_role": "tester",
+    }

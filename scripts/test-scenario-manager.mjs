@@ -310,6 +310,24 @@ function dependencyCommandSummary(value) {
   return sanitizeArg(expandToken(value || ""));
 }
 
+function isLiveAiEnvironmentProbeScenario(scenario) {
+  return (
+    scenario.execution_policy?.lane === "live_ai_environment_probe"
+    || scenario.execution_policy?.live_ai === "environment_probe"
+    || scenario.safety?.environment_probe === true
+    || scenario.safety?.live_ai_environment_probe === true
+  );
+}
+
+function isLiveAiEnvironmentProbeDependency(scenario, dependency) {
+  const mode = dependency.mode || dependency.probe_mode || "";
+  const markedDependency = (
+    dependency.id === "live_ai_environment_probe"
+    || (dependency.id === "live_ai_runtime" && ["environment_probe", "live_ai_environment_probe"].includes(mode))
+  );
+  return markedDependency && isLiveAiEnvironmentProbeScenario(scenario);
+}
+
 function buildDependencyDecisions(scenario, options, { planning = false } = {}) {
   const decisions = [];
   for (const dependency of scenario.dependencies) {
@@ -353,6 +371,14 @@ function buildDependencyDecisions(scenario, options, { planning = false } = {}) 
             decision.remediation = "Start Docker and re-run the scenario with --allow-docker.";
           }
         }
+      }
+    } else if (isLiveAiEnvironmentProbeDependency(scenario, dependency)) {
+      if (!options.allowLiveAi) {
+        decision.status = "blocked";
+        decision.reason = "live AI environment probes are gated and require --allow-live-ai";
+      } else {
+        decision.status = "allowed";
+        decision.reason = "live AI environment probe explicitly approved; the scenario command records provider/model/auth evidence";
       }
     } else if (dependency.id === "live_ai_runtime") {
       decision.status = "blocked";
