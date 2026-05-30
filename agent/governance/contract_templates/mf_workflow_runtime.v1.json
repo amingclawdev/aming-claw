@@ -9,6 +9,36 @@
     "precheck_service_role": "authoritative_gate_decision_and_evidence",
     "timeline_role": "append_only_audit_and_replay_source"
   },
+  "route_prompt_contract": {
+    "schema_version": "aming_route_prompt_contract.v1",
+    "description": "Route-owned visible prompt context and pre-mutation action policy for observer, judger, and bounded implementation lanes.",
+    "bundle_schema_version": "aming_route_prompt_alert_bundle.v1",
+    "visible_injection_manifest_schema_version": "visible_injection_manifest.v1",
+    "bundle_service_id": "route.prompt_alert_bundle",
+    "action_gate_service_id": "route.action_precheck",
+    "action_gate_function": "agent.governance.mf_subagent_contract.validate_route_action_gate",
+    "dispatch_gate_function": "agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+    "required_hash_fields": [
+      "route_context_hash",
+      "prompt_contract_id",
+      "prompt_contract_hash"
+    ],
+    "blocked_roles": [
+      "observer",
+      "judger"
+    ],
+    "blocked_implementation_actions": [
+      "apply_patch",
+      "edit_file",
+      "edit_files",
+      "write_file",
+      "implementation_exec",
+      "mutate_files",
+      "run_implementation_command"
+    ],
+    "allowance": "bounded worker or subagent dispatch must carry matching route_context_hash, prompt_contract_id, and prompt_contract_hash; observer or judger direct mutation additionally requires an accepted matching waiver",
+    "no_raw_context_policy": "route bundle output contains compact summaries, ids, refs, and hashes only; raw prompt, hidden context, and unmanifested injection text are excluded"
+  },
   "fixture_policy": {
     "decision": "new_scenario_required",
     "fixture_required": true,
@@ -98,6 +128,54 @@
   ],
   "service_routes": [
     {
+      "route_id": "service.route.prompt_alert_bundle",
+      "service_id": "route.prompt_alert_bundle",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "requirement_ids": [
+        "route_context_hash",
+        "prompt_contract_hash",
+        "visible_injection_manifest"
+      ],
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "payload.route_id",
+          "payload.prompt_contract_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.route.action_precheck",
+      "service_id": "route.action_precheck",
+      "mode": "gate",
+      "side_effect_class": "gate",
+      "requirement_ids": [
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_action_allowed"
+      ],
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "payload.route_context_hash",
+          "payload.prompt_contract_id",
+          "payload.prompt_contract_hash",
+          "payload.action",
+          "payload.caller_role",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
       "route_id": "service.precheck.run",
       "service_id": "precheck.run",
       "mode": "gate",
@@ -170,6 +248,41 @@
     }
   ],
   "event_routes": [
+    {
+      "route_id": "event.route_prompt_context.preview",
+      "event_kind": "route.prompt_context.requested",
+      "stages": [
+        "dispatch",
+        "startup_gate",
+        "implementation_wait",
+        "handoff_gate"
+      ],
+      "service_route_id": "service.route.prompt_alert_bundle",
+      "required_evidence_ids": [
+        "route_context_hash",
+        "prompt_contract_hash",
+        "visible_injection_manifest"
+      ],
+      "enabled": true
+    },
+    {
+      "route_id": "event.route_action.pre_mutation",
+      "event_kind": "route.action.requested",
+      "stages": [
+        "dispatch",
+        "startup_gate",
+        "implementation_wait",
+        "handoff_gate"
+      ],
+      "service_route_id": "service.route.action_precheck",
+      "required_evidence_ids": [
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_action_allowed"
+      ],
+      "enabled": true
+    },
     {
       "route_id": "event.stage_completed.precheck",
       "event_kind": "stage.completed",
@@ -408,6 +521,15 @@
     }
   },
   "gate_registry": {
+    "route.action.pre_mutation": [
+      "route_context_hash_present",
+      "prompt_contract_id_present",
+      "prompt_contract_hash_present",
+      "route_alerts_acknowledged",
+      "observer_judger_implementation_action_blocked",
+      "bounded_dispatch_evidence_matches_route",
+      "accepted_waiver_matches_route_when_required"
+    ],
     "mf_subagent.dispatch": [
       "target_main_worktree_clean",
       "worker_worktree_clean",
@@ -536,6 +658,18 @@
     ]
   },
   "evidence_requirements": [
+    {
+      "id": "route_prompt_bundle",
+      "required": true,
+      "phase": "dispatch",
+      "kind": "service_route"
+    },
+    {
+      "id": "route_action_gate",
+      "required": true,
+      "phase": "pre_mutation",
+      "kind": "local_precheck"
+    },
     {
       "id": "fixture_contract",
       "required": true,

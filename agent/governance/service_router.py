@@ -210,6 +210,20 @@ class ServiceRouter:
                 "ok": True,
                 "summary": f"{service_id} allowed for {_event_kind(event)}",
             }
+        gate_block = _gate_result_block(result_summary, merged)
+        if gate_block:
+            return _with_route_evidence({
+                "route_id": route_id,
+                "service_id": service_id,
+                "mode": merged["mode"],
+                "side_effect_class": merged["side_effect_class"],
+                "side_effect": merged["side_effect_class"],
+                "decision": "block",
+                "status": gate_block["status"],
+                "reason": gate_block["reason"],
+                "idempotency_key": idempotency_key,
+                "result": result_summary,
+            }, event=event, event_route=event_route, service_route=service_route)
         return _with_route_evidence({
             "route_id": route_id,
             "service_id": service_id,
@@ -308,6 +322,39 @@ def _merge_descriptor_route(
     }
 
 
+def _gate_result_block(
+    result: Mapping[str, Any],
+    route: Mapping[str, Any],
+) -> dict[str, str]:
+    if _string(route.get("mode")) != "gate" and _string(
+        route.get("side_effect_class") or route.get("side_effect")
+    ) != "gate":
+        return {}
+    route_action_gate = _mapping(result.get("route_action_gate"))
+    explicit_block = (
+        result.get("allowed") is False
+        or result.get("ok") is False
+        or route_action_gate.get("allowed") is False
+        or route_action_gate.get("ok") is False
+    )
+    if not explicit_block:
+        return {}
+    status = _string(
+        route_action_gate.get("status")
+        or result.get("status")
+        or "gate_policy_blocked"
+    )
+    reason = _string(
+        route_action_gate.get("reason")
+        or result.get("reason")
+        or "gate handler blocked route"
+    )
+    return {
+        "status": status or "gate_policy_blocked",
+        "reason": reason,
+    }
+
+
 def _with_route_evidence(
     route_result: dict[str, Any],
     *,
@@ -356,6 +403,7 @@ def _route_evidence(
     evidence_status = (
         SERVICE_ROUTE_PASS_STATUS if decision == "allow" else SERVICE_ROUTE_BLOCK_STATUS
     )
+    route_prompt_identity = _route_prompt_identity(_mapping(result))
     contract_evidence = [
         {
             "schema_version": SERVICE_ROUTE_EVIDENCE_SCHEMA_VERSION,
@@ -369,6 +417,7 @@ def _route_evidence(
             "side_effect_class": side_effect_class,
             "decision": decision,
             "idempotency_key": idempotency_key,
+            **route_prompt_identity,
         }
         for requirement_id in requirement_ids
     ]
@@ -387,6 +436,41 @@ def _route_evidence(
         "contract_evidence": contract_evidence,
         "result": _mapping(result),
         "reason": reason,
+        **route_prompt_identity,
+    }
+
+
+def _route_prompt_identity(result: Mapping[str, Any]) -> dict[str, Any]:
+    bundle = _mapping(result.get("route_prompt_bundle") or result.get("bundle"))
+    hashes = _mapping(result.get("hashes"))
+    action_gate = _mapping(result.get("route_action_gate"))
+    prompt_contract = _mapping(bundle.get("prompt_contract"))
+    visible_manifest = _mapping(bundle.get("visible_injection_manifest"))
+    identity = {
+        "route_context_hash": _string(
+            result.get("route_context_hash")
+            or bundle.get("route_context_hash")
+            or hashes.get("route_context_hash")
+            or action_gate.get("route_context_hash")
+        ),
+        "prompt_contract_id": _string(
+            result.get("prompt_contract_id")
+            or prompt_contract.get("prompt_contract_id")
+            or action_gate.get("prompt_contract_id")
+        ),
+        "prompt_contract_hash": _string(
+            result.get("prompt_contract_hash")
+            or bundle.get("prompt_contract_hash")
+            or hashes.get("prompt_contract_hash")
+            or action_gate.get("prompt_contract_hash")
+        ),
+    }
+    if visible_manifest:
+        identity["visible_injection_manifest_hash"] = _sha256_json(visible_manifest)
+    return {
+        key: value
+        for key, value in identity.items()
+        if isinstance(value, str) and value
     }
 
 
@@ -759,6 +843,13 @@ def _dedupe_strings(values: list[str]) -> list[str]:
             out.append(item)
             seen.add(item)
     return out
+
+
+def _sha256_json(value: Mapping[str, Any]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return "sha256:" + digest
 
 
 def _string(value: Any) -> str:

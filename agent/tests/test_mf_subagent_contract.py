@@ -23,6 +23,7 @@ from agent.governance.mf_subagent_contract import (
     MF_SUB_ROLE,
     OBSERVER_COORDINATOR_ROLE,
     OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION,
+    ROUTE_ACTION_GATE_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
     build_mf_subagent_input,
@@ -30,6 +31,7 @@ from agent.governance.mf_subagent_contract import (
     validate_observer_direct_mutation_exception,
     validate_mf_subagent_dispatch_gate,
     validate_mf_subagent_finish_gate,
+    validate_route_action_gate,
 )
 from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
@@ -175,6 +177,9 @@ def _dispatch_payload(**overrides: object) -> dict[str, object]:
         "target_head_commit": "target123",
         "merge_queue_id": "mq-1",
         "fence_token": "fence-1",
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
         "owned_files": ["agent/governance/mf_subagent_contract.py"],
         "dirty_scope_check": {
             "status": "passed",
@@ -194,12 +199,16 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
     )
 
     assert evidence["schema_version"] == DISPATCH_GATE_SCHEMA_VERSION
+    assert evidence["allowed"] is True
     assert evidence["role"] == MF_SUB_ROLE
     assert evidence["dispatch_default"] == DISPATCH_DEFAULT
     assert evidence["worktree_policy"] == WORKTREE_POLICY_MODE
     assert evidence["branch"] == "mf/subagent-1"
     assert evidence["worktree"] == "/repo/.worktrees/mf-subagent-1"
     assert evidence["merge_queue_id"] == "mq-1"
+    assert evidence["route_context_hash"] == "sha256:route-context"
+    assert evidence["prompt_contract_id"] == "rprompt-1"
+    assert evidence["prompt_contract_hash"] == "sha256:prompt-contract"
     assert evidence["isolated_worktree"] is True
     assert evidence["same_worktree_allowed"] is False
     assert evidence["override"]["used"] is False
@@ -215,6 +224,9 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
         ("base_commit", {"base_commit": ""}),
         ("target_head_commit", {"target_head_commit": ""}),
         ("merge_queue_id", {"merge_queue_id": ""}),
+        ("route_context_hash", {"route_context_hash": ""}),
+        ("prompt_contract_id", {"prompt_contract_id": ""}),
+        ("prompt_contract_hash", {"prompt_contract_hash": ""}),
     ],
 )
 def test_dispatch_gate_rejects_missing_branch_worktree_fence_or_commits(
@@ -284,6 +296,168 @@ def test_dispatch_gate_requires_complete_same_worktree_override() -> None:
     assert evidence["isolated_worktree"] is False
     assert evidence["override"]["used"] is True
     assert evidence["override"]["timeline_evidence_recorded"] is True
+
+
+def _route_action_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "caller_role": "observer",
+        "action": "apply_patch",
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
+        "route_alerts": [{"code": "observer_judger_must_not_implement"}],
+        "version_check": {"status": "passed", "dirty": False, "dirty_files": []},
+        "graph_status": {"current_state": {"graph_stale": {"is_stale": False}}},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_route_action_gate_rejects_observer_direct_implementation_action() -> None:
+    with pytest.raises(MfSubagentContractError, match="observer_judger_must_not_implement"):
+        validate_route_action_gate(_route_action_payload())
+
+
+def test_route_action_gate_allows_bounded_worker_with_route_prompt_identity() -> None:
+    evidence = validate_route_action_gate(
+        _route_action_payload(caller_role="implementation_worker")
+    )
+
+    assert evidence["schema_version"] == ROUTE_ACTION_GATE_SCHEMA_VERSION
+    assert evidence["allowed"] is True
+    assert evidence["implementation_action"] is True
+    assert evidence["route_context_hash"] == "sha256:route-context"
+    assert evidence["prompt_contract_id"] == "rprompt-1"
+    assert evidence["prompt_contract_hash"] == "sha256:prompt-contract"
+    assert evidence["version_workspace_gate"]["passed"] is True
+    assert evidence["graph_current_gate"]["passed"] is True
+
+
+def test_route_action_gate_rejects_implementation_without_route_identity() -> None:
+    with pytest.raises(MfSubagentContractError, match="route_context_hash"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role="implementation_worker",
+                route_context_hash="",
+            )
+        )
+
+
+def test_route_action_gate_rejects_implementation_without_prompt_contract_hash() -> None:
+    with pytest.raises(MfSubagentContractError, match="prompt_contract_hash"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role="implementation_worker",
+                prompt_contract_hash="",
+            )
+        )
+
+
+def test_route_action_gate_rejects_dirty_workspace_without_waiver() -> None:
+    with pytest.raises(MfSubagentContractError, match="version/workspace"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role="implementation_worker",
+                version_check={
+                    "status": "failed",
+                    "dirty": True,
+                    "dirty_files": ["agent/governance/mf_subagent_contract.py"],
+                },
+            )
+        )
+
+
+def test_route_action_gate_rejects_stale_graph_without_waiver() -> None:
+    with pytest.raises(MfSubagentContractError, match="current graph"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role="implementation_worker",
+                graph_status={
+                    "current_state": {
+                        "graph_stale": {
+                            "is_stale": True,
+                            "changed_files": ["agent/governance/service_router.py"],
+                        }
+                    }
+                },
+            )
+        )
+
+
+def test_route_action_gate_waiver_can_bypass_dirty_or_stale_preconditions() -> None:
+    evidence = validate_route_action_gate(
+        _route_action_payload(
+            caller_role="implementation_worker",
+            version_check={
+                "status": "failed",
+                "dirty": True,
+                "dirty_files": ["agent/governance/mf_subagent_contract.py"],
+            },
+            graph_status={"current_state": {"graph_stale": {"is_stale": True}}},
+            route_action_waiver={
+                "accepted": True,
+                "route_context_hash": "sha256:route-context",
+                "prompt_contract_id": "rprompt-1",
+                "prompt_contract_hash": "sha256:prompt-contract",
+            },
+        )
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["accepted_waiver_present"] is True
+    assert evidence["precondition_waiver_used"] is True
+    assert evidence["version_workspace_gate"]["passed"] is False
+    assert evidence["graph_current_gate"]["passed"] is False
+
+
+def test_route_action_gate_accepts_observer_with_waiver_and_matching_dispatch() -> None:
+    dispatch = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(),
+        target_worktree_path="/repo",
+    )
+
+    assert dispatch["allowed"] is True
+
+    evidence = validate_route_action_gate(
+        _route_action_payload(
+            route_action_waiver={
+                "accepted": True,
+                "route_context_hash": "sha256:route-context",
+                "prompt_contract_id": "rprompt-1",
+                "prompt_contract_hash": "sha256:prompt-contract",
+            },
+            bounded_dispatch_evidence=dispatch,
+        )
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["accepted_waiver_present"] is True
+    assert evidence["bounded_dispatch_evidence_present"] is True
+
+
+def test_route_action_gate_rejects_observer_when_dispatch_explicitly_failed() -> None:
+    failed_dispatch = {
+        "schema_version": DISPATCH_GATE_SCHEMA_VERSION,
+        "allowed": False,
+        "status": "failed",
+        "role": MF_SUB_ROLE,
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
+    }
+
+    with pytest.raises(MfSubagentContractError, match="matching bounded dispatch"):
+        validate_route_action_gate(
+            _route_action_payload(
+                route_action_waiver={
+                    "accepted": True,
+                    "route_context_hash": "sha256:route-context",
+                    "prompt_contract_id": "rprompt-1",
+                    "prompt_contract_hash": "sha256:prompt-contract",
+                },
+                bounded_dispatch_evidence=failed_dispatch,
+            )
+        )
 
 
 def _observer_direct_mutation_payload(**overrides: object) -> dict[str, object]:
@@ -480,6 +654,9 @@ def test_build_input_carries_branch_runtime_identity() -> None:
         acceptance_criteria=["tests pass"],
         target_files=["agent/governance/mf_subagent_contract.py"],
         test_commands=["python -m pytest agent/tests/test_mf_subagent_contract.py -q"],
+        route_context_hash="sha256:route-context",
+        prompt_contract_id="rprompt-1",
+        prompt_contract_hash="sha256:prompt-contract",
     )
 
     assert payload["role"] == MF_SUB_ROLE
@@ -490,6 +667,11 @@ def test_build_input_carries_branch_runtime_identity() -> None:
     assert payload["runtime_identity"]["fence_token"] == "fence-2"
     assert payload["runtime_identity"]["depends_on"] == ["task-foundation"]
     assert payload["work"]["acceptance_criteria"] == ["tests pass"]
+    assert payload["route_prompt_contract"] == {
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
+    }
     assert "modify_code" in payload["capabilities"]["can"]
     assert set(MF_SUB_FORBIDDEN_ACTIONS).issubset(payload["capabilities"]["cannot"])
     assert payload["prechecks"]["asset_binding_proposal"]["proposal_schema_version"] == (

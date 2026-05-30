@@ -57,6 +57,44 @@ def test_observer_reminder_echo_template_declares_route_and_worker_echo_requirem
     assert "received_reminder_echo" in template["worker_contract"]["final_output"]["required_fields"]
 
 
+def test_mf_workflow_runtime_declares_route_prompt_contract_and_action_gate():
+    template = get_contract_template("mf_workflow_runtime.v1")
+
+    service_routes = {
+        route["route_id"]: route
+        for route in template["service_routes"]
+    }
+    event_routes = {
+        route["route_id"]: route
+        for route in template["event_routes"]
+    }
+    route_action_service = service_routes["service.route.action_precheck"]
+    route_action_event = event_routes["event.route_action.pre_mutation"]
+    route_action_gate = template["gate_registry"]["route.action.pre_mutation"]
+
+    assert template["route_prompt_contract"]["schema_version"] == (
+        "aming_route_prompt_contract.v1"
+    )
+    assert template["route_prompt_contract"]["required_hash_fields"] == [
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+    ]
+    assert service_routes["service.route.prompt_alert_bundle"]["service_id"] == (
+        "route.prompt_alert_bundle"
+    )
+    assert service_routes["service.route.action_precheck"]["service_id"] == (
+        "route.action_precheck"
+    )
+    assert "prompt_contract_hash" in route_action_service["requirement_ids"]
+    assert event_routes["event.route_prompt_context.preview"]["service_route_id"] == (
+        "service.route.prompt_alert_bundle"
+    )
+    assert route_action_event["service_route_id"] == "service.route.action_precheck"
+    assert "prompt_contract_hash" in route_action_event["required_evidence_ids"]
+    assert "prompt_contract_hash_present" in route_action_gate
+
+
 def test_unknown_template_id_raises_explicit_error():
     with pytest.raises(UnknownContractTemplateError):
         get_contract_template("missing.v1")

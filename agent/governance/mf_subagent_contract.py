@@ -20,11 +20,13 @@ RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
+ROUTE_ACTION_GATE_SCHEMA_VERSION = "route_action_gate.v1"
 FINISH_GATE_REPLAY_SOURCE = "mf_sub_finish_gate"
 BACKEND_CONTRACT = "parallel_branch_worker.v1"
 DISPATCH_DEFAULT = "non_blocking_after_gate"
 WORKTREE_POLICY_MODE = "isolated_worktree_required"
 OBSERVER_DIRECT_MUTATION_DEFAULT = "reject"
+ROUTE_OBSERVER_JUDGER_BLOCK_ALERT = "observer_judger_must_not_implement"
 
 MF_SUB_ALLOWED_CAPABILITIES = (
     "modify_code",
@@ -63,6 +65,19 @@ _REQUIRED_CONTEXT_FIELDS = (
 )
 _READY_STATUSES = {"completed", "succeeded", "ready_for_merge"}
 _PASS_STATUSES = {"pass", "passed", "ok", "succeeded", "success", "clean"}
+_FAIL_STATUSES = {
+    "block",
+    "blocked",
+    "deny",
+    "denied",
+    "error",
+    "errored",
+    "fail",
+    "failed",
+    "not_allowed",
+    "reject",
+    "rejected",
+}
 _FORBIDDEN_RESULT_FLAGS = {
     "merge_commit": "merge",
     "push_performed": "push",
@@ -88,7 +103,30 @@ _DISPATCH_REQUIRED_FIELDS = (
     "target_head_commit",
     "merge_queue_id",
     "fence_token",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
 )
+_IMPLEMENTATION_ACTIONS = {
+    "apply_patch",
+    "apply_patch_within_target_files",
+    "edit_file",
+    "edit_files",
+    "implementation_exec",
+    "implementation_file_edit",
+    "mutate_files",
+    "run_implementation_command",
+    "write_file",
+    "write_files",
+}
+_OBSERVER_JUDGER_ROLES = {"observer", "judger"}
+_WORKER_ROLES = {
+    "implementation_worker",
+    "mf_sub",
+    "mf_subagent",
+    "subagent",
+    "worker",
+}
 
 
 class MfSubagentContractError(ValueError):
@@ -129,6 +167,14 @@ def _bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _explicit_false(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, str):
+        return value.strip().lower() in {"0", "false", "no", "n", "off"}
+    return False
 
 
 def _normalize_worktree_path(path: str) -> str:
@@ -172,6 +218,334 @@ def _dispatch_string(
             if token:
                 return token
     return ""
+
+
+def _route_prompt_contract_id(payload: Mapping[str, Any]) -> str:
+    prompt_contract = _nested_mapping(payload, "prompt_contract")
+    route_prompt_contract = _nested_mapping(payload, "route_prompt_contract")
+    route_context = _nested_mapping(payload, "route_context")
+    return _string(
+        payload.get("prompt_contract_id")
+        or prompt_contract.get("prompt_contract_id")
+        or prompt_contract.get("id")
+        or route_prompt_contract.get("prompt_contract_id")
+        or route_prompt_contract.get("id")
+        or route_context.get("prompt_contract_id")
+    )
+
+
+def _route_context_hash(payload: Mapping[str, Any]) -> str:
+    prompt_contract = _nested_mapping(payload, "prompt_contract")
+    route_prompt_contract = _nested_mapping(payload, "route_prompt_contract")
+    route_context = _nested_mapping(payload, "route_context")
+    return _string(
+        payload.get("route_context_hash")
+        or route_context.get("route_context_hash")
+        or prompt_contract.get("route_context_hash")
+        or route_prompt_contract.get("route_context_hash")
+    )
+
+
+def _route_prompt_contract_hash(payload: Mapping[str, Any]) -> str:
+    prompt_contract = _nested_mapping(payload, "prompt_contract")
+    route_prompt_contract = _nested_mapping(payload, "route_prompt_contract")
+    route_context = _nested_mapping(payload, "route_context")
+    return _string(
+        payload.get("prompt_contract_hash")
+        or prompt_contract.get("prompt_contract_hash")
+        or route_context.get("prompt_contract_hash")
+        or route_prompt_contract.get("prompt_contract_hash")
+    )
+
+
+def _alert_codes(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise MfSubagentContractError("route_alerts must be a list of alerts")
+    codes: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, str):
+            code = _string(item)
+        elif isinstance(item, Mapping):
+            code = _string(item.get("code"))
+        else:
+            continue
+        if code and code not in seen:
+            codes.append(code)
+            seen.add(code)
+    return codes
+
+
+def _route_alert_codes(payload: Mapping[str, Any]) -> list[str]:
+    route_context = _nested_mapping(payload, "route_context")
+    alerts = payload.get("route_alerts")
+    if alerts is None:
+        alerts = route_context.get("route_alerts")
+    return _alert_codes(alerts)
+
+
+def _normalized_action(value: Any) -> str:
+    return _string(value).lower().replace("-", "_").replace(".", "_")
+
+
+def _accepted_waiver_matches(
+    waiver: Mapping[str, Any],
+    *,
+    route_context_hash: str,
+    prompt_contract_id: str,
+    prompt_contract_hash: str,
+) -> bool:
+    status = _string(waiver.get("status") or waiver.get("decision")).lower()
+    accepted = _bool(waiver.get("accepted")) or status in {
+        "accepted",
+        "approved",
+        "allow",
+        "allowed",
+        "waived",
+    }
+    if not accepted:
+        return False
+    return (
+        _string(waiver.get("route_context_hash")) == route_context_hash
+        and _string(waiver.get("prompt_contract_id")) == prompt_contract_id
+        and _string(waiver.get("prompt_contract_hash")) == prompt_contract_hash
+    )
+
+
+def _dispatch_evidence_matches(
+    evidence: Mapping[str, Any],
+    *,
+    route_context_hash: str,
+    prompt_contract_id: str,
+    prompt_contract_hash: str,
+) -> bool:
+    status = _string(evidence.get("status") or evidence.get("decision")).lower()
+    if (
+        _explicit_false(evidence.get("allowed"))
+        or _explicit_false(evidence.get("ok"))
+        or status in _FAIL_STATUSES
+    ):
+        return False
+    allowed = (
+        _bool(evidence.get("allowed"))
+        or _bool(evidence.get("ok"))
+        or status in _PASS_STATUSES
+        or status in {"allow", "allowed"}
+        or _string(evidence.get("schema_version")) == DISPATCH_GATE_SCHEMA_VERSION
+    )
+    role = _string(
+        evidence.get("role") or evidence.get("worker_role") or evidence.get("caller_role")
+    ).lower()
+    worker_role_ok = not role or role in _WORKER_ROLES or role == MF_SUB_ROLE
+    return (
+        allowed
+        and worker_role_ok
+        and _string(evidence.get("route_context_hash")) == route_context_hash
+        and _string(evidence.get("prompt_contract_id")) == prompt_contract_id
+        and _string(evidence.get("prompt_contract_hash")) == prompt_contract_hash
+    )
+
+
+def _first_mapping(payload: Mapping[str, Any], keys: Sequence[str]) -> dict[str, Any]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _version_workspace_gate(payload: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = _first_mapping(
+        payload,
+        (
+            "version_check",
+            "workspace_gate",
+            "workspace_evidence",
+            "version_gate",
+        ),
+    )
+    if not evidence:
+        return {"present": False, "passed": False, "reason": "missing"}
+    status = _string(evidence.get("status") or evidence.get("result")).lower()
+    dirty = _bool(evidence.get("dirty"))
+    dirty_files = _string_list(evidence.get("dirty_files"), field_name="dirty_files")
+    passed_signal = (
+        _bool(evidence.get("ok"))
+        or _bool(evidence.get("passed"))
+        or status in _PASS_STATUSES
+    )
+    passed = passed_signal and not dirty and not dirty_files
+    reason = ""
+    if dirty:
+        reason = "dirty worktree"
+    elif dirty_files:
+        reason = "dirty files present"
+    elif not passed_signal:
+        reason = "not passed"
+    return {
+        "present": True,
+        "passed": passed,
+        "status": status or ("passed" if passed_signal else ""),
+        "dirty": dirty,
+        "dirty_file_count": len(dirty_files),
+        "reason": reason,
+    }
+
+
+def _graph_current_gate(payload: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = _first_mapping(
+        payload,
+        (
+            "graph_status",
+            "graph_gate",
+            "current_graph",
+            "graph_evidence",
+        ),
+    )
+    if not evidence:
+        return {"present": False, "passed": False, "reason": "missing"}
+    current_state = _mapping(evidence.get("current_state"), field_name="current_state")
+    raw_graph_stale = evidence.get("graph_stale")
+    if isinstance(raw_graph_stale, Mapping):
+        graph_stale = dict(raw_graph_stale)
+    elif isinstance(current_state.get("graph_stale"), Mapping):
+        graph_stale = dict(current_state["graph_stale"])
+    else:
+        graph_stale = {}
+    stale_known = "is_stale" in graph_stale or isinstance(raw_graph_stale, bool)
+    if "is_stale" in graph_stale:
+        stale = _bool(graph_stale.get("is_stale"))
+    elif isinstance(raw_graph_stale, bool):
+        stale = raw_graph_stale
+    else:
+        stale = False
+    status = _string(evidence.get("status") or evidence.get("result")).lower()
+    passed_signal = (
+        _bool(evidence.get("ok"))
+        or _bool(evidence.get("passed"))
+        or _bool(evidence.get("current"))
+        or _bool(evidence.get("graph_current"))
+        or status in _PASS_STATUSES
+        or (stale_known and not stale)
+    )
+    passed = passed_signal and not stale
+    reason = "graph stale" if stale else ("" if passed_signal else "not current")
+    return {
+        "present": True,
+        "passed": passed,
+        "status": status or ("passed" if passed_signal else ""),
+        "graph_stale": stale,
+        "reason": reason,
+    }
+
+
+def validate_route_action_gate(
+    payload: Mapping[str, Any],
+    *,
+    action: str = "",
+) -> dict[str, Any]:
+    """Validate route-owned role/action policy before implementation mutation."""
+
+    if not isinstance(payload, Mapping):
+        raise MfSubagentContractError("route action gate payload must be a mapping")
+    payload = dict(payload)
+    action_name = _normalized_action(
+        action
+        or payload.get("action")
+        or payload.get("requested_action")
+        or payload.get("tool_name")
+    )
+    caller_role = _string(
+        payload.get("caller_role")
+        or payload.get("role")
+        or payload.get("actor_role")
+        or _nested_mapping(payload, "route").get("caller_role")
+    ).lower()
+    route_context_hash = _route_context_hash(payload)
+    prompt_contract_id = _route_prompt_contract_id(payload)
+    prompt_contract_hash = _route_prompt_contract_hash(payload)
+    route_alert_codes = _route_alert_codes(payload)
+    implementation_action = action_name in _IMPLEMENTATION_ACTIONS
+
+    if implementation_action and (
+        not route_context_hash or not prompt_contract_id or not prompt_contract_hash
+    ):
+        raise MfSubagentContractError(
+            "implementation action requires route_context_hash, "
+            "prompt_contract_id, and prompt_contract_hash"
+        )
+
+    blocked_by_role_alert = (
+        caller_role in _OBSERVER_JUDGER_ROLES
+        and implementation_action
+        and ROUTE_OBSERVER_JUDGER_BLOCK_ALERT in route_alert_codes
+    )
+    waiver = _mapping(
+        payload.get("route_action_waiver")
+        or payload.get("accepted_waiver")
+        or payload.get("waiver"),
+        field_name="route_action_waiver",
+    )
+    dispatch_evidence = _mapping(
+        payload.get("bounded_dispatch_evidence")
+        or payload.get("dispatch_evidence")
+        or payload.get("mf_subagent_dispatch_gate"),
+        field_name="bounded_dispatch_evidence",
+    )
+    waiver_matches = _accepted_waiver_matches(
+        waiver,
+        route_context_hash=route_context_hash,
+        prompt_contract_id=prompt_contract_id,
+        prompt_contract_hash=prompt_contract_hash,
+    )
+    dispatch_matches = _dispatch_evidence_matches(
+        dispatch_evidence,
+        route_context_hash=route_context_hash,
+        prompt_contract_id=prompt_contract_id,
+        prompt_contract_hash=prompt_contract_hash,
+    )
+    if blocked_by_role_alert and not (waiver_matches and dispatch_matches):
+        raise MfSubagentContractError(
+            "observer_judger_must_not_implement blocks "
+            f"{caller_role or 'unknown'} action {action_name or 'unknown'} "
+            "without accepted waiver and matching bounded dispatch evidence"
+        )
+
+    version_workspace_gate = _version_workspace_gate(payload)
+    graph_current_gate = _graph_current_gate(payload)
+    precondition_waiver_used = False
+    if implementation_action:
+        if not version_workspace_gate["passed"]:
+            if not waiver_matches:
+                raise MfSubagentContractError(
+                    "implementation action requires clean version/workspace evidence"
+                )
+            precondition_waiver_used = True
+        if not graph_current_gate["passed"]:
+            if not waiver_matches:
+                raise MfSubagentContractError(
+                    "implementation action requires current graph evidence"
+                )
+            precondition_waiver_used = True
+
+    return {
+        "schema_version": ROUTE_ACTION_GATE_SCHEMA_VERSION,
+        "allowed": True,
+        "action": action_name,
+        "caller_role": caller_role,
+        "implementation_action": implementation_action,
+        "route_alert_codes": route_alert_codes,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "accepted_waiver_present": waiver_matches,
+        "bounded_dispatch_evidence_present": dispatch_matches,
+        "version_workspace_gate": version_workspace_gate,
+        "graph_current_gate": graph_current_gate,
+        "precondition_waiver_used": precondition_waiver_used,
+    }
 
 
 def _dirty_scope_evidence(value: Any) -> dict[str, Any]:
@@ -452,6 +826,33 @@ def validate_mf_subagent_dispatch_gate(
         ),
     )
     fence_token = _dispatch_string(payload, names=("fence_token",))
+    route_context_hash = _dispatch_string(
+        payload,
+        names=("route_context_hash",),
+        nested_keys=(
+            ("route_context", ("route_context_hash",)),
+            ("prompt_contract", ("route_context_hash",)),
+            ("route_prompt_contract", ("route_context_hash",)),
+        ),
+    )
+    prompt_contract_id = _dispatch_string(
+        payload,
+        names=("prompt_contract_id",),
+        nested_keys=(
+            ("route_context", ("prompt_contract_id",)),
+            ("prompt_contract", ("prompt_contract_id", "id")),
+            ("route_prompt_contract", ("prompt_contract_id", "id")),
+        ),
+    )
+    prompt_contract_hash = _dispatch_string(
+        payload,
+        names=("prompt_contract_hash",),
+        nested_keys=(
+            ("route_context", ("prompt_contract_hash",)),
+            ("prompt_contract", ("prompt_contract_hash",)),
+            ("route_prompt_contract", ("prompt_contract_hash",)),
+        ),
+    )
     values = {
         "branch": branch,
         "worktree": worktree,
@@ -459,6 +860,9 @@ def validate_mf_subagent_dispatch_gate(
         "target_head_commit": target_head_commit,
         "merge_queue_id": merge_queue_id,
         "fence_token": fence_token,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
     }
     missing = [field for field in _DISPATCH_REQUIRED_FIELDS if not values[field]]
     if missing:
@@ -527,6 +931,7 @@ def validate_mf_subagent_dispatch_gate(
 
     return {
         "schema_version": DISPATCH_GATE_SCHEMA_VERSION,
+        "allowed": True,
         "role": MF_SUB_ROLE,
         "dispatch_default": DISPATCH_DEFAULT,
         "worktree_policy": WORKTREE_POLICY_MODE,
@@ -536,6 +941,9 @@ def validate_mf_subagent_dispatch_gate(
         "target_head_commit": target_head_commit,
         "merge_queue_id": merge_queue_id,
         "fence_token": fence_token,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
         "owned_files": owned_files,
         "isolated_worktree": not same_worktree,
         "same_worktree_allowed": same_worktree_allowed,
@@ -565,6 +973,9 @@ def build_mf_subagent_input(
     test_commands: Sequence[str] | None = None,
     operator_notes: str = "",
     backend: str = "codex_subagent",
+    route_context_hash: str = "",
+    prompt_contract_id: str = "",
+    prompt_contract_hash: str = "",
 ) -> dict[str, Any]:
     """Build the stable input payload for a branch-isolated MF subagent."""
 
@@ -619,6 +1030,11 @@ def build_mf_subagent_input(
             "target_files": _string_list(target_files, field_name="target_files"),
             "test_commands": _string_list(test_commands, field_name="test_commands"),
             "operator_notes": operator_notes,
+        },
+        "route_prompt_contract": {
+            "route_context_hash": _string(route_context_hash),
+            "prompt_contract_id": _string(prompt_contract_id),
+            "prompt_contract_hash": _string(prompt_contract_hash),
         },
         "capabilities": {
             "can": list(MF_SUB_ALLOWED_CAPABILITIES),
