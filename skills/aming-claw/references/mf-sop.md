@@ -45,7 +45,17 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - for orphan file flows, put the orphan doc/test/config file in the fixture artifact, verify weak evidence first appears as an `asset_binding_proposal`, then let the E2E write the source-controlled governance hint, commit the fixture change, run Update graph, and assert the binding;
    - file a follow-up backlog row when live-AI, DB-mutating, slow, or human-approval E2E is deferred;
    - write `e2e_not_applicable` with a reason for docs-only or non-runtime changes.
-7. For parallel MF or subagent work, instantiate a source-controlled contract template before delegation:
+7. For nontrivial architecture, frontend/UI, or QA-sensitive work, resolve the
+   matching source-controlled review pack before implementation or before close:
+   - architecture/data continuity: preserve API, persistence, state, migration,
+     retry, and acceptance traceability;
+   - frontend/UI implementation: require component convention, responsive,
+     state, accessibility, and screenshot evidence;
+   - QA evidence gate: require focused test, fixture, contract validation, E2E
+     run/defer, and close-gate evidence;
+   - validate structured review output with the review pack validator before
+     converting accepted findings into acceptance criteria or follow-up backlog.
+8. For parallel MF or subagent work, instantiate a source-controlled contract template before delegation:
    - start from `agent/governance/contract_templates/mf_parallel.v1.json`;
    - when a deterministic MF workflow worker is used, instantiate
      `agent/governance/contract_templates/mf_workflow_runtime.v1.json` and run
@@ -138,11 +148,11 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      policy, graph/reconcile plan, Chain trailers, and backlog close policy;
    - when changed docs/templates are not graph-bound, record Asset Inbox
      binding or Governance Hint follow-up as needed for auditability.
-8. If an AI session or `mf_sub` worker proposes doc/test/config binding changes, require the local asset-binding precheck first:
+9. If an AI session or `mf_sub` worker proposes doc/test/config binding changes, require the local asset-binding precheck first:
    - run `agent.governance.asset_binding_proposals.precheck_asset_binding_proposal` against the draft proposal;
    - include compact `self_precheck` evidence with the submitted proposal;
    - do not request direct graph materialization from weak evidence.
-9. Treat documentation as a commit-bound asset before impact scope:
+10. Treat documentation as a commit-bound asset before impact scope:
    - weak doc path matches stay as doc asset state `candidate` rows;
    - only accepted bindings from review decisions, source-controlled hints, or durable rules count as node-owned docs;
    - when changing doc binding behavior, verify `doc-asset-state.json` shows path/hash/status/proposal evidence.
@@ -151,7 +161,7 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      `target_title`; title-only hints are repair candidates when the title is
      ambiguous. Reset/repair hints by editing the source hint, committing it,
      and running Update Graph/reconcile.
-10. Keep asset binding and drift on separate audit lines:
+11. Keep asset binding and drift on separate audit lines:
    - binding relationships are source-controlled append-only commands,
      normally governance-hint bind/unbind events, then reconcile materializes
      graph secondary/test/config fields, file inventory effective state,
@@ -165,7 +175,7 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      resolves them;
    - do not directly hand-write trusted accepted binding rows into DB as a
      substitute for source-controlled binding evidence.
-11. For observer/MF work, append timeline evidence as work proceeds:
+12. For observer/MF work, append timeline evidence as work proceeds:
    - `task_timeline_append` with `event_kind=implementation` after scoped code,
      docs, config, or fixture changes are made;
    - `task_timeline_append` with `event_kind=verification` after focused tests,

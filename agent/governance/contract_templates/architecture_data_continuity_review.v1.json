@@ -1,0 +1,141 @@
+{
+  "schema_version": "review_pack.v1",
+  "template_id": "architecture_data_continuity_review.v1",
+  "version": "v1",
+  "contract_kind": "review_pack",
+  "description": "Review architecture, API, persistence, and state continuity for implementation work that can lose or distort data across boundaries.",
+  "review_pack": {
+    "kind": "expert_review_pack",
+    "domain": "architecture_data_continuity",
+    "purpose": "Preserve data meaning and durable contracts across architecture boundaries."
+  },
+  "task_types": [
+    "architecture_review",
+    "data_continuity",
+    "backend",
+    "manual_fix"
+  ],
+  "stages": [
+    "pre_implementation",
+    "implementation_review",
+    "pre_close_gate"
+  ],
+  "source": {
+    "type": "source_controlled",
+    "path": "agent/governance/contract_templates/architecture_data_continuity_review.v1.json"
+  },
+  "required_inputs": [
+    "task_summary",
+    "target_files",
+    "graph_trace_refs",
+    "data_flow_map",
+    "api_contracts",
+    "persistence_contracts",
+    "state_ownership",
+    "acceptance_criteria",
+    "artifact_refs"
+  ],
+  "artifact_refs": [
+    {
+      "id": "graph_trace_refs",
+      "required": true,
+      "description": "Graph or bounded source evidence for the owning modules and affected boundaries."
+    },
+    {
+      "id": "data_flow_map",
+      "required": true,
+      "description": "Named path from input through API, persistence, state, and rendered or consumed output."
+    },
+    {
+      "id": "contract_examples",
+      "required": true,
+      "description": "Representative request, response, row, event, or state examples before and after the change."
+    },
+    {
+      "id": "migration_or_backfill_plan",
+      "required": false,
+      "description": "Migration, compatibility, or cleanup evidence when stored data shape changes."
+    }
+  ],
+  "forbidden_assumptions": [
+    "Do not infer API compatibility without request and response evidence.",
+    "Do not claim persistence safety without row, document, file, or event shape evidence.",
+    "Do not replace durable state with lossy summaries unless the backlog explicitly accepts that loss.",
+    "Do not ignore retry, cancellation, partial-write, or stale-cache paths when they can affect user data."
+  ],
+  "review_dimensions": [
+    "api_contract_continuity",
+    "persistence_shape_continuity",
+    "frontend_state_contracts",
+    "lifecycle_retry_and_cancellation",
+    "migration_and_backfill_safety",
+    "graph_scope_and_ownership",
+    "acceptance_traceability"
+  ],
+  "finding_fields": [
+    "finding_id",
+    "severity",
+    "dimension",
+    "summary",
+    "evidence_refs",
+    "recommendation",
+    "acceptance_impact",
+    "backlog_conversion_hints"
+  ],
+  "severity_values": [
+    "info",
+    "minor",
+    "major",
+    "critical"
+  ],
+  "gate_decisions": [
+    "pass",
+    "pass_with_followups",
+    "block"
+  ],
+  "output_schema": {
+    "type": "object",
+    "required": [
+      "gate_decision",
+      "findings"
+    ],
+    "properties": {
+      "gate_decision": {
+        "enum": [
+          "pass",
+          "pass_with_followups",
+          "block"
+        ]
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "finding_id",
+            "severity",
+            "dimension",
+            "summary",
+            "evidence_refs",
+            "recommendation",
+            "acceptance_impact",
+            "backlog_conversion_hints"
+          ]
+        }
+      }
+    }
+  },
+  "backlog_conversion_hints": {
+    "allowed_actions": [
+      "none",
+      "acceptance_criteria",
+      "follow_up_backlog"
+    ],
+    "default_action": "acceptance_criteria",
+    "acceptance_criteria_template": "Add a criterion that preserves the named data contract across the referenced boundary.",
+    "follow_up_backlog_template": {
+      "title_prefix": "Architecture continuity follow-up: ",
+      "priority_guidance": "Use P1 for critical or blocking data loss, otherwise inherit the parent priority."
+    }
+  }
+}

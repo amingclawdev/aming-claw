@@ -788,6 +788,53 @@ TOOLS: list[dict] = [
             "required": ["payload"],
         },
     },
+    {
+        "name": "review_pack_list",
+        "description": "List source-controlled expert review packs, optionally filtered by task type or stage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_type": {"type": "string"},
+                "stage": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "review_pack_get",
+        "description": "Get one source-controlled expert review pack by exact versioned template id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_id": {"type": "string"},
+            },
+            "required": ["template_id"],
+        },
+    },
+    {
+        "name": "review_pack_resolve",
+        "description": "Resolve an expert review pack by template id, task type, stage, or version.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_id": {"type": "string"},
+                "task_type": {"type": "string"},
+                "stage": {"type": "string"},
+                "version": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "review_pack_validate_output",
+        "description": "Validate a machine-readable review output against a source-controlled review pack.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_id": {"type": "string"},
+                "payload": {"type": "object"},
+            },
+            "required": ["template_id", "payload"],
+        },
+    },
     # --- Context Registry ---
     {
         "name": "context_pack_list",
@@ -1448,6 +1495,51 @@ class ToolDispatcher:
             if not isinstance(payload, dict):
                 return {"ok": False, "errors": ["payload must be an object"]}
             return validate_ue_audit_payload(payload)
+
+        if name in {
+            "review_pack_list",
+            "review_pack_get",
+            "review_pack_resolve",
+            "review_pack_validate_output",
+        }:
+            from agent.governance.review_contracts import (
+                ReviewContractError,
+                get_review_pack,
+                list_review_packs,
+                resolve_review_pack,
+                validate_review_output,
+            )
+
+            try:
+                if name == "review_pack_list":
+                    return {
+                        "ok": True,
+                        "review_packs": list_review_packs(
+                            task_type=args.get("task_type"),
+                            stage=args.get("stage"),
+                        ),
+                    }
+                if name == "review_pack_get":
+                    return {
+                        "ok": True,
+                        "review_pack": get_review_pack(str(args["template_id"])),
+                    }
+                if name == "review_pack_resolve":
+                    return {
+                        "ok": True,
+                        "review_pack": resolve_review_pack(
+                            template_id=args.get("template_id"),
+                            task_type=args.get("task_type"),
+                            stage=args.get("stage"),
+                            version=args.get("version"),
+                        ),
+                    }
+                payload = args.get("payload")
+                if not isinstance(payload, dict):
+                    return {"ok": False, "errors": ["payload must be an object"]}
+                return validate_review_output(str(args.get("template_id") or ""), payload)
+            except ReviewContractError as exc:
+                return {"ok": False, "error": str(exc)}
 
         if name in {
             "context_pack_list",

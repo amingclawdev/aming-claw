@@ -1,0 +1,142 @@
+{
+  "schema_version": "review_pack.v1",
+  "template_id": "frontend_ui_implementation_review.v1",
+  "version": "v1",
+  "contract_kind": "review_pack",
+  "description": "Review frontend implementation work for UI convention fit, responsive behavior, state coverage, and screenshot-verifiable results.",
+  "review_pack": {
+    "kind": "expert_review_pack",
+    "domain": "frontend_ui_implementation",
+    "purpose": "Verify UI implementation quality through concrete state and viewport evidence."
+  },
+  "task_types": [
+    "frontend",
+    "ui_implementation",
+    "design_review",
+    "manual_fix"
+  ],
+  "stages": [
+    "pre_frontend_implementation",
+    "post_implementation_screenshot_smoke",
+    "pre_close_gate"
+  ],
+  "source": {
+    "type": "source_controlled",
+    "path": "agent/governance/contract_templates/frontend_ui_implementation_review.v1.json"
+  },
+  "required_inputs": [
+    "target_user_type",
+    "product_surface",
+    "flow_scenario",
+    "target_files",
+    "screenshots_or_mockups",
+    "responsive_viewports",
+    "design_constraints",
+    "acceptance_criteria",
+    "artifact_refs"
+  ],
+  "artifact_refs": [
+    {
+      "id": "desktop_screenshot",
+      "required": true,
+      "description": "Desktop screenshot or mockup evidence for the reviewed state."
+    },
+    {
+      "id": "mobile_screenshot",
+      "required": true,
+      "description": "Mobile screenshot or mockup evidence for the reviewed state."
+    },
+    {
+      "id": "source_excerpts",
+      "required": true,
+      "description": "Bounded component, style, and state-management source excerpts."
+    },
+    {
+      "id": "interaction_state_evidence",
+      "required": false,
+      "description": "Evidence for loading, empty, error, disabled, selected, and success states when applicable."
+    }
+  ],
+  "forbidden_assumptions": [
+    "Do not claim responsive quality without viewport-specific evidence.",
+    "Do not replace existing component or style conventions without an explicit reason.",
+    "Do not hide required states behind explanatory text instead of rendering them.",
+    "Do not rely on color alone for status, selection, or destructive actions."
+  ],
+  "review_dimensions": [
+    "layout_hierarchy",
+    "component_convention_fit",
+    "responsive_constraints",
+    "state_coverage",
+    "accessibility_basics",
+    "copy_and_terminology",
+    "screenshot_evidence",
+    "interaction_affordance"
+  ],
+  "finding_fields": [
+    "finding_id",
+    "severity",
+    "dimension",
+    "summary",
+    "evidence_refs",
+    "recommendation",
+    "acceptance_impact",
+    "backlog_conversion_hints"
+  ],
+  "severity_values": [
+    "info",
+    "minor",
+    "major",
+    "critical"
+  ],
+  "gate_decisions": [
+    "pass",
+    "pass_with_followups",
+    "block"
+  ],
+  "output_schema": {
+    "type": "object",
+    "required": [
+      "gate_decision",
+      "findings"
+    ],
+    "properties": {
+      "gate_decision": {
+        "enum": [
+          "pass",
+          "pass_with_followups",
+          "block"
+        ]
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "finding_id",
+            "severity",
+            "dimension",
+            "summary",
+            "evidence_refs",
+            "recommendation",
+            "acceptance_impact",
+            "backlog_conversion_hints"
+          ]
+        }
+      }
+    }
+  },
+  "backlog_conversion_hints": {
+    "allowed_actions": [
+      "none",
+      "acceptance_criteria",
+      "follow_up_backlog"
+    ],
+    "default_action": "acceptance_criteria",
+    "acceptance_criteria_template": "Add a criterion that names the viewport, UI state, and screenshot evidence required before close.",
+    "follow_up_backlog_template": {
+      "title_prefix": "UI implementation follow-up: ",
+      "priority_guidance": "Use P1 when the finding blocks core task completion, otherwise inherit the parent priority."
+    }
+  }
+}

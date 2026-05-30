@@ -35,7 +35,10 @@ def _template_paths(template_dir: str | Path = DEFAULT_TEMPLATE_DIR) -> list[Pat
     root = Path(template_dir)
     if not root.exists():
         return []
-    return sorted(root.glob("*.json"), key=lambda item: item.name)
+    return sorted(
+        (path for path in root.glob("*.json") if not path.name.endswith(".schema.json")),
+        key=lambda item: item.name,
+    )
 
 
 def _load_json(path: Path) -> dict[str, Any]:

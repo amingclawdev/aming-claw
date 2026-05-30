@@ -1,0 +1,141 @@
+{
+  "schema_version": "review_pack.v1",
+  "template_id": "qa_evidence_gate_review.v1",
+  "version": "v1",
+  "contract_kind": "review_pack",
+  "description": "Review close-gate evidence for focused tests, fixtures, browser or E2E proof, contract checks, and unresolved risk.",
+  "review_pack": {
+    "kind": "expert_review_pack",
+    "domain": "qa_evidence_gate",
+    "purpose": "Gate close readiness on explicit verification and repeatable evidence."
+  },
+  "task_types": [
+    "qa",
+    "testing",
+    "evidence_gate",
+    "manual_fix"
+  ],
+  "stages": [
+    "pre_implementation_test_plan",
+    "post_implementation_verification",
+    "pre_close_gate"
+  ],
+  "source": {
+    "type": "source_controlled",
+    "path": "agent/governance/contract_templates/qa_evidence_gate_review.v1.json"
+  },
+  "required_inputs": [
+    "backlog_id",
+    "acceptance_criteria",
+    "changed_files",
+    "test_commands",
+    "test_results",
+    "fixture_paths",
+    "evidence_refs",
+    "e2e_decision",
+    "known_risks"
+  ],
+  "artifact_refs": [
+    {
+      "id": "test_command_output",
+      "required": true,
+      "description": "Focused command output with pass, fail, or skipped state."
+    },
+    {
+      "id": "fixture_refs",
+      "required": true,
+      "description": "Fixture paths or fixture generation evidence used by the tests."
+    },
+    {
+      "id": "contract_validation_output",
+      "required": false,
+      "description": "Schema, contract, or precheck validation output when the task emits structured data."
+    },
+    {
+      "id": "browser_or_e2e_evidence",
+      "required": false,
+      "description": "Screenshot, trace, or deferred row for UI or workflow paths."
+    }
+  ],
+  "forbidden_assumptions": [
+    "Do not treat an unrun test plan as verification evidence.",
+    "Do not remove or weaken failing coverage to make a close gate pass.",
+    "Do not claim browser or E2E behavior from source inspection alone.",
+    "Do not ignore fixture cleanup, generated state, or skipped tests when they affect repeatability."
+  ],
+  "review_dimensions": [
+    "acceptance_coverage",
+    "focused_test_fit",
+    "fixture_integrity",
+    "browser_or_e2e_evidence",
+    "contract_validation",
+    "regression_scope",
+    "close_gate_readiness"
+  ],
+  "finding_fields": [
+    "finding_id",
+    "severity",
+    "dimension",
+    "summary",
+    "evidence_refs",
+    "recommendation",
+    "acceptance_impact",
+    "backlog_conversion_hints"
+  ],
+  "severity_values": [
+    "info",
+    "minor",
+    "major",
+    "critical"
+  ],
+  "gate_decisions": [
+    "pass",
+    "pass_with_followups",
+    "block"
+  ],
+  "output_schema": {
+    "type": "object",
+    "required": [
+      "gate_decision",
+      "findings"
+    ],
+    "properties": {
+      "gate_decision": {
+        "enum": [
+          "pass",
+          "pass_with_followups",
+          "block"
+        ]
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "finding_id",
+            "severity",
+            "dimension",
+            "summary",
+            "evidence_refs",
+            "recommendation",
+            "acceptance_impact",
+            "backlog_conversion_hints"
+          ]
+        }
+      }
+    }
+  },
+  "backlog_conversion_hints": {
+    "allowed_actions": [
+      "none",
+      "acceptance_criteria",
+      "follow_up_backlog"
+    ],
+    "default_action": "follow_up_backlog",
+    "acceptance_criteria_template": "Add a criterion that names the required verification command and evidence reference.",
+    "follow_up_backlog_template": {
+      "title_prefix": "QA evidence follow-up: ",
+      "priority_guidance": "Use P1 when missing evidence blocks close, otherwise inherit the parent priority."
+    }
+  }
+}

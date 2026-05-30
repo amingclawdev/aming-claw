@@ -158,6 +158,29 @@ def test_malformed_template_raises_explicit_error(tmp_path):
         list_contract_templates(template_dir=tmp_path)
 
 
+def test_schema_json_files_are_not_loaded_as_templates(tmp_path):
+    (tmp_path / "review_pack.schema.json").write_text(
+        json.dumps({"$schema": "https://json-schema.org/draft/2020-12/schema"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "valid.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "test_contract_template.v1",
+                "template_id": "valid.v1",
+                "version": "v1",
+                "task_types": ["task"],
+                "stages": ["review_ready"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    templates = list_contract_templates(template_dir=tmp_path)
+
+    assert [template["template_id"] for template in templates] == ["valid.v1"]
+
+
 def _write_template(tmp_path, payload):
     path = tmp_path / "routes.v1.json"
     base = {

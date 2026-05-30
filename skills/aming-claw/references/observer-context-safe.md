@@ -1,7 +1,7 @@
 # Observer-Safe Expertise Routing
 
 This reference is safe to include in public skills and worker-adjacent docs. It
-does not include private strategy or founder-specific reasoning. It describes
+does not include private strategy or local-only reasoning. It describes
 how an observer should turn specialized judgment into governed work.
 
 ## Operating Rule
@@ -15,12 +15,16 @@ contract requirements.
 
 1. Identify the surface being judged: product UX, onboarding, demo credibility,
    architecture, security, evidence integrity, or documentation clarity.
-2. Resolve the matching review context or contract template.
+2. Resolve the matching review context or contract template. For development
+   work, prefer the source-controlled review packs for architecture/data
+   continuity, frontend/UI implementation, or QA evidence gate when those
+   domains apply.
 3. Provide concrete artifacts: screenshots, URLs, source files, backlog rows,
    timeline events, graph traces, or reproduced errors.
 4. Require structured findings with severity, evidence references, user impact,
    recommendation, and acceptance impact.
-5. Keep the expert review separate from implementation. Review first, then
+5. Validate the review output before using it for gates or backlog conversion.
+6. Keep the expert review separate from implementation. Review first, then
    patch from accepted findings.
 
 ## Ordinary-User Product Bias

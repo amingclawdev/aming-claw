@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amingclaw.dev/schemas/review_pack.v1.schema.json",
+  "title": "Aming Claw Review Pack",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "template_id",
+    "version",
+    "contract_kind",
+    "task_types",
+    "stages",
+    "required_inputs",
+    "artifact_refs",
+    "forbidden_assumptions",
+    "review_dimensions",
+    "output_schema",
+    "finding_fields",
+    "severity_values",
+    "gate_decisions",
+    "backlog_conversion_hints"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "template_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "contract_kind": {
+      "const": "review_pack"
+    },
+    "description": {
+      "type": "string"
+    },
+    "task_types": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required_inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "artifact_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "forbidden_assumptions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "review_dimensions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "output_schema": {
+      "type": "object"
+    },
+    "finding_fields": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "severity_values": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "gate_decisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "backlog_conversion_hints": {
+      "type": "object",
+      "required": ["allowed_actions"],
+      "properties": {
+        "allowed_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "default_action": {
+          "type": "string"
+        },
+        "acceptance_criteria_template": {
+          "type": "string"
+        },
+        "follow_up_backlog_template": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

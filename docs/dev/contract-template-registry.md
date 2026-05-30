@@ -43,8 +43,10 @@ Templates are JSON files in:
 agent/governance/contract_templates
 ```
 
-The registry loads every `*.json` file deterministically, validates the basic
-contract metadata, and sorts templates by `template_id`.
+The registry loads every `*.json` template file deterministically, validates the
+basic contract metadata, and sorts templates by `template_id`. Files ending in
+`.schema.json` are skipped so source-controlled schema artifacts can live next
+to executable templates without being loaded as templates.
 
 Required metadata:
 
@@ -78,9 +80,27 @@ The MCP dispatcher resolves templates in process:
   version.
 - `ue_audit_validate`: validate UE audit inputs and output against
   `ue_audit.v1`.
+- `review_pack_list`: list source-controlled expert review packs.
+- `review_pack_get`: fetch an exact versioned review pack.
+- `review_pack_resolve`: resolve a review pack by id, task type, stage, or
+  version.
+- `review_pack_validate_output`: validate a review output against its pack.
 
 The MCP tools intentionally do not mutate templates. Template changes require a
 source-controlled code review.
+
+## Review Packs
+
+Review packs are a specialized contract-template shape documented in
+`docs/dev/review-contract-packs.md`. They declare required review inputs,
+artifact references, forbidden assumptions, review dimensions, output fields,
+severity values, gate decisions, and backlog conversion hints.
+
+The first V1 development packs are:
+
+- `architecture_data_continuity_review.v1`
+- `frontend_ui_implementation_review.v1`
+- `qa_evidence_gate_review.v1`
 
 ## Deferred Work
 
