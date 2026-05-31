@@ -12,6 +12,10 @@ from agent.governance.contract_template_registry import (
     ContractTemplateError,
     get_contract_template,
 )
+from agent.governance.mf_subagent_contract import (
+    MfSubagentContractError,
+    validate_route_token_mutation_gate,
+)
 from agent.governance.service_registry import (
     ServiceDescriptor,
     ServiceRegistry,
@@ -23,6 +27,17 @@ from agent.governance.service_registry import (
 SERVICE_ROUTE_EVIDENCE_SCHEMA_VERSION = "service_route_evidence.v1"
 SERVICE_ROUTE_PASS_STATUS = "passed"
 SERVICE_ROUTE_BLOCK_STATUS = "blocked"
+SERVICE_ROUTE_CONTEXT_GATE_ACTION = "service_route"
+ROUTE_CONTEXT_GATE_EXEMPT_SERVICE_IDS = {
+    "route.prompt_alert_bundle",
+    "route.action_precheck",
+}
+_ROUTE_CONTEXT_GATE_KEYS = (
+    "route_token",
+    "route_waiver",
+    "route_token_waiver",
+    "protected_route_waiver",
+)
 
 
 def route_event(
@@ -175,6 +190,20 @@ class ServiceRouter:
 
         merged = _merge_descriptor_route(descriptor, service_route, event_route)
         idempotency_key = _idempotency_key(event, contract, merged, route_id, service_id)
+        route_context_gate = _validate_service_route_context_gate(event, service_id=service_id)
+        if route_context_gate.get("allowed") is False:
+            return _with_route_evidence({
+                "route_id": route_id,
+                "service_id": service_id,
+                "mode": merged["mode"],
+                "side_effect_class": merged["side_effect_class"],
+                "side_effect": merged["side_effect_class"],
+                "decision": "block",
+                "status": "route_context_token_required",
+                "reason": _string(route_context_gate.get("reason")),
+                "idempotency_key": idempotency_key,
+                "result": {"route_context_gate": route_context_gate},
+            }, event=event, event_route=event_route, service_route=service_route)
         permission_check = _permission_check(event, contract, merged)
         if permission_check:
             return _with_route_evidence({
@@ -210,6 +239,7 @@ class ServiceRouter:
                 "ok": True,
                 "summary": f"{service_id} allowed for {_event_kind(event)}",
             }
+        result_summary = _with_route_context_gate_result(result_summary, route_context_gate)
         gate_block = _gate_result_block(result_summary, merged)
         if gate_block:
             return _with_route_evidence({
@@ -355,6 +385,83 @@ def _gate_result_block(
     }
 
 
+def _validate_service_route_context_gate(
+    event: Mapping[str, Any],
+    *,
+    service_id: str,
+) -> dict[str, Any]:
+    if service_id in ROUTE_CONTEXT_GATE_EXEMPT_SERVICE_IDS:
+        return {"allowed": True, "status": "exempt", "action": SERVICE_ROUTE_CONTEXT_GATE_ACTION}
+    payload = _route_context_gate_payload(event)
+    try:
+        gate = validate_route_token_mutation_gate(
+            payload,
+            action=SERVICE_ROUTE_CONTEXT_GATE_ACTION,
+            project_id=_event_scope_value(event, "project_id"),
+            backlog_id=_event_scope_value(event, "backlog_id"),
+            task_id=_event_scope_value(event, "task_id"),
+        )
+    except MfSubagentContractError as exc:
+        return {
+            "allowed": False,
+            "status": "route_context_token_required",
+            "action": SERVICE_ROUTE_CONTEXT_GATE_ACTION,
+            "decision": "block",
+            "reason": str(exc),
+            "required_route_token": True,
+        }
+    return _with_route_context_identity(gate, payload)
+
+
+def _route_context_gate_payload(event: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _mapping(event.get("payload"))
+    out: dict[str, Any] = {}
+    for key in _ROUTE_CONTEXT_GATE_KEYS:
+        value = event.get(key)
+        if value in (None, "", {}, []):
+            value = payload.get(key)
+        if value not in (None, "", {}, []):
+            out[key] = value
+    return out
+
+
+def _event_scope_value(event: Mapping[str, Any], key: str) -> str:
+    payload = _mapping(event.get("payload"))
+    return _string(event.get(key) or payload.get(key))
+
+
+def _with_route_context_identity(
+    gate: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    out = dict(gate)
+    source = _mapping(payload.get("route_token")) or _mapping(
+        payload.get("route_waiver")
+        or payload.get("route_token_waiver")
+        or payload.get("protected_route_waiver")
+    )
+    for key in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+        value = _string(out.get(key) or source.get(key))
+        if value:
+            out[key] = value
+    return out
+
+
+def _with_route_context_gate_result(
+    result: Mapping[str, Any],
+    gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not gate or gate.get("status") == "exempt":
+        return dict(result)
+    out = dict(result)
+    out.setdefault("route_context_gate", dict(gate))
+    for key in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+        value = _string(gate.get(key))
+        if value and not _string(out.get(key)):
+            out[key] = value
+    return out
+
+
 def _with_route_evidence(
     route_result: dict[str, Any],
     *,
@@ -444,6 +551,7 @@ def _route_prompt_identity(result: Mapping[str, Any]) -> dict[str, Any]:
     bundle = _mapping(result.get("route_prompt_bundle") or result.get("bundle"))
     hashes = _mapping(result.get("hashes"))
     action_gate = _mapping(result.get("route_action_gate"))
+    route_context_gate = _mapping(result.get("route_context_gate"))
     prompt_contract = _mapping(bundle.get("prompt_contract"))
     visible_manifest = _mapping(bundle.get("visible_injection_manifest"))
     identity = {
@@ -452,17 +560,20 @@ def _route_prompt_identity(result: Mapping[str, Any]) -> dict[str, Any]:
             or bundle.get("route_context_hash")
             or hashes.get("route_context_hash")
             or action_gate.get("route_context_hash")
+            or route_context_gate.get("route_context_hash")
         ),
         "prompt_contract_id": _string(
             result.get("prompt_contract_id")
             or prompt_contract.get("prompt_contract_id")
             or action_gate.get("prompt_contract_id")
+            or route_context_gate.get("prompt_contract_id")
         ),
         "prompt_contract_hash": _string(
             result.get("prompt_contract_hash")
             or bundle.get("prompt_contract_hash")
             or hashes.get("prompt_contract_hash")
             or action_gate.get("prompt_contract_hash")
+            or route_context_gate.get("prompt_contract_hash")
         ),
     }
     if visible_manifest:
@@ -573,7 +684,7 @@ def _normalize_timeline_event(timeline_event: Mapping[str, Any]) -> dict[str, An
     payload = _mapping(timeline_event.get("payload"))
     event_id = timeline_event.get("id") or timeline_event.get("event_id") or ""
     phase = _string(timeline_event.get("phase"))
-    return {
+    event = {
         "event_id": str(event_id),
         "source_event_id": str(event_id),
         "event_kind": _string(timeline_event.get("event_type")),
@@ -589,6 +700,11 @@ def _normalize_timeline_event(timeline_event: Mapping[str, Any]) -> dict[str, An
         "artifact_refs": _mapping(timeline_event.get("artifact_refs")),
         "trace_id": _string(timeline_event.get("trace_id")),
     }
+    for key in _ROUTE_CONTEXT_GATE_KEYS:
+        value = timeline_event.get(key)
+        if value not in (None, "", {}, []):
+            event[key] = value
+    return event
 
 
 def _resolve_timeline_contract(

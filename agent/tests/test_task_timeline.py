@@ -43,9 +43,9 @@ def _ctx(query=None, *, path_params=None, body=None, method="GET"):
 
 
 ROUTE_IDENTITY = {
-    "route_context_hash": "sha256:test-route-context",
-    "prompt_contract_id": "prompt-contract-test",
-    "prompt_contract_hash": "sha256:test-prompt-contract",
+    "route_context_hash": "sha256:4920bc6ece43e5166504c5c91d8e657eb4bf7490eb85df81d668b6ea60f6a927",
+    "prompt_contract_id": "rprompt-ac-service-route-context-gate-20260531",
+    "prompt_contract_hash": "sha256:e96ff2d045d64d1578145c9ec1457ff0a3b220b6dfdfe35c331dff620a3e0e3a",
 }
 
 
@@ -107,6 +107,25 @@ def _route_context_consumption_events():
     ]
 
 
+def _route_context_qa_verification_event():
+    return {
+        "event_kind": "qa_verification",
+        "phase": "verification",
+        "status": "passed",
+        "event_id": "tl-qa-verification",
+        "verification": {
+            **ROUTE_IDENTITY,
+            "contract_evidence": [
+                {
+                    "requirement_id": "independent_verification_lane",
+                    "status": "passed",
+                    "reviewer_role": "qa",
+                }
+            ],
+        },
+    }
+
+
 def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", project_id="proj"):
     scope = {"project_id": project_id, "backlog_id": bug_id}
     if task_id:
@@ -114,6 +133,7 @@ def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", 
     return {
         "route_context_hash": f"sha256:test-route-context-{action}",
         "prompt_contract_id": f"prompt-contract-{action}",
+        "prompt_contract_hash": f"sha256:test-prompt-contract-{action}",
         "caller_role": "observer",
         "allowed_action": action,
         "scope": scope,
@@ -204,25 +224,27 @@ class TestTaskTimeline(unittest.TestCase):
         from agent.governance import server
         from agent.governance.errors import GovernanceError
 
-        with self.assertRaises(GovernanceError) as raised:
-            server.handle_task_timeline_append(
-                _ctx(
-                    body={
-                        "backlog_id": "BUG-TL-PROTECTED",
-                        "event_type": "mf.implementation",
-                        "event_kind": "implementation",
-                        "status": "accepted",
-                    },
-                    method="POST",
-                )
-            )
+        for event_kind in ("implementation", "qa_verification", "independent_verification"):
+            with self.subTest(event_kind=event_kind):
+                with self.assertRaises(GovernanceError) as raised:
+                    server.handle_task_timeline_append(
+                        _ctx(
+                            body={
+                                "backlog_id": "BUG-TL-PROTECTED",
+                                "event_type": f"mf.{event_kind}",
+                                "event_kind": event_kind,
+                                "status": "accepted",
+                            },
+                            method="POST",
+                        )
+                    )
 
-        self.assertEqual(raised.exception.code, "route_token_required")
-        count = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
-            ("BUG-TL-PROTECTED",),
-        ).fetchone()["c"]
-        self.assertEqual(count, 0)
+                self.assertEqual(raised.exception.code, "route_token_required")
+                count = self.conn.execute(
+                    "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+                    ("BUG-TL-PROTECTED",),
+                ).fetchone()["c"]
+                self.assertEqual(count, 0)
 
     def test_timeline_append_rejects_generic_waiver_without_route_identity(self):
         from agent.governance import server
@@ -391,7 +413,7 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual([event["task_id"] for event in events], ["task-a", "task-b"])
         self.assertEqual({event["backlog_id"] for event in events}, {"BUG-A"})
 
-    def test_task_completed_timeline_event_routes_contract_services(self):
+    def test_task_completed_timeline_event_without_route_token_records_blocked_services(self):
         from agent.governance import task_timeline
 
         self._insert_router_backlog()
@@ -426,7 +448,63 @@ class TestTaskTimeline(unittest.TestCase):
             "review.recommendations",
             {event["payload"]["service_id"] for event in routed},
         )
+        self.assertEqual({event["event_type"] for event in routed}, {"service.route.blocked"})
+        self.assertEqual(
+            {event["payload"]["status"] for event in routed},
+            {"route_context_token_required"},
+        )
+
+    def test_timeline_append_preserves_top_level_route_token_for_service_router(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-SERVICE-ROUTER-TOKEN"
+        task_id = "task-router-token"
+        self._insert_router_backlog(bug_id=bug_id)
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                method="POST",
+                body={
+                    "task_id": task_id,
+                    "backlog_id": bug_id,
+                    "event_type": "task.completed",
+                    "actor": "worker",
+                    "status": "succeeded",
+                    "payload": {"task_type": "dev"},
+                    "route_token": _route_token(
+                        "service_route",
+                        bug_id=bug_id,
+                        task_id=task_id,
+                    ),
+                },
+            )
+        )
+        self.conn.commit()
+
+        source = task_timeline.list_events(
+            self.conn,
+            "proj",
+            task_id=task_id,
+            backlog_id=bug_id,
+        )[0]
+        routed = task_timeline.list_events(
+            self.conn,
+            "proj",
+            parent_event_id=result["id"],
+            event_kind="service_route",
+        )
+
+        self.assertIn("route_token", source["payload"])
+        self.assertGreaterEqual(len(routed), 2)
         self.assertEqual({event["event_type"] for event in routed}, {"service.route.completed"})
+        self.assertEqual({event["payload"]["decision"] for event in routed}, {"allow"})
+        self.assertTrue(
+            all(
+                event["payload"]["route_evidence"]["route_context_hash"]
+                == "sha256:test-route-context-service_route"
+                for event in routed
+            )
+        )
 
     def test_ai_validated_timeline_route_persists_contract_evidence(self):
         from agent.governance import task_timeline
@@ -468,7 +546,15 @@ class TestTaskTimeline(unittest.TestCase):
             event_type="ai.structured_output.validated",
             actor="ai-fixture",
             status="passed",
-            payload={"producer": "fixture", "validated": True},
+            payload={
+                "producer": "fixture",
+                "validated": True,
+                "route_token": _route_token(
+                    "service_route",
+                    bug_id=bug_id,
+                    task_id="task-ai-route",
+                ),
+            },
         )
         self.conn.commit()
 
@@ -529,7 +615,12 @@ class TestTaskTimeline(unittest.TestCase):
                     "source": "dashboard",
                     "command_type": "analyze_requirements",
                     "command_id": "cmd-1",
-                }
+                },
+                "route_token": _route_token(
+                    "service_route",
+                    bug_id=bug_id,
+                    task_id="task-reminder-echo",
+                ),
             },
         )
         self.conn.commit()
@@ -937,6 +1028,7 @@ class TestTaskTimeline(unittest.TestCase):
             [
                 *base_events,
                 *_route_context_consumption_events(),
+                _route_context_qa_verification_event(),
                 {
                     "event_kind": "verification",
                     "phase": "integration",
@@ -989,6 +1081,7 @@ class TestTaskTimeline(unittest.TestCase):
                 "route_action_precheck",
                 "bounded_implementation_worker_dispatch",
                 "mf_subagent_startup",
+                "independent_verification_lane",
             ],
         )
 
@@ -1005,8 +1098,23 @@ class TestTaskTimeline(unittest.TestCase):
         )
         self.assertFalse(advisory_only["passed"], advisory_only)
 
-        ready = task_timeline.mf_close_gate_verification(
+        ordinary_verification_only = task_timeline.mf_close_gate_verification(
             [*base_events, *_route_context_consumption_events()],
+            contract=contract,
+        )
+
+        self.assertFalse(ordinary_verification_only["passed"], ordinary_verification_only)
+        self.assertEqual(
+            ordinary_verification_only["route_context_gate"]["missing_requirement_ids"],
+            ["independent_verification_lane"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                *_route_context_consumption_events(),
+                _route_context_qa_verification_event(),
+            ],
             contract=contract,
         )
 
@@ -1018,7 +1126,64 @@ class TestTaskTimeline(unittest.TestCase):
                 "route_action_precheck",
                 "bounded_implementation_worker_dispatch",
                 "mf_subagent_startup",
+                "independent_verification_lane",
             ],
+        )
+
+    def test_mf_parallel_close_gate_requires_matching_qa_lane(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-QA-LANE",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            ["independent_verification_lane"],
+        )
+
+        wrong_identity = _route_context_qa_verification_event()
+        wrong_identity["verification"]["prompt_contract_hash"] = "sha256:wrong"
+        mismatch = task_timeline.mf_close_gate_verification(
+            [*base_events, wrong_identity],
+            contract=contract,
+        )
+        self.assertFalse(mismatch["passed"], mismatch)
+        self.assertIn(
+            "route_identity_mismatch",
+            mismatch["route_context_gate"]["missing_requirement_ids"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [*base_events, _route_context_qa_verification_event()],
+            contract=contract,
+        )
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(
+            ready["route_context_gate"]["evidence_events"][
+                "independent_verification_lane"
+            ][0]["event_kind"],
+            "qa_verification",
         )
 
     def test_mf_parallel_close_gate_rejects_route_identity_mismatch(self):
@@ -1120,6 +1285,7 @@ class TestTaskTimeline(unittest.TestCase):
             [
                 *base_events,
                 *_route_context_consumption_events(),
+                _route_context_qa_verification_event(),
                 {
                     "event_kind": "verification",
                     "phase": "integration",
@@ -1490,7 +1656,10 @@ class TestTaskTimeline(unittest.TestCase):
                 ]
             },
         )
-        for event in _route_context_consumption_events():
+        for event in [
+            *_route_context_consumption_events(),
+            _route_context_qa_verification_event(),
+        ]:
             task_timeline.record_event(
                 self.conn,
                 project_id="proj",

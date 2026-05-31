@@ -41,6 +41,70 @@ def _service_route(
     }
 
 
+def _route_token(
+    *,
+    action="service_route",
+    project_id="",
+    backlog_id="",
+    task_id="",
+):
+    scope = {}
+    if project_id:
+        scope["project_id"] = project_id
+    if backlog_id:
+        scope["backlog_id"] = backlog_id
+    if task_id:
+        scope["task_id"] = task_id
+    return {
+        "route_context_hash": "sha256:test-route-context",
+        "prompt_contract_id": "rprompt-test-service-route",
+        "prompt_contract_hash": "sha256:test-prompt-contract",
+        "caller_role": "mf_sub",
+        "allowed_action": action,
+        "scope": scope,
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:test-service-route-token"],
+    }
+
+
+def _route_waiver(
+    *,
+    action="service_route",
+    project_id="",
+    backlog_id="",
+    task_id="",
+):
+    scope = {}
+    if project_id:
+        scope["project_id"] = project_id
+    if backlog_id:
+        scope["backlog_id"] = backlog_id
+    if task_id:
+        scope["task_id"] = task_id
+    return {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "route_context_hash": "sha256:test-route-waiver-context",
+        "prompt_contract_id": "rprompt-test-service-route-waiver",
+        "prompt_contract_hash": "sha256:test-waiver-prompt-contract",
+        "caller_role": "observer",
+        "allowed_action": action,
+        "scope": scope,
+        "reason": "Unit test accepts a bounded route context waiver.",
+        "timeline_evidence": {"event_id": "timeline:test-route-waiver"},
+    }
+
+
+def _with_route_token(event):
+    out = dict(event)
+    out["route_token"] = _route_token(
+        project_id=out.get("project_id", ""),
+        backlog_id=out.get("backlog_id", ""),
+        task_id=out.get("task_id", ""),
+    )
+    return out
+
+
 def test_unmatched_event_returns_no_op():
     result = route_event({"event_kind": "task.started"}, _contract())
 
@@ -64,13 +128,13 @@ def test_preview_route_allows_and_runs_default_handler():
     )
 
     result = route_event(
-        {
+        _with_route_token({
             "event_id": "evt-1",
             "event_kind": "task.completed",
             "stage": "review_ready",
             "task_id": "task-1",
             "backlog_id": "bug-1",
-        },
+        }),
         contract,
     )
 
@@ -80,6 +144,13 @@ def test_preview_route_allows_and_runs_default_handler():
     assert result["routes"][0]["side_effect_class"] == "read"
     assert result["routes"][0]["side_effect"] == "read"
     assert result["routes"][0]["result"]["service_id"] == "test_governance.preview"
+    assert result["routes"][0]["evidence"]["route_context_hash"] == "sha256:test-route-context"
+    assert result["routes"][0]["evidence"]["prompt_contract_id"] == (
+        "rprompt-test-service-route"
+    )
+    assert result["routes"][0]["evidence"]["prompt_contract_hash"] == (
+        "sha256:test-prompt-contract"
+    )
     assert result["routes"][0]["requirement_ids"] == []
     assert result["routes"][0]["contract_evidence"] == []
 
@@ -104,13 +175,13 @@ def test_ai_validated_event_route_exposes_declared_contract_evidence():
     )
 
     result = route_event(
-        {
+        _with_route_token({
             "event_id": "evt-ai-validated",
             "event_kind": "ai.structured_output.validated",
             "stage": "review_ready",
             "task_id": "task-ai",
             "backlog_id": "BUG-AI",
-        },
+        }),
         contract,
     )
 
@@ -145,13 +216,13 @@ def test_route_stages_array_matches_current_event_stage():
     )
 
     result = route_event(
-        {
+        _with_route_token({
             "event_id": "evt-1",
             "event_kind": "task.completed",
             "stage": "waiting_merge",
             "task_id": "task-1",
             "backlog_id": "bug-1",
-        },
+        }),
         contract,
     )
 
@@ -178,6 +249,83 @@ def test_unknown_service_blocks():
     assert "missing.service" in result["routes"][0]["reason"]
 
 
+def test_non_route_service_without_route_token_blocks_before_handler():
+    calls = []
+
+    def handler(event, route_context):
+        calls.append((event, route_context))
+        return {"ok": True}
+
+    registry = ServiceRegistry({
+        "custom.preview": ServiceDescriptor(
+            service_id="custom.preview",
+            mode="preview",
+            side_effect="read",
+            supported_events=("custom.requested",),
+            handler=handler,
+        )
+    })
+    contract = _contract(
+        service_routes=[_service_route(service_id="custom.preview")],
+        event_routes=[
+            {
+                "route_id": "event.custom.preview",
+                "event_kind": "custom.requested",
+                "service_route_id": "service.custom.preview",
+                "enabled": True,
+            }
+        ],
+    )
+
+    result = route_event(
+        {"event_id": "evt-custom", "event_kind": "custom.requested"},
+        contract,
+        registry=registry,
+    )
+
+    route = result["routes"][0]
+    assert calls == []
+    assert result["decision"] == "block"
+    assert route["decision"] == "block"
+    assert route["status"] == "route_context_token_required"
+    assert route["evidence"]["route_status"] == "route_context_token_required"
+    assert route["result"]["route_context_gate"]["action"] == "service_route"
+
+
+def test_non_route_service_with_accepted_route_waiver_allows():
+    contract = _contract(
+        service_routes=[_service_route()],
+        event_routes=[
+            {
+                "route_id": "event.task_completed.preview",
+                "event_kind": "task.completed",
+                "service_route_id": "service.test_governance.preview",
+                "enabled": True,
+            }
+        ],
+    )
+    event = {
+        "event_id": "evt-waiver",
+        "event_kind": "task.completed",
+        "project_id": "demo",
+        "task_id": "task-waiver",
+        "backlog_id": "BUG-WAIVER",
+        "route_waiver": _route_waiver(
+            project_id="demo",
+            backlog_id="BUG-WAIVER",
+            task_id="task-waiver",
+        ),
+    }
+
+    result = route_event(event, contract)
+
+    route = result["routes"][0]
+    assert result["decision"] == "allow"
+    assert route["status"] == "allowed"
+    assert route["result"]["route_context_gate"]["decision"] == "route_waiver"
+    assert route["evidence"]["route_context_hash"] == "sha256:test-route-waiver-context"
+
+
 def test_apply_route_without_permission_blocks():
     contract = _contract(
         service_routes=[
@@ -198,11 +346,49 @@ def test_apply_route_without_permission_blocks():
         ],
     )
 
-    result = route_event({"event_kind": "cleanup.requested", "event_id": "evt-2"}, contract)
+    result = route_event(
+        _with_route_token({"event_kind": "cleanup.requested", "event_id": "evt-2"}),
+        contract,
+    )
 
     assert result["decision"] == "block"
     assert result["routes"][0]["status"] == "permission_blocked"
     assert "cleanup.apply" in result["routes"][0]["reason"]
+
+
+def test_apply_route_with_permission_but_no_route_token_blocks():
+    contract = _contract(
+        service_routes=[
+            _service_route(
+                service_id="cleanup.apply",
+                mode="apply",
+                side_effect_class="write",
+                required_permissions=["cleanup.apply"],
+            )
+        ],
+        event_routes=[
+            {
+                "route_id": "event.cleanup.apply",
+                "event_kind": "cleanup.requested",
+                "service_route_id": "service.cleanup.apply",
+                "enabled": True,
+            }
+        ],
+    )
+
+    result = route_event(
+        {
+            "event_kind": "cleanup.requested",
+            "event_id": "evt-cleanup-tokenless",
+            "permissions": ["cleanup.apply"],
+        },
+        contract,
+    )
+
+    route = result["routes"][0]
+    assert result["decision"] == "block"
+    assert route["status"] == "route_context_token_required"
+    assert route["result"]["route_context_gate"]["action"] == "service_route"
 
 
 def test_apply_route_with_explicit_permission_allows():
@@ -226,11 +412,11 @@ def test_apply_route_with_explicit_permission_allows():
     )
 
     result = route_event(
-        {
+        _with_route_token({
             "event_kind": "cleanup.requested",
             "event_id": "evt-2",
             "permissions": ["cleanup.apply"],
-        },
+        }),
         contract,
     )
 
@@ -276,7 +462,7 @@ def test_gate_route_explicit_handler_block_becomes_route_block():
     )
 
     result = route_event(
-        {"event_id": "evt-gate-block", "event_kind": "precheck.requested"},
+        _with_route_token({"event_id": "evt-gate-block", "event_kind": "precheck.requested"}),
         contract,
         registry=registry,
     )
@@ -309,6 +495,7 @@ def test_idempotency_key_is_stable_for_same_event_and_route():
         "task_id": "task-1",
         "backlog_id": "bug-1",
     }
+    event = _with_route_token(event)
 
     first = route_event(event, contract)
     second = route_event(dict(event), contract)
@@ -331,7 +518,10 @@ def test_legacy_side_effect_alias_still_routes():
         ],
     )
 
-    result = route_event({"event_kind": "task.completed", "event_id": "evt-legacy"}, contract)
+    result = route_event(
+        _with_route_token({"event_kind": "task.completed", "event_id": "evt-legacy"}),
+        contract,
+    )
 
     assert result["decision"] == "allow"
     assert result["routes"][0]["side_effect_class"] == "read"
@@ -360,7 +550,7 @@ def test_observer_reminder_echo_route_returns_only_safe_reminder_fields():
     )
 
     result = route_event(
-        {
+        _with_route_token({
             "event_id": "evt-reminder",
             "event_kind": "observer.command.notified",
             "project_id": "demo",
@@ -381,7 +571,7 @@ def test_observer_reminder_echo_route_returns_only_safe_reminder_fields():
                     "command_id": "cmd-1",
                 }
             },
-        },
+        }),
         contract,
     )
 

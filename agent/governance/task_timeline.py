@@ -118,6 +118,7 @@ MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS = (
     "bounded_implementation_worker_dispatch",
     "mf_subagent_startup",
 )
+MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID = "independent_verification_lane"
 MF_ROUTE_CONTEXT_PASS_STATUSES = {
     *MF_CLOSE_PASS_STATUSES,
     "allow",
@@ -140,6 +141,7 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
         tokens.add(event_type)
         tokens.update(part for part in re.split(r"[._:/]+", event_type) if part)
     protected = {item.lower().replace("-", "_") for item in MF_CLOSE_REQUIRED_EVENT_KINDS}
+    protected.update({"independent_verification", "qa_verification"})
     return bool(tokens & protected)
 
 
@@ -731,6 +733,37 @@ def _route_context_required(topology_policy: dict[str, Any]) -> bool:
     )
 
 
+def _route_marker(value: Any) -> str:
+    return re.sub(r"[\s.\-]+", "_", str(value or "").strip().lower())
+
+
+def _route_independent_verification_required(topology_policy: dict[str, Any]) -> bool:
+    required_lanes: set[str] = set()
+    for item in _list(topology_policy.get("required_lanes")):
+        if isinstance(item, dict):
+            required_lanes.update(
+                _route_marker(item.get(key))
+                for key in ("id", "requirement_id", "role", "lane", "kind", "type", "name")
+                if item.get(key)
+            )
+        else:
+            required_lanes.add(_route_marker(item))
+    return bool(topology_policy.get("independent_verification_required")) or bool(
+        required_lanes.intersection(
+            {
+                "independent_verification_lane",
+                "independent_verification",
+                "qa",
+                "qa_lane",
+                "qa_role",
+                "qa_verification",
+                "independent_qa",
+                "independent_qa_lane",
+            }
+        )
+    )
+
+
 def _first_deep_text(value: Any, key: str) -> str:
     if isinstance(value, dict):
         if key in value and str(value.get(key) or "").strip():
@@ -803,6 +836,7 @@ def _route_event_markers(event: dict[str, Any]) -> set[str]:
 
 def _route_event_categories(event: dict[str, Any]) -> set[str]:
     markers = _route_event_markers(event)
+    normalized_markers = {_route_marker(marker) for marker in markers}
     categories: set[str] = set()
     if markers.intersection(
         {
@@ -846,6 +880,19 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
         }
     ):
         categories.add("mf_subagent_startup")
+    if normalized_markers.intersection(
+        {
+            "independent_verification_lane",
+            "independent_verification",
+            "qa",
+            "qa_lane",
+            "qa_role",
+            "qa_verification",
+            "independent_qa",
+            "independent_qa_lane",
+        }
+    ):
+        categories.add(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
     return categories
 
 
@@ -857,12 +904,19 @@ def mf_route_context_gate_verification(
 
     rows = events if isinstance(events, list) else []
     topology_policy = _route_topology_policy(contract)
-    required = _route_context_required(topology_policy)
+    route_context_required = _route_context_required(topology_policy)
+    independent_verification_required = _route_independent_verification_required(
+        topology_policy
+    )
+    required = route_context_required or independent_verification_required
+    required_requirement_ids = list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS)
+    if independent_verification_required:
+        required_requirement_ids.append(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
     present: dict[str, list[dict[str, Any]]] = {
-        req_id: [] for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+        req_id: [] for req_id in required_requirement_ids
     }
     identities: dict[str, list[dict[str, str]]] = {
-        req_id: [] for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+        req_id: [] for req_id in required_requirement_ids
     }
     ignored: list[dict[str, Any]] = []
 
@@ -903,14 +957,10 @@ def mf_route_context_gate_verification(
                 present[category].append(event_ref)
                 identities[category].append(identity)
 
-    missing = [
-        req_id
-        for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
-        if required and not present[req_id]
-    ]
+    missing = [req_id for req_id in required_requirement_ids if required and not present[req_id]]
     identity_keys = {
         _route_identity_key(identity)
-        for category_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+        for category_id in required_requirement_ids
         for identity in identities[category_id]
         if identity
     }
@@ -930,18 +980,14 @@ def mf_route_context_gate_verification(
         "passed": passed,
         "status": "passed" if passed else "failed",
         "required": required,
-        "required_requirement_ids": (
-            list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS) if required else []
-        ),
-        "present_requirement_ids": [
-            req_id for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS if present[req_id]
-        ],
+        "required_requirement_ids": required_requirement_ids if required else [],
+        "present_requirement_ids": [req_id for req_id in required_requirement_ids if present[req_id]],
         "missing_requirement_ids": missing,
         "topology_policy": topology_policy,
         "route_identity": route_identity,
         "same_route_identity": same_route_identity,
         "evidence_events": {
-            req_id: present[req_id] for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+            req_id: present[req_id] for req_id in required_requirement_ids
         },
         "ignored_route_events": ignored,
         "checks": {
@@ -951,6 +997,10 @@ def mf_route_context_gate_verification(
                 present["bounded_implementation_worker_dispatch"]
             ),
             "mf_subagent_startup_present": bool(present["mf_subagent_startup"]),
+            "independent_verification_required": independent_verification_required,
+            "independent_verification_lane_present": bool(
+                present.get(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+            ),
             "same_route_identity": same_route_identity,
         },
     }

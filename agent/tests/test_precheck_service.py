@@ -28,6 +28,56 @@ from agent.tests.fixtures.mf_workflow_runtime import (
 )
 
 
+ROUTE_IDENTITY = {
+    "route_context_hash": "sha256:test-route-context",
+    "prompt_contract_id": "prompt-contract-test",
+    "prompt_contract_hash": "sha256:test-prompt-contract",
+}
+
+
+def route_context_consumption_events() -> list[dict[str, object]]:
+    return [
+        {
+            "event_kind": "route_context",
+            "status": "passed",
+            "payload": {
+                "route_context": {
+                    **ROUTE_IDENTITY,
+                    "blocked_actions": ["apply_patch"],
+                    "required_lanes": ["bounded_implementation_worker"],
+                }
+            },
+        },
+        {
+            "event_kind": "route_action_precheck",
+            "status": "allowed",
+            "verification": {**ROUTE_IDENTITY, "allowed_action": "dispatch_worker"},
+        },
+        {
+            "event_kind": "mf_subagent_dispatch",
+            "status": "passed",
+            "payload": {
+                "mf_subagent_dispatch_gate": {
+                    **ROUTE_IDENTITY,
+                    "worker_id": "mf-sub-test",
+                    "bounded": True,
+                }
+            },
+        },
+        {
+            "event_kind": "mf_subagent_startup",
+            "status": "passed",
+            "payload": {
+                "mf_subagent_startup_gate": {
+                    **ROUTE_IDENTITY,
+                    "worker_id": "mf-sub-test",
+                    "fence_token": FENCE_TOKEN,
+                }
+            },
+        },
+    ]
+
+
 def test_scn_mf_wf_002_dispatch_collects_git_evidence_and_blocks_bad_state(
     tmp_path: Path,
 ) -> None:
@@ -799,8 +849,25 @@ def test_p1_governance_route_work_requires_independent_verification_before_merge
             "status": "passed",
             "event_id": "tl-independent-verify",
             "actor": "qa",
+            "verification": {**ROUTE_IDENTITY},
         }
     )
+    blocked_without_route_context = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        close_subject,
+        "pytest",
+    )
+    assert blocked_without_route_context["decision"] == "block"
+    assert "missing_route_context_evidence" in blocked_without_route_context[
+        "evidence"
+    ]["errors"]
+    assert "missing_bounded_implementation_worker_dispatch_evidence" in (
+        blocked_without_route_context["evidence"]["errors"]
+    )
+
+    close_subject["timeline_evidence"].extend(route_context_consumption_events())
     allowed_close = run_precheck(
         "backlog.close",
         CONTRACT_ID,
@@ -810,6 +877,7 @@ def test_p1_governance_route_work_requires_independent_verification_before_merge
     )
     assert allowed_close["decision"] == "allow"
     assert allowed_close["evidence"]["independent_verification_evidence_present"] is True
+    assert allowed_close["evidence"]["route_context_gate"]["passed"] is True
 
 
 def _result_contract_fields_present(result: dict[str, object]) -> bool:

@@ -16642,6 +16642,12 @@ def _publish_event(event_name, payload):
 
 
 _ROUTE_TOKEN_TASK_CREATE_TYPES = {"dev", "test", "qa", "gatekeeper", "merge", "deploy"}
+_ROUTE_GATE_PAYLOAD_KEYS = (
+    "route_token",
+    "route_waiver",
+    "route_token_waiver",
+    "protected_route_waiver",
+)
 
 
 def _body_with_metadata_route_gate(body: dict, metadata: dict | None = None) -> dict:
@@ -16653,6 +16659,18 @@ def _body_with_metadata_route_gate(body: dict, metadata: dict | None = None) -> 
             payload["route_waiver"] = metadata.get("route_waiver")
         if not payload.get("route_token_waiver") and metadata.get("route_token_waiver"):
             payload["route_token_waiver"] = metadata.get("route_token_waiver")
+    return payload
+
+
+def _timeline_payload_with_route_gate(body: dict) -> dict:
+    payload_value = body.get("payload") if isinstance(body, dict) else {}
+    payload = dict(payload_value) if isinstance(payload_value, dict) else {}
+    event_type = str(body.get("event_type", "") if isinstance(body, dict) else "")
+    if event_type.startswith("service.route.") or payload.get("service_router_suppress") is True:
+        return payload
+    for key in _ROUTE_GATE_PAYLOAD_KEYS:
+        if not payload.get(key) and body.get(key):
+            payload[key] = body.get(key)
     return payload
 
 
@@ -17403,7 +17421,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             schema_version=_query_int(ctx.body, "schema_version", 2),
             actor=ctx.body.get("actor", ""),
             status=ctx.body.get("status", ""),
-            payload=ctx.body.get("payload") or {},
+            payload=_timeline_payload_with_route_gate(ctx.body),
             verification=ctx.body.get("verification") or {},
             artifact_refs=ctx.body.get("artifact_refs") or {},
             trace_id=ctx.body.get("trace_id", ""),

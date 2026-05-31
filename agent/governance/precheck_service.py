@@ -676,6 +676,7 @@ def _close_gate(
     topology_policy = _topology_policy(subject)
     independent_verification_required = _independent_verification_required(topology_policy)
     independent_verification_present = _independent_verification_present(subject)
+    route_context_gate = _route_context_consumption_gate(subject)
 
     if not _text(subject.get("merge_commit")):
         errors.append("missing_merge_commit")
@@ -690,6 +691,9 @@ def _close_gate(
         errors.append("required_evidence_ids_missing")
     if independent_verification_required and not independent_verification_present:
         errors.append("missing_independent_verification_lane_evidence")
+    if route_context_gate.get("required") and not route_context_gate.get("passed"):
+        for missing in route_context_gate.get("missing_requirement_ids") or []:
+            errors.append(_route_context_missing_error(str(missing)))
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -701,6 +705,8 @@ def _close_gate(
         "merge_commit": _text(subject.get("merge_commit")),
         "missing_required_evidence": missing_evidence,
         "topology_policy": topology_policy,
+        "route_context_gate": route_context_gate,
+        "route_context_consumption_required": bool(route_context_gate.get("required")),
         "independent_verification_required": independent_verification_required,
         "independent_verification_evidence_present": independent_verification_present,
         "close_ready_present": _has_timeline_kind(subject.get("timeline_evidence"), {"close_ready"}),
@@ -1000,6 +1006,82 @@ def _independent_verification_required(topology_policy: Mapping[str, Any]) -> bo
         bool(topology_policy.get("independent_verification_required"))
         or _text(topology_policy.get("selected_topology")) == OBSERVER_LED_PARALLEL_TOPOLOGY
     )
+
+
+def _route_context_consumption_gate(subject: Mapping[str, Any]) -> dict[str, Any]:
+    from . import task_timeline
+
+    return task_timeline.mf_route_context_gate_verification(
+        _route_context_timeline_events(subject),
+        contract=_route_context_contract(subject),
+    )
+
+
+def _route_context_contract(subject: Mapping[str, Any]) -> dict[str, Any]:
+    contract = dict(subject.get("contract")) if isinstance(subject.get("contract"), Mapping) else {}
+    close_context: dict[str, Any] = {}
+    for key in (
+        "priority",
+        "selected_topology",
+        "recommended_topology",
+        "topology",
+        "target_files",
+        "test_files",
+        "changed_files",
+        "owned_files",
+        "risk_class",
+        "summary",
+        "task_summary",
+        "title",
+        "caller_role",
+        "observer_direct_mutation",
+        "same_observer_direct_mutation",
+        "direct_mutation",
+        "implementation_mutation_requested",
+    ):
+        if key in subject and subject.get(key) not in (None, "", [], {}):
+            close_context[key] = subject[key]
+    if close_context:
+        existing = contract.get("close_context")
+        if isinstance(existing, Mapping):
+            close_context = {**dict(existing), **close_context}
+        contract["close_context"] = close_context
+    return contract
+
+
+def _route_context_timeline_events(subject: Mapping[str, Any]) -> list[dict[str, Any]]:
+    events = [
+        dict(item)
+        for item in _iter_mappings(subject.get("timeline_evidence"))
+        if isinstance(item, Mapping)
+    ]
+    for key in (
+        "route_evidence",
+        "route_context_evidence",
+        "route_action_precheck_evidence",
+        "dispatch_evidence",
+        "startup_evidence",
+    ):
+        value = subject.get(key)
+        if isinstance(value, Mapping):
+            events.append({
+                "event_kind": key,
+                "status": value.get("status") or value.get("decision") or "passed",
+                "payload": dict(value),
+            })
+    return events
+
+
+def _route_context_missing_error(requirement_id: str) -> str:
+    return {
+        "route_context": "missing_route_context_evidence",
+        "route_action_precheck": "missing_route_action_precheck_evidence",
+        "bounded_implementation_worker_dispatch": (
+            "missing_bounded_implementation_worker_dispatch_evidence"
+        ),
+        "mf_subagent_startup": "missing_mf_subagent_startup_evidence",
+        "route_identity_mismatch": "route_context_identity_mismatch",
+    }.get(requirement_id, f"missing_{requirement_id}_evidence")
 
 
 def _independent_verification_present(subject: Mapping[str, Any]) -> bool:

@@ -553,6 +553,10 @@ def test_route_token_mutation_gate_accepts_explicit_manual_fix_waiver() -> None:
             "route_waiver": {
                 "accepted": True,
                 "waiver_type": "manual_fix",
+                "route_context_hash": "sha256:route-context",
+                "prompt_contract_id": "rprompt-1",
+                "prompt_contract_hash": "sha256:prompt-contract",
+                "caller_role": "observer",
                 "allowed_action": "backlog_close",
                 "project_id": "aming-claw",
                 "backlog_id": "BUG-1",
@@ -567,6 +571,9 @@ def test_route_token_mutation_gate_accepts_explicit_manual_fix_waiver() -> None:
 
     assert gate["allowed"] is True
     assert gate["decision"] == "route_waiver"
+    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["prompt_contract_id"] == "rprompt-1"
+    assert gate["caller_role"] == "observer"
     assert gate["timeline_evidence"] == ["978"]
 
 
