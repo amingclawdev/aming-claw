@@ -1267,7 +1267,18 @@ class TestTaskTimeline(unittest.TestCase):
             server.handle_backlog_close(
                 _ctx(
                     path_params={"bug_id": "BUG-MF-CONTRACT-CLOSE"},
-                    body={"actor": "observer"},
+                    body={
+                        "actor": "observer",
+                        "route_waiver": {
+                            "accepted": True,
+                            "waiver_type": "manual_fix",
+                            "allowed_action": "backlog_close",
+                            "project_id": "proj",
+                            "backlog_id": "BUG-MF-CONTRACT-CLOSE",
+                            "reason": "Unit test supplies explicit route gate waiver evidence.",
+                            "timeline_evidence": {"event_id": "test-route-gate"},
+                        },
+                    },
                     method="POST",
                 )
             )

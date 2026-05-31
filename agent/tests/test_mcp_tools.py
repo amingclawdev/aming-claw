@@ -191,6 +191,68 @@ def test_mcp_backlog_tools_route_to_governance_api():
     )
 
 
+def test_mcp_protected_mutations_forward_route_token_or_waiver():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    route_token = {
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "caller_role": "observer",
+        "allowed_action": "task_create",
+        "project_id": "aming-claw",
+        "backlog_id": "BUG-1",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:route-context"],
+    }
+    route_waiver = {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "allowed_action": "backlog_close",
+        "project_id": "aming-claw",
+        "backlog_id": "BUG-1",
+        "reason": "Operator approved a bounded manual-fix route gate waiver.",
+        "timeline_evidence": {"event_id": 42},
+    }
+
+    dispatcher.dispatch(
+        "task_create",
+        {
+            "project_id": "aming-claw",
+            "prompt": "Implement scoped work.",
+            "type": "dev",
+            "metadata": {"bug_id": "BUG-1"},
+            "route_token": route_token,
+        },
+    )
+    dispatcher.dispatch(
+        "task_complete",
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-1",
+            "status": "succeeded",
+            "result": {"changed_files": ["agent/mcp/tools.py"]},
+            "route_token": {**route_token, "allowed_action": "task_complete", "task_id": "task-1"},
+        },
+    )
+    dispatcher.dispatch(
+        "backlog_close",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-1",
+            "commit": "abc1234",
+            "route_waiver": route_waiver,
+        },
+    )
+
+    assert recorder.calls[0][2]["route_token"] == route_token
+    assert recorder.calls[1][2]["route_token"]["allowed_action"] == "task_complete"
+    assert recorder.calls[2] == (
+        "POST",
+        "/api/backlog/aming-claw/BUG-1/close",
+        {"commit": "abc1234", "route_waiver": route_waiver},
+    )
+
+
 def test_mcp_backlog_list_defaults_to_compact_open_page():
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,7 @@ FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
 ROUTE_ACTION_GATE_SCHEMA_VERSION = "route_action_gate.v1"
+ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION = "route_token_mutation_gate.v1"
 FINISH_GATE_REPLAY_SOURCE = "mf_sub_finish_gate"
 BACKEND_CONTRACT = "parallel_branch_worker.v1"
 DISPATCH_DEFAULT = "non_blocking_after_gate"
@@ -127,6 +131,22 @@ _WORKER_ROLES = {
     "subagent",
     "worker",
 }
+_ROUTE_TOKEN_WAIVER_TYPES = {
+    "manual_fix",
+    "manual-fix",
+    "manual_fix_route_gate",
+    "observer_manual_fix",
+    "same_worktree",
+    "same-worktree",
+}
+_ROUTE_TOKEN_REQUIRED_FIELDS = (
+    "route_context_hash",
+    "prompt_contract_id",
+    "caller_role",
+    "allowed_action",
+    "expires_at",
+    "evidence_refs",
+)
 
 
 class MfSubagentContractError(ValueError):
@@ -621,6 +641,371 @@ def validate_route_action_gate(
         "graph_current_gate": graph_current_gate,
         "precondition_waiver_used": precondition_waiver_used,
     }
+
+
+def validate_route_token_mutation_gate(
+    payload: Mapping[str, Any],
+    *,
+    action: str,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate route-token or explicit waiver evidence for protected mutations."""
+
+    if not isinstance(payload, Mapping):
+        raise MfSubagentContractError("route token gate payload must be a mapping")
+    payload = dict(payload)
+    action_name = _normalized_action(action)
+    if not action_name:
+        raise MfSubagentContractError("route token gate requires an action")
+
+    request_scope = {
+        "project_id": _string(project_id),
+        "backlog_id": _string(backlog_id),
+        "task_id": _string(task_id),
+    }
+    token = _route_token_payload(payload)
+    if token:
+        return _validate_route_token(
+            token,
+            action=action_name,
+            request_scope=request_scope,
+            now=now,
+        )
+
+    waiver = _route_token_waiver(payload)
+    if waiver:
+        return _validate_route_token_waiver(
+            waiver,
+            action=action_name,
+            request_scope=request_scope,
+        )
+
+    raise MfSubagentContractError(
+        f"route_token is required for protected governance action {action_name}; "
+        "pass route_token with route_context_hash, prompt_contract_id, caller_role, "
+        "allowed action, scope, expiry, and evidence_refs, or pass an explicit "
+        "route_waiver with reason and timeline evidence"
+    )
+
+
+def _route_token_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    token = payload.get("route_token")
+    if isinstance(token, str):
+        try:
+            parsed = json.loads(token)
+        except json.JSONDecodeError:
+            parsed = {}
+        token = parsed
+    if isinstance(token, Mapping):
+        return dict(token)
+    return {}
+
+
+def _route_token_waiver(payload: Mapping[str, Any]) -> dict[str, Any]:
+    waiver = (
+        payload.get("route_waiver")
+        or payload.get("route_token_waiver")
+        or payload.get("protected_route_waiver")
+    )
+    if isinstance(waiver, str):
+        try:
+            parsed = json.loads(waiver)
+        except json.JSONDecodeError:
+            parsed = {}
+        waiver = parsed
+    if isinstance(waiver, Mapping):
+        return dict(waiver)
+    return {}
+
+
+def _validate_route_token(
+    token: Mapping[str, Any],
+    *,
+    action: str,
+    request_scope: Mapping[str, str],
+    now: datetime | None,
+) -> dict[str, Any]:
+    route_context_hash = _string(token.get("route_context_hash"))
+    prompt_contract_id = _string(token.get("prompt_contract_id"))
+    prompt_contract_hash = _string(token.get("prompt_contract_hash"))
+    caller_role = _string(token.get("caller_role") or token.get("role")).lower()
+    expires_at = _string(token.get("expires_at") or token.get("expiry"))
+    evidence_refs = _route_evidence_refs(token)
+    allowed_actions = _route_allowed_actions(token)
+
+    missing = []
+    if not route_context_hash:
+        missing.append("route_context_hash")
+    if not prompt_contract_id:
+        missing.append("prompt_contract_id")
+    if not caller_role:
+        missing.append("caller_role")
+    if not allowed_actions:
+        missing.append("allowed_action")
+    if not expires_at:
+        missing.append("expires_at")
+    if not evidence_refs:
+        missing.append("evidence_refs")
+    if missing:
+        raise MfSubagentContractError(
+            "route_token missing required fields: " + ", ".join(missing)
+        )
+
+    if not _route_action_allowed(action, allowed_actions):
+        raise MfSubagentContractError(
+            f"route_token does not allow protected action {action}"
+        )
+
+    expires_dt = _parse_route_expiry(expires_at)
+    now_dt = now or datetime.now(timezone.utc)
+    if expires_dt <= now_dt:
+        raise MfSubagentContractError("route_token expired")
+
+    _validate_route_scope(token, request_scope=request_scope)
+    return {
+        "schema_version": ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
+        "allowed": True,
+        "status": "accepted",
+        "action": action,
+        "decision": "route_token",
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "caller_role": caller_role,
+        "route_token_hash": _stable_hash(token),
+        "expires_at": expires_at,
+        "evidence_refs": evidence_refs,
+        "scope": _route_scope_summary(token, request_scope),
+        "required_fields": list(_ROUTE_TOKEN_REQUIRED_FIELDS),
+    }
+
+
+def _validate_route_token_waiver(
+    waiver: Mapping[str, Any],
+    *,
+    action: str,
+    request_scope: Mapping[str, str],
+) -> dict[str, Any]:
+    status = _string(waiver.get("status") or waiver.get("decision")).lower()
+    accepted = _bool(waiver.get("accepted")) or status in {
+        "accepted",
+        "approved",
+        "allow",
+        "allowed",
+        "waived",
+    }
+    if not accepted:
+        raise MfSubagentContractError("route_waiver must be explicitly accepted")
+
+    waiver_type = _string(
+        waiver.get("waiver_type")
+        or waiver.get("type")
+        or waiver.get("kind")
+    ).lower()
+    manual_fix = _bool(waiver.get("manual_fix") or waiver.get("manual_fix_allowed"))
+    same_worktree = _bool(
+        waiver.get("same_worktree_allowed") or waiver.get("same_worktree")
+    )
+    if waiver_type not in _ROUTE_TOKEN_WAIVER_TYPES and not (manual_fix or same_worktree):
+        raise MfSubagentContractError(
+            "route_waiver requires manual_fix or same_worktree waiver type"
+        )
+
+    reason = _string(waiver.get("reason") or waiver.get("operator_reason"))
+    if len(reason) < 20:
+        raise MfSubagentContractError(
+            "route_waiver requires reason with at least 20 characters"
+        )
+
+    allowed_actions = _route_allowed_actions(waiver)
+    if not allowed_actions or not _route_action_allowed(action, allowed_actions):
+        raise MfSubagentContractError(
+            f"route_waiver does not allow protected action {action}"
+        )
+
+    timeline_evidence = _timeline_evidence_refs(waiver)
+    if not timeline_evidence:
+        raise MfSubagentContractError(
+            "route_waiver requires timeline evidence"
+        )
+
+    _validate_route_scope(waiver, request_scope=request_scope)
+    return {
+        "schema_version": ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
+        "allowed": True,
+        "status": "accepted",
+        "action": action,
+        "decision": "route_waiver",
+        "waiver_hash": _stable_hash(waiver),
+        "waiver_type": waiver_type or ("manual_fix" if manual_fix else "same_worktree"),
+        "reason": reason,
+        "timeline_evidence": timeline_evidence,
+        "scope": _route_scope_summary(waiver, request_scope),
+    }
+
+
+def _route_allowed_actions(value: Mapping[str, Any]) -> list[str]:
+    candidates: list[Any] = [
+        value.get("allowed_action"),
+        value.get("action"),
+        value.get("requested_action"),
+    ]
+    allowed_actions = value.get("allowed_actions")
+    if isinstance(allowed_actions, Sequence) and not isinstance(
+        allowed_actions, (str, bytes, bytearray)
+    ):
+        candidates.extend(allowed_actions)
+    elif allowed_actions:
+        candidates.append(allowed_actions)
+    actions: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        action = _normalized_action(candidate)
+        if action and action not in seen:
+            actions.append(action)
+            seen.add(action)
+    return actions
+
+
+def _route_action_allowed(action: str, allowed_actions: Sequence[str]) -> bool:
+    allowed = {_normalized_action(item) for item in allowed_actions if _string(item)}
+    return "*" in allowed or _normalized_action(action) in allowed
+
+
+def _route_evidence_refs(token: Mapping[str, Any]) -> list[str]:
+    refs = _string_list_forgiving(token.get("evidence_refs"))
+    for key in ("evidence_ref", "trace_id", "timeline_event_id", "source_event_id"):
+        ref = _string(token.get(key))
+        if ref:
+            refs.append(ref)
+    return _dedupe_strings(refs)
+
+
+def _timeline_evidence_refs(waiver: Mapping[str, Any]) -> list[str]:
+    refs = _string_list_forgiving(waiver.get("timeline_evidence_refs"))
+    for key in ("timeline_event_id", "event_id", "trace_id"):
+        ref = _string(waiver.get(key))
+        if ref:
+            refs.append(ref)
+    timeline_evidence = waiver.get("timeline_evidence")
+    if isinstance(timeline_evidence, Mapping):
+        for key in ("event_id", "id", "trace_id"):
+            ref = _string(timeline_evidence.get(key))
+            if ref:
+                refs.append(ref)
+    return _dedupe_strings(refs)
+
+
+def _string_list_forgiving(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        token = _string(value)
+        return [token] if token else []
+    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
+        return []
+    refs: list[str] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            ref = _string(
+                item.get("id")
+                or item.get("event_id")
+                or item.get("trace_id")
+                or item.get("ref")
+            )
+        else:
+            ref = _string(item)
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def _dedupe_strings(values: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = _string(value)
+        if token and token not in seen:
+            out.append(token)
+            seen.add(token)
+    return out
+
+
+def _parse_route_expiry(value: str) -> datetime:
+    raw = _string(value)
+    if not raw:
+        raise MfSubagentContractError("route_token expires_at is required")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise MfSubagentContractError("route_token expires_at must be ISO-8601") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _route_scope_value(value: Mapping[str, Any], *names: str) -> str:
+    scope = _nested_mapping(value, "scope")
+    for name in names:
+        token = _string(value.get(name) or scope.get(name))
+        if token:
+            return token
+    return ""
+
+
+def _validate_route_scope(
+    value: Mapping[str, Any],
+    *,
+    request_scope: Mapping[str, str],
+) -> None:
+    project_id = _string(request_scope.get("project_id"))
+    if project_id:
+        token_project_id = _route_scope_value(value, "project_id")
+        if not token_project_id:
+            raise MfSubagentContractError("route token scope requires project_id")
+        if token_project_id != project_id:
+            raise MfSubagentContractError(
+                f"route token project scope {token_project_id!r} does not match {project_id!r}"
+            )
+
+    backlog_id = _string(request_scope.get("backlog_id"))
+    if backlog_id:
+        token_backlog_id = _route_scope_value(value, "backlog_id", "bug_id")
+        if not token_backlog_id:
+            raise MfSubagentContractError("route token scope requires backlog_id")
+        if token_backlog_id != backlog_id:
+            raise MfSubagentContractError(
+                f"route token backlog scope {token_backlog_id!r} does not match {backlog_id!r}"
+            )
+
+    task_id = _string(request_scope.get("task_id"))
+    if task_id:
+        token_task_id = _route_scope_value(value, "task_id")
+        if not token_task_id:
+            raise MfSubagentContractError("route token scope requires task_id")
+        if token_task_id != task_id:
+            raise MfSubagentContractError(
+                f"route token task scope {token_task_id!r} does not match {task_id!r}"
+            )
+
+
+def _route_scope_summary(
+    value: Mapping[str, Any],
+    request_scope: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        "project_id": _route_scope_value(value, "project_id") or _string(request_scope.get("project_id")),
+        "backlog_id": _route_scope_value(value, "backlog_id", "bug_id") or _string(request_scope.get("backlog_id")),
+        "task_id": _route_scope_value(value, "task_id") or _string(request_scope.get("task_id")),
+    }
+
+
+def _stable_hash(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _dirty_scope_evidence(value: Any) -> dict[str, Any]:

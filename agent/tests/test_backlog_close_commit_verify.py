@@ -14,7 +14,20 @@ def _make_ctx(bug_id="BUG-001", commit="abc123", project_id="test-proj"):
     """Build a minimal RequestContext-like object for handle_backlog_close."""
     ctx = MagicMock()
     ctx.path_params = {"project_id": project_id, "bug_id": bug_id}
-    ctx.body = {"commit": commit, "actor": "test"}
+    ctx.get_project_id.return_value = project_id
+    ctx.body = {
+        "commit": commit,
+        "actor": "test",
+        "route_waiver": {
+            "accepted": True,
+            "waiver_type": "manual_fix",
+            "allowed_action": "backlog_close",
+            "project_id": project_id,
+            "backlog_id": bug_id,
+            "reason": "Unit test supplies explicit route gate waiver evidence.",
+            "timeline_evidence": {"event_id": "test-route-gate"},
+        },
+    }
     return ctx
 
 
@@ -54,6 +67,23 @@ def test_close_with_real_commit(_mock_subprocess, _mock_db, _mock_audit):
     assert "rev-parse" in call_args[0][0]
     assert "--verify" in call_args[0][0]
     assert "abc123" in call_args[0][0]
+
+
+@patch("agent.governance.server.subprocess.run")
+def test_backlog_close_without_route_token_or_waiver_is_blocked(_mock_subprocess, _mock_db, _mock_audit):
+    """Protected backlog_close rejects callers that provide no route gate evidence."""
+    from agent.governance.errors import GovernanceError
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    ctx = _make_ctx(commit="abc123")
+    ctx.body.pop("route_waiver")
+
+    with pytest.raises(GovernanceError) as exc_info:
+        handle_backlog_close(ctx)
+
+    assert exc_info.value.code == "route_token_required"
+    assert exc_info.value.status == 422
 
 
 @patch("agent.governance.server.subprocess.run")
@@ -322,4 +352,4 @@ def test_mf_close_timeline_gate_explicit_bypass_requires_reason(_mock_subprocess
 
     assert result["ok"] is True
     assert result["timeline_gate"]["status"] == "bypassed"
-    record_event.assert_called_once()
+    assert record_event.call_count == 2

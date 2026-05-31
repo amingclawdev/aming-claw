@@ -112,6 +112,9 @@ TOOLS: list[dict] = [
                          "description": "Task type (determines role and chain stage)"},
                 "priority": {"type": "integer", "description": "Priority (1=highest)", "default": 5},
                 "metadata": {"type": "object", "description": "Additional metadata (target_files, etc.)"},
+                "route_token": {"type": "object", "description": "Route-token evidence required for protected task dispatch mutations."},
+                "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
             "required": ["project_id", "prompt", "type"],
         },
@@ -150,6 +153,9 @@ TOOLS: list[dict] = [
                 "task_id": {"type": "string"},
                 "status": {"type": "string", "enum": ["succeeded", "failed"]},
                 "result": {"type": "object", "description": "Task result (changed_files, test_report, etc.)"},
+                "route_token": {"type": "object", "description": "Route-token evidence required for mutation-bearing task completion."},
+                "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
             "required": ["project_id", "task_id", "status"],
         },
@@ -460,6 +466,9 @@ TOOLS: list[dict] = [
                 "bug_id": {"type": "string"},
                 "commit": {"type": "string"},
                 "actor": {"type": "string"},
+                "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog close."},
+                "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
             "required": ["project_id", "bug_id"],
         },
@@ -1071,6 +1080,9 @@ class ToolDispatcher:
                 body["priority"] = args["priority"]
             if args.get("metadata"):
                 body["metadata"] = args["metadata"]
+            for key in ("route_token", "route_waiver", "route_token_waiver"):
+                if args.get(key):
+                    body[key] = args[key]
             return self._api("POST", f"/api/task/{pid}/create", body)
 
         if name == "task_list":
@@ -1088,6 +1100,9 @@ class ToolDispatcher:
             body = {"task_id": args["task_id"], "status": args["status"]}
             if args.get("result"):
                 body["result"] = args["result"]
+            for key in ("route_token", "route_waiver", "route_token_waiver"):
+                if args.get(key):
+                    body[key] = args[key]
             return self._api("POST", f"/api/task/{pid}/complete", body)
 
         # --- Observer tools ---
@@ -1236,7 +1251,7 @@ class ToolDispatcher:
             bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
             body = {
                 key: args[key]
-                for key in ("commit", "actor")
+                for key in ("commit", "actor", "route_token", "route_waiver", "route_token_waiver")
                 if args.get(key)
             }
             return self._api("POST", f"/api/backlog/{pid}/{bug_id}/close", body)

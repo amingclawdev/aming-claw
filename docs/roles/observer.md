@@ -28,6 +28,22 @@ auto-chain execution is active.
 
 ---
 
+## Route-Token Gate For Protected Mutations
+
+High-risk governance mutations must carry route-owned evidence. The protected
+external actions are implementation-worker `task_create`, mutation-bearing
+`task_complete`, merge queue writes, external merge-result recording, live merge
+execution, `backlog_close`, and release-gate checks. Read-only status/backlog,
+graph, and dry-run merge planning queries remain usable without a `route_token`.
+
+A valid `route_token` must include `route_context_hash`, `prompt_contract_id`,
+`caller_role`, an allowed action, matching project/backlog/task scope where
+applicable, `expires_at`, and `evidence_refs`. If the observer is using an
+explicit manual-fix or same-worktree exception, pass `route_waiver` with an
+accepted decision, waiver type, reason, matching action/scope, and timeline
+evidence. Governance records accepted route-token or waiver evidence into the
+task timeline for later audit.
+
 ## Advanced Chain Flow: Coordinator Takeover
 
 ### Prerequisites

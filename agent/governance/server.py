@@ -4564,6 +4564,11 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.merge-queue")
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="merge_queue",
+            task_id=task_id,
+        )
         with sqlite_write_lock():
             queued = queue_merge_item_for_branch_context(
                 conn,
@@ -4610,10 +4615,17 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-002"),
             )
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                task_id=task_id,
+            )
             conn.commit()
         return {
             "ok": True,
             "project_id": project_id,
+            "route_token_gate": route_gate,
             **queued,
             "decision": {
                 "scenario_id": decision.scenario_id,
@@ -4788,6 +4800,11 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
             conn,
             "graph-governance.parallel-branches.merge-result",
         )
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="merge_result",
+            task_id=str(ctx.body.get("task_id") or ""),
+        )
         with sqlite_write_lock():
             recorded = record_merge_queue_result(
                 conn,
@@ -4819,10 +4836,18 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-014"),
             )
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                task_id=str(ctx.body.get("task_id") or ""),
+                commit_sha=str(ctx.body.get("merge_commit") or ""),
+            )
             conn.commit()
         return {
             "ok": True,
             "project_id": project_id,
+            "route_token_gate": route_gate,
             **recorded,
             "decision": {
                 "scenario_id": decision.scenario_id,
@@ -4867,6 +4892,14 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
             conn,
             "graph-governance.parallel-branches.merge-execute",
         )
+        route_gate = {}
+        dry_run = _query_bool(ctx.body, "dry_run", True)
+        if not dry_run:
+            route_gate = _require_route_token_mutation_gate(
+                ctx,
+                action="merge_execute",
+                task_id=str(ctx.body.get("task_id") or ""),
+            )
         with sqlite_write_lock():
             result = execute_merge_queue_item(
                 conn,
@@ -4878,7 +4911,7 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 target_ref=target_ref,
                 evidence=evidence,
                 batch_status=str(ctx.body.get("batch_status") or ""),
-                dry_run=_query_bool(ctx.body, "dry_run", True),
+                dry_run=dry_run,
                 allow_target_ref_mutation=_query_bool(
                     ctx.body,
                     "allow_target_ref_mutation",
@@ -4906,10 +4939,19 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-016"),
             )
+            if route_gate:
+                _record_route_token_gate_event(
+                    conn,
+                    project_id,
+                    route_gate,
+                    task_id=str(ctx.body.get("task_id") or ""),
+                    commit_sha=str(result.get("merge_commit") or ""),
+                )
             conn.commit()
         return {
             "ok": bool(result.get("ok")),
             "project_id": project_id,
+            "route_token_gate": route_gate or None,
             **result,
             "decision": {
                 "scenario_id": decision.scenario_id,
@@ -16003,6 +16045,7 @@ def handle_baseline(ctx: RequestContext):
 @route("POST", "/api/wf/{project_id}/release-gate")
 def handle_release_gate(ctx: RequestContext):
     project_id = ctx.get_project_id()
+    route_gate = _require_route_token_mutation_gate(ctx, action="release_gate")
     with DBContext(project_id) as conn:
         graph = project_service.load_project_graph(project_id)
         result = state_service.release_gate(
@@ -16011,6 +16054,8 @@ def handle_release_gate(ctx: RequestContext):
             profile=ctx.body.get("profile"),
             min_status=ctx.body.get("min_status", "qa_pass"),
         )
+        _record_route_token_gate_event(conn, project_id, route_gate)
+    result["route_token_gate"] = route_gate
     return result
 
 
@@ -16561,6 +16606,126 @@ def _publish_event(event_name, payload):
         pass
 
 
+_ROUTE_TOKEN_TASK_CREATE_TYPES = {"dev", "test", "qa", "gatekeeper", "merge", "deploy"}
+
+
+def _body_with_metadata_route_gate(body: dict, metadata: dict | None = None) -> dict:
+    payload = dict(body or {})
+    if isinstance(metadata, dict):
+        if not payload.get("route_token") and metadata.get("route_token"):
+            payload["route_token"] = metadata.get("route_token")
+        if not payload.get("route_waiver") and metadata.get("route_waiver"):
+            payload["route_waiver"] = metadata.get("route_waiver")
+        if not payload.get("route_token_waiver") and metadata.get("route_token_waiver"):
+            payload["route_token_waiver"] = metadata.get("route_token_waiver")
+    return payload
+
+
+def _require_route_token_mutation_gate(
+    ctx: RequestContext,
+    *,
+    action: str,
+    backlog_id: str = "",
+    task_id: str = "",
+    metadata: dict | None = None,
+) -> dict:
+    from .mf_subagent_contract import (
+        MfSubagentContractError,
+        validate_route_token_mutation_gate,
+    )
+
+    try:
+        return validate_route_token_mutation_gate(
+            _body_with_metadata_route_gate(ctx.body or {}, metadata),
+            action=action,
+            project_id=ctx.get_project_id(),
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except MfSubagentContractError as exc:
+        raise GovernanceError(
+            "route_token_required",
+            str(exc),
+            422,
+            {
+                "protected_action": action,
+                "route_token_required": True,
+                "required_route_token_fields": [
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "caller_role",
+                    "allowed_action",
+                    "scope.project_id",
+                    "expires_at",
+                    "evidence_refs",
+                ],
+                "waiver_fields": [
+                    "route_waiver.waiver_type",
+                    "route_waiver.reason",
+                    "route_waiver.timeline_evidence",
+                    "route_waiver.allowed_action",
+                ],
+            },
+        ) from exc
+
+
+def _task_complete_result_mutates(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    mutation_keys = {
+        "changed_files",
+        "file_changes",
+        "files_written",
+        "patches",
+        "commit",
+        "merge_commit",
+        "checkpoint_id",
+        "graph_delta",
+        "graph_patch",
+        "writes_state",
+        "release_gate_passed",
+        "backlog_closed",
+    }
+    if any(key in result and result.get(key) not in (None, "", [], {}) for key in mutation_keys):
+        return True
+    actions = result.get("actions")
+    if isinstance(actions, list):
+        return any(str(action).strip() for action in actions)
+    return False
+
+
+def _record_route_token_gate_event(
+    conn,
+    project_id: str,
+    gate: dict,
+    *,
+    backlog_id: str = "",
+    task_id: str = "",
+    commit_sha: str = "",
+) -> None:
+    if not gate:
+        return
+    try:
+        from . import task_timeline
+
+        task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            event_type=f"route_token_gate.{gate.get('action', 'protected_mutation')}",
+            phase="route_gate",
+            event_kind="verification",
+            actor=str(gate.get("caller_role") or gate.get("decision") or "route_gate"),
+            status="accepted",
+            payload={"route_token_gate": gate},
+            verification=gate,
+            commit_sha=commit_sha,
+        )
+    except Exception:
+        log.debug("route_token_gate: failed to record timeline evidence", exc_info=True)
+
+
 @route("POST", "/api/task/{project_id}/create")
 def handle_task_create(ctx: RequestContext):
     """Create a task. Auth optional — uses principal_id if token provided, else 'anonymous'.
@@ -16591,6 +16756,14 @@ def handle_task_create(ctx: RequestContext):
             metadata = _json.loads(metadata)
         except Exception:
             metadata = {}
+    if task_type in _ROUTE_TOKEN_TASK_CREATE_TYPES and created_by not in ("auto-chain", "auto-chain-retry"):
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="task_create",
+            backlog_id=str(metadata.get("bug_id") or ""),
+            metadata=metadata,
+        )
+        metadata["route_token_gate"] = route_gate
 
     # Auto-enrich metadata
     if "operation_type" not in metadata:
@@ -16848,6 +17021,14 @@ def handle_task_create(ctx: RequestContext):
                 metadata=metadata,
                 runtime_state=result.get("status", "queued"),
             )
+        if metadata.get("route_token_gate"):
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                metadata.get("route_token_gate") or {},
+                backlog_id=_created_bug_id,
+                task_id=result.get("task_id", ""),
+            )
     # §2.2: Audit reconcile task creation (R3)
     if _is_reconcile:
         try:
@@ -16920,7 +17101,22 @@ def handle_task_complete(ctx: RequestContext):
              project_id, ctx.body.get("task_id", "?"), ctx.body.get("status", "?"),
              list((ctx.body.get("result") or {}).keys()))
     from . import task_registry
+    route_gate = {}
+    result_payload = ctx.body.get("result") or {}
+    if ctx.body.get("status", "succeeded") == "succeeded" and _task_complete_result_mutates(result_payload):
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="task_complete",
+            task_id=ctx.body.get("task_id", ""),
+        )
     with DBContext(project_id) as conn:
+        if route_gate:
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                task_id=ctx.body.get("task_id", ""),
+            )
         return task_registry.complete_task(
             conn, ctx.body.get("task_id", ""),
             status=ctx.body.get("status", "succeeded"),
@@ -19542,6 +19738,18 @@ def handle_backlog_close(ctx: RequestContext):
             except FileNotFoundError:
                 log.warning("git not found; skipping commit verification for %s", commit_sha)
 
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="backlog_close",
+            backlog_id=bug_id,
+        )
+        _record_route_token_gate_event(
+            conn,
+            pid,
+            route_gate,
+            backlog_id=bug_id,
+            commit_sha=commit_sha,
+        )
         timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
         close_impact_check = _build_backlog_close_impact_check(conn, pid, body)
 
@@ -19570,7 +19778,7 @@ def handle_backlog_close(ctx: RequestContext):
             bug_id,
             "manual_fix" if prior_status == "MF_IN_PROGRESS" else "fixed",
             project_id=pid,
-            result={"commit": body.get("commit", "")},
+            result={"commit": body.get("commit", ""), "route_token_gate": route_gate},
             runtime_state="fixed",
         )
         conn.commit()
@@ -19589,6 +19797,7 @@ def handle_backlog_close(ctx: RequestContext):
             result["chain_stage"] = chain_stage
         if timeline_gate:
             result["timeline_gate"] = timeline_gate
+        result["route_token_gate"] = route_gate
         if close_impact_check:
             result["close_impact_check"] = close_impact_check
         return result

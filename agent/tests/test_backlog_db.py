@@ -234,6 +234,7 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         ctx.path_params = path_params
         ctx.query = query or {}
         ctx.body = body or {}
+        ctx.get_project_id.return_value = path_params.get("project_id", "")
         return ctx
 
     def test_upsert_and_list(self):
@@ -421,7 +422,17 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
 
         ctx2 = self._make_ctx(
             {"project_id": "test-project", "bug_id": "B101"},
-            body={},
+            body={
+                "route_waiver": {
+                    "accepted": True,
+                    "waiver_type": "manual_fix",
+                    "allowed_action": "backlog_close",
+                    "project_id": "test-project",
+                    "backlog_id": "B101",
+                    "reason": "Unit test supplies explicit route gate waiver evidence.",
+                    "timeline_evidence": {"event_id": "test-route-gate"},
+                }
+            },
         )
         result = handle_backlog_close(ctx2)
         self.assertTrue(result["ok"])

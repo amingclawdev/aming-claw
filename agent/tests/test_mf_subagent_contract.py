@@ -24,6 +24,7 @@ from agent.governance.mf_subagent_contract import (
     OBSERVER_COORDINATOR_ROLE,
     OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION,
     ROUTE_ACTION_GATE_SCHEMA_VERSION,
+    ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
     build_mf_subagent_input,
@@ -32,6 +33,7 @@ from agent.governance.mf_subagent_contract import (
     validate_mf_subagent_dispatch_gate,
     validate_mf_subagent_finish_gate,
     validate_route_action_gate,
+    validate_route_token_mutation_gate,
 )
 from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
@@ -481,6 +483,91 @@ def test_route_action_gate_rejects_observer_when_dispatch_explicitly_failed() ->
                 bounded_dispatch_evidence=failed_dispatch,
             )
         )
+
+
+def _route_token(**overrides: object) -> dict[str, object]:
+    token: dict[str, object] = {
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
+        "caller_role": "observer",
+        "allowed_action": "backlog_close",
+        "project_id": "aming-claw",
+        "backlog_id": "BUG-1",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:route-context"],
+    }
+    token.update(overrides)
+    return token
+
+
+def test_route_token_mutation_gate_accepts_bounded_token() -> None:
+    gate = validate_route_token_mutation_gate(
+        {"route_token": _route_token()},
+        action="backlog_close",
+        project_id="aming-claw",
+        backlog_id="BUG-1",
+    )
+
+    assert gate["schema_version"] == ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION
+    assert gate["allowed"] is True
+    assert gate["decision"] == "route_token"
+    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["prompt_contract_id"] == "rprompt-1"
+    assert gate["route_token_hash"].startswith("sha256:")
+
+
+def test_route_token_mutation_gate_rejects_missing_token_for_protected_action() -> None:
+    with pytest.raises(MfSubagentContractError, match="route_token is required"):
+        validate_route_token_mutation_gate(
+            {},
+            action="backlog_close",
+            project_id="aming-claw",
+            backlog_id="BUG-1",
+        )
+
+
+def test_route_token_mutation_gate_rejects_scope_mismatch() -> None:
+    with pytest.raises(MfSubagentContractError, match="backlog scope"):
+        validate_route_token_mutation_gate(
+            {"route_token": _route_token(backlog_id="BUG-2")},
+            action="backlog_close",
+            project_id="aming-claw",
+            backlog_id="BUG-1",
+        )
+
+
+def test_route_token_mutation_gate_rejects_expired_token() -> None:
+    with pytest.raises(MfSubagentContractError, match="expired"):
+        validate_route_token_mutation_gate(
+            {"route_token": _route_token(expires_at="2000-01-01T00:00:00Z")},
+            action="backlog_close",
+            project_id="aming-claw",
+            backlog_id="BUG-1",
+        )
+
+
+def test_route_token_mutation_gate_accepts_explicit_manual_fix_waiver() -> None:
+    gate = validate_route_token_mutation_gate(
+        {
+            "route_waiver": {
+                "accepted": True,
+                "waiver_type": "manual_fix",
+                "allowed_action": "backlog_close",
+                "project_id": "aming-claw",
+                "backlog_id": "BUG-1",
+                "reason": "Operator approved a bounded manual-fix close with timeline evidence.",
+                "timeline_evidence": {"event_id": 978},
+            }
+        },
+        action="backlog_close",
+        project_id="aming-claw",
+        backlog_id="BUG-1",
+    )
+
+    assert gate["allowed"] is True
+    assert gate["decision"] == "route_waiver"
+    assert gate["timeline_evidence"] == ["978"]
 
 
 def _observer_direct_mutation_payload(**overrides: object) -> dict[str, object]:

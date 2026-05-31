@@ -360,6 +360,16 @@ def test_task_create_persists_parallel_contract_gate_evidence(tmp_path, monkeypa
                 "parallel_agent_id": "backend",
                 "target_files": ["agent/governance/server.py"],
             },
+            "route_token": {
+                "route_context_hash": "sha256:route-context",
+                "prompt_contract_id": "rprompt-1",
+                "caller_role": "observer",
+                "allowed_action": "task_create",
+                "project_id": project_id,
+                "backlog_id": feature_bug_id,
+                "expires_at": "2999-01-01T00:00:00Z",
+                "evidence_refs": ["timeline:route-context"],
+            },
         }
 
         def get_project_id(self) -> str:

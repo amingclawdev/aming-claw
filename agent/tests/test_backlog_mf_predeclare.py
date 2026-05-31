@@ -12,6 +12,7 @@ def _make_ctx(bug_id="BUG-001", project_id="test-proj", **body_fields):
     """Build a minimal RequestContext-like object."""
     ctx = MagicMock()
     ctx.path_params = {"project_id": project_id, "bug_id": bug_id}
+    ctx.get_project_id.return_value = project_id
     ctx.body = body_fields
     return ctx
 
@@ -314,6 +315,15 @@ def test_close_from_mf_in_progress(_mock_subprocess, _mock_db_mf_in_progress, _m
         actor="test-user",
         bypass_timeline_gate=True,
         timeline_bypass_reason="Unit test covers MF_IN_PROGRESS close transition only.",
+        route_waiver={
+            "accepted": True,
+            "waiver_type": "manual_fix",
+            "allowed_action": "backlog_close",
+            "project_id": "test-proj",
+            "backlog_id": "BUG-001",
+            "reason": "Unit test supplies explicit route gate waiver evidence.",
+            "timeline_evidence": {"event_id": "test-route-gate"},
+        },
     )
 
     result = handle_backlog_close(ctx)

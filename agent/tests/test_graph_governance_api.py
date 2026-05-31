@@ -85,6 +85,22 @@ def _ctx_with_role(
     return ctx
 
 
+def _route_waiver(action: str, *, task_id: str = "", backlog_id: str = "") -> dict:
+    waiver = {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "allowed_action": action,
+        "project_id": PID,
+        "reason": "Unit test supplies explicit route gate waiver evidence.",
+        "timeline_evidence": {"event_id": f"test-route-gate-{action}"},
+    }
+    if task_id:
+        waiver["task_id"] = task_id
+    if backlog_id:
+        waiver["backlog_id"] = backlog_id
+    return waiver
+
+
 def _bare_handler():
     handler = object.__new__(server.GovernanceHandler)
     handler.path = "/api/health"
@@ -442,6 +458,15 @@ def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_
                 "actor": "test",
                 "bypass_timeline_gate": True,
                 "timeline_bypass_reason": "Unit test focuses on close impact output contract.",
+                "route_waiver": {
+                    "accepted": True,
+                    "waiver_type": "manual_fix",
+                    "allowed_action": "backlog_close",
+                    "project_id": PID,
+                    "backlog_id": "BUG-CLOSE-ASSET",
+                    "reason": "Unit test supplies explicit route gate waiver evidence.",
+                    "timeline_evidence": {"event_id": "test-route-gate"},
+                },
                 "changed_files": [
                     "scripts/external_protocol_mcp.py",
                     "skills/external-protocol/SKILL.md",
@@ -933,6 +958,7 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
                     "task_id": "queue-task",
                     "merge_queue_id": queue_id,
                     "fence_token": "fence-stale",
+                    "route_waiver": _route_waiver("merge_queue", task_id="queue-task"),
                 },
             )
         )
@@ -946,6 +972,7 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
                 "merge_queue_id": queue_id,
                 "queue_index": 1,
                 "fence_token": "fence-queue-current",
+                "route_waiver": _route_waiver("merge_queue", task_id="queue-task"),
                 "hard_depends_on": ["foundation-task"],
                 "merge_preview_id": "preview-queue",
                 "now_iso": "2026-05-17T07:21:00Z",
@@ -973,6 +1000,38 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
     )
     assert read["read_model"]["merge_queue"]["blocked_task_ids"] == ["queue-task"]
     assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
+
+
+def test_parallel_branch_merge_queue_requires_route_token_or_waiver(conn):
+    queue_id = "mergeq-api-route-token"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-route-token",
+            task_id="route-token-task",
+            branch_ref="refs/heads/codex/route-token-task",
+            status="worktree_ready",
+            fence_token="fence-route-token",
+            base_commit="base-route-token",
+            head_commit="head-route-token",
+            target_head_commit="target-route-token",
+        ),
+        now_iso="2026-05-17T07:21:30Z",
+    )
+
+    with pytest.raises(GovernanceError, match="route_token"):
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "route-token-task",
+                    "merge_queue_id": queue_id,
+                    "fence_token": "fence-route-token",
+                },
+            )
+        )
 
 
 def test_parallel_branch_checkpoint_refreshes_worktree_head_before_merge_queue(conn, tmp_path):
@@ -1042,6 +1101,7 @@ def test_parallel_branch_checkpoint_refreshes_worktree_head_before_merge_queue(c
                 "task_id": "refresh-head-task",
                 "merge_queue_id": queue_id,
                 "fence_token": "fence-refresh-head",
+                "route_waiver": _route_waiver("merge_queue", task_id="refresh-head-task"),
             },
         )
     )
@@ -1289,6 +1349,7 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
                     "merge_queue_id": queue_id,
                     "worker_role": "mf_sub",
                     "fence_token": "fence-mf-sub",
+                    "route_waiver": _route_waiver("merge_queue", task_id="mf-sub-queue-task"),
                 },
             )
         )
@@ -1319,6 +1380,7 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
                 "worker_role": "mf_sub",
                 "checkpoint_id": "ckpt-mf-sub",
                 "fence_token": "fence-mf-sub",
+                "route_waiver": _route_waiver("merge_queue", task_id="mf-sub-queue-task"),
             },
         )
     )
@@ -1648,6 +1710,26 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
         text=True,
     ).stdout.strip() == main_head
 
+    with pytest.raises(GovernanceError, match="route_token"):
+        server.handle_graph_governance_parallel_branch_merge_execute(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "repo_root_path": str(repo),
+                    "merge_queue_id": queue_id,
+                    "target_ref": "main",
+                    "task_id": "execute-task",
+                    "evidence": evidence,
+                    "dry_run": False,
+                    "allow_target_ref_mutation": True,
+                    "fence_token": "fence-execute-current",
+                    "message": "merge feature-live",
+                    "bug_id": "ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION",
+                },
+            )
+        )
+
     live = server.handle_graph_governance_parallel_branch_merge_execute(
         _ctx(
             {"project_id": PID},
@@ -1661,6 +1743,7 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
                 "dry_run": False,
                 "allow_target_ref_mutation": True,
                 "fence_token": "fence-execute-current",
+                "route_waiver": _route_waiver("merge_execute", task_id="execute-task"),
                 "message": "merge feature-live",
                 "bug_id": "ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION",
                 "now_iso": "2026-05-17T08:29:00Z",
@@ -1737,6 +1820,7 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
                     "merge_commit": "merge-result",
                     "target_head_after_merge": "target-after",
                     "fence_token": "fence-stale",
+                    "route_waiver": _route_waiver("merge_result", task_id="result-task"),
                 },
             )
         )
@@ -1753,6 +1837,7 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
                 "target_head_before_merge": "target-before",
                 "target_head_after_merge": "target-after",
                 "fence_token": "fence-result-current",
+                "route_waiver": _route_waiver("merge_result", task_id="result-task"),
                 "now_iso": "2026-05-17T08:26:00Z",
             },
         )
