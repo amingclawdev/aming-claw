@@ -42,6 +42,103 @@ def _ctx(query=None, *, path_params=None, body=None, method="GET"):
     )
 
 
+ROUTE_IDENTITY = {
+    "route_context_hash": "sha256:test-route-context",
+    "prompt_contract_id": "prompt-contract-test",
+    "prompt_contract_hash": "sha256:test-prompt-contract",
+}
+
+
+def _route_context_consumption_events():
+    return [
+        {
+            "event_kind": "route_context",
+            "phase": "dispatch",
+            "status": "passed",
+            "event_id": "tl-route-context",
+            "payload": {
+                "route_context": {
+                    **ROUTE_IDENTITY,
+                    "caller_role": "observer",
+                    "allowed_actions": ["dispatch_worker"],
+                    "blocked_actions": ["apply_patch"],
+                    "required_lanes": ["bounded_implementation_worker"],
+                },
+                "visible_injection_manifest_hash": "sha256:test-visible-manifest",
+            },
+        },
+        {
+            "event_kind": "route_action_precheck",
+            "phase": "pre_mutation",
+            "status": "allowed",
+            "event_id": "tl-route-action",
+            "verification": {
+                **ROUTE_IDENTITY,
+                "allowed_action": "dispatch_worker",
+                "caller_role": "observer",
+            },
+        },
+        {
+            "event_kind": "mf_subagent_dispatch",
+            "phase": "dispatch",
+            "status": "passed",
+            "event_id": "tl-dispatch",
+            "payload": {
+                "mf_subagent_dispatch_gate": {
+                    **ROUTE_IDENTITY,
+                    "worker_id": "mf-sub-test",
+                    "bounded": True,
+                }
+            },
+        },
+        {
+            "event_kind": "mf_subagent_startup",
+            "phase": "startup_gate",
+            "status": "passed",
+            "event_id": "tl-startup",
+            "payload": {
+                "mf_subagent_startup_gate": {
+                    **ROUTE_IDENTITY,
+                    "worker_id": "mf-sub-test",
+                    "fence_token": "fence-test",
+                }
+            },
+        },
+    ]
+
+
+def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", project_id="proj"):
+    scope = {"project_id": project_id, "backlog_id": bug_id}
+    if task_id:
+        scope["task_id"] = task_id
+    return {
+        "route_context_hash": f"sha256:test-route-context-{action}",
+        "prompt_contract_id": f"prompt-contract-{action}",
+        "caller_role": "observer",
+        "allowed_action": action,
+        "scope": scope,
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:test-route-token"],
+    }
+
+
+def _route_waiver(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", project_id="proj"):
+    scope = {"project_id": project_id, "backlog_id": bug_id}
+    if task_id:
+        scope["task_id"] = task_id
+    return {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "route_context_hash": f"sha256:test-route-context-{action}",
+        "prompt_contract_id": f"prompt-contract-{action}",
+        "caller_role": "observer",
+        "allowed_action": action,
+        "scope": scope,
+        "reason": "Unit test supplies explicit route gate waiver evidence.",
+        "timeline_evidence": {"event_id": "test-route-gate"},
+    }
+
+
 class TestTaskTimeline(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -102,6 +199,109 @@ class TestTaskTimeline(unittest.TestCase):
             {event["payload"]["i"] for event in events},
             set(range(20)),
         )
+
+    def test_timeline_append_protected_close_evidence_requires_route_token_before_mutation(self):
+        from agent.governance import server
+        from agent.governance.errors import GovernanceError
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": "BUG-TL-PROTECTED",
+                        "event_type": "mf.implementation",
+                        "event_kind": "implementation",
+                        "status": "accepted",
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-TL-PROTECTED",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
+    def test_timeline_append_rejects_generic_waiver_without_route_identity(self):
+        from agent.governance import server
+        from agent.governance.errors import GovernanceError
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": "BUG-TL-BAD-WAIVER",
+                        "event_type": "mf.verification",
+                        "event_kind": "verification",
+                        "status": "passed",
+                        "route_waiver": {
+                            "accepted": True,
+                            "waiver_type": "manual_fix",
+                            "allowed_action": "task_timeline_append",
+                            "scope": {"project_id": "proj", "backlog_id": "BUG-TL-BAD-WAIVER"},
+                            "reason": "Unit test supplies explicit route gate waiver evidence.",
+                            "timeline_evidence": {"event_id": "test-route-gate"},
+                        },
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        self.assertIn("route identity", str(raised.exception))
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-TL-BAD-WAIVER",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
+    def test_timeline_append_accepts_valid_route_token(self):
+        from agent.governance import server
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": "BUG-TL-TOKEN",
+                    "event_type": "mf.close_ready",
+                    "event_kind": "close_ready",
+                    "status": "accepted",
+                    "route_token": _route_token("task_timeline_append", "BUG-TL-TOKEN"),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(result["route_token_gate"]["decision"], "route_token")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-TL-TOKEN",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 2)
+
+    def test_timeline_append_accepts_route_context_waiver(self):
+        from agent.governance import server
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": "BUG-TL-WAIVER",
+                    "event_type": "mf.verification",
+                    "event_kind": "verification",
+                    "status": "passed",
+                    "route_waiver": _route_waiver("task_timeline_append", "BUG-TL-WAIVER"),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(result["route_token_gate"]["decision"], "route_waiver")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-TL-WAIVER",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 2)
 
     def test_task_claim_and_complete_write_verified_timeline(self):
         from agent.governance import task_timeline
@@ -736,6 +936,7 @@ class TestTaskTimeline(unittest.TestCase):
         ready = task_timeline.mf_close_gate_verification(
             [
                 *base_events,
+                *_route_context_consumption_events(),
                 {
                     "event_kind": "verification",
                     "phase": "integration",
@@ -759,9 +960,90 @@ class TestTaskTimeline(unittest.TestCase):
 
         self.assertTrue(ready["passed"], ready)
         self.assertTrue(ready["contract_gate"]["passed"])
+        self.assertTrue(ready["route_context_gate"]["passed"])
         self.assertEqual(
             ready["contract_gate"]["present_requirement_ids"],
             ["backend_tests", "review_queue_category_e2e"],
+        )
+
+    def test_mf_parallel_close_gate_requires_route_context_consumption(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-CONTEXT",
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            [
+                "route_context",
+                "route_action_precheck",
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+            ],
+        )
+
+        advisory_only = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                {
+                    "event_kind": "route_context_advisory",
+                    "status": "passed",
+                    "payload": {"message": "observer should dispatch a worker"},
+                },
+            ],
+            contract=contract,
+        )
+        self.assertFalse(advisory_only["passed"], advisory_only)
+
+        ready = task_timeline.mf_close_gate_verification(
+            [*base_events, *_route_context_consumption_events()],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(
+            ready["route_context_gate"]["present_requirement_ids"],
+            [
+                "route_context",
+                "route_action_precheck",
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+            ],
+        )
+
+    def test_mf_parallel_close_gate_rejects_route_identity_mismatch(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-MISMATCH",
+        }
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events(),
+        ]
+        events[-1]["payload"]["mf_subagent_startup_gate"]["prompt_contract_hash"] = (
+            "sha256:different-prompt-contract"
+        )
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn(
+            "route_identity_mismatch",
+            blocked["route_context_gate"]["missing_requirement_ids"],
         )
 
     def test_mf_contract_gate_uses_observer_configured_required_evidence_ids(self):
@@ -837,6 +1119,7 @@ class TestTaskTimeline(unittest.TestCase):
         ready = task_timeline.mf_close_gate_verification(
             [
                 *base_events,
+                *_route_context_consumption_events(),
                 {
                     "event_kind": "verification",
                     "phase": "integration",
@@ -858,6 +1141,7 @@ class TestTaskTimeline(unittest.TestCase):
         )
 
         self.assertTrue(ready["passed"], ready)
+        self.assertTrue(ready["route_context_gate"]["passed"])
         self.assertEqual(
             ready["contract_gate"]["present_requirement_ids"],
             [
@@ -1206,6 +1490,19 @@ class TestTaskTimeline(unittest.TestCase):
                 ]
             },
         )
+        for event in _route_context_consumption_events():
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-MF-CONTRACT-PRECHECK",
+                event_type=f"mf.{event['event_kind']}",
+                phase=event.get("phase", ""),
+                event_kind=event.get("event_kind", ""),
+                status=event.get("status", ""),
+                payload=event.get("payload"),
+                verification=event.get("verification"),
+                artifact_refs=event.get("artifact_refs"),
+            )
         self.conn.commit()
 
         ready = server.handle_backlog_timeline_gate(
@@ -1269,15 +1566,7 @@ class TestTaskTimeline(unittest.TestCase):
                     path_params={"bug_id": "BUG-MF-CONTRACT-CLOSE"},
                     body={
                         "actor": "observer",
-                        "route_waiver": {
-                            "accepted": True,
-                            "waiver_type": "manual_fix",
-                            "allowed_action": "backlog_close",
-                            "project_id": "proj",
-                            "backlog_id": "BUG-MF-CONTRACT-CLOSE",
-                            "reason": "Unit test supplies explicit route gate waiver evidence.",
-                            "timeline_evidence": {"event_id": "test-route-gate"},
-                        },
+                        "route_waiver": _route_waiver("backlog_close", "BUG-MF-CONTRACT-CLOSE"),
                     },
                     method="POST",
                 )

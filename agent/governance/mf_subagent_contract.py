@@ -789,6 +789,22 @@ def _validate_route_token_waiver(
     action: str,
     request_scope: Mapping[str, str],
 ) -> dict[str, Any]:
+    route_context_hash = _route_context_hash(waiver)
+    prompt_contract_id = _route_prompt_contract_id(waiver)
+    caller_role = _route_caller_role(waiver)
+    missing_identity = []
+    if not route_context_hash:
+        missing_identity.append("route_context_hash")
+    if not prompt_contract_id:
+        missing_identity.append("prompt_contract_id")
+    if not caller_role:
+        missing_identity.append("caller_role")
+    if missing_identity:
+        raise MfSubagentContractError(
+            "route_waiver missing required route identity fields: "
+            + ", ".join(missing_identity)
+        )
+
     status = _string(waiver.get("status") or waiver.get("decision")).lower()
     accepted = _bool(waiver.get("accepted")) or status in {
         "accepted",
@@ -839,6 +855,9 @@ def _validate_route_token_waiver(
         "status": "accepted",
         "action": action,
         "decision": "route_waiver",
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "caller_role": caller_role,
         "waiver_hash": _stable_hash(waiver),
         "waiver_type": waiver_type or ("manual_fix" if manual_fix else "same_worktree"),
         "reason": reason,

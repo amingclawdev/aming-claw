@@ -98,6 +98,21 @@ def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():
     assert "route_token_waiver" in properties
 
 
+def test_mcp_stdio_protected_write_schemas_expose_route_gate_fields():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    for name in ("backlog_upsert", "task_timeline_append"):
+        properties = tools[name]["inputSchema"]["properties"]
+        assert "route_token" in properties
+        assert "route_waiver" in properties
+        assert "route_token_waiver" in properties
+
+
 def test_mcp_backlog_close_forwards_route_gate_payloads():
     calls = []
 
@@ -123,9 +138,11 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
     route_waiver = {
         "accepted": True,
         "waiver_type": "manual_fix",
+        "route_context_hash": "sha256:test-route-waiver",
+        "prompt_contract_id": "prompt-contract",
+        "caller_role": "observer",
         "allowed_action": "backlog_close",
-        "project_id": "aming-claw",
-        "backlog_id": "BUG-ROUTE",
+        "scope": {"project_id": "aming-claw", "backlog_id": "BUG-ROUTE"},
         "reason": "Unit test supplies explicit route waiver evidence.",
         "timeline_evidence": {"event_id": "event-2"},
     }
@@ -154,6 +171,79 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
                 "route_waiver": route_waiver,
             },
         )
+    ]
+
+
+def test_mcp_protected_write_dispatch_forwards_route_gate_payloads():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    route_token = {
+        "route_context_hash": "sha256:test-route",
+        "prompt_contract_id": "prompt-contract",
+        "caller_role": "observer",
+        "allowed_action": "backlog_upsert",
+        "scope": {"project_id": "aming-claw", "backlog_id": "BUG-ROUTE"},
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:event-1"],
+    }
+    route_waiver = {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "route_context_hash": "sha256:test-route-waiver",
+        "prompt_contract_id": "prompt-contract",
+        "caller_role": "observer",
+        "allowed_action": "task_timeline_append",
+        "scope": {"project_id": "aming-claw", "backlog_id": "BUG-ROUTE"},
+        "reason": "Unit test supplies explicit route waiver evidence.",
+        "timeline_evidence": {"event_id": "event-2"},
+    }
+
+    dispatcher.dispatch(
+        "backlog_upsert",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-ROUTE",
+            "status": "FIXED",
+            "route_token": route_token,
+        },
+    )
+    dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "BUG-ROUTE",
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+            "route_waiver": route_waiver,
+        },
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/backlog/aming-claw/BUG-ROUTE",
+            {"status": "FIXED", "route_token": route_token},
+        ),
+        (
+            "POST",
+            "/api/task/aming-claw/timeline",
+            {
+                "backlog_id": "BUG-ROUTE",
+                "event_type": "mf.verification",
+                "event_kind": "verification",
+                "route_waiver": route_waiver,
+            },
+        ),
     ]
 
 

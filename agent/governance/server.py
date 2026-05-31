@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -16698,11 +16698,53 @@ def _require_route_token_mutation_gate(
                 "waiver_fields": [
                     "route_waiver.waiver_type",
                     "route_waiver.reason",
+                    "route_waiver.route_context_hash",
+                    "route_waiver.prompt_contract_id",
+                    "route_waiver.caller_role",
+                    "route_waiver.scope.project_id",
+                    "route_waiver.scope.backlog_id",
+                    "route_waiver.scope.task_id",
                     "route_waiver.timeline_evidence",
                     "route_waiver.allowed_action",
                 ],
             },
         ) from exc
+
+
+def _backlog_upsert_requires_route_gate(body: dict | None, existing_row: Any | None) -> bool:
+    payload = body or {}
+
+    def _existing_value(key: str, default: str = "") -> str:
+        if existing_row is None:
+            return default
+        try:
+            return str(existing_row[key] or "")
+        except Exception:
+            return default
+
+    if "commit" in payload and str(payload.get("commit") or "").strip() != _existing_value("commit"):
+        return True
+    if "fixed_at" in payload and str(payload.get("fixed_at") or "").strip() != _existing_value("fixed_at"):
+        return True
+
+    if "status" in payload:
+        new_status = str(payload.get("status") or "").strip().upper()
+        old_status = _existing_value("status", "OPEN").strip().upper() or "OPEN"
+        if new_status in {"FIXED", "CLOSED", "DONE", "RESOLVED"}:
+            return True
+        if existing_row is not None and new_status != old_status:
+            return True
+        if existing_row is None and new_status != "OPEN":
+            return True
+
+    close_evidence_keys = {
+        "close_evidence",
+        "close_ready_evidence",
+        "timeline_gate",
+        "close_impact_check",
+        "route_token_gate",
+    }
+    return any(payload.get(key) not in (None, "", [], {}) for key in close_evidence_keys)
 
 
 def _task_complete_result_mutates(result: Any) -> bool:
@@ -17319,8 +17361,31 @@ def handle_task_timeline_append(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import task_timeline
 
+    event = {
+        "event_type": ctx.body.get("event_type", ""),
+        "phase": ctx.body.get("phase", ""),
+        "event_kind": ctx.body.get("event_kind", ""),
+    }
+    route_gate = {}
+    if task_timeline.is_protected_close_evidence(event):
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="task_timeline_append",
+            backlog_id=ctx.body.get("backlog_id", ""),
+            task_id=ctx.body.get("task_id", ""),
+        )
+
     with DBContext(project_id) as conn:
-        return task_timeline.record_event(
+        if route_gate:
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                backlog_id=ctx.body.get("backlog_id", ""),
+                task_id=ctx.body.get("task_id", ""),
+                commit_sha=ctx.body.get("commit_sha", ""),
+            )
+        result = task_timeline.record_event(
             conn,
             project_id=project_id,
             task_id=ctx.body.get("task_id", ""),
@@ -17344,6 +17409,9 @@ def handle_task_timeline_append(ctx: RequestContext):
             trace_id=ctx.body.get("trace_id", ""),
             commit_sha=ctx.body.get("commit_sha", ""),
         )
+        if route_gate:
+            result["route_token_gate"] = route_gate
+        return result
 
 
 @route("GET", "/api/task/{project_id}/timeline")
@@ -19151,6 +19219,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         events = task_timeline.list_events(conn, pid, backlog_id=bug_id, limit=limit)
         if applicable["is_mf"]:
             contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
+            contract = _mf_close_contract_with_route_context(contract, row, ctx.query)
             verification = task_timeline.mf_close_gate_verification(events, contract=contract)
         else:
             verification = {
@@ -19295,6 +19364,14 @@ def handle_backlog_upsert(ctx: RequestContext):
         existing_row = conn.execute(
             "SELECT * FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
         ).fetchone()
+        route_gate = {}
+        if _backlog_upsert_requires_route_gate(body, existing_row):
+            route_gate = _require_route_token_mutation_gate(
+                ctx,
+                action="backlog_upsert",
+                project_id=pid,
+                backlog_id=bug_id,
+            )
         # --- AI triage gate (R2: before INSERT, skip if force_admit) ---
         decision = None
         if existing_row is None and not body.get("force_admit"):
@@ -19427,6 +19504,14 @@ def handle_backlog_upsert(ctx: RequestContext):
             else ""
         )
         takeover_raw = backlog_runtime.policy_json(backlog_runtime.parse_json_object(body.get("takeover_json")))
+        if route_gate:
+            _record_route_token_gate_event(
+                conn,
+                pid,
+                route_gate,
+                backlog_id=bug_id,
+                commit_sha=str(body.get("commit") or ""),
+            )
         conn.execute(
             """INSERT INTO backlog_bugs
                (bug_id, title, status, priority, target_files, test_files,
@@ -19513,8 +19598,14 @@ def handle_backlog_upsert(ctx: RequestContext):
             except Exception:
                 pass
             conn.commit()
-            return {"ok": True, "bug_id": bug_id, "action": "superseded", "closed_bugs": decision["related_bug_ids"]}
-        return {"ok": True, "bug_id": bug_id, "action": "upserted"}
+            result = {"ok": True, "bug_id": bug_id, "action": "superseded", "closed_bugs": decision["related_bug_ids"]}
+            if route_gate:
+                result["route_token_gate"] = route_gate
+            return result
+        result = {"ok": True, "bug_id": bug_id, "action": "upserted"}
+        if route_gate:
+            result["route_token_gate"] = route_gate
+        return result
     finally:
         conn.close()
 
@@ -19739,7 +19830,7 @@ def handle_backlog_close(ctx: RequestContext):
     conn = get_connection(pid)
     try:
         row = conn.execute(
-            "SELECT bug_id, status, chain_stage, bypass_policy_json, mf_type, chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
             (bug_id,),
         ).fetchone()
         if not row:
@@ -19882,18 +19973,53 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
 
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
+    contract = _mf_close_contract_with_route_context(contract, row, body)
     verification = task_timeline.mf_close_gate_verification(events, contract=contract)
     if not verification.get("passed"):
         missing_event_kinds = verification.get("missing_event_kinds") or []
         contract_gate = verification.get("contract_gate") if isinstance(verification.get("contract_gate"), dict) else {}
         missing_contract = contract_gate.get("missing_requirement_ids") or []
-        missing = ", ".join([*missing_event_kinds, *missing_contract])
+        route_context_gate = (
+            verification.get("route_context_gate")
+            if isinstance(verification.get("route_context_gate"), dict)
+            else {}
+        )
+        missing_route_context = route_context_gate.get("missing_requirement_ids") or []
+        missing = ", ".join([*missing_event_kinds, *missing_contract, *missing_route_context])
         raise GovernanceError(
             "mf_timeline_gate_failed",
             f"MF backlog close requires task timeline evidence before FIXED; missing: {missing}",
             422,
         )
     return verification
+
+
+def _mf_close_contract_with_route_context(contract: dict, row, body: Mapping[str, Any]) -> dict:
+    enriched = dict(contract) if isinstance(contract, dict) else {}
+    close_context: dict[str, Any] = {}
+    for key in (
+        "priority",
+        "target_files",
+        "test_files",
+        "acceptance_criteria",
+    ):
+        value = _row_get(row, key, "")
+        if key in {"target_files", "test_files", "acceptance_criteria"}:
+            value = _string_list_field(value)
+        if value not in (None, "", [], {}):
+            close_context[key] = value
+    for key in ("changed_files", "owned_files", "caller_role", "task_summary", "summary"):
+        value = body.get(key) if isinstance(body, Mapping) else None
+        if key in {"changed_files", "owned_files"}:
+            value = _string_list_field(value)
+        if value not in (None, "", [], {}):
+            close_context[key] = value
+    if close_context:
+        existing = enriched.get("close_context")
+        if isinstance(existing, Mapping):
+            close_context = {**dict(existing), **close_context}
+        enriched["close_context"] = close_context
+    return enriched
 
 
 def _mf_close_timeline_applicability(row) -> dict:

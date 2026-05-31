@@ -21,6 +21,32 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+def _route_token(action="backlog_upsert", bug_id="BUG-ROUTE", project_id="test-project"):
+    return {
+        "route_context_hash": f"sha256:test-route-context-{action}",
+        "prompt_contract_id": f"prompt-contract-{action}",
+        "caller_role": "observer",
+        "allowed_action": action,
+        "scope": {"project_id": project_id, "backlog_id": bug_id},
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:test-route-token"],
+    }
+
+
+def _route_waiver(action="backlog_upsert", bug_id="BUG-ROUTE", project_id="test-project"):
+    return {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "route_context_hash": f"sha256:test-route-context-{action}",
+        "prompt_contract_id": f"prompt-contract-{action}",
+        "caller_role": "observer",
+        "allowed_action": action,
+        "scope": {"project_id": project_id, "backlog_id": bug_id},
+        "reason": "Unit test supplies explicit route gate waiver evidence.",
+        "timeline_evidence": {"event_id": "test-route-gate"},
+    }
+
+
 def _safe_cleanup(tmp_dir):
     """Best-effort cleanup that tolerates Windows file locks on SQLite WAL files."""
     import shutil
@@ -277,7 +303,12 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
 
         patch_ctx = self._make_ctx(
             {"project_id": "test-project", "bug_id": "PATCH-1"},
-            body={"status": "FIXED", "commit": "abc1234", "fixed_at": "2026-05-24T00:00:00Z"},
+            body={
+                "status": "FIXED",
+                "commit": "abc1234",
+                "fixed_at": "2026-05-24T00:00:00Z",
+                "route_token": _route_token("backlog_upsert", "PATCH-1"),
+            },
         )
         handle_backlog_upsert(patch_ctx)
 
@@ -423,20 +454,115 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         ctx2 = self._make_ctx(
             {"project_id": "test-project", "bug_id": "B101"},
             body={
-                "route_waiver": {
-                    "accepted": True,
-                    "waiver_type": "manual_fix",
-                    "allowed_action": "backlog_close",
-                    "project_id": "test-project",
-                    "backlog_id": "B101",
-                    "reason": "Unit test supplies explicit route gate waiver evidence.",
-                    "timeline_evidence": {"event_id": "test-route-gate"},
-                }
+                "route_waiver": _route_waiver("backlog_close", "B101")
             },
         )
         result = handle_backlog_close(ctx2)
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "FIXED")
+
+    def test_upsert_fixed_status_without_route_token_rejects_before_mutation(self):
+        from governance.server import handle_backlog_upsert
+        from governance.errors import GovernanceError
+
+        ctx = self._make_ctx(
+            {"project_id": "test-project", "bug_id": "B-PROTECTED-NO-TOKEN"},
+            body={"title": "Fallback close", "status": "FIXED", "force_admit": True},
+        )
+        with self.assertRaises(GovernanceError) as cm:
+            handle_backlog_upsert(ctx)
+
+        self.assertEqual(cm.exception.code, "route_token_required")
+        from governance.db import get_connection
+        conn = get_connection("test-project")
+        try:
+            row = conn.execute(
+                "SELECT bug_id FROM backlog_bugs WHERE bug_id = ?",
+                ("B-PROTECTED-NO-TOKEN",),
+            ).fetchone()
+            self.assertIsNone(row)
+        finally:
+            conn.close()
+
+    def test_upsert_fixed_status_rejects_generic_waiver_without_route_identity(self):
+        from governance.server import handle_backlog_upsert
+        from governance.errors import GovernanceError
+
+        ctx = self._make_ctx(
+            {"project_id": "test-project", "bug_id": "B-PROTECTED-BAD-WAIVER"},
+            body={
+                "title": "Bad waiver",
+                "status": "FIXED",
+                "force_admit": True,
+                "route_waiver": {
+                    "accepted": True,
+                    "waiver_type": "manual_fix",
+                    "allowed_action": "backlog_upsert",
+                    "scope": {"project_id": "test-project", "backlog_id": "B-PROTECTED-BAD-WAIVER"},
+                    "reason": "Unit test supplies explicit route gate waiver evidence.",
+                    "timeline_evidence": {"event_id": "test-route-gate"},
+                },
+            },
+        )
+        with self.assertRaises(GovernanceError) as cm:
+            handle_backlog_upsert(ctx)
+
+        self.assertEqual(cm.exception.code, "route_token_required")
+        self.assertIn("route identity", str(cm.exception))
+        from governance.db import get_connection
+        conn = get_connection("test-project")
+        try:
+            row = conn.execute(
+                "SELECT bug_id FROM backlog_bugs WHERE bug_id = ?",
+                ("B-PROTECTED-BAD-WAIVER",),
+            ).fetchone()
+            self.assertIsNone(row)
+        finally:
+            conn.close()
+
+    def test_upsert_fixed_status_accepts_valid_route_token(self):
+        from governance.server import handle_backlog_upsert, handle_backlog_get
+
+        bug_id = "B-PROTECTED-TOKEN"
+        result = handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Token close fallback",
+                    "status": "FIXED",
+                    "commit": "abc123",
+                    "force_admit": True,
+                    "route_token": _route_token("backlog_upsert", bug_id),
+                },
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["route_token_gate"]["decision"], "route_token")
+        row = handle_backlog_get(self._make_ctx({"project_id": "test-project", "bug_id": bug_id}))
+        self.assertEqual(row["status"], "FIXED")
+        self.assertEqual(row["commit"], "abc123")
+
+    def test_upsert_fixed_status_accepts_route_context_waiver(self):
+        from governance.server import handle_backlog_upsert, handle_backlog_get
+
+        bug_id = "B-PROTECTED-WAIVER"
+        result = handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Waiver close fallback",
+                    "status": "FIXED",
+                    "force_admit": True,
+                    "route_waiver": _route_waiver("backlog_upsert", bug_id),
+                },
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["route_token_gate"]["decision"], "route_waiver")
+        row = handle_backlog_get(self._make_ctx({"project_id": "test-project", "bug_id": bug_id}))
+        self.assertEqual(row["status"], "FIXED")
 
     def test_close_missing_404(self):
         from governance.server import handle_backlog_close
@@ -455,9 +581,12 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
 
         # Create OPEN and FIXED bugs
         for bug_id, status in [("BF1", "OPEN"), ("BF2", "FIXED"), ("BF3", "OPEN")]:
+            body = {"title": "Bug %s" % bug_id, "status": status}
+            if status == "FIXED":
+                body["route_token"] = _route_token("backlog_upsert", bug_id)
             ctx = self._make_ctx(
                 {"project_id": "test-project", "bug_id": bug_id},
-                body={"title": "Bug %s" % bug_id, "status": status},
+                body=body,
             )
             handle_backlog_upsert(ctx)
 
@@ -543,6 +672,7 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
                     "status": "FIXED",
                     "details_md": "needle-token",
                     "force_admit": True,
+                    "route_token": _route_token("backlog_upsert", "BS2"),
                 },
             )
         )

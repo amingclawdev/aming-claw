@@ -115,6 +115,9 @@ def _task_timeline_body(args: dict) -> dict:
         "artifact_refs",
         "trace_id",
         "commit_sha",
+        "route_token",
+        "route_waiver",
+        "route_token_waiver",
     }
     return {key: args[key] for key in allowed if key in args and args[key] is not None}
 
@@ -239,6 +242,11 @@ TOOLS: list[dict] = [
                 "discovered_at": {"type": "string"},
                 "details_md": {"type": "string"},
                 "chain_trigger_json": {"type": "object"},
+                "fixed_at": {"type": "string"},
+                "actor": {"type": "string"},
+                "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog state/close evidence writes."},
+                "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
             "required": ["project_id", "bug_id"],
         },
@@ -286,6 +294,9 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object"},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
+                "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
             "required": ["project_id", "event_type"],
         },

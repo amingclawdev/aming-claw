@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -104,6 +105,42 @@ MF_CLOSE_PASS_STATUSES = {
 }
 
 MF_CONTRACT_SCHEMA_VERSION = "mf_contract_gate.v1"
+
+MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION = "mf_route_context_consumption_gate.v1"
+MF_ROUTE_IDENTITY_FIELDS = (
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+)
+MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS = (
+    "route_context",
+    "route_action_precheck",
+    "bounded_implementation_worker_dispatch",
+    "mf_subagent_startup",
+)
+MF_ROUTE_CONTEXT_PASS_STATUSES = {
+    *MF_CLOSE_PASS_STATUSES,
+    "allow",
+    "allowed",
+    "approved",
+}
+
+
+def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
+    """Return true when a timeline append can satisfy MF close evidence."""
+
+    if not isinstance(event, dict):
+        return False
+    tokens = {
+        _text(event.get("event_kind")).lower().replace("-", "_"),
+        _text(event.get("phase")).lower().replace("-", "_"),
+    }
+    event_type = _text(event.get("event_type")).lower().replace("-", "_")
+    if event_type:
+        tokens.add(event_type)
+        tokens.update(part for part in re.split(r"[._:/]+", event_type) if part)
+    protected = {item.lower().replace("-", "_") for item in MF_CLOSE_REQUIRED_EVENT_KINDS}
+    return bool(tokens & protected)
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -601,6 +638,324 @@ def _contract_root(contract: dict[str, Any] | None) -> dict[str, Any]:
     return data
 
 
+def _copy_route_payload_fields(source: dict[str, Any], payload: dict[str, Any]) -> None:
+    for key in (
+        "priority",
+        "selected_topology",
+        "recommended_topology",
+        "topology",
+        "target_files",
+        "test_files",
+        "changed_files",
+        "owned_files",
+        "risk_class",
+        "summary",
+        "task_summary",
+        "title",
+        "caller_role",
+        "observer_direct_mutation",
+        "same_observer_direct_mutation",
+        "direct_mutation",
+        "implementation_mutation_requested",
+    ):
+        if key in source and source.get(key) not in (None, "", [], {}):
+            payload[key] = source[key]
+
+
+def _route_topology_policy(contract: dict[str, Any] | None) -> dict[str, Any]:
+    data = _mapping(contract)
+    root = _contract_root(contract)
+    payload: dict[str, Any] = {}
+
+    for source in (
+        data,
+        _mapping(data.get("close_context")),
+        root,
+        _mapping(root.get("close_context")),
+    ):
+        _copy_route_payload_fields(source, payload)
+
+    route_policy = _mapping(root.get("route_topology_policy"))
+    _copy_route_payload_fields(route_policy, payload)
+    if str(root.get("template_id") or "").strip() == "mf_parallel.v1":
+        payload.setdefault("selected_topology", "observer_led_parallel_lanes")
+        payload.setdefault("recommended_topology", "mf_parallel.v1")
+        _copy_route_payload_fields(_mapping(route_policy.get("high_risk")), payload)
+
+    try:
+        from .service_registry import classify_route_topology
+
+        return classify_route_topology(payload)
+    except Exception:
+        selected = str(
+            payload.get("selected_topology")
+            or payload.get("recommended_topology")
+            or payload.get("topology")
+            or ""
+        ).strip()
+        high_risk = selected in {
+            "observer_led_parallel_lanes",
+            "mf_parallel.v1",
+            "mf_parallel",
+            "parallel",
+        }
+        return {
+            "schema_version": "route_topology_selection.v1",
+            "selected_topology": (
+                "observer_led_parallel_lanes" if high_risk else "lightweight_single_lane"
+            ),
+            "recommended_topology": "mf_parallel.v1" if high_risk else "single_lane.v1",
+            "required_lanes": (
+                [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ]
+                if high_risk
+                else ["single_bounded_worker"]
+            ),
+            "reason_codes": ["explicit_parallel_topology"] if high_risk else ["small_deterministic"],
+            "independent_verification_required": high_risk,
+        }
+
+
+def _route_context_required(topology_policy: dict[str, Any]) -> bool:
+    selected = str(topology_policy.get("selected_topology") or "").strip()
+    recommended = str(topology_policy.get("recommended_topology") or "").strip()
+    required_lanes = {str(item).strip() for item in _list(topology_policy.get("required_lanes"))}
+    return (
+        selected == "observer_led_parallel_lanes"
+        or recommended == "mf_parallel.v1"
+        or "bounded_implementation_worker" in required_lanes
+    )
+
+
+def _first_deep_text(value: Any, key: str) -> str:
+    if isinstance(value, dict):
+        if key in value and str(value.get(key) or "").strip():
+            return str(value.get(key) or "").strip()
+        for child in value.values():
+            found = _first_deep_text(child, key)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _first_deep_text(child, key)
+            if found:
+                return found
+    return ""
+
+
+def _route_identity(value: Any) -> dict[str, str]:
+    identity = {field: _first_deep_text(value, field) for field in MF_ROUTE_IDENTITY_FIELDS}
+    return identity if all(identity.values()) else {}
+
+
+def _route_identity_key(identity: dict[str, str]) -> tuple[str, str, str]:
+    return tuple(identity.get(field, "") for field in MF_ROUTE_IDENTITY_FIELDS)
+
+
+def _route_event_passed(event: dict[str, Any]) -> bool:
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    return bool(event.get("passed")) or status in MF_ROUTE_CONTEXT_PASS_STATUSES
+
+
+def _route_event_markers(event: dict[str, Any]) -> set[str]:
+    markers: set[str] = set()
+    for key in ("event_kind", "event_type", "phase", "schema_version"):
+        value = str(event.get(key) or "").strip().lower()
+        if value:
+            markers.add(value)
+    for key in event.keys():
+        markers.add(str(key).strip().lower())
+    for key in ("payload", "verification", "artifact_refs"):
+        container = _mapping(event.get(key))
+        for marker in container.keys():
+            markers.add(str(marker).strip().lower())
+        for nested_key in (
+            "route_context",
+            "route_prompt_bundle",
+            "prompt_alert_bundle",
+            "visible_injection_manifest",
+            "route_action_gate",
+            "route_action_precheck",
+            "mf_subagent_dispatch_gate",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup_gate",
+            "dispatch_evidence",
+            "startup_evidence",
+            "contract_evidence",
+        ):
+            nested = container.get(nested_key)
+            if isinstance(nested, dict):
+                markers.add(nested_key)
+                for marker in nested.keys():
+                    markers.add(str(marker).strip().lower())
+            for item in _list(nested):
+                item = _mapping(item)
+                for item_key in ("id", "requirement_id", "kind", "event_kind"):
+                    value = str(item.get(item_key) or "").strip().lower()
+                    if value:
+                        markers.add(value)
+    return markers
+
+
+def _route_event_categories(event: dict[str, Any]) -> set[str]:
+    markers = _route_event_markers(event)
+    categories: set[str] = set()
+    if markers.intersection(
+        {
+            "route_context",
+            "route_prompt_bundle",
+            "prompt_alert_bundle",
+            "visible_injection_manifest",
+            "visible_injection_manifest_hash",
+        }
+    ):
+        categories.add("route_context")
+    if markers.intersection(
+        {
+            "route_action",
+            "route_action_gate",
+            "route_action_precheck",
+            "action_precheck",
+            "pre_mutation",
+            "route.action",
+            "route.action.pre_mutation",
+        }
+    ):
+        categories.add("route_action_precheck")
+    if markers.intersection(
+        {
+            "mf_subagent_dispatch",
+            "mf_subagent.dispatch",
+            "mf_subagent_dispatch_gate",
+            "bounded_implementation_worker_dispatch",
+            "dispatch_evidence",
+        }
+    ):
+        categories.add("bounded_implementation_worker_dispatch")
+    if markers.intersection(
+        {
+            "mf_subagent_startup",
+            "mf_subagent.startup",
+            "mf_subagent_startup_gate",
+            "startup_gate",
+            "startup_evidence",
+        }
+    ):
+        categories.add("mf_subagent_startup")
+    return categories
+
+
+def mf_route_context_gate_verification(
+    events: list[dict[str, Any]] | None,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify route context was consumed by route, dispatch, and startup gates."""
+
+    rows = events if isinstance(events, list) else []
+    topology_policy = _route_topology_policy(contract)
+    required = _route_context_required(topology_policy)
+    present: dict[str, list[dict[str, Any]]] = {
+        req_id: [] for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+    }
+    identities: dict[str, list[dict[str, str]]] = {
+        req_id: [] for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+    }
+    ignored: list[dict[str, Any]] = []
+
+    for raw_event in rows:
+        event = _mapping(raw_event)
+        if not event:
+            continue
+        identity = _route_identity(event)
+        categories = _route_event_categories(event)
+        if not categories:
+            continue
+        if not identity:
+            ignored.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "missing_route_identity",
+                "categories": sorted(categories),
+            })
+            continue
+        if not _route_event_passed(event):
+            ignored.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "non_passing_route_evidence",
+                "categories": sorted(categories),
+            })
+            continue
+        event_ref = {
+            "id": event.get("id") or event.get("event_id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "status": event.get("status") or event.get("decision"),
+        }
+        for category in categories:
+            if category in present:
+                present[category].append(event_ref)
+                identities[category].append(identity)
+
+    missing = [
+        req_id
+        for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+        if required and not present[req_id]
+    ]
+    identity_keys = {
+        _route_identity_key(identity)
+        for category_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+        for identity in identities[category_id]
+        if identity
+    }
+    same_route_identity = len(identity_keys) <= 1
+    if required and identity_keys and not same_route_identity:
+        missing.append("route_identity_mismatch")
+    passed = (not required) or (not missing and same_route_identity)
+    route_identity: dict[str, str] = {}
+    if len(identity_keys) == 1:
+        identity_key = next(iter(identity_keys))
+        route_identity = {
+            field: identity_key[idx]
+            for idx, field in enumerate(MF_ROUTE_IDENTITY_FIELDS)
+        }
+    return {
+        "schema_version": MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "required": required,
+        "required_requirement_ids": (
+            list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS) if required else []
+        ),
+        "present_requirement_ids": [
+            req_id for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS if present[req_id]
+        ],
+        "missing_requirement_ids": missing,
+        "topology_policy": topology_policy,
+        "route_identity": route_identity,
+        "same_route_identity": same_route_identity,
+        "evidence_events": {
+            req_id: present[req_id] for req_id in MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS
+        },
+        "ignored_route_events": ignored,
+        "checks": {
+            "route_context_present": bool(present["route_context"]),
+            "route_action_precheck_present": bool(present["route_action_precheck"]),
+            "bounded_implementation_worker_dispatch_present": bool(
+                present["bounded_implementation_worker_dispatch"]
+            ),
+            "mf_subagent_startup_present": bool(present["mf_subagent_startup"]),
+            "same_route_identity": same_route_identity,
+        },
+    }
+
+
 def _normalize_requirement(item: Any, *, default_required: bool = True) -> dict[str, Any] | None:
     if isinstance(item, str):
         req_id = item.strip()
@@ -797,7 +1152,12 @@ def mf_close_gate_verification(
             })
     missing = sorted(MF_CLOSE_REQUIRED_EVENT_KINDS - present)
     contract_gate = mf_contract_gate_verification(rows, contract)
-    passed = not missing and bool(contract_gate.get("passed"))
+    route_context_gate = mf_route_context_gate_verification(rows, contract)
+    passed = (
+        not missing
+        and bool(contract_gate.get("passed"))
+        and bool(route_context_gate.get("passed"))
+    )
     return {
         "schema_version": "mf_close_timeline_gate.v1",
         "passed": passed,
@@ -808,11 +1168,13 @@ def mf_close_gate_verification(
         "event_count": len(rows),
         "ignored_required_events": ignored,
         "contract_gate": contract_gate,
+        "route_context_gate": route_context_gate,
         "checks": {
             "has_implementation": "implementation" in present,
             "has_verification": "verification" in present,
             "has_close_ready": "close_ready" in present,
             "has_contract_evidence": bool(contract_gate.get("passed")),
+            "has_route_context_consumption": bool(route_context_gate.get("passed")),
         },
     }
 
