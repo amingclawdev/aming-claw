@@ -73,12 +73,14 @@ def test_doctor_json_reports_backend_blocker_without_failing_hard(tmp_path: Path
     assert {
         "simple_user_entry",
         "paradigm_route_context_demo",
+        "dashboard_mock_ai_playwright_fixture",
+        "mock_ai_docker_fixture",
         "service_router_docker_fixture",
         "service_router_ai_structured_output_fixture",
         "service_router_live_ai_environment_tester",
         "ruby_graph_sinatra",
     }.issubset(set(payload["registry"]["scenario_ids"]))
-    assert payload["registry"]["scenario_count"] == 6
+    assert payload["registry"]["scenario_count"] == 8
     assert payload["paths"]["cache_inside_repo"] is False
 
 
@@ -93,15 +95,19 @@ def test_plan_output_lists_scenarios_actions_and_fixture_metadata(tmp_path: Path
     scenarios = {scenario["scenario_id"]: scenario for scenario in payload["scenarios"]}
     scenario = scenarios["simple_user_entry"]
     paradigm = scenarios["paradigm_route_context_demo"]
+    dashboard_mock = scenarios["dashboard_mock_ai_playwright_fixture"]
+    mock_docker = scenarios["mock_ai_docker_fixture"]
     docker = scenarios["service_router_docker_fixture"]
     ai_fixture = scenarios["service_router_ai_structured_output_fixture"]
     live_probe = scenarios["service_router_live_ai_environment_tester"]
     ruby = scenarios["ruby_graph_sinatra"]
 
-    assert payload["selected_count"] == 6
+    assert payload["selected_count"] == 8
     assert set(scenarios) == {
         "simple_user_entry",
         "paradigm_route_context_demo",
+        "dashboard_mock_ai_playwright_fixture",
+        "mock_ai_docker_fixture",
         "service_router_docker_fixture",
         "service_router_ai_structured_output_fixture",
         "service_router_live_ai_environment_tester",
@@ -134,6 +140,9 @@ def test_plan_output_lists_scenarios_actions_and_fixture_metadata(tmp_path: Path
     assert {
         alert["code"] for alert in paradigm["test_flow_route"]["prompt_alert_bundle"]["alerts"]
     } == {"test_flow_focused_unit", "test_flow_fixture_only"}
+    assert "dashboard_mock_ai_playwright_route_declared" in paradigm["test_flow_route"][
+        "evidence_ids"
+    ]
     assert "route_prompt_bundle_is_hashable_and_low_noise" in paradigm["test_flow_route"][
         "evidence_ids"
     ]
@@ -142,6 +151,38 @@ def test_plan_output_lists_scenarios_actions_and_fixture_metadata(tmp_path: Path
         "python",
         "scripts/paradigm-route-context-demo.py",
     ]
+    dashboard_alerts = dashboard_mock["test_flow_route"]["prompt_alert_bundle"]["alerts"]
+    dashboard_commands = {command["id"]: command for command in dashboard_mock["commands"]}
+    assert dashboard_mock["execution_policy"]["lane"] == "playwright_mock_ai"
+    assert dashboard_mock["execution_policy"]["model_calls"] == "mocked"
+    assert dashboard_mock["execution_policy"]["live_ai"] == "disabled"
+    assert dashboard_mock["test_flow_route"]["decision"] == "playwright_mock_ai"
+    assert dashboard_mock["test_flow_route"]["primary_lane"] == "playwright_mock_ai"
+    assert dashboard_mock["test_flow_route"]["lanes"] == ["playwright_mock_ai"]
+    assert dashboard_mock["test_flow_route"]["model_calls"] == "mocked"
+    assert dashboard_mock["test_flow_route"]["autorun"] is True
+    assert dashboard_alerts[0]["code"] == "test_flow_playwright_mock_ai"
+    assert dashboard_alerts[0]["severity"] == "warning"
+    assert "call_live_ai" in dashboard_alerts[0]["blocked_actions"]
+    assert dashboard_mock["safety"]["mock_ai"] is True
+    assert dashboard_mock["safety"]["calls_models"] is False
+    assert dashboard_mock["fixtures"][0]["kind"] == "mock_ai_timeline"
+    assert (
+        "frontend/dashboard/scripts/e2e-demo-mock-ai.mjs"
+        in dashboard_commands["dashboard_mock_ai_playwright_evidence"]["command"]
+    )
+    mock_docker_deps = {item["id"]: item for item in mock_docker["dependency_decisions"]}
+    assert mock_docker["execution_policy"]["requires_flags"] == ["--allow-docker"]
+    assert mock_docker["execution_policy"]["model_calls"] == "mocked"
+    assert mock_docker["test_flow_route"]["decision"] == "docker_fixture"
+    assert mock_docker["test_flow_route"]["primary_lane"] == "docker_fixture"
+    assert mock_docker["test_flow_route"]["requires_flags"] == ["--allow-docker"]
+    assert mock_docker["test_flow_route"]["model_calls"] == "mocked"
+    assert mock_docker["safety"]["no_ai_credentials"] is True
+    assert mock_docker["safety"]["fixed_structured_output"] is True
+    assert mock_docker["fixtures"][0]["kind"] == "docker_fixture"
+    assert mock_docker["fixtures"][1]["kind"] == "json_fixture"
+    assert mock_docker_deps["docker_fixture"]["status"] == "planned"
     docker_deps = {item["id"]: item for item in docker["dependency_decisions"]}
     assert docker["execution_policy"]["requires_flags"] == ["--allow-docker"]
     assert docker["execution_policy"]["model_calls"] == "forbidden"
@@ -421,6 +462,31 @@ def test_service_router_fixture_dependency_gating_shape(tmp_path: Path) -> None:
     assert docker_report["test_flow_route"]["prompt_alert_bundle"]["alerts"][0]["lane"] == "docker_fixture"
     assert docker_report["fixtures"][0]["kind"] == "docker_fixture"
     assert docker_report["command_summaries"] == []
+
+    mock_docker_result = _run_manager(
+        "run",
+        "--scenario",
+        "mock_ai_docker_fixture",
+        "--json",
+        "--state-dir",
+        str(tmp_path / "mock-docker-state"),
+        check=False,
+    )
+    mock_docker_payload = _json(mock_docker_result)
+    [mock_docker_report] = mock_docker_payload["reports"]
+    mock_docker_deps = {item["id"]: item for item in mock_docker_report["dependency_decisions"]}
+
+    assert mock_docker_result.returncode == 2
+    assert mock_docker_payload["ok"] is False
+    assert mock_docker_report["status"] == "blocked"
+    assert mock_docker_report["blocked"]["reason_code"] == "dependency_docker_fixture_blocked"
+    assert mock_docker_deps["docker_fixture"]["status"] == "blocked"
+    assert mock_docker_report["execution_policy"]["model_calls"] == "mocked"
+    assert mock_docker_report["safety"]["mock_ai"] is True
+    assert mock_docker_report["safety"]["no_ai_credentials"] is True
+    assert mock_docker_report["test_flow_route"]["model_calls"] == "mocked"
+    assert mock_docker_report["test_flow_route"]["prompt_alert_bundle"]["alerts"][0]["lane"] == "docker_fixture"
+    assert mock_docker_report["command_summaries"] == []
 
     ai_result = _run_manager(
         "run",

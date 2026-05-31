@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Runnable proof case for route context and test-flow routing.
 
-The demo intentionally avoids Docker, live AI, and primary governance
-mutations. It proves that the route layer can:
+The default proof intentionally avoids Docker, live AI, browser E2E, and primary
+governance mutations. It proves that the route layer can:
 
-- select fixture-only, Docker-gated, live-AI-gated, and external manifest lanes;
-- keep Docker/live-AI lanes blocked without explicit operator flags;
+- select fixture-only, Playwright mock-AI, Docker-gated, live-AI-gated, and
+  external manifest lanes;
+- keep Docker/live-AI lanes blocked without explicit operator flags while
+  keeping dashboard AI validation on fixed mock inputs;
 - expose compact prompt alert context with stable hashes; and
 - keep raw prompt/private context out of the worker-facing bundle.
 """
@@ -329,10 +331,23 @@ def build_report(state_dir: Path) -> dict[str, Any]:
             state_dir=state_dir / "fixture-run",
         )
     )
+    dashboard_plan = _first_scenario(
+        _manager_json(
+            ["plan", "--scenario", "dashboard_mock_ai_playwright_fixture"],
+            state_dir=state_dir / "dashboard-plan",
+        )
+    )
     docker_report = _first_report(
         _manager_json(
             ["run", "--scenario", "service_router_docker_fixture"],
             state_dir=state_dir / "docker-run",
+            expected_codes={2},
+        )
+    )
+    mock_docker_report = _first_report(
+        _manager_json(
+            ["run", "--scenario", "mock_ai_docker_fixture"],
+            state_dir=state_dir / "mock-ai-docker-run",
             expected_codes={2},
         )
     )
@@ -379,6 +394,21 @@ def build_report(state_dir: Path) -> dict[str, Any]:
             "command_statuses": [item["status"] for item in fixture_report["command_summaries"]],
         },
         {
+            "id": "dashboard_mock_ai_playwright_route_declared",
+            "scenario_id": dashboard_plan["scenario_id"],
+            "status": "planned",
+            "decision": dashboard_plan["test_flow_route"]["decision"],
+            "primary_lane": dashboard_plan["test_flow_route"]["primary_lane"],
+            "model_calls": dashboard_plan["test_flow_route"]["model_calls"],
+            "live_ai": dashboard_plan["test_flow_route"]["live_ai"],
+            "alert_codes": [
+                alert["code"]
+                for alert in dashboard_plan["test_flow_route"]["prompt_alert_bundle"]["alerts"]
+            ],
+            "command_ids": [item["id"] for item in dashboard_plan["commands"]],
+            "fixture_kinds": [item["kind"] for item in dashboard_plan["fixtures"]],
+        },
+        {
             "id": "docker_route_blocks_without_approval",
             "scenario_id": docker_report["scenario_id"],
             "status": docker_report["status"],
@@ -390,6 +420,20 @@ def build_report(state_dir: Path) -> dict[str, Any]:
                 for alert in docker_report["test_flow_route"]["prompt_alert_bundle"]["alerts"]
             ],
             "command_summaries": docker_report["command_summaries"],
+        },
+        {
+            "id": "mock_ai_docker_route_blocks_without_approval",
+            "scenario_id": mock_docker_report["scenario_id"],
+            "status": mock_docker_report["status"],
+            "decision": mock_docker_report["test_flow_route"]["decision"],
+            "model_calls": mock_docker_report["test_flow_route"]["model_calls"],
+            "requires_flags": mock_docker_report["test_flow_route"]["requires_flags"],
+            "blocked_reason_code": mock_docker_report["blocked"]["reason_code"],
+            "alert_codes": [
+                alert["code"]
+                for alert in mock_docker_report["test_flow_route"]["prompt_alert_bundle"]["alerts"]
+            ],
+            "command_summaries": mock_docker_report["command_summaries"],
         },
         {
             "id": "live_ai_route_blocks_without_approval",
@@ -433,8 +477,13 @@ def build_report(state_dir: Path) -> dict[str, Any]:
         fixture_plan["test_flow_route"]["decision"] == "fixture_only"
         and fixture_report["status"] == "passed"
         and fixture_report["safety"]["calls_models"] is False
+        and dashboard_plan["test_flow_route"]["decision"] == "playwright_mock_ai"
+        and dashboard_plan["test_flow_route"]["model_calls"] == "mocked"
         and docker_report["status"] == "blocked"
         and "--allow-docker" in docker_report["test_flow_route"]["requires_flags"]
+        and mock_docker_report["status"] == "blocked"
+        and mock_docker_report["test_flow_route"]["model_calls"] == "mocked"
+        and "--allow-docker" in mock_docker_report["test_flow_route"]["requires_flags"]
         and live_report["status"] == "blocked"
         and "--allow-live-ai" in live_report["test_flow_route"]["requires_flags"]
         and external_report["status"] == "passed"
@@ -449,7 +498,8 @@ def build_report(state_dir: Path) -> dict[str, Any]:
         "summary": (
             "Route-owned context selects the right test lane, emits only lane-specific "
             "alerts, blocks unsafe Docker/live-AI routes without approval, and exposes "
-            "hashable prompt context without raw prompt leakage."
+            "hashable prompt context without raw prompt leakage. Dashboard validation uses "
+            "Playwright with mock AI inputs; AI-related Docker validation stays gated."
         ),
         "surfaces": {
             "intent": "scenario ids and external manifest route ids state the test intent",

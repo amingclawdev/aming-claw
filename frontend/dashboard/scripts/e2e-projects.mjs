@@ -798,6 +798,11 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("ImplementationStepGrid"), "Timeline tab should group implementation evidence into audit steps");
   assert(viewSource.includes("ArtifactPills"), "Timeline and inspector should surface concrete artifacts");
   assert(viewSource.includes("EvidenceInspector"), "Backlog DAG nodes should open an evidence inspector");
+  assert(viewSource.includes("RouteEvidenceCards"), "Evidence inspector should render route-context evidence cards");
+  assert(viewSource.includes("Observer alert received"), "Evidence inspector should surface observer alert acknowledgement");
+  assert(viewSource.includes("Expert review"), "Evidence inspector should surface expert review evidence");
+  assert(viewSource.includes("Test route"), "Evidence inspector should surface selected test-route evidence");
+  assert(viewSource.includes("Final drift prompt"), "Evidence inspector should surface the final drift prompt");
   assert(viewSource.includes("relatedIdsFromBug"), "Backlog detail should discover related backlog ids");
   assert(viewSource.includes("BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS"), "Backlog detail should include a deterministic parallel-lane fixture");
   assert(viewSource.includes("contract_missing_visualization"), "Backlog fixture should model missing contract evidence");
@@ -817,6 +822,7 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".backlog-modal"), "Backlog modal should have stable layout CSS");
   assert(cssSource.includes(".backlog-dag-node.status-missing"), "Backlog DAG should visibly distinguish missing evidence");
   assert(cssSource.includes(".backlog-evidence-inspector"), "Backlog evidence inspector should have stable layout CSS");
+  assert(cssSource.includes(".backlog-route-evidence-cards"), "Route-context evidence cards should have stable layout CSS");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }

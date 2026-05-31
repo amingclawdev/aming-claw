@@ -3309,6 +3309,74 @@ a:hover { text-decoration: underline; }
   border-top: 1px solid var(--ink-100);
 }
 
+.backlog-route-evidence-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.backlog-route-evidence-card {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  background: #f8fbff;
+}
+
+.backlog-route-evidence-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.backlog-route-evidence-card-head strong {
+  min-width: 0;
+  color: var(--ink-900);
+  font-size: 12px;
+}
+
+.backlog-route-evidence-card-head span {
+  flex: 0 0 auto;
+  max-width: 45%;
+  overflow: hidden;
+  padding: 2px 6px;
+  border: 1px solid #bae6fd;
+  border-radius: 999px;
+  background: #e0f2fe;
+  color: #075985;
+  font-size: 10px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backlog-route-evidence-card p {
+  margin: 6px 0 0;
+  color: var(--ink-600);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.backlog-route-evidence-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 7px;
+}
+
+.backlog-route-evidence-chip-row em {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: #e2e8f0;
+  color: var(--ink-700);
+  font-size: 10px;
+  font-style: normal;
+}
+
 .backlog-contract-inputs {
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 }

@@ -115,7 +115,7 @@
     {
       "id": "paradigm_route_context_demo",
       "title": "Paradigm route context and test-flow proof",
-      "description": "Runs the concrete proof case for the AI-agent development system paradigm: route-owned context, selected test-flow alerts, fixture-only pass, Docker/live-AI gated blocks, and external route registration.",
+      "description": "Runs the concrete proof case for the AI-agent development system paradigm: route-owned context, selected test-flow alerts, fixture-only pass, mock-AI Playwright routing, Docker/live-AI gated blocks, and external route registration.",
       "target_project": "aming-claw",
       "target_ref": "HEAD",
       "runner": "commands",
@@ -154,7 +154,9 @@
           "route_context",
           "test_flow_route",
           "external_route_manifest",
-          "prompt_alert_bundle"
+          "prompt_alert_bundle",
+          "playwright_mock_ai",
+          "mock_ai_docker_gate"
         ],
         "test_files": [
           "agent/tests/test_paradigm_route_context_demo.py",
@@ -178,7 +180,9 @@
         ],
         "evidence_ids": [
           "fixture_only_route_runs",
+          "dashboard_mock_ai_playwright_route_declared",
           "docker_route_blocks_without_approval",
+          "mock_ai_docker_route_blocks_without_approval",
           "live_ai_route_blocks_without_approval",
           "external_project_registers_fixture_route",
           "route_prompt_bundle_is_hashable_and_low_noise"
@@ -201,10 +205,22 @@
           "expected": "passed"
         },
         {
+          "id": "dashboard_mock_ai_playwright_route_declared",
+          "kind": "demo_output",
+          "field": "proof_cases.dashboard_mock_ai_playwright_route_declared.decision",
+          "expected": "playwright_mock_ai"
+        },
+        {
           "id": "docker_route_blocks_without_approval",
           "kind": "demo_output",
           "field": "proof_cases.docker_route_blocks_without_approval.status",
           "expected": "blocked"
+        },
+        {
+          "id": "mock_ai_docker_route_blocks_without_approval",
+          "kind": "demo_output",
+          "field": "proof_cases.mock_ai_docker_route_blocks_without_approval.model_calls",
+          "expected": "mocked"
         },
         {
           "id": "live_ai_route_blocks_without_approval",
@@ -246,6 +262,286 @@
           "kind": "demo_script",
           "path": "scripts/paradigm-route-context-demo.py",
           "description": "Runnable JSON proof tying the article's paradigm surfaces to route context and test-flow route evidence."
+        }
+      ]
+    },
+    {
+      "id": "dashboard_mock_ai_playwright_fixture",
+      "title": "Dashboard mock-AI Playwright evidence route",
+      "description": "Browser validation for the route-context demo dashboard. It runs the dashboard against fixed mock AI/timeline inputs and asserts visible observer alert acknowledgement, expert review, test-route evidence, backlog state, and final drift prompt.",
+      "target_project": "aming-claw",
+      "target_ref": "HEAD",
+      "runner": "commands",
+      "dependencies": [
+        {
+          "id": "node",
+          "kind": "command",
+          "command": "{node}",
+          "required": true,
+          "remediation": "Install Node.js so the dashboard Playwright mock-AI fixture can run."
+        }
+      ],
+      "execution_policy": {
+        "lane": "playwright_mock_ai",
+        "autorun": true,
+        "requires_flags": [],
+        "live_ai": "disabled",
+        "model_calls": "mocked"
+      },
+      "safety": {
+        "fixture_only": true,
+        "live_ai": false,
+        "calls_models": false,
+        "mock_ai": true,
+        "requires_human_approval": false
+      },
+      "coverage": {
+        "areas": [
+          "dashboard",
+          "route_context_evidence",
+          "mock_ai_fixture",
+          "playwright",
+          "test_flow_route"
+        ],
+        "test_files": [
+          "frontend/dashboard/scripts/e2e-demo-mock-ai.mjs",
+          "agent/tests/test_test_scenario_manager.py"
+        ]
+      },
+      "route_context": {
+        "service_id": "dashboard.demo_mock_ai_playwright",
+        "event_kind": "dashboard.mock_ai_fixture.requested",
+        "mode": "browser_fixture",
+        "side_effect_class": "browser_fixture"
+      },
+      "test_flow_route": {
+        "source": "scenario_registry",
+        "decision": "playwright_mock_ai",
+        "primary_lane": "playwright_mock_ai",
+        "lanes": [
+          "playwright_mock_ai"
+        ],
+        "evidence_ids": [
+          "observer_alert_ack_visible",
+          "expert_review_visible",
+          "test_route_visible",
+          "final_drift_prompt_visible",
+          "no_live_ai_calls"
+        ]
+      },
+      "fixtures": [
+        {
+          "id": "dashboard-route-context-mock-ai-timeline",
+          "kind": "mock_ai_timeline",
+          "deterministic": true,
+          "calls_models": false,
+          "description": "Fixed dashboard timeline payload that renders observer alert acknowledgement, expert review, test route, and final drift prompt cards."
+        }
+      ],
+      "evidence_requirements": [
+        {
+          "id": "observer_alert_ack_visible",
+          "kind": "playwright_locator",
+          "selector_text": "Observer alert received",
+          "expected": true
+        },
+        {
+          "id": "expert_review_visible",
+          "kind": "playwright_locator",
+          "selector_text": "Expert review",
+          "expected": true
+        },
+        {
+          "id": "test_route_visible",
+          "kind": "playwright_locator",
+          "selector_text": "Test route",
+          "expected": true
+        },
+        {
+          "id": "final_drift_prompt_visible",
+          "kind": "playwright_locator",
+          "selector_text": "Final drift prompt",
+          "expected": true
+        },
+        {
+          "id": "no_live_ai_calls",
+          "kind": "safety_metadata",
+          "field": "safety.calls_models",
+          "expected": false
+        }
+      ],
+      "commands": [
+        {
+          "id": "dashboard_mock_ai_playwright_evidence",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "frontend/dashboard/scripts/e2e-demo-mock-ai.mjs"
+          ],
+          "env": {
+            "AMING_CLAW_LIVE_AI": "0",
+            "AMING_CLAW_MODEL_CALLS": "mocked"
+          },
+          "timeout_ms": 180000
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "dashboard_mock_ai_playwright_script",
+          "kind": "playwright_contract",
+          "path": "frontend/dashboard/scripts/e2e-demo-mock-ai.mjs",
+          "description": "Playwright fixture that drives the dashboard with a mocked governance API and fixed mock-AI timeline inputs."
+        }
+      ]
+    },
+    {
+      "id": "mock_ai_docker_fixture",
+      "title": "Mock-AI Docker boundary fixture lane",
+      "description": "Gated Docker route for AI-related validation that must prove container/no-credential boundaries with fixed structured mock output and no provider calls.",
+      "target_project": "aming-claw",
+      "target_ref": "HEAD",
+      "runner": "commands",
+      "dependencies": [
+        {
+          "id": "node",
+          "kind": "command",
+          "command": "{node}",
+          "required": true,
+          "remediation": "Install Node.js so the mock-AI Docker metadata check can run after Docker approval."
+        },
+        {
+          "id": "docker_fixture",
+          "kind": "capability",
+          "command": [
+            "docker",
+            "info",
+            "--format",
+            "{{json .ServerVersion}}"
+          ],
+          "required": true,
+          "remediation": "Re-run with --allow-docker only after approving Docker fixture setup for this isolated AI boundary lane."
+        }
+      ],
+      "execution_policy": {
+        "lane": "docker_fixture",
+        "autorun": false,
+        "requires_flags": [
+          "--allow-docker"
+        ],
+        "live_ai": "disabled",
+        "model_calls": "mocked"
+      },
+      "safety": {
+        "fixture_only": true,
+        "live_ai": false,
+        "calls_models": false,
+        "mock_ai": true,
+        "uses_docker_fixture": true,
+        "no_ai_credentials": true,
+        "fixed_structured_output": true,
+        "requires_human_approval": true
+      },
+      "coverage": {
+        "areas": [
+          "docker_fixture",
+          "mock_ai_fixture",
+          "credential_boundary",
+          "structured_output"
+        ],
+        "test_files": [
+          "agent/tests/test_test_scenario_manager.py"
+        ]
+      },
+      "route_context": {
+        "service_id": "demo.mock_ai_docker_fixture",
+        "event_kind": "ai.mock_fixture.container_requested",
+        "mode": "docker_fixture",
+        "side_effect_class": "docker_fixture"
+      },
+      "fixtures": [
+        {
+          "id": "mock-ai-docker-boundary",
+          "kind": "docker_fixture",
+          "deterministic": true,
+          "calls_models": false,
+          "description": "Docker-gated lane metadata for fixed mock-AI output with credentials cleared from the fixture command environment."
+        },
+        {
+          "id": "mock-ai-structured-output-envelope",
+          "kind": "json_fixture",
+          "deterministic": true,
+          "calls_models": false,
+          "description": "Structured mock output envelope used after Docker approval; no provider runtime is invoked."
+        }
+      ],
+      "evidence_requirements": [
+        {
+          "id": "docker_fixture_gate",
+          "kind": "dependency_decision",
+          "dependency_id": "docker_fixture",
+          "required_status": "allowed"
+        },
+        {
+          "id": "no_ai_credentials",
+          "kind": "command_env",
+          "fields": [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY"
+          ],
+          "expected": "empty"
+        },
+        {
+          "id": "fixed_structured_output",
+          "kind": "command_stdout",
+          "fields": [
+            "schema_version",
+            "source",
+            "calls_models"
+          ]
+        },
+        {
+          "id": "no_model_calls",
+          "kind": "safety_metadata",
+          "field": "safety.calls_models",
+          "expected": false
+        }
+      ],
+      "commands": [
+        {
+          "id": "mock_ai_docker_environment_probe",
+          "cwd": "repo",
+          "command": [
+            "docker",
+            "info",
+            "--format",
+            "{{json .ServerVersion}}"
+          ],
+          "env": {},
+          "timeout_ms": 30000
+        },
+        {
+          "id": "mock_ai_no_credential_structured_output",
+          "cwd": "repo",
+          "command": [
+            "{node}",
+            "-e",
+            "const assert = require('node:assert/strict'); const envelope = {schema_version: 1, source: 'mock_ai_docker_fixture', calls_models: false, payload: {observer_alert_acknowledged: true, recommendation: 'qa_pass'}}; assert.equal(process.env.OPENAI_API_KEY || '', ''); assert.equal(process.env.ANTHROPIC_API_KEY || '', ''); assert.equal(envelope.calls_models, false); console.log(JSON.stringify(envelope));"
+          ],
+          "env": {
+            "OPENAI_API_KEY": "",
+            "ANTHROPIC_API_KEY": "",
+            "AMING_CLAW_LIVE_AI": "0",
+            "AMING_CLAW_MODEL_CALLS": "mocked"
+          },
+          "timeout_ms": 30000
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "mock_ai_docker_fixture_route",
+          "kind": "test_flow_route",
+          "path": "scripts/test-scenarios.json",
+          "description": "Docker-gated AI-related route that separates mock structured output from optional live-AI probing."
         }
       ]
     },

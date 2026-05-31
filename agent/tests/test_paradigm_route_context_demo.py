@@ -57,10 +57,27 @@ def test_paradigm_route_context_demo_proves_test_flow_lanes(tmp_path: Path) -> N
     assert cases["fixture_only_route_runs"]["model_calls"] == "forbidden"
     assert cases["fixture_only_route_runs"]["calls_models"] is False
 
+    assert cases["dashboard_mock_ai_playwright_route_declared"]["status"] == "planned"
+    assert cases["dashboard_mock_ai_playwright_route_declared"]["decision"] == "playwright_mock_ai"
+    assert cases["dashboard_mock_ai_playwright_route_declared"]["model_calls"] == "mocked"
+    assert cases["dashboard_mock_ai_playwright_route_declared"]["live_ai"] == "disabled"
+    assert cases["dashboard_mock_ai_playwright_route_declared"]["alert_codes"] == [
+        "test_flow_playwright_mock_ai"
+    ]
+    assert cases["dashboard_mock_ai_playwright_route_declared"]["fixture_kinds"] == [
+        "mock_ai_timeline"
+    ]
+
     assert cases["docker_route_blocks_without_approval"]["status"] == "blocked"
     assert cases["docker_route_blocks_without_approval"]["decision"] == "docker_fixture"
     assert "--allow-docker" in cases["docker_route_blocks_without_approval"]["requires_flags"]
     assert cases["docker_route_blocks_without_approval"]["command_summaries"] == []
+
+    assert cases["mock_ai_docker_route_blocks_without_approval"]["status"] == "blocked"
+    assert cases["mock_ai_docker_route_blocks_without_approval"]["decision"] == "docker_fixture"
+    assert cases["mock_ai_docker_route_blocks_without_approval"]["model_calls"] == "mocked"
+    assert "--allow-docker" in cases["mock_ai_docker_route_blocks_without_approval"]["requires_flags"]
+    assert cases["mock_ai_docker_route_blocks_without_approval"]["command_summaries"] == []
 
     assert cases["live_ai_route_blocks_without_approval"]["status"] == "blocked"
     assert cases["live_ai_route_blocks_without_approval"]["decision"] == "live_ai_environment_probe"

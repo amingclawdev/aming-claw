@@ -280,6 +280,13 @@ reports as `test_flow_route`.
   structured-output lane. It uses fixture JSON only, declares model calls
   forbidden, and records live AI as manual/auth-unknown rather than invoking a
   provider.
+- `dashboard_mock_ai_playwright_fixture` is a deterministic browser lane. It
+  runs Playwright with a mocked governance API and fixed mock-AI timeline input
+  so dashboard evidence cards can be checked without provider calls.
+- `mock_ai_docker_fixture` is an AI-related Docker lane. It is blocked by
+  default, requires `--allow-docker`, clears AI credential env vars in the
+  fixture command, and records fixed structured mock output instead of calling
+  a live model.
 
 The scenario manager preserves lane metadata in `plan` and `run` reports.
 Live-AI validation remains outside this deterministic runner until project AI
@@ -287,10 +294,10 @@ config, local CLI auth, and operator approval are verified.
 
 The `test_flow_route.prompt_alert_bundle` is intentionally low-noise: it emits
 only the alerts for lanes selected by the current scenario. Focused unit tests
-and fixture-only checks produce informational alerts. E2E fixture checks warn
-about isolation and retained evidence. Docker fixture, live-AI probe, and
-external graph fixture lanes produce blocking alerts until their explicit
-approval flags are present.
+and fixture-only checks produce informational alerts. Playwright mock-AI and
+E2E fixture checks warn about isolation and retained evidence. Docker fixture,
+live-AI probe, and external graph fixture lanes produce blocking alerts until
+their explicit approval flags are present.
 
 ### 7.2 Live-AI Environment Probe Lane
 

@@ -12,8 +12,10 @@ It exercises two Aming Claw mechanisms together:
 - `route.prompt_alert_bundle`: the route-owned prompt context packet with
   stable hashes and low-noise alerts.
 
-The demo is deterministic. It does not start Docker, call live AI, mutate the
-primary governance project registry, or require browser E2E.
+The demo is deterministic. Its default proof does not start Docker, call live
+AI, mutate the primary governance project registry, or require live providers.
+Dashboard evidence is covered by a separate Playwright lane that uses a mocked
+governance API and fixed mock-AI timeline input.
 
 ## Run
 
@@ -31,12 +33,14 @@ node scripts/test-scenario-manager.mjs run \
 
 ## What It Proves
 
-The JSON report contains five proof cases:
+The JSON report contains seven proof cases:
 
 | Proof case | Expected result | Surface proved |
 |---|---|---|
 | `fixture_only_route_runs` | `fixture_only` passes with `model_calls: forbidden` | Contract + process |
+| `dashboard_mock_ai_playwright_route_declared` | Playwright mock-AI dashboard lane is declared with `model_calls: mocked` | Process + contract |
 | `docker_route_blocks_without_approval` | Docker route is blocked without `--allow-docker` | Constraint |
+| `mock_ai_docker_route_blocks_without_approval` | AI-related Docker route is gated and uses fixed mock output only | Constraint + contract |
 | `live_ai_route_blocks_without_approval` | Live-AI route is blocked without `--allow-live-ai` | Constraint |
 | `external_project_registers_fixture_route` | External manifest route passes and records manifest hash | Relationship / impact + contract |
 | `route_prompt_bundle_is_hashable_and_low_noise` | Prompt bundle has route/prompt hashes and no raw context leak | Contract + constraint |
@@ -77,6 +81,16 @@ The Docker and live-AI routes should fail closed without operator approval:
   "command_summaries": []
 }
 ```
+
+The dashboard mock-AI route is browser-verifiable without provider calls:
+
+```bash
+node frontend/dashboard/scripts/e2e-demo-mock-ai.mjs
+```
+
+It starts the dashboard on a temporary dev port, mocks the governance API, and
+asserts that these evidence cards are visible: `Observer alert received`,
+`Expert review`, `Test route`, and `Final drift prompt`.
 
 ```json
 {

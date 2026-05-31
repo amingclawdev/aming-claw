@@ -36,6 +36,56 @@ export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
     created_at: "2026-05-25T12:00:00Z",
   },
   {
+    event_id: "fixture-observer-route-alert",
+    event_type: "route_context_alert",
+    event_kind: "route_context",
+    actor: "observer",
+    phase: "route alert",
+    status: "acknowledged",
+    payload: {
+      lane: "observer",
+      requirement_ids: [
+        "observer_alert_ack_visible",
+        "expert_review_visible",
+        "test_route_visible",
+        "final_drift_prompt_visible",
+      ],
+      observer_alert_acknowledgement: {
+        received: true,
+        stage: "implementation",
+        caller_role: "observer",
+        route_context_hash: "sha256:fixture-route-context",
+        prompt_contract_hash: "sha256:fixture-prompt-contract",
+        alert_codes: ["route_context_loaded", "test_flow_playwright_mock_ai"],
+        raw_context_exposed: false,
+      },
+      expert_review: {
+        reviewer: "architecture-review-agent",
+        verdict: "approved_with_tests",
+        evidence: "Reviewed route context evidence cards, Playwright mock input, and test-flow route metadata.",
+      },
+      test_flow_route: {
+        decision: "playwright_mock_ai",
+        primary_lane: "playwright_mock_ai",
+        lanes: ["playwright_mock_ai"],
+        model_calls: "mocked",
+        live_ai: "disabled",
+        requires_flags: [],
+      },
+      final_drift_prompt: {
+        status: "shown",
+        drift_state: "possible_drift_reviewed",
+        message: "Before close, re-check route context, test evidence, and asset drift state.",
+      },
+    },
+    verification: {
+      passed: true,
+      mock_ai_provider: "fixture",
+      model_calls: "mocked",
+    },
+    created_at: "2026-05-25T12:00:30Z",
+  },
+  {
     event_id: "fixture-worker-frontend",
     event_type: "subagent_result",
     event_kind: "implementation",
@@ -897,6 +947,7 @@ function ArtifactPills({ summary, compact = false }: { summary: EventArtifactSum
 function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
   const event = node?.event;
   const artifacts = event ? timelineEventArtifacts(event) : emptyArtifactSummary();
+  const routeEvidenceCards = event ? buildRouteEvidenceCards(event) : [];
   const rows = [
     ["event_type", event?.event_type],
     ["event_kind", event?.event_kind],
@@ -927,6 +978,7 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
             ))}
           </div>
           <ArtifactPills summary={artifacts} />
+          {routeEvidenceCards.length > 0 ? <RouteEvidenceCards cards={routeEvidenceCards} /> : null}
           <div className="backlog-inspector-json">
             <div>
               <span>verification</span>
@@ -947,6 +999,152 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
       )}
     </div>
   );
+}
+
+interface RouteEvidenceCard {
+  id: string;
+  title: string;
+  status: string;
+  detail: string;
+  chips: string[];
+}
+
+function RouteEvidenceCards({ cards }: { cards: RouteEvidenceCard[] }) {
+  return (
+    <div className="backlog-route-evidence-cards" aria-label="Route context evidence cards">
+      {cards.map((card) => (
+        <div className="backlog-route-evidence-card" key={card.id}>
+          <div className="backlog-route-evidence-card-head">
+            <strong>{card.title}</strong>
+            <span>{card.status || "recorded"}</span>
+          </div>
+          <p>{card.detail}</p>
+          {card.chips.length > 0 ? (
+            <div className="backlog-route-evidence-chip-row">
+              {card.chips.map((chip) => (
+                <em className="mono" key={chip}>{chip}</em>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function buildRouteEvidenceCards(event: TaskTimelineEvent): RouteEvidenceCard[] {
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  const promptBundle = firstRecord(
+    payload.prompt_alert_bundle,
+    payload.route_prompt_bundle,
+    payload.route_prompt_alert_bundle,
+    verification.prompt_alert_bundle,
+  );
+  const observerAck = firstRecord(
+    payload.observer_alert_acknowledgement,
+    payload.observer_alert_ack,
+    payload.alert_acknowledgement,
+    verification.observer_alert_acknowledgement,
+  );
+  const expertReview = firstRecord(
+    payload.expert_review,
+    payload.expert_review_evidence,
+    verification.expert_review,
+  );
+  const testFlowRoute = firstRecord(
+    payload.test_flow_route,
+    payload.test_route,
+    verification.test_flow_route,
+  );
+  const finalDriftPrompt = firstRecord(
+    payload.final_drift_prompt,
+    payload.drift_prompt,
+    verification.final_drift_prompt,
+  );
+  const cards: RouteEvidenceCard[] = [];
+
+  const routeContextHash = firstText(
+    payload.route_context_hash,
+    observerAck.route_context_hash,
+    promptBundle.route_context_hash,
+  );
+  const promptContractHash = firstText(
+    payload.prompt_contract_hash,
+    observerAck.prompt_contract_hash,
+    promptBundle.prompt_contract_hash,
+  );
+  const alertCodes = stableUnique([
+    ...alertCodesFrom(promptBundle.alerts),
+    ...listUnknown(observerAck.alert_codes).map(String),
+    ...listUnknown(payload.alert_codes).map(String),
+  ].map((item) => item.trim()).filter(Boolean));
+  if (Object.keys(observerAck).length > 0 || routeContextHash || promptContractHash || alertCodes.length > 0) {
+    const rawContextExposed = observerAck.raw_context_exposed === true || payload.raw_context_exposed === true;
+    cards.push({
+      id: "observer-alert-ack",
+      title: "Observer alert received",
+      status: firstText(observerAck.status, payload.status) || (observerAck.received === false ? "missing" : "acknowledged"),
+      detail: alertCodes.length > 0
+        ? `Observer acknowledged ${alertCodes.length} selected route alert${alertCodes.length === 1 ? "" : "s"}.`
+        : "Observer acknowledged the route-owned prompt context alert.",
+      chips: evidenceChips([
+        ["stage", firstText(observerAck.stage, payload.stage, event.phase)],
+        ["role", firstText(observerAck.caller_role, payload.caller_role, event.actor)],
+        ["route", shortEvidenceHash(routeContextHash)],
+        ["prompt", shortEvidenceHash(promptContractHash)],
+        ["raw", rawContextExposed ? "exposed" : "hidden"],
+        ["alerts", alertCodes.join(", ")],
+      ]),
+    });
+  }
+
+  if (Object.keys(expertReview).length > 0) {
+    cards.push({
+      id: "expert-review",
+      title: "Expert review",
+      status: firstText(expertReview.verdict, expertReview.status) || "recorded",
+      detail: firstText(expertReview.evidence, expertReview.summary, expertReview.recommendation)
+        || "Expert review evidence was attached to the selected route event.",
+      chips: evidenceChips([
+        ["reviewer", firstText(expertReview.reviewer, expertReview.actor)],
+        ["route", firstText(expertReview.route, testFlowRoute.primary_lane, testFlowRoute.decision)],
+      ]),
+    });
+  }
+
+  if (Object.keys(testFlowRoute).length > 0) {
+    const lanes = listUnknown(testFlowRoute.lanes).map(String).filter(Boolean);
+    const requiredFlags = listUnknown(testFlowRoute.requires_flags).map(String).filter(Boolean);
+    const decision = firstText(testFlowRoute.decision, testFlowRoute.primary_lane) || "recorded";
+    cards.push({
+      id: "test-route",
+      title: "Test route",
+      status: decision,
+      detail: `Selected ${decision} with ${firstText(testFlowRoute.model_calls) || "unknown"} model-call policy.`,
+      chips: evidenceChips([
+        ["lanes", lanes.join(", ") || firstText(testFlowRoute.primary_lane)],
+        ["flags", requiredFlags.join(", ") || "none"],
+        ["live_ai", firstText(testFlowRoute.live_ai) || "not specified"],
+      ]),
+    });
+  }
+
+  if (Object.keys(finalDriftPrompt).length > 0) {
+    cards.push({
+      id: "final-drift-prompt",
+      title: "Final drift prompt",
+      status: firstText(finalDriftPrompt.status, finalDriftPrompt.decision) || "shown",
+      detail: firstText(finalDriftPrompt.message, finalDriftPrompt.prompt, finalDriftPrompt.summary)
+        || "Final drift prompt was shown before close.",
+      chips: evidenceChips([
+        ["drift", firstText(finalDriftPrompt.drift_state, finalDriftPrompt.state)],
+        ["stage", firstText(finalDriftPrompt.stage, event.phase)],
+      ]),
+    });
+  }
+
+  return cards;
 }
 
 function ContractGatePanel({
@@ -2064,6 +2262,45 @@ function eventBlockers(event: TaskTimelineEvent): string[] {
 function stringField(record: Record<string, unknown>, key: string): string {
   const value = record[key];
   return typeof value === "string" ? value.trim() : "";
+}
+
+function firstText(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+  }
+  return "";
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> {
+  for (const value of values) {
+    const record = asRecord(value);
+    if (Object.keys(record).length > 0) return record;
+  }
+  return {};
+}
+
+function alertCodesFrom(value: unknown): string[] {
+  return listUnknown(value)
+    .map((item) => {
+      const record = asRecord(item);
+      return firstText(record.code, record.alert_code, item);
+    })
+    .filter(Boolean);
+}
+
+function evidenceChips(entries: [string, string][]): string[] {
+  return entries
+    .map(([label, value]) => (value ? `${label}: ${value}` : ""))
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function shortEvidenceHash(value: string): string {
+  if (!value) return "";
+  const normalized = value.trim();
+  if (!normalized.startsWith("sha256:")) return normalized.length > 18 ? `${normalized.slice(0, 18)}...` : normalized;
+  return `${normalized.slice(0, 14)}...`;
 }
 
 function titleizeLane(value: string): string {

@@ -10,6 +10,7 @@
     "preview": "vite preview --port 5173",
     "typecheck": "tsc -b --noEmit",
     "e2e:hn-demo": "node scripts/e2e-hn-demo.mjs",
+    "e2e:demo-mock-ai": "node scripts/e2e-demo-mock-ai.mjs",
     "e2e:projects": "node scripts/e2e-projects.mjs",
     "e2e:semantic": "node scripts/e2e-semantic.mjs",
     "e2e:trunk": "node scripts/e2e-trunk.mjs"

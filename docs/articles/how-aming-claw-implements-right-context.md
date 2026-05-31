@@ -340,12 +340,14 @@ This demo does not ask an agent to infer test policy from a prompt. It asks the
 route layer to return a structured `test_flow_route` and a low-noise
 `prompt_alert_bundle`.
 
-It proves five route decisions:
+It proves seven route decisions:
 
 | Route proof | Expected result | Why it matters |
 |---|---|---|
 | `fixture_only_route_runs` | passes with `model_calls: forbidden` | deterministic fixture work should not call a model |
+| `dashboard_mock_ai_playwright_route_declared` | declares the Playwright mock-AI dashboard lane | browser evidence can use fixed mock AI inputs without provider calls |
 | `docker_route_blocks_without_approval` | blocks without `--allow-docker` | container boundaries require explicit operator approval |
+| `mock_ai_docker_route_blocks_without_approval` | blocks AI-related Docker validation without approval | Docker AI checks stay gated and use fixed structured mock output |
 | `live_ai_route_blocks_without_approval` | blocks without `--allow-live-ai` | live provider checks must not spend quota silently |
 | `external_project_registers_fixture_route` | records external project root and manifest hash | external project routes are source-controlled target evidence |
 | `route_prompt_bundle_is_hashable_and_low_noise` | exposes route/prompt hashes and no raw context | context injection is visible, scoped, and auditable |
@@ -360,10 +362,12 @@ Process               -> scenario manager run reports
 Constraint            -> selected-lane alerts and action precheck
 ```
 
-The demo is intentionally not a browser E2E and not a Docker proof. Its job is
-to prove that the system chooses those heavier routes only when the selected
-lane requires them, and that the corresponding alert is short, visible, and
-stage-specific.
+The default proof does not run browser E2E or Docker. Those heavier lanes are
+registered separately: `dashboard_mock_ai_playwright_fixture` runs Playwright
+against a mocked governance API, while `mock_ai_docker_fixture` remains blocked
+until `--allow-docker`. The point is that the system chooses those routes only
+when the selected lane requires them, and the corresponding alert is short,
+visible, and stage-specific.
 
 ## Observer Reminder Echo proof
 
