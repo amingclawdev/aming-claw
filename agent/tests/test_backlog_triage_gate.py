@@ -122,6 +122,115 @@ def test_single_generic_file_overlap_does_not_merge_unrelated_domains():
 
     assert decision["action"] == "admit"
 
+def test_single_context_file_same_target_does_not_supersede_distinct_rows():
+    decision = triage_backlog_insert(
+        {
+            "bug_id": "MS-RENDER-E2E-VIDEO-EVIDENCE-20260531",
+            "title": "Content production render verification should expose dashboard evidence",
+            "target_files": ["content-system/render-pipeline.md"],
+        },
+        [
+            {
+                "bug_id": "MS-GRAPH-FIXTURE-BINDINGS-20260531",
+                "title": "Graph fixture bindings should cover render docs",
+                "target_files": '["content-system/render-pipeline.md"]',
+            }
+        ],
+    )
+
+    assert decision["action"] == "admit"
+
+def test_single_context_file_with_weak_title_overlap_does_not_merge():
+    decision = triage_backlog_insert(
+        {
+            "bug_id": "AC-RUNTIME-STATUS-SM-GOV-VERSION-MISMATCH-20260531",
+            "title": "Runtime status compact explanation for service mismatch",
+            "target_files": ["agent/governance/server.py", "agent/governance/runtime_status.py"],
+        },
+        [
+            {
+                "bug_id": "OPT-GOVERNANCE-HINT-ATTACH-COMPACT-RESPONSE",
+                "title": "Governance hint compact response should stay readable",
+                "target_files": '["agent/governance/server.py","agent/governance/hints.py"]',
+            }
+        ],
+    )
+
+    assert decision["action"] == "admit"
+
+def test_common_context_patterns_do_not_block_single_file_rows():
+    rows = [
+        {
+            "bug_id": "DOC-README-BINDING-20260531",
+            "title": "Graph fixture binding uses README examples",
+            "target_files": '["README.md"]',
+        },
+        {
+            "bug_id": "SCRIPT-MCP-STABLE-DECISION-20260531",
+            "title": "Stable decision dedupe script should keep compact output",
+            "target_files": '["scripts/example_mcp.py"]',
+        },
+    ]
+
+    readme_decision = triage_backlog_insert(
+        {
+            "bug_id": "MS-DEMO-README-20260531",
+            "title": "Marketing demo requirements should mention reviewer evidence",
+            "target_files": ["README.md"],
+        },
+        [rows[0]],
+    )
+    script_decision = triage_backlog_insert(
+        {
+            "bug_id": "EXT-MCP-VOICE-FOLLOWUP-20260531",
+            "title": "Voice conversion follow-up should register command help",
+            "target_files": ["scripts/example_mcp.py"],
+        },
+        [rows[1]],
+    )
+
+    assert readme_decision["action"] == "admit"
+    assert script_decision["action"] == "admit"
+
+def test_single_context_file_with_strong_title_match_still_flags_candidate():
+    decision = triage_backlog_insert(
+        {
+            "bug_id": "MS-RENDER-PIPELINE-E2E-20260531",
+            "title": "Render pipeline E2E evidence is missing",
+            "target_files": ["content-system/render-pipeline.md"],
+        },
+        [
+            {
+                "bug_id": "MS-RENDER-PIPELINE-VIDEO-20260531",
+                "title": "Render pipeline E2E video evidence is stale",
+                "target_files": '["content-system/render-pipeline.md"]',
+            }
+        ],
+    )
+
+    assert decision["action"] == "supersede"
+    assert decision["evidence"]["title_token_overlap"] == ["e2e", "evidence", "pipeline", "render"]
+
+def test_explicit_backlog_lineage_allows_single_context_file_candidate():
+    decision = triage_backlog_insert(
+        {
+            "bug_id": "MS-RENDER-CHILD-20260531",
+            "title": "Child follow-up should track video output",
+            "target_files": ["content-system/render-pipeline.md", "content-system/video.md"],
+            "details_md": "Follow-up for MS-GRAPH-FIXTURE-BINDINGS-20260531.",
+        },
+        [
+            {
+                "bug_id": "MS-GRAPH-FIXTURE-BINDINGS-20260531",
+                "title": "Graph fixture bindings should cover render docs",
+                "target_files": '["content-system/render-pipeline.md","content-system/fixtures.md"]',
+            }
+        ],
+    )
+
+    assert decision["action"] == "merge_into"
+    assert decision["evidence"]["lineage_match"] is True
+
 def test_merge_into_reports_overlap_evidence():
     decision = triage_backlog_insert(
         {"bug_id": "NEW-1", "title": "Worker queue lease timeout", "target_files": ["a.py", "b.py"]},
