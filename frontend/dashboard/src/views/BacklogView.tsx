@@ -18,6 +18,7 @@ type StatusFilter = "OPEN" | "FIXED" | "ALL";
 type PriorityFilter = "ALL" | "P0" | "P1" | "P2" | "P3";
 type DetailTab = "timeline" | "contract";
 type ContractEvidenceStatus = "passed" | "missing" | "failed" | "bypassed" | "inferred" | "not_applicable";
+type FixtureReplayState = "idle" | "running" | "blocked" | "passed";
 
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
@@ -134,6 +135,198 @@ export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
       precheck_results: { no_false_evidence_gate: true },
     },
     created_at: "2026-05-25T12:03:00Z",
+  },
+];
+
+interface FixtureProjectStreamFrame {
+  id: string;
+  label: string;
+  phase: string;
+  at: string;
+  state: FixtureReplayState;
+  projectStatus: string;
+  graphStatus: string;
+  backlogStatus: string;
+  timelineCount: number;
+  gateStatus: string;
+  testStatus: string;
+  detail: string;
+  evidence: string[];
+  event: TaskTimelineEvent;
+}
+
+const FIXTURE_PROJECT_STREAM_REPLAY_FRAMES: FixtureProjectStreamFrame[] = [
+  {
+    id: "fixture-stream-register",
+    label: "Project registered",
+    phase: "project",
+    at: "00:00",
+    state: "idle",
+    projectStatus: "registered",
+    graphStatus: "not built",
+    backlogStatus: "empty",
+    timelineCount: 0,
+    gateStatus: "not evaluated",
+    testStatus: "not run",
+    detail: "fixture-stream-demo enters the dashboard as a public-safe project record.",
+    evidence: ["project_id: fixture-stream-demo", "model_calls: disabled", "raw_prompt_emitted: false"],
+    event: {
+      event_id: "fixture-stream-register",
+      event_type: "project.registered",
+      event_kind: "route_context",
+      actor: "observer",
+      phase: "project",
+      status: "accepted",
+      payload: { lane: "observer", project_id: "fixture-stream-demo", privacy_boundary: "public_safe" },
+      created_at: "2026-06-01T21:00:00Z",
+    },
+  },
+  {
+    id: "fixture-stream-bootstrap",
+    label: "Graph bootstrap",
+    phase: "graph",
+    at: "00:08",
+    state: "running",
+    projectStatus: "active",
+    graphStatus: "building",
+    backlogStatus: "queued",
+    timelineCount: 1,
+    gateStatus: "not evaluated",
+    testStatus: "pending",
+    detail: "Graph and semantic counters move while the replay keeps the stream ordered.",
+    evidence: ["snapshot: fixture-scope-001", "nodes: 24", "edges: 63"],
+    event: {
+      event_id: "fixture-stream-bootstrap",
+      event_type: "graph.bootstrap.started",
+      event_kind: "implementation",
+      actor: "governance",
+      phase: "graph",
+      status: "running",
+      payload: { lane: "backend", snapshot_id: "fixture-scope-001", node_count: 24, edge_count: 63 },
+      created_at: "2026-06-01T21:00:08Z",
+    },
+  },
+  {
+    id: "fixture-stream-backlog",
+    label: "Backlog admitted",
+    phase: "backlog",
+    at: "00:15",
+    state: "running",
+    projectStatus: "active",
+    graphStatus: "current",
+    backlogStatus: "MF_IN_PROGRESS",
+    timelineCount: 2,
+    gateStatus: "waiting route",
+    testStatus: "pending",
+    detail: "The backlog row appears before implementation evidence and carries the replay contract.",
+    evidence: ["backlog: AC-DEMO-LIVE-AUDIT-SSE-BACKLOG-TIMELINE-20260531", "priority: P1", "contract: manual_fix_contract.v1"],
+    event: {
+      event_id: "fixture-stream-backlog",
+      event_type: "backlog.upserted",
+      event_kind: "route_context",
+      actor: "observer",
+      phase: "backlog",
+      status: "accepted",
+      payload: {
+        lane: "observer",
+        backlog_id: "AC-DEMO-LIVE-AUDIT-SSE-BACKLOG-TIMELINE-20260531",
+        requirement_ids: ["fixture_project_stream_replay"],
+      },
+      created_at: "2026-06-01T21:00:15Z",
+    },
+  },
+  {
+    id: "fixture-stream-route-gate",
+    label: "Route gate",
+    phase: "route",
+    at: "00:22",
+    state: "blocked",
+    projectStatus: "active",
+    graphStatus: "current",
+    backlogStatus: "MF_IN_PROGRESS",
+    timelineCount: 3,
+    gateStatus: "route_token_required",
+    testStatus: "pending",
+    detail: "The replay shows the gate blocking first, then the public waiver evidence being recorded.",
+    evidence: ["route_token_required", "timeline:1166", "waiver_type: manual_fix"],
+    event: {
+      event_id: "fixture-stream-route-gate",
+      event_type: "route_token_gate.backlog_upsert",
+      event_kind: "verification",
+      actor: "observer",
+      phase: "route",
+      status: "blocked",
+      payload: {
+        lane: "observer",
+        requirement_ids: ["route_context", "route_action_precheck"],
+        route_token_gate: {
+          status: "blocked",
+          reason_codes: ["route_token_required"],
+          raw_context_exposed: false,
+        },
+      },
+      created_at: "2026-06-01T21:00:22Z",
+    },
+  },
+  {
+    id: "fixture-stream-evidence",
+    label: "Timeline evidence",
+    phase: "timeline",
+    at: "00:31",
+    state: "running",
+    projectStatus: "active",
+    graphStatus: "current",
+    backlogStatus: "MF_IN_PROGRESS",
+    timelineCount: 5,
+    gateStatus: "accepted waiver",
+    testStatus: "running",
+    detail: "Timeline events arrive as cards, lanes, route evidence, and artifact chips.",
+    evidence: ["task.timeline.appended", "service.route.recorded", "lanes: observer + worker"],
+    event: {
+      event_id: "fixture-stream-evidence",
+      event_type: "task.timeline.appended",
+      event_kind: "implementation",
+      actor: "mf_sub_frontend",
+      phase: "timeline",
+      status: "accepted",
+      payload: {
+        lane: "frontend",
+        requirement_ids: ["fixture_project_stream_replay", "timeline_live_update"],
+        changed_files: ["frontend/dashboard/src/views/BacklogView.tsx", "frontend/dashboard/src/styles.css"],
+      },
+      verification: { passed: true, tests_run: ["npm run e2e:demo-mock-ai"] },
+      created_at: "2026-06-01T21:00:31Z",
+    },
+  },
+  {
+    id: "fixture-stream-verify",
+    label: "Replay verified",
+    phase: "verify",
+    at: "00:42",
+    state: "passed",
+    projectStatus: "active",
+    graphStatus: "stale after commit",
+    backlogStatus: "review ready",
+    timelineCount: 7,
+    gateStatus: "close-ready pending",
+    testStatus: "passed",
+    detail: "The fixture ends with browser-visible proof while graph reconcile remains an explicit next state.",
+    evidence: ["browser: fixture stream visible", "e2e: three states changed", "graph_reconcile: pending"],
+    event: {
+      event_id: "fixture-stream-verify",
+      event_type: "mf.verification.fixture_stream_replay",
+      event_kind: "verification",
+      actor: "observer",
+      phase: "verify",
+      status: "passed",
+      payload: {
+        lane: "observer",
+        requirement_ids: ["browser_evidence", "fixture_project_stream_replay"],
+        screenshots: ["fixture-stream-replay-visible"],
+      },
+      verification: { passed: true, model_calls: "disabled", raw_prompt_emitted: false },
+      created_at: "2026-06-01T21:00:42Z",
+    },
   },
 ];
 
@@ -396,6 +589,8 @@ export default function BacklogView({ backlog, projectId }: Props) {
         </button>
       </div>
 
+      <FixtureStreamReplay />
+
       <div className="score-grid backlog-score-grid">
         <Kpi label="Open" value={stats.open} tone={stats.open > 0 ? "amber" : "green"} />
         <Kpi label="P0/P1 open" value={stats.urgent} tone={stats.urgent > 0 ? "red" : "neutral"} />
@@ -486,6 +681,137 @@ export default function BacklogView({ backlog, projectId }: Props) {
           onSelectRelated={(bugId) => openDetail(bugId, "push", true)}
         />
       ) : null}
+    </div>
+  );
+}
+
+function FixtureStreamReplay() {
+  const frames = FIXTURE_PROJECT_STREAM_REPLAY_FRAMES;
+  const [index, setIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const frame = frames[index] ?? frames[0];
+  const eventCount = index + 1;
+  const progress = frames.length <= 1 ? 100 : Math.round((index / (frames.length - 1)) * 100);
+
+  useEffect(() => {
+    if (!playing) return undefined;
+    const interval = Math.max(450, 1500 / speed);
+    const timer = window.setInterval(() => {
+      setIndex((current) => {
+        if (current >= frames.length - 1) {
+          setPlaying(false);
+          return current;
+        }
+        return current + 1;
+      });
+    }, interval);
+    return () => window.clearInterval(timer);
+  }, [frames.length, playing, speed]);
+
+  const reset = () => {
+    setPlaying(false);
+    setIndex(0);
+  };
+  const step = (delta: number) => {
+    setPlaying(false);
+    setIndex((current) => Math.min(frames.length - 1, Math.max(0, current + delta)));
+  };
+
+  return (
+    <section className="fixture-stream-replay" aria-label="Fixture stream replay">
+      <div className="fixture-stream-head">
+        <div>
+          <span className="fixture-stream-eyebrow">fixture project · data stream</span>
+          <h3>Fixture stream replay</h3>
+        </div>
+        <span className="mono">fixture-stream-demo · {eventCount}/{frames.length} events</span>
+      </div>
+
+      <div className="fixture-stream-controls">
+        <button type="button" onClick={() => setPlaying((value) => !value)}>
+          {playing ? "Pause" : "Play"}
+        </button>
+        <button type="button" onClick={() => step(-1)} disabled={index === 0}>
+          Back
+        </button>
+        <button type="button" onClick={() => step(1)} disabled={index === frames.length - 1}>
+          Step
+        </button>
+        <button type="button" onClick={reset}>
+          Reset
+        </button>
+        <label>
+          <span>Speed</span>
+          <input
+            type="range"
+            min="0.5"
+            max="2"
+            step="0.5"
+            value={speed}
+            onChange={(event) => setSpeed(Number(event.currentTarget.value))}
+          />
+          <strong className="mono">{speed}x</strong>
+        </label>
+      </div>
+
+      <div className="fixture-stream-progress" aria-label="Replay progress">
+        <span style={{ width: `${progress}%` }} />
+      </div>
+
+      <div className="fixture-stream-state-grid">
+        <ReplayStateItem label="Project" value={frame.projectStatus} tone={frame.state} />
+        <ReplayStateItem label="Graph" value={frame.graphStatus} tone={frame.state} />
+        <ReplayStateItem label="Backlog" value={frame.backlogStatus} tone={frame.state} />
+        <ReplayStateItem label="Timeline" value={`${frame.timelineCount} events`} tone={frame.state} />
+        <ReplayStateItem label="Gate" value={frame.gateStatus} tone={frame.state} />
+        <ReplayStateItem label="Tests" value={frame.testStatus} tone={frame.state} />
+      </div>
+
+      <div className="fixture-stream-body">
+        <ol className="fixture-stream-event-list">
+          {frames.map((candidate, candidateIndex) => (
+            <li key={candidate.id}>
+              <button
+                type="button"
+                className={`${candidateIndex === index ? "active" : ""} ${candidateIndex < index ? "complete" : ""}`}
+                onClick={() => {
+                  setPlaying(false);
+                  setIndex(candidateIndex);
+                }}
+              >
+                <span className={`fixture-stream-dot state-${candidate.state}`} />
+                <strong>{candidate.label}</strong>
+                <em className="mono">{candidate.at}</em>
+              </button>
+            </li>
+          ))}
+        </ol>
+        <div className={`fixture-stream-current state-${frame.state}`}>
+          <div className="fixture-stream-current-head">
+            <span className={`status-badge ${statusClass(frame.event.status || frame.state)}`}>
+              {frame.event.status || frame.state}
+            </span>
+            <strong>{frame.phase}</strong>
+            <em className="mono">{frame.event.event_type}</em>
+          </div>
+          <p>{frame.detail}</p>
+          <div className="fixture-stream-evidence">
+            {frame.evidence.map((item) => (
+              <span className="mono" key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ReplayStateItem({ label, value, tone }: { label: string; value: string; tone: FixtureReplayState }) {
+  return (
+    <div className={`fixture-stream-state state-${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }

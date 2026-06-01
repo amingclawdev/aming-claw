@@ -547,6 +547,9 @@ async function main() {
       "Docker artifact refs",
       "Privacy boundary",
       "Frontend display contract",
+      "Fixture stream replay",
+      "fixture-stream-demo",
+      "model_calls: disabled",
       "playwright_mock_ai",
       "mocked",
       "content_sys.demo_visualization_evidence.v1",
@@ -557,6 +560,17 @@ async function main() {
     for (const text of requiredTexts) {
       found.push(await expectVisibleText(page, text));
     }
+    const closeDetail = page.getByRole("button", { name: "Close backlog detail" });
+    if (await closeDetail.count()) {
+      await closeDetail.click();
+    }
+    const stepReplay = page.locator(".fixture-stream-controls").getByRole("button", { name: "Step" });
+    for (let i = 0; i < 3; i++) {
+      await stepReplay.click();
+    }
+    found.push(await expectVisibleText(page, "route_token_required"));
+    await stepReplay.click();
+    found.push(await expectVisibleText(page, "accepted waiver"));
     const body = (await page.textContent("body")) || "";
     assert(!body.includes(RAW_PROMPT_SENTINEL), "raw prompt sentinel leaked into dashboard body");
     const unexpectedTexts = [

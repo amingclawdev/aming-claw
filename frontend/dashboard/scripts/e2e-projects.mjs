@@ -814,6 +814,11 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("Inspect raw timeline payloads"), "Raw timeline payloads should remain inspectable without being the primary evidence surface");
   assert(viewSource.includes("relatedIdsFromBug"), "Backlog detail should discover related backlog ids");
   assert(viewSource.includes("BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS"), "Backlog detail should include a deterministic parallel-lane fixture");
+  assert(viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view should include deterministic fixture stream replay frames");
+  assert(viewSource.includes("FixtureStreamReplay"), "Backlog view should render a fixture data-stream replay panel");
+  assert(viewSource.includes("fixture-stream-demo"), "Fixture stream replay should use a fixture project id");
+  assert(viewSource.includes("route_token_required"), "Fixture stream replay should expose the route-token-required gate state");
+  assert(viewSource.includes("model_calls: disabled"), "Fixture stream replay should make the no-model-call boundary visible");
   assert(viewSource.includes("contract_missing_visualization"), "Backlog fixture should model missing contract evidence");
   assert(viewSource.includes("no_false_evidence_gate"), "Backlog fixture should assert missing evidence is never rendered as passed");
   assert(viewSource.includes("missing.has(requirement.id)"), "Missing contract requirements must render as missing, not passed");
@@ -833,6 +838,8 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".backlog-evidence-inspector"), "Backlog evidence inspector should have stable layout CSS");
   assert(cssSource.includes(".backlog-route-evidence-cards"), "Route-context evidence cards should have stable layout CSS");
   assert(cssSource.includes(".backlog-inspector-raw"), "Raw inspector payloads should have stable disclosure CSS");
+  assert(cssSource.includes(".fixture-stream-replay"), "Fixture stream replay should have stable layout CSS");
+  assert(cssSource.includes(".fixture-stream-progress"), "Fixture stream replay should expose a progress surface");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }
