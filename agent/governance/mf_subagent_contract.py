@@ -117,7 +117,6 @@ _DISPATCH_REQUIRED_FIELDS = (
     "fence_token",
     "route_context_hash",
     "prompt_contract_id",
-    "prompt_contract_hash",
 )
 _IMPLEMENTATION_ACTIONS = {
     "apply_patch",

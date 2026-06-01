@@ -242,6 +242,18 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
     assert evidence["dirty_scope_check"]["passed"] is True
 
 
+def test_dispatch_gate_accepts_optional_prompt_contract_hash_absent() -> None:
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(prompt_contract_hash=""),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["route_context_hash"] == "sha256:route-context"
+    assert evidence["prompt_contract_id"] == "rprompt-1"
+    assert evidence["prompt_contract_hash"] == ""
+
+
 @pytest.mark.parametrize(
     ("field", "override"),
     [
@@ -253,7 +265,6 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
         ("merge_queue_id", {"merge_queue_id": ""}),
         ("route_context_hash", {"route_context_hash": ""}),
         ("prompt_contract_id", {"prompt_contract_id": ""}),
-        ("prompt_contract_hash", {"prompt_contract_hash": ""}),
     ],
 )
 def test_dispatch_gate_rejects_missing_branch_worktree_fence_or_commits(
@@ -567,6 +578,44 @@ def test_route_action_gate_allows_high_risk_worker_with_bounded_dispatch_and_sta
     assert evidence["bounded_startup_evidence_present"] is True
     assert evidence["bounded_worker_evidence_present"] is True
     assert evidence["bounded_dispatch_evidence"]["fence_present"] is True
+
+
+def test_route_action_gate_allows_high_risk_worker_without_optional_prompt_contract_hash() -> None:
+    dispatch = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(prompt_contract_hash=""),
+        target_worktree_path="/repo",
+    )
+
+    evidence = validate_route_action_gate(
+        _route_action_payload(
+            caller_role="implementation_worker",
+            prompt_contract_hash="",
+            mf_subagent_dispatch_gate=dispatch,
+            mf_subagent_startup_gate=_startup_evidence(prompt_contract_hash=""),
+            **_high_risk_route_machine_fields(),
+        )
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["prompt_contract_hash"] == ""
+    assert evidence["bounded_worker_evidence_present"] is True
+
+
+def test_route_action_gate_blocks_high_risk_worker_when_optional_prompt_hash_mismatches() -> None:
+    dispatch = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(prompt_contract_hash="sha256:different-prompt"),
+        target_worktree_path="/repo",
+    )
+
+    with pytest.raises(MfSubagentContractError, match="bounded dispatch/startup evidence"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role="implementation_worker",
+                mf_subagent_dispatch_gate=dispatch,
+                mf_subagent_startup_gate=_startup_evidence(),
+                **_high_risk_route_machine_fields(),
+            )
+        )
 
 
 def test_route_action_gate_waiver_does_not_satisfy_high_risk_dispatch_evidence() -> None:
