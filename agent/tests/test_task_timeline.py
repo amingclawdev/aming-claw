@@ -523,6 +523,70 @@ class TestTaskTimeline(unittest.TestCase):
         ).fetchone()["c"]
         self.assertEqual(count, 1)
 
+    def test_mf_parallel_timeline_accepts_task_scoped_waiver_after_backlog_evidence(self):
+        from agent.governance import server
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-TASK-SCOPED"
+        worker_task_id = "worker-task-scoped"
+        self._insert_router_backlog(bug_id)
+        self._record_route_context_consumption(bug_id)
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    "event_type": "mf.implementation",
+                    "event_kind": "implementation",
+                    "status": "accepted",
+                    "route_waiver": self._route_waiver_for_existing_identity(
+                        bug_id,
+                        task_id=worker_task_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(result["route_token_gate"]["decision"], "route_waiver")
+        self.assertEqual(result["event_kind"], "implementation")
+        self.assertEqual(result["task_id"], worker_task_id)
+
+    def test_mf_parallel_task_scoped_backlog_fallback_keeps_identity_mismatch_blocked(self):
+        from agent.governance import server
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-TASK-MISMATCH"
+        worker_task_id = "worker-task-mismatch"
+        self._insert_router_backlog(bug_id)
+        self._record_route_context_consumption(bug_id)
+        waiver = self._route_waiver_for_existing_identity(
+            bug_id,
+            task_id=worker_task_id,
+        )
+        waiver["route_context_hash"] = "sha256:mismatched-route-context"
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": bug_id,
+                        "task_id": worker_task_id,
+                        "event_type": "mf.implementation",
+                        "event_kind": "implementation",
+                        "status": "accepted",
+                        "route_waiver": waiver,
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        self.assertEqual(
+            raised.exception.details["route_identity_mismatch_fields"],
+            ["route_context_hash"],
+        )
+
     def test_mf_parallel_timeline_allows_qa_waiver_to_break_independent_verification_cycle(self):
         from agent.governance import server, task_timeline
         from agent.governance.errors import GovernanceError

@@ -18,6 +18,8 @@ ROUTE_CONTEXT_SCHEMA_VERSION = "observer_repair_route_context.v1"
 ROUTE_SERVICE_PREVIEW_SCHEMA_VERSION = "observer_repair_route_service_preview.v1"
 ROUTE_SERVICE_MATERIALIZATION_SCHEMA_VERSION = "observer_repair_route_service_materialization.v1"
 ROUTE_SERVICE_SOURCE_EVENT_SCHEMA_VERSION = "observer_repair_route_service_source_event.v1"
+OBSERVER_STEP_MONITOR_SCHEMA_VERSION = "observer_step_monitor.v1"
+OBSERVER_DIRECT_MUTATION_POLICY_SCHEMA_VERSION = "observer_direct_mutation_policy.v1"
 ROUTE_WORKFLOW_TEMPLATE_ID = "mf_workflow_runtime.v1"
 ROUTE_PROMPT_EVENT_KIND = "route.prompt_context.requested"
 ROUTE_ACTION_EVENT_KIND = "route.action.requested"
@@ -139,6 +141,99 @@ BLOCKER_RULES = [
     ),
 ]
 
+OBSERVER_MONITORED_STEPS = [
+    {
+        "step_id": "route_context",
+        "label": "route context",
+        "required_evidence": ["route.prompt_alert_bundle source event or route_context_hash"],
+        "next_action": "request_route_prompt_alert_bundle",
+        "backlog_followup_action": "update_backlog_with_route_context_blocker",
+        "severity": "block",
+    },
+    {
+        "step_id": "route_action_precheck",
+        "label": "route action precheck",
+        "required_evidence": ["route.action_precheck source event"],
+        "next_action": "run_route_action_precheck",
+        "backlog_followup_action": "update_backlog_with_route_precheck_blocker",
+        "severity": "block",
+    },
+    {
+        "step_id": "graph_first_discovery",
+        "label": "graph-first discovery",
+        "required_evidence": ["graph_status", "graph_query trace id"],
+        "next_action": "run_graph_query_schema_then_targeted_graph_queries",
+        "backlog_followup_action": "update_backlog_with_graph_discovery_gap",
+        "severity": "block",
+    },
+    {
+        "step_id": "backlog_row",
+        "label": "backlog row",
+        "required_evidence": ["open or existing backlog row for each root backlog id"],
+        "next_action": "upsert_or_update_backlog_before_mutation",
+        "backlog_followup_action": "create_or_update_missing_backlog_row",
+        "severity": "block",
+    },
+    {
+        "step_id": "bounded_implementation_worker_dispatch",
+        "label": "bounded implementation worker dispatch",
+        "required_evidence": ["bounded_implementation_worker_dispatch timeline evidence"],
+        "next_action": "dispatch_bounded_implementation_worker",
+        "backlog_followup_action": "update_backlog_with_missing_worker_dispatch",
+        "severity": "block",
+    },
+    {
+        "step_id": "mf_subagent_startup",
+        "label": "mf_subagent startup",
+        "required_evidence": ["mf_subagent_startup timeline evidence"],
+        "next_action": "record_mf_subagent_startup_with_matching_route_identity",
+        "backlog_followup_action": "update_backlog_with_missing_subagent_startup",
+        "severity": "block",
+    },
+    {
+        "step_id": "independent_verification_lane",
+        "label": "independent verification lane",
+        "required_evidence": [
+            "independent_verification_lane or independent_verification timeline evidence"
+        ],
+        "next_action": "dispatch_independent_verification_lane",
+        "backlog_followup_action": "update_backlog_with_missing_independent_verification",
+        "severity": "block",
+    },
+    {
+        "step_id": "implementation",
+        "label": "implementation evidence",
+        "required_evidence": ["implementation timeline evidence after worker result"],
+        "next_action": "append_implementation_evidence_after_real_worker_result",
+        "backlog_followup_action": "update_backlog_with_missing_implementation_evidence",
+        "severity": "block",
+    },
+    {
+        "step_id": "verification",
+        "label": "verification evidence",
+        "required_evidence": ["verification timeline evidence after focused tests or QA"],
+        "next_action": "append_verification_evidence_after_results_pass",
+        "backlog_followup_action": "update_backlog_with_missing_verification_evidence",
+        "severity": "block",
+    },
+    {
+        "step_id": "close_ready",
+        "label": "close-ready evidence",
+        "required_evidence": ["close_ready timeline evidence after precheck passes"],
+        "next_action": "append_close_ready_after_timeline_precheck_passes",
+        "backlog_followup_action": "update_backlog_with_missing_close_ready_evidence",
+        "severity": "block",
+    },
+    {
+        "step_id": "followup_backlog_on_blocker_or_scope_expansion",
+        "label": "follow-up backlog on blocker or scope expansion",
+        "required_evidence": ["backlog row or follow-up row for blockers and expanded scope"],
+        "next_action": "file_or_update_followup_backlog_when_gate_blocks_or_scope_expands",
+        "backlog_followup_action": "create_followup_backlog_for_unresolved_blocker",
+        "severity": "warning",
+    },
+]
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -155,6 +250,18 @@ def _stable_hash(payload: Any, *, length: int = 16) -> str:
 
 def _string(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on", "passed", "accepted", "allow", "allowed"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "failed", "blocked", "reject", "rejected"}:
+            return False
+    return bool(value)
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -793,6 +900,321 @@ def _build_route_service_preview(
         }
 
 
+def _timeline_evidence_sets(
+    timeline_prechecks: Sequence[Mapping[str, Any]],
+) -> dict[str, set[str]]:
+    present_event_kinds: set[str] = set()
+    missing_event_kinds: set[str] = set()
+    present_route_requirements: set[str] = set()
+    missing_route_requirements: set[str] = set()
+    for item in timeline_prechecks:
+        if not isinstance(item, Mapping):
+            continue
+        gate = _object(item.get("timeline_gate"))
+        present_event_kinds.update(_string_list_field(gate.get("present_event_kinds")))
+        missing_event_kinds.update(_string_list_field(gate.get("missing_event_kinds")))
+        route_gate = _object(gate.get("route_context_gate"))
+        present_route_requirements.update(
+            _string_list_field(route_gate.get("present_requirement_ids"))
+        )
+        missing_route_requirements.update(
+            _string_list_field(route_gate.get("missing_requirement_ids"))
+        )
+    return {
+        "present_event_kinds": present_event_kinds,
+        "missing_event_kinds": missing_event_kinds,
+        "present_route_requirements": present_route_requirements,
+        "missing_route_requirements": missing_route_requirements,
+    }
+
+
+def _route_action_precheck_present(route_service_preview: Mapping[str, Any]) -> bool:
+    for item in _list(route_service_preview.get("action_prechecks")):
+        precheck = _object(item)
+        if _string(precheck.get("precheck_id")) != DEFAULT_ROUTE_ACTION_PRECHECK_ID:
+            continue
+        if _object(precheck.get("source_event")):
+            return True
+    return False
+
+
+def _graph_query_trace_ids(seed: Mapping[str, Any]) -> list[str]:
+    candidates: list[Any] = []
+    for key in (
+        "graph_query_trace_ids",
+        "graph_query_traces",
+        "graph_traces",
+        "graph_first_traces",
+    ):
+        candidates.extend(_list(seed.get(key)))
+    discovery = _object(seed.get("graph_first_discovery"))
+    for key in ("trace_ids", "graph_query_trace_ids", "graph_query_traces"):
+        candidates.extend(_list(discovery.get(key)))
+    return sorted({str(item).strip() for item in candidates if str(item).strip()})
+
+
+def _direct_observer_mutation_policy(seed: Mapping[str, Any]) -> dict[str, Any]:
+    exception = _object(
+        seed.get("observer_direct_mutation_exception")
+        or seed.get("direct_mutation_exception")
+    )
+    requested = _bool(
+        seed.get("observer_direct_mutation")
+        or seed.get("same_observer_direct_mutation")
+        or seed.get("direct_mutation")
+        or exception
+    )
+    validation_error = ""
+    accepted = False
+    if requested:
+        try:
+            from .mf_subagent_contract import validate_observer_direct_mutation_exception
+
+            validate_observer_direct_mutation_exception(seed)
+            accepted = True
+        except Exception as exc:
+            validation_error = str(exc)
+    status = "not_requested"
+    if requested:
+        status = "accepted_exception" if accepted else "blocked_missing_exception"
+    return {
+        "schema_version": OBSERVER_DIRECT_MUTATION_POLICY_SCHEMA_VERSION,
+        "default_action": "dispatch_bounded_mf_sub",
+        "direct_code_edits_allowed_by_default": False,
+        "status": status,
+        "requested": requested,
+        "accepted_exception": accepted,
+        "validation_error": validation_error,
+        "validator": (
+            "agent.governance.mf_subagent_contract."
+            "validate_observer_direct_mutation_exception"
+        ),
+        "required_exception_evidence": [
+            "observer_direct_mutation=true",
+            "observer role evidence",
+            "tiny deterministic scope",
+            "explicit reason",
+            "allowed_files",
+            "dirty_scope_exact_match",
+            "timeline_evidence_before_mutation",
+        ],
+        "blocked_without_exception": [
+            "edit_files_as_observer_or_independent_reviewer",
+            "run_implementation_commands_as_observer_or_independent_reviewer",
+        ],
+    }
+
+
+def _step_entry(
+    step: Mapping[str, Any],
+    *,
+    present: bool,
+    evidence_refs: Sequence[str] = (),
+    reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "step_id": _string(step.get("step_id")),
+        "label": _string(step.get("label")),
+        "status": "present" if present else "missing",
+        "severity": _string(step.get("severity")),
+        "required_evidence": _list(step.get("required_evidence")),
+        "evidence_refs": [str(item) for item in evidence_refs if str(item)],
+        "reason": reason,
+        "next_action": _string(step.get("next_action")),
+        "backlog_followup_action": _string(step.get("backlog_followup_action")),
+    }
+
+
+def _build_observer_step_monitor(
+    *,
+    roots: Sequence[str],
+    normalized_rows: Sequence[Mapping[str, Any]],
+    blocker_inputs: Sequence[str],
+    recovery_actions: Sequence[str],
+    graph_status: Mapping[str, Any],
+    route_context: Mapping[str, Any],
+    route_service_preview: Mapping[str, Any],
+    timeline_prechecks: Sequence[Mapping[str, Any]],
+    route_context_seed: Mapping[str, Any],
+) -> dict[str, Any]:
+    timeline_sets = _timeline_evidence_sets(timeline_prechecks)
+    present_events = timeline_sets["present_event_kinds"]
+    missing_events = timeline_sets["missing_event_kinds"]
+    present_route = timeline_sets["present_route_requirements"]
+    missing_route = timeline_sets["missing_route_requirements"]
+    row_ids = {_string(row.get("bug_id")) for row in normalized_rows if _string(row.get("bug_id"))}
+    root_set = {str(item) for item in roots if str(item)}
+    route_identity = _object(route_service_preview.get("service_generated_route_identity"))
+    graph_trace_ids = _graph_query_trace_ids(route_context_seed)
+    graph_status_present = bool(graph_status) and _bool(_object(graph_status).get("ok", True))
+    graph_stale = bool(
+        _object(_object(graph_status).get("current_state"))
+        .get("graph_stale", {})
+        .get("is_stale", False)
+    )
+    direct_policy = _direct_observer_mutation_policy(route_context_seed)
+
+    def event_present(*event_ids: str) -> bool:
+        return any(item in present_events for item in event_ids) and not any(
+            item in missing_events for item in event_ids
+        )
+
+    def route_requirement_present(*requirement_ids: str) -> bool:
+        return any(item in present_route for item in requirement_ids) and not any(
+            item in missing_route for item in requirement_ids
+        )
+
+    step_presence = {
+        "route_context": {
+            "present": bool(
+                (
+                    _object(_object(route_service_preview).get("prompt_context_event")).get("source_event")
+                    or route_identity.get("route_context_hash")
+                    or route_context.get("route_context_hash")
+                    or route_requirement_present("route_context")
+                )
+                and "route_context" not in missing_route
+            ),
+            "evidence": [
+                _string(route_identity.get("route_context_hash")),
+                _string(route_context.get("route_context_hash")),
+            ],
+        },
+        "route_action_precheck": {
+            "present": (
+                _route_action_precheck_present(route_service_preview)
+                or route_requirement_present("route_action_precheck")
+            )
+            and "route_action_precheck" not in missing_route,
+            "evidence": [DEFAULT_ROUTE_ACTION_PRECHECK_ID],
+        },
+        "graph_first_discovery": {
+            "present": graph_status_present and not graph_stale and bool(graph_trace_ids),
+            "evidence": graph_trace_ids,
+            "reason": "requires graph_status current and at least one graph_query trace id",
+        },
+        "backlog_row": {
+            "present": bool(normalized_rows) and (not root_set or root_set.issubset(row_ids)),
+            "evidence": sorted(row_ids),
+        },
+        "bounded_implementation_worker_dispatch": {
+            "present": route_requirement_present("bounded_implementation_worker_dispatch")
+            or event_present("bounded_implementation_worker_dispatch"),
+            "evidence": ["bounded_implementation_worker_dispatch"]
+            if route_requirement_present("bounded_implementation_worker_dispatch")
+            or event_present("bounded_implementation_worker_dispatch")
+            else [],
+        },
+        "mf_subagent_startup": {
+            "present": route_requirement_present("mf_subagent_startup")
+            or event_present("mf_subagent_startup"),
+            "evidence": ["mf_subagent_startup"]
+            if route_requirement_present("mf_subagent_startup")
+            or event_present("mf_subagent_startup")
+            else [],
+        },
+        "independent_verification_lane": {
+            "present": route_requirement_present("independent_verification_lane")
+            or event_present("independent_verification_lane", "independent_verification"),
+            "evidence": [
+                item
+                for item in ("independent_verification_lane", "independent_verification")
+                if route_requirement_present(item) or event_present(item)
+            ],
+        },
+        "implementation": {
+            "present": event_present("implementation"),
+            "evidence": ["implementation"] if event_present("implementation") else [],
+        },
+        "verification": {
+            "present": event_present("verification"),
+            "evidence": ["verification"] if event_present("verification") else [],
+        },
+        "close_ready": {
+            "present": event_present("close_ready"),
+            "evidence": ["close_ready"] if event_present("close_ready") else [],
+        },
+        "followup_backlog_on_blocker_or_scope_expansion": {
+            "present": not blocker_inputs or bool(normalized_rows),
+            "evidence": sorted(row_ids),
+            "reason": "blockers require a backlog row or follow-up backlog before repair continues",
+        },
+    }
+    if direct_policy["requested"] and not direct_policy["accepted_exception"]:
+        step_presence["observer_direct_mutation_exception"] = {
+            "present": False,
+            "evidence": [],
+            "reason": "direct observer code mutation was requested without an accepted exception",
+        }
+
+    present_steps: list[dict[str, Any]] = []
+    missing_steps: list[dict[str, Any]] = []
+    step_defs = list(OBSERVER_MONITORED_STEPS)
+    if "observer_direct_mutation_exception" in step_presence:
+        step_defs.append(
+            {
+                "step_id": "observer_direct_mutation_exception",
+                "label": "observer direct mutation exception",
+                "required_evidence": direct_policy["required_exception_evidence"],
+                "next_action": "run_and_record_observer_direct_mutation_exception_validator",
+                "backlog_followup_action": "update_backlog_with_direct_mutation_exception_gap",
+                "severity": "block",
+            }
+        )
+
+    for step in step_defs:
+        step_id = _string(step.get("step_id"))
+        condition = _object(step_presence.get(step_id))
+        present = bool(condition.get("present"))
+        entry = _step_entry(
+            step,
+            present=present,
+            evidence_refs=_list(condition.get("evidence")),
+            reason=_string(condition.get("reason")),
+        )
+        if present:
+            present_steps.append(entry)
+        else:
+            missing_steps.append(entry)
+
+    missing_step_ids = [step["step_id"] for step in missing_steps]
+    missing_blockers = [step for step in missing_steps if step.get("severity") == "block"]
+    next_actions = sorted(
+        {
+            *[step["next_action"] for step in missing_steps if step.get("next_action")],
+            *[str(action) for action in recovery_actions if str(action)],
+        }
+    )
+    return {
+        "schema_version": OBSERVER_STEP_MONITOR_SCHEMA_VERSION,
+        "status": "blocked" if missing_blockers else ("warning" if missing_steps else "passed"),
+        "required": True,
+        "present_steps": present_steps,
+        "missing_steps": missing_steps,
+        "missing_step_ids": missing_step_ids,
+        "next_actions": next_actions,
+        "backlog_followup": {
+            "required": bool(missing_steps),
+            "policy": "file_or_update_backlog_for_missing_observer_steps",
+            "target_backlog_ids": list(roots),
+            "missing_step_ids": missing_step_ids,
+            "actions": sorted(
+                {
+                    step["backlog_followup_action"]
+                    for step in missing_steps
+                    if step.get("backlog_followup_action")
+                }
+            ),
+        },
+        "direct_observer_mutation_policy": direct_policy,
+        "close_policy": {
+            "may_close": not missing_blockers,
+            "requires_mf_timeline_precheck": True,
+            "diagnostic_events_count_as_close_evidence": False,
+        },
+    }
+
+
 def build_repair_run_plan(
     *,
     project_id: str,
@@ -882,6 +1304,17 @@ def build_repair_run_plan(
         for item in timeline_prechecks
         if isinstance(item, Mapping) and item.get("can_close") is False
     ]
+    observer_step_monitor = _build_observer_step_monitor(
+        roots=roots,
+        normalized_rows=normalized_rows,
+        blocker_inputs=blocker_inputs,
+        recovery_actions=recovery_actions,
+        graph_status=graph_status or {},
+        route_context=route_context,
+        route_service_preview=route_service_preview,
+        timeline_prechecks=timeline_prechecks,
+        route_context_seed=seed,
+    )
     return {
         "ok": True,
         "schema_version": SCHEMA_VERSION,
@@ -891,6 +1324,7 @@ def build_repair_run_plan(
         "root_backlog_ids": roots,
         "route_context": route_context,
         "route_service_preview": route_service_preview,
+        "observer_step_monitor": observer_step_monitor,
         "backlog_dependency_dag": dag,
         "lane_dispatches": lanes,
         "checkpoints": _build_checkpoints(route_context, lanes),
@@ -910,7 +1344,11 @@ def build_repair_run_plan(
             "blocked_count": len(timeline_blocked),
             "blocked": timeline_blocked,
         },
-        "next_legal_actions": recovery_actions or ["inspect_evidence_and_file_bounded_followup"],
+        "next_legal_actions": (
+            observer_step_monitor["next_actions"]
+            or recovery_actions
+            or ["inspect_evidence_and_file_bounded_followup"]
+        ),
     }
 
 

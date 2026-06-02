@@ -17058,16 +17058,34 @@ def _timeline_route_waiver_block_for_high_risk(
             }
         }
 
+    scoped_task_id = str(body.get("task_id") or "").strip()
     route_context_gate = task_timeline.mf_route_context_gate_verification(
         task_timeline.list_events(
             conn,
             project_id,
             backlog_id=backlog_id,
-            task_id=str(body.get("task_id") or "").strip(),
+            task_id=scoped_task_id,
             limit=1000,
         ),
         contract=contract,
     )
+    if (
+        scoped_task_id
+        and route_context_gate.get("required")
+        and not route_context_gate.get("passed")
+        and not route_context_gate.get("present_requirement_ids")
+    ):
+        backlog_route_context_gate = task_timeline.mf_route_context_gate_verification(
+            task_timeline.list_events(
+                conn,
+                project_id,
+                backlog_id=backlog_id,
+                limit=1000,
+            ),
+            contract=contract,
+        )
+        if backlog_route_context_gate.get("required"):
+            route_context_gate = backlog_route_context_gate
     if not route_context_gate.get("required"):
         return {}
     identity_mismatch = _route_waiver_identity_mismatch(

@@ -41,6 +41,27 @@ def _rows():
     ]
 
 
+def _passing_timeline_precheck():
+    return {
+        "bug_id": "CONTENT-SYS-DOCKER-CONTEXT-FIXTURE-20260601",
+        "can_close": True,
+        "timeline_gate": {
+            "present_event_kinds": ["implementation", "verification", "close_ready"],
+            "missing_event_kinds": [],
+            "route_context_gate": {
+                "present_requirement_ids": [
+                    "route_context",
+                    "route_action_precheck",
+                    "bounded_implementation_worker_dispatch",
+                    "mf_subagent_startup",
+                    "independent_verification_lane",
+                ],
+                "missing_requirement_ids": [],
+            },
+        },
+    }
+
+
 def test_repair_run_plan_is_deterministic_and_judge_independent():
     kwargs = {
         "project_id": "aming-claw",
@@ -59,6 +80,7 @@ def test_repair_run_plan_is_deterministic_and_judge_independent():
     assert first["route_context"]["judgment_brain_required"] is False
     assert first["route_context"]["authorizes_protected_write"] is False
     assert first["protected_write_policy"]["diagnostic_events_count_as_close_evidence"] is False
+    assert first["observer_step_monitor"]["schema_version"] == "observer_step_monitor.v1"
 
 
 def test_repair_run_groups_lanes_and_orders_dependencies():
@@ -90,6 +112,167 @@ def test_repair_run_groups_lanes_and_orders_dependencies():
         "declared_dependency",
     ) in edges
     assert any(edge[2] == "schema_before_protected_write" for edge in edges)
+
+
+def test_repair_run_step_monitor_passes_when_required_observer_evidence_is_present():
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"] for row in _rows()],
+        backlog_rows=_rows(),
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+        timeline_prechecks=[_passing_timeline_precheck()],
+        route_context_seed={"graph_query_trace_ids": ["gqt-test-route-context"]},
+    )
+
+    monitor = plan["observer_step_monitor"]
+
+    assert monitor["status"] == "passed"
+    assert monitor["missing_steps"] == []
+    assert monitor["missing_step_ids"] == []
+    assert monitor["backlog_followup"]["required"] is False
+    assert monitor["close_policy"]["may_close"] is True
+    assert {step["step_id"] for step in monitor["present_steps"]} >= {
+        "route_context",
+        "route_action_precheck",
+        "graph_first_discovery",
+        "backlog_row",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "independent_verification_lane",
+        "implementation",
+        "verification",
+        "close_ready",
+    }
+
+
+def test_repair_run_step_monitor_surfaces_forgotten_steps_and_backlog_followup():
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=["AC-MISSING-WORKFLOW-STEPS-20260602"],
+        backlog_rows=[],
+        blockers=["graph unavailable and missing independent verification"],
+    )
+
+    monitor = plan["observer_step_monitor"]
+    missing = set(monitor["missing_step_ids"])
+
+    assert monitor["status"] == "blocked"
+    assert "graph_first_discovery" in missing
+    assert "backlog_row" in missing
+    assert "bounded_implementation_worker_dispatch" in missing
+    assert "mf_subagent_startup" in missing
+    assert "independent_verification_lane" in missing
+    assert "implementation" in missing
+    assert "verification" in missing
+    assert "close_ready" in missing
+    assert monitor["backlog_followup"]["required"] is True
+    assert "create_or_update_missing_backlog_row" in monitor["backlog_followup"]["actions"]
+    assert "upsert_or_update_backlog_before_mutation" in monitor["next_actions"]
+
+
+def test_repair_run_step_monitor_keeps_independent_verification_separate():
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"] for row in _rows()],
+        backlog_rows=_rows(),
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        timeline_prechecks=[
+            {
+                "bug_id": "CONTENT-SYS-DOCKER-CONTEXT-FIXTURE-20260601",
+                "can_close": False,
+                "timeline_gate": {
+                    "present_event_kinds": ["implementation", "verification", "close_ready"],
+                    "missing_event_kinds": [],
+                    "route_context_gate": {
+                        "present_requirement_ids": [
+                            "route_context",
+                            "route_action_precheck",
+                            "bounded_implementation_worker_dispatch",
+                            "mf_subagent_startup",
+                        ],
+                        "missing_requirement_ids": ["independent_verification_lane"],
+                    },
+                },
+            }
+        ],
+        route_context_seed={"graph_query_trace_ids": ["gqt-test-route-context"]},
+    )
+
+    monitor = plan["observer_step_monitor"]
+
+    assert "implementation" not in monitor["missing_step_ids"]
+    assert "verification" not in monitor["missing_step_ids"]
+    assert "close_ready" not in monitor["missing_step_ids"]
+    assert "independent_verification_lane" in monitor["missing_step_ids"]
+    assert "dispatch_independent_verification_lane" in monitor["next_actions"]
+
+
+def test_repair_run_step_monitor_blocks_direct_observer_mutation_without_exception():
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=["AC-DIRECT-OBSERVER-MUTATION-20260602"],
+        backlog_rows=[
+            {
+                "bug_id": "AC-DIRECT-OBSERVER-MUTATION-20260602",
+                "title": "direct observer edit request",
+                "status": "OPEN",
+                "priority": "P2",
+                "details_md": "observer direct mutation requested",
+            }
+        ],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        route_context_seed={
+            "graph_query_trace_ids": ["gqt-direct-mutation"],
+            "observer_direct_mutation": True,
+        },
+    )
+
+    monitor = plan["observer_step_monitor"]
+    policy = monitor["direct_observer_mutation_policy"]
+
+    assert policy["default_action"] == "dispatch_bounded_mf_sub"
+    assert policy["direct_code_edits_allowed_by_default"] is False
+    assert policy["status"] == "blocked_missing_exception"
+    assert "timeline_evidence_before_mutation" in policy["required_exception_evidence"]
+    assert "observer_direct_mutation_exception" in monitor["missing_step_ids"]
+    assert (
+        "run_and_record_observer_direct_mutation_exception_validator"
+        in monitor["next_actions"]
+    )
+
+
+def test_repair_run_step_monitor_rejects_bare_direct_mutation_acceptance_flag():
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=["AC-DIRECT-OBSERVER-MUTATION-20260602"],
+        backlog_rows=[
+            {
+                "bug_id": "AC-DIRECT-OBSERVER-MUTATION-20260602",
+                "title": "direct observer edit request",
+                "status": "OPEN",
+                "priority": "P2",
+                "details_md": "observer direct mutation requested",
+            }
+        ],
+        route_context_seed={
+            "observer_direct_mutation": True,
+            "role": "observer",
+            "direct_mutation_exception": {
+                "accepted": True,
+                "allowed": True,
+                "tiny_deterministic": True,
+            },
+        },
+    )
+
+    monitor = plan["observer_step_monitor"]
+    policy = monitor["direct_observer_mutation_policy"]
+
+    assert policy["status"] == "blocked_missing_exception"
+    assert policy["accepted_exception"] is False
+    assert "explicit reason" in policy["validation_error"]
+    assert "observer_direct_mutation_exception" in monitor["missing_step_ids"]
 
 
 def test_repair_run_classifies_gate_failures_into_next_legal_actions():
