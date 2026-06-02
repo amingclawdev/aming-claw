@@ -10,6 +10,11 @@ def _tool_names() -> set[str]:
     return {str(tool.get("name") or "") for tool in TOOLS}
 
 
+def _tool_properties(name: str) -> dict:
+    tool = next(tool for tool in TOOLS if tool.get("name") == name)
+    return tool["inputSchema"]["properties"]
+
+
 class _Recorder:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []
@@ -281,6 +286,144 @@ def test_mcp_protected_mutations_forward_route_token_or_waiver():
         "/api/backlog/aming-claw/BUG-1/close",
         {"commit": "abc1234", "route_waiver": route_waiver},
     )
+
+
+def test_mcp_protected_write_schemas_expose_route_gate_payloads():
+    for name in ("backlog_upsert", "backlog_close", "task_timeline_append"):
+        properties = _tool_properties(name)
+
+        assert properties["route_token"]["type"] == "object"
+        assert properties["route_waiver"]["type"] == "object"
+        assert properties["route_token_waiver"]["type"] == "object"
+
+
+def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    route_token = {
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "caller_role": "observer",
+        "allowed_action": "backlog_upsert",
+        "project_id": "aming-claw",
+        "backlog_id": "BUG-1",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "evidence_refs": ["timeline:route-context"],
+    }
+    route_waiver = {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "allowed_action": "task_timeline_append",
+        "project_id": "aming-claw",
+        "backlog_id": "BUG-1",
+        "reason": "Operator approved a bounded manual-fix route gate waiver.",
+        "timeline_evidence": {"event_id": 42},
+    }
+    backlog_upsert_waiver = {**route_waiver, "allowed_action": "backlog_upsert"}
+    timeline_token = {**route_token, "allowed_action": "task_timeline_append"}
+    backlog_close_token = {**route_token, "allowed_action": "backlog_close"}
+    backlog_close_waiver = {**route_waiver, "allowed_action": "backlog_close"}
+
+    dispatcher.dispatch(
+        "backlog_upsert",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-1",
+            "status": "FIXED",
+            "route_token": route_token,
+            "route_waiver": backlog_upsert_waiver,
+        },
+    )
+    dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "BUG-1",
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+            "route_token": timeline_token,
+            "route_waiver": route_waiver,
+        },
+    )
+    dispatcher.dispatch(
+        "backlog_close",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-1",
+            "commit": "abc1234",
+            "route_token": backlog_close_token,
+            "route_waiver": backlog_close_waiver,
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/backlog/aming-claw/BUG-1",
+            {
+                "status": "FIXED",
+                "route_token": route_token,
+                "route_waiver": backlog_upsert_waiver,
+            },
+        ),
+        (
+            "POST",
+            "/api/task/aming-claw/timeline",
+            {
+                "backlog_id": "BUG-1",
+                "event_type": "mf.verification",
+                "event_kind": "verification",
+                "route_token": timeline_token,
+                "route_waiver": route_waiver,
+            },
+        ),
+        (
+            "POST",
+            "/api/backlog/aming-claw/BUG-1/close",
+            {
+                "commit": "abc1234",
+                "route_token": backlog_close_token,
+                "route_waiver": backlog_close_waiver,
+            },
+        ),
+    ]
+
+
+def test_mcp_protected_dispatch_does_not_synthesize_route_gate_payloads_when_absent():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch(
+        "backlog_upsert",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-1",
+            "status": "FIXED",
+        },
+    )
+    dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "BUG-1",
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+        },
+    )
+    dispatcher.dispatch(
+        "backlog_close",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-1",
+            "commit": "abc1234",
+        },
+    )
+
+    for _method, _path, body in recorder.calls:
+        assert body is not None
+        assert "route_token" not in body
+        assert "route_waiver" not in body
+        assert "route_token_waiver" not in body
 
 
 def test_mcp_backlog_list_defaults_to_compact_open_page():
