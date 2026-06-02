@@ -1790,6 +1790,76 @@ class TestTaskTimeline(unittest.TestCase):
             "qa_verification",
         )
 
+    def test_optional_architecture_review_lane_does_not_block_lightweight_close(self):
+        from agent.governance import task_timeline
+
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        optional_contract = {
+            "template_id": "mf_workflow_runtime.v1",
+            "contract_instance_id": "BUG-OPTIONAL-ARCH-LANE",
+            "route_topology_policy": {
+                "selected_topology": "lightweight_single_lane",
+                "recommended_topology": "single_lane.v1",
+                "required_lanes": ["single_bounded_worker"],
+            },
+            "evidence_requirements": [
+                {
+                    "id": "architecture_review_lane",
+                    "required": False,
+                    "phase": "architecture_review",
+                },
+            ],
+        }
+
+        ready = task_timeline.mf_close_gate_verification(
+            base_events,
+            contract=optional_contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertFalse(ready["route_context_gate"]["required"])
+        self.assertNotIn(
+            "architecture_review_lane",
+            ready["route_context_gate"]["missing_requirement_ids"],
+        )
+
+        required_contract = {
+            **optional_contract,
+            "contract_instance_id": "BUG-REQUIRED-ARCH-LANE",
+            "evidence_requirements": [
+                {
+                    "id": "architecture_review_lane",
+                    "required": True,
+                    "phase": "architecture_review",
+                },
+            ],
+        }
+        blocked = task_timeline.mf_close_gate_verification(
+            [*base_events, *_route_context_consumption_events()],
+            contract=required_contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            ["architecture_review_lane"],
+        )
+
+        with_arch_review = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                *_route_context_consumption_events(),
+                _route_context_architecture_review_event(),
+            ],
+            contract=required_contract,
+        )
+
+        self.assertTrue(with_arch_review["passed"], with_arch_review)
+
     def test_mf_parallel_close_gate_requires_architecture_lane_only_when_named(self):
         from agent.governance import task_timeline
 

@@ -829,10 +829,26 @@ def _route_architecture_review_required(
     topology_policy: dict[str, Any],
     contract: dict[str, Any] | None,
 ) -> bool:
-    markers: set[str] = set()
+    architecture_markers = {
+        "architecture_review_lane",
+        "architecture_review",
+        "architecture_data_continuity_review",
+        "architecture_lane",
+        "arch_review",
+    }
+    for key in (
+        "architecture_review_required",
+        "require_architecture_review",
+        "architecture_data_continuity_review_required",
+    ):
+        if _truthy(topology_policy.get(key)):
+            return True
+
     for item in _list(topology_policy.get("required_lanes")):
+        if isinstance(item, dict) and item.get("required") is False:
+            continue
         if isinstance(item, dict):
-            markers.update(
+            markers = {
                 _route_marker(item.get(key))
                 for key in (
                     "id",
@@ -844,10 +860,20 @@ def _route_architecture_review_required(
                     "name",
                 )
                 if item.get(key)
-            )
+            }
         else:
-            markers.add(_route_marker(item))
+            markers = {_route_marker(item)}
+        if markers.intersection(architecture_markers):
+            return True
+
     for obj in _contract_walk(_mapping(contract), max_depth=5):
+        for key in (
+            "architecture_review_required",
+            "require_architecture_review",
+            "architecture_data_continuity_review_required",
+        ):
+            if _truthy(obj.get(key)):
+                return True
         for key in (
             "required_lanes",
             "required_evidence",
@@ -856,8 +882,10 @@ def _route_architecture_review_required(
             "contract_evidence",
         ):
             for item in _list(obj.get(key)):
+                if isinstance(item, dict) and item.get("required") is False:
+                    continue
                 if isinstance(item, dict):
-                    markers.update(
+                    markers = {
                         _route_marker(item.get(field))
                         for field in (
                             "id",
@@ -869,20 +897,12 @@ def _route_architecture_review_required(
                             "name",
                         )
                         if item.get(field)
-                    )
+                    }
                 else:
-                    markers.add(_route_marker(item))
-    return bool(
-        markers.intersection(
-            {
-                "architecture_review_lane",
-                "architecture_review",
-                "architecture_data_continuity_review",
-                "architecture_lane",
-                "arch_review",
-            }
-        )
-    )
+                    markers = {_route_marker(item)}
+                if markers.intersection(architecture_markers):
+                    return True
+    return False
 
 
 def _first_deep_text(value: Any, key: str) -> str:
