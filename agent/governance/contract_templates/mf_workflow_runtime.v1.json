@@ -29,7 +29,8 @@
       "recommended_topology",
       "required_lanes",
       "reason_codes",
-      "observer_authorities"
+      "observer_authorities",
+      "review_pack_templates"
     ],
     "worker_prompt_fields": [
       "target_files",
@@ -57,6 +58,14 @@
       "low_risk_topology": "lightweight_single_lane",
       "high_risk_topology": "observer_led_parallel_lanes",
       "p0_p1_governance_routing_runtime_requires_independent_verification": true,
+      "strategic_judge_routed_optional_lanes": [
+        "architecture_review_lane",
+        "qa_evidence_gate_review"
+      ],
+      "review_pack_templates": [
+        "architecture_data_continuity_review.v1",
+        "qa_evidence_gate_review.v1"
+      ],
       "observer_authorities": [
         "merge",
         "redeploy_governance",
@@ -362,6 +371,8 @@
         "merge_queue_id",
         "current_target_head",
         "graph_current",
+        "graph_trace_evidence",
+        "service_dispatch_evidence",
         "next_stage"
       ]
     },
@@ -540,7 +551,9 @@
         "required_evidence_ids",
         "route_context_gate_evidence",
         "bounded_implementation_worker_dispatch_evidence",
-        "mf_subagent_startup_evidence"
+        "mf_subagent_startup_evidence",
+        "architecture_review_lane_evidence",
+        "qa_evidence_gate_review"
       ],
       "outputs": [
         "precheck_run_id",
@@ -572,6 +585,8 @@
       "branch_ref_present",
       "merge_queue_id_present",
       "active_graph_current_at_dispatch",
+      "graph_trace_evidence_present_for_governed_route",
+      "service_dispatch_evidence_present_for_governed_route",
       "write_scope_present",
       "contract_shape_valid"
     ],
@@ -642,6 +657,8 @@
       "route_action_precheck_consumed",
       "bounded_implementation_worker_dispatch_matches_route",
       "mf_subagent_startup_matches_route",
+      "architecture_review_lane_when_required",
+      "qa_evidence_gate_review_when_required",
       "independent_verification_lane_evidence_for_p0_p1_governance_routing_runtime"
     ]
   },
@@ -729,6 +746,38 @@
       "phase": "startup_gate",
       "kind": "local_precheck",
       "description": "Required by close/precommit gates when route topology is observer_led_parallel_lanes or mf_parallel.v1; proves the bounded worker actually started inside the assigned runtime context."
+    },
+    {
+      "id": "graph_trace_evidence",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "graph_query_trace",
+      "schema_version": "mf_subagent_graph_trace.v1",
+      "description": "Required by dispatch and finish gates for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work."
+    },
+    {
+      "id": "observer_subagent_service_dispatch",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "service_dispatch",
+      "schema_version": "observer_subagent_service_dispatch.v1",
+      "description": "Required by dispatch gate for governed subagent handoff; records replayable command/monitor refs or a documented host-adapter boundary."
+    },
+    {
+      "id": "architecture_review_lane",
+      "required": false,
+      "phase": "architecture_review",
+      "kind": "review_pack",
+      "review_pack_template": "architecture_data_continuity_review.v1",
+      "description": "Required only when route_topology_policy.required_lanes or instantiated evidence explicitly names architecture_review_lane."
+    },
+    {
+      "id": "qa_evidence_gate_review",
+      "required": false,
+      "phase": "verification",
+      "kind": "review_pack",
+      "review_pack_template": "qa_evidence_gate_review.v1",
+      "description": "Required only when the route or instantiated contract asks for the QA evidence gate review pack."
     },
     {
       "id": "fixture_contract",

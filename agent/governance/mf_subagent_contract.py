@@ -24,6 +24,8 @@ FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
 ROUTE_LINEAGE_SCHEMA_VERSION = "mf_subagent_route_lineage.v1"
+GRAPH_TRACE_SCHEMA_VERSION = "mf_subagent_graph_trace.v1"
+SERVICE_DISPATCH_SCHEMA_VERSION = "observer_subagent_service_dispatch.v1"
 OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
 ROUTE_ACTION_GATE_SCHEMA_VERSION = "route_action_gate.v1"
 ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION = "route_token_mutation_gate.v1"
@@ -177,6 +179,66 @@ _PARENT_ROUTE_LINEAGE_MARKER_KEYS = (
     "parent_prompt_contract_id",
     "parent_visible_injection_manifest_hash",
 )
+_GOVERNED_NONTRIVIAL_KEYS = (
+    "governed_nontrivial",
+    "governed_nontrivial_work",
+    "governed_nontrivial_implementation",
+    "governed_implementation",
+    "nontrivial_governed_work",
+    "nontrivial_implementation",
+    "strategic_judge_routed",
+    "strategic_route_required",
+)
+_GOVERNED_NONTRIVIAL_TEXT_MARKERS = {
+    "governed_nontrivial",
+    "governed_nontrivial_work",
+    "governed_nontrivial_implementation",
+    "judge_routed",
+    "judgment_routed",
+    "parent_judge_routed",
+    "strategic_judge_routed",
+    "parent_route_required",
+}
+_GRAPH_TRACE_ID_KEYS = {
+    "trace_id",
+    "trace_ids",
+    "graph_trace_id",
+    "graph_trace_ids",
+    "graph_query_trace_id",
+    "graph_query_trace_ids",
+}
+_GRAPH_TRACE_CONTAINER_KEYS = (
+    "graph_trace_evidence",
+    "graph_query_trace_evidence",
+    "mf_subagent_graph_trace",
+    "graph_evidence",
+)
+_SERVICE_DISPATCH_CONTAINER_KEYS = (
+    "service_dispatch_evidence",
+    "observer_subagent_service_dispatch",
+    "observer_subagent_service_dispatch_evidence",
+    "subagent_service_dispatch",
+    "spawn_agent_evidence",
+)
+_SERVICE_DISPATCH_COMMAND_REF_KEYS = {
+    "dispatch_command_ref",
+    "command_ref",
+    "replay_command_ref",
+    "spawn_command_ref",
+    "command_id",
+}
+_SERVICE_DISPATCH_MONITOR_REF_KEYS = {
+    "monitor_ref",
+    "monitor_command_ref",
+    "session_monitor_ref",
+    "status_ref",
+    "log_ref",
+}
+_SERVICE_DISPATCH_BOUNDARY_KEYS = {
+    "documented_host_adapter_boundary",
+    "host_adapter_boundary",
+    "host_adapter_boundary_ref",
+}
 _IMPLEMENTATION_ACTIONS = {
     "apply_patch",
     "apply_patch_within_target_files",
@@ -312,6 +374,68 @@ def _normalize_worktree_path(path: str) -> str:
 def _nested_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
     value = payload.get(key)
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _deep_field_values(
+    value: Any,
+    keys: set[str],
+    *,
+    depth: int = 0,
+    max_depth: int = 5,
+) -> list[Any]:
+    if depth > max_depth:
+        return []
+    values: list[Any] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if str(key) in keys:
+                values.append(child)
+            values.extend(
+                _deep_field_values(child, keys, depth=depth + 1, max_depth=max_depth)
+            )
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for child in value:
+            values.extend(
+                _deep_field_values(child, keys, depth=depth + 1, max_depth=max_depth)
+            )
+    return values
+
+
+def _trace_id_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, Mapping):
+        result: list[str] = []
+        for key in _GRAPH_TRACE_ID_KEYS:
+            if key in value:
+                result.extend(_trace_id_strings(value.get(key)))
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        result: list[str] = []
+        for item in value:
+            result.extend(_trace_id_strings(item))
+        return result
+    return []
+
+
+def _first_deep_string(value: Any, keys: set[str]) -> str:
+    for item in _deep_field_values(value, keys):
+        if isinstance(item, Mapping):
+            for key in ("id", "ref", "name", "value", "description"):
+                token = _string(item.get(key))
+                if token:
+                    return token
+            continue
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+            for child in item:
+                token = _string(child)
+                if token:
+                    return token
+            continue
+        token = _string(item)
+        if token:
+            return token
+    return ""
 
 
 def _dispatch_string(
@@ -852,6 +976,175 @@ def _parent_route_lineage_from_payload(
         project_id=project_id,
         backlog_id=backlog_id,
     )
+
+
+def _governed_nontrivial_graph_required(
+    payload: Mapping[str, Any],
+    *,
+    parent_route_lineage: Mapping[str, Any] | None = None,
+) -> bool:
+    if parent_route_lineage:
+        return True
+    if _parent_route_required(payload):
+        return True
+    for container in _route_machine_containers(payload):
+        if any(_bool(container.get(key)) for key in _GOVERNED_NONTRIVIAL_KEYS):
+            return True
+    marker_values = _route_collect_texts(
+        payload,
+        "work_class",
+        "route_class",
+        "route_kind",
+        "route_type",
+        "selected_topology",
+        "recommended_topology",
+        "topology",
+        "classification",
+    )
+    return any(
+        _normalized_action(value) in _GOVERNED_NONTRIVIAL_TEXT_MARKERS
+        for value in marker_values
+    )
+
+
+def _graph_trace_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+    for key in _GRAPH_TRACE_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return dict(payload)
+
+
+def _normalize_graph_trace_evidence(
+    payload: Mapping[str, Any],
+    *,
+    required: bool,
+    task_id: str = "",
+    parent_task_id: str = "",
+    worker_role: str = "",
+    fence_token: str = "",
+) -> dict[str, Any]:
+    source = _graph_trace_source(payload)
+    trace_ids = _dedupe_strings(
+        trace_id
+        for item in _deep_field_values(source, _GRAPH_TRACE_ID_KEYS)
+        for trace_id in _trace_id_strings(item)
+    )
+    query_source = _first_deep_string(source, {"query_source", "source"})
+    if query_source and query_source != "mf_subagent":
+        raise MfSubagentContractError(
+            "graph trace evidence must use query_source=mf_subagent"
+        )
+
+    evidence_task_id = _first_deep_string(source, {"task_id"}) or task_id
+    evidence_parent_task_id = (
+        _first_deep_string(source, {"parent_task_id"}) or parent_task_id
+    )
+    evidence_worker_role = (
+        _first_deep_string(source, {"worker_role", "role"}) or worker_role or MF_SUB_ROLE
+    )
+    evidence_fence_token = _first_deep_string(source, {"fence_token"}) or fence_token
+
+    expected = {
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": worker_role or MF_SUB_ROLE,
+        "fence_token": fence_token,
+    }
+    observed = {
+        "task_id": evidence_task_id,
+        "parent_task_id": evidence_parent_task_id,
+        "worker_role": evidence_worker_role,
+        "fence_token": evidence_fence_token,
+    }
+    mismatches = [
+        field
+        for field, expected_value in expected.items()
+        if expected_value and observed[field] and observed[field] != expected_value
+    ]
+    if mismatches:
+        raise MfSubagentContractError(
+            "graph trace evidence identity mismatch: " + ", ".join(sorted(mismatches))
+        )
+
+    missing_context = [
+        field
+        for field, value in observed.items()
+        if field in {"task_id", "parent_task_id", "worker_role", "fence_token"}
+        and not value
+    ]
+    if required and not trace_ids:
+        raise MfSubagentContractError(
+            "governed mf_sub dispatch/finish requires graph trace evidence"
+        )
+    if required and missing_context:
+        raise MfSubagentContractError(
+            "graph trace evidence missing required context: "
+            + ", ".join(sorted(missing_context))
+        )
+
+    return {
+        "schema_version": GRAPH_TRACE_SCHEMA_VERSION,
+        "required": required,
+        "present": bool(trace_ids),
+        "query_source": "mf_subagent" if query_source or trace_ids or required else "",
+        "trace_ids": trace_ids,
+        "task_id": observed["task_id"],
+        "parent_task_id": observed["parent_task_id"],
+        "worker_role": observed["worker_role"],
+        "fence_token": observed["fence_token"],
+    }
+
+
+def _service_dispatch_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+    for key in _SERVICE_DISPATCH_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    if (
+        _first_deep_string(payload, _SERVICE_DISPATCH_COMMAND_REF_KEYS)
+        or _first_deep_string(payload, _SERVICE_DISPATCH_BOUNDARY_KEYS)
+    ):
+        return dict(payload)
+    return {}
+
+
+def _normalize_service_dispatch_evidence(
+    payload: Mapping[str, Any],
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    source = _service_dispatch_source(payload)
+    command_ref = _first_deep_string(source, _SERVICE_DISPATCH_COMMAND_REF_KEYS)
+    monitor_ref = _first_deep_string(source, _SERVICE_DISPATCH_MONITOR_REF_KEYS)
+    boundary_ref = _first_deep_string(source, _SERVICE_DISPATCH_BOUNDARY_KEYS)
+    boundary_documentation_ref = _first_deep_string(
+        source,
+        {"boundary_documentation_ref", "documentation_ref", "adapter_contract_ref"},
+    )
+    documented_boundary = bool(boundary_ref) and (
+        "documented_host_adapter_boundary" in source
+        or _bool(source.get("documented"))
+        or bool(boundary_documentation_ref)
+    )
+    replayable_refs = bool(command_ref and monitor_ref)
+    present = replayable_refs or documented_boundary
+    if required and not present:
+        raise MfSubagentContractError(
+            "observer_subagent_service_dispatch evidence must include replayable "
+            "command/monitor refs or a documented host-adapter boundary"
+        )
+    return {
+        "schema_version": SERVICE_DISPATCH_SCHEMA_VERSION,
+        "required": required,
+        "present": present,
+        "replayable_refs_present": replayable_refs,
+        "dispatch_command_ref": command_ref,
+        "monitor_ref": monitor_ref,
+        "documented_host_adapter_boundary": documented_boundary,
+        "host_adapter_boundary": boundary_ref,
+        "boundary_documentation_ref": boundary_documentation_ref,
+    }
 
 
 def _child_route_prompt_contract(
@@ -2395,6 +2688,31 @@ def validate_mf_subagent_dispatch_gate(
             ("worker_contract", ("backlog_id",)),
         ),
     )
+    task_id = _dispatch_string(
+        payload,
+        names=("task_id",),
+        nested_keys=(
+            ("runtime_identity", ("task_id",)),
+            ("worker_contract", ("task_id",)),
+        ),
+    )
+    parent_task_id = _dispatch_string(
+        payload,
+        names=("parent_task_id",),
+        nested_keys=(
+            ("runtime_identity", ("parent_task_id",)),
+            ("worker_contract", ("parent_task_id",)),
+            ("parent", ("task_id",)),
+        ),
+    )
+    worker_role = _dispatch_string(
+        payload,
+        names=("worker_role", "role"),
+        nested_keys=(
+            ("runtime_identity", ("worker_role", "role")),
+            ("worker_contract", ("worker_role", "role")),
+        ),
+    ) or MF_SUB_ROLE
     values = {
         "branch": branch,
         "worktree": worktree,
@@ -2428,6 +2746,22 @@ def validate_mf_subagent_dispatch_gate(
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+    )
+    governed_evidence_required = _governed_nontrivial_graph_required(
+        payload,
+        parent_route_lineage=parent_route_lineage,
+    )
+    graph_trace_evidence = _normalize_graph_trace_evidence(
+        payload,
+        required=governed_evidence_required,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_role=worker_role,
+        fence_token=fence_token,
+    )
+    service_dispatch_evidence = _normalize_service_dispatch_evidence(
+        payload,
+        required=governed_evidence_required,
     )
 
     policy = _nested_mapping(payload, "worktree_policy")
@@ -2502,6 +2836,9 @@ def validate_mf_subagent_dispatch_gate(
             parent_route_lineage=parent_route_lineage,
             child_route_prompt_contract=child_route_prompt_contract,
         ),
+        "governed_evidence_required": governed_evidence_required,
+        "graph_trace_evidence": graph_trace_evidence,
+        "service_dispatch_evidence": service_dispatch_evidence,
         "owned_files": owned_files,
         "isolated_worktree": not same_worktree,
         "same_worktree_allowed": same_worktree_allowed,
@@ -2725,6 +3062,35 @@ def validate_mf_subagent_finish_gate(
         backlog_id=context.backlog_id,
     )
     child_route_prompt_contract = _child_route_prompt_contract_from_payload(payload)
+    parent_task_id = _dispatch_string(
+        payload,
+        names=("parent_task_id",),
+        nested_keys=(
+            ("runtime_identity", ("parent_task_id",)),
+            ("worker_contract", ("parent_task_id",)),
+            ("parent", ("task_id",)),
+        ),
+    )
+    worker_role = _dispatch_string(
+        payload,
+        names=("worker_role", "role"),
+        nested_keys=(
+            ("runtime_identity", ("worker_role", "role")),
+            ("worker_contract", ("worker_role", "role")),
+        ),
+    ) or MF_SUB_ROLE
+    governed_evidence_required = _governed_nontrivial_graph_required(
+        payload,
+        parent_route_lineage=parent_route_lineage,
+    )
+    graph_trace_evidence = _normalize_graph_trace_evidence(
+        payload,
+        required=governed_evidence_required,
+        task_id=context.task_id,
+        parent_task_id=parent_task_id,
+        worker_role=worker_role,
+        fence_token=context.fence_token,
+    )
 
     return {
         "schema_version": FINISH_GATE_SCHEMA_VERSION,
@@ -2747,6 +3113,8 @@ def validate_mf_subagent_finish_gate(
             parent_route_lineage=parent_route_lineage,
             child_route_prompt_contract=child_route_prompt_contract,
         ),
+        "governed_evidence_required": governed_evidence_required,
+        "graph_trace_evidence": graph_trace_evidence,
         "changed_files": normalized["changed_files"],
         "new_files": normalized["new_files"],
         "test_results": normalized["test_results"],

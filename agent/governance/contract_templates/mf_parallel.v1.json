@@ -67,6 +67,18 @@
         "independent_verification_lane",
         "independent_verification_evidence"
       ]
+    },
+    "strategic_judge_routed_review_lanes": {
+      "default_required": false,
+      "description": "Strategic Judge-routed repairs may require explicit architecture and QA review lanes. Ordinary mf_parallel.v1 instances do not require architecture_review_lane unless route_topology_policy.required_lanes or evidence_requirements names it.",
+      "lane_ids": [
+        "architecture_review_lane",
+        "qa_evidence_gate_review"
+      ],
+      "review_pack_templates": [
+        "architecture_data_continuity_review.v1",
+        "qa_evidence_gate_review.v1"
+      ]
     }
   },
   "observer_contract": {
@@ -162,6 +174,8 @@
       "responsibility",
       "required_evidence",
       "review_evidence",
+      "graph_trace_evidence",
+      "service_dispatch_evidence",
       "graph_queries",
       "self_precheck",
       "gate_alignment",
@@ -252,6 +266,13 @@
     "graph_queries": {
       "audited": true,
       "query_source": "mf_subagent",
+      "evidence_schema_version": "mf_subagent_graph_trace.v1",
+      "required_for": [
+        "governed_nontrivial",
+        "judge_routed",
+        "parent_route_required",
+        "parent_route_lineage_present"
+      ],
       "required_context_fields": [
         "task_id",
         "parent_task_id",
@@ -259,7 +280,21 @@
         "fence_token"
       ],
       "timeline_trace_requirement": "graph_trace_ids",
+      "dispatch_finish_gate": "validate_mf_subagent_dispatch_gate and validate_mf_subagent_finish_gate require normalized graph trace evidence for governed nontrivial, Judge-routed, or parent-route-bound work.",
       "description": "Any subagent graph lookup must use audited query_source=mf_subagent with task identity and fence context; returned trace ids must be recorded in timeline evidence."
+    },
+    "service_dispatch": {
+      "schema_version": "observer_subagent_service_dispatch.v1",
+      "required_for": [
+        "governed_nontrivial",
+        "judge_routed",
+        "parent_route_required"
+      ],
+      "valid_evidence": [
+        "dispatch_command_ref + monitor_ref",
+        "documented_host_adapter_boundary + boundary_documentation_ref"
+      ],
+      "description": "Observer-to-subagent service dispatch must be replayable from command/monitor refs or documented as a host-adapter boundary before governed handoff."
     },
     "self_precheck": {
       "required": true,
@@ -509,6 +544,38 @@
       "description": "Startup gate evidence proving the bounded worker/subagent actually began in the assigned worktree/fence context before implementation."
     },
     {
+      "id": "graph_trace_evidence",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "graph_query_trace",
+      "schema_version": "mf_subagent_graph_trace.v1",
+      "description": "Set required=true for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work; dispatch and finish gates normalize returned graph trace ids."
+    },
+    {
+      "id": "observer_subagent_service_dispatch",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "service_dispatch",
+      "schema_version": "observer_subagent_service_dispatch.v1",
+      "description": "Set required=true for governed subagent handoff; evidence must include replayable command/monitor refs or a documented host-adapter boundary."
+    },
+    {
+      "id": "architecture_review_lane",
+      "required": false,
+      "phase": "architecture_review",
+      "kind": "review_pack",
+      "review_pack_template": "architecture_data_continuity_review.v1",
+      "description": "Strategic Judge-routed repairs set required=true when architecture/data-continuity review is part of route_topology_policy.required_lanes."
+    },
+    {
+      "id": "qa_evidence_gate_review",
+      "required": false,
+      "phase": "verification",
+      "kind": "review_pack",
+      "review_pack_template": "qa_evidence_gate_review.v1",
+      "description": "Strategic repairs may require this QA review pack in addition to focused tests and independent verification lane evidence."
+    },
+    {
       "id": "observer_test_strategy",
       "required": true,
       "phase": "plan",
@@ -572,8 +639,10 @@
     ],
     "trace_id_locations": [
       "payload.graph_trace_ids",
+      "payload.graph_trace_evidence.trace_ids",
       "payload.graph_query_trace_ids",
       "verification.graph_trace_ids",
+      "verification.graph_trace_evidence.trace_ids",
       "verification.graph_query_trace_ids",
       "verification.contract_evidence[].graph_trace_ids"
     ],

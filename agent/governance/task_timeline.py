@@ -132,6 +132,7 @@ MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS = (
     "mf_subagent_startup",
 )
 MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID = "independent_verification_lane"
+MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID = "architecture_review_lane"
 MF_ROUTE_CONTEXT_PASS_STATUSES = {
     *MF_CLOSE_PASS_STATUSES,
     "allow",
@@ -824,6 +825,66 @@ def _route_independent_verification_required(topology_policy: dict[str, Any]) ->
     )
 
 
+def _route_architecture_review_required(
+    topology_policy: dict[str, Any],
+    contract: dict[str, Any] | None,
+) -> bool:
+    markers: set[str] = set()
+    for item in _list(topology_policy.get("required_lanes")):
+        if isinstance(item, dict):
+            markers.update(
+                _route_marker(item.get(key))
+                for key in (
+                    "id",
+                    "requirement_id",
+                    "role",
+                    "lane",
+                    "kind",
+                    "type",
+                    "name",
+                )
+                if item.get(key)
+            )
+        else:
+            markers.add(_route_marker(item))
+    for obj in _contract_walk(_mapping(contract), max_depth=5):
+        for key in (
+            "required_lanes",
+            "required_evidence",
+            "required_evidence_ids",
+            "evidence_requirements",
+            "contract_evidence",
+        ):
+            for item in _list(obj.get(key)):
+                if isinstance(item, dict):
+                    markers.update(
+                        _route_marker(item.get(field))
+                        for field in (
+                            "id",
+                            "requirement_id",
+                            "role",
+                            "lane",
+                            "kind",
+                            "type",
+                            "name",
+                        )
+                        if item.get(field)
+                    )
+                else:
+                    markers.add(_route_marker(item))
+    return bool(
+        markers.intersection(
+            {
+                "architecture_review_lane",
+                "architecture_review",
+                "architecture_data_continuity_review",
+                "architecture_lane",
+                "arch_review",
+            }
+        )
+    )
+
+
 def _first_deep_text(value: Any, key: str) -> str:
     if isinstance(value, dict):
         if key in value and str(value.get(key) or "").strip():
@@ -892,6 +953,10 @@ def _route_event_markers(event: dict[str, Any]) -> set[str]:
             "dispatch_evidence",
             "startup_evidence",
             "contract_evidence",
+            "architecture_review_lane",
+            "architecture_review",
+            "architecture_data_continuity_review",
+            "qa_evidence_gate_review",
             "route_evidence",
         ):
             nested = container.get(nested_key)
@@ -970,6 +1035,16 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
         }
     ):
         categories.add(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+    if normalized_markers.intersection(
+        {
+            "architecture_review_lane",
+            "architecture_review",
+            "architecture_data_continuity_review",
+            "architecture_lane",
+            "arch_review",
+        }
+    ):
+        categories.add(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
     return categories
 
 
@@ -985,10 +1060,20 @@ def mf_route_context_gate_verification(
     independent_verification_required = _route_independent_verification_required(
         topology_policy
     )
-    required = route_context_required or independent_verification_required
+    architecture_review_required = _route_architecture_review_required(
+        topology_policy,
+        contract,
+    )
+    required = (
+        route_context_required
+        or independent_verification_required
+        or architecture_review_required
+    )
     required_requirement_ids = list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS)
     if independent_verification_required:
         required_requirement_ids.append(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+    if architecture_review_required:
+        required_requirement_ids.append(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
     present: dict[str, list[dict[str, Any]]] = {
         req_id: [] for req_id in required_requirement_ids
     }
@@ -1098,6 +1183,10 @@ def mf_route_context_gate_verification(
             "independent_verification_lane_present": bool(
                 present.get(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
             ),
+            "architecture_review_required": architecture_review_required,
+            "architecture_review_lane_present": bool(
+                present.get(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
+            ),
             "same_route_identity": same_route_identity,
             "same_optional_prompt_contract_hash": same_optional_prompt_contract_hash,
         },
@@ -1133,6 +1222,7 @@ def mf_close_missing_evidence_groups(
         *MF_ROUTE_SERVICE_REQUIREMENTS,
         *MF_ROUTE_WORKER_REQUIREMENTS,
         MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID,
+        MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID,
         *MF_ROUTE_IDENTITY_REQUIREMENTS,
     }
     other_route = [item for item in route_missing if item not in known_route]
@@ -1159,6 +1249,14 @@ def mf_close_missing_evidence_groups(
                 {MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID},
             ),
             "next_action": "run independent QA verification before retrying close",
+        },
+        "architecture_review": {
+            "label": "architecture review lane",
+            "missing": _ordered_subset(
+                route_missing,
+                {MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID},
+            ),
+            "next_action": "run architecture/data-continuity review before retrying close",
         },
         "route_identity": {
             "label": "route identity",
@@ -1224,6 +1322,11 @@ def mf_route_context_reminder(
                 "id": "run_independent_verification",
                 "command": "run independent verification",
                 "detail": "record QA verification separate from observer and implementation worker",
+            },
+            {
+                "id": "run_architecture_review",
+                "command": "run architecture review",
+                "detail": "record architecture/data-continuity review only when the route or contract requires architecture_review_lane",
             },
             {
                 "id": "retry_close",

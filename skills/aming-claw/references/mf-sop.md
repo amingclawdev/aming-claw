@@ -93,6 +93,20 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      `contract_id`, `stage`, `decision`, `status`, `subject`, `evidence`,
      `evidence_hash`, and `created_at`; merge/reconcile/close gates must verify
      the referenced token still matches subject commit/fence evidence;
+   - for governed nontrivial, Judge-routed, or parent-route-bound `mf_sub`
+     dispatch, require `mf_subagent_graph_trace.v1` evidence before worker
+     implementation starts and again at finish/handoff. The graph lookup must
+     be audited with `query_source=mf_subagent`, `task_id`, `parent_task_id`,
+     `worker_role=mf_sub`, and `fence_token`;
+   - for observer-to-subagent dispatch, require
+     `observer_subagent_service_dispatch.v1` evidence with replayable
+     `dispatch_command_ref` plus `monitor_ref`, or a documented host-adapter
+     boundary with a documentation ref;
+   - when route topology or instantiated evidence names
+     `architecture_review_lane` or `qa_evidence_gate_review`, record those
+     review lanes as first-class evidence. Do not make architecture review
+     mandatory for ordinary `mf_parallel.v1` rows unless the route/contract
+     asks for it;
    - write the instance to `chain_trigger_json.parallel_contract`;
    - treat subagents as local Codex workers governed by the MF backlog row,
      contract, file/worktree fence, and timeline evidence; do not use
@@ -170,6 +184,9 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      policy, graph/reconcile plan, Chain trailers, and backlog close policy;
    - when changed docs/templates are not graph-bound, record Asset Inbox
      binding or Governance Hint follow-up as needed for auditability.
+     Close-impact accepted asset reminders stay warning/follow-up based for
+     unrelated repairs; do not claim graph/doc/test asset coverage until the
+     accepted binding or durable evidence exists.
 9. If an AI session or `mf_sub` worker proposes doc/test/config binding changes, require the local asset-binding precheck first:
    - run `agent.governance.asset_binding_proposals.precheck_asset_binding_proposal` against the draft proposal;
    - include compact `self_precheck` evidence with the submitted proposal;

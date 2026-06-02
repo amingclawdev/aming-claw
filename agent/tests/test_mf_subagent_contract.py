@@ -19,6 +19,7 @@ from agent.governance.mf_subagent_contract import (
     DISPATCH_GATE_SCHEMA_VERSION,
     FINISH_GATE_REPLAY_SOURCE,
     FINISH_GATE_SCHEMA_VERSION,
+    GRAPH_TRACE_SCHEMA_VERSION,
     MF_SUB_FORBIDDEN_ACTIONS,
     MF_SUB_ROLE,
     OBSERVER_COORDINATOR_ROLE,
@@ -26,6 +27,7 @@ from agent.governance.mf_subagent_contract import (
     ROUTE_ACTION_GATE_SCHEMA_VERSION,
     ROUTE_TOKEN_REQUIRED_FAILURE_SCHEMA_VERSION,
     ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
+    SERVICE_DISPATCH_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
     build_mf_subagent_input,
@@ -65,6 +67,8 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
             "test_files",
             "test_commands",
             "review_evidence",
+            "graph_trace_evidence",
+            "service_dispatch_evidence",
         }
     )
 
@@ -86,14 +90,33 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
     graph_queries = worker_contract["graph_queries"]
     assert graph_queries["query_source"] == "mf_subagent"
     assert graph_queries["audited"] is True
+    assert graph_queries["evidence_schema_version"] == GRAPH_TRACE_SCHEMA_VERSION
     assert set(graph_queries["required_context_fields"]).issuperset(
         {"task_id", "parent_task_id", "worker_role", "fence_token"}
     )
     assert graph_queries["timeline_trace_requirement"] == "graph_trace_ids"
+    assert "judge_routed" in graph_queries["required_for"]
+
+    service_dispatch = worker_contract["service_dispatch"]
+    assert service_dispatch["schema_version"] == SERVICE_DISPATCH_SCHEMA_VERSION
+    assert "dispatch_command_ref + monitor_ref" in service_dispatch["valid_evidence"]
 
     timeline_contract = template["timeline_contract"]
     assert "payload.graph_trace_ids" in timeline_contract["trace_id_locations"]
+    assert (
+        "payload.graph_trace_evidence.trace_ids"
+        in timeline_contract["trace_id_locations"]
+    )
     assert "verification.graph_trace_ids" in timeline_contract["trace_id_locations"]
+
+    strategic_lanes = template["route_topology_policy"][
+        "strategic_judge_routed_review_lanes"
+    ]
+    assert strategic_lanes["default_required"] is False
+    assert set(strategic_lanes["lane_ids"]) == {
+        "architecture_review_lane",
+        "qa_evidence_gate_review",
+    }
 
     worktree_policy = worker_contract["worktree_policy"]
     assert worktree_policy["mode"] == "isolated_worktree_required"
@@ -119,6 +142,34 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
             "observer_timeline_event_before_dispatch",
         }
     )
+
+
+def test_mf_workflow_runtime_template_names_graph_service_architecture_and_qa_lanes() -> None:
+    template_path = (
+        _repo_root
+        / "agent"
+        / "governance"
+        / "contract_templates"
+        / "mf_workflow_runtime.v1.json"
+    )
+    template = json.loads(template_path.read_text(encoding="utf-8"))
+
+    evidence = {item["id"]: item for item in template["evidence_requirements"]}
+    assert evidence["graph_trace_evidence"]["schema_version"] == GRAPH_TRACE_SCHEMA_VERSION
+    assert (
+        evidence["observer_subagent_service_dispatch"]["schema_version"]
+        == SERVICE_DISPATCH_SCHEMA_VERSION
+    )
+    assert evidence["architecture_review_lane"]["required"] is False
+    assert evidence["architecture_review_lane"]["review_pack_template"] == (
+        "architecture_data_continuity_review.v1"
+    )
+    assert evidence["qa_evidence_gate_review"]["review_pack_template"] == (
+        "qa_evidence_gate_review.v1"
+    )
+    assert "architecture_review_lane_when_required" in template["gate_registry"][
+        "backlog.close"
+    ]
 
 
 def test_mf_parallel_template_exposes_observer_no_direct_code_boundary() -> None:
@@ -245,6 +296,30 @@ def _parent_route_lineage(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def _graph_trace_evidence(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "mf_subagent_graph_trace.v1",
+        "query_source": "mf_subagent",
+        "trace_ids": ["gqt-test-mf-subagent-1"],
+        "task_id": "task-mf-sub-1",
+        "parent_task_id": "task-mf-parent",
+        "worker_role": "mf_sub",
+        "fence_token": "fence-1",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _service_dispatch_evidence(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "observer_subagent_service_dispatch.v1",
+        "dispatch_command_ref": "spawn_agent:task-mf-sub-1",
+        "monitor_ref": "monitor:task-mf-sub-1",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None:
     evidence = validate_mf_subagent_dispatch_gate(
         _dispatch_payload(),
@@ -266,6 +341,9 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
     assert evidence["same_worktree_allowed"] is False
     assert evidence["override"]["used"] is False
     assert evidence["dirty_scope_check"]["passed"] is True
+    assert evidence["governed_evidence_required"] is False
+    assert evidence["graph_trace_evidence"]["present"] is False
+    assert evidence["service_dispatch_evidence"]["present"] is False
 
 
 def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
@@ -274,6 +352,8 @@ def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
             project_id="aming-claw",
             backlog_id="ARCH-MF-SUBAGENT-BACKEND",
             judge_routed=True,
+            graph_trace_evidence=_graph_trace_evidence(),
+            service_dispatch_evidence=_service_dispatch_evidence(),
             judge_route={
                 **_parent_route_lineage(),
                 "raw_private_memory": "must not be propagated",
@@ -308,6 +388,62 @@ def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
     assert evidence["route_lineage"]["parent_route_id"] == "route-20260602-parent"
     assert evidence["route_lineage"]["child_route_context_hash"] == (
         "sha256:route-context"
+    )
+    assert evidence["governed_evidence_required"] is True
+    assert evidence["graph_trace_evidence"]["schema_version"] == GRAPH_TRACE_SCHEMA_VERSION
+    assert evidence["graph_trace_evidence"]["trace_ids"] == ["gqt-test-mf-subagent-1"]
+    assert (
+        evidence["service_dispatch_evidence"]["schema_version"]
+        == SERVICE_DISPATCH_SCHEMA_VERSION
+    )
+    assert evidence["service_dispatch_evidence"]["replayable_refs_present"] is True
+
+
+def test_dispatch_gate_rejects_governed_work_without_graph_trace() -> None:
+    with pytest.raises(MfSubagentContractError, match="graph trace evidence"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
+def test_dispatch_gate_rejects_governed_work_without_service_dispatch_evidence() -> None:
+    with pytest.raises(
+        MfSubagentContractError,
+        match="observer_subagent_service_dispatch",
+    ):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                graph_trace_evidence=_graph_trace_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
+def test_dispatch_gate_accepts_documented_host_adapter_service_boundary() -> None:
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            governed_nontrivial=True,
+            graph_trace_evidence=_graph_trace_evidence(),
+            service_dispatch_evidence={
+                "schema_version": "observer_subagent_service_dispatch.v1",
+                "documented_host_adapter_boundary": "codex local subagent adapter",
+                "boundary_documentation_ref": (
+                    "docs/governance/manual-fix-sop.md#mf-subagent-dispatch"
+                ),
+            },
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["service_dispatch_evidence"]["present"] is True
+    assert (
+        evidence["service_dispatch_evidence"]["documented_host_adapter_boundary"]
+        is True
     )
 
 
@@ -1492,6 +1628,11 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
             "test_results": {"status": "passed", "command": "pytest -q"},
             "checkpoint_id": "ckpt-finish",
             "fence_token": "fence-2",
+            "parent_task_id": "task-mf-parent",
+            "graph_trace_evidence": _graph_trace_evidence(
+                trace_ids=["gqt-test-finish-1"],
+                fence_token="fence-2",
+            ),
             "route_prompt_contract": {
                 "route_context_hash": "sha256:child-route-context",
                 "prompt_contract_id": "rprompt-child",
@@ -1518,6 +1659,34 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
     assert gate["route_lineage"]["child_route_context_hash"] == (
         "sha256:child-route-context"
     )
+    assert gate["governed_evidence_required"] is True
+    assert gate["graph_trace_evidence"]["trace_ids"] == ["gqt-test-finish-1"]
+
+
+def test_finish_gate_rejects_parent_route_without_graph_trace() -> None:
+    with pytest.raises(MfSubagentContractError, match="graph trace evidence"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "parent_task_id": "task-mf-parent",
+                "parent_route_lineage": _parent_route_lineage(),
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
 
 
 def test_finish_gate_rejects_identity_mismatch() -> None:

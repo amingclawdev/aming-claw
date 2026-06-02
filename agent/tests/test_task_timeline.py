@@ -126,6 +126,25 @@ def _route_context_qa_verification_event():
     }
 
 
+def _route_context_architecture_review_event():
+    return {
+        "event_kind": "architecture_review",
+        "phase": "architecture_review",
+        "status": "passed",
+        "event_id": "tl-architecture-review",
+        "verification": {
+            **ROUTE_IDENTITY,
+            "contract_evidence": [
+                {
+                    "requirement_id": "architecture_review_lane",
+                    "status": "passed",
+                    "reviewer_role": "architecture",
+                }
+            ],
+        },
+    }
+
+
 def _without_prompt_contract_hash(value):
     if isinstance(value, dict):
         return {
@@ -1769,6 +1788,66 @@ class TestTaskTimeline(unittest.TestCase):
                 "independent_verification_lane"
             ][0]["event_kind"],
             "qa_verification",
+        )
+
+    def test_mf_parallel_close_gate_requires_architecture_lane_only_when_named(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-ARCH-LANE",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "architecture_review_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events(),
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            ["architecture_review_lane"],
+        )
+        self.assertEqual(
+            blocked["missing_evidence_groups"]["groups"]["architecture_review"]["missing"],
+            ["architecture_review_lane"],
+        )
+        self.assertTrue(
+            blocked["route_context_reminder"]["missing_evidence_groups"][
+                "architecture_review"
+            ]["missing"]
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [*base_events, _route_context_architecture_review_event()],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertIn(
+            "architecture_review_lane",
+            ready["route_context_gate"]["present_requirement_ids"],
+        )
+        self.assertEqual(
+            ready["route_context_gate"]["evidence_events"]["architecture_review_lane"][
+                0
+            ]["event_kind"],
+            "architecture_review",
         )
 
     def test_mf_parallel_close_gate_rejects_route_identity_mismatch(self):
