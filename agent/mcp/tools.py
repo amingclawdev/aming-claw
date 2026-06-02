@@ -735,6 +735,113 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "parallel_branch_allocate",
+        "description": "Observer-facing wrapper to allocate/register a parallel branch runtime context before spawning a bounded worker.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "workspace_root": {"type": "string"},
+                "repo_root_path": {"type": "string"},
+                "batch_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "chain_id": {"type": "string"},
+                "parent_task_id": {"type": "string"},
+                "root_task_id": {"type": "string"},
+                "stage_task_id": {"type": "string"},
+                "stage_type": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "worker_id": {"type": "string"},
+                "actor": {"type": "string"},
+                "attempt": {"type": "integer"},
+                "branch_prefix": {"type": "string"},
+                "worktree_root": {"type": "string"},
+                "ref_name": {"type": "string"},
+                "target_branch": {"type": "string"},
+                "base_commit": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "merge_queue_id": {"type": "string"},
+                "fence_token": {"type": "string"},
+                "create_worktree": {"type": "boolean"},
+                "now_iso": {"type": "string"},
+                "route_token": {"type": "object", "description": "Route-token evidence required when governance protects this mutation."},
+                "route_waiver": {"type": "object", "description": "Explicit waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
+            },
+            "required": ["project_id", "task_id"],
+        },
+    },
+    {
+        "name": "parallel_branch_checkpoint",
+        "description": "Observer-facing wrapper to record a fenced checkpoint for a parallel branch runtime context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+                "fence_token": {"type": "string"},
+                "head_commit": {"type": "string"},
+                "refresh_head": {"type": "boolean"},
+                "refresh_head_from_worktree": {"type": "boolean"},
+                "replay_source": {"type": "string"},
+                "now_iso": {"type": "string"},
+                "route_token": {"type": "object", "description": "Route-token evidence required when governance protects this mutation."},
+                "route_waiver": {"type": "object", "description": "Explicit waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
+            },
+            "required": ["project_id", "task_id", "checkpoint_id", "fence_token"],
+        },
+    },
+    {
+        "name": "parallel_branch_finish_gate",
+        "description": "Worker-facing wrapper to validate an mf_sub finish claim and record a fenced finish-gate checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "parent_task_id": {"type": "string"},
+                "worker_role": {"type": "string"},
+                "role": {"type": "string"},
+                "branch_ref": {"type": "string"},
+                "worktree_path": {"type": "string"},
+                "base_commit": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "merge_queue_id": {"type": "string"},
+                "head_commit": {"type": "string"},
+                "branch_head": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+                "fence_token": {"type": "string"},
+                "status": {"type": "string"},
+                "changed_files": {"type": "array", "items": {"type": "string"}},
+                "new_files": {"type": "array", "items": {"type": "string"}},
+                "test_results": {"type": "object"},
+                "blockers": {"type": "array", "items": {"type": "string"}},
+                "summary": {"type": "string"},
+                "evidence": {"type": "object"},
+                "actions": {"type": "array", "items": {"type": "string"}},
+                "graph_trace_evidence": {"type": "object"},
+                "graph_trace_ids": {"type": "array", "items": {"type": "string"}},
+                "graph_query_trace_ids": {"type": "array", "items": {"type": "string"}},
+                "parent_route_lineage": {"type": "object"},
+                "route_lineage": {"type": "object"},
+                "route_prompt_contract": {"type": "object"},
+                "child_route_prompt_contract": {"type": "object"},
+                "runtime_identity": {"type": "object"},
+                "worker_contract": {"type": "object"},
+                "generated_assets_policy": {"type": "object"},
+                "precheck_evidence": {"type": "object"},
+                "route_token": {"type": "object", "description": "Route-token evidence required when governance protects this mutation."},
+                "route_waiver": {"type": "object", "description": "Explicit waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
+                "now_iso": {"type": "string"},
+            },
+            "required": ["project_id", "task_id"],
+        },
+    },
+    {
         "name": "graph_pending_scope_queue",
         "description": "Queue or update a pending scope-reconcile row for a target commit.",
         "inputSchema": {
@@ -1450,6 +1557,45 @@ class ToolDispatcher:
             body.setdefault("query_source", "observer")
             body.setdefault("query_purpose", "prompt_context_build")
             return self._api("POST", f"/api/graph-governance/{pid}/query", body)
+
+        if name == "parallel_branch_allocate":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/parallel-branches/allocate",
+                body,
+            )
+
+        if name == "parallel_branch_checkpoint":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/parallel-branches/checkpoint",
+                body,
+            )
+
+        if name == "parallel_branch_finish_gate":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/parallel-branches/finish-gate",
+                body,
+            )
 
         if name == "graph_pending_scope_queue":
             pid = args["project_id"]

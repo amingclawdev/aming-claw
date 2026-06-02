@@ -443,6 +443,20 @@ def test_dispatch_gate_rejects_governed_work_without_graph_trace() -> None:
         )
 
 
+def test_dispatch_gate_rejects_governed_top_level_graph_trace_fields() -> None:
+    with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                query_source="mf_subagent",
+                graph_query_trace_ids=["gqt-top-level-only"],
+                branch_runtime_evidence=_branch_runtime_evidence(),
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
 def test_dispatch_gate_rejects_governed_work_without_service_dispatch_evidence() -> None:
     with pytest.raises(
         MfSubagentContractError,
@@ -474,12 +488,65 @@ def test_dispatch_gate_rejects_governed_graph_trace_without_query_source() -> No
         )
 
 
+def test_dispatch_gate_rejects_governed_graph_trace_generic_source_key() -> None:
+    graph_trace = _graph_trace_evidence()
+    graph_trace.pop("query_source")
+    graph_trace["source"] = "mf_subagent"
+
+    with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                graph_trace_evidence=graph_trace,
+                branch_runtime_evidence=_branch_runtime_evidence(),
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
 def test_dispatch_gate_rejects_governed_graph_trace_wrong_query_source() -> None:
     with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
         validate_mf_subagent_dispatch_gate(
             _dispatch_payload(
                 governed_nontrivial=True,
                 graph_trace_evidence=_graph_trace_evidence(query_source="observer"),
+                branch_runtime_evidence=_branch_runtime_evidence(),
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["task_id", "parent_task_id", "worker_role", "fence_token"],
+)
+def test_dispatch_gate_rejects_governed_graph_trace_missing_embedded_identity(
+    field: str,
+) -> None:
+    graph_trace = _graph_trace_evidence()
+    graph_trace.pop(field)
+
+    with pytest.raises(MfSubagentContractError, match=field):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                graph_trace_evidence=graph_trace,
+                branch_runtime_evidence=_branch_runtime_evidence(),
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
+def test_dispatch_gate_rejects_governed_observer_graph_trace_role() -> None:
+    with pytest.raises(MfSubagentContractError, match="worker_role=mf_sub"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                worker_role="observer",
+                graph_trace_evidence=_graph_trace_evidence(worker_role="observer"),
                 branch_runtime_evidence=_branch_runtime_evidence(),
                 service_dispatch_evidence=_service_dispatch_evidence(),
             ),
@@ -1788,9 +1855,69 @@ def test_finish_gate_rejects_parent_route_without_graph_trace() -> None:
         )
 
 
+def test_finish_gate_rejects_parent_route_top_level_graph_trace_fields() -> None:
+    with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "parent_task_id": "task-mf-parent",
+                "worker_role": "mf_sub",
+                "query_source": "mf_subagent",
+                "graph_query_trace_ids": ["gqt-top-level-only"],
+                "parent_route_lineage": _parent_route_lineage(),
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
+
+
 def test_finish_gate_rejects_parent_route_graph_trace_without_query_source() -> None:
     graph_trace = _graph_trace_evidence(fence_token="fence-2")
     graph_trace.pop("query_source")
+
+    with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "parent_task_id": "task-mf-parent",
+                "parent_route_lineage": _parent_route_lineage(),
+                "graph_trace_evidence": graph_trace,
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_parent_route_graph_trace_generic_source_key() -> None:
+    graph_trace = _graph_trace_evidence(fence_token="fence-2")
+    graph_trace.pop("query_source")
+    graph_trace["source"] = "mf_subagent"
 
     with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
         validate_mf_subagent_finish_gate(
@@ -1840,6 +1967,73 @@ def test_finish_gate_rejects_parent_route_graph_trace_wrong_query_source() -> No
                 "parent_route_lineage": _parent_route_lineage(),
                 "graph_trace_evidence": _graph_trace_evidence(
                     query_source="observer",
+                    fence_token="fence-2",
+                ),
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["task_id", "parent_task_id", "worker_role", "fence_token"],
+)
+def test_finish_gate_rejects_parent_route_graph_trace_missing_embedded_identity(
+    field: str,
+) -> None:
+    graph_trace = _graph_trace_evidence(fence_token="fence-2")
+    graph_trace.pop(field)
+
+    with pytest.raises(MfSubagentContractError, match=field):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "parent_task_id": "task-mf-parent",
+                "parent_route_lineage": _parent_route_lineage(),
+                "graph_trace_evidence": graph_trace,
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_parent_route_observer_graph_trace_role() -> None:
+    with pytest.raises(MfSubagentContractError, match="worker_role=mf_sub"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "parent_task_id": "task-mf-parent",
+                "worker_role": "observer",
+                "parent_route_lineage": _parent_route_lineage(),
+                "graph_trace_evidence": _graph_trace_evidence(
+                    worker_role="observer",
                     fence_token="fence-2",
                 ),
                 "summary": "Ready.",

@@ -114,6 +114,9 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "graph_status",
         "graph_operations_queue",
         "graph_query",
+        "parallel_branch_allocate",
+        "parallel_branch_checkpoint",
+        "parallel_branch_finish_gate",
         "graph_pending_scope_queue",
         "manager_health",
         "manager_start",
@@ -733,6 +736,193 @@ def test_mcp_graph_tools_route_to_governance_api():
         "/api/graph-governance/aming-claw/pending-scope",
         {"commit_sha": "head", "parent_commit_sha": "old", "evidence": {"source": "test"}},
     )
+
+
+def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
+    allocate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_allocate")
+    checkpoint = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_checkpoint")
+    finish_gate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_finish_gate")
+
+    allocate_props = allocate["inputSchema"]["properties"]
+    checkpoint_props = checkpoint["inputSchema"]["properties"]
+    finish_props = finish_gate["inputSchema"]["properties"]
+
+    assert allocate["inputSchema"]["required"] == ["project_id", "task_id"]
+    for key in (
+        "workspace_root",
+        "repo_root_path",
+        "backlog_id",
+        "parent_task_id",
+        "root_task_id",
+        "stage_task_id",
+        "agent_id",
+        "worker_id",
+        "branch_prefix",
+        "worktree_root",
+        "ref_name",
+        "target_branch",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "fence_token",
+        "create_worktree",
+    ):
+        assert key in allocate_props
+
+    assert checkpoint["inputSchema"]["required"] == [
+        "project_id",
+        "task_id",
+        "checkpoint_id",
+        "fence_token",
+    ]
+    for key in ("head_commit", "refresh_head", "refresh_head_from_worktree", "replay_source"):
+        assert key in checkpoint_props
+
+    assert finish_gate["inputSchema"]["required"] == ["project_id", "task_id"]
+    for key in (
+        "fence_token",
+        "checkpoint_id",
+        "status",
+        "changed_files",
+        "test_results",
+        "graph_trace_evidence",
+        "route_lineage",
+        "parent_route_lineage",
+    ):
+        assert key in finish_props
+
+    for props in (allocate_props, checkpoint_props, finish_props):
+        assert props["route_token"]["type"] == "object"
+        assert props["route_waiver"]["type"] == "object"
+        assert props["route_token_waiver"]["type"] == "object"
+
+
+def test_mcp_parallel_branch_tools_route_to_governance_api():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    route_token = {
+        "route_context_hash": "sha256:route",
+        "prompt_contract_id": "rprompt-1",
+        "allowed_action": "parallel_branch_allocate",
+    }
+
+    dispatcher.dispatch(
+        "parallel_branch_allocate",
+        {
+            "project_id": "aming-claw",
+            "task_id": "mf-sub-1",
+            "workspace_root": "/repo",
+            "repo_root_path": "/repo",
+            "backlog_id": "BUG-1",
+            "parent_task_id": "observer-1",
+            "root_task_id": "observer-1",
+            "stage_task_id": "mf-sub-1",
+            "agent_id": "codex",
+            "worker_id": "worker-1",
+            "branch_prefix": "mf",
+            "worktree_root": ".worktrees",
+            "ref_name": "main",
+            "target_branch": "main",
+            "base_commit": "base",
+            "target_head_commit": "target",
+            "merge_queue_id": "mq-1",
+            "fence_token": "fence-1",
+            "create_worktree": False,
+            "route_token": route_token,
+        },
+    )
+    dispatcher.dispatch(
+        "parallel_branch_checkpoint",
+        {
+            "project_id": "aming-claw",
+            "task_id": "mf-sub-1",
+            "checkpoint_id": "ckpt-1",
+            "fence_token": "fence-1",
+            "head_commit": "head",
+            "refresh_head": False,
+            "replay_source": "checkpoint",
+        },
+    )
+    dispatcher.dispatch(
+        "parallel_branch_finish_gate",
+        {
+            "project_id": "aming-claw",
+            "task_id": "mf-sub-1",
+            "parent_task_id": "observer-1",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-1",
+            "checkpoint_id": "ckpt-2",
+            "status": "review_ready",
+            "changed_files": ["agent/mcp/tools.py"],
+            "test_results": {"status": "passed", "passed": True},
+            "graph_trace_evidence": {
+                "query_source": "mf_subagent",
+                "trace_ids": ["gqt-1"],
+            },
+            "route_lineage": {"schema_version": "mf_subagent_route_lineage.v1"},
+            "blockers": [],
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/allocate",
+            {
+                "task_id": "mf-sub-1",
+                "workspace_root": "/repo",
+                "repo_root_path": "/repo",
+                "backlog_id": "BUG-1",
+                "parent_task_id": "observer-1",
+                "root_task_id": "observer-1",
+                "stage_task_id": "mf-sub-1",
+                "agent_id": "codex",
+                "worker_id": "worker-1",
+                "branch_prefix": "mf",
+                "worktree_root": ".worktrees",
+                "ref_name": "main",
+                "target_branch": "main",
+                "base_commit": "base",
+                "target_head_commit": "target",
+                "merge_queue_id": "mq-1",
+                "fence_token": "fence-1",
+                "create_worktree": False,
+                "route_token": route_token,
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/checkpoint",
+            {
+                "task_id": "mf-sub-1",
+                "checkpoint_id": "ckpt-1",
+                "fence_token": "fence-1",
+                "head_commit": "head",
+                "refresh_head": False,
+                "replay_source": "checkpoint",
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/finish-gate",
+            {
+                "task_id": "mf-sub-1",
+                "parent_task_id": "observer-1",
+                "worker_role": "mf_sub",
+                "fence_token": "fence-1",
+                "checkpoint_id": "ckpt-2",
+                "status": "review_ready",
+                "changed_files": ["agent/mcp/tools.py"],
+                "test_results": {"status": "passed", "passed": True},
+                "graph_trace_evidence": {
+                    "query_source": "mf_subagent",
+                    "trace_ids": ["gqt-1"],
+                },
+                "route_lineage": {"schema_version": "mf_subagent_route_lineage.v1"},
+                "blockers": [],
+            },
+        ),
+    ]
 
 
 def test_mcp_pending_scope_queue_can_force_requeue_suspect_materialization():

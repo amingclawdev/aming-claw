@@ -1028,11 +1028,17 @@ def _governed_nontrivial_graph_required(
     )
 
 
-def _graph_trace_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _graph_trace_source(
+    payload: Mapping[str, Any],
+    *,
+    allow_payload_fallback: bool = True,
+) -> dict[str, Any]:
     for key in _GRAPH_TRACE_CONTAINER_KEYS:
         value = payload.get(key)
         if isinstance(value, Mapping):
             return dict(value)
+    if not allow_payload_fallback:
+        return {}
     return dict(payload)
 
 
@@ -1045,13 +1051,13 @@ def _normalize_graph_trace_evidence(
     worker_role: str = "",
     fence_token: str = "",
 ) -> dict[str, Any]:
-    source = _graph_trace_source(payload)
+    source = _graph_trace_source(payload, allow_payload_fallback=not required)
     trace_ids = _dedupe_strings(
         trace_id
         for item in _deep_field_values(source, _GRAPH_TRACE_ID_KEYS)
         for trace_id in _trace_id_strings(item)
     )
-    query_source = _first_deep_string(source, {"query_source", "source"})
+    query_source = _first_deep_string(source, {"query_source"})
     if query_source and query_source != "mf_subagent":
         raise MfSubagentContractError(
             "graph trace evidence must use query_source=mf_subagent"
@@ -1061,19 +1067,35 @@ def _normalize_graph_trace_evidence(
             "graph trace evidence requires explicit query_source=mf_subagent"
         )
 
-    evidence_task_id = _first_deep_string(source, {"task_id"}) or task_id
+    embedded_task_id = _first_deep_string(source, {"task_id"})
+    embedded_parent_task_id = _first_deep_string(source, {"parent_task_id"})
+    embedded_worker_role = _first_deep_string(source, {"worker_role", "role"})
+    embedded_fence_token = _first_deep_string(source, {"fence_token"})
+
+    if required and embedded_worker_role and embedded_worker_role != MF_SUB_ROLE:
+        raise MfSubagentContractError(
+            "graph trace evidence must use worker_role=mf_sub"
+        )
+
+    evidence_task_id = embedded_task_id if required else embedded_task_id or task_id
     evidence_parent_task_id = (
-        _first_deep_string(source, {"parent_task_id"}) or parent_task_id
+        embedded_parent_task_id
+        if required
+        else embedded_parent_task_id or parent_task_id
     )
     evidence_worker_role = (
-        _first_deep_string(source, {"worker_role", "role"}) or worker_role or MF_SUB_ROLE
+        embedded_worker_role
+        if required
+        else embedded_worker_role or worker_role or MF_SUB_ROLE
     )
-    evidence_fence_token = _first_deep_string(source, {"fence_token"}) or fence_token
+    evidence_fence_token = (
+        embedded_fence_token if required else embedded_fence_token or fence_token
+    )
 
     expected = {
         "task_id": task_id,
         "parent_task_id": parent_task_id,
-        "worker_role": worker_role or MF_SUB_ROLE,
+        "worker_role": MF_SUB_ROLE if required else worker_role or MF_SUB_ROLE,
         "fence_token": fence_token,
     }
     observed = {
@@ -2904,6 +2926,10 @@ def validate_mf_subagent_dispatch_gate(
         payload,
         parent_route_lineage=parent_route_lineage,
     )
+    if governed_evidence_required and worker_role != MF_SUB_ROLE:
+        raise MfSubagentContractError(
+            "governed mf_sub dispatch requires worker_role=mf_sub"
+        )
     graph_trace_evidence = _normalize_graph_trace_evidence(
         payload,
         required=governed_evidence_required,
@@ -3248,6 +3274,10 @@ def validate_mf_subagent_finish_gate(
         payload,
         parent_route_lineage=parent_route_lineage,
     )
+    if governed_evidence_required and worker_role != MF_SUB_ROLE:
+        raise MfSubagentContractError(
+            "governed mf_sub finish requires worker_role=mf_sub"
+        )
     graph_trace_evidence = _normalize_graph_trace_evidence(
         payload,
         required=governed_evidence_required,
