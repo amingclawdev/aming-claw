@@ -22,6 +22,8 @@ INPUT_SCHEMA_VERSION = "mf_subagent_input.v1"
 RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
+PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
+ROUTE_LINEAGE_SCHEMA_VERSION = "mf_subagent_route_lineage.v1"
 OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
 ROUTE_ACTION_GATE_SCHEMA_VERSION = "route_action_gate.v1"
 ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION = "route_token_mutation_gate.v1"
@@ -117,6 +119,63 @@ _DISPATCH_REQUIRED_FIELDS = (
     "fence_token",
     "route_context_hash",
     "prompt_contract_id",
+)
+_PARENT_ROUTE_LINEAGE_REQUIRED_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "visible_injection_manifest_hash",
+    "selected_project",
+    "selected_backlog_id",
+    "allowed_actions",
+    "blocked_actions",
+    "required_lanes",
+    "required_evidence",
+)
+_PARENT_ROUTE_LINEAGE_KEYS = (
+    "parent_route_lineage",
+    "parent_route_identity",
+    "parent_judgment_route",
+    "parent_judge_route",
+    "judgment_route",
+    "judgment_route_identity",
+    "judge_route",
+    "judge_route_identity",
+    "parent_route",
+    "parent_route_context",
+)
+_PARENT_ROUTE_LINEAGE_CONTAINER_KEYS = (
+    "route_lineage",
+    "lineage",
+    "dispatch",
+    "dispatch_context",
+    "dispatch_gate",
+    "worker_dispatch",
+    "worker_contract",
+    "bounded_dispatch",
+    "route_context",
+    "route_prompt_bundle",
+    "bundle",
+    "evidence",
+    "verification",
+    "artifact_refs",
+)
+_PARENT_ROUTE_REQUIRED_KEYS = (
+    "parent_route_required",
+    "parent_lineage_required",
+    "route_lineage_required",
+    "judge_routed",
+    "judgment_routed",
+    "parent_judge_routed",
+    "parent_route_lineage_required",
+)
+_PARENT_ROUTE_LINEAGE_MARKER_KEYS = (
+    "parent_route_id",
+    "judge_route_id",
+    "judgment_route_id",
+    "parent_route_context_hash",
+    "parent_prompt_contract_id",
+    "parent_visible_injection_manifest_hash",
 )
 _IMPLEMENTATION_ACTIONS = {
     "apply_patch",
@@ -572,6 +631,279 @@ def _route_required_evidence(payload: Mapping[str, Any]) -> list[str]:
         "evidence_requirements",
         "contract_evidence",
     )
+
+
+def _lineage_text_list(value: Any) -> list[str]:
+    return _dedupe_strings(
+        value for value in _route_text_values(value) if value != "<mapping>"
+    )
+
+
+def _lineage_first_text(*values: Any) -> str:
+    for value in values:
+        texts = _lineage_text_list(value)
+        if texts:
+            return texts[0]
+    return ""
+
+
+def _parent_lineage_scope_value(
+    packet: Mapping[str, Any],
+    *,
+    field_names: Sequence[str],
+    scope_field_names: Sequence[str],
+) -> str:
+    scope = _nested_mapping(packet, "selected_scope")
+    if not scope:
+        scope = _nested_mapping(packet, "scope")
+    if not scope:
+        scope = _nested_mapping(packet, "route_scope")
+    return _lineage_first_text(
+        *(packet.get(field_name) for field_name in field_names),
+        *(scope.get(field_name) for field_name in scope_field_names),
+    )
+
+
+def _parent_route_required(payload: Mapping[str, Any]) -> bool:
+    containers: list[Mapping[str, Any]] = [payload]
+    containers.extend(
+        _nested_mapping(payload, key)
+        for key in _PARENT_ROUTE_LINEAGE_CONTAINER_KEYS
+        if _nested_mapping(payload, key)
+    )
+    for container in containers:
+        for key in _PARENT_ROUTE_REQUIRED_KEYS:
+            if _bool(container.get(key)):
+                return True
+    return False
+
+
+def _has_parent_route_markers(packet: Mapping[str, Any]) -> bool:
+    return any(_string(packet.get(key)) for key in _PARENT_ROUTE_LINEAGE_MARKER_KEYS)
+
+
+def _parent_route_lineage_source(
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    for key in _PARENT_ROUTE_LINEAGE_KEYS:
+        if key in payload:
+            packet = _mapping(payload.get(key), field_name=key)
+            return packet, bool(packet)
+
+    for container_key in _PARENT_ROUTE_LINEAGE_CONTAINER_KEYS:
+        container = _nested_mapping(payload, container_key)
+        if not container:
+            continue
+        for key in _PARENT_ROUTE_LINEAGE_KEYS:
+            if key in container:
+                packet = _mapping(container.get(key), field_name=key)
+                return packet, bool(packet)
+        if container_key in {"route_lineage", "lineage"} and _has_parent_route_markers(
+            container
+        ):
+            return dict(container), True
+
+    if _has_parent_route_markers(payload):
+        return dict(payload), True
+    return {}, False
+
+
+def _normalize_parent_route_lineage(
+    payload: Mapping[str, Any] | None,
+    *,
+    required: bool = False,
+    project_id: str = "",
+    backlog_id: str = "",
+) -> dict[str, Any]:
+    packet = dict(payload) if isinstance(payload, Mapping) else {}
+    route = _nested_mapping(packet, "route")
+    prompt_contract = _nested_mapping(packet, "prompt_contract")
+    hashes = _nested_mapping(packet, "hashes")
+    route_machine_context = _nested_mapping(packet, "route_machine_context")
+    if not route_machine_context:
+        route_machine_context = _nested_mapping(packet, "machine_context")
+    selected_project = _parent_lineage_scope_value(
+        packet,
+        field_names=(
+            "selected_project",
+            "selected_project_id",
+            "selected_project_slug",
+            "parent_selected_project",
+            "parent_selected_project_id",
+        ),
+        scope_field_names=(
+            "project_id",
+            "project",
+            "selected_project",
+            "selected_project_id",
+        ),
+    )
+    selected_backlog_id = _parent_lineage_scope_value(
+        packet,
+        field_names=(
+            "selected_backlog_id",
+            "selected_backlog",
+            "parent_selected_backlog_id",
+            "backlog_id",
+            "root_backlog_id",
+        ),
+        scope_field_names=(
+            "backlog_id",
+            "selected_backlog_id",
+            "root_backlog_id",
+        ),
+    )
+    if not selected_backlog_id:
+        selected_backlog_id = _lineage_first_text(
+            packet.get("selected_backlog_ids"),
+            packet.get("root_backlog_ids"),
+            _nested_mapping(packet, "scope").get("backlog_ids"),
+            _nested_mapping(packet, "selected_scope").get("backlog_ids"),
+        )
+
+    normalized = {
+        "schema_version": PARENT_ROUTE_LINEAGE_SCHEMA_VERSION,
+        "route_id": _lineage_first_text(
+            packet.get("route_id"),
+            packet.get("parent_route_id"),
+            packet.get("judge_route_id"),
+            packet.get("judgment_route_id"),
+            route.get("route_id"),
+            route.get("id"),
+        ),
+        "route_context_hash": _lineage_first_text(
+            packet.get("parent_route_context_hash"),
+            packet.get("route_context_hash"),
+            packet.get("context_hash"),
+            route.get("route_context_hash"),
+        ),
+        "prompt_contract_id": _lineage_first_text(
+            packet.get("parent_prompt_contract_id"),
+            packet.get("prompt_contract_id"),
+            prompt_contract.get("prompt_contract_id"),
+            prompt_contract.get("id"),
+        ),
+        "visible_injection_manifest_hash": _lineage_first_text(
+            packet.get("parent_visible_injection_manifest_hash"),
+            packet.get("visible_injection_manifest_hash"),
+            hashes.get("visible_injection_manifest_hash"),
+            route_machine_context.get("visible_injection_manifest_hash"),
+        ),
+        "selected_project": selected_project,
+        "selected_backlog_id": selected_backlog_id,
+        "allowed_actions": _lineage_text_list(
+            packet.get("allowed_actions") or route_machine_context.get("allowed_actions")
+        ),
+        "blocked_actions": _lineage_text_list(
+            packet.get("blocked_actions") or route_machine_context.get("blocked_actions")
+        ),
+        "required_lanes": _lineage_text_list(
+            packet.get("required_lanes") or route_machine_context.get("required_lanes")
+        ),
+        "required_evidence": _lineage_text_list(
+            packet.get("required_evidence")
+            or packet.get("required_evidence_ids")
+            or packet.get("evidence_required")
+            or packet.get("evidence_requirements")
+            or route_machine_context.get("required_evidence")
+            or route_machine_context.get("required_evidence_ids")
+            or route_machine_context.get("evidence_required")
+        ),
+    }
+
+    missing = [
+        field
+        for field in _PARENT_ROUTE_LINEAGE_REQUIRED_FIELDS
+        if not normalized[field]
+    ]
+    if missing and required:
+        raise MfSubagentContractError(
+            "parent_route_lineage missing required fields: " + ", ".join(missing)
+        )
+    if missing and not required:
+        return {}
+
+    expected_project = _string(project_id)
+    if expected_project and normalized["selected_project"] != expected_project:
+        raise MfSubagentContractError(
+            "parent_route_lineage selected_project does not match dispatch project"
+        )
+    expected_backlog = _string(backlog_id)
+    if expected_backlog and normalized["selected_backlog_id"] != expected_backlog:
+        raise MfSubagentContractError(
+            "parent_route_lineage selected_backlog_id does not match dispatch backlog"
+        )
+    return normalized
+
+
+def _parent_route_lineage_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+) -> dict[str, Any]:
+    source, present = _parent_route_lineage_source(payload)
+    required = _parent_route_required(payload) or present
+    if required and not source:
+        raise MfSubagentContractError("parent_route_lineage is required")
+    return _normalize_parent_route_lineage(
+        source,
+        required=required,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+
+
+def _child_route_prompt_contract(
+    *,
+    route_context_hash: str = "",
+    prompt_contract_id: str = "",
+    prompt_contract_hash: str = "",
+) -> dict[str, str]:
+    return {
+        "route_context_hash": _string(route_context_hash),
+        "prompt_contract_id": _string(prompt_contract_id),
+        "prompt_contract_hash": _string(prompt_contract_hash),
+    }
+
+
+def _child_route_prompt_contract_from_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, str]:
+    route_lineage = _nested_mapping(payload, "route_lineage")
+    child_route = _nested_mapping(route_lineage, "child_route_prompt_contract")
+    if not child_route:
+        child_route = _nested_mapping(route_lineage, "child_route_identity")
+    if not child_route:
+        child_route = _nested_mapping(route_lineage, "route_prompt_contract")
+    return _child_route_prompt_contract(
+        route_context_hash=_route_context_hash(payload)
+        or _string(child_route.get("route_context_hash")),
+        prompt_contract_id=_route_prompt_contract_id(payload)
+        or _string(child_route.get("prompt_contract_id") or child_route.get("id")),
+        prompt_contract_hash=_route_prompt_contract_hash(payload)
+        or _string(child_route.get("prompt_contract_hash")),
+    )
+
+
+def _mf_subagent_route_lineage(
+    *,
+    parent_route_lineage: Mapping[str, Any],
+    child_route_prompt_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    parent = dict(parent_route_lineage) if parent_route_lineage else {}
+    child = dict(child_route_prompt_contract)
+    return {
+        "schema_version": ROUTE_LINEAGE_SCHEMA_VERSION,
+        "parent_route_lineage": parent,
+        "child_route_prompt_contract": child,
+        "parent_route_id": _string(parent.get("route_id")),
+        "parent_route_context_hash": _string(parent.get("route_context_hash")),
+        "parent_prompt_contract_id": _string(parent.get("prompt_contract_id")),
+        "child_route_context_hash": _string(child.get("route_context_hash")),
+        "child_prompt_contract_id": _string(child.get("prompt_contract_id")),
+        "child_prompt_contract_hash": _string(child.get("prompt_contract_hash")),
+    }
 
 
 def _route_visible_injection_manifest_present(payload: Mapping[str, Any]) -> bool:
@@ -2045,6 +2377,24 @@ def validate_mf_subagent_dispatch_gate(
             ("route_prompt_contract", ("prompt_contract_hash",)),
         ),
     )
+    project_id = _dispatch_string(
+        payload,
+        names=("project_id",),
+        nested_keys=(
+            ("scope", ("project_id", "project")),
+            ("selected_scope", ("project_id", "project")),
+            ("worker_contract", ("project_id",)),
+        ),
+    )
+    backlog_id = _dispatch_string(
+        payload,
+        names=("backlog_id",),
+        nested_keys=(
+            ("scope", ("backlog_id",)),
+            ("selected_scope", ("backlog_id", "selected_backlog_id")),
+            ("worker_contract", ("backlog_id",)),
+        ),
+    )
     values = {
         "branch": branch,
         "worktree": worktree,
@@ -2069,6 +2419,16 @@ def validate_mf_subagent_dispatch_gate(
     if not owned_files:
         raise MfSubagentContractError("MF subagent dispatch missing owned_files fence")
     dirty_scope = _dirty_scope_evidence(payload.get("dirty_scope_check"))
+    parent_route_lineage = _parent_route_lineage_from_payload(
+        payload,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    child_route_prompt_contract = _child_route_prompt_contract(
+        route_context_hash=route_context_hash,
+        prompt_contract_id=prompt_contract_id,
+        prompt_contract_hash=prompt_contract_hash,
+    )
 
     policy = _nested_mapping(payload, "worktree_policy")
     override = _nested_mapping(payload, "same_worktree_override")
@@ -2136,6 +2496,12 @@ def validate_mf_subagent_dispatch_gate(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "route_prompt_contract": child_route_prompt_contract,
+        "parent_route_lineage": parent_route_lineage,
+        "route_lineage": _mf_subagent_route_lineage(
+            parent_route_lineage=parent_route_lineage,
+            child_route_prompt_contract=child_route_prompt_contract,
+        ),
         "owned_files": owned_files,
         "isolated_worktree": not same_worktree,
         "same_worktree_allowed": same_worktree_allowed,
@@ -2168,10 +2534,22 @@ def build_mf_subagent_input(
     route_context_hash: str = "",
     prompt_contract_id: str = "",
     prompt_contract_hash: str = "",
+    parent_route_lineage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable input payload for a branch-isolated MF subagent."""
 
     _require_context(context)
+    child_route_prompt_contract = _child_route_prompt_contract(
+        route_context_hash=route_context_hash,
+        prompt_contract_id=prompt_contract_id,
+        prompt_contract_hash=prompt_contract_hash,
+    )
+    normalized_parent_route_lineage = _normalize_parent_route_lineage(
+        parent_route_lineage,
+        required=parent_route_lineage is not None,
+        project_id=context.project_id,
+        backlog_id=context.backlog_id,
+    )
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
         "role": MF_SUB_ROLE,
@@ -2223,11 +2601,12 @@ def build_mf_subagent_input(
             "test_commands": _string_list(test_commands, field_name="test_commands"),
             "operator_notes": operator_notes,
         },
-        "route_prompt_contract": {
-            "route_context_hash": _string(route_context_hash),
-            "prompt_contract_id": _string(prompt_contract_id),
-            "prompt_contract_hash": _string(prompt_contract_hash),
-        },
+        "route_prompt_contract": child_route_prompt_contract,
+        "parent_route_lineage": normalized_parent_route_lineage,
+        "route_lineage": _mf_subagent_route_lineage(
+            parent_route_lineage=normalized_parent_route_lineage,
+            child_route_prompt_contract=child_route_prompt_contract,
+        ),
         "capabilities": {
             "can": list(MF_SUB_ALLOWED_CAPABILITIES),
             "cannot": list(MF_SUB_FORBIDDEN_ACTIONS),
@@ -2340,6 +2719,12 @@ def validate_mf_subagent_finish_gate(
     checkpoint_id = str(normalized.get("checkpoint_id") or "").strip()
     if not checkpoint_id:
         raise MfSubagentContractError("checkpoint_id is required")
+    parent_route_lineage = _parent_route_lineage_from_payload(
+        payload,
+        project_id=context.project_id,
+        backlog_id=context.backlog_id,
+    )
+    child_route_prompt_contract = _child_route_prompt_contract_from_payload(payload)
 
     return {
         "schema_version": FINISH_GATE_SCHEMA_VERSION,
@@ -2356,6 +2741,12 @@ def validate_mf_subagent_finish_gate(
         "checkpoint_id": checkpoint_id,
         "fence_token": context.fence_token,
         "replay_source": FINISH_GATE_REPLAY_SOURCE,
+        "route_prompt_contract": child_route_prompt_contract,
+        "parent_route_lineage": parent_route_lineage,
+        "route_lineage": _mf_subagent_route_lineage(
+            parent_route_lineage=parent_route_lineage,
+            child_route_prompt_contract=child_route_prompt_contract,
+        ),
         "changed_files": normalized["changed_files"],
         "new_files": normalized["new_files"],
         "test_results": normalized["test_results"],

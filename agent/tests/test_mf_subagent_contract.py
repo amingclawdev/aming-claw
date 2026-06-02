@@ -219,6 +219,32 @@ def _dispatch_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def _parent_route_lineage(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "route_id": "route-20260602-parent",
+        "route_context_hash": "sha256:parent-route-context",
+        "prompt_contract_id": "rprompt-parent",
+        "visible_injection_manifest_hash": "sha256:parent-visible-manifest",
+        "selected_project": "aming-claw",
+        "selected_backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "allowed_actions": ["dispatch_bounded_worker"],
+        "blocked_actions": ["apply_patch", "write_file"],
+        "required_lanes": [
+            {"id": "observer_coordinator", "role": "observer"},
+            {"id": "bounded_implementation_worker", "role": "mf_sub"},
+            {"id": "independent_verification_lane", "role": "qa"},
+        ],
+        "required_evidence": [
+            "route_context",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "independent_verification",
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None:
     evidence = validate_mf_subagent_dispatch_gate(
         _dispatch_payload(),
@@ -240,6 +266,85 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
     assert evidence["same_worktree_allowed"] is False
     assert evidence["override"]["used"] is False
     assert evidence["dirty_scope_check"]["passed"] is True
+
+
+def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            project_id="aming-claw",
+            backlog_id="ARCH-MF-SUBAGENT-BACKEND",
+            judge_routed=True,
+            judge_route={
+                **_parent_route_lineage(),
+                "raw_private_memory": "must not be propagated",
+            },
+        ),
+        target_worktree_path="/repo",
+    )
+
+    parent = evidence["parent_route_lineage"]
+    assert parent["schema_version"] == "parent_route_lineage.v1"
+    assert parent["route_id"] == "route-20260602-parent"
+    assert parent["route_context_hash"] == "sha256:parent-route-context"
+    assert parent["prompt_contract_id"] == "rprompt-parent"
+    assert parent["visible_injection_manifest_hash"] == (
+        "sha256:parent-visible-manifest"
+    )
+    assert parent["selected_project"] == "aming-claw"
+    assert parent["selected_backlog_id"] == "ARCH-MF-SUBAGENT-BACKEND"
+    assert parent["allowed_actions"] == ["dispatch_bounded_worker"]
+    assert parent["blocked_actions"] == ["apply_patch", "write_file"]
+    assert parent["required_lanes"] == [
+        "observer_coordinator",
+        "bounded_implementation_worker",
+        "independent_verification_lane",
+    ]
+    assert "raw_private_memory" not in parent
+    assert evidence["route_prompt_contract"] == {
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
+    }
+    assert evidence["route_lineage"]["parent_route_id"] == "route-20260602-parent"
+    assert evidence["route_lineage"]["child_route_context_hash"] == (
+        "sha256:route-context"
+    )
+
+
+def test_dispatch_gate_rejects_missing_parent_lineage_when_required() -> None:
+    with pytest.raises(MfSubagentContractError, match="parent_route_lineage"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(parent_route_required=True),
+            target_worktree_path="/repo",
+        )
+
+
+def test_dispatch_gate_rejects_parent_scope_mismatch() -> None:
+    with pytest.raises(MfSubagentContractError, match="selected_backlog_id"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                project_id="aming-claw",
+                backlog_id="ARCH-MF-SUBAGENT-BACKEND",
+                parent_route_lineage=_parent_route_lineage(
+                    selected_backlog_id="OTHER-BACKLOG"
+                ),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
+def test_dispatch_gate_rejects_parent_selected_project_mismatch() -> None:
+    with pytest.raises(MfSubagentContractError, match="selected_project"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                project_id="aming-claw",
+                backlog_id="ARCH-MF-SUBAGENT-BACKEND",
+                parent_route_lineage=_parent_route_lineage(
+                    selected_project="other-project"
+                ),
+            ),
+            target_worktree_path="/repo",
+        )
 
 
 def test_dispatch_gate_accepts_optional_prompt_contract_hash_absent() -> None:
@@ -1238,6 +1343,29 @@ def test_build_input_carries_branch_runtime_identity() -> None:
     ]
 
 
+def test_build_input_carries_parent_and_child_route_lineage() -> None:
+    payload = build_mf_subagent_input(
+        _context(),
+        prompt="Implement the isolated change.",
+        route_context_hash="sha256:child-route-context",
+        prompt_contract_id="rprompt-child",
+        prompt_contract_hash="sha256:child-prompt",
+        parent_route_lineage=_parent_route_lineage(),
+    )
+
+    assert payload["parent_route_lineage"]["route_id"] == "route-20260602-parent"
+    assert payload["parent_route_lineage"]["selected_project"] == "aming-claw"
+    assert payload["route_prompt_contract"] == {
+        "route_context_hash": "sha256:child-route-context",
+        "prompt_contract_id": "rprompt-child",
+        "prompt_contract_hash": "sha256:child-prompt",
+    }
+    assert payload["route_lineage"]["parent_route_context_hash"] == (
+        "sha256:parent-route-context"
+    )
+    assert payload["route_lineage"]["child_prompt_contract_id"] == "rprompt-child"
+
+
 @pytest.mark.parametrize("field", ["backlog_id", "worktree_path", "fence_token", "merge_queue_id"])
 def test_build_input_rejects_missing_required_identity(field: str) -> None:
     with pytest.raises(MfSubagentContractError, match=field):
@@ -1345,6 +1473,51 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["merge_queue_id"] == "mq-1"
     assert gate["replay_source"] == FINISH_GATE_REPLAY_SOURCE
     assert gate["merge_queue_ready"] is True
+
+
+def test_finish_gate_carries_route_lineage_when_present() -> None:
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": "ckpt-finish",
+            "fence_token": "fence-2",
+            "route_prompt_contract": {
+                "route_context_hash": "sha256:child-route-context",
+                "prompt_contract_id": "rprompt-child",
+                "prompt_contract_hash": "sha256:child-prompt",
+            },
+            "route_lineage": {
+                "parent_route_lineage": _parent_route_lineage(),
+                "child_route_prompt_contract": {
+                    "route_context_hash": "sha256:child-route-context",
+                    "prompt_contract_id": "rprompt-child",
+                    "prompt_contract_hash": "sha256:child-prompt",
+                },
+            },
+            "summary": "Ready.",
+        },
+        context=_context(),
+    )
+
+    assert gate["parent_route_lineage"]["route_id"] == "route-20260602-parent"
+    assert gate["route_prompt_contract"]["prompt_contract_id"] == "rprompt-child"
+    assert gate["route_lineage"]["parent_route_context_hash"] == (
+        "sha256:parent-route-context"
+    )
+    assert gate["route_lineage"]["child_route_context_hash"] == (
+        "sha256:child-route-context"
+    )
 
 
 def test_finish_gate_rejects_identity_mismatch() -> None:
