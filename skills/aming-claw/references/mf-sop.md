@@ -94,10 +94,16 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      `evidence_hash`, and `created_at`; merge/reconcile/close gates must verify
      the referenced token still matches subject commit/fence evidence;
    - for governed nontrivial, Judge-routed, or parent-route-bound `mf_sub`
-     dispatch, require `mf_subagent_graph_trace.v1` evidence before worker
-     implementation starts and again at finish/handoff. The graph lookup must
-     be audited with `query_source=mf_subagent`, `task_id`, `parent_task_id`,
-     `worker_role=mf_sub`, and `fence_token`;
+     dispatch, require branch runtime registration evidence before
+     `spawn_agent`. Use `/api/graph-governance/{project_id}/parallel-branches/allocate`
+     or `agent.governance.parallel_branch_runtime.upsert_branch_context`, and
+     record `mf_subagent_branch_runtime.v1` evidence matching `task_id`,
+     `parent_task_id` where available, `fence_token`, `worktree_path`,
+     `base_commit`, `target_head_commit`, and `merge_queue_id`;
+   - after branch runtime registration, require `mf_subagent_graph_trace.v1`
+     evidence before worker implementation starts and again at finish/handoff.
+     The graph lookup must be audited with explicit `query_source=mf_subagent`,
+     `task_id`, `parent_task_id`, `worker_role=mf_sub`, and `fence_token`;
    - for observer-to-subagent dispatch, require
      `observer_subagent_service_dispatch.v1` evidence with replayable
      `dispatch_command_ref` plus `monitor_ref`, or a documented host-adapter
@@ -128,13 +134,18 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      `waiting_merge`, never merge/push or mutate merge queues;
    - require subagent graph lookups to use audited
      `query_source=mf_subagent`, with `task_id`, `parent_task_id`,
-     `worker_role`, and `fence_token` in the query context;
-   - before `spawn_agent`, run and record
+     `worker_role`, and `fence_token` in the query context. Trace ids alone do
+     not satisfy the gate when `query_source` is missing or not `mf_subagent`;
+   - before `spawn_agent`, allocate/register the branch runtime context, then
+     run and record
      `agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate`
      for each local `mf_sub` worker; the gate must pass with an isolated
      branch/worktree/file fence, `base_commit`, `target_head_commit`,
      `merge_queue_id`, `fence_token`, owned files, current target graph
-     evidence, and dirty-scope evidence before non-blocking dispatch;
+     evidence, dirty-scope evidence, and branch runtime registration evidence
+     before non-blocking dispatch. Without that registration,
+     `query_source=mf_subagent` graph queries fail fence validation as
+     `fence_invalidated_or_unknown`;
    - block dispatch when the target/main HEAD moved after contract creation or
      when the active target graph is stale. Existing branch/worktree adoption is
      allowed only as a first-class recovery path with explicit adoption

@@ -174,6 +174,7 @@
       "responsibility",
       "required_evidence",
       "review_evidence",
+      "branch_runtime_evidence",
       "graph_trace_evidence",
       "service_dispatch_evidence",
       "graph_queries",
@@ -267,6 +268,8 @@
       "audited": true,
       "query_source": "mf_subagent",
       "evidence_schema_version": "mf_subagent_graph_trace.v1",
+      "query_source_required": true,
+      "precondition": "observer must allocate/register branch runtime context before spawn_agent so validate_mf_subagent_graph_query_identity can resolve the task/fence",
       "required_for": [
         "governed_nontrivial",
         "judge_routed",
@@ -282,6 +285,28 @@
       "timeline_trace_requirement": "graph_trace_ids",
       "dispatch_finish_gate": "validate_mf_subagent_dispatch_gate and validate_mf_subagent_finish_gate require normalized graph trace evidence for governed nontrivial, Judge-routed, or parent-route-bound work.",
       "description": "Any subagent graph lookup must use audited query_source=mf_subagent with task identity and fence context; returned trace ids must be recorded in timeline evidence."
+    },
+    "branch_runtime": {
+      "schema_version": "mf_subagent_branch_runtime.v1",
+      "required_for": [
+        "governed_nontrivial",
+        "judge_routed",
+        "parent_route_required"
+      ],
+      "valid_registration_refs": [
+        "/api/graph-governance/{project_id}/parallel-branches/allocate",
+        "agent.governance.parallel_branch_runtime.upsert_branch_context"
+      ],
+      "required_fields": [
+        "task_id",
+        "parent_task_id",
+        "fence_token",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id"
+      ],
+      "description": "Observer must allocate/register the branch runtime context before spawn_agent; otherwise mf_subagent graph queries fail fence validation as fence_invalidated_or_unknown."
     },
     "service_dispatch": {
       "schema_version": "observer_subagent_service_dispatch.v1",
@@ -549,7 +574,15 @@
       "phase": "dispatch",
       "kind": "graph_query_trace",
       "schema_version": "mf_subagent_graph_trace.v1",
-      "description": "Set required=true for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work; dispatch and finish gates normalize returned graph trace ids."
+      "description": "Set required=true for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work; query_source=mf_subagent is explicit and required, and dispatch/finish gates normalize returned graph trace ids."
+    },
+    {
+      "id": "branch_runtime_registration",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "branch_runtime",
+      "schema_version": "mf_subagent_branch_runtime.v1",
+      "description": "Set required=true for governed mf_sub dispatch; evidence must show observer allocated/registered the branch runtime context via parallel-branches/allocate or upsert_branch_context before spawn_agent."
     },
     {
       "id": "observer_subagent_service_dispatch",

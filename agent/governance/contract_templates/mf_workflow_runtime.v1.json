@@ -19,6 +19,15 @@
     "action_gate_service_id": "route.action_precheck",
     "action_gate_function": "agent.governance.mf_subagent_contract.validate_route_action_gate",
     "dispatch_gate_function": "agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+    "branch_runtime_registration": {
+      "schema_version": "mf_subagent_branch_runtime.v1",
+      "required_before": "spawn_agent",
+      "valid_registration_refs": [
+        "/api/graph-governance/{project_id}/parallel-branches/allocate",
+        "agent.governance.parallel_branch_runtime.upsert_branch_context"
+      ],
+      "description": "Observer allocates/registers branch runtime context before spawn_agent so mf_subagent graph query fence validation can resolve task_id and fence_token."
+    },
     "required_hash_fields": [
       "route_context_hash",
       "prompt_contract_id",
@@ -371,6 +380,7 @@
         "merge_queue_id",
         "current_target_head",
         "graph_current",
+        "branch_runtime_evidence",
         "graph_trace_evidence",
         "service_dispatch_evidence",
         "next_stage"
@@ -585,7 +595,9 @@
       "branch_ref_present",
       "merge_queue_id_present",
       "active_graph_current_at_dispatch",
+      "branch_runtime_registration_present_for_governed_route",
       "graph_trace_evidence_present_for_governed_route",
+      "graph_trace_query_source_is_mf_subagent",
       "service_dispatch_evidence_present_for_governed_route",
       "write_scope_present",
       "contract_shape_valid"
@@ -753,7 +765,15 @@
       "phase": "dispatch",
       "kind": "graph_query_trace",
       "schema_version": "mf_subagent_graph_trace.v1",
-      "description": "Required by dispatch and finish gates for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work."
+      "description": "Required by dispatch and finish gates for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work; query_source=mf_subagent must be explicit."
+    },
+    {
+      "id": "branch_runtime_registration",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "branch_runtime",
+      "schema_version": "mf_subagent_branch_runtime.v1",
+      "description": "Required before spawn_agent for governed mf_sub dispatch; records parallel-branches/allocate or upsert_branch_context evidence matching task/fence/worktree/commit/merge queue identity."
     },
     {
       "id": "observer_subagent_service_dispatch",

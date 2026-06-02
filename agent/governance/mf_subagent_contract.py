@@ -26,6 +26,7 @@ PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
 ROUTE_LINEAGE_SCHEMA_VERSION = "mf_subagent_route_lineage.v1"
 GRAPH_TRACE_SCHEMA_VERSION = "mf_subagent_graph_trace.v1"
 SERVICE_DISPATCH_SCHEMA_VERSION = "observer_subagent_service_dispatch.v1"
+BRANCH_RUNTIME_SCHEMA_VERSION = "mf_subagent_branch_runtime.v1"
 OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
 ROUTE_ACTION_GATE_SCHEMA_VERSION = "route_action_gate.v1"
 ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION = "route_token_mutation_gate.v1"
@@ -219,6 +220,26 @@ _SERVICE_DISPATCH_CONTAINER_KEYS = (
     "observer_subagent_service_dispatch_evidence",
     "subagent_service_dispatch",
     "spawn_agent_evidence",
+)
+_BRANCH_RUNTIME_CONTAINER_KEYS = (
+    "branch_runtime_evidence",
+    "branch_runtime_context",
+    "parallel_branch_runtime_context",
+    "branch_context",
+)
+_BRANCH_RUNTIME_SOURCE_REF_KEYS = {
+    "api_ref",
+    "api_route",
+    "endpoint",
+    "function_ref",
+    "registration_ref",
+    "registration_source",
+    "source_ref",
+}
+_BRANCH_RUNTIME_SOURCE_MARKERS = (
+    "/parallel-branches/allocate",
+    "parallel-branches/allocate",
+    "upsert_branch_context",
 )
 _SERVICE_DISPATCH_COMMAND_REF_KEYS = {
     "dispatch_command_ref",
@@ -1035,6 +1056,10 @@ def _normalize_graph_trace_evidence(
         raise MfSubagentContractError(
             "graph trace evidence must use query_source=mf_subagent"
         )
+    if required and not query_source:
+        raise MfSubagentContractError(
+            "graph trace evidence requires explicit query_source=mf_subagent"
+        )
 
     evidence_task_id = _first_deep_string(source, {"task_id"}) or task_id
     evidence_parent_task_id = (
@@ -1087,13 +1112,141 @@ def _normalize_graph_trace_evidence(
         "schema_version": GRAPH_TRACE_SCHEMA_VERSION,
         "required": required,
         "present": bool(trace_ids),
-        "query_source": "mf_subagent" if query_source or trace_ids or required else "",
+        "query_source": query_source,
         "trace_ids": trace_ids,
         "task_id": observed["task_id"],
         "parent_task_id": observed["parent_task_id"],
         "worker_role": observed["worker_role"],
         "fence_token": observed["fence_token"],
     }
+
+
+def _branch_runtime_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+    for key in _BRANCH_RUNTIME_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _branch_runtime_source_ref(source: Mapping[str, Any]) -> str:
+    ref = _first_deep_string(source, _BRANCH_RUNTIME_SOURCE_REF_KEYS)
+    if ref:
+        return ref
+    for value in _deep_field_values(source, {"source", "function", "handler", "route"}):
+        token = _string(value)
+        if any(marker in token for marker in _BRANCH_RUNTIME_SOURCE_MARKERS):
+            return token
+    return ""
+
+
+def _source_ref_is_branch_runtime_registration(source_ref: str) -> bool:
+    normalized = source_ref.strip()
+    return any(marker in normalized for marker in _BRANCH_RUNTIME_SOURCE_MARKERS)
+
+
+def _context_field(source: Mapping[str, Any], *keys: str) -> str:
+    context = _nested_mapping(source, "context")
+    if context:
+        for key in keys:
+            token = _string(context.get(key))
+            if token:
+                return token
+    for key in keys:
+        token = _string(source.get(key))
+        if token:
+            return token
+    return _first_deep_string(source, set(keys))
+
+
+def _normalize_branch_runtime_evidence(
+    payload: Mapping[str, Any],
+    *,
+    required: bool,
+    task_id: str = "",
+    parent_task_id: str = "",
+    fence_token: str = "",
+    worktree_path: str = "",
+    base_commit: str = "",
+    target_head_commit: str = "",
+    merge_queue_id: str = "",
+) -> dict[str, Any]:
+    source = _branch_runtime_source(payload)
+    source_ref = _branch_runtime_source_ref(source)
+    normalized = {
+        "schema_version": BRANCH_RUNTIME_SCHEMA_VERSION,
+        "required": required,
+        "present": bool(source),
+        "registered": False,
+        "source_ref": source_ref,
+        "task_id": _context_field(source, "task_id") if source else "",
+        "parent_task_id": (
+            _context_field(source, "parent_task_id", "root_task_id", "chain_id")
+            if source
+            else ""
+        ),
+        "fence_token": _context_field(source, "fence_token") if source else "",
+        "worktree_path": _context_field(source, "worktree_path", "worktree")
+        if source
+        else "",
+        "base_commit": _context_field(source, "base_commit") if source else "",
+        "target_head_commit": _context_field(source, "target_head_commit")
+        if source
+        else "",
+        "merge_queue_id": _context_field(source, "merge_queue_id") if source else "",
+    }
+    if not required:
+        normalized["registered"] = bool(
+            normalized["present"]
+            and _source_ref_is_branch_runtime_registration(source_ref)
+        )
+        return normalized
+
+    if not source:
+        raise MfSubagentContractError(
+            "governed mf_sub dispatch requires branch runtime registration evidence"
+        )
+    if not _source_ref_is_branch_runtime_registration(source_ref):
+        raise MfSubagentContractError(
+            "branch runtime registration evidence must reference "
+            "parallel-branches/allocate or upsert_branch_context"
+        )
+
+    required_fields = {
+        "task_id": task_id,
+        "fence_token": fence_token,
+        "worktree_path": worktree_path,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "merge_queue_id": merge_queue_id,
+    }
+    if parent_task_id:
+        required_fields["parent_task_id"] = parent_task_id
+    missing = [
+        field
+        for field, expected_value in required_fields.items()
+        if expected_value and not normalized[field]
+    ]
+    if missing:
+        raise MfSubagentContractError(
+            "branch runtime registration evidence missing required fields: "
+            + ", ".join(sorted(missing))
+        )
+
+    mismatches = [
+        field
+        for field, expected_value in required_fields.items()
+        if expected_value
+        and normalized[field]
+        and normalized[field] != expected_value
+    ]
+    if mismatches:
+        raise MfSubagentContractError(
+            "branch runtime registration evidence identity mismatch: "
+            + ", ".join(sorted(mismatches))
+        )
+    normalized["registered"] = True
+    return normalized
 
 
 def _service_dispatch_source(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -2759,6 +2912,17 @@ def validate_mf_subagent_dispatch_gate(
         worker_role=worker_role,
         fence_token=fence_token,
     )
+    branch_runtime_evidence = _normalize_branch_runtime_evidence(
+        payload,
+        required=governed_evidence_required,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=fence_token,
+        worktree_path=worktree,
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        merge_queue_id=merge_queue_id,
+    )
     service_dispatch_evidence = _normalize_service_dispatch_evidence(
         payload,
         required=governed_evidence_required,
@@ -2838,6 +3002,7 @@ def validate_mf_subagent_dispatch_gate(
         ),
         "governed_evidence_required": governed_evidence_required,
         "graph_trace_evidence": graph_trace_evidence,
+        "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,
         "owned_files": owned_files,
         "isolated_worktree": not same_worktree,
