@@ -337,6 +337,41 @@ TOOLS: list[dict] = [
             "required": ["project_id", "bug_id"],
         },
     },
+    {
+        "name": "observer_repair_run_plan",
+        "description": "Build a read-only replayable observer repair-run plan for cross-system recovery. Does not authorize protected writes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "root_backlog_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Root backlog ids to diagnose and order.",
+                },
+                "backlog_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Alias for root_backlog_ids.",
+                },
+                "blockers": {
+                    "type": "array",
+                    "items": {},
+                    "description": "Optional blocker messages or structured failures to classify.",
+                },
+                "include_timeline_precheck": {
+                    "type": "boolean",
+                    "description": "When true, include read-only MF timeline precheck summaries for root backlog ids.",
+                },
+                "route_context_seed": {
+                    "type": "object",
+                    "description": "Public-safe seed material for deterministic route context identity.",
+                },
+                "actor": {"type": "string"},
+            },
+            "required": ["project_id"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -443,6 +478,15 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             query["limit"] = str(_int_arg(args, "limit", 1000, minimum=1, maximum=1000))
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         return _http("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
+
+    if name == "observer_repair_run_plan":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        return _http("POST", f"/api/projects/{pid}/observer-repair-run/plan", body)
 
     raise ValueError(f"Unknown tool: {name!r}")
 

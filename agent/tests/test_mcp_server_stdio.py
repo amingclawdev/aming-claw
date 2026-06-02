@@ -113,6 +113,24 @@ def test_mcp_stdio_protected_write_schemas_expose_route_gate_fields():
         assert "route_token_waiver" in properties
 
 
+def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    schema = tools["observer_repair_run_plan"]["inputSchema"]
+    properties = schema["properties"]
+    assert schema["required"] == ["project_id"]
+    assert "root_backlog_ids" in properties
+    assert "blockers" in properties
+    assert "include_timeline_precheck" in properties
+    assert "route_token" not in properties
+    assert "route_waiver" not in properties
+
+
 def test_mcp_backlog_close_forwards_route_gate_payloads():
     calls = []
 
@@ -285,6 +303,46 @@ def test_mcp_protected_write_dispatch_preserves_structured_gate_failure():
     assert result["details"]["fault_domain"] == "caller_missing_route_evidence"
     assert result["details"]["expected_behavior"] is True
     assert result["details"]["is_system_bug"] is False
+
+
+def test_mcp_observer_repair_run_plan_dispatches_to_read_only_endpoint():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "repair_run_id": "repair-test"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "observer_repair_run_plan",
+        {
+            "project_id": "aming-claw",
+            "root_backlog_ids": ["AC-ROUTE-FLOW-SESSION-GUIDANCE-20260602"],
+            "blockers": ["route_token_required"],
+            "include_timeline_precheck": True,
+            "actor": "observer-test",
+        },
+    )
+
+    assert result == {"ok": True, "repair_run_id": "repair-test"}
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-repair-run/plan",
+            {
+                "root_backlog_ids": ["AC-ROUTE-FLOW-SESSION-GUIDANCE-20260602"],
+                "blockers": ["route_token_required"],
+                "include_timeline_precheck": True,
+                "actor": "observer-test",
+            },
+        )
+    ]
 
 
 def test_mcp_stdio_resources_expose_skill_and_context_without_governance():

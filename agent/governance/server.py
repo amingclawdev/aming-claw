@@ -1375,6 +1375,88 @@ def handle_observer_command_fail(ctx: RequestContext):
         return _observer_error(exc)
 
 
+def _observer_repair_id_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw = value.replace("\r", "\n").replace(",", "\n").split("\n")
+    elif isinstance(value, list):
+        raw = value
+    elif isinstance(value, tuple):
+        raw = list(value)
+    elif value in (None, ""):
+        raw = []
+    else:
+        raw = [value]
+    return sorted({str(item or "").strip() for item in raw if str(item or "").strip()})
+
+
+@route("POST", "/api/projects/{project_id}/observer-repair-run/plan")
+def handle_observer_repair_run_plan(ctx: RequestContext):
+    """Build a read-only, replayable observer repair-run plan."""
+
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    root_backlog_ids = _observer_repair_id_list(
+        body.get("root_backlog_ids") or body.get("backlog_ids") or body.get("bug_ids")
+    )
+    conn = get_connection(project_id)
+    try:
+        backlog_rows: list[dict[str, Any]] = []
+        missing_backlog_ids: list[str] = []
+        if root_backlog_ids:
+            placeholders = ",".join("?" for _ in root_backlog_ids)
+            rows = conn.execute(
+                f"SELECT * FROM backlog_bugs WHERE bug_id IN ({placeholders})",
+                root_backlog_ids,
+            ).fetchall()
+            by_id = {str(row["bug_id"]): dict(row) for row in rows}
+            backlog_rows = [by_id[bug_id] for bug_id in root_backlog_ids if bug_id in by_id]
+            missing_backlog_ids = [bug_id for bug_id in root_backlog_ids if bug_id not in by_id]
+
+        timeline_prechecks: list[dict[str, Any]] = []
+        if body.get("include_timeline_precheck"):
+            from . import task_timeline
+
+            for row in backlog_rows:
+                bug_id = str(row.get("bug_id") or "")
+                events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
+                if _mf_close_timeline_applicability(row)["is_mf"]:
+                    contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
+                    contract = _mf_close_contract_with_route_context(contract, row, {})
+                    verification = task_timeline.mf_close_gate_verification(events, contract=contract)
+                else:
+                    verification = {"passed": True, "missing_event_kinds": []}
+                timeline_prechecks.append(
+                    {
+                        "project_id": project_id,
+                        "bug_id": bug_id,
+                        "can_close": bool(verification.get("passed")),
+                        "timeline_gate": verification,
+                    }
+                )
+
+        blockers = list(body.get("blockers") or [])
+        blockers.extend(f"missing backlog row: {bug_id}" for bug_id in missing_backlog_ids)
+        from . import observer_repair_run
+
+        plan = observer_repair_run.build_repair_run_plan(
+            project_id=project_id,
+            root_backlog_ids=root_backlog_ids,
+            backlog_rows=backlog_rows,
+            blockers=blockers,
+            graph_status=body.get("graph_status") if isinstance(body.get("graph_status"), dict) else {},
+            operations_queue=body.get("operations_queue") if isinstance(body.get("operations_queue"), dict) else {},
+            timeline_prechecks=timeline_prechecks,
+            route_context_seed=body.get("route_context_seed")
+            if isinstance(body.get("route_context_seed"), dict)
+            else {},
+            actor=str(body.get("actor") or "observer"),
+        )
+        plan["missing_backlog_ids"] = missing_backlog_ids
+        return plan
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/projects/{project_id}/project-inbox")
 def handle_project_inbox(ctx: RequestContext):
     project_id = ctx.get_project_id()
