@@ -208,6 +208,313 @@ def test_observer_run_execute_rejects_incomplete_dispatch_gate(tmp_path):
         assert field in gate["error"]
 
 
+DOGFOOD_BACKLOG_ID = "AC-OBSERVER-CLI-LAUNCHER-JUDGE-OBSERVER-SUBAGENT-20260602"
+DOGFOOD_ROUTE_CONTEXT_HASH = "sha256:206c6621998609402a7f4276bf33eb9b6d9468f2096116505d388670dab6e352"
+DOGFOOD_PROMPT_CONTRACT_ID = "rprompt-205a50783038d2f0"
+DOGFOOD_VISIBLE_MANIFEST_HASH = "sha256:0603ba125fff6a7fa5267872d3e4e93ec090f6456f8a656ee0e16c77460b7b23"
+
+
+def _dogfood_args(tmp_path, *, main_worktree=None):
+    main = Path(main_worktree or (tmp_path / "main"))
+    main.mkdir(parents=True, exist_ok=True)
+    workspace_root = tmp_path / "workers"
+    return [
+        "observer",
+        "dogfood",
+        "--project-id",
+        "aming-claw",
+        "--backlog-id",
+        DOGFOOD_BACKLOG_ID,
+        "--route-context-hash",
+        DOGFOOD_ROUTE_CONTEXT_HASH,
+        "--prompt-contract-id",
+        DOGFOOD_PROMPT_CONTRACT_ID,
+        "--prompt-contract-hash",
+        "sha256:prompt-contract",
+        "--route-token-ref",
+        "route-token-ref",
+        "--route-id",
+        "route-20260602-ebc022240d",
+        "--precheck-run-id",
+        "precheck-judgment-plan-topology-f27328488fb9",
+        "--visible-injection-manifest-hash",
+        DOGFOOD_VISIBLE_MANIFEST_HASH,
+        "--provider",
+        "openai",
+        "--backend-mode",
+        "codex_cli",
+        "--main-worktree",
+        str(main),
+        "--workspace-root",
+        str(workspace_root),
+        "--owned-file",
+        "agent/observer_runtime.py",
+        "--owned-file",
+        "agent/cli.py",
+        "--task-id",
+        DOGFOOD_BACKLOG_ID,
+        "--worker-id",
+        "worker-a",
+        "--attempt",
+        "2",
+        "--worktree-root",
+        "worktrees",
+        "--branch-prefix",
+        "dogfood",
+        "--merge-queue-id",
+        "mq-dogfood-test",
+        "--fence-token",
+        "fence-dogfood-test",
+        "--graph-trace-id",
+        "gqt-20260602-testtrace",
+        "--base-commit",
+        "base123",
+        "--target-head-commit",
+        "head123",
+        "--json-output",
+    ]
+
+
+def _without_option(args, option):
+    result = list(args)
+    index = result.index(option)
+    del result[index : index + 2]
+    return result
+
+
+def _replace_option(args, option, value):
+    result = list(args)
+    index = result.index(option)
+    result[index + 1] = value
+    return result
+
+
+def test_observer_dogfood_dry_run_generates_valid_gate_and_plan_without_model_call(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(main, _dogfood_args(tmp_path))
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["status"] == "planned"
+    assert payload["execute"] is False
+    assert payload["calls_models"] is False
+    gate = payload["dispatch_gate_validation"]
+    assert gate["schema_version"] == "mf_subagent_dispatch_gate.v1"
+    assert gate["allowed"] is True
+    assert gate["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
+    assert gate["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
+    assert gate["merge_queue_id"] == "mq-dogfood-test"
+    assert gate["fence_token"] == "fence-dogfood-test"
+    assert gate["isolated_worktree"] is True
+    assert set(gate["owned_files"]) == {"agent/observer_runtime.py", "agent/cli.py"}
+    assert payload["dispatch_gate"]["graph_evidence"]["trace_ids"] == ["gqt-20260602-testtrace"]
+    assert payload["dispatch_gate"]["route_evidence"]["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
+    observer_run = payload["observer_run"]
+    assert observer_run["status"] == "planned"
+    evidence = observer_run["invocation"]
+    assert evidence["calls_models"] is False
+    assert evidence["auth_status"] == "not_invoked"
+    assert evidence["route_prompt_contract"]["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
+
+
+def test_observer_dogfood_rejects_missing_visible_injection_manifest(tmp_path):
+    runner = CliRunner()
+    gate_output = tmp_path / "dispatch-gate.json"
+
+    result = runner.invoke(
+        main,
+        _without_option(_dogfood_args(tmp_path), "--visible-injection-manifest-hash")[:-1]
+        + ["--gate-output-path", str(gate_output), "--json-output"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["calls_models"] is False
+    assert payload["route_identity_validation"]["allowed"] is False
+    assert "visible_injection_manifest_hash" in payload["route_identity_validation"]["missing"]
+    assert payload["gate_output_skipped"]["route_identity_allowed"] is False
+    assert not gate_output.exists()
+    assert "observer_run" not in payload
+
+
+def test_observer_dogfood_rejects_missing_route_id(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(main, _without_option(_dogfood_args(tmp_path), "--route-id"))
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["calls_models"] is False
+    assert payload["route_identity_validation"]["allowed"] is False
+    assert "route_id" in payload["route_identity_validation"]["missing"]
+    assert "observer_run" not in payload
+
+
+def test_observer_dogfood_writes_gate_output_file(tmp_path):
+    runner = CliRunner()
+    gate_output = tmp_path / "evidence" / "dispatch-gate.json"
+
+    result = runner.invoke(
+        main,
+        _dogfood_args(tmp_path)[:-1] + ["--gate-output-path", str(gate_output), "--json-output"],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = json.loads(gate_output.read_text(encoding="utf-8"))
+    assert written["schema_version"] == "mf_subagent_dispatch_gate.v1"
+    assert written["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
+    assert written["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
+    assert written["graph_evidence"]["trace_ids"] == ["gqt-20260602-testtrace"]
+    payload = json.loads(result.output)
+    assert payload["gate_output"] == str(gate_output)
+
+
+def test_observer_execute_gate_rejects_mismatched_route_identity(tmp_path):
+    from agent.ai_invocation import RoutePromptContract
+    from agent.observer_runtime import ObserverRunRequest, validate_one_hop_execution_gate
+
+    gate = {
+        "branch": "refs/heads/dogfood/test",
+        "worktree": str(tmp_path / "worker"),
+        "base_commit": "base123",
+        "target_head_commit": "head123",
+        "merge_queue_id": "mq-test",
+        "fence_token": "fence-test",
+        "route_context_hash": "sha256:gate-route",
+        "prompt_contract_id": "rprompt-gate",
+        "prompt_contract_hash": "sha256:gate-prompt",
+        "owned_files": ["agent/observer_runtime.py"],
+        "dirty_scope_check": {
+            "status": "passed",
+            "passed": True,
+            "dirty_scope_exact_match": True,
+            "owned_files": ["agent/observer_runtime.py"],
+        },
+    }
+    request = ObserverRunRequest(
+        project_id="aming-claw",
+        backlog_id=DOGFOOD_BACKLOG_ID,
+        route=RoutePromptContract(
+            route_context_hash=DOGFOOD_ROUTE_CONTEXT_HASH,
+            prompt_contract_id=DOGFOOD_PROMPT_CONTRACT_ID,
+            prompt_contract_hash="sha256:request-prompt",
+        ),
+        backend_mode="codex_cli",
+        workspace=str(tmp_path / "worker"),
+        main_worktree=str(tmp_path / "main"),
+        dispatch_gate=gate,
+    )
+
+    result = validate_one_hop_execution_gate(request)
+
+    assert result["allowed"] is False
+    assert "route identity" in result["error"]
+    mismatch_fields = {item["field"] for item in result["route_identity_mismatches"]}
+    assert mismatch_fields == {
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+    }
+
+
+def test_observer_dogfood_execute_rejects_missing_materialized_worktree(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(main, _dogfood_args(tmp_path)[:-1] + ["--execute", "--json-output"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["status"] == "rejected"
+    assert payload["execute"] is True
+    assert payload["calls_models"] is False
+    assert payload["auth_status"] == "not_invoked"
+    assert payload["execute_preflight"]["allowed"] is False
+    assert "isolated real git worktree" in payload["execute_preflight"]["error"]
+    assert "observer_run" not in payload
+
+
+def test_observer_dogfood_execute_rejects_existing_non_git_worker_directory(tmp_path):
+    runner = CliRunner()
+    args = _dogfood_args(tmp_path)
+    plan_result = runner.invoke(main, args)
+    assert plan_result.exit_code == 0, plan_result.output
+    planned = json.loads(plan_result.output)
+    worker_dir = Path(planned["runtime_context"]["worktree_path"])
+    worker_dir.mkdir(parents=True)
+
+    result = runner.invoke(main, args[:-1] + ["--execute", "--json-output"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["calls_models"] is False
+    assert payload["execute_preflight"]["allowed"] is False
+    status = payload["execute_preflight"]["worktree_status"]
+    assert status["exists"] is True
+    assert status["git_marker_exists"] is False
+    assert status["is_git_worktree"] is False
+    assert "observer_run" not in payload
+
+
+def test_observer_dogfood_materialize_worktree_creates_real_git_worktree_without_model_call(tmp_path):
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init"], repo)
+    (repo / "README.md").write_text("dogfood materialization fixture\n", encoding="utf-8")
+    _git(["add", "README.md"], repo)
+    _git(
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial fixture",
+        ],
+        repo,
+    )
+    commit = _git(["rev-parse", "HEAD"], repo)
+    args = _dogfood_args(tmp_path, main_worktree=repo)
+    args = _replace_option(args, "--workspace-root", str(repo))
+    args = _replace_option(args, "--worktree-root", ".worktrees")
+    args = _replace_option(args, "--base-commit", commit)
+    args = _replace_option(args, "--target-head-commit", commit)
+    args = _replace_option(args, "--backend-mode", "fixture")
+
+    result = runner.invoke(main, args[:-1] + ["--materialize-worktree", "--json-output"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["calls_models"] is False
+    assert payload["worktree_materialization"]["materialized"] is True
+    worker_path = Path(payload["runtime_context"]["worktree_path"]).resolve()
+    assert worker_path != repo.resolve()
+    assert (worker_path / ".git").exists()
+    status = payload["worktree_materialization"]["worktree_status"]
+    assert status["is_git_worktree"] is True
+    assert status["differs_from_main_worktree"] is True
+
+
+def test_observer_dogfood_generated_worker_workspace_differs_from_main(tmp_path):
+    runner = CliRunner()
+    main_worktree = tmp_path / "main"
+
+    result = runner.invoke(main, _dogfood_args(tmp_path, main_worktree=main_worktree))
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    worker_workspace = Path(payload["runtime_context"]["worktree_path"]).resolve()
+    assert worker_workspace != main_worktree.resolve()
+
+
 def _git(args: list[str], cwd):
     proc = subprocess.run(
         ["git", *args],

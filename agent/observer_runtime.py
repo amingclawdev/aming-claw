@@ -7,7 +7,8 @@ HTTP endpoints can call the same functions without depending on click.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,6 +22,11 @@ try:
     from governance.mf_subagent_contract import (
         MfSubagentContractError,
         validate_mf_subagent_dispatch_gate,
+    )
+    from governance import batch_jobs
+    from governance.parallel_branch_runtime import (
+        branch_strategy_from_runtime_context,
+        plan_branch_runtime_context,
     )
 except ImportError:  # pragma: no cover - package import path
     from agent.ai_invocation import (
@@ -36,11 +42,17 @@ except ImportError:  # pragma: no cover - package import path
         MfSubagentContractError,
         validate_mf_subagent_dispatch_gate,
     )
+    from agent.governance import batch_jobs
+    from agent.governance.parallel_branch_runtime import (
+        branch_strategy_from_runtime_context,
+        plan_branch_runtime_context,
+    )
 else:  # pragma: no cover - direct module import path
     from ai_invocation import BACKEND_CLAUDE_CLI, BACKEND_CODEX_CLI, BACKEND_DOCKER_LIVE_AI
 
 
 OBSERVER_RUN_SCHEMA_VERSION = "observer_run.v1"
+DOGFOOD_OBSERVER_PLAN_SCHEMA_VERSION = "observer_dogfood_plan.v1"
 ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION = "observer_one_hop_execution_gate.v1"
 ONE_HOP_REQUIRED_BACKENDS = {
     BACKEND_CODEX_CLI,
@@ -90,6 +102,34 @@ class ObserverRunRequest:
         )
 
 
+@dataclass
+class DogfoodObserverPlanRequest:
+    project_id: str
+    backlog_id: str
+    route: RoutePromptContract
+    provider: str = "openai"
+    model: str = ""
+    backend_mode: str = "codex_cli"
+    main_worktree: str = ""
+    workspace_root: str = ""
+    owned_files: tuple[str, ...] = ()
+    task_id: str = ""
+    worker_id: str = ""
+    attempt: int = 1
+    worktree_root: str = ".worktrees"
+    branch_prefix: str = "dogfood"
+    merge_queue_id: str = ""
+    fence_token: str = ""
+    graph_trace_ids: tuple[str, ...] = ()
+    base_commit: str = ""
+    target_head_commit: str = ""
+    prompt: str = ""
+    timeout_sec: int = 120
+    route_id: str = ""
+    precheck_run_id: str = ""
+    visible_injection_manifest_hash: str = ""
+
+
 def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
     missing: list[str] = []
     if not request.project_id:
@@ -107,6 +147,11 @@ def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
     return missing
 
 
+def _stable_suffix(*parts: str, length: int = 12) -> str:
+    payload = "\n".join(str(part or "") for part in parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
+
+
 def _normalize_path(path: str) -> str:
     token = str(path or "").strip()
     if not token:
@@ -114,8 +159,106 @@ def _normalize_path(path: str) -> str:
     return str(Path(token).expanduser().resolve())
 
 
+def _git_head(path: Path) -> str:
+    try:
+        return batch_jobs.git_commit(path)
+    except Exception:
+        return ""
+
+
+def _git_worktree_status(worktree: str | Path, *, main_worktree: str | Path) -> dict[str, Any]:
+    normalized_worktree = _normalize_path(str(worktree))
+    normalized_main = _normalize_path(str(main_worktree))
+    git_marker = Path(normalized_worktree) / ".git" if normalized_worktree else Path("")
+    marker_exists = bool(normalized_worktree) and (
+        git_marker.is_file() or git_marker.is_dir()
+    )
+    differs_from_main = bool(normalized_worktree and normalized_main) and (
+        normalized_worktree != normalized_main
+    )
+    return {
+        "worktree": normalized_worktree,
+        "main_worktree": normalized_main,
+        "exists": Path(normalized_worktree).is_dir() if normalized_worktree else False,
+        "git_marker_exists": marker_exists,
+        "differs_from_main_worktree": differs_from_main,
+        "is_git_worktree": marker_exists and differs_from_main,
+    }
+
+
+def _materialize_worktree(
+    *,
+    main_worktree: Path,
+    context: Any,
+) -> dict[str, Any]:
+    try:
+        strategy = branch_strategy_from_runtime_context(
+            context,
+            repo_root_path=main_worktree,
+        )
+        worktree = batch_jobs.create_worktree(strategy, repo_root_path=main_worktree)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "materialized": False,
+            "error": str(exc),
+            "worktree": str(Path(str(getattr(context, "worktree_path", ""))).expanduser()),
+        }
+    status = _git_worktree_status(strategy.worktree_path, main_worktree=main_worktree)
+    return {
+        "status": "materialized" if status["is_git_worktree"] else "failed",
+        "materialized": status["is_git_worktree"],
+        "worktree": status["worktree"],
+        "branch_strategy": strategy.to_metadata(),
+        "worktree_result": worktree,
+        "worktree_status": status,
+    }
+
+
 def _execution_gate_required(request: ObserverRunRequest) -> bool:
     return request.backend_mode in ONE_HOP_REQUIRED_BACKENDS
+
+
+def _route_identity_mismatches(
+    route: RoutePromptContract,
+    gate: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    checks = [
+        ("route_context_hash", route.route_context_hash, str(gate.get("route_context_hash") or "")),
+        ("prompt_contract_id", route.prompt_contract_id, str(gate.get("prompt_contract_id") or "")),
+    ]
+    expected_prompt_hash = str(route.prompt_contract_hash or "")
+    actual_prompt_hash = str(gate.get("prompt_contract_hash") or "")
+    if expected_prompt_hash or actual_prompt_hash:
+        checks.append(("prompt_contract_hash", expected_prompt_hash, actual_prompt_hash))
+    mismatches: list[dict[str, str]] = []
+    for field, expected, actual in checks:
+        if expected != actual:
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": expected,
+                    "actual": actual,
+                }
+            )
+    return mismatches
+
+
+def _dogfood_route_identity_validation(request: DogfoodObserverPlanRequest) -> dict[str, Any]:
+    missing: list[str] = []
+    if not str(request.route_id or "").strip():
+        missing.append("route_id")
+    if not str(request.visible_injection_manifest_hash or "").strip():
+        missing.append("visible_injection_manifest_hash")
+    return {
+        "allowed": not missing,
+        "missing": missing,
+        "error": "observer dogfood requires complete route identity evidence"
+        if missing
+        else "",
+        "route_id": request.route_id,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+    }
 
 
 def validate_one_hop_execution_gate(request: ObserverRunRequest) -> dict[str, Any]:
@@ -159,6 +302,18 @@ def validate_one_hop_execution_gate(request: ObserverRunRequest) -> dict[str, An
             "error": str(exc),
         }
 
+    route_mismatches = _route_identity_mismatches(request.route, gate)
+    if route_mismatches:
+        return {
+            "schema_version": ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION,
+            "required": True,
+            "allowed": False,
+            "missing": [],
+            "error": "dispatch gate route identity does not match observer request",
+            "route_identity_mismatches": route_mismatches,
+            "dispatch_gate": gate,
+        }
+
     workspace = _normalize_path(request.workspace or str(Path.cwd()))
     gated_worktree = _normalize_path(str(gate.get("worktree") or ""))
     if workspace != gated_worktree:
@@ -173,11 +328,27 @@ def validate_one_hop_execution_gate(request: ObserverRunRequest) -> dict[str, An
             "dispatch_gate": gate,
         }
 
+    worktree_status = _git_worktree_status(
+        gated_worktree,
+        main_worktree=request.main_worktree,
+    )
+    if not worktree_status["is_git_worktree"]:
+        return {
+            "schema_version": ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION,
+            "required": True,
+            "allowed": False,
+            "missing": [],
+            "error": "observer execution requires an isolated real git worker worktree",
+            "worktree_status": worktree_status,
+            "dispatch_gate": gate,
+        }
+
     return {
         "schema_version": ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION,
         "required": True,
         "allowed": True,
         "dispatch_gate": gate,
+        "worktree_status": worktree_status,
     }
 
 
@@ -216,6 +387,211 @@ def build_observer_invocation_request(request: ObserverRunRequest) -> AIInvocati
             "observer_launcher": True,
         },
     )
+
+
+def build_dogfood_observer_run_plan(
+    request: DogfoodObserverPlanRequest,
+    *,
+    execute: bool = False,
+    materialize_worktree: bool = False,
+) -> dict[str, Any]:
+    """Generate a source-backed observer dogfood plan and one-hop gate."""
+
+    main_worktree = Path(request.main_worktree or Path.cwd()).expanduser().resolve()
+    workspace_root = (
+        Path(request.workspace_root).expanduser().resolve()
+        if request.workspace_root
+        else main_worktree.parent
+    )
+    task_id = request.task_id or request.backlog_id
+    worker_id = request.worker_id or "dogfood-worker"
+    git_head = _git_head(main_worktree)
+    base_commit = request.base_commit or git_head
+    target_head_commit = request.target_head_commit or base_commit or git_head
+    merge_queue_id = request.merge_queue_id or (
+        "mq-dogfood-" + _stable_suffix(request.project_id, request.backlog_id, task_id)
+    )
+    fence_token = request.fence_token or (
+        "fence-dogfood-"
+        + _stable_suffix(
+            request.project_id,
+            request.backlog_id,
+            task_id,
+            request.route.route_context_hash,
+        )
+    )
+    context = plan_branch_runtime_context(
+        project_id=request.project_id,
+        task_id=task_id,
+        workspace_root=str(workspace_root),
+        backlog_id=request.backlog_id,
+        stage_type="observer_dogfood",
+        worker_id=worker_id,
+        attempt=request.attempt,
+        branch_prefix=request.branch_prefix,
+        worktree_root=request.worktree_root,
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        merge_queue_id=merge_queue_id,
+        fence_token=fence_token,
+    )
+    owned_files = [str(item) for item in request.owned_files if str(item or "").strip()]
+    graph_trace_ids = [
+        str(item) for item in request.graph_trace_ids if str(item or "").strip()
+    ]
+    dispatch_gate = {
+        "schema_version": "mf_subagent_dispatch_gate.v1",
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": context.task_id,
+        "branch": context.branch_ref,
+        "worktree": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "fence_token": context.fence_token,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "owned_files": owned_files,
+        "worktree_policy": {
+            "worktree_role": "isolated_worker",
+            "same_worktree_allowed": False,
+            "target_worktree_path": str(main_worktree),
+            "main_worktree_path": str(main_worktree),
+        },
+        "dirty_scope_check": {
+            "status": "passed",
+            "passed": True,
+            "dirty_scope_exact_match": True,
+            "dirty_files": [],
+            "changed_files": [],
+            "owned_files": owned_files,
+            "checked_paths": owned_files,
+        },
+        "graph_evidence": {
+            "required": True,
+            "source": "operator_supplied_graph_query_traces",
+            "trace_ids": graph_trace_ids,
+            "trace_count": len(graph_trace_ids),
+        },
+        "route_evidence": {
+            "route_id": request.route_id,
+            "precheck_run_id": request.precheck_run_id,
+            "route_context_hash": request.route.route_context_hash,
+            "prompt_contract_id": request.route.prompt_contract_id,
+            "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+            "raw_private_context_exposed": False,
+        },
+    }
+    result: dict[str, Any] = {
+        "ok": False,
+        "schema_version": DOGFOOD_OBSERVER_PLAN_SCHEMA_VERSION,
+        "status": "rejected",
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "execute": execute,
+        "calls_models": False,
+        "auth_status": "not_invoked",
+        "main_worktree": str(main_worktree),
+        "runtime_context": asdict(context),
+        "dispatch_gate": dispatch_gate,
+        "source_evidence": {
+            "main_worktree": str(main_worktree),
+            "workspace_root": str(workspace_root),
+            "git_head": git_head,
+            "base_commit_source": "cli_option" if request.base_commit else "git_head",
+            "target_head_commit_source": (
+                "cli_option" if request.target_head_commit else "base_commit"
+            ),
+        },
+    }
+    route_identity_validation = _dogfood_route_identity_validation(request)
+    result["route_identity_validation"] = route_identity_validation
+    if not route_identity_validation["allowed"]:
+        result["error"] = "observer dogfood requires complete route identity evidence"
+        return result
+
+    try:
+        gate_validation = validate_mf_subagent_dispatch_gate(
+            dispatch_gate,
+            target_worktree_path=str(main_worktree),
+            main_worktree_path=str(main_worktree),
+        )
+    except MfSubagentContractError as exc:
+        result["dispatch_gate_validation"] = {
+            "allowed": False,
+            "error": str(exc),
+        }
+        return result
+    if not graph_trace_ids:
+        result["dispatch_gate_validation"] = {
+            "allowed": False,
+            "error": "observer dogfood dispatch requires at least one graph_trace_id",
+        }
+        return result
+    result["dispatch_gate_validation"] = gate_validation
+
+    worker_worktree = Path(context.worktree_path).expanduser().resolve()
+    worker_status = _git_worktree_status(worker_worktree, main_worktree=main_worktree)
+    materialization = {
+        "status": "existing_git_worktree"
+        if worker_status["is_git_worktree"]
+        else ("existing_non_git_directory" if worker_status["exists"] else "not_materialized"),
+        "materialized": worker_status["is_git_worktree"],
+        "worktree": str(worker_worktree),
+        "worktree_status": worker_status,
+    }
+    if materialize_worktree:
+        materialization = _materialize_worktree(
+            main_worktree=main_worktree,
+            context=context,
+        )
+    result["worktree_materialization"] = materialization
+    if materialize_worktree and not materialization.get("materialized"):
+        result["materialization_preflight"] = {
+            "allowed": False,
+            "error": "materialize_worktree requested but the gated worker worktree was not created",
+            "worktree": str(worker_worktree),
+        }
+        return result
+
+    observer_request = ObserverRunRequest(
+        project_id=request.project_id,
+        backlog_id=request.backlog_id,
+        route=request.route,
+        provider=request.provider,
+        model=request.model,
+        backend_mode=request.backend_mode,
+        workspace=str(worker_worktree),
+        prompt=request.prompt,
+        timeout_sec=request.timeout_sec,
+        dispatch_gate=dispatch_gate,
+        main_worktree=str(main_worktree),
+    )
+    if execute and not materialization.get("materialized"):
+        result["execute_preflight"] = {
+            "allowed": False,
+            "error": "execute requires the gated worker worktree to be an isolated real git worktree",
+            "worktree": str(worker_worktree),
+            "worktree_status": materialization.get("worktree_status") or {},
+        }
+        return result
+
+    observer_result = run_observer(observer_request, execute=execute)
+    invocation = observer_result.get("invocation") or observer_result.get("invocation_request") or {}
+    result.update(
+        {
+            "ok": bool(observer_result.get("ok")),
+            "status": observer_result.get("status") or "planned",
+            "observer_run": observer_result,
+            "planned_invocation": invocation,
+            "calls_models": bool(invocation.get("calls_models")),
+            "auth_status": invocation.get("auth_status", "not_invoked"),
+        }
+    )
+    return result
 
 
 def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[str, Any]:

@@ -13,6 +13,7 @@ Usage:
     aming-claw launcher        - write a local launcher HTML artifact
     aming-claw run-executor    - start executor worker
     aming-claw observer run    - build or execute route-bound observer invocation
+    aming-claw observer dogfood - plan controlled dogfood observer/subagent run
     aming-claw mf precommit-check - run MF pre-commit guards
     aming-claw mf dispatch-gate - validate MF subagent dispatch evidence
 """
@@ -590,6 +591,149 @@ def observer_run(
         click.echo(f"route: {route_context_hash}")
         if not result.get("ok"):
             click.echo("missing: " + ", ".join(result.get("missing") or []), err=True)
+    if not result.get("ok"):
+        raise click.exceptions.Exit(1)
+
+
+@observer.command("dogfood")
+@click.option("--project-id", required=True, help="Governance project id.")
+@click.option("--backlog-id", required=True, help="Backlog id the observer will supervise.")
+@click.option("--route-context-hash", required=True, help="Route context hash for this observer run.")
+@click.option("--prompt-contract-id", required=True, help="Prompt contract id for this observer run.")
+@click.option("--prompt-contract-hash", default="", help="Optional prompt contract hash.")
+@click.option("--route-token-ref", default="", help="Optional route token id/ref.")
+@click.option("--route-id", default="", help="Route id for route-owned dogfood evidence.")
+@click.option("--precheck-run-id", default="", help="Optional judgment topology precheck id for evidence.")
+@click.option("--visible-injection-manifest-hash", default="", help="Visible injection manifest hash for route-owned dogfood evidence.")
+@click.option("--provider", default="openai", help="Provider name, e.g. openai or anthropic.")
+@click.option("--model", default="", help="Optional provider model override.")
+@click.option("--backend-mode", default="codex_cli", help="Invocation backend, e.g. codex_cli, claude_cli, openai_api, anthropic_api.")
+@click.option("--main-worktree", default="", help="Target/main worktree path blocked by dispatch policy. Defaults to cwd.")
+@click.option("--workspace-root", default="", help="Parent workspace root for generated worker worktrees. Defaults to main worktree parent.")
+@click.option("--owned-file", "owned_files", multiple=True, required=True, help="Owned file fence for the worker. Repeatable.")
+@click.option("--task-id", default="", help="Worker task id. Defaults to backlog id.")
+@click.option("--worker-id", default="", help="Worker id used in deterministic worktree planning.")
+@click.option("--attempt", default=1, type=int, help="Worker attempt number.")
+@click.option("--worktree-root", default=".worktrees", help="Worktree root under workspace-root.")
+@click.option("--branch-prefix", default="dogfood", help="Generated branch prefix.")
+@click.option("--merge-queue-id", default="", help="Merge queue id. Defaults to a deterministic dogfood id.")
+@click.option("--fence-token", default="", help="Fence token. Defaults to a deterministic dogfood token.")
+@click.option("--graph-trace-id", "graph_trace_ids", multiple=True, required=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
+@click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
+@click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
+@click.option("--gate-output", "--gate-output-path", "gate_output", default="", type=click.Path(dir_okay=False), help="Optional path to write generated dispatch gate JSON.")
+@click.option("--materialize-worktree", is_flag=True, help="Create the gated worker worktree before planning/execution.")
+@click.option("--execute", is_flag=True, help="Invoke the configured provider after gate and worktree preflight. Default is dry-run evidence only.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def observer_dogfood(
+    project_id,
+    backlog_id,
+    route_context_hash,
+    prompt_contract_id,
+    prompt_contract_hash,
+    route_token_ref,
+    route_id,
+    precheck_run_id,
+    visible_injection_manifest_hash,
+    provider,
+    model,
+    backend_mode,
+    main_worktree,
+    workspace_root,
+    owned_files,
+    task_id,
+    worker_id,
+    attempt,
+    worktree_root,
+    branch_prefix,
+    merge_queue_id,
+    fence_token,
+    graph_trace_ids,
+    base_commit,
+    target_head_commit,
+    gate_output,
+    materialize_worktree,
+    execute,
+    json_output,
+):
+    """Plan or execute a controlled source-backed dogfood observer run."""
+    from agent.ai_invocation import RoutePromptContract
+    from agent.observer_runtime import (
+        DogfoodObserverPlanRequest,
+        build_dogfood_observer_run_plan,
+    )
+
+    request = DogfoodObserverPlanRequest(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route=RoutePromptContract(
+            route_context_hash=route_context_hash,
+            prompt_contract_id=prompt_contract_id,
+            prompt_contract_hash=prompt_contract_hash,
+            route_token_ref=route_token_ref,
+        ),
+        provider=provider,
+        model=model,
+        backend_mode=backend_mode,
+        main_worktree=main_worktree or os.getcwd(),
+        workspace_root=workspace_root,
+        owned_files=tuple(owned_files),
+        task_id=task_id,
+        worker_id=worker_id,
+        attempt=attempt,
+        worktree_root=worktree_root,
+        branch_prefix=branch_prefix,
+        merge_queue_id=merge_queue_id,
+        fence_token=fence_token,
+        graph_trace_ids=tuple(graph_trace_ids),
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        route_id=route_id,
+        precheck_run_id=precheck_run_id,
+        visible_injection_manifest_hash=visible_injection_manifest_hash,
+    )
+    result = build_dogfood_observer_run_plan(
+        request,
+        execute=execute,
+        materialize_worktree=materialize_worktree,
+    )
+    if gate_output:
+        route_allowed = bool((result.get("route_identity_validation") or {}).get("allowed", True))
+        gate_allowed = bool((result.get("dispatch_gate_validation") or {}).get("allowed", False))
+        if route_allowed and gate_allowed:
+            gate_path = Path(gate_output)
+            gate_path.parent.mkdir(parents=True, exist_ok=True)
+            gate_path.write_text(
+                json.dumps(result.get("dispatch_gate") or {}, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            result["gate_output"] = str(gate_path)
+        else:
+            result["gate_output_skipped"] = {
+                "path": gate_output,
+                "reason": "route_identity_or_dispatch_gate_validation_failed",
+                "route_identity_allowed": route_allowed,
+                "dispatch_gate_allowed": gate_allowed,
+            }
+    if json_output:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        click.echo(f"observer dogfood: {result.get('status')} project={project_id} backlog={backlog_id}")
+        click.echo(f"execute={execute} calls_models={result.get('calls_models')}")
+        runtime_context = result.get("runtime_context") or {}
+        if runtime_context.get("worktree_path"):
+            click.echo(f"worktree: {runtime_context.get('worktree_path')}")
+        if gate_output:
+            click.echo(f"gate: {gate_output}")
+        if not result.get("ok"):
+            validation = (
+                result.get("route_identity_validation")
+                or result.get("dispatch_gate_validation")
+                or result.get("materialization_preflight")
+                or result.get("execute_preflight")
+                or {}
+            )
+            click.echo(f"error: {validation.get('error', 'observer dogfood rejected')}", err=True)
     if not result.get("ok"):
         raise click.exceptions.Exit(1)
 
