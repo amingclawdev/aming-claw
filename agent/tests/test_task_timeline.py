@@ -1625,6 +1625,10 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("route.prompt_alert_bundle", [
             action["command"] for action in reminder["next_actions"]
         ])
+        support_context = reminder["boundary"]["supporting_context_not_route_token"]
+        self.assertIn("private_route_provider_context", support_context)
+        self.assertNotIn("judgment_brain", support_context)
+        self.assertNotIn("judgment_brain", repr(reminder))
 
         advisory_only = task_timeline.mf_close_gate_verification(
             [
