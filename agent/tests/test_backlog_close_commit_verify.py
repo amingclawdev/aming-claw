@@ -54,6 +54,7 @@ def _route_context_consumption_events():
         "route_context_hash": "sha256:test-route-context",
         "prompt_contract_id": "prompt-contract-backlog-close",
         "prompt_contract_hash": "sha256:test-prompt-contract",
+        "visible_injection_manifest_hash": "sha256:test-visible-manifest",
     }
     return [
         {
@@ -408,6 +409,49 @@ def test_mf_close_instantiated_contract_missing_e2e_is_blocked(_mock_subprocess,
 
     assert exc_info.value.code == "mf_timeline_gate_failed"
     assert "dashboard_e2e" in str(exc_info.value)
+
+
+@patch("agent.governance.server.subprocess.run")
+def test_mf_close_subagent_lane_requirement_missing_is_reported(_mock_subprocess, _mock_db, _mock_audit):
+    """Close errors include missing bounded subagent lane ownership evidence."""
+    from agent.governance.errors import GovernanceError
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    _mock_db.execute.return_value.fetchone.return_value = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "mf_type": "observer_hotfix",
+        "bypass_policy_json": "{}",
+        "chain_stage": "",
+        "chain_trigger_json": {
+            "route_id": "route-lane-required",
+            "route_context_hash": "sha256:lane-required",
+            "required_lanes": [
+                {"id": "bounded_implementation_subagent", "role": "implementation_worker"},
+            ],
+            "blocked_actions": ["edit_files_as_observer_or_independent_reviewer"],
+        },
+    }
+    events = [
+        {
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "actor": "codex-observer",
+            "status": "accepted",
+        },
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+    ]
+    ctx = _make_ctx(commit="abc123")
+
+    with patch("agent.governance.task_timeline.list_events", return_value=events):
+        with pytest.raises(GovernanceError) as exc_info:
+            handle_backlog_close(ctx)
+
+    assert exc_info.value.code == "mf_timeline_gate_failed"
+    assert "bounded_implementation_subagent.dispatch" in str(exc_info.value)
+    assert "bounded_implementation_subagent.review_ready" in str(exc_info.value)
 
 
 @patch("agent.governance.server.subprocess.run")

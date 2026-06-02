@@ -105,6 +105,10 @@ MF_CLOSE_PASS_STATUSES = {
 }
 
 MF_CONTRACT_SCHEMA_VERSION = "mf_contract_gate.v1"
+MF_LANE_OWNERSHIP_SCHEMA_VERSION = "mf_lane_ownership_gate.v1"
+MF_BOUNDED_SUBAGENT_LANE_ID = "bounded_implementation_subagent"
+MF_BOUNDED_SUBAGENT_DISPATCH_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.dispatch"
+MF_BOUNDED_SUBAGENT_REVIEW_READY_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.review_ready"
 
 MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION = "mf_route_context_consumption_gate.v1"
 MF_CLOSE_MISSING_GROUPS_SCHEMA_VERSION = "mf_close_missing_evidence_groups.v1"
@@ -222,6 +226,30 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 def _list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _normalize_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "accepted",
+            "approved",
+            "ok",
+            "passed",
+            "succeeded",
+        }
+    return bool(value)
 
 
 def _scenario_spec(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1364,6 +1392,18 @@ def mf_contract_gate_verification(
             "status": event.get("status"),
             "requirement_ids": sorted(ids),
         })
+    exception_ids, exception_event = _observer_direct_exception_contract_evidence(
+        rows,
+        contract,
+        requirements,
+    )
+    if exception_ids:
+        present.update(exception_ids)
+        evidence_events.append({
+            **exception_event,
+            "requirement_ids": sorted(exception_ids),
+            "source": "observer_direct_implementation_exception",
+        })
     missing = [req_id for req_id in required_ids if req_id not in present]
     root = _contract_root(contract)
     return {
@@ -1383,6 +1423,599 @@ def mf_contract_gate_verification(
             "has_contract": bool(root),
             "required_count": len(required_ids),
             "missing_count": len(missing),
+        },
+    }
+
+
+def _contract_walk(value: Any, *, depth: int = 0, max_depth: int = 4):
+    if depth > max_depth:
+        return
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _contract_walk(child, depth=depth + 1, max_depth=max_depth)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _contract_walk(child, depth=depth + 1, max_depth=max_depth)
+
+
+def _compact_contract_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return repr(value)
+
+
+def _contract_signal(signals: list[dict[str, Any]], seen: set[tuple[str, str]], *, source: str, value: Any) -> None:
+    compact = _compact_contract_value(value)
+    key = (source, compact)
+    if key in seen:
+        return
+    seen.add(key)
+    signals.append({"source": source, "value": compact})
+
+
+def _subagent_requirement_marker(value: Any) -> bool:
+    text = _normalize_token(_compact_contract_value(value))
+    if any(
+        marker in text
+        for marker in (
+            "bounded_implementation_subagent",
+            "bounded_subagent",
+            "mf_sub",
+            "mf_subagent",
+        )
+    ):
+        return True
+    return "subagent" in text and "implementation" in text
+
+
+def _required_lane_requires_subagent(item: Any) -> bool:
+    if isinstance(item, dict) and item.get("required") is False:
+        return False
+    if not _subagent_requirement_marker(item):
+        return False
+    item_map = _mapping(item)
+    role = _normalize_token(
+        item_map.get("role")
+        or item_map.get("worker_role")
+        or item_map.get("type")
+        or item_map.get("kind")
+    )
+    return not role or role in {
+        "implementation",
+        "implementation_worker",
+        "worker",
+        "mf_sub",
+        "subagent",
+        "bounded_implementation_subagent",
+    }
+
+
+def _required_evidence_requires_subagent(item: Any) -> bool:
+    item_map = _mapping(item)
+    if item_map and item_map.get("required") is False:
+        return False
+    text = _normalize_token(_compact_contract_value(item))
+    if any(
+        marker in text
+        for marker in (
+            "bounded_implementation_subagent",
+            "bounded_subagent_dispatch",
+            "mf_subagent_dispatch",
+            "mf_subagent_handoff",
+            "mf_sub",
+        )
+    ):
+        return True
+    return "subagent_id" in text and "implementation" in text
+
+
+def _lane_contract_requirement_id(value: Any) -> bool:
+    text = _normalize_token(_compact_contract_value(value))
+    return any(
+        marker in text
+        for marker in (
+            "bounded_implementation_subagent",
+            "bounded_subagent",
+            "mf_subagent",
+            "mf_sub",
+            "subagent_dispatch",
+            "subagent_handoff",
+            "subagent_review_ready",
+            "subagent_id",
+            "implementation_worker",
+            "worker_or_subagent_evidence",
+        )
+    )
+
+
+def _lane_related_contract_requirement_ids(requirements: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for requirement in requirements:
+        req_id = str(requirement.get("id") or "").strip()
+        if not req_id:
+            continue
+        if (
+            _lane_contract_requirement_id(req_id)
+            or _required_evidence_requires_subagent(requirement)
+        ):
+            ids.add(req_id)
+    return ids
+
+
+def _blocked_action_requires_subagent(action: Any) -> bool:
+    text = _normalize_token(action)
+    return any(
+        marker in text
+        for marker in (
+            "edit_files_as_observer_or_independent_reviewer",
+            "close_without_worker_or_subagent_evidence",
+            "observer_direct_implementation",
+            "observer_direct_file_edit",
+            "edit_files_as_observer",
+        )
+    )
+
+
+def _policy_text_requires_subagent(value: Any) -> bool:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if not text:
+        return False
+    has_subagent = (
+        ("bounded" in text and "subagent" in text)
+        or "bounded_implementation_subagent" in text
+        or "mf_sub" in text
+    )
+    has_requirement_language = any(
+        marker in text
+        for marker in (
+            "must",
+            "required",
+            "requires",
+            "block",
+            "blocked",
+            "not directly",
+            "not_directly",
+        )
+    )
+    return has_subagent and has_requirement_language
+
+
+def _mf_lane_ownership_requirements(contract: dict[str, Any] | None) -> dict[str, Any]:
+    root = _contract_root(contract)
+    data = _mapping(contract)
+    if not root and not data:
+        return {
+            "subagent_required": False,
+            "required_lane_ownership_ids": [],
+            "requirement_signals": [],
+        }
+
+    signals: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for obj in _contract_walk(data or root):
+        for item in _list(obj.get("required_lanes")):
+            if _required_lane_requires_subagent(item):
+                _contract_signal(signals, seen, source="required_lanes", value=item)
+        for key in ("required_evidence", "evidence_requirements", "required_evidence_ids"):
+            for item in _list(obj.get(key)):
+                if _required_evidence_requires_subagent(item):
+                    _contract_signal(signals, seen, source=key, value=item)
+        for item in _string_list(obj.get("blocked_actions")):
+            if _blocked_action_requires_subagent(item):
+                _contract_signal(signals, seen, source="blocked_actions", value=item)
+        for key in (
+            "implementation_policy",
+            "execution_policy",
+            "lane_policy",
+            "observer_policy",
+        ):
+            if _policy_text_requires_subagent(obj.get(key)):
+                _contract_signal(signals, seen, source=key, value=obj.get(key))
+
+    for requirement in mf_contract_requirements(contract):
+        if requirement.get("required", True) and _required_evidence_requires_subagent(requirement):
+            _contract_signal(signals, seen, source="contract_requirement", value=requirement)
+
+    required = bool(signals)
+    return {
+        "subagent_required": required,
+        "required_lane_ownership_ids": [MF_BOUNDED_SUBAGENT_LANE_ID] if required else [],
+        "requirement_signals": signals,
+    }
+
+
+def _contract_route_identity(contract: dict[str, Any] | None) -> dict[str, list[str]]:
+    route_ids: set[str] = set()
+    route_hashes: set[str] = set()
+    for obj in _contract_walk(_mapping(contract)):
+        for key in ("route_id", "execution_route_id", "audit_route_id"):
+            value = str(obj.get(key) or "").strip()
+            if value:
+                route_ids.add(value)
+        for key in (
+            "route_context_hash",
+            "execution_route_context_hash",
+            "audit_route_context_hash",
+        ):
+            value = str(obj.get(key) or "").strip()
+            if value:
+                route_hashes.add(value)
+    return {
+        "route_ids": sorted(route_ids),
+        "route_context_hashes": sorted(route_hashes),
+    }
+
+
+def _event_passed(event: dict[str, Any]) -> bool:
+    status = str(event.get("status") or "").strip().lower()
+    return status in MF_CLOSE_PASS_STATUSES
+
+
+def _field_values(value: Any, keys: set[str], *, depth: int = 0, max_depth: int = 4) -> list[Any]:
+    if depth > max_depth:
+        return []
+    values: list[Any] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in keys:
+                values.append(child)
+            values.extend(_field_values(child, keys, depth=depth + 1, max_depth=max_depth))
+    elif isinstance(value, list):
+        for child in value:
+            values.extend(_field_values(child, keys, depth=depth + 1, max_depth=max_depth))
+    return values
+
+
+def _event_field_values(event: dict[str, Any], keys: set[str]) -> list[Any]:
+    values: list[Any] = []
+    for container in (
+        _mapping(event),
+        _mapping(event.get("payload")),
+        _mapping(event.get("verification")),
+        _mapping(event.get("artifact_refs")),
+    ):
+        values.extend(_field_values(container, keys))
+    return values
+
+
+def _first_event_string(event: dict[str, Any], keys: set[str]) -> str:
+    for value in _event_field_values(event, keys):
+        if isinstance(value, (dict, list)):
+            continue
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _event_key_text(event: dict[str, Any]) -> str:
+    keys: list[str] = []
+    for container in (
+        _mapping(event.get("payload")),
+        _mapping(event.get("verification")),
+        _mapping(event.get("artifact_refs")),
+    ):
+        keys.extend(str(key) for key in container.keys())
+    return _normalize_token(" ".join(keys))
+
+
+def _event_lane_text(event: dict[str, Any]) -> str:
+    fields = [
+        event.get("event_type"),
+        event.get("phase"),
+        event.get("event_kind"),
+        event.get("actor"),
+        event.get("decision"),
+        event.get("task_id"),
+        event.get("trace_id"),
+    ]
+    for key in (
+        "worker_role",
+        "role",
+        "required_dispatch_key",
+        "bounded_implementation_subagent_id",
+        "subagent_id",
+        "agent_id",
+        "worker_id",
+        "lane",
+        "stop_state",
+        "worker_status",
+    ):
+        fields.extend(
+            str(value)
+            for value in _event_field_values(event, {key})
+            if not isinstance(value, (dict, list))
+        )
+    return _normalize_token(" ".join(str(field or "") for field in fields))
+
+
+def _event_has_subagent_identity(event: dict[str, Any]) -> bool:
+    text = _event_lane_text(event)
+    if any(
+        marker in text
+        for marker in (
+            "bounded_subagent",
+            "bounded_implementation_subagent",
+            "mf_sub",
+            "mf_subagent",
+            "subagent",
+        )
+    ):
+        return True
+    for value in _event_field_values(event, {"worker_role", "role"}):
+        role = _normalize_token(value)
+        if role in {"mf_sub", "implementation_worker", "subagent"}:
+            return True
+    for key in (
+        "bounded_implementation_subagent_id",
+        "subagent_id",
+        "agent_id",
+        "worker_id",
+    ):
+        if _first_event_string(event, {key}):
+            return True
+    return False
+
+
+def _is_subagent_dispatch_event(event: dict[str, Any]) -> bool:
+    if not _event_passed(event):
+        return False
+    text = _event_lane_text(event)
+    if any(
+        _normalize_token(value) == "bounded_subagent_dispatch"
+        for value in _event_field_values(event, {"required_dispatch_key"})
+    ):
+        return True
+    if any(
+        marker in text
+        for marker in (
+            "mf_subagent.dispatch",
+            "mf_subagent_dispatch",
+            "bounded_subagent_dispatch",
+            "observer_to_subagent_dispatch",
+        )
+    ):
+        return True
+    return "dispatch" in text and _event_has_subagent_identity(event)
+
+
+def _is_subagent_review_ready_event(event: dict[str, Any]) -> bool:
+    if not _event_passed(event) or not _event_has_subagent_identity(event):
+        return False
+    text = _event_lane_text(event)
+    if any(marker in text for marker in ("review_ready", "waiting_merge", "handoff")):
+        return True
+    if any(_truthy(value) for value in _event_field_values(event, {"review_ready"})):
+        return True
+    for value in _event_field_values(event, {"stop_state", "worker_status", "state"}):
+        if _normalize_token(value) in {"review_ready", "waiting_merge"}:
+            return True
+    return False
+
+
+def _lane_event_summary(event: dict[str, Any], evidence_id: str) -> dict[str, Any]:
+    return {
+        "id": event.get("id"),
+        "event_type": event.get("event_type"),
+        "event_kind": event.get("event_kind"),
+        "phase": event.get("phase"),
+        "actor": event.get("actor"),
+        "status": event.get("status"),
+        "task_id": event.get("task_id"),
+        "trace_id": event.get("trace_id"),
+        "evidence_id": evidence_id,
+    }
+
+
+def _has_dirty_scope_evidence(event: dict[str, Any]) -> bool:
+    for value in _event_field_values(event, {"dirty_scope", "dirty_scope_check"}):
+        if value not in (None, "", {}, []):
+            return True
+    return False
+
+
+def _has_operator_approval(event: dict[str, Any]) -> bool:
+    if _first_event_string(event, {"approved_by"}):
+        return True
+    if any(_truthy(value) for value in _event_field_values(event, {"operator_approved"})):
+        return True
+    for value in _event_field_values(event, {"operator_approval", "approval"}):
+        if isinstance(value, dict):
+            if str(value.get("approved_by") or "").strip():
+                return True
+            if _truthy(value.get("operator_approved") or value.get("approved")):
+                return True
+        elif _truthy(value):
+            return True
+    return False
+
+
+def _observer_direct_exception_event(
+    event: dict[str, Any],
+    route_identity: dict[str, list[str]],
+) -> dict[str, Any]:
+    event_name = _normalize_token(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_type", "event_kind", "phase", "decision")
+        )
+    )
+    event_name = f"{event_name} {_event_key_text(event)}"
+    if "observer_direct" not in event_name or not any(
+        marker in event_name for marker in ("exception", "waiver")
+    ):
+        return {"accepted": False, "missing_fields": ["observer_direct_exception_event"]}
+
+    if not _event_passed(event):
+        return {"accepted": False, "missing_fields": ["passing_status"]}
+
+    route_ids = [
+        str(value).strip()
+        for value in _event_field_values(event, {"route_id", "execution_route_id"})
+        if str(value or "").strip()
+    ]
+    route_hashes = [
+        str(value).strip()
+        for value in _event_field_values(event, {"route_context_hash", "execution_route_context_hash"})
+        if str(value or "").strip()
+    ]
+    expected_route_ids = set(route_identity.get("route_ids") or [])
+    expected_route_hashes = set(route_identity.get("route_context_hashes") or [])
+    has_route = bool(route_ids or route_hashes)
+    route_matches = True
+    if has_route and (expected_route_ids or expected_route_hashes):
+        route_matches = bool(
+            expected_route_ids.intersection(route_ids)
+            or expected_route_hashes.intersection(route_hashes)
+        )
+    reason = _first_event_string(event, {"reason", "exception_reason", "waiver_reason"})
+    has_dirty_scope = _has_dirty_scope_evidence(event)
+    has_operator_approval = _has_operator_approval(event)
+
+    missing_fields: list[str] = []
+    if not has_route:
+        missing_fields.append("route_id_or_route_context_hash")
+    elif not route_matches:
+        missing_fields.append("matching_route_id_or_route_context_hash")
+    if not reason:
+        missing_fields.append("reason")
+    if not has_dirty_scope:
+        missing_fields.append("dirty_scope_or_dirty_scope_check")
+    if not has_operator_approval:
+        missing_fields.append("operator_approval")
+
+    accepted = not missing_fields
+    return {
+        "accepted": accepted,
+        "missing_fields": missing_fields,
+        "event": _lane_event_summary(event, "observer_direct_implementation_exception"),
+        "accepted_fields": [
+            field
+            for field, present in (
+                ("route_id_or_route_context_hash", has_route and route_matches),
+                ("reason", bool(reason)),
+                ("dirty_scope_or_dirty_scope_check", has_dirty_scope),
+                ("operator_approval", has_operator_approval),
+            )
+            if present
+        ],
+    }
+
+
+def _observer_direct_exception_contract_evidence(
+    events: list[dict[str, Any]],
+    contract: dict[str, Any] | None,
+    requirements: list[dict[str, Any]],
+) -> tuple[set[str], dict[str, Any]]:
+    lane_requirement_ids = _lane_related_contract_requirement_ids(requirements)
+    if not lane_requirement_ids:
+        return set(), {}
+
+    route_identity = _contract_route_identity(contract)
+    for raw in events:
+        event = _mapping(raw)
+        if not event:
+            continue
+        exception = _observer_direct_exception_event(event, route_identity)
+        if not exception.get("accepted"):
+            continue
+        return lane_requirement_ids, {
+            "id": event.get("id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "status": event.get("status"),
+        }
+    return set(), {}
+
+
+def mf_lane_ownership_gate_verification(
+    events: list[dict[str, Any]] | None,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate MF lane ownership when a route requires bounded subagent work."""
+
+    rows = events if isinstance(events, list) else []
+    requirements = _mf_lane_ownership_requirements(contract)
+    route_identity = _contract_route_identity(contract)
+    if not requirements["subagent_required"]:
+        return {
+            "schema_version": MF_LANE_OWNERSHIP_SCHEMA_VERSION,
+            "passed": True,
+            "status": "not_applicable",
+            "subagent_required": False,
+            "required_lane_ownership_ids": [],
+            "present_lane_ownership_ids": [],
+            "missing_lane_ownership_ids": [],
+            "requirement_signals": [],
+            "route_identity": route_identity,
+            "evidence_events": [],
+            "observer_direct_exception": {"accepted": False},
+            "checks": {
+                "has_subagent_requirement": False,
+                "has_subagent_dispatch": True,
+                "has_subagent_review_ready": True,
+                "has_observer_direct_exception": False,
+            },
+        }
+
+    dispatch_events: list[dict[str, Any]] = []
+    review_ready_events: list[dict[str, Any]] = []
+    rejected_exceptions: list[dict[str, Any]] = []
+    accepted_exception: dict[str, Any] | None = None
+    for raw in rows:
+        event = _mapping(raw)
+        if not event:
+            continue
+        if _is_subagent_dispatch_event(event):
+            dispatch_events.append(_lane_event_summary(event, MF_BOUNDED_SUBAGENT_DISPATCH_ID))
+        if _is_subagent_review_ready_event(event):
+            review_ready_events.append(
+                _lane_event_summary(event, MF_BOUNDED_SUBAGENT_REVIEW_READY_ID)
+            )
+        exception = _observer_direct_exception_event(event, route_identity)
+        if exception.get("accepted"):
+            accepted_exception = exception
+        elif exception.get("missing_fields") != ["observer_direct_exception_event"]:
+            rejected_exceptions.append(exception)
+
+    present: list[str] = []
+    if dispatch_events:
+        present.append(MF_BOUNDED_SUBAGENT_DISPATCH_ID)
+    if review_ready_events:
+        present.append(MF_BOUNDED_SUBAGENT_REVIEW_READY_ID)
+    if accepted_exception:
+        present.append("observer_direct_implementation_exception")
+
+    missing: list[str] = []
+    if not accepted_exception:
+        if not dispatch_events:
+            missing.append(MF_BOUNDED_SUBAGENT_DISPATCH_ID)
+        if not review_ready_events:
+            missing.append(MF_BOUNDED_SUBAGENT_REVIEW_READY_ID)
+
+    passed = not missing
+    return {
+        "schema_version": MF_LANE_OWNERSHIP_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "subagent_required": True,
+        "required_lane_ownership_ids": requirements["required_lane_ownership_ids"],
+        "present_lane_ownership_ids": present,
+        "missing_lane_ownership_ids": missing,
+        "requirement_signals": requirements["requirement_signals"],
+        "route_identity": route_identity,
+        "evidence_events": [*dispatch_events, *review_ready_events],
+        "observer_direct_exception": accepted_exception or {"accepted": False},
+        "rejected_observer_direct_exceptions": rejected_exceptions,
+        "checks": {
+            "has_subagent_requirement": True,
+            "has_subagent_dispatch": bool(dispatch_events),
+            "has_subagent_review_ready": bool(review_ready_events),
+            "has_observer_direct_exception": bool(accepted_exception),
         },
     }
 
@@ -1415,6 +2048,7 @@ def mf_close_gate_verification(
     missing = sorted(MF_CLOSE_REQUIRED_EVENT_KINDS - present)
     contract_gate = mf_contract_gate_verification(rows, contract)
     route_context_gate = mf_route_context_gate_verification(rows, contract)
+    lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
     missing_evidence_groups = mf_close_missing_evidence_groups(
         missing,
         route_context_gate,
@@ -1427,6 +2061,7 @@ def mf_close_gate_verification(
         not missing
         and bool(contract_gate.get("passed"))
         and bool(route_context_gate.get("passed"))
+        and bool(lane_ownership_gate.get("passed"))
     )
     return {
         "schema_version": "mf_close_timeline_gate.v1",
@@ -1439,6 +2074,7 @@ def mf_close_gate_verification(
         "ignored_required_events": ignored,
         "contract_gate": contract_gate,
         "route_context_gate": route_context_gate,
+        "lane_ownership_gate": lane_ownership_gate,
         "missing_evidence_groups": missing_evidence_groups,
         "route_context_reminder": route_context_reminder,
         "checks": {
@@ -1447,6 +2083,7 @@ def mf_close_gate_verification(
             "has_close_ready": "close_ready" in present,
             "has_contract_evidence": bool(contract_gate.get("passed")),
             "has_route_context_consumption": bool(route_context_gate.get("passed")),
+            "has_lane_ownership": bool(lane_ownership_gate.get("passed")),
         },
     }
 

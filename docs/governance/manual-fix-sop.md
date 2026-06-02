@@ -1,6 +1,6 @@
 <!-- governance-hint {"attach_to_node": {"path": "docs/governance/manual-fix-sop.md", "role": "doc", "target_area_key": "agent.governance", "target_node_id": "L3.13", "target_subsystem_key": "workflow_orchestration", "target_title": "Workflow Orchestration"}} -->
 
-# Manual Fix SOP (Standard Operating Procedure)
+# Manual Fix SOP v7 trailer-priority (Standard Operating Procedure)
 
 > Status: DRAFT v7 - trailer-priority chain anchor + graph-first/E2E impact gate
 > Author: Observer
@@ -196,7 +196,7 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R8 | Multi-commit restart loop | Phase 4 generates additional files (audit record, execution record, node updates) | MUST re-run Phase 4 (restart governance + version_check + preflight delta) after EVERY subsequent commit. Do NOT push until final restart confirms ok=true |
 | R9 | Coverage warnings actionable | preflight_check reports unmapped files that are in the current commit | MUST either create nodes for unmapped committed files or document why they are intentionally unmapped |
 | R10 | Doc location check | Any new documentation file | MUST verify file is placed in the correct directory per project convention (e.g., governance docs in docs/governance/, dev docs in docs/dev/). Misplaced docs must be moved before commit |
-| R11 | chain anchor via trailer (trailer-priority) | Every manual fix commit | MUST author the MF commit with a `Chain-Source-Stage:` git trailer (e.g. `Chain-Source-Stage: observer-hotfix`) so it is recognized as the latest chain anchor. `handle_version_check` in `agent/governance/server.py` now uses `agent/governance/chain_trailer.py get_chain_state()` as the primary source of `chain_version` — the legacy `POST /api/version-update/{project_id}` DB-write path is **deprecated** in the trailer era and the API returns `{"deprecated_write_ignored": true, "source": "git_trailer"}` (the DB `project_version.chain_version` row is no longer authoritative). Without a trailer on HEAD, `get_chain_state()` walks first-parent back to the previous trailered commit and `HEAD != CHAIN_VERSION` blocks all dispatch through the version gate. Verify with `GET /api/version-check/{project_id}` returns `ok: true`, `dirty: false`, and `chain_version == HEAD`. Working reference: MF commit `0d4329d` (a trailered observer-hotfix that became the chain anchor). The deprecated `POST /api/version-sync` + `POST /api/version-update` flow MUST NOT be used as the primary mechanism — calling it is a DB-write no-op against chain state. |
+| R11 | chain anchor via trailer (trailer-priority) | Every manual fix commit | MUST author the MF commit with a `Chain-Source-Stage:` git trailer (e.g. `Chain-Source-Stage: observer-hotfix`) so it is recognized as the latest chain anchor. `handle_version_check` in `agent/governance/server.py` now uses `agent.governance.chain_trailer.get_chain_state` as the primary source of `chain_version` — the legacy `POST /api/version-update/{project_id}` DB-write path is **deprecated** in the trailer era and the API returns `{"deprecated_write_ignored": true, "source": "git_trailer"}` (the DB `project_version.chain_version` row is no longer authoritative). Without a trailer on HEAD, `chain_trailer.get_chain_state` walks first-parent back to the previous trailered commit and `HEAD != CHAIN_VERSION` blocks all dispatch through the version gate. Verify with `GET /api/version-check/{project_id}` returns `ok: true`, `dirty: false`, and `chain_version == HEAD`. Working reference: MF commit `0d4329d` (a trailered observer-hotfix that became the chain anchor). The deprecated `POST /api/version-sync` + `POST /api/version-update` flow MUST NOT be used as the primary mechanism — calling it is a DB-write no-op against chain state. |
 | R12 | Per-project chain history cache | Every manual fix commit | After commit, the per-project chain history cache at `agent/governance/chain_history/{project_id}.json` will be updated on next governance startup or bootstrap. Manual fixes that add commits without trailers will be detected as `legacy_inferred` entries in the cache. No manual action needed — the cache updates incrementally. |
 | R13 | Graph-first reuse check | Every AI-authored manual fix or implementation task | MUST inspect the active graph or graph snapshot for target files, nearby modules, existing nodes, and reusable subsystems before creating new modules or abstractions. The execution record must list reused graph nodes/modules or state that the graph was unavailable and why. |
 | R14 | E2E impact gate | New feature, user-visible behavior change, dashboard operator path, graph/reconcile/bootstrap/project-config behavior, semantic job/review/cancel/backlog behavior, or any change to a feature already covered by an E2E suite | MUST record an E2E impact decision before close: run or add/update the relevant E2E and record evidence, or file a follow-up backlog row when the E2E is deferred. Live-AI, DB-mutating, or human-approval E2E may be deferred, but only with an explicit backlog row and reason. |
@@ -218,6 +218,19 @@ Before `spawn_agent`, the observer MUST run and record
 each local `mf_sub` worker. The gate must pass before non-blocking dispatch and
 must prove an isolated branch/worktree/file fence, `base_commit`,
 `target_head_commit`, `fence_token`, owned files, and dirty-scope evidence.
+
+Close/precheck lane ownership is contract-driven. When `chain_trigger_json`
+requires `bounded_implementation_subagent` evidence or blocks observer-direct
+file edits, observer-authored implementation rows alone do not satisfy the MF
+close gate. Close requires passing bounded subagent dispatch evidence plus
+subagent handoff evidence at `review_ready` or `waiting_merge`. An
+observer-direct implementation exception is valid only as a passing timeline
+waiver/exception tied to `route_id` or `route_context_hash` with a reason,
+`dirty_scope` or `dirty_scope_check`, and operator approval such as
+`approved_by`, `operator_approved`, or `operator_approval`. A valid exception
+satisfies only lane/subagent ownership contract evidence ids; unrelated
+requirements such as focused tests, docs policy, E2E, or graph evidence still
+need their normal passing timeline evidence.
 
 Dispatch into the target/main worktree is blocked by default. If a
 same-worktree exception is ever used, it MUST include
@@ -644,7 +657,7 @@ This structured record enables:
 ### 6.1 Canonical MF Commit-Message Template (Trailer-Priority)
 
 Every manual fix commit MUST carry the four chain trailers below so that
-`agent/governance/chain_trailer.py get_chain_state()` recognizes the commit as
+`agent.governance.chain_trailer.get_chain_state` recognizes the commit as
 the latest chain anchor.
 Without these trailers the version gate will fall back to the previous trailered
 commit and `HEAD != CHAIN_VERSION` will block all subsequent dispatch.

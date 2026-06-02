@@ -20411,7 +20411,20 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
             else {}
         )
         missing_route_context = route_context_gate.get("missing_requirement_ids") or []
-        missing = ", ".join([*missing_event_kinds, *missing_contract, *missing_route_context])
+        lane_ownership_gate = (
+            verification.get("lane_ownership_gate")
+            if isinstance(verification.get("lane_ownership_gate"), dict)
+            else {}
+        )
+        missing_lane_ownership = lane_ownership_gate.get("missing_lane_ownership_ids") or []
+        missing = ", ".join([
+            *missing_event_kinds,
+            *missing_contract,
+            *missing_route_context,
+            *missing_lane_ownership,
+        ])
+        if not missing:
+            missing = "timeline gate failed"
         raise GovernanceError(
             "mf_timeline_gate_failed",
             f"MF backlog close requires task timeline evidence before FIXED; missing: {missing}",
