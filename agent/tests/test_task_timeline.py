@@ -101,6 +101,10 @@ def _route_context_consumption_events():
                     **ROUTE_IDENTITY,
                     "worker_id": "mf-sub-test",
                     "fence_token": "fence-test",
+                    "actual_cwd": "/repo/.worktrees/mf-sub-test",
+                    "actual_git_root": "/repo/.worktrees/mf-sub-test",
+                    "branch": "refs/heads/codex/mf-sub-test",
+                    "head_commit": "head-test",
                 }
             },
         },
@@ -174,6 +178,123 @@ def _route_context_worker_startup_event(identity=None):
                 **route_identity,
                 "worker_id": "mf-sub-test",
                 "fence_token": "fence-test",
+                "actual_cwd": "/repo/.worktrees/mf-sub-test",
+                "actual_git_root": "/repo/.worktrees/mf-sub-test",
+                "branch": "refs/heads/codex/mf-sub-test",
+                "head_commit": "head-test",
+            }
+        },
+    }
+
+
+def _runtime_text_generated_startup_intent_event(identity=None):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    launch_text_hash = "sha256:runtime-text-launch"
+    return {
+        "schema_version": "mf_subagent_startup_intent_event.v1",
+        "event_type": "mf_subagent.startup_intent",
+        "event_kind": "mf_subagent_startup_intent",
+        "phase": "startup_intent",
+        "status": "planned",
+        "actor": "observer_runtime_text",
+        "task_id": "BUG-RUNTIME-TEXT-STARTUP-impl-1",
+        "backlog_id": "BUG-RUNTIME-TEXT-STARTUP",
+        "close_satisfying": False,
+        "actual_startup_required": True,
+        "payload": {
+            "mf_subagent_startup_intent": {
+                "schema_version": "mf_subagent_startup_intent.v1",
+                "intent_kind": "mf_subagent.startup_intent",
+                "status": "planned",
+                "close_satisfying": False,
+                "actual_startup_required": True,
+                **route_identity,
+                "runtime_context_id": "orctx-runtime-text",
+                "launch_text_hash": launch_text_hash,
+                "raw_launch_text_persisted": False,
+                "project_id": "proj",
+                "task_id": "BUG-RUNTIME-TEXT-STARTUP-impl-1",
+                "parent_task_id": "BUG-RUNTIME-TEXT-STARTUP",
+                "worker_role": "mf_sub",
+                "role": "mf_sub",
+                "fence_token": "fence-runtime-text",
+                "assigned_worktree": "/repo/.worktrees/runtime-text",
+                "worktree_path": "/repo/.worktrees/runtime-text",
+                "branch": "refs/heads/runtime-text/BUG-RUNTIME-TEXT-STARTUP-impl-1",
+                "head_commit": "target123",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+            }
+        },
+        "artifact_refs": {
+            "runtime_context_id": "orctx-runtime-text",
+            "launch_text_hash": launch_text_hash,
+        },
+    }
+
+
+def _runtime_text_actual_startup_event(identity=None):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "schema_version": "task_timeline_event_packet.v1",
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "actor": "mf_sub",
+        "task_id": "BUG-RUNTIME-TEXT-STARTUP-impl-1",
+        "backlog_id": "BUG-RUNTIME-TEXT-STARTUP",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                "schema_version": "mf_subagent_startup_gate.v1",
+                "gate_kind": "mf_subagent.startup",
+                "status": "passed",
+                "bounded": True,
+                "same_as_expected_worker": True,
+                "fence_token_matches": True,
+                **route_identity,
+                "runtime_context_id": "orctx-runtime-text",
+                "launch_text_hash": "sha256:runtime-text-launch",
+                "raw_launch_text_persisted": False,
+                "project_id": "proj",
+                "task_id": "BUG-RUNTIME-TEXT-STARTUP-impl-1",
+                "parent_task_id": "BUG-RUNTIME-TEXT-STARTUP",
+                "worker_role": "mf_sub",
+                "role": "mf_sub",
+                "fence_token": "fence-runtime-text",
+                "assigned_worktree": "/repo/.worktrees/runtime-text",
+                "worktree_path": "/repo/.worktrees/runtime-text",
+                "actual_cwd": "/repo/.worktrees/runtime-text",
+                "actual_git_root": "/repo/.worktrees/runtime-text",
+                "branch": "refs/heads/runtime-text/BUG-RUNTIME-TEXT-STARTUP-impl-1",
+                "head_commit": "target123",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+            }
+        },
+    }
+
+
+def _runtime_text_legacy_weak_startup_event(identity=None):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "actor": "observer_runtime_text",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                **route_identity,
+                "runtime_context_id": "orctx-runtime-text",
+                "launch_text_hash": "sha256:runtime-text-launch",
+                "project_id": "proj",
+                "task_id": "BUG-RUNTIME-TEXT-STARTUP-impl-1",
+                "parent_task_id": "BUG-RUNTIME-TEXT-STARTUP",
+                "worker_role": "mf_sub",
+                "fence_token": "fence-runtime-text",
+                "branch": "refs/heads/runtime-text/BUG-RUNTIME-TEXT-STARTUP-impl-1",
+                "head_commit": "target123",
             }
         },
     }
@@ -1868,6 +1989,173 @@ class TestTaskTimeline(unittest.TestCase):
                 "independent_verification_lane",
             ],
         )
+
+    def test_mf_parallel_close_gate_rejects_generated_runtime_text_startup_intent(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-RUNTIME-TEXT-STARTUP",
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        route_context, route_action, dispatch, _manual_startup = (
+            _route_context_consumption_events()
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                route_context,
+                route_action,
+                dispatch,
+                _runtime_text_generated_startup_intent_event(),
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(ready["passed"], ready)
+        self.assertEqual(
+            ready["route_context_gate"]["missing_requirement_ids"],
+            ["mf_subagent_startup"],
+        )
+        self.assertNotIn(
+            "mf_subagent_startup",
+            ready["route_context_gate"]["present_requirement_ids"],
+        )
+
+    def test_mf_parallel_close_gate_accepts_actual_runtime_text_startup_event(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-RUNTIME-TEXT-STARTUP",
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        route_context, route_action, dispatch, _manual_startup = (
+            _route_context_consumption_events()
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                route_context,
+                route_action,
+                dispatch,
+                _runtime_text_actual_startup_event(),
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        startup_events = ready["route_context_gate"]["evidence_events"][
+            "mf_subagent_startup"
+        ]
+        self.assertEqual(startup_events[0]["event_kind"], "mf_subagent_startup")
+        self.assertIn(
+            "mf_subagent_startup",
+            ready["route_context_gate"]["present_requirement_ids"],
+        )
+
+    def test_mf_parallel_close_gate_rejects_weak_startup_without_actual_identity(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-RUNTIME-TEXT-WEAK-STARTUP",
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "finish", "phase": "handoff_gate", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        route_context, route_action, dispatch, _manual_startup = (
+            _route_context_consumption_events()
+        )
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                route_context,
+                route_action,
+                dispatch,
+                _runtime_text_legacy_weak_startup_event(),
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["missing_event_kinds"], [])
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            ["mf_subagent_startup"],
+        )
+        self.assertNotIn(
+            "mf_subagent_startup",
+            blocked["route_context_gate"]["present_requirement_ids"],
+        )
+        self.assertIn(
+            {
+                "id": None,
+                "event_kind": "mf_subagent_startup",
+                "status": "passed",
+                "reason": "missing_actual_startup_identity",
+                "categories": ["mf_subagent_startup"],
+            },
+            blocked["route_context_gate"]["ignored_route_events"],
+        )
+        self.assertTrue(blocked["checks"]["has_implementation"])
+        self.assertTrue(blocked["checks"]["has_verification"])
+        self.assertTrue(blocked["checks"]["has_close_ready"])
+
+    def test_mf_parallel_close_gate_blocks_when_generated_startup_missing(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-RUNTIME-TEXT-MISSING-STARTUP",
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "finish", "phase": "handoff_gate", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        route_context, route_action, dispatch, _manual_startup = (
+            _route_context_consumption_events()
+        )
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                route_context,
+                route_action,
+                dispatch,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["missing_event_kinds"], [])
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            ["mf_subagent_startup"],
+        )
+        self.assertTrue(blocked["checks"]["has_implementation"])
+        self.assertTrue(blocked["checks"]["has_verification"])
+        self.assertTrue(blocked["checks"]["has_close_ready"])
 
     def test_route_context_gate_accepts_visible_manifest_without_prompt_contract_hash(self):
         from agent.governance import task_timeline

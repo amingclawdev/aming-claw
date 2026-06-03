@@ -65,24 +65,67 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["launch_text"]
     assert result["launch_text_hash"].startswith("sha256:")
     assert result["raw_launch_text_persisted"] is False
-    assert result["persistent_evidence"] == {
-        "runtime_context_id": result["runtime_context_id"],
-        "launch_text_hash": result["launch_text_hash"],
-        "raw_launch_text_persisted": False,
-        "dispatch_ready": True,
-        "allocation_required": False,
-    }
+    persistent = result["persistent_evidence"]
+    assert persistent["runtime_context_id"] == result["runtime_context_id"]
+    assert persistent["launch_text_hash"] == result["launch_text_hash"]
+    assert persistent["raw_launch_text_persisted"] is False
+    assert persistent["dispatch_ready"] is True
+    assert persistent["allocation_required"] is False
+    assert persistent["startup_intent_event_generated"] is True
+    assert persistent["actual_startup_required"] is True
+    assert persistent["actual_startup_recorded"] is False
+    assert persistent["close_ready"] is False
+    assert persistent["startup_intent_event"] == result["startup_intent_event"]
     assert "launch_text" not in result["persistent_evidence"]
     assert "Judgment Brain" not in result["launch_text"]
     assert "raw private route/context-pack content" in result["launch_text"]
 
     gate = result["dispatch_gate_validation"]
     assert gate["allowed"] is True
+    assert gate["startup_intent_event_generated"] is True
+    assert gate["actual_startup_required"] is True
+    assert gate["actual_startup_recorded"] is False
+    assert gate["close_ready"] is False
     assert gate["governed_evidence_required"] is True
     assert gate["graph_trace_evidence"]["query_source"] == "mf_subagent"
     assert gate["graph_trace_evidence"]["trace_ids"] == ["gqt-runtime-text"]
     assert gate["branch_runtime_evidence"]["registered"] is True
     assert gate["service_dispatch_evidence"]["documented_host_adapter_boundary"] is True
+
+    startup_event = result["startup_intent_event"]
+    assert startup_event["event_type"] == "mf_subagent.startup_intent"
+    assert startup_event["event_kind"] == "mf_subagent_startup_intent"
+    assert startup_event["phase"] == "startup_intent"
+    assert startup_event["status"] == "planned"
+    assert startup_event["close_satisfying"] is False
+    assert startup_event["actual_startup_required"] is True
+    startup_intent = startup_event["payload"]["mf_subagent_startup_intent"]
+    assert startup_intent["schema_version"] == "mf_subagent_startup_intent.v1"
+    assert startup_intent["runtime_context_id"] == result["runtime_context_id"]
+    assert startup_intent["launch_text_hash"] == result["launch_text_hash"]
+    assert startup_intent["raw_launch_text_persisted"] is False
+    assert startup_intent["close_satisfying"] is False
+    assert startup_intent["actual_startup_required"] is True
+    assert startup_intent["project_id"] == "aming-claw"
+    assert startup_intent["task_id"] == "AC-RUNTIME-TEXT-impl-1"
+    assert startup_intent["parent_task_id"] == "AC-RUNTIME-TEXT"
+    assert startup_intent["worker_role"] == "mf_sub"
+    assert startup_intent["fence_token"] == "fence-runtime-text"
+    assert startup_intent["assigned_worktree"] == result["runtime_context"]["worktree_path"]
+    assert startup_intent["branch"] == result["runtime_context"]["branch_ref"]
+    assert startup_intent["head_commit"] == "target123"
+    assert startup_intent["base_commit"] == "base123"
+    assert startup_intent["target_head_commit"] == "target123"
+    assert startup_intent["route_context_hash"] == "sha256:route"
+    assert startup_intent["prompt_contract_id"] == "rprompt-runtime"
+    assert startup_intent["graph_trace_ids"] == ["gqt-runtime-text"]
+    assert "same_as_expected_worker" not in startup_intent
+    assert "fence_token_matches" not in startup_intent
+    assert "actual_cwd" not in startup_intent
+    assert "actual_git_root" not in startup_intent
+    assert "launch_text" not in startup_intent
+    assert result["startup_recording"]["close_ready"] is False
+    assert result["startup_recording"]["actual_startup_required"] is True
 
     assert result["mf_subagent_input"]["role"] == "mf_sub"
     assert result["startup_echo_contract"]["required"] is True
@@ -105,6 +148,8 @@ def test_runtime_text_builder_requires_supplied_branch_allocation_evidence(tmp_p
     validation = result["dispatch_gate_validation"]
     assert validation["allowed"] is False
     assert validation["allocation_required"] is True
+    assert validation["actual_startup_required"] is False
+    assert validation["close_ready"] is False
     evidence = result["branch_runtime_evidence"]
     assert evidence["status"] == "allocation_required"
     assert evidence["registered"] is False
@@ -142,6 +187,7 @@ def test_runtime_text_builder_rejects_weak_branch_runtime_evidence_without_ref(t
     validation = result["dispatch_gate_validation"]
     assert validation["allowed"] is False
     assert validation["allocation_required"] is True
+    assert result["startup_intent_event"] == {}
     evidence = result["branch_runtime_evidence"]
     assert evidence["registered"] is False
     assert evidence["allocation_required"] is True
@@ -157,4 +203,5 @@ def test_runtime_text_builder_rejects_missing_graph_trace_identity(tmp_path):
     assert result["ok"] is False
     assert result["raw_launch_text_persisted"] is False
     assert result["dispatch_gate_validation"]["allowed"] is False
+    assert result["startup_intent_event"] == {}
     assert "graph trace evidence" in result["dispatch_gate_validation"]["error"]

@@ -1720,6 +1720,46 @@ def _fence_evidence_present(evidence: Mapping[str, Any]) -> bool:
     return False
 
 
+def _actual_startup_identity_present(evidence: Mapping[str, Any]) -> bool:
+    actual_runtime = _nested_mapping(evidence, "actual_runtime")
+    actual_cwd = _string(evidence.get("actual_cwd") or actual_runtime.get("cwd"))
+    actual_git_root = _string(
+        evidence.get("actual_git_root") or actual_runtime.get("git_root")
+    )
+    branch = _string(
+        evidence.get("branch")
+        or evidence.get("branch_ref")
+        or actual_runtime.get("branch")
+        or actual_runtime.get("branch_ref")
+    )
+    head_commit = _string(
+        evidence.get("head_commit")
+        or evidence.get("branch_head")
+        or actual_runtime.get("head_commit")
+        or actual_runtime.get("branch_head")
+    )
+    return bool(
+        (actual_cwd or actual_git_root)
+        and branch
+        and head_commit
+        and _fence_evidence_present(evidence)
+    )
+
+
+def _startup_intent_only(evidence: Mapping[str, Any]) -> bool:
+    schema_version = _string(evidence.get("schema_version"))
+    kind = _string(
+        evidence.get("gate_kind")
+        or evidence.get("kind")
+        or evidence.get("intent_kind")
+    ).lower()
+    return (
+        schema_version == "mf_subagent_startup_intent.v1"
+        or "startup_intent" in kind
+        or _explicit_false(evidence.get("close_satisfying"))
+    )
+
+
 def _bounded_dispatch_evidence_present(evidence: Mapping[str, Any]) -> bool:
     if _explicit_false(evidence.get("bounded")):
         return False
@@ -1734,11 +1774,13 @@ def _bounded_dispatch_evidence_present(evidence: Mapping[str, Any]) -> bool:
 
 
 def _bounded_startup_evidence_present(evidence: Mapping[str, Any]) -> bool:
-    if _explicit_false(evidence.get("bounded")):
+    if _explicit_false(evidence.get("bounded")) or _startup_intent_only(evidence):
         return False
     gate_kind = _string(evidence.get("gate_kind") or evidence.get("kind")).lower()
-    return (
+    schema_version = _string(evidence.get("schema_version"))
+    bounded_signal = (
         _bool(evidence.get("bounded"))
+        or schema_version == "mf_subagent_startup_gate.v1"
         or gate_kind == "mf_subagent.startup"
         or _bool(evidence.get("same_as_expected_worker"))
         or _bool(evidence.get("fence_token_matches"))
@@ -1747,6 +1789,7 @@ def _bounded_startup_evidence_present(evidence: Mapping[str, Any]) -> bool:
             and _fence_evidence_present(evidence)
         )
     )
+    return bounded_signal and _actual_startup_identity_present(evidence)
 
 
 def _startup_evidence_matches(
@@ -1756,6 +1799,8 @@ def _startup_evidence_matches(
     prompt_contract_id: str,
     prompt_contract_hash: str,
 ) -> bool:
+    if _startup_intent_only(evidence) or not _actual_startup_identity_present(evidence):
+        return False
     status = _string(evidence.get("status") or evidence.get("decision")).lower()
     if (
         _explicit_false(evidence.get("allowed"))
@@ -1793,12 +1838,25 @@ def _startup_evidence_matches(
 
 
 def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
-    return _mapping(
+    direct = _mapping(
         payload.get("bounded_startup_evidence")
         or payload.get("startup_evidence")
         or payload.get("mf_subagent_startup_gate"),
         field_name="bounded_startup_evidence",
     )
+    if direct:
+        return direct
+    for key in ("startup_timeline_event", "generated_startup_timeline_event"):
+        event = _mapping(payload.get(key), field_name=key)
+        if not event:
+            continue
+        if _string(event.get("event_kind")) != "mf_subagent_startup":
+            continue
+        event_payload = _nested_mapping(event, "payload")
+        gate = _nested_mapping(event_payload, "mf_subagent_startup_gate")
+        if gate:
+            return gate
+    return {}
 
 
 def _bounded_worker_evidence_matches(

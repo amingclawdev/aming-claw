@@ -916,6 +916,22 @@ def _route_architecture_review_required(
     return False
 
 
+def _first_deep_mapping(value: Any, key: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        if key in value and isinstance(value.get(key), dict):
+            return value.get(key) or {}
+        for child in value.values():
+            found = _first_deep_mapping(child, key)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _first_deep_mapping(child, key)
+            if found:
+                return found
+    return {}
+
+
 def _first_deep_text(value: Any, key: str) -> str:
     if isinstance(value, dict):
         if key in value and str(value.get(key) or "").strip():
@@ -969,6 +985,55 @@ def _route_visible_manifest_present(value: Any) -> bool:
 def _route_event_passed(event: dict[str, Any]) -> bool:
     status = str(event.get("status") or event.get("decision") or "").strip().lower()
     return bool(event.get("passed")) or status in MF_ROUTE_CONTEXT_PASS_STATUSES
+
+
+def _route_startup_fence_evidence_present(event: dict[str, Any]) -> bool:
+    for key in (
+        "fence_token",
+        "worker_fence_token",
+        "route_fence_token",
+        "actual_fence_token",
+        "reported_fence_token",
+        "fence_token_hash",
+    ):
+        if _first_deep_text(event, key):
+            return True
+    for key in (
+        "fence_token_present",
+        "actual_fence_token_present",
+        "fence_token_matches",
+    ):
+        if _truthy(_first_deep_text(event, key)):
+            return True
+    return False
+
+
+def _route_actual_startup_identity_present(event: dict[str, Any]) -> bool:
+    actual_runtime = _mapping(_first_deep_mapping(event, "actual_runtime"))
+    actual_cwd = _first_deep_text(event, "actual_cwd") or str(
+        actual_runtime.get("cwd") or ""
+    ).strip()
+    actual_git_root = _first_deep_text(event, "actual_git_root") or str(
+        actual_runtime.get("git_root") or ""
+    ).strip()
+    branch = (
+        _first_deep_text(event, "branch")
+        or _first_deep_text(event, "branch_ref")
+        or str(actual_runtime.get("branch") or actual_runtime.get("branch_ref") or "").strip()
+    )
+    head_commit = (
+        _first_deep_text(event, "head_commit")
+        or _first_deep_text(event, "branch_head")
+        or str(
+            actual_runtime.get("head_commit") or actual_runtime.get("branch_head") or ""
+        ).strip()
+    )
+    return bool(
+        (actual_cwd or actual_git_root)
+        and branch
+        and head_commit
+        and _route_startup_fence_evidence_present(event)
+    )
 
 
 def _route_event_is_identity_cleanup(event: dict[str, Any]) -> bool:
@@ -1224,6 +1289,21 @@ def mf_route_context_gate_verification(
                 "categories": sorted(categories),
             })
             continue
+        if (
+            "mf_subagent_startup" in categories
+            and not _route_actual_startup_identity_present(event)
+        ):
+            ignored.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "missing_actual_startup_identity",
+                "categories": ["mf_subagent_startup"],
+            })
+            categories = set(categories)
+            categories.discard("mf_subagent_startup")
+            if not categories:
+                continue
         event_ref = {
             "id": event.get("id") or event.get("event_id"),
             "event_kind": event.get("event_kind"),

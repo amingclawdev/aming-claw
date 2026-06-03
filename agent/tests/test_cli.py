@@ -847,6 +847,15 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
     assert payload["launch_text_hash"].startswith("sha256:")
     assert payload["raw_launch_text_persisted"] is False
     assert payload["persistent_evidence"]["launch_text_hash"] == payload["launch_text_hash"]
+    assert payload["persistent_evidence"]["startup_intent_event_generated"] is True
+    assert payload["persistent_evidence"]["actual_startup_required"] is True
+    assert payload["persistent_evidence"]["actual_startup_recorded"] is False
+    assert payload["persistent_evidence"]["close_ready"] is False
+    assert payload["startup_intent_event"]["event_kind"] == "mf_subagent_startup_intent"
+    assert payload["startup_intent_event"]["close_satisfying"] is False
+    assert payload["startup_intent_event"]["payload"]["mf_subagent_startup_intent"][
+        "launch_text_hash"
+    ] == payload["launch_text_hash"]
     assert "launch_text" not in payload["persistent_evidence"]
 
 
@@ -1682,7 +1691,17 @@ class TestCliMf:
                 {
                     "event_kind": "mf_subagent_startup",
                     "status": "passed",
-                    "payload": {"mf_subagent_startup_gate": {**identity, "worker_id": "mf-sub"}},
+                    "payload": {
+                        "mf_subagent_startup_gate": {
+                            **identity,
+                            "worker_id": "mf-sub",
+                            "fence_token": "fence-test",
+                            "actual_cwd": "/repo/.worktrees/mf-sub",
+                            "actual_git_root": "/repo/.worktrees/mf-sub",
+                            "branch": "refs/heads/codex/mf-sub",
+                            "head_commit": "head-test",
+                        }
+                    },
                 },
                 {
                     "event_kind": "qa_verification",

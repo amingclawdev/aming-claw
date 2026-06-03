@@ -915,6 +915,84 @@ def _runtime_text_startup_echo_contract(
     }
 
 
+def _runtime_text_startup_intent_event(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    runtime_context_id: str,
+    context: Any,
+    parent_task_id: str,
+    launch_text_hash: str,
+    graph_trace_ids: Sequence[str],
+) -> dict[str, Any]:
+    head_commit = context.head_commit or context.target_head_commit
+    startup_intent = {
+        "schema_version": "mf_subagent_startup_intent.v1",
+        "intent_kind": "mf_subagent.startup_intent",
+        "status": "planned",
+        "close_satisfying": False,
+        "actual_startup_required": True,
+        "runtime_context_id": runtime_context_id,
+        "launch_text_hash": launch_text_hash,
+        "raw_launch_text_persisted": False,
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "role": "mf_sub",
+        "fence_token": context.fence_token,
+        "worktree_path": context.worktree_path,
+        "worktree": context.worktree_path,
+        "assigned_worktree": context.worktree_path,
+        "branch": context.branch_ref,
+        "branch_ref": context.branch_ref,
+        "head_commit": head_commit,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "route_id": request.route_id,
+        "precheck_run_id": request.precheck_run_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "graph_trace_ids": list(graph_trace_ids),
+        "startup_source": "observer_runtime_text_prepare",
+        "startup_timing": "generated_prelaunch",
+        "actual_startup_must_include": [
+            "actual_cwd",
+            "actual_git_root",
+            "fence_token",
+            "branch",
+            "head_commit",
+            "route_context_hash",
+            "prompt_contract_id",
+        ],
+    }
+    return {
+        "schema_version": "mf_subagent_startup_intent_event.v1",
+        "project_id": request.project_id,
+        "task_id": context.task_id,
+        "backlog_id": request.backlog_id,
+        "attempt_num": context.attempt,
+        "event_type": "mf_subagent.startup_intent",
+        "event_kind": "mf_subagent_startup_intent",
+        "phase": "startup_intent",
+        "actor": "observer_runtime_text",
+        "status": "planned",
+        "close_satisfying": False,
+        "actual_startup_required": True,
+        "payload": {
+            "mf_subagent_startup_intent": startup_intent,
+            "graph_trace_ids": list(graph_trace_ids),
+        },
+        "artifact_refs": {
+            "runtime_context_id": runtime_context_id,
+            "launch_text_hash": launch_text_hash,
+        },
+    }
+
+
 def _runtime_text_graph_first_obligations(
     *,
     project_id: str,
@@ -1212,6 +1290,42 @@ def build_observer_runtime_text_context(
             "branch_runtime_evidence": branch_runtime_evidence,
         }
     ok = bool(dispatch_gate_validation.get("allowed")) and not input_error
+    startup_intent_event = (
+        _runtime_text_startup_intent_event(
+            request=request,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_task_id=parent_task_id,
+            launch_text_hash=launch_text_hash,
+            graph_trace_ids=graph_trace_ids,
+        )
+        if ok
+        else {}
+    )
+    startup_recording = {
+        "schema_version": "mf_subagent_startup_recording.v1",
+        "required": bool(ok),
+        "recorded": False,
+        "close_ready": False,
+        "append_tool": "task_timeline_append",
+        "event_kind": "mf_subagent_startup",
+        "intent_event_kind": "mf_subagent_startup_intent",
+        "intent_event_ref": "startup_intent_event" if ok else "",
+        "close_satisfying": False,
+        "actual_startup_required": bool(ok),
+        "blocker": (
+            "record actual mf_subagent_startup after worker runtime identity is known"
+            if ok
+            else "dispatch gate rejected before startup intent generation"
+        ),
+    }
+    dispatch_gate_validation = {
+        **dispatch_gate_validation,
+        "startup_intent_event_generated": bool(ok),
+        "actual_startup_required": bool(ok),
+        "actual_startup_recorded": False,
+        "close_ready": False,
+    }
     return {
         "ok": ok,
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
@@ -1229,7 +1343,16 @@ def build_observer_runtime_text_context(
             "raw_launch_text_persisted": False,
             "dispatch_ready": ok,
             "allocation_required": allocation_required,
+            "startup_intent_event_generated": bool(ok),
+            "actual_startup_required": bool(ok),
+            "actual_startup_recorded": False,
+            "close_ready": False,
+            "startup_recording": startup_recording,
+            "startup_intent_event": startup_intent_event,
         },
+        "startup_intent_event": startup_intent_event,
+        "startup_recording": startup_recording,
+        "close_ready": False,
         "runtime_context": asdict(context),
         "branch_identity": launch_payload["branch_identity"],
         "mf_subagent_input": mf_subagent_input,

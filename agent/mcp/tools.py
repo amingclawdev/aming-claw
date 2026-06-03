@@ -345,7 +345,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "observer_runtime_text_prepare",
-        "description": "Prepare runtime launch text for a host-created mf_sub worker. Dry-run only: no model call, no ServiceManager/executor spawn, and no raw launch text persistence.",
+        "description": "Prepare runtime launch text and a generated mf_subagent_startup_intent packet for a host-created mf_sub worker. Dry-run only: no model call, no ServiceManager/executor spawn, no actual startup evidence, and no raw launch text persistence.",
         "inputSchema": {
             "type": "object",
             "properties": {

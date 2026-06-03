@@ -18117,7 +18117,7 @@ def handle_runtime(ctx: RequestContext):
 
 @route("POST", "/api/projects/{project_id}/observer/runtime-text/prepare")
 def handle_observer_runtime_text_prepare(ctx: RequestContext):
-    """Prepare host/Codex mf_sub launch text without persistence or model calls."""
+    """Prepare host/Codex mf_sub launch text plus startup intent packet."""
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
     from agent.ai_invocation import RoutePromptContract

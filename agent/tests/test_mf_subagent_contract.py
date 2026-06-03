@@ -838,6 +838,10 @@ def _startup_evidence(**overrides: object) -> dict[str, object]:
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
         "fence_token": "fence-1",
+        "actual_cwd": "/repo/.worktrees/task-1",
+        "actual_git_root": "/repo/.worktrees/task-1",
+        "branch": "refs/heads/codex/task-1",
+        "head_commit": "head123",
         "same_as_expected_worker": True,
         "fence_token_matches": True,
     }
@@ -987,6 +991,7 @@ def test_route_action_gate_blocks_high_risk_worker_when_dispatch_lacks_fence() -
     "startup_override",
     [
         {"fence_token": "", "fence_token_matches": False},
+        {"actual_cwd": "", "actual_git_root": ""},
     ],
 )
 def test_route_action_gate_blocks_high_risk_worker_when_startup_evidence_incomplete(
@@ -1033,6 +1038,97 @@ def test_route_action_gate_allows_high_risk_worker_with_bounded_dispatch_and_sta
     assert evidence["bounded_startup_evidence_present"] is True
     assert evidence["bounded_worker_evidence_present"] is True
     assert evidence["bounded_dispatch_evidence"]["fence_present"] is True
+
+
+def test_route_action_gate_rejects_generated_startup_intent_packet() -> None:
+    dispatch = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(),
+        target_worktree_path="/repo",
+    )
+    startup_intent_event = {
+        "event_type": "mf_subagent.startup_intent",
+        "event_kind": "mf_subagent_startup_intent",
+        "phase": "startup_intent",
+        "status": "planned",
+        "close_satisfying": False,
+        "actual_startup_required": True,
+        "payload": {
+            "mf_subagent_startup_intent": _startup_evidence(
+                schema_version="mf_subagent_startup_intent.v1",
+                gate_kind="",
+                intent_kind="mf_subagent.startup_intent",
+                status="planned",
+                bounded=False,
+                same_as_expected_worker=False,
+                fence_token_matches=False,
+                close_satisfying=False,
+                actual_startup_required=True,
+                actual_cwd="",
+                actual_git_root="",
+                runtime_context_id="orctx-test",
+                launch_text_hash="sha256:launch",
+                project_id="aming-claw",
+                task_id="TASK-impl-1",
+                parent_task_id="TASK",
+                worktree_path="/repo/.worktrees/TASK-impl-1",
+                branch="refs/heads/test/TASK-impl-1",
+                head_commit="target123",
+                base_commit="base123",
+                target_head_commit="target123",
+            ),
+        },
+    }
+
+    with pytest.raises(MfSubagentContractError, match="bounded dispatch/startup evidence"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role="implementation_worker",
+                mf_subagent_dispatch_gate=dispatch,
+                startup_timeline_event=startup_intent_event,
+                **_high_risk_route_machine_fields(),
+            )
+        )
+
+
+def test_route_action_gate_allows_actual_startup_timeline_event_packet() -> None:
+    dispatch = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(),
+        target_worktree_path="/repo",
+    )
+    startup_event = {
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {
+            "mf_subagent_startup_gate": _startup_evidence(
+                schema_version="mf_subagent_startup_gate.v1",
+                runtime_context_id="orctx-test",
+                launch_text_hash="sha256:launch",
+                project_id="aming-claw",
+                task_id="TASK-impl-1",
+                parent_task_id="TASK",
+                worktree_path="/repo/.worktrees/TASK-impl-1",
+                branch="refs/heads/test/TASK-impl-1",
+                head_commit="target123",
+                base_commit="base123",
+                target_head_commit="target123",
+            ),
+        },
+    }
+
+    evidence = validate_route_action_gate(
+        _route_action_payload(
+            caller_role="implementation_worker",
+            mf_subagent_dispatch_gate=dispatch,
+            startup_timeline_event=startup_event,
+            **_high_risk_route_machine_fields(),
+        )
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["bounded_startup_evidence_present"] is True
+    assert evidence["bounded_worker_evidence_present"] is True
 
 
 def test_route_action_gate_allows_high_risk_worker_without_optional_prompt_contract_hash() -> None:

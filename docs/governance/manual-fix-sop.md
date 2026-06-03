@@ -219,10 +219,18 @@ For host-created local workers, the observer prepares launch text through
 `POST /api/projects/{project_id}/observer/runtime-text/prepare`. This service is
 independent from ServiceManager and executor workers: it plans runtime context,
 builds the bounded `mf_subagent_input`, validates the dispatch gate, and returns
-`runtime_context_id`, `launch_text`, and `launch_text_hash` without calling a
-model or writing timeline rows. Timeline or durable evidence may store
-`runtime_context_id`, `launch_text_hash`, branch runtime evidence, graph trace
-identity, and service dispatch evidence, but MUST NOT persist raw launch text.
+`runtime_context_id`, `launch_text`, `launch_text_hash`, and a generated
+`startup_intent_event` packet without calling a model or writing timeline rows.
+The generated intent is not close-satisfying startup evidence:
+`close_satisfying=false`, `actual_startup_required=true`, and
+`close_ready=false` remain true until the host/worker appends a real
+`event_kind=mf_subagent_startup` after runtime identity is known. That actual
+startup event MUST include `actual_cwd` and/or `actual_git_root`, fence token,
+branch/head/base/target commit identity, runtime context id when available, and
+route identity. Timeline or durable evidence may store `runtime_context_id`,
+`launch_text_hash`, the generated startup intent packet, branch runtime evidence,
+graph trace identity, and service dispatch evidence, but MUST NOT persist raw
+launch text.
 The runtime text prepare service consumes branch runtime allocation evidence; it
 does not allocate/register branch runtime context by itself. Dispatch-ready
 prepare requires a caller-supplied `branch_runtime_registration_ref` or
