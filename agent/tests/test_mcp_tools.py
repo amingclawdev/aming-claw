@@ -131,6 +131,7 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "observer_command_enqueue",
         "observer_command_next",
         "observer_command_claim",
+        "observer_command_takeover",
         "observer_command_complete",
         "observer_command_fail",
     }.issubset(names)
@@ -586,6 +587,16 @@ def test_mcp_observer_command_tools_route_to_governance_api():
         },
     )
     dispatcher.dispatch(
+        "observer_command_takeover",
+        {
+            "project_id": "aming-claw",
+            "session_id": "obs-fallback",
+            "session_token": "fallback-tok",
+            "command_id": "cmd-stale",
+            "reason": "fallback observer resolves stale claimed command",
+        },
+    )
+    dispatcher.dispatch(
         "observer_command_complete",
         {
             "project_id": "aming-claw",
@@ -662,6 +673,15 @@ def test_mcp_observer_command_tools_route_to_governance_api():
             "POST",
             "/api/projects/aming-claw/observer-commands/claim",
             {"session_id": "obs-1", "session_token": "tok", "command_id": "cmd-1"},
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-commands/cmd-stale/takeover",
+            {
+                "session_id": "obs-fallback",
+                "session_token": "fallback-tok",
+                "reason": "fallback observer resolves stale claimed command",
+            },
         ),
         (
             "POST",

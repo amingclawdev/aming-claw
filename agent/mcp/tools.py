@@ -298,6 +298,21 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_command_takeover",
+        "description": "Take over a claimed observer command whose owner session is stale, closed, revoked, or missing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "session_id": {"type": "string"},
+                "session_token": {"type": "string"},
+                "command_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["project_id", "session_id", "session_token", "command_id", "reason"],
+        },
+    },
+    {
         "name": "observer_command_complete",
         "description": "Complete a claimed observer command. Requires the same claimed session token.",
         "inputSchema": {
@@ -1386,6 +1401,16 @@ class ToolDispatcher:
             if args.get("command_id"):
                 body["command_id"] = args["command_id"]
             return self._api("POST", f"/api/projects/{pid}/observer-commands/claim", body)
+
+        if name == "observer_command_takeover":
+            pid = args["project_id"]
+            cid = urllib.parse.quote(str(args["command_id"]), safe="")
+            body = {
+                "session_id": args["session_id"],
+                "session_token": args["session_token"],
+                "reason": args["reason"],
+            }
+            return self._api("POST", f"/api/projects/{pid}/observer-commands/{cid}/takeover", body)
 
         if name == "observer_command_complete":
             pid = args["project_id"]

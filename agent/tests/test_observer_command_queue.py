@@ -208,6 +208,168 @@ def test_claim_is_idempotent_for_same_session_and_rejects_double_claim():
         )
 
 
+def test_stale_claimed_command_can_be_taken_over_by_fallback_session():
+    conn = _conn()
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    takeover = observer_session.takeover_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        reason="fallback observer resolves stale claimed command",
+        now="2026-06-03T00:03:01Z",
+    )
+
+    assert takeover["command"]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert takeover["command"]["claimed_by_session_id"] == fallback["session_id"]
+    assert takeover["takeover"]["previous_session_id"] == owner["session_id"]
+    assert takeover["takeover"]["previous_session_status"] == "stale"
+
+    observer_session.heartbeat_session(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        now="2026-06-03T00:03:02Z",
+    )
+    with pytest.raises(observer_session.ObserverPermissionError, match="same claimed session"):
+        observer_session.complete_command(
+            conn,
+            project_id="demo",
+            session_id=owner["session_id"],
+            session_token=owner["session_token"],
+            command_id=command["command_id"],
+            result={"ok": True},
+            now="2026-06-03T00:03:03Z",
+        )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        result={"ok": True, "takeover": takeover["takeover"]},
+        now="2026-06-03T00:03:04Z",
+    )
+    assert completed["command"]["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert completed["command"]["result"]["takeover"]["previous_session_status"] == "stale"
+
+
+def test_active_claimed_command_cannot_be_taken_over():
+    conn = _conn()
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:00:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_CANCEL_WORKER,
+        payload={"task_id": "task-1"},
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    with pytest.raises(observer_session.ObserverCommandConflict, match="not stale: active"):
+        observer_session.takeover_command(
+            conn,
+            project_id="demo",
+            session_id=fallback["session_id"],
+            session_token=fallback["session_token"],
+            command_id=command["command_id"],
+            reason="fallback observer tries to steal active command",
+            now="2026-06-03T00:00:03Z",
+        )
+
+
+def test_missing_owner_claimed_command_can_be_taken_over():
+    conn = _conn()
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:00:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_PAUSE_WORKER,
+        payload={"task_id": "task-1"},
+        now="2026-06-03T00:00:01Z",
+    )
+    conn.execute(
+        """UPDATE observer_command_queue
+              SET status = ?, claimed_by_session_id = ?, claimed_at = ?
+            WHERE command_id = ?""",
+        (
+            observer_session.COMMAND_STATUS_CLAIMED,
+            "obs-missing",
+            "2026-06-03T00:00:02Z",
+            command["command_id"],
+        ),
+    )
+    conn.commit()
+
+    takeover = observer_session.takeover_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        reason="fallback observer resolves missing owner",
+        now="2026-06-03T00:00:03Z",
+    )
+
+    assert takeover["takeover"]["previous_session_id"] == "obs-missing"
+    assert takeover["takeover"]["previous_session_status"] == "missing"
+    assert takeover["command"]["claimed_by_session_id"] == fallback["session_id"]
+
+
 def test_complete_and_fail_require_same_claimed_session():
     conn = _conn()
     session = _register(conn)

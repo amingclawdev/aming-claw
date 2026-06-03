@@ -70,6 +70,7 @@ ACTION_SESSION_HEARTBEAT = "observer_session_heartbeat"
 ACTION_SESSION_CLOSE = "observer_session_close"
 ACTION_SESSION_REVOKE = "observer_session_revoke"
 ACTION_COMMAND_CLAIM = "observer_command_claim"
+ACTION_COMMAND_TAKEOVER = "observer_command_takeover"
 ACTION_COMMAND_COMPLETE = "observer_command_complete"
 ACTION_COMMAND_FAIL = "observer_command_fail"
 
@@ -79,6 +80,7 @@ DEFAULT_CAPABILITIES = {
         ACTION_SESSION_CLOSE,
         ACTION_SESSION_REVOKE,
         ACTION_COMMAND_CLAIM,
+        ACTION_COMMAND_TAKEOVER,
         ACTION_COMMAND_COMPLETE,
         ACTION_COMMAND_FAIL,
     ],
@@ -686,6 +688,16 @@ def _command_target_allows(command: dict[str, Any], session_id: str) -> bool:
     return not target or target == session_id
 
 
+def _command_target_allows_takeover(
+    command: dict[str, Any],
+    *,
+    session_id: str,
+    previous_session_id: str,
+) -> bool:
+    target = str(command.get("target_session_id") or "")
+    return not target or target in {session_id, previous_session_id}
+
+
 def _find_next_claimable_command(
     conn: sqlite3.Connection,
     *,
@@ -839,6 +851,114 @@ def claim_command(
         "observer_session_id": sid,
         "command": get_command(conn, project_id=pid, command_id=command["command_id"]),
         "empty": False,
+    }
+
+
+def _owner_session_takeover_status(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    owner_session_id: str,
+    now: str,
+) -> str:
+    if not owner_session_id:
+        return "missing"
+    row = _raw_session_row(conn, owner_session_id)
+    if row is None or str(row["project_id"]) != project_id:
+        return "missing"
+    return computed_session_status(row, now=now)
+
+
+def takeover_command(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    session_id: str,
+    session_token: str,
+    command_id: str,
+    reason: str,
+    now: str | None = None,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    pid = (project_id or "").strip()
+    sid = (session_id or "").strip()
+    cid = (command_id or "").strip()
+    takeover_reason = (reason or "").strip()
+    if not takeover_reason:
+        raise ValueError("takeover reason is required")
+
+    timestamp = now or _utc_now()
+    command = get_command(conn, project_id=pid, command_id=cid)
+    if not command:
+        raise LookupError("observer command not found")
+    authenticate_session(
+        conn,
+        project_id=pid,
+        session_id=sid,
+        session_token=session_token,
+        action=ACTION_COMMAND_TAKEOVER,
+        command_type=str(command.get("command_type") or ""),
+        now=timestamp,
+    )
+
+    previous_session_id = str(command.get("claimed_by_session_id") or "")
+    if command.get("status") in TERMINAL_COMMAND_STATUSES:
+        raise ObserverCommandConflict("observer command is already terminal")
+    if command.get("status") not in OWNED_COMMAND_STATUSES:
+        raise ObserverCommandConflict("observer command is not claimed")
+    if previous_session_id == sid:
+        raise ObserverCommandConflict("observer command is already owned by this session")
+    if not _command_target_allows_takeover(
+        command,
+        session_id=sid,
+        previous_session_id=previous_session_id,
+    ):
+        raise ObserverPermissionError("observer command targets a different session")
+
+    previous_status = _owner_session_takeover_status(
+        conn,
+        project_id=pid,
+        owner_session_id=previous_session_id,
+        now=timestamp,
+    )
+    if previous_status not in {"missing", "stale", SESSION_STATUS_CLOSED, SESSION_STATUS_REVOKED}:
+        raise ObserverCommandConflict(
+            f"observer command owner is not stale: {previous_status}"
+        )
+
+    cursor = conn.execute(
+        """UPDATE observer_command_queue
+              SET status = ?, claimed_by_session_id = ?, claimed_at = ?
+            WHERE project_id = ?
+              AND command_id = ?
+              AND status IN (?, ?)
+              AND claimed_by_session_id = ?""",
+        (
+            COMMAND_STATUS_CLAIMED,
+            sid,
+            timestamp,
+            pid,
+            cid,
+            COMMAND_STATUS_CLAIMED,
+            COMMAND_STATUS_RUNNING,
+            previous_session_id,
+        ),
+    )
+    conn.commit()
+    if cursor.rowcount != 1:
+        raise ObserverCommandConflict("observer command takeover lost race")
+
+    return {
+        "ok": True,
+        "project_id": pid,
+        "observer_session_id": sid,
+        "command": get_command(conn, project_id=pid, command_id=cid),
+        "takeover": {
+            "previous_session_id": previous_session_id,
+            "previous_session_status": previous_status,
+            "reason": takeover_reason,
+            "taken_over_at": timestamp,
+        },
     }
 
 

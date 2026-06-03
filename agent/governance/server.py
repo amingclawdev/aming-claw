@@ -1336,6 +1336,42 @@ def handle_observer_command_claim(ctx: RequestContext):
     return _observer_command_claim(ctx)
 
 
+@route("POST", "/api/projects/{project_id}/observer-commands/{command_id}/takeover")
+def handle_observer_command_takeover(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    command_id = unquote(str(ctx.path_params.get("command_id") or ctx.body.get("command_id") or ""))
+    conn = get_connection(project_id)
+    session_id = str(ctx.body.get("session_id") or ctx.body.get("observer_session_id") or "")
+    try:
+        with sqlite_write_lock():
+            result = observer_session.takeover_command(
+                conn,
+                project_id=project_id,
+                session_id=session_id,
+                session_token=_observer_token(ctx),
+                command_id=command_id,
+                reason=str(ctx.body.get("reason") or ""),
+            )
+            try:
+                takeover = result.get("takeover") if isinstance(result.get("takeover"), dict) else {}
+                audit_service.record(
+                    conn,
+                    project_id,
+                    "observer_command_takeover",
+                    actor=session_id,
+                    command_id=command_id,
+                    previous_session_id=str(takeover.get("previous_session_id") or ""),
+                    previous_session_status=str(takeover.get("previous_session_status") or ""),
+                    reason=str(takeover.get("reason") or ""),
+                )
+                conn.commit()
+            except Exception:
+                log.exception("failed to audit observer command takeover")
+            return result
+    except Exception as exc:
+        return _observer_error(exc)
+
+
 @route("POST", "/api/projects/{project_id}/observer-commands/{command_id}/complete")
 def handle_observer_command_complete(ctx: RequestContext):
     project_id = ctx.get_project_id()
