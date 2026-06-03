@@ -18126,6 +18126,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         build_observer_runtime_text_context,
     )
 
+    branch_runtime_evidence = (
+        body.get("branch_runtime_evidence")
+        if isinstance(body.get("branch_runtime_evidence"), dict)
+        else {}
+    )
     request = ObserverRuntimeTextPrepareRequest(
         project_id=project_id,
         backlog_id=str(body.get("backlog_id") or ""),
@@ -18147,6 +18152,10 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         merge_queue_id=str(body.get("merge_queue_id") or ""),
         fence_token=str(body.get("fence_token") or ""),
         graph_trace_ids=tuple(str(item) for item in (body.get("graph_trace_ids") or [])),
+        branch_runtime_registration_ref=str(
+            body.get("branch_runtime_registration_ref") or ""
+        ),
+        branch_runtime_evidence=branch_runtime_evidence,
         base_commit=str(body.get("base_commit") or ""),
         target_head_commit=str(body.get("target_head_commit") or ""),
         prompt=str(body.get("prompt") or ""),

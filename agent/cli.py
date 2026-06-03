@@ -1071,6 +1071,13 @@ def observer_run(
 @click.option("--branch-prefix", default="dogfood", help="Generated branch prefix.")
 @click.option("--merge-queue-id", default="", help="Merge queue id. Defaults to a deterministic dogfood id.")
 @click.option("--fence-token", default="", help="Fence token. Defaults to a deterministic dogfood token.")
+@click.option("--branch-runtime-registration-ref", default="", help="Caller-supplied branch runtime allocation evidence ref.")
+@click.option(
+    "--branch-runtime-evidence-file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Optional JSON object with branch runtime allocation evidence.",
+)
 @click.option("--graph-trace-id", "graph_trace_ids", multiple=True, required=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
 @click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
@@ -1101,6 +1108,8 @@ def observer_dogfood(
     branch_prefix,
     merge_queue_id,
     fence_token,
+    branch_runtime_registration_ref,
+    branch_runtime_evidence_file,
     graph_trace_ids,
     base_commit,
     target_head_commit,
@@ -1116,6 +1125,15 @@ def observer_dogfood(
         build_dogfood_observer_run_plan,
     )
 
+    branch_runtime_evidence: dict[str, Any] = {}
+    if branch_runtime_evidence_file:
+        try:
+            parsed_evidence = json.loads(Path(branch_runtime_evidence_file).read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise click.ClickException(f"invalid branch runtime evidence file: {exc}") from exc
+        if not isinstance(parsed_evidence, dict):
+            raise click.ClickException("branch runtime evidence file must contain a JSON object")
+        branch_runtime_evidence = parsed_evidence
     request = DogfoodObserverPlanRequest(
         project_id=project_id,
         backlog_id=backlog_id,
@@ -1139,6 +1157,8 @@ def observer_dogfood(
         merge_queue_id=merge_queue_id,
         fence_token=fence_token,
         graph_trace_ids=tuple(graph_trace_ids),
+        branch_runtime_registration_ref=branch_runtime_registration_ref,
+        branch_runtime_evidence=branch_runtime_evidence,
         base_commit=base_commit,
         target_head_commit=target_head_commit,
         route_id=route_id,
@@ -1218,6 +1238,13 @@ def observer_runtime_text():
 @click.option("--branch-prefix", default="runtime-text", help="Generated branch prefix.")
 @click.option("--merge-queue-id", default="", help="Merge queue id. Defaults to a deterministic runtime-text id.")
 @click.option("--fence-token", default="", help="Fence token. Defaults to a deterministic runtime-text token.")
+@click.option("--branch-runtime-registration-ref", default="", help="Caller-supplied branch runtime allocation evidence ref.")
+@click.option(
+    "--branch-runtime-evidence-file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Optional JSON object with branch runtime allocation evidence.",
+)
 @click.option("--graph-trace-id", "graph_trace_ids", multiple=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
 @click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
@@ -1251,6 +1278,8 @@ def observer_runtime_text_prepare(
     branch_prefix,
     merge_queue_id,
     fence_token,
+    branch_runtime_registration_ref,
+    branch_runtime_evidence_file,
     graph_trace_ids,
     base_commit,
     target_head_commit,
@@ -1267,6 +1296,15 @@ def observer_runtime_text_prepare(
     )
 
     prompt = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else ""
+    branch_runtime_evidence: dict[str, Any] = {}
+    if branch_runtime_evidence_file:
+        try:
+            parsed_evidence = json.loads(Path(branch_runtime_evidence_file).read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise click.ClickException(f"invalid branch runtime evidence file: {exc}") from exc
+        if not isinstance(parsed_evidence, dict):
+            raise click.ClickException("branch runtime evidence file must contain a JSON object")
+        branch_runtime_evidence = parsed_evidence
     request = ObserverRuntimeTextPrepareRequest(
         project_id=project_id,
         backlog_id=backlog_id,
@@ -1288,6 +1326,8 @@ def observer_runtime_text_prepare(
         merge_queue_id=merge_queue_id,
         fence_token=fence_token,
         graph_trace_ids=tuple(graph_trace_ids),
+        branch_runtime_registration_ref=branch_runtime_registration_ref,
+        branch_runtime_evidence=branch_runtime_evidence,
         base_commit=base_commit,
         target_head_commit=target_head_commit,
         prompt=prompt,

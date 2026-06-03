@@ -301,6 +301,7 @@
         "/api/graph-governance/{project_id}/parallel-branches/allocate",
         "agent.governance.parallel_branch_runtime.upsert_branch_context"
       ],
+      "runtime_text_prepare_boundary": "observer_runtime_text_prepare consumes caller-supplied branch_runtime_registration_ref or branch_runtime_evidence from this allocation step. It must return allocation_required and dispatch_ready=false when real allocation evidence is not supplied.",
       "required_fields": [
         "task_id",
         "parent_task_id",
@@ -344,11 +345,18 @@
         "raw_launch_text_persisted": false,
         "persistent_fields": [
           "runtime_context_id",
-          "launch_text_hash"
+          "launch_text_hash",
+          "dispatch_ready",
+          "allocation_required"
         ]
       },
+      "required_inputs_for_dispatch_ready": [
+        "branch_runtime_registration_ref or branch_runtime_evidence from prior branch runtime allocation",
+        "graph_trace_evidence with query_source=mf_subagent and matching identity",
+        "observer_subagent_service_dispatch replay refs or documented host-adapter boundary"
+      ],
       "public_boundary": "Worker prompts may include bounded route identity, file fences, branch/runtime identity, and evidence contracts. Raw private route/context-pack content must not be embedded in generated prompts, timeline rows, or persisted evidence.",
-      "description": "Prepares launch text for host/Codex-created mf_sub workers without invoking a model, ServiceManager, or executor worker. Governed dispatch still requires parent_route_lineage, graph_trace_evidence, branch_runtime_evidence, and observer_subagent_service_dispatch evidence."
+      "description": "Prepares launch text for host/Codex-created mf_sub workers without invoking a model, ServiceManager, executor worker, or branch allocation service. Governed dispatch still requires parent_route_lineage, graph_trace_evidence, caller-supplied branch_runtime_evidence, and observer_subagent_service_dispatch evidence."
     },
     "self_precheck": {
       "required": true,
@@ -611,7 +619,7 @@
       "phase": "dispatch",
       "kind": "branch_runtime",
       "schema_version": "mf_subagent_branch_runtime.v1",
-      "description": "Set required=true for governed mf_sub dispatch; evidence must show observer allocated/registered the branch runtime context via parallel-branches/allocate or upsert_branch_context before spawn_agent."
+      "description": "Set required=true for governed mf_sub dispatch; evidence must show observer allocated/registered the branch runtime context via parallel-branches/allocate or upsert_branch_context before spawn_agent. Runtime text prepare may consume this evidence but must not fabricate it."
     },
     {
       "id": "observer_subagent_service_dispatch",

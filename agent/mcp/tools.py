@@ -370,6 +370,8 @@ TOOLS: list[dict] = [
                 "merge_queue_id": {"type": "string"},
                 "fence_token": {"type": "string"},
                 "graph_trace_ids": {"type": "array", "items": {"type": "string"}},
+                "branch_runtime_registration_ref": {"type": "string"},
+                "branch_runtime_evidence": {"type": "object"},
                 "base_commit": {"type": "string"},
                 "target_head_commit": {"type": "string"},
                 "prompt": {"type": "string"},
@@ -1467,49 +1469,18 @@ class ToolDispatcher:
             return self._api("POST", f"/api/projects/{pid}/observer-commands/{cid}/fail", body)
 
         if name == "observer_runtime_text_prepare":
-            from agent.ai_invocation import RoutePromptContract
-            from agent.observer_runtime import (
-                ObserverRuntimeTextPrepareRequest,
-                build_observer_runtime_text_context,
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            body.setdefault("main_worktree", self._workspace)
+            return self._api(
+                "POST",
+                f"/api/projects/{pid}/observer/runtime-text/prepare",
+                body,
             )
-
-            request = ObserverRuntimeTextPrepareRequest(
-                project_id=str(args["project_id"]),
-                backlog_id=str(args["backlog_id"]),
-                route=RoutePromptContract(
-                    route_context_hash=str(args.get("route_context_hash") or ""),
-                    prompt_contract_id=str(args.get("prompt_contract_id") or ""),
-                    prompt_contract_hash=str(args.get("prompt_contract_hash") or ""),
-                    route_token_ref=str(args.get("route_token_ref") or ""),
-                ),
-                main_worktree=str(args.get("main_worktree") or self._workspace),
-                workspace_root=str(args.get("workspace_root") or ""),
-                owned_files=tuple(str(item) for item in (args.get("owned_files") or [])),
-                task_id=str(args.get("task_id") or ""),
-                parent_task_id=str(args.get("parent_task_id") or ""),
-                worker_id=str(args.get("worker_id") or ""),
-                attempt=int(args.get("attempt") or 1),
-                worktree_root=str(args.get("worktree_root") or ".worktrees"),
-                branch_prefix=str(args.get("branch_prefix") or "runtime-text"),
-                merge_queue_id=str(args.get("merge_queue_id") or ""),
-                fence_token=str(args.get("fence_token") or ""),
-                graph_trace_ids=tuple(
-                    str(item) for item in (args.get("graph_trace_ids") or [])
-                ),
-                base_commit=str(args.get("base_commit") or ""),
-                target_head_commit=str(args.get("target_head_commit") or ""),
-                prompt=str(args.get("prompt") or ""),
-                acceptance_criteria=tuple(
-                    str(item) for item in (args.get("acceptance_criteria") or [])
-                ),
-                test_commands=tuple(str(item) for item in (args.get("test_commands") or [])),
-                route_id=str(args.get("route_id") or ""),
-                precheck_run_id=str(args.get("precheck_run_id") or ""),
-                visible_injection_manifest_hash=str(
-                    args.get("visible_injection_manifest_hash") or ""
-                ),
-            )
-            return build_observer_runtime_text_context(request)
 
         if name == "task_hold":
             pid = args["project_id"]

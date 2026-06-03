@@ -163,6 +163,8 @@ class DogfoodObserverPlanRequest:
     merge_queue_id: str = ""
     fence_token: str = ""
     graph_trace_ids: tuple[str, ...] = ()
+    branch_runtime_registration_ref: str = ""
+    branch_runtime_evidence: Mapping[str, Any] = field(default_factory=dict)
     base_commit: str = ""
     target_head_commit: str = ""
     prompt: str = ""
@@ -189,6 +191,8 @@ class ObserverRuntimeTextPrepareRequest:
     merge_queue_id: str = ""
     fence_token: str = ""
     graph_trace_ids: tuple[str, ...] = ()
+    branch_runtime_registration_ref: str = ""
+    branch_runtime_evidence: Mapping[str, Any] = field(default_factory=dict)
     base_commit: str = ""
     target_head_commit: str = ""
     prompt: str = ""
@@ -753,19 +757,105 @@ def _runtime_text_branch_runtime_evidence(
     project_id: str,
     context: Any,
     parent_task_id: str,
+    branch_runtime_registration_ref: str = "",
+    branch_runtime_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    supplied = dict(branch_runtime_evidence or {})
+    registration_ref = str(
+        branch_runtime_registration_ref
+        or supplied.get("registration_ref")
+        or supplied.get("source_ref")
+        or supplied.get("api_ref")
+        or supplied.get("api_route")
+        or ""
+    ).strip()
+    supplied_context = supplied.get("context") if isinstance(supplied.get("context"), Mapping) else {}
+    supplied_status = str(supplied.get("status") or "").strip().lower()
+    supplied_rejected = bool(supplied) and (
+        supplied.get("ok") is False
+        or supplied.get("registered") is False
+        or bool(supplied.get("allocation_required"))
+        or supplied_status in {"allocation_required", "rejected", "failed", "error"}
+    )
+    if (
+        not registration_ref
+        and supplied_context
+        and (supplied.get("ok") is True or supplied.get("registered") is True)
+        and not supplied_rejected
+    ):
+        registration_ref = f"/api/graph-governance/{project_id}/parallel-branches/allocate"
+    if not registration_ref:
+        return {
+            "schema_version": "mf_subagent_branch_runtime.v1",
+            "status": "allocation_required",
+            "allocation_required": True,
+            "registered": False,
+            "present": False,
+            "source": "observer_runtime_text_prepare",
+            "message": (
+                "Call MCP parallel_branch_allocate or "
+                f"POST /api/graph-governance/{project_id}/parallel-branches/allocate, "
+                "then pass branch_runtime_registration_ref or branch_runtime_evidence."
+            ),
+            "planned_context": {
+                "task_id": context.task_id,
+                "parent_task_id": parent_task_id,
+                "fence_token": context.fence_token,
+                "worktree_path": context.worktree_path,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+            },
+        }
+    if supplied_rejected:
+        return {
+            "schema_version": "mf_subagent_branch_runtime.v1",
+            "status": "allocation_required",
+            "allocation_required": True,
+            "registered": False,
+            "present": False,
+            "source": "observer_runtime_text_prepare",
+            "message": "Supplied branch runtime evidence is not a registered allocation.",
+            "supplied_evidence_status": supplied_status or supplied.get("status") or "",
+            "planned_context": {
+                "task_id": context.task_id,
+                "parent_task_id": parent_task_id,
+                "fence_token": context.fence_token,
+                "worktree_path": context.worktree_path,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+            },
+        }
     return {
         "schema_version": "mf_subagent_branch_runtime.v1",
-        "source_ref": f"/api/graph-governance/{project_id}/parallel-branches/allocate",
-        "registration_source": "observer_runtime_text_prepare",
+        "source_ref": registration_ref,
+        "registration_ref": registration_ref,
+        "registration_source": str(
+            supplied.get("registration_source") or "caller_supplied_allocation_evidence"
+        ),
+        "allocation_required": False,
+        "registered": True,
         "context": {
-            "task_id": context.task_id,
-            "parent_task_id": parent_task_id,
-            "fence_token": context.fence_token,
-            "worktree_path": context.worktree_path,
-            "base_commit": context.base_commit,
-            "target_head_commit": context.target_head_commit,
-            "merge_queue_id": context.merge_queue_id,
+            "task_id": str(supplied_context.get("task_id") or context.task_id),
+            "parent_task_id": str(
+                supplied_context.get("parent_task_id")
+                or supplied_context.get("root_task_id")
+                or parent_task_id
+            ),
+            "fence_token": str(supplied_context.get("fence_token") or context.fence_token),
+            "worktree_path": str(
+                supplied_context.get("worktree_path")
+                or supplied_context.get("worktree")
+                or context.worktree_path
+            ),
+            "base_commit": str(supplied_context.get("base_commit") or context.base_commit),
+            "target_head_commit": str(
+                supplied_context.get("target_head_commit") or context.target_head_commit
+            ),
+            "merge_queue_id": str(
+                supplied_context.get("merge_queue_id") or context.merge_queue_id
+            ),
         },
     }
 
@@ -981,6 +1071,8 @@ def build_observer_runtime_text_context(
         project_id=request.project_id,
         context=context,
         parent_task_id=parent_task_id,
+        branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+        branch_runtime_evidence=request.branch_runtime_evidence,
     )
     service_dispatch_evidence = _runtime_text_service_dispatch_evidence()
     dispatch_gate = {
@@ -1102,12 +1194,25 @@ def build_observer_runtime_text_context(
     except MfSubagentContractError as exc:
         dispatch_gate_validation = {"allowed": False, "error": str(exc)}
 
+    allocation_required = bool(branch_runtime_evidence.get("allocation_required"))
+    if allocation_required:
+        dispatch_gate_validation = {
+            **dispatch_gate_validation,
+            "allowed": False,
+            "status": "allocation_required",
+            "allocation_required": True,
+            "error": (
+                "branch runtime allocation is required before dispatch-ready "
+                "runtime text evidence"
+            ),
+            "branch_runtime_evidence": branch_runtime_evidence,
+        }
     ok = bool(dispatch_gate_validation.get("allowed")) and not input_error
     return {
         "ok": ok,
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "service_schema_version": OBSERVER_RUNTIME_TEXT_SERVICE_SCHEMA_VERSION,
-        "status": "prepared" if ok else "rejected",
+        "status": "prepared" if ok else ("allocation_required" if allocation_required else "rejected"),
         "project_id": request.project_id,
         "backlog_id": request.backlog_id,
         "runtime_context_id": runtime_context_id,
@@ -1118,6 +1223,8 @@ def build_observer_runtime_text_context(
             "runtime_context_id": runtime_context_id,
             "launch_text_hash": launch_text_hash,
             "raw_launch_text_persisted": False,
+            "dispatch_ready": ok,
+            "allocation_required": allocation_required,
         },
         "runtime_context": asdict(context),
         "branch_identity": launch_payload["branch_identity"],
@@ -1210,6 +1317,8 @@ def build_dogfood_observer_run_plan(
         merge_queue_id=context.merge_queue_id,
         fence_token=context.fence_token,
         graph_trace_ids=tuple(graph_trace_ids),
+        branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+        branch_runtime_evidence=request.branch_runtime_evidence,
         base_commit=context.base_commit,
         target_head_commit=context.target_head_commit,
         prompt=request.prompt,
@@ -1228,6 +1337,8 @@ def build_dogfood_observer_run_plan(
         project_id=request.project_id,
         context=context,
         parent_task_id=parent_task_id,
+        branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+        branch_runtime_evidence=request.branch_runtime_evidence,
     )
     service_dispatch_evidence = _runtime_text_service_dispatch_evidence()
     dispatch_gate = {

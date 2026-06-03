@@ -536,6 +536,8 @@ def _dogfood_args(tmp_path, *, main_worktree=None):
         "mq-dogfood-test",
         "--fence-token",
         "fence-dogfood-test",
+        "--branch-runtime-registration-ref",
+        "/api/graph-governance/aming-claw/parallel-branches/allocate",
         "--graph-trace-id",
         "gqt-20260602-testtrace",
         "--base-commit",
@@ -825,6 +827,8 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
             "mq-runtime-text-test",
             "--fence-token",
             "fence-runtime-text-test",
+            "--branch-runtime-registration-ref",
+            "/api/graph-governance/aming-claw/parallel-branches/allocate",
             "--graph-trace-id",
             "gqt-runtime-text-test",
             "--base-commit",
@@ -844,6 +848,62 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
     assert payload["raw_launch_text_persisted"] is False
     assert payload["persistent_evidence"]["launch_text_hash"] == payload["launch_text_hash"]
     assert "launch_text" not in payload["persistent_evidence"]
+
+
+def test_observer_runtime_text_prepare_json_requires_branch_allocation_ref(tmp_path):
+    runner = CliRunner()
+    main_worktree = tmp_path / "main"
+    main_worktree.mkdir(parents=True)
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "runtime-text",
+            "prepare",
+            "--project-id",
+            "aming-claw",
+            "--backlog-id",
+            DOGFOOD_BACKLOG_ID,
+            "--route-context-hash",
+            DOGFOOD_ROUTE_CONTEXT_HASH,
+            "--prompt-contract-id",
+            DOGFOOD_PROMPT_CONTRACT_ID,
+            "--route-id",
+            "route-20260603-runtime-text",
+            "--visible-injection-manifest-hash",
+            DOGFOOD_VISIBLE_MANIFEST_HASH,
+            "--main-worktree",
+            str(main_worktree),
+            "--workspace-root",
+            str(tmp_path / "workers"),
+            "--owned-file",
+            "agent/observer_runtime.py",
+            "--task-id",
+            f"{DOGFOOD_BACKLOG_ID}-impl-1",
+            "--parent-task-id",
+            DOGFOOD_BACKLOG_ID,
+            "--merge-queue-id",
+            "mq-runtime-text-test",
+            "--fence-token",
+            "fence-runtime-text-test",
+            "--graph-trace-id",
+            "gqt-runtime-text-test",
+            "--base-commit",
+            "base123",
+            "--target-head-commit",
+            "target123",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["status"] == "allocation_required"
+    assert payload["dispatch_gate_validation"]["allowed"] is False
+    assert payload["persistent_evidence"]["dispatch_ready"] is False
+    assert payload["persistent_evidence"]["allocation_required"] is True
 
 
 def _git(args: list[str], cwd):

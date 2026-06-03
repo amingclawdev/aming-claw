@@ -41,6 +41,9 @@ def _runtime_text_request(tmp_path: Path, **overrides: object) -> ObserverRuntim
         "merge_queue_id": "mq-runtime-text",
         "fence_token": "fence-runtime-text",
         "graph_trace_ids": ("gqt-runtime-text",),
+        "branch_runtime_registration_ref": (
+            "/api/graph-governance/aming-claw/parallel-branches/allocate"
+        ),
         "base_commit": "base123",
         "target_head_commit": "target123",
         "route_id": "route-20260603-runtime",
@@ -66,6 +69,8 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         "runtime_context_id": result["runtime_context_id"],
         "launch_text_hash": result["launch_text_hash"],
         "raw_launch_text_persisted": False,
+        "dispatch_ready": True,
+        "allocation_required": False,
     }
     assert "launch_text" not in result["persistent_evidence"]
     assert "Judgment Brain" not in result["launch_text"]
@@ -83,6 +88,29 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["startup_echo_contract"]["required"] is True
     assert result["graph_first_obligations"]["query"]["query_source"] == "mf_subagent"
     assert result["finish_gate_contract"]["required"] is True
+
+
+def test_runtime_text_builder_requires_supplied_branch_allocation_evidence(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(tmp_path, branch_runtime_registration_ref="")
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "allocation_required"
+    assert result["launch_text"]
+    assert result["launch_text_hash"].startswith("sha256:")
+    assert result["raw_launch_text_persisted"] is False
+    assert result["persistent_evidence"]["dispatch_ready"] is False
+    assert result["persistent_evidence"]["allocation_required"] is True
+    validation = result["dispatch_gate_validation"]
+    assert validation["allowed"] is False
+    assert validation["allocation_required"] is True
+    evidence = result["branch_runtime_evidence"]
+    assert evidence["status"] == "allocation_required"
+    assert evidence["registered"] is False
+    assert evidence["allocation_required"] is True
+    assert "source_ref" not in evidence
+    assert "/api/graph-governance/aming-claw/parallel-branches/allocate" in evidence["message"]
 
 
 def test_runtime_text_builder_rejects_missing_graph_trace_identity(tmp_path):

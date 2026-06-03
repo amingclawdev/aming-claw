@@ -223,6 +223,16 @@ builds the bounded `mf_subagent_input`, validates the dispatch gate, and returns
 model or writing timeline rows. Timeline or durable evidence may store
 `runtime_context_id`, `launch_text_hash`, branch runtime evidence, graph trace
 identity, and service dispatch evidence, but MUST NOT persist raw launch text.
+The runtime text prepare service consumes branch runtime allocation evidence; it
+does not allocate/register branch runtime context by itself. Dispatch-ready
+prepare requires a caller-supplied `branch_runtime_registration_ref` or
+`branch_runtime_evidence` from MCP `parallel_branch_allocate`,
+`POST /api/graph-governance/{project_id}/parallel-branches/allocate`, or
+`upsert_branch_context`. Without that real allocation evidence, prepare may
+return planned `runtime_context`, `launch_text`, and `launch_text_hash`, but it
+MUST return `status=allocation_required`, `dispatch_gate_validation.allowed=false`,
+and `persistent_evidence.dispatch_ready=false`; this output is not governed
+dispatch evidence.
 Generated worker prompts may contain bounded route identity, file fences,
 runtime identity, graph-first obligations, and finish-gate contracts only. Raw
 private route/context-pack content must stay outside generated prompts and
