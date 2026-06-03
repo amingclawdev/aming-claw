@@ -54,6 +54,7 @@ else:  # pragma: no cover - direct module import path
 
 OBSERVER_RUN_SCHEMA_VERSION = "observer_run.v1"
 OBSERVER_POLL_SCHEMA_VERSION = "observer_poll.v1"
+OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION = "observer_poll_timeline_payload.v1"
 DOGFOOD_OBSERVER_PLAN_SCHEMA_VERSION = "observer_dogfood_plan.v1"
 ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION = "observer_one_hop_execution_gate.v1"
 EXECUTE_BACKLOG_ROW_COMMAND_TYPE = "execute_backlog_row"
@@ -69,6 +70,19 @@ ONE_HOP_REQUIRED_BACKENDS = {
     BACKEND_CLAUDE_CLI,
     BACKEND_DOCKER_LIVE_AI,
 }
+OBSERVER_POLL_TIMELINE_ROUTE_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "visible_injection_manifest_hash",
+)
+OBSERVER_POLL_TIMELINE_FLAG_FIELDS = (
+    "execute",
+    "calls_models",
+    "service_manager_required",
+    "executor_worker_required",
+    "uses_task_create",
+)
 
 
 @dataclass
@@ -203,6 +217,72 @@ def _route_from_command_payload(payload: Mapping[str, Any]) -> RoutePromptContra
         prompt_contract_hash=str(payload.get("prompt_contract_hash") or ""),
         route_token_ref=str(payload.get("route_token_ref") or ""),
     )
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return ""
+
+
+def observer_poll_timeline_payload(
+    *,
+    observer_command_id: str = "",
+    command: Mapping[str, Any] | None = None,
+    plan: Mapping[str, Any] | None = None,
+    result: Mapping[str, Any] | None = None,
+    event: str = "",
+) -> dict[str, Any]:
+    """Build route-bound task_timeline payload for observer poll events."""
+
+    command_payload = _command_payload(command)
+    plan_payload = dict(plan) if isinstance(plan, Mapping) else {}
+    result_payload = dict(result) if isinstance(result, Mapping) else {}
+    route_identity = (
+        plan_payload.get("route_identity")
+        if isinstance(plan_payload.get("route_identity"), Mapping)
+        else {}
+    )
+    timeline = {
+        "schema_version": OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION,
+        "event": str(event or ""),
+        "observer_command_id": str(
+            _first_non_empty(
+                observer_command_id,
+                plan_payload.get("observer_command_id"),
+                result_payload.get("observer_command_id"),
+                command.get("command_id") if isinstance(command, Mapping) else "",
+            )
+            or ""
+        ),
+        "backlog_id": str(
+            _first_non_empty(
+                plan_payload.get("backlog_id"),
+                result_payload.get("backlog_id"),
+                command_payload.get("backlog_id"),
+            )
+            or ""
+        ),
+    }
+    for field in OBSERVER_POLL_TIMELINE_ROUTE_FIELDS:
+        timeline[field] = str(
+            _first_non_empty(
+                route_identity.get(field),
+                result_payload.get(field),
+                command_payload.get(field),
+            )
+            or ""
+        )
+    for field in OBSERVER_POLL_TIMELINE_FLAG_FIELDS:
+        value = _first_non_empty(
+            plan_payload.get(field),
+            result_payload.get(field),
+            command_payload.get(field),
+            False,
+        )
+        timeline[field] = bool(value)
+    return timeline
 
 
 def _observer_poll_base_result(request: ObserverPollRequest) -> dict[str, Any]:

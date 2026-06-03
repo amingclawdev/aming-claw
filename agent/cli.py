@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import click
@@ -558,14 +558,73 @@ def _observer_poll_completion_result(plan: dict) -> dict:
         "schema_version": str(plan.get("schema_version") or ""),
         "observer_command_id": str(plan.get("observer_command_id") or ""),
         "backlog_id": str(plan.get("backlog_id") or ""),
+        "route_id": str(route_identity.get("route_id") or ""),
         "route_context_hash": str(route_identity.get("route_context_hash") or ""),
         "prompt_contract_id": str(route_identity.get("prompt_contract_id") or ""),
+        "visible_injection_manifest_hash": str(
+            route_identity.get("visible_injection_manifest_hash") or ""
+        ),
         "calls_models": bool(plan.get("calls_models")),
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,
         "uses_task_create": False,
     }
+
+
+def _observer_poll_append_timeline(
+    *,
+    base_url: str,
+    project_id: str,
+    observer_command_id: str,
+    event_type: str,
+    phase: str,
+    status: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not observer_command_id:
+        return {
+            "ok": False,
+            "skipped": True,
+            "event_type": event_type,
+            "phase": phase,
+            "error": "missing_observer_command_id",
+        }
+    encoded_project = urllib.parse.quote(project_id, safe="")
+    body = {
+        "task_id": observer_command_id,
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "event_type": event_type,
+        "phase": phase,
+        "event_kind": "observer_poll",
+        "status": status,
+        "actor": "observer_poll_cli",
+        "payload": payload,
+    }
+    try:
+        code, response = _http_json(
+            "POST",
+            f"{base_url}/api/task/{encoded_project}/timeline",
+            body,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fail-soft CLI guard
+        return {
+            "ok": False,
+            "event_type": event_type,
+            "phase": phase,
+            "http_status": 0,
+            "error": str(exc),
+        }
+    ok = code < 400 and response.get("ok", True) is not False
+    result = {
+        "ok": ok,
+        "event_type": event_type,
+        "phase": phase,
+        "http_status": code,
+    }
+    if not ok:
+        result["response"] = response
+    return result
 
 
 def _observer_poll_normalize_claim_response(payload: dict) -> dict:
@@ -671,7 +730,11 @@ def observer_poll(
     json_output,
 ):
     """Claim an observer command and build a standalone route-bound plan."""
-    from agent.observer_runtime import ObserverPollRequest, build_observer_poll_plan
+    from agent.observer_runtime import (
+        ObserverPollRequest,
+        build_observer_poll_plan,
+        observer_poll_timeline_payload,
+    )
 
     base_url = governance_url.rstrip("/")
     encoded_project = urllib.parse.quote(project_id, safe="")
@@ -686,6 +749,7 @@ def observer_poll(
         "service_manager_required": False,
         "executor_worker_required": False,
         "uses_task_create": False,
+        "timeline": [],
     }
     active_session_id = session_id
     active_session_token = session_token
@@ -769,6 +833,23 @@ def observer_poll(
         raise click.exceptions.Exit(1)
 
     command = claim_response.get("command") if isinstance(claim_response.get("command"), dict) else None
+    if command:
+        observer_command_id = str(command.get("command_id") or "")
+        result["timeline"].append(
+            _observer_poll_append_timeline(
+                base_url=base_url,
+                project_id=project_id,
+                observer_command_id=observer_command_id,
+                event_type="observer_poll_claimed",
+                phase="claim",
+                status="claimed",
+                payload=observer_poll_timeline_payload(
+                    observer_command_id=observer_command_id,
+                    command=command,
+                    event="claim",
+                ),
+            )
+        )
     plan = build_observer_poll_plan(
         ObserverPollRequest(
             project_id=project_id,
@@ -798,11 +879,30 @@ def observer_poll(
             "observer_poll": plan,
         }
     )
+    if command:
+        observer_command_id = str(command.get("command_id") or "")
+        result["timeline"].append(
+            _observer_poll_append_timeline(
+                base_url=base_url,
+                project_id=project_id,
+                observer_command_id=observer_command_id,
+                event_type="observer_poll_planned",
+                phase="plan",
+                status=str(plan.get("status") or "planned"),
+                payload=observer_poll_timeline_payload(
+                    observer_command_id=observer_command_id,
+                    command=command,
+                    plan=plan,
+                    event="plan",
+                ),
+            )
+        )
     if complete_planned and command and plan.get("ok"):
+        completion_result = _observer_poll_completion_result(plan)
         complete_payload = {
             "session_id": active_session_id,
             "session_token": active_session_token,
-            "result": _observer_poll_completion_result(plan),
+            "result": completion_result,
         }
         complete_code, complete_response = _http_json(
             "POST",
@@ -822,6 +922,28 @@ def observer_poll(
             result["status"] = "rejected"
             result["error"] = "observer command completion failed"
             result["completion"]["response"] = complete_response
+        observer_command_id = str(command.get("command_id") or "")
+        result["timeline"].append(
+            _observer_poll_append_timeline(
+                base_url=base_url,
+                project_id=project_id,
+                observer_command_id=observer_command_id,
+                event_type="observer_poll_completed",
+                phase="complete",
+                status=(
+                    "completed"
+                    if complete_code < 400 and complete_response.get("ok")
+                    else "completion_failed"
+                ),
+                payload=observer_poll_timeline_payload(
+                    observer_command_id=observer_command_id,
+                    command=command,
+                    plan=plan,
+                    result=completion_result,
+                    event="complete",
+                ),
+            )
+        )
 
     if json_output:
         click.echo(json.dumps(result, indent=2, sort_keys=True))
