@@ -28,9 +28,11 @@ from agent.governance.mf_subagent_contract import (
     ROUTE_ACTION_GATE_SCHEMA_VERSION,
     ROUTE_TOKEN_REQUIRED_FAILURE_SCHEMA_VERSION,
     ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
+    RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION,
     SERVICE_DISPATCH_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
+    build_mf_subagent_runtime_contract_view,
     build_mf_subagent_input,
     normalize_mf_subagent_result,
     validate_observer_direct_mutation_exception,
@@ -105,6 +107,14 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
     branch_runtime = worker_contract["branch_runtime"]
     assert branch_runtime["schema_version"] == BRANCH_RUNTIME_SCHEMA_VERSION
     assert "parallel-branches/allocate" in branch_runtime["valid_registration_refs"][0]
+    runtime_contract = worker_contract["runtime_contract_service"]
+    assert runtime_contract["schema_version"] == RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION
+    assert runtime_contract["source_of_truth"] == "contract_service"
+    assert "{task_id}/runtime-contract" in runtime_contract["query_route"]
+    assert set(runtime_contract["required_query_fields"]).issuperset(
+        {"task_id", "fence_token", "contract_version"}
+    )
+    assert runtime_contract["privacy_boundary"]["raw_private_context_exposed"] is False
     runtime_text = worker_contract["runtime_text_service"]
     assert runtime_text["schema_version"] == "observer_runtime_text_service.v1"
     assert "aming-claw observer runtime-text prepare --json-output" in runtime_text["entrypoints"]
@@ -153,6 +163,67 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
             "observer_timeline_event_before_dispatch",
         }
     )
+
+
+def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-runtime-contract",
+        root_task_id="task-parent",
+        backlog_id="AC-CONTRACT-RUNTIME-SERVICE-SHARED-CONTEXT-20260603",
+        worker_id="worker-1",
+        attempt=2,
+        branch_ref="refs/heads/codex/task-runtime-contract",
+        ref_name="main",
+        worktree_path="/repo/.worktrees/task-runtime-contract",
+        base_commit="base123",
+        head_commit="head123",
+        target_head_commit="target123",
+        snapshot_id="scope-1",
+        projection_id="semproj-1",
+        merge_queue_id="mq-1",
+        fence_token="fence-runtime",
+        status="running",
+        lease_id="lease-1",
+        lease_expires_at="2999-01-01T00:00:00Z",
+        checkpoint_id="ckpt-1",
+        depends_on=("task-a",),
+    )
+
+    view = build_mf_subagent_runtime_contract_view(
+        context,
+        role=MF_SUB_ROLE,
+        contract_version="mf_parallel.v1",
+        contract_revision_id="crev-1",
+        route_identity={
+            "route_id": "route-1",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-1",
+            "visible_injection_manifest_hash": "sha256:visible",
+            "raw_private_context": "do not expose",
+            "hidden_context": "do not expose",
+        },
+    )
+
+    assert view["schema_version"] == RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION
+    assert view["role_scope"] == "worker"
+    assert view["runtime_context_id"].startswith("mfrctx-")
+    assert view["runtime_context"]["task_id"] == "task-runtime-contract"
+    assert view["runtime_context"]["parent_task_id"] == "task-parent"
+    assert view["runtime_context"]["fence_token"] == "fence-runtime"
+    assert view["runtime_context"]["worktree_path"] == "/repo/.worktrees/task-runtime-contract"
+    assert view["contract"]["contract_change_policy"]["source_of_truth"] == "contract_service"
+    assert view["contract"]["contract_change_policy"]["raw_prompt_as_runtime_source"] is False
+    assert view["contract"]["service_routes"]["finish_gate"].endswith(
+        "/parallel-branches/finish-gate"
+    )
+    assert view["route_identity"]["route_context_hash"] == "sha256:route"
+    assert view["route_identity"]["prompt_contract_id"] == "rprompt-1"
+    assert view["route_identity"]["raw_private_context_exposed"] is False
+    assert "raw_private_context" not in view["route_identity"]
+    assert "hidden_context" not in view["route_identity"]
+    assert view["privacy_boundary"]["raw_private_context_exposed"] is False
+    assert view["worker_runtime_query"]["fence_token_required"] is True
 
 
 def test_mf_workflow_runtime_template_names_graph_service_architecture_and_qa_lanes() -> None:

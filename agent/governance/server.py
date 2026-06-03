@@ -4689,6 +4689,89 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
+def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext):
+    """Return a role-scoped runtime/contract view for one bounded worker lane."""
+    project_id = ctx.get_project_id()
+    from .mf_subagent_contract import build_mf_subagent_runtime_contract_view
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        get_branch_context,
+        validate_mf_subagent_graph_query_identity,
+    )
+    from .permissions import session_role
+
+    task_id = str(ctx.path_params.get("task_id") or ctx.query.get("task_id") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        session = _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.runtime-contract",
+        )
+        role = session_role(session)
+        if role == "mf_sub":
+            fence_token = str(ctx.query.get("fence_token") or "").strip()
+            if not fence_token:
+                raise ValidationError("fence_token is required for mf_sub runtime contract query")
+            try:
+                context = validate_mf_subagent_graph_query_identity(
+                    conn,
+                    project_id=project_id,
+                    task_id=task_id,
+                    parent_task_id=str(ctx.query.get("parent_task_id") or ""),
+                    worker_role="mf_sub",
+                    fence_token=fence_token,
+                )
+            except BranchRuntimeFenceError as exc:
+                raise GovernanceError(
+                    "fence_invalidated_or_unknown",
+                    "mf_subagent runtime contract fence is invalidated or unknown",
+                    403,
+                    {
+                        "task_id": task_id,
+                        "reason": "fence_invalidated_or_unknown",
+                    },
+                ) from exc
+        else:
+            context = get_branch_context(conn, project_id, task_id)
+            if context is None:
+                raise GovernanceError(
+                    "runtime_context_not_found",
+                    f"branch runtime context not found: {project_id}/{task_id}",
+                    404,
+                    {"task_id": task_id},
+                )
+
+        route_identity = {
+            key: ctx.query.get(key)
+            for key in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
+                "selected_project",
+                "selected_backlog_id",
+            )
+            if ctx.query.get(key)
+        }
+        view = build_mf_subagent_runtime_contract_view(
+            context,
+            role=role,
+            contract_version=str(ctx.query.get("contract_version") or "mf_parallel.v1"),
+            contract_revision_id=str(ctx.query.get("contract_revision_id") or ""),
+            route_identity=route_identity,
+        )
+        return {"ok": True, "project_id": project_id, "runtime_contract": view}
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/checkpoint")
 def handle_graph_governance_parallel_branch_checkpoint(ctx: RequestContext):
     """Record a checkpoint for a branch runtime context with fence protection."""

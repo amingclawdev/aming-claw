@@ -313,6 +313,25 @@
       ],
       "description": "Observer must allocate/register the branch runtime context before spawn_agent; otherwise mf_subagent graph queries fail fence validation as fence_invalidated_or_unknown."
     },
+    "runtime_contract_service": {
+      "schema_version": "mf_subagent_runtime_contract_view.v1",
+      "source_of_truth": "contract_service",
+      "query_route": "GET /api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract",
+      "required_query_fields": [
+        "task_id",
+        "fence_token",
+        "contract_version"
+      ],
+      "role_scoped_views": [
+        "worker",
+        "operator"
+      ],
+      "privacy_boundary": {
+        "raw_private_context_exposed": false,
+        "safe_route_identity_only": true
+      },
+      "description": "Worker and observer lanes query the shared runtime/contract view by task/fence identity instead of treating generated runtime text as the source of truth. Observer changes must append contract revisions; workers poll this service for current bounded execution state."
+    },
     "service_dispatch": {
       "schema_version": "observer_subagent_service_dispatch.v1",
       "required_for": [

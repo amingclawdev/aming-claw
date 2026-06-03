@@ -91,6 +91,9 @@ def _route_waiver(action: str, *, task_id: str = "", backlog_id: str = "") -> di
         "waiver_type": "manual_fix",
         "allowed_action": action,
         "project_id": PID,
+        "route_context_hash": f"sha256:test-route-context-{action}",
+        "prompt_contract_id": f"prompt-contract-{action}",
+        "caller_role": "observer",
         "reason": "Unit test supplies explicit route gate waiver evidence.",
         "timeline_evidence": {"event_id": f"test-route-gate-{action}"},
     }
@@ -571,6 +574,9 @@ def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_
                     "allowed_action": "backlog_close",
                     "project_id": PID,
                     "backlog_id": "BUG-CLOSE-ASSET",
+                    "route_context_hash": "sha256:test-route-context-backlog-close",
+                    "prompt_contract_id": "prompt-contract-backlog-close",
+                    "caller_role": "observer",
                     "reason": "Unit test supplies explicit route gate waiver evidence.",
                     "timeline_evidence": {"event_id": "test-route-gate"},
                 },
@@ -969,6 +975,101 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["status"] == "worktree_ready"
     assert lanes[0]["worktree_path"] == context["worktree_path"]
     assert lanes[0]["graph_epoch"]["base_commit"]
+
+
+def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-contract-task",
+            root_task_id="runtime-contract-parent",
+            backlog_id="AC-CONTRACT-RUNTIME-SERVICE-SHARED-CONTEXT-20260603",
+            worker_id="worker-runtime",
+            attempt=1,
+            branch_ref="refs/heads/codex/runtime-contract-task",
+            ref_name="main",
+            worktree_path="/repo/.worktrees/runtime-contract-task",
+            base_commit="base123",
+            head_commit="head123",
+            target_head_commit="target123",
+            snapshot_id="scope-1",
+            projection_id="semproj-1",
+            merge_queue_id="mq-runtime",
+            fence_token="fence-runtime",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-03T10:00:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branch_runtime_contract(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "task_id": "runtime-contract-task",
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "runtime-contract-parent",
+                "fence_token": "fence-runtime",
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-runtime",
+                "visible_injection_manifest_hash": "sha256:visible",
+                "raw_private_context": "must-not-leak",
+            },
+        )
+    )
+
+    view = result["runtime_contract"]
+    assert result["ok"] is True
+    assert view["schema_version"] == "mf_subagent_runtime_contract_view.v1"
+    assert view["role_scope"] == "worker"
+    assert view["runtime_context"]["task_id"] == "runtime-contract-task"
+    assert view["runtime_context"]["parent_task_id"] == "runtime-contract-parent"
+    assert view["runtime_context"]["fence_token"] == "fence-runtime"
+    assert view["contract"]["contract_change_policy"]["source_of_truth"] == "contract_service"
+    assert view["route_identity"]["route_context_hash"] == "sha256:route"
+    assert view["route_identity"]["prompt_contract_id"] == "rprompt-runtime"
+    assert view["route_identity"]["raw_private_context_exposed"] is False
+    assert "raw_private_context" not in view["route_identity"]
+
+
+def test_parallel_branch_runtime_contract_route_rejects_wrong_worker_fence(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-contract-fence-task",
+            root_task_id="runtime-contract-parent",
+            branch_ref="refs/heads/codex/runtime-contract-fence-task",
+            worktree_path="/repo/.worktrees/runtime-contract-fence-task",
+            base_commit="base123",
+            target_head_commit="target123",
+            merge_queue_id="mq-runtime",
+            fence_token="fence-good",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-03T10:00:00Z",
+    )
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_parallel_branch_runtime_contract(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "task_id": "runtime-contract-fence-task",
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-contract-parent",
+                    "fence_token": "fence-bad",
+                },
+            )
+    )
+    assert exc_info.value.code == "fence_invalidated_or_unknown"
+    assert exc_info.value.status == 403
 
 
 def test_parallel_branch_recover_and_checkpoint_routes_enforce_fence(conn):

@@ -22,6 +22,7 @@ INPUT_SCHEMA_VERSION = "mf_subagent_input.v1"
 RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
+RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION = "mf_subagent_runtime_contract_view.v1"
 PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
 ROUTE_LINEAGE_SCHEMA_VERSION = "mf_subagent_route_lineage.v1"
 GRAPH_TRACE_SCHEMA_VERSION = "mf_subagent_graph_trace.v1"
@@ -221,6 +222,22 @@ _SERVICE_DISPATCH_CONTAINER_KEYS = (
     "subagent_service_dispatch",
     "spawn_agent_evidence",
 )
+_SAFE_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+    "selected_project",
+    "selected_backlog_id",
+)
+_DEFAULT_RUNTIME_CONTRACT_EVIDENCE = (
+    "branch_runtime_registration",
+    "observer_subagent_service_dispatch",
+    "mf_subagent_startup",
+    "graph_trace_evidence",
+)
 _BRANCH_RUNTIME_CONTAINER_KEYS = (
     "branch_runtime_evidence",
     "branch_runtime_context",
@@ -395,6 +412,167 @@ def _normalize_worktree_path(path: str) -> str:
 def _nested_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
     value = payload.get(key)
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _safe_route_identity(route_identity: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = dict(route_identity or {})
+    safe = {
+        key: _string(source.get(key))
+        for key in _SAFE_ROUTE_IDENTITY_FIELDS
+        if _string(source.get(key))
+    }
+    safe["raw_private_context_exposed"] = False
+    return safe
+
+
+def mf_subagent_runtime_context_id(context: BranchTaskRuntimeContext) -> str:
+    seed = "\0".join(
+        (
+            context.project_id,
+            context.task_id,
+            str(context.attempt or 1),
+        )
+    )
+    return "mfrctx-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def build_mf_subagent_runtime_contract_view(
+    context: BranchTaskRuntimeContext,
+    *,
+    role: str = MF_SUB_ROLE,
+    contract_version: str = "mf_parallel.v1",
+    contract_revision_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
+    required_evidence: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Build a queryable, role-scoped runtime/contract view for a worker lane."""
+
+    normalized_role = _string(role).lower().replace("-", "_") or MF_SUB_ROLE
+    is_worker = normalized_role == MF_SUB_ROLE
+    parent_task_id = (
+        context.root_task_id
+        or context.chain_id
+        or context.stage_task_id
+        or context.task_id
+    )
+    runtime_context_id = mf_subagent_runtime_context_id(context)
+    evidence_ids = tuple(
+        _string(item)
+        for item in (required_evidence or _DEFAULT_RUNTIME_CONTRACT_EVIDENCE)
+        if _string(item)
+    )
+
+    runtime_context = {
+        "runtime_context_id": runtime_context_id,
+        "project_id": context.project_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": context.backlog_id,
+        "worker_role": MF_SUB_ROLE,
+        "worker_id": context.worker_id,
+        "agent_id": context.agent_id,
+        "attempt": context.attempt,
+        "branch_ref": context.branch_ref,
+        "ref_name": context.ref_name,
+        "worktree_id": context.worktree_id,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "head_commit": context.head_commit,
+        "target_head_commit": context.target_head_commit,
+        "snapshot_id": context.snapshot_id,
+        "projection_id": context.projection_id,
+        "merge_queue_id": context.merge_queue_id,
+        "merge_preview_id": context.merge_preview_id,
+        "fence_token": context.fence_token,
+        "status": context.status,
+        "checkpoint_id": context.checkpoint_id,
+        "replay_source": context.replay_source,
+        "depends_on": list(context.depends_on),
+        "lease": {
+            "lease_id": context.lease_id,
+            "lease_expires_at": context.lease_expires_at,
+            "heartbeat_required": True,
+        },
+        "timestamps": {
+            "created_at": context.created_at,
+            "updated_at": context.updated_at,
+        },
+    }
+
+    contract = {
+        "contract_version": _string(contract_version) or "mf_parallel.v1",
+        "contract_revision_id": _string(contract_revision_id),
+        "backend_contract": BACKEND_CONTRACT,
+        "dispatch_default": DISPATCH_DEFAULT,
+        "worktree_policy": WORKTREE_POLICY_MODE,
+        "allowed_capabilities": list(MF_SUB_ALLOWED_CAPABILITIES),
+        "forbidden_actions": list(MF_SUB_FORBIDDEN_ACTIONS),
+        "required_output": list(MF_SUB_REQUIRED_OUTPUT),
+        "required_evidence": list(evidence_ids),
+        "graph_query": {
+            "query_source": "mf_subagent",
+            "schema_version": GRAPH_TRACE_SCHEMA_VERSION,
+            "required_context_fields": [
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "fence_token",
+            ],
+            "trace_ids_required_in_timeline": True,
+        },
+        "service_routes": {
+            "runtime_contract": (
+                "/api/graph-governance/{project_id}/parallel-branches/"
+                "{task_id}/runtime-contract"
+            ),
+            "graph_query": "/api/graph-governance/{project_id}/query",
+            "checkpoint": "/api/graph-governance/{project_id}/parallel-branches/checkpoint",
+            "finish_gate": (
+                "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
+            ),
+        },
+        "contract_change_policy": {
+            "source_of_truth": "contract_service",
+            "observer_mutation": "append_contract_revision_only",
+            "worker_poll_required": True,
+            "worker_receives_runtime_context_id": True,
+            "raw_prompt_as_runtime_source": False,
+        },
+    }
+
+    view: dict[str, Any] = {
+        "schema_version": RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION,
+        "runtime_context_id": runtime_context_id,
+        "role_scope": "worker" if is_worker else "operator",
+        "runtime_context": runtime_context,
+        "contract": contract,
+        "route_identity": _safe_route_identity(route_identity),
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "redacted_context_sources": [
+                "raw_private_route_body",
+                "observer_only_context",
+                "hidden_context",
+                "unmanifested_prompt_text",
+            ],
+        },
+        "worker_runtime_query": {
+            "runtime_context_id": runtime_context_id,
+            "contract_version": contract["contract_version"],
+            "contract_revision_id": contract["contract_revision_id"],
+            "task_id": context.task_id,
+            "fence_token_required": True,
+            "query_source": "contract_service",
+        },
+    }
+    if not is_worker:
+        view["observer_controls"] = {
+            "can_append_contract_revision": True,
+            "can_update_dispatch_intent": True,
+            "can_mark_blocker": True,
+            "must_not_directly_implement_worker_code": True,
+        }
+    return view
 
 
 def _deep_field_values(

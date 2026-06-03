@@ -73,6 +73,29 @@ terminal dispatch blocker, a fallback observer may take it over. The takeover
 records `claimed_to_startup_timeout` in the command result so operators can fail
 or close the stuck command without the original owner token.
 
+## Runtime Contract Query
+
+Observer runtime text is startup material, not the source of truth. After a
+bounded `mf_sub` lane is allocated, the shared runtime/contract state is exposed
+through:
+
+```bash
+GET /api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract
+```
+
+An `mf_sub` worker must query it with its `task_id`, `parent_task_id`, and
+`fence_token`; governance validates the same fence used for graph queries before
+returning the worker-scoped view. The view includes branch/worktree identity,
+lease, graph-query obligations, finish/checkpoint routes, allowed capabilities,
+forbidden actions, and required evidence. It exposes only safe route identity
+fields such as `route_context_hash`, `prompt_contract_id`, and
+`visible_injection_manifest_hash`; raw private route/context bodies remain
+outside worker scope.
+
+When the observer needs to redirect a worker, it should append or update the
+contract service state and let the worker re-query. Do not patch generated
+runtime text as the durable coordination mechanism.
+
 ## Principles
 
 1. **Observer uses the governance control plane, not direct DB access**: All operations go through MCP tools or the REST API — do not read or write the DB directly.
