@@ -115,6 +115,7 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "graph_operations_queue",
         "graph_query",
         "parallel_branch_allocate",
+        "parallel_branch_startup",
         "parallel_branch_checkpoint",
         "parallel_branch_finish_gate",
         "graph_pending_scope_queue",
@@ -846,10 +847,12 @@ def test_mcp_graph_tools_route_to_governance_api():
 
 def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     allocate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_allocate")
+    startup = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_startup")
     checkpoint = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_checkpoint")
     finish_gate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_finish_gate")
 
     allocate_props = allocate["inputSchema"]["properties"]
+    startup_props = startup["inputSchema"]["properties"]
     checkpoint_props = checkpoint["inputSchema"]["properties"]
     finish_props = finish_gate["inputSchema"]["properties"]
 
@@ -874,6 +877,33 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "create_worktree",
     ):
         assert key in allocate_props
+
+    assert startup["inputSchema"]["required"] == ["project_id", "task_id"]
+    for key in (
+        "parent_task_id",
+        "worker_role",
+        "worker_id",
+        "agent_id",
+        "session_token",
+        "session_token_surrogate",
+        "fence_token",
+        "runtime_context_id",
+        "observer_command_id",
+        "actual_cwd",
+        "actual_git_root",
+        "branch",
+        "head_commit",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "owned_files",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert key in startup_props
 
     assert checkpoint["inputSchema"]["required"] == [
         "project_id",
@@ -938,6 +968,32 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
         },
     )
     dispatcher.dispatch(
+        "parallel_branch_startup",
+        {
+            "project_id": "aming-claw",
+            "task_id": "mf-sub-1",
+            "parent_task_id": "observer-1",
+            "worker_role": "mf_sub",
+            "worker_id": "worker-1",
+            "agent_id": "agent-1",
+            "session_token_surrogate": "host-session:worker-1",
+            "fence_token": "fence-1",
+            "actual_cwd": "/repo/.worktrees/mf-sub-1",
+            "actual_git_root": "/repo/.worktrees/mf-sub-1",
+            "branch": "refs/heads/mf/mf-sub-1",
+            "head_commit": "head",
+            "base_commit": "base",
+            "target_head_commit": "target",
+            "merge_queue_id": "mq-1",
+            "owned_files": ["agent/mcp/tools.py"],
+            "route_id": "route-1",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-1",
+            "prompt_contract_hash": "sha256:prompt",
+            "visible_injection_manifest_hash": "sha256:visible",
+        },
+    )
+    dispatcher.dispatch(
         "parallel_branch_checkpoint",
         {
             "project_id": "aming-claw",
@@ -994,6 +1050,32 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
                 "fence_token": "fence-1",
                 "create_worktree": False,
                 "route_token": route_token,
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/startup",
+            {
+                "task_id": "mf-sub-1",
+                "parent_task_id": "observer-1",
+                "worker_role": "mf_sub",
+                "worker_id": "worker-1",
+                "agent_id": "agent-1",
+                "session_token_surrogate": "host-session:worker-1",
+                "fence_token": "fence-1",
+                "actual_cwd": "/repo/.worktrees/mf-sub-1",
+                "actual_git_root": "/repo/.worktrees/mf-sub-1",
+                "branch": "refs/heads/mf/mf-sub-1",
+                "head_commit": "head",
+                "base_commit": "base",
+                "target_head_commit": "target",
+                "merge_queue_id": "mq-1",
+                "owned_files": ["agent/mcp/tools.py"],
+                "route_id": "route-1",
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-1",
+                "prompt_contract_hash": "sha256:prompt",
+                "visible_injection_manifest_hash": "sha256:visible",
             },
         ),
         (

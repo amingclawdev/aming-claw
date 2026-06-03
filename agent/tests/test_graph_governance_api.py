@@ -21,6 +21,7 @@ from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance import server
 from agent.governance import state_reconcile
+from agent.governance import task_timeline
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
@@ -1632,6 +1633,126 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn):
     assert finished["ok"] is True
     assert finished["context"]["checkpoint_id"] == "ckpt-finish-mf-sub"
     assert finished["context"]["replay_source"] == "mf_sub_finish_gate"
+
+
+def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_path):
+    worktree = tmp_path / "worker-startup"
+    worktree.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-startup",
+            task_id="startup-mf-sub-task",
+            root_task_id="startup-parent",
+            stage_task_id="startup-mf-sub-task",
+            backlog_id="FEAT-STARTUP-GATE",
+            branch_ref="refs/heads/codex/startup-mf-sub-task",
+            status="worktree_ready",
+            worker_id="startup-worker",
+            agent_id="startup-agent",
+            fence_token="fence-startup-mf-sub",
+            worktree_path=str(worktree),
+            base_commit="base-startup",
+            head_commit="base-startup",
+            target_head_commit="target-startup",
+            merge_queue_id="mergeq-api-startup",
+        ),
+        now_iso="2026-06-03T07:30:00Z",
+    )
+
+    started = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "startup-mf-sub-task",
+                "parent_task_id": "startup-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "startup-worker",
+                "agent_id": "startup-agent",
+                "session_token_surrogate": "host-session:019-startup",
+                "fence_token": "fence-startup-mf-sub",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/startup-mf-sub-task",
+                "head_commit": "head-startup",
+                "base_commit": "base-startup",
+                "target_head_commit": "target-startup",
+                "merge_queue_id": "mergeq-api-startup",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                "route_id": "route-startup",
+                "route_context_hash": "sha256:route-startup",
+                "prompt_contract_id": "rprompt-startup",
+                "prompt_contract_hash": "sha256:prompt-startup",
+                "visible_injection_manifest_hash": "sha256:visible-startup",
+                "observer_command_id": "cmd-startup",
+            },
+        )
+    )
+
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="FEAT-STARTUP-GATE",
+        event_kind="mf_subagent_startup",
+    )
+    assert started["ok"] is True
+    assert started["context"]["status"] == "running"
+    assert started["startup_gate"]["actual_startup_recorded"] is True
+    assert started["startup_gate"]["session_token_surrogate"] == "host-session:019-startup"
+    assert started["timeline_event_recorded"]["event_kind"] == "mf_subagent_startup"
+    assert len(events) == 1
+    assert events[0]["payload"]["mf_subagent_startup_gate"]["worker_role"] == "mf_sub"
+
+
+def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tmp_path):
+    worktree = tmp_path / "worker-startup-blocked"
+    worktree.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="startup-blocked-task",
+            root_task_id="startup-parent",
+            stage_task_id="startup-blocked-task",
+            backlog_id="FEAT-STARTUP-GATE",
+            branch_ref="refs/heads/codex/startup-blocked-task",
+            status="worktree_ready",
+            worker_id="startup-worker",
+            agent_id="startup-agent",
+            fence_token="fence-startup-blocked",
+            worktree_path=str(worktree),
+            base_commit="base-startup",
+            target_head_commit="target-startup",
+            merge_queue_id="mergeq-api-startup",
+        ),
+    )
+
+    blocked = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "startup-blocked-task",
+                "branch_runtime_evidence": {"registered": True},
+                "startup_intent_event": {"event_kind": "mf_subagent_startup_intent"},
+            },
+        )
+    )
+
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="FEAT-STARTUP-GATE",
+        event_kind="mf_subagent_startup",
+    )
+    assert blocked["ok"] is False
+    assert blocked["blocker_id"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert blocked["terminal_dispatch_blocker"] is True
+    assert events == []
 
 
 def test_parallel_branch_finish_gate_rejects_stale_fence(conn):
@@ -6065,7 +6186,7 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
 def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
     _activate_basic_graph(conn, "full-query-mf-sub")
 
-    with pytest.raises(ValidationError, match="fence_token is required"):
+    with pytest.raises(ValidationError, match="task_id is required"):
         server.handle_graph_governance_query(
             _ctx_with_role(
                 {"project_id": PID},
@@ -6076,6 +6197,59 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
                     "tool": "query_schema",
                     "query_source": "mf_subagent",
                     "parent_task_id": "subtask-1",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-subtask-1",
+                },
+            )
+        )
+
+    with pytest.raises(ValidationError, match="parent_task_id is required"):
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "task_id": "subtask-1",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-subtask-1",
+                },
+            )
+        )
+
+    with pytest.raises(ValidationError, match="worker_role=mf_sub is required"):
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "task_id": "subtask-1",
+                    "parent_task_id": "parent-task-1",
+                    "fence_token": "fence-subtask-1",
+                },
+            )
+        )
+
+    with pytest.raises(ValidationError, match="fence_token is required"):
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "task_id": "subtask-1",
+                    "parent_task_id": "parent-task-1",
+                    "worker_role": "mf_sub",
                 },
             )
         )

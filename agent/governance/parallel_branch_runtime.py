@@ -245,6 +245,7 @@ ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
     STATE_WORKTREE_READY,
     STATE_RUNNING,
 }
+MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION = "mf_subagent_startup_gate.v1"
 MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
 MERGE_REVALIDATION_BLOCKING_STATES = {
@@ -1798,7 +1799,7 @@ def validate_mf_subagent_graph_query_identity(
     task = str(task_id or "").strip()
     fence = str(fence_token or "").strip()
     role = str(worker_role or "").strip().lower().replace("-", "_")
-    if role and role != "mf_sub":
+    if role != "mf_sub":
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if not task or not fence:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
@@ -1832,6 +1833,415 @@ def validate_mf_subagent_graph_query_identity(
         if allowed_parent_ids and parent not in allowed_parent_ids:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     return context
+
+
+def _startup_string_list(value: Any) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item).strip() for item in value if str(item or "").strip())
+    if isinstance(value, str) and value.strip():
+        return (value.strip(),)
+    return ()
+
+
+def _startup_path_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return text
+
+
+def _startup_path_matches(actual: str, expected: str) -> bool:
+    actual_text = _startup_path_text(actual)
+    expected_text = _startup_path_text(expected)
+    return bool(actual_text and expected_text and actual_text == expected_text)
+
+
+def _startup_branch_name(value: str) -> str:
+    text = str(value or "").strip()
+    prefix = "refs/heads/"
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def _startup_token_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
+    session_token = str(payload.get("session_token") or "").strip()
+    surrogate = str(
+        payload.get("session_token_surrogate")
+        or payload.get("session_surrogate")
+        or ""
+    ).strip()
+    if session_token:
+        return {
+            "session_token_hash": "sha256:"
+            + hashlib.sha256(session_token.encode("utf-8")).hexdigest(),
+            "session_token_present": True,
+            "session_token_persisted": False,
+            "session_token_surrogate": surrogate,
+            "session_token_evidence_type": "hash",
+        }
+    if surrogate:
+        return {
+            "session_token_hash": "",
+            "session_token_present": False,
+            "session_token_persisted": False,
+            "session_token_surrogate": surrogate,
+            "session_token_evidence_type": "surrogate",
+        }
+    return {
+        "session_token_hash": "",
+        "session_token_present": False,
+        "session_token_persisted": False,
+        "session_token_surrogate": "",
+        "session_token_evidence_type": "",
+    }
+
+
+def _startup_blocker(
+    *,
+    blocker_id: str,
+    message: str,
+    context: BranchTaskRuntimeContext | None = None,
+    missing: tuple[str, ...] = (),
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "schema_version": MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION,
+        "status": "blocked",
+        "blocker": blocker_id,
+        "blocker_id": blocker_id,
+        "dispatch_blocker": True,
+        "terminal_dispatch_blocker": True,
+        "actual_startup_recorded": False,
+        "actual_startup_required": True,
+        "close_ready": False,
+        "message": message,
+        "missing": list(missing),
+    }
+    if context is not None:
+        payload["context"] = {
+            "project_id": context.project_id,
+            "task_id": context.task_id,
+            "parent_task_id": _parent_task_id_for_context(context),
+            "worker_id": context.worker_id,
+            "agent_id": context.agent_id,
+            "fence_token": context.fence_token,
+            "branch": context.branch_ref,
+            "worktree": context.worktree_path,
+            "base_commit": context.base_commit,
+            "target_head_commit": context.target_head_commit,
+            "merge_queue_id": context.merge_queue_id,
+            "status": context.status,
+        }
+    if details:
+        payload["details"] = dict(details)
+    return payload
+
+
+def record_mf_subagent_startup(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    payload: Mapping[str, Any],
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Validate and record a real host-created bounded mf_sub startup.
+
+    This is intentionally stricter than branch allocation or runtime-text
+    preparation: it requires the started worker to report runtime identity,
+    route identity, and a token hash/surrogate before a startup event can be
+    considered durable evidence.
+    """
+
+    ensure_branch_runtime_schema(conn)
+    task = str(task_id or payload.get("task_id") or "").strip()
+    if not task:
+        return _startup_blocker(
+            blocker_id="missing_task_id",
+            message="mf_subagent startup requires task_id",
+            missing=("task_id",),
+        )
+
+    context = get_branch_context(conn, project_id, task)
+    if context is None:
+        return _startup_blocker(
+            blocker_id="runtime_context_not_found",
+            message="branch runtime context must exist before mf_subagent startup",
+            missing=("branch_runtime_context",),
+            details={"task_id": task},
+        )
+
+    parent_task_id = str(payload.get("parent_task_id") or "").strip()
+    worker_role = str(payload.get("worker_role") or payload.get("role") or "").strip()
+    worker_role = worker_role.lower().replace("-", "_")
+    fence_token = str(payload.get("fence_token") or "").strip()
+    worker_id = str(payload.get("worker_id") or context.worker_id or "").strip()
+    agent_id = str(payload.get("agent_id") or context.agent_id or "").strip()
+    token_evidence = _startup_token_evidence(payload)
+    actual_cwd = str(payload.get("actual_cwd") or payload.get("cwd") or "").strip()
+    actual_git_root = str(payload.get("actual_git_root") or payload.get("git_root") or "").strip()
+    branch = str(payload.get("branch") or payload.get("branch_ref") or "").strip()
+    head_commit = str(payload.get("head_commit") or payload.get("branch_head") or "").strip()
+    base_commit = str(payload.get("base_commit") or context.base_commit or "").strip()
+    target_head_commit = str(
+        payload.get("target_head_commit") or context.target_head_commit or ""
+    ).strip()
+    route_id = str(payload.get("route_id") or "").strip()
+    route_context_hash = str(payload.get("route_context_hash") or "").strip()
+    prompt_contract_id = str(payload.get("prompt_contract_id") or "").strip()
+    prompt_contract_hash = str(payload.get("prompt_contract_hash") or "").strip()
+    visible_manifest = str(payload.get("visible_injection_manifest_hash") or "").strip()
+    owned_files = _startup_string_list(payload.get("owned_files"))
+    runtime_context_id = str(
+        payload.get("runtime_context_id") or runtime_context_id_for_branch_context(context)
+    ).strip()
+    launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
+    observer_command_id = str(payload.get("observer_command_id") or "").strip()
+    host_startup_id = str(payload.get("host_startup_id") or "").strip()
+
+    missing: list[str] = []
+    for field, value in (
+        ("parent_task_id", parent_task_id),
+        ("worker_role", worker_role),
+        ("worker_id", worker_id),
+        ("agent_id", agent_id),
+        ("fence_token", fence_token),
+        ("actual_cwd", actual_cwd),
+        ("actual_git_root", actual_git_root),
+        ("branch", branch),
+        ("head_commit", head_commit),
+        ("route_id", route_id),
+        ("route_context_hash", route_context_hash),
+        ("prompt_contract_id", prompt_contract_id),
+        ("prompt_contract_hash", prompt_contract_hash),
+        ("visible_injection_manifest_hash", visible_manifest),
+        ("owned_files", owned_files),
+    ):
+        if not value:
+            missing.append(field)
+    if not (
+        token_evidence["session_token_hash"]
+        or token_evidence["session_token_surrogate"]
+    ):
+        missing.append("session_token_or_surrogate")
+    if missing:
+        return _startup_blocker(
+            blocker_id="no_truthful_bounded_mf_sub_startup_surface_available",
+            message=(
+                "actual mf_sub startup evidence is incomplete; branch allocation "
+                "or runtime-text startup intent is not sufficient"
+            ),
+            context=context,
+            missing=tuple(missing),
+        )
+
+    if worker_role != "mf_sub":
+        return _startup_blocker(
+            blocker_id="worker_role_mismatch",
+            message="mf_subagent startup requires worker_role=mf_sub",
+            context=context,
+            details={"worker_role": worker_role},
+        )
+    if context.worker_id and worker_id != context.worker_id:
+        return _startup_blocker(
+            blocker_id="worker_id_mismatch",
+            message="mf_subagent startup worker_id must match branch runtime context",
+            context=context,
+            details={"worker_id": worker_id, "expected_worker_id": context.worker_id},
+        )
+    try:
+        _require_current_fence(context, fence_token)
+    except BranchRuntimeFenceError:
+        return _startup_blocker(
+            blocker_id="fence_invalidated_or_unknown",
+            message="mf_subagent startup fence is invalidated or unknown",
+            context=context,
+            details={"task_id": task},
+        )
+    allowed_parent_ids = {
+        value
+        for value in (
+            context.root_task_id,
+            context.chain_id,
+            context.stage_task_id,
+            context.backlog_id,
+        )
+        if value
+    }
+    if allowed_parent_ids and parent_task_id not in allowed_parent_ids:
+        return _startup_blocker(
+            blocker_id="parent_task_id_mismatch",
+            message="mf_subagent startup parent_task_id does not match branch context",
+            context=context,
+            details={
+                "parent_task_id": parent_task_id,
+                "allowed_parent_task_ids": sorted(allowed_parent_ids),
+            },
+        )
+    expected_worktree = context.worktree_path
+    if expected_worktree:
+        if not _startup_path_matches(actual_git_root, expected_worktree):
+            return _startup_blocker(
+                blocker_id="actual_git_root_mismatch",
+                message="mf_subagent startup actual_git_root must match assigned worktree",
+                context=context,
+                details={
+                    "actual_git_root": actual_git_root,
+                    "expected_worktree": expected_worktree,
+                },
+            )
+        actual_cwd_path = _startup_path_text(actual_cwd)
+        expected_path = _startup_path_text(expected_worktree)
+        if actual_cwd_path and expected_path and not (
+            actual_cwd_path == expected_path
+            or actual_cwd_path.startswith(expected_path + "/")
+        ):
+            return _startup_blocker(
+                blocker_id="actual_cwd_outside_worktree",
+                message="mf_subagent startup actual_cwd must be inside assigned worktree",
+                context=context,
+                details={
+                    "actual_cwd": actual_cwd,
+                    "expected_worktree": expected_worktree,
+                },
+            )
+    if _startup_branch_name(branch) != _startup_branch_name(context.branch_ref):
+        return _startup_blocker(
+            blocker_id="branch_mismatch",
+            message="mf_subagent startup branch must match branch runtime context",
+            context=context,
+            details={"branch": branch, "expected_branch": context.branch_ref},
+        )
+    if context.base_commit and base_commit and base_commit != context.base_commit:
+        return _startup_blocker(
+            blocker_id="base_commit_mismatch",
+            message="mf_subagent startup base_commit must match branch runtime context",
+            context=context,
+            details={"base_commit": base_commit, "expected_base_commit": context.base_commit},
+        )
+    if context.target_head_commit and target_head_commit and target_head_commit != context.target_head_commit:
+        return _startup_blocker(
+            blocker_id="target_head_commit_mismatch",
+            message="mf_subagent startup target_head_commit must match branch runtime context",
+            context=context,
+            details={
+                "target_head_commit": target_head_commit,
+                "expected_target_head_commit": context.target_head_commit,
+            },
+        )
+    merge_queue_id = str(payload.get("merge_queue_id") or "").strip()
+    if context.merge_queue_id and merge_queue_id and merge_queue_id != context.merge_queue_id:
+        return _startup_blocker(
+            blocker_id="merge_queue_id_mismatch",
+            message="mf_subagent startup merge_queue_id must match branch runtime context",
+            context=context,
+            details={
+                "merge_queue_id": merge_queue_id,
+                "expected_merge_queue_id": context.merge_queue_id,
+            },
+        )
+
+    saved = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            status=STATE_RUNNING,
+            worker_id=worker_id,
+            agent_id=agent_id,
+            head_commit=head_commit,
+            last_recovery_action="mf_subagent_startup_recorded",
+        ),
+        now_iso=now_iso,
+    )
+    gate: dict[str, Any] = {
+        "schema_version": MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION,
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "started": True,
+        "startup_complete": True,
+        "actual_startup_recorded": True,
+        "actual_startup_required": False,
+        "same_as_expected_worker": True,
+        "fence_token_matches": True,
+        "close_satisfying": True,
+        "raw_launch_text_persisted": False,
+        "project_id": project_id,
+        "backlog_id": saved.backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": saved.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "role": "mf_sub",
+        "worker_id": worker_id,
+        "agent_id": agent_id,
+        "fence_token": saved.fence_token,
+        "branch": saved.branch_ref,
+        "branch_ref": saved.branch_ref,
+        "worktree": saved.worktree_path,
+        "worktree_path": saved.worktree_path,
+        "assigned_worktree": saved.worktree_path,
+        "actual_cwd": _startup_path_text(actual_cwd),
+        "actual_git_root": _startup_path_text(actual_git_root),
+        "base_commit": saved.base_commit,
+        "target_head_commit": saved.target_head_commit,
+        "head_commit": saved.head_commit,
+        "merge_queue_id": saved.merge_queue_id,
+        "owned_files": list(owned_files),
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "visible_injection_manifest_hash": visible_manifest,
+        "session_token_hash": token_evidence["session_token_hash"],
+        "session_token_surrogate": token_evidence["session_token_surrogate"],
+        "session_token_evidence_type": token_evidence["session_token_evidence_type"],
+        "session_token_present": token_evidence["session_token_present"],
+        "session_token_persisted": False,
+        "startup_source": str(payload.get("startup_source") or "host_created_mf_sub_worker"),
+        "startup_timing": "actual_worker_started",
+        "observer_command_id": observer_command_id,
+        "host_startup_id": host_startup_id,
+    }
+    if launch_text_hash:
+        gate["launch_text_hash"] = launch_text_hash
+    timeline_event = {
+        "schema_version": 2,
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "actor": "mf_sub",
+        "project_id": project_id,
+        "backlog_id": saved.backlog_id,
+        "task_id": saved.task_id,
+        "attempt_num": saved.attempt,
+        "correlation_id": observer_command_id or host_startup_id,
+        "payload": {
+            "mf_subagent_startup_gate": gate,
+        },
+        "artifact_refs": {
+            "runtime_context_id": runtime_context_id,
+            "session_token_evidence_type": token_evidence["session_token_evidence_type"],
+        },
+        "commit_sha": saved.head_commit,
+    }
+    return {
+        "ok": True,
+        "schema_version": MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION,
+        "status": "startup_recorded",
+        "project_id": project_id,
+        "context": branch_context_to_dict(saved),
+        "startup_gate": gate,
+        "timeline_event": timeline_event,
+        "actual_startup_recorded": True,
+        "close_ready": False,
+    }
 
 
 def validate_mf_subagent_runtime_context_lookup(

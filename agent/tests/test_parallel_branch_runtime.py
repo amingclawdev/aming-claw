@@ -37,10 +37,12 @@ from agent.governance.parallel_branch_runtime import (
     materialize_branch_worktree,
     plan_branch_runtime_context,
     queue_merge_item_for_branch_context,
+    record_mf_subagent_startup,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
     runtime_tasks_from_contexts,
     upsert_branch_context,
+    validate_mf_subagent_graph_query_identity,
 )
 
 PROJECT_ID = "fixture-parallel-project"
@@ -138,6 +140,158 @@ def _runtime_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     ensure_branch_runtime_schema(conn)
     return conn
+
+
+def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "task_id": "mf-sub-startup",
+        "parent_task_id": "parent-startup",
+        "worker_role": "mf_sub",
+        "worker_id": "worker-startup",
+        "agent_id": "agent-startup",
+        "session_token": "secret-worker-session-token",
+        "fence_token": "fence-startup",
+        "actual_cwd": worktree,
+        "actual_git_root": worktree,
+        "branch": "refs/heads/codex/mf-sub-startup",
+        "head_commit": "head-startup",
+        "base_commit": "base-startup",
+        "target_head_commit": "target-startup",
+        "merge_queue_id": "mq-startup",
+        "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+        "route_id": "route-startup",
+        "route_context_hash": "sha256:route-startup",
+        "prompt_contract_id": "rprompt-startup",
+        "prompt_contract_hash": "sha256:prompt-startup",
+        "visible_injection_manifest_hash": "sha256:visible-startup",
+        "observer_command_id": "cmd-startup",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup"
+    worktree.mkdir(parents=True)
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="mf-sub-startup",
+            root_task_id="parent-startup",
+            stage_task_id="mf-sub-startup",
+            backlog_id="BUG-STARTUP",
+            worker_id="worker-startup",
+            agent_id="agent-startup",
+            branch_ref="refs/heads/codex/mf-sub-startup",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-startup",
+            worktree_path=str(worktree),
+            base_commit="base-startup",
+            target_head_commit="target-startup",
+            merge_queue_id="mq-startup",
+        ),
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree)),
+        now_iso=NOW,
+    )
+
+    gate = result["startup_gate"]
+    saved = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert result["ok"] is True
+    assert saved is not None
+    assert saved.status == STATE_RUNNING
+    assert saved.head_commit == "head-startup"
+    assert gate["actual_startup_recorded"] is True
+    assert gate["session_token_hash"].startswith("sha256:")
+    assert gate["session_token_persisted"] is False
+    assert "secret-worker-session-token" not in str(result)
+    assert result["timeline_event"]["event_kind"] == "mf_subagent_startup"
+    assert result["timeline_event"]["payload"]["mf_subagent_startup_gate"] == gate
+
+    accepted = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        parent_task_id="parent-startup",
+        worker_role="mf_sub",
+        fence_token="fence-startup",
+    )
+    assert accepted.task_id == "mf-sub-startup"
+
+
+def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-blocked"
+    worktree.mkdir(parents=True)
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="mf-sub-startup",
+            root_task_id="parent-startup",
+            stage_task_id="mf-sub-startup",
+            backlog_id="BUG-STARTUP",
+            worker_id="worker-startup",
+            agent_id="agent-startup",
+            branch_ref="refs/heads/codex/mf-sub-startup",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-startup",
+            worktree_path=str(worktree),
+            base_commit="base-startup",
+            target_head_commit="target-startup",
+            merge_queue_id="mq-startup",
+        ),
+        now_iso=NOW,
+    )
+
+    allocation_only = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload={"task_id": "mf-sub-startup"},
+        now_iso=NOW,
+    )
+    stale_fence = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), fence_token="stale-fence"),
+        now_iso=NOW,
+    )
+    wrong_worker = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), worker_id="other-worker"),
+        now_iso=NOW,
+    )
+
+    assert allocation_only["ok"] is False
+    assert allocation_only["blocker_id"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert allocation_only["terminal_dispatch_blocker"] is True
+    assert "actual_cwd" in allocation_only["missing"]
+    assert stale_fence["ok"] is False
+    assert stale_fence["blocker_id"] == "fence_invalidated_or_unknown"
+    assert wrong_worker["ok"] is False
+    assert wrong_worker["blocker_id"] == "worker_id_mismatch"
+
+    with pytest.raises(BranchRuntimeFenceError):
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="mf-sub-startup",
+            parent_task_id="parent-startup",
+            worker_role="",
+            fence_token="fence-startup",
+        )
 
 
 def _pb001_contexts(

@@ -176,14 +176,64 @@ def _json_loads_object(value: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _startup_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _startup_fence_present(value: dict[str, Any]) -> bool:
+    return bool(
+        _startup_text(value.get("fence_token"))
+        or _startup_text(value.get("worker_fence_token"))
+        or _startup_text(value.get("actual_fence_token"))
+        or _startup_text(value.get("fence_token_hash"))
+        or value.get("fence_token_matches") is True
+    )
+
+
+def _startup_token_present(value: dict[str, Any]) -> bool:
+    return bool(
+        _startup_text(value.get("session_token_hash"))
+        or _startup_text(value.get("session_token_surrogate"))
+        or value.get("session_token_present") is True
+    )
+
+
+def _actual_startup_identity_present(value: dict[str, Any]) -> bool:
+    actual_runtime = value.get("actual_runtime") if isinstance(value.get("actual_runtime"), dict) else {}
+    actual_cwd = _startup_text(value.get("actual_cwd") or actual_runtime.get("cwd"))
+    actual_git_root = _startup_text(
+        value.get("actual_git_root") or actual_runtime.get("git_root")
+    )
+    branch = _startup_text(
+        value.get("branch")
+        or value.get("branch_ref")
+        or actual_runtime.get("branch")
+        or actual_runtime.get("branch_ref")
+    )
+    head_commit = _startup_text(
+        value.get("head_commit")
+        or value.get("branch_head")
+        or actual_runtime.get("head_commit")
+        or actual_runtime.get("branch_head")
+    )
+    return bool(
+        (actual_cwd or actual_git_root)
+        and branch
+        and head_commit
+        and _startup_fence_present(value)
+        and _startup_token_present(value)
+    )
+
+
 def _contains_actual_startup_evidence(value: Any) -> bool:
     if isinstance(value, dict):
         lowered = {str(key).lower(): item for key, item in value.items()}
-        if lowered.get("actual_startup_recorded") is True:
-            return True
         if isinstance(lowered.get("startup_recording"), dict):
             startup_recording = lowered["startup_recording"]
-            if startup_recording.get("recorded") is True:
+            if (
+                startup_recording.get("recorded") is True
+                and _actual_startup_identity_present(startup_recording)
+            ):
                 return True
 
         event_kind = str(
@@ -192,6 +242,15 @@ def _contains_actual_startup_evidence(value: Any) -> bool:
         if event_kind == "mf_subagent_startup":
             if lowered.get("recorded") is False or lowered.get("actual_startup_recorded") is False:
                 return False
+            payload = lowered.get("payload") if isinstance(lowered.get("payload"), dict) else {}
+            gate = (
+                payload.get("mf_subagent_startup_gate")
+                if isinstance(payload.get("mf_subagent_startup_gate"), dict)
+                else {}
+            )
+            return _actual_startup_identity_present(gate) or _actual_startup_identity_present(lowered)
+
+        if lowered.get("actual_startup_recorded") is True and _actual_startup_identity_present(lowered):
             return True
 
         return any(_contains_actual_startup_evidence(item) for item in value.values())
@@ -299,12 +358,43 @@ def _command_result(command: dict[str, Any]) -> dict[str, Any]:
 
 def _command_has_startup_or_blocker_evidence(command: dict[str, Any]) -> bool:
     result = _command_result(command)
+    if _result_has_startup_or_blocker_evidence(result):
+        return True
+    error = str(command.get("error") or "").lower()
+    return "dispatch_blocker" in error or "dispatch blocker" in error
+
+
+def _result_has_startup_or_blocker_evidence(result: dict[str, Any]) -> bool:
     if _contains_actual_startup_evidence(result):
         return True
     if _contains_terminal_dispatch_blocker(result):
         return True
-    error = str(command.get("error") or "").lower()
-    return "dispatch_blocker" in error or "dispatch blocker" in error
+    return False
+
+
+def _missing_startup_surface_blocker(command: dict[str, Any], *, now: str) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    return {
+        "blocker_id": "no_truthful_bounded_mf_sub_startup_surface_available",
+        "dispatch_blocker": True,
+        "terminal_dispatch_blocker": True,
+        "status": "blocked",
+        "observer_command_id": str(command.get("command_id") or ""),
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "route_id": str(payload.get("route_id") or ""),
+        "route_context_hash": str(payload.get("route_context_hash") or ""),
+        "prompt_contract_id": str(payload.get("prompt_contract_id") or ""),
+        "visible_injection_manifest_hash": str(
+            payload.get("visible_injection_manifest_hash") or ""
+        ),
+        "claimed_at": str(command.get("claimed_at") or ""),
+        "failed_at": now,
+        "reason": (
+            "execute_backlog_row completion requires actual bounded mf_sub startup "
+            "evidence or an explicit terminal dispatch blocker; branch allocation "
+            "and runtime-text startup intent are not startup"
+        ),
+    }
 
 
 def _command_claim_age_sec(command: dict[str, Any], *, now: str) -> float | None:
@@ -1181,6 +1271,34 @@ def complete_command(
     )
     _ensure_command_owned_by_session(command, session_id=sid, action="complete")
     result_payload = _merge_result_with_durable_takeover(command, result)
+    if (
+        str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        and not _result_has_startup_or_blocker_evidence(result_payload)
+    ):
+        blocker = _missing_startup_surface_blocker(command, now=timestamp)
+        result_payload["ok"] = False
+        result_payload["startup_surface_blocker"] = blocker
+        conn.execute(
+            """UPDATE observer_command_queue
+                  SET status = ?, completed_at = ?, result_json = ?, error = ?
+                WHERE project_id = ? AND command_id = ?""",
+            (
+                COMMAND_STATUS_FAILED,
+                timestamp,
+                _json_dumps(result_payload),
+                blocker["blocker_id"],
+                pid,
+                command_id,
+            ),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "project_id": pid,
+            "observer_session_id": sid,
+            "command": get_command(conn, project_id=pid, command_id=command_id),
+            "startup_surface_blocker": blocker,
+        }
     conn.execute(
         """UPDATE observer_command_queue
               SET status = ?, completed_at = ?, result_json = ?, error = ''

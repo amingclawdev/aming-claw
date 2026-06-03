@@ -4103,10 +4103,14 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     session = _require_graph_governance_mf_subagent(ctx, conn, action)
     task_id = str(body.get("task_id") or "").strip()
     parent_task_id = str(body.get("parent_task_id") or "").strip()
-    validation_task_id = task_id or parent_task_id
+    worker_role = str(body.get("worker_role") or "").strip().lower().replace("-", "_")
     fence_token = str(body.get("fence_token") or "").strip()
-    if not validation_task_id:
-        raise ValidationError("parent_task_id or task_id is required for mf_subagent graph query")
+    if not task_id:
+        raise ValidationError("task_id is required for mf_subagent graph query")
+    if not parent_task_id:
+        raise ValidationError("parent_task_id is required for mf_subagent graph query")
+    if worker_role != "mf_sub":
+        raise ValidationError("worker_role=mf_sub is required for mf_subagent graph query")
     if not fence_token:
         raise ValidationError("fence_token is required for mf_subagent graph query")
     from .parallel_branch_runtime import (
@@ -4117,9 +4121,9 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         context = validate_mf_subagent_graph_query_identity(
             conn,
             project_id=ctx.get_project_id(),
-            task_id=validation_task_id,
+            task_id=task_id,
             parent_task_id=parent_task_id,
-            worker_role=str(body.get("worker_role") or ""),
+            worker_role=worker_role,
             fence_token=fence_token,
         )
     except BranchRuntimeFenceError as exc:
@@ -4128,7 +4132,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             "mf_subagent graph query fence is invalidated or unknown",
             403,
             {
-                "task_id": validation_task_id,
+                "task_id": task_id,
                 "parent_task_id": parent_task_id,
                 "reason": "fence_invalidated_or_unknown",
             },
@@ -5148,6 +5152,65 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             "gate": gate,
             "context": branch_context_to_dict(saved),
         }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/startup")
+def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
+    """Record a real host-created bounded mf_sub startup as timeline evidence."""
+    project_id = ctx.get_project_id()
+    from . import task_timeline
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import record_mf_subagent_startup
+
+    task_id = str(ctx.body.get("task_id") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.startup",
+        )
+        with sqlite_write_lock():
+            task_timeline.ensure_schema(conn)
+            result = record_mf_subagent_startup(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                payload=ctx.body or {},
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            if not result.get("ok"):
+                conn.commit()
+                return result
+
+            event = result.get("timeline_event") if isinstance(result.get("timeline_event"), dict) else {}
+            recorded = task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                task_id=str(event.get("task_id") or task_id),
+                backlog_id=str(event.get("backlog_id") or ""),
+                attempt_num=int(event.get("attempt_num") or 0),
+                event_type=str(event.get("event_type") or "mf_subagent.startup"),
+                phase=str(event.get("phase") or "startup_gate"),
+                event_kind=str(event.get("event_kind") or "mf_subagent_startup"),
+                correlation_id=str(event.get("correlation_id") or ""),
+                schema_version=int(event.get("schema_version") or 2),
+                actor=str(event.get("actor") or "mf_sub"),
+                status=str(event.get("status") or "passed"),
+                payload=event.get("payload") if isinstance(event.get("payload"), dict) else {},
+                artifact_refs=event.get("artifact_refs")
+                if isinstance(event.get("artifact_refs"), dict)
+                else {},
+                commit_sha=str(event.get("commit_sha") or ""),
+            )
+            result["timeline_event_recorded"] = recorded
+            conn.commit()
+            return result
     finally:
         conn.close()
 

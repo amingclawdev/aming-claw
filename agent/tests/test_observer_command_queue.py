@@ -32,6 +32,27 @@ def _execute_backlog_row_payload() -> dict:
     }
 
 
+def _actual_startup_result() -> dict:
+    return {
+        "ok": True,
+        "startup_gate": {
+            "schema_version": "mf_subagent_startup_gate.v1",
+            "gate_kind": "mf_subagent.startup",
+            "status": "passed",
+            "actual_startup_recorded": True,
+            "worker_role": "mf_sub",
+            "worker_id": "worker-1",
+            "agent_id": "agent-1",
+            "session_token_hash": "sha256:startup-token",
+            "fence_token": "fence-1",
+            "actual_cwd": "/repo/.worktrees/worker-1",
+            "actual_git_root": "/repo/.worktrees/worker-1",
+            "branch": "refs/heads/codex/worker-1",
+            "head_commit": "head-1",
+        },
+    }
+
+
 def test_command_enqueue_and_list_preserve_business_payload_in_db():
     conn = _conn()
 
@@ -92,7 +113,7 @@ def test_execute_backlog_row_claim_complete_preserves_payload_without_reminder_l
         session_id=session["session_id"],
         session_token=session["session_token"],
         command_id=command["command_id"],
-        result={"ok": True, "backlog_id": payload["backlog_id"]},
+        result={**_actual_startup_result(), "backlog_id": payload["backlog_id"]},
     )
 
     reminder = observer_session.command_pending_reminder("demo")
@@ -101,10 +122,57 @@ def test_execute_backlog_row_claim_complete_preserves_payload_without_reminder_l
     assert claimed["command"]["payload"] == payload
     assert completed["command"]["status"] == observer_session.COMMAND_STATUS_COMPLETED
     assert completed["command"]["payload"] == payload
-    assert completed["command"]["result"] == {"ok": True, "backlog_id": payload["backlog_id"]}
+    assert completed["command"]["result"]["ok"] is True
+    assert completed["command"]["result"]["backlog_id"] == payload["backlog_id"]
+    assert completed["command"]["result"]["startup_gate"]["actual_startup_recorded"] is True
     assert reminder["payload_included"] is False
     assert "payload" not in reminder
     assert payload["backlog_id"] not in str(reminder)
+
+
+def test_execute_backlog_row_complete_without_startup_fails_truthfully():
+    conn = _conn()
+    session = _register(conn)
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "branch_runtime_evidence": {"registered": True},
+            "startup_intent_event": {
+                "event_kind": "mf_subagent_startup_intent",
+                "actual_startup_required": True,
+            },
+        },
+        now="2026-06-03T00:00:03Z",
+    )
+
+    command_after = completed["command"]
+    blocker = command_after["result"]["startup_surface_blocker"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert blocker["terminal_dispatch_blocker"] is True
+    assert "runtime-text startup intent" in blocker["reason"]
 
 
 def test_execute_backlog_row_rejects_missing_route_payload_fields():
@@ -278,7 +346,7 @@ def test_stale_claimed_command_can_be_taken_over_by_fallback_session():
         session_id=fallback["session_id"],
         session_token=fallback["session_token"],
         command_id=command["command_id"],
-        result={"ok": True, "takeover": takeover["takeover"]},
+        result={**_actual_startup_result(), "takeover": takeover["takeover"]},
         now="2026-06-03T00:03:04Z",
     )
     assert completed["command"]["status"] == observer_session.COMMAND_STATUS_COMPLETED
@@ -493,7 +561,10 @@ def test_active_owner_old_execute_with_startup_evidence_cannot_be_taken_over():
         """UPDATE observer_command_queue
               SET result_json = ?
             WHERE command_id = ?""",
-        ('{"actual_startup_recorded": true}', command["command_id"]),
+        (
+            observer_session._json_dumps(_actual_startup_result()),
+            command["command_id"],
+        ),
     )
     conn.commit()
     observer_session.heartbeat_session(

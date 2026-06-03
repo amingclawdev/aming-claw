@@ -827,6 +827,53 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "parallel_branch_startup",
+        "description": "Record actual host-created bounded mf_sub startup evidence for an allocated branch/worktree. This is not dry-run runtime text and returns a structured blocker when real startup identity or token evidence is missing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "parent_task_id": {"type": "string"},
+                "worker_role": {"type": "string", "description": "Must be mf_sub."},
+                "role": {"type": "string"},
+                "worker_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "session_token": {
+                    "type": "string",
+                    "description": "One-time worker session token. The server persists only a hash.",
+                },
+                "session_token_surrogate": {
+                    "type": "string",
+                    "description": "Explicit startup token surrogate when the host cannot expose the raw session token.",
+                },
+                "fence_token": {"type": "string"},
+                "runtime_context_id": {"type": "string"},
+                "observer_command_id": {"type": "string"},
+                "host_startup_id": {"type": "string"},
+                "actual_cwd": {"type": "string"},
+                "actual_git_root": {"type": "string"},
+                "branch": {"type": "string"},
+                "branch_ref": {"type": "string"},
+                "head_commit": {"type": "string"},
+                "branch_head": {"type": "string"},
+                "base_commit": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "merge_queue_id": {"type": "string"},
+                "owned_files": {"type": "array", "items": {"type": "string"}},
+                "route_id": {"type": "string"},
+                "route_context_hash": {"type": "string"},
+                "prompt_contract_id": {"type": "string"},
+                "prompt_contract_hash": {"type": "string"},
+                "visible_injection_manifest_hash": {"type": "string"},
+                "launch_text_hash": {"type": "string"},
+                "startup_source": {"type": "string"},
+                "now_iso": {"type": "string"},
+            },
+            "required": ["project_id", "task_id"],
+        },
+    },
+    {
         "name": "parallel_branch_checkpoint",
         "description": "Observer-facing wrapper to record a fenced checkpoint for a parallel branch runtime context.",
         "inputSchema": {
@@ -1646,6 +1693,19 @@ class ToolDispatcher:
             return self._api(
                 "POST",
                 f"/api/graph-governance/{pid}/parallel-branches/allocate",
+                body,
+            )
+
+        if name == "parallel_branch_startup":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/parallel-branches/startup",
                 body,
             )
 
