@@ -25,6 +25,15 @@ ROUTE_PROMPT_EVENT_KIND = "route.prompt_context.requested"
 ROUTE_ACTION_EVENT_KIND = "route.action.requested"
 ROUTE_SERVICE_STAGE = "dispatch"
 DEFAULT_ROUTE_ACTION_PRECHECK_ID = "observer_dispatch_bounded_worker"
+EXTERNAL_ROUTE_ACTION_PRECHECK_SCHEMA_VERSION = (
+    "observer_repair_external_route_action_precheck.v1"
+)
+WORKER_DISPATCH_ROUTE_ACTIONS = {
+    "dispatch_bounded_worker",
+    "dispatch_bounded_implementation_worker",
+    "dispatch_worker",
+    "dispatch_bounded_lanes_after_route_token",
+}
 
 CHECKPOINTS = [
     "diagnosed",
@@ -558,6 +567,278 @@ def _service_route_identity(route: Mapping[str, Any], bundle: Mapping[str, Any])
             bundle.get("prompt_contract_hash") or evidence.get("prompt_contract_hash")
         ),
         "visible_injection_manifest_hash": _string(evidence.get("visible_injection_manifest_hash")),
+    }
+
+
+def _route_identity_from_public(value: Any) -> dict[str, str]:
+    payload = _object(value)
+    route = _object(payload.get("route"))
+    route_context = _object(payload.get("route_context"))
+    route_identity = _object(payload.get("route_identity"))
+    hashes = _object(payload.get("hashes"))
+    prompt_contract = _object(payload.get("prompt_contract"))
+    visible_manifest = payload.get("visible_injection_manifest")
+    visible_manifest_hash = _string(
+        payload.get("visible_injection_manifest_hash")
+        or route_identity.get("visible_injection_manifest_hash")
+        or route_context.get("visible_injection_manifest_hash")
+        or route.get("visible_injection_manifest_hash")
+        or hashes.get("visible_injection_manifest_hash")
+    )
+    identity = {
+        "route_context_hash": _string(
+            payload.get("route_context_hash")
+            or route_identity.get("route_context_hash")
+            or route_context.get("route_context_hash")
+            or route.get("route_context_hash")
+        ),
+        "prompt_contract_id": _string(
+            payload.get("prompt_contract_id")
+            or route_identity.get("prompt_contract_id")
+            or route_context.get("prompt_contract_id")
+            or route.get("prompt_contract_id")
+            or prompt_contract.get("prompt_contract_id")
+            or prompt_contract.get("id")
+        ),
+        "prompt_contract_hash": _string(
+            payload.get("prompt_contract_hash")
+            or route_identity.get("prompt_contract_hash")
+            or route_context.get("prompt_contract_hash")
+            or route.get("prompt_contract_hash")
+            or prompt_contract.get("prompt_contract_hash")
+        ),
+        "visible_injection_manifest_hash": visible_manifest_hash,
+    }
+    if visible_manifest_hash:
+        return {key: value for key, value in identity.items() if value}
+    if isinstance(visible_manifest, Mapping) and visible_manifest:
+        identity["visible_injection_manifest"] = "present"
+    return {key: value for key, value in identity.items() if value}
+
+
+def _route_identity_mismatch_fields(
+    expected: Mapping[str, Any],
+    supplied: Mapping[str, Any],
+) -> list[str]:
+    mismatched: list[str] = []
+    for field in (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        expected_value = _string(expected.get(field))
+        supplied_value = _string(supplied.get(field))
+        if expected_value and supplied_value and expected_value != supplied_value:
+            mismatched.append(field)
+    return mismatched
+
+
+def _external_precheck_block_reason(packet: Mapping[str, Any]) -> str:
+    allowed = packet.get("allowed")
+    if allowed is False:
+        return "external action precheck marked allowed=false"
+    status = _string(packet.get("status") or packet.get("decision")).lower()
+    if status in {"block", "blocked", "failed", "fail", "rejected", "deny", "denied"}:
+        return f"external action precheck status is {status}"
+    return ""
+
+
+def _external_precheck_marker_present(packet: Mapping[str, Any]) -> bool:
+    for key in (
+        "action",
+        "requested_action",
+        "allowed_action",
+        "allowed_actions",
+        "caller_role",
+        "role",
+        "actor_role",
+        "precheck_id",
+        "external_precheck_id",
+        "source_event_id",
+        "source_event_ref",
+        "source_ref",
+        "source_event",
+        "route_action_gate",
+        "status",
+        "decision",
+        "allowed",
+    ):
+        if key in packet and packet.get(key) not in (None, "", [], {}):
+            return True
+    return False
+
+
+def _external_route_action_precheck(
+    *,
+    plan: Mapping[str, Any],
+    action_precheck_id: str,
+    route_identity: Mapping[str, Any],
+    action_precheck: Mapping[str, Any],
+    actor: str,
+    graph_status: Mapping[str, Any],
+    version_check: Mapping[str, Any],
+) -> dict[str, Any]:
+    identity = _route_identity_from_public(route_identity)
+    packet = _object(action_precheck)
+    packet_identity = _route_identity_from_public(packet)
+    selected_action = _string(action_precheck_id) or DEFAULT_ROUTE_ACTION_PRECHECK_ID
+    required_missing = [
+        field
+        for field in (
+            "route_context_hash",
+            "prompt_contract_id",
+            "visible_injection_manifest_hash",
+        )
+        if not identity.get(field)
+    ]
+    if required_missing:
+        return {
+            "present": False,
+            "valid": False,
+            "precheck_id": selected_action,
+            "source": "external",
+            "reason": "external route identity missing required fields: "
+            + ", ".join(required_missing),
+            "route_identity": identity,
+        }
+    if not _external_precheck_marker_present(packet):
+        return {
+            "present": False,
+            "valid": False,
+            "precheck_id": selected_action,
+            "source": "external",
+            "reason": "external action precheck packet or source marker is required",
+            "route_identity": identity,
+        }
+    mismatches = (
+        _route_identity_mismatch_fields(identity, packet_identity)
+        if packet_identity
+        else []
+    )
+    if mismatches:
+        return {
+            "present": False,
+            "valid": False,
+            "precheck_id": selected_action,
+            "source": "external",
+            "reason": "external route action precheck identity mismatch: "
+            + ", ".join(mismatches),
+            "route_identity": identity,
+            "supplied_route_identity": packet_identity,
+            "route_identity_mismatch_fields": mismatches,
+        }
+    blocked_reason = _external_precheck_block_reason(packet)
+    if blocked_reason:
+        return {
+            "present": False,
+            "valid": False,
+            "precheck_id": selected_action,
+            "source": "external",
+            "reason": blocked_reason,
+            "route_identity": identity,
+        }
+
+    action = _string(
+        packet.get("action")
+        or packet.get("requested_action")
+        or packet.get("allowed_action")
+        or "dispatch_bounded_worker"
+    )
+    caller_role = _string(
+        packet.get("caller_role")
+        or packet.get("role")
+        or packet.get("actor_role")
+        or "observer"
+    )
+    allowed_actions = _string_list_field(
+        packet.get("allowed_actions")
+        or packet.get("allowed_action")
+        or [action]
+    )
+    payload = {
+        "schema_version": EXTERNAL_ROUTE_ACTION_PRECHECK_SCHEMA_VERSION,
+        "template_id": ROUTE_WORKFLOW_TEMPLATE_ID,
+        "stage": ROUTE_SERVICE_STAGE,
+        "precheck_id": selected_action,
+        "external_precheck_id": selected_action,
+        "caller_role": caller_role,
+        "action": action,
+        "allowed_actions": allowed_actions,
+        "route_context_hash": identity["route_context_hash"],
+        "prompt_contract_id": identity["prompt_contract_id"],
+        "visible_injection_manifest_hash": identity["visible_injection_manifest_hash"],
+        "external_route_identity_validated": True,
+        "private_provider_body_excluded": True,
+        "raw_prompt_excluded": True,
+        "hidden_context_excluded": True,
+        "version_check": dict(version_check) if isinstance(version_check, Mapping) else {},
+        "graph_status": dict(graph_status) if isinstance(graph_status, Mapping) else {},
+    }
+    if identity.get("prompt_contract_hash"):
+        payload["prompt_contract_hash"] = identity["prompt_contract_hash"]
+
+    try:
+        from agent.governance.mf_subagent_contract import validate_route_action_gate
+
+        route_action_gate = validate_route_action_gate(payload)
+    except Exception as exc:
+        return {
+            "present": False,
+            "valid": False,
+            "precheck_id": selected_action,
+            "source": "external",
+            "reason": _string(exc),
+            "route_identity": identity,
+        }
+
+    repair_run_id = _string(plan.get("repair_run_id"))
+    root_backlog_ids = [
+        str(item) for item in _list(plan.get("root_backlog_ids")) if str(item)
+    ]
+    backlog_id = root_backlog_ids[0] if len(root_backlog_ids) == 1 else ""
+    source_event = _route_service_source_event(
+        source_event_id=f"{repair_run_id}:external:{selected_action}",
+        event_type=ROUTE_ACTION_EVENT_KIND,
+        event_kind="route_action_precheck",
+        project_id=_string(plan.get("project_id")),
+        backlog_id=backlog_id,
+        actor=actor,
+        payload={**payload, "route_action_gate": route_action_gate},
+        route_identity=identity,
+        repair_run_id=repair_run_id,
+        service_id="route.action_precheck",
+        precheck_id=selected_action,
+    )
+    source_event["status"] = "allowed"
+    source_event["verification"] = {
+        **_object(source_event.get("verification")),
+        "status": "allowed",
+        "allowed_action": action,
+        "caller_role": caller_role,
+        "route_action_gate": route_action_gate,
+        "external_route_identity_validated": True,
+        "private_provider_body_excluded": True,
+    }
+    source_event["artifact_refs"] = {
+        **_object(source_event.get("artifact_refs")),
+        "external_precheck_id": selected_action,
+        "private_provider_body_excluded": True,
+    }
+    authorizes_dispatch = (
+        bool(route_action_gate.get("allowed"))
+        and action in WORKER_DISPATCH_ROUTE_ACTIONS
+    )
+    return {
+        "present": True,
+        "valid": bool(route_action_gate.get("allowed")),
+        "precheck_id": selected_action,
+        "source": "external",
+        "route_identity": identity,
+        "route_action_gate": route_action_gate,
+        "source_event": source_event,
+        "authorizes_protected_worker_dispatch_evidence": authorizes_dispatch,
+        "private_provider_body_excluded": True,
     }
 
 
@@ -1356,43 +1637,91 @@ def build_route_service_materialization(
     plan: Mapping[str, Any],
     *,
     action_precheck_id: str = DEFAULT_ROUTE_ACTION_PRECHECK_ID,
+    external_route_identity: Mapping[str, Any] | None = None,
+    action_precheck: Mapping[str, Any] | None = None,
+    graph_status: Mapping[str, Any] | None = None,
+    version_check: Mapping[str, Any] | None = None,
     actor: str = "",
 ) -> dict[str, Any]:
     """Select replayable route-service source events from a repair-run plan."""
 
     preview = _object(plan.get("route_service_preview"))
-    root_backlog_ids = [str(item) for item in _list(plan.get("root_backlog_ids")) if str(item)]
+    root_backlog_ids = [
+        str(item) for item in _list(plan.get("root_backlog_ids")) if str(item)
+    ]
     selected_action = _string(action_precheck_id) or DEFAULT_ROUTE_ACTION_PRECHECK_ID
+    external_identity = _route_identity_from_public(external_route_identity or {})
+    external_requested = bool(external_identity)
     source_events: list[dict[str, Any]] = []
     missing: list[str] = []
 
-    prompt_event = _object(_object(preview.get("prompt_context_event")).get("source_event"))
-    if prompt_event:
-        source_events.append(_materialization_event(prompt_event, actor=actor))
-    else:
-        missing.append("route.prompt_alert_bundle")
+    if not external_requested:
+        prompt_event = _object(
+            _object(preview.get("prompt_context_event")).get("source_event")
+        )
+        if prompt_event:
+            source_events.append(_materialization_event(prompt_event, actor=actor))
+        else:
+            missing.append("route.prompt_alert_bundle")
 
     prechecks = [_object(item) for item in _list(preview.get("action_prechecks"))]
     precheck = next(
         (item for item in prechecks if _string(item.get("precheck_id")) == selected_action),
         {},
     )
-    action_source_event = _object(precheck.get("source_event"))
-    if action_source_event:
-        source_events.append(_materialization_event(action_source_event, actor=actor))
+    route_action_precheck: dict[str, Any]
+    if external_requested:
+        route_action_precheck = _external_route_action_precheck(
+            plan=plan,
+            action_precheck_id=selected_action,
+            route_identity=external_identity,
+            action_precheck=action_precheck or {},
+            actor=actor,
+            graph_status=graph_status or {},
+            version_check=version_check or {},
+        )
+        action_source_event = _object(route_action_precheck.get("source_event"))
+        if action_source_event:
+            source_events.append(_materialization_event(action_source_event, actor=actor))
+        else:
+            missing.append(f"route.action_precheck:{selected_action}")
     else:
-        missing.append(f"route.action_precheck:{selected_action}")
+        action_source_event = _object(precheck.get("source_event"))
+        route_action_gate = _object(precheck.get("route_action_gate"))
+        action_name = _string(precheck.get("action"))
+        route_action_precheck = {
+            "present": bool(action_source_event),
+            "valid": bool(route_action_gate.get("allowed")),
+            "precheck_id": selected_action,
+            "source": "generated",
+            "route_identity": _object(preview.get("service_generated_route_identity")),
+            "route_action_gate": route_action_gate,
+            "authorizes_protected_worker_dispatch_evidence": bool(
+                route_action_gate.get("allowed")
+            )
+            and action_name in WORKER_DISPATCH_ROUTE_ACTIONS,
+        }
+        if action_source_event:
+            source_events.append(_materialization_event(action_source_event, actor=actor))
+        else:
+            missing.append(f"route.action_precheck:{selected_action}")
 
     recordable = bool(preview.get("available")) and len(root_backlog_ids) == 1 and not missing
     return {
-        "ok": bool(preview.get("available")) and not missing,
+        "ok": bool(preview.get("available"))
+        and not missing
+        and bool(route_action_precheck.get("valid")),
         "schema_version": ROUTE_SERVICE_MATERIALIZATION_SCHEMA_VERSION,
         "repair_run_id": _string(plan.get("repair_run_id")),
         "project_id": _string(plan.get("project_id")),
         "root_backlog_ids": root_backlog_ids,
         "backlog_id": root_backlog_ids[0] if len(root_backlog_ids) == 1 else "",
         "action_precheck_id": selected_action,
-        "recordable": recordable,
+        "recordable": recordable and bool(route_action_precheck.get("valid")),
+        "route_action_precheck": route_action_precheck,
+        "authorizes_protected_worker_dispatch_evidence": bool(
+            route_action_precheck.get("authorizes_protected_worker_dispatch_evidence")
+        ),
         "source_events": source_events,
         "missing_source_events": missing,
         "route_service_preview_available": bool(preview.get("available")),

@@ -1522,9 +1522,43 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
         from . import observer_repair_run, task_timeline
 
         plan = _build_observer_repair_run_plan_from_body(conn, project_id, body)
+        action_precheck = (
+            body.get("action_precheck")
+            or body.get("external_action_precheck")
+            or body.get("action_precheck_packet")
+        )
+        if not isinstance(action_precheck, Mapping):
+            action_precheck = {}
+        external_route_identity = (
+            body.get("route_identity")
+            or body.get("external_route_identity")
+            or body.get("route_context")
+        )
+        if not isinstance(external_route_identity, Mapping):
+            external_route_identity = {
+                key: body.get(key)
+                for key in (
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                    "visible_injection_manifest",
+                )
+                if body.get(key)
+            }
+        if not external_route_identity and action_precheck:
+            external_route_identity = dict(action_precheck)
         materialization = observer_repair_run.build_route_service_materialization(
             plan,
             action_precheck_id=action_precheck_id,
+            external_route_identity=external_route_identity,
+            action_precheck=action_precheck,
+            graph_status=body.get("graph_status")
+            if isinstance(body.get("graph_status"), dict)
+            else {},
+            version_check=body.get("version_check")
+            if isinstance(body.get("version_check"), dict)
+            else {},
             actor=actor,
         )
         materialization["record"] = record

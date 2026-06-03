@@ -97,6 +97,16 @@ identity (`route_context_hash`, `prompt_contract_id`) plus public-safe
 `prompt_contract_hash` may be supplied for propagation/comparison, but is not
 required route identity.
 
+When Judge files a backlog row and starts an observer command, the observer owns
+route evidence production. Before dispatching a bounded worker, call
+`observer_repair_run_route_evidence` to dry-run or record the
+`route.action_precheck` source event. If the command carries an existing
+external route/precheck identity, pass only the public `route_identity` and
+`action_precheck_id` or public `action_precheck` packet; do not include private
+provider bodies, hidden context, or raw prompts. If route evidence cannot be
+materialized or the supplied identity mismatches, block with that truthful
+reason and update the backlog instead of asking Judge to implement.
+
 ## Advanced Chain Flow: Coordinator Takeover
 
 ### Prerequisites

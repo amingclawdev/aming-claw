@@ -149,6 +149,17 @@ def test_mcp_observer_repair_run_route_evidence_routes_to_governance_api():
             "root_backlog_ids": ["AC-ROUTE-FLOW-SESSION-GUIDANCE-20260602"],
             "record": False,
             "actor": "observer-test",
+            "action_precheck_id": "external-dispatch-precheck",
+            "route_identity": {
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-route",
+                "visible_injection_manifest_hash": "sha256:visible",
+            },
+            "action_precheck": {
+                "action": "dispatch_bounded_worker",
+                "caller_role": "observer",
+                "allowed": True,
+            },
         },
     )
 
@@ -161,6 +172,17 @@ def test_mcp_observer_repair_run_route_evidence_routes_to_governance_api():
                 "root_backlog_ids": ["AC-ROUTE-FLOW-SESSION-GUIDANCE-20260602"],
                 "record": False,
                 "actor": "observer-test",
+                "action_precheck_id": "external-dispatch-precheck",
+                "route_identity": {
+                    "route_context_hash": "sha256:route",
+                    "prompt_contract_id": "rprompt-route",
+                    "visible_injection_manifest_hash": "sha256:visible",
+                },
+                "action_precheck": {
+                    "action": "dispatch_bounded_worker",
+                    "caller_role": "observer",
+                    "allowed": True,
+                },
             },
         )
     ]

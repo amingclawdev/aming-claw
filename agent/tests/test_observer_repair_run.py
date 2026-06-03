@@ -62,6 +62,26 @@ def _passing_timeline_precheck():
     }
 
 
+def _single_route_row():
+    return {
+        "bug_id": "AC-EXTERNAL-ROUTE-PRECHECK-20260603",
+        "title": "external route action precheck",
+        "status": "OPEN",
+        "priority": "P1",
+        "details_md": "external route action precheck materialization",
+        "chain_trigger_json": "{}",
+    }
+
+
+def _external_route_identity():
+    return {
+        "route_context_hash": "sha256:external-route-context",
+        "prompt_contract_id": "rprompt-external-route",
+        "prompt_contract_hash": "sha256:external-prompt-contract",
+        "visible_injection_manifest_hash": "sha256:external-visible-manifest",
+    }
+
+
 def test_repair_run_plan_is_deterministic_and_judge_independent():
     kwargs = {
         "project_id": "aming-claw",
@@ -345,3 +365,140 @@ def test_repair_run_includes_service_generated_route_preview():
         "route.action.requested",
     ]
     assert materialization["counts_as_close_evidence"] is False
+
+
+def test_external_route_action_precheck_materializes_public_source_event():
+    row = _single_route_row()
+    identity = _external_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        action_precheck_id="external-dispatch-precheck",
+        external_route_identity=identity,
+        action_precheck={
+            **identity,
+            "caller_role": "observer",
+            "action": "dispatch_bounded_worker",
+            "allowed": True,
+            "private_provider_body": "do-not-leak-provider-body",
+            "raw_prompt": "do-not-leak-raw-prompt",
+            "hidden_context": "do-not-leak-hidden-context",
+        },
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+        actor="observer-test",
+    )
+
+    assert materialization["ok"] is True
+    assert materialization["recordable"] is True
+    assert materialization["route_action_precheck"]["present"] is True
+    assert materialization["route_action_precheck"]["valid"] is True
+    assert materialization["route_action_precheck"]["source"] == "external"
+    assert materialization["authorizes_protected_worker_dispatch_evidence"] is True
+    assert materialization["authorizes_protected_write"] is False
+    assert [event["event_type"] for event in materialization["source_events"]] == [
+        "route.action.requested"
+    ]
+
+    source = materialization["source_events"][0]
+    assert source["event_kind"] == "route_action_precheck"
+    assert source["status"] == "allowed"
+    assert source["payload"]["precheck_id"] == "external-dispatch-precheck"
+    assert source["payload"]["route_context_hash"] == identity["route_context_hash"]
+    assert source["verification"]["route_action_gate"]["allowed"] is True
+    materialized_json = json.dumps(materialization, sort_keys=True)
+    assert "do-not-leak-provider-body" not in materialized_json
+    assert "do-not-leak-raw-prompt" not in materialized_json
+    assert "do-not-leak-hidden-context" not in materialized_json
+
+
+def test_external_route_action_precheck_rejects_mismatched_identity():
+    row = _single_route_row()
+    identity = _external_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        action_precheck_id="external-dispatch-precheck",
+        external_route_identity=identity,
+        action_precheck={
+            **identity,
+            "route_context_hash": "sha256:wrong-route-context",
+            "caller_role": "observer",
+            "action": "dispatch_bounded_worker",
+            "allowed": True,
+        },
+    )
+
+    assert materialization["ok"] is False
+    assert materialization["recordable"] is False
+    assert materialization["missing_source_events"] == [
+        "route.action_precheck:external-dispatch-precheck"
+    ]
+    assert materialization["route_action_precheck"]["present"] is False
+    assert materialization["route_action_precheck"]["valid"] is False
+    assert materialization["route_action_precheck"]["route_identity_mismatch_fields"] == [
+        "route_context_hash"
+    ]
+
+
+def test_external_route_identity_with_empty_action_precheck_blocks():
+    row = _single_route_row()
+    identity = _external_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        action_precheck_id="external-dispatch-precheck",
+        external_route_identity=identity,
+        action_precheck={},
+    )
+
+    assert materialization["ok"] is False
+    assert materialization["recordable"] is False
+    assert materialization["missing_source_events"] == [
+        "route.action_precheck:external-dispatch-precheck"
+    ]
+    assert materialization["authorizes_protected_worker_dispatch_evidence"] is False
+    assert materialization["route_action_precheck"]["present"] is False
+    assert materialization["route_action_precheck"]["valid"] is False
+    assert (
+        materialization["route_action_precheck"]["reason"]
+        == "external action precheck packet or source marker is required"
+    )
+
+
+def test_missing_external_route_action_precheck_source_event_still_blocks():
+    row = _single_route_row()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        action_precheck_id="external-dispatch-precheck",
+    )
+
+    assert materialization["ok"] is False
+    assert materialization["recordable"] is False
+    assert materialization["route_action_precheck"]["present"] is False
+    assert materialization["missing_source_events"] == [
+        "route.action_precheck:external-dispatch-precheck"
+    ]

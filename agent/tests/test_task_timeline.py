@@ -1323,6 +1323,115 @@ class TestTaskTimeline(unittest.TestCase):
             ["close_ready", "implementation", "verification"],
         )
 
+    def test_observer_repair_route_evidence_records_external_action_precheck(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-OBSERVER-EXTERNAL-ROUTE-PRECHECK"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": bug_id,
+        }
+        identity = {
+            **ROUTE_IDENTITY,
+            "visible_injection_manifest_hash": "sha256:external-visible-manifest",
+        }
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, target_files, test_files,
+                acceptance_criteria, chain_trigger_json, mf_type, bypass_policy_json,
+                created_at, updated_at)
+               VALUES (?, ?, 'MF_IN_PROGRESS', 'P0', ?, ?, ?, ?, 'chain_rescue', ?,
+                       '2026-06-03T00:00:00Z', '2026-06-03T00:00:00Z')""",
+            (
+                bug_id,
+                "Observer external route action precheck",
+                json.dumps(["agent/governance/observer_repair_run.py"]),
+                json.dumps(["agent/tests/test_observer_repair_run.py"]),
+                json.dumps(["record external route action precheck"]),
+                json.dumps(contract),
+                json.dumps({"mf_type": "chain_rescue"}),
+            ),
+        )
+        self.conn.commit()
+
+        dry_run = server.handle_observer_repair_run_route_evidence(
+            _ctx(
+                method="POST",
+                body={
+                    "root_backlog_ids": [bug_id],
+                    "actor": "observer-test",
+                    "action_precheck_id": "external-dispatch-precheck",
+                    "route_identity": identity,
+                    "action_precheck": {
+                        **identity,
+                        "caller_role": "observer",
+                        "action": "dispatch_bounded_worker",
+                        "allowed": True,
+                        "private_provider_body": "do-not-leak-provider-body",
+                        "raw_prompt": "do-not-leak-raw-prompt",
+                    },
+                    "version_check": {"ok": True, "dirty": False, "dirty_files": []},
+                },
+            )
+        )
+
+        self.assertFalse(dry_run["record"])
+        self.assertTrue(dry_run["recordable"], dry_run)
+        self.assertTrue(dry_run["route_action_precheck"]["present"])
+        self.assertTrue(dry_run["route_action_precheck"]["valid"])
+        self.assertTrue(dry_run["authorizes_protected_worker_dispatch_evidence"])
+        self.assertFalse(dry_run["authorizes_protected_write"])
+        dry_run_json = json.dumps(dry_run, sort_keys=True)
+        self.assertNotIn("do-not-leak-provider-body", dry_run_json)
+        self.assertNotIn("do-not-leak-raw-prompt", dry_run_json)
+
+        result = server.handle_observer_repair_run_route_evidence(
+            _ctx(
+                method="POST",
+                body={
+                    "root_backlog_ids": [bug_id],
+                    "actor": "observer-test",
+                    "record": True,
+                    "action_precheck_id": "external-dispatch-precheck",
+                    "route_identity": identity,
+                    "action_precheck": {
+                        **identity,
+                        "caller_role": "observer",
+                        "action": "dispatch_bounded_worker",
+                        "allowed": True,
+                    },
+                    "version_check": {"ok": True, "dirty": False, "dirty_files": []},
+                },
+            )
+        )
+
+        self.assertTrue(result["recorded"])
+        self.assertEqual(len(result["recorded_source_event_ids"]), 1)
+        self.assertEqual(
+            {event["payload"]["service_id"] for event in result["recorded_service_events"]},
+            {"route.action_precheck"},
+        )
+
+        events = task_timeline.list_events(self.conn, "proj", backlog_id=bug_id, limit=100)
+        route_gate = task_timeline.mf_route_context_gate_verification(
+            events,
+            contract=contract,
+        )
+
+        self.assertEqual(
+            route_gate["present_requirement_ids"],
+            ["route_context", "route_action_precheck"],
+        )
+        self.assertNotIn("route_identity_mismatch", route_gate["missing_requirement_ids"])
+        self.assertEqual(
+            route_gate["route_identity"],
+            {
+                "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+                "prompt_contract_id": ROUTE_IDENTITY["prompt_contract_id"],
+                "prompt_contract_hash": ROUTE_IDENTITY["prompt_contract_hash"],
+            },
+        )
+
     def test_ai_validated_timeline_route_persists_contract_evidence(self):
         from agent.governance import task_timeline
 

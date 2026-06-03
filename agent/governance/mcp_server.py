@@ -414,6 +414,18 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Route action precheck to record; defaults to observer_dispatch_bounded_worker.",
                 },
+                "route_identity": {
+                    "type": "object",
+                    "description": "Public route identity for external action-precheck materialization: route_context_hash, prompt_contract_id, optional prompt_contract_hash, and visible_injection_manifest_hash.",
+                },
+                "external_route_identity": {
+                    "type": "object",
+                    "description": "Alias for route_identity.",
+                },
+                "action_precheck": {
+                    "type": "object",
+                    "description": "Optional public action-precheck packet to validate against route_identity. Private provider bodies and raw prompts are not required and are not materialized.",
+                },
                 "record": {
                     "type": "boolean",
                     "description": "When true, append route-service source events to the timeline. Defaults to false.",
