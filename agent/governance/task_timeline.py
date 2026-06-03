@@ -176,12 +176,17 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
     protected = {item.lower().replace("-", "_") for item in MF_CLOSE_REQUIRED_EVENT_KINDS}
     protected.update(
         {
+            "bounded_implementation_worker_dispatch",
             "checkpoint",
             "checkpoint_branch_task",
             "evidence_checkpoint",
             "evidence_export",
             "export",
             "independent_verification",
+            "mf_subagent_dispatch",
+            "mf_subagent_dispatch_gate",
+            "mf_subagent_startup",
+            "mf_subagent_startup_gate",
             "qa_verification",
         }
     )
@@ -1092,6 +1097,25 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
     ):
         categories.add(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
     return categories
+
+
+def route_context_consumption_event_summary(
+    event: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return route-consumption categories and identity for one timeline event."""
+
+    row = _mapping(event)
+    if not row:
+        return {
+            "categories": [],
+            "route_identity": {},
+            "passed": False,
+        }
+    return {
+        "categories": sorted(_route_event_categories(row)),
+        "route_identity": _route_identity(row),
+        "passed": _route_event_passed(row),
+    }
 
 
 def mf_route_context_gate_verification(

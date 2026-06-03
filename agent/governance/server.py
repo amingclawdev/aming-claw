@@ -17000,56 +17000,153 @@ def _route_waiver_identity_mismatch(
     return mismatched
 
 
-def _timeline_event_supplies_independent_verification_lane(body: dict, event: dict) -> bool:
+_TIMELINE_ROUTE_WAIVER_BOOTSTRAP_WORKER_REQUIREMENTS = {
+    "bounded_implementation_worker_dispatch",
+    "mf_subagent_startup",
+}
+_TIMELINE_ROUTE_WAIVER_BLOCKED_EVIDENCE_MARKERS = {
+    "checkpoint",
+    "checkpoint_branch_task",
+    "close_ready",
+    "evidence_checkpoint",
+    "evidence_export",
+    "export",
+    "implementation",
+    "verification",
+}
+
+
+def _timeline_event_route_consumption_candidate(body: dict, event: dict) -> dict:
+    payload = body.get("payload") if isinstance(body, dict) else {}
+    verification = body.get("verification") if isinstance(body, dict) else {}
+    artifact_refs = body.get("artifact_refs") if isinstance(body, dict) else {}
+    return {
+        **(event if isinstance(event, dict) else {}),
+        "status": body.get("status", "") if isinstance(body, dict) else "",
+        "decision": body.get("decision", "") if isinstance(body, dict) else "",
+        "payload": payload if isinstance(payload, Mapping) else {},
+        "verification": verification if isinstance(verification, Mapping) else {},
+        "artifact_refs": artifact_refs if isinstance(artifact_refs, Mapping) else {},
+    }
+
+
+def _timeline_event_blocked_evidence_markers(event: dict) -> set[str]:
     markers = {
         _route_gate_marker(event.get("event_type")),
         _route_gate_marker(event.get("event_kind")),
-        _route_gate_marker(event.get("phase")),
     }
-    if markers.intersection(
-        {
-            "independent_verification_lane",
-            "independent_verification",
-            "qa_verification",
-            "independent_qa",
-        }
+    event_type = str(event.get("event_type") or "").strip().lower()
+    for part in re.split(r"[.:/]+", event_type):
+        marker = _route_gate_marker(part)
+        if marker:
+            markers.add(marker)
+    phase_marker = _route_gate_marker(event.get("phase"))
+    if phase_marker in {
+        "checkpoint",
+        "checkpoint_branch_task",
+        "close_ready",
+        "evidence_checkpoint",
+        "evidence_export",
+        "export",
+    }:
+        markers.add(phase_marker)
+    return markers.intersection(_TIMELINE_ROUTE_WAIVER_BLOCKED_EVIDENCE_MARKERS)
+
+
+def _route_waiver_is_manual_fix(waiver: Mapping[str, Any]) -> bool:
+    waiver_type = _route_gate_marker(
+        waiver.get("waiver_type") or waiver.get("type") or waiver.get("kind")
+    )
+    manual_fix_flag = str(
+        waiver.get("manual_fix") or waiver.get("manual_fix_allowed") or ""
+    ).strip().lower()
+    return waiver_type in {
+        "manual_fix",
+        "manual_fix_route_gate",
+        "observer_manual_fix",
+    } or manual_fix_flag in {"1", "true", "yes", "y", "allowed", "accepted"}
+
+
+def _route_identity_mismatch_fields(
+    expected_identity: Mapping[str, Any],
+    supplied_identity: Mapping[str, Any],
+    *,
+    require_required_fields: bool = False,
+) -> list[str]:
+    mismatched: list[str] = []
+    for field in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+        expected = str(expected_identity.get(field) or "").strip()
+        supplied = str(supplied_identity.get(field) or "").strip()
+        if (
+            require_required_fields
+            and field in {"route_context_hash", "prompt_contract_id"}
+            and expected
+            and not supplied
+        ):
+            mismatched.append(field)
+        elif supplied and expected and supplied != expected:
+            mismatched.append(field)
+    return mismatched
+
+
+def _timeline_route_waiver_consumption_bootstrap_allowed(
+    body: dict,
+    event: dict,
+    route_context_gate: dict,
+    missing_requirement_ids: list[str],
+) -> bool:
+    waiver = _route_waiver_payload(body)
+    if not _route_waiver_is_manual_fix(waiver):
+        return False
+    if _timeline_event_blocked_evidence_markers(event):
+        return False
+
+    from . import task_timeline
+
+    candidate = _timeline_event_route_consumption_candidate(body, event)
+    summary = task_timeline.route_context_consumption_event_summary(candidate)
+    if not summary.get("passed"):
+        return False
+    supplied_categories = {
+        str(item)
+        for item in summary.get("categories", [])
+        if str(item)
+    }
+    missing = {str(item) for item in missing_requirement_ids if str(item)}
+    event_identity = summary.get("route_identity")
+    expected_identity = route_context_gate.get("route_identity")
+    if not isinstance(event_identity, Mapping) or not event_identity:
+        return False
+    if not isinstance(expected_identity, Mapping) or not expected_identity:
+        return False
+    if _route_identity_mismatch_fields(
+        expected_identity,
+        event_identity,
+        require_required_fields=True,
     ):
-        return True
-    return _route_gate_deep_marker_present(
-        {
-            "payload": body.get("payload") if isinstance(body, dict) else {},
-            "verification": body.get("verification") if isinstance(body, dict) else {},
-            "artifact_refs": body.get("artifact_refs") if isinstance(body, dict) else {},
-        },
-        {
-            "independent_verification_lane",
-            "independent_verification",
-            "qa_verification",
-            "independent_qa",
-        },
+        return False
+
+    present = {
+        str(item)
+        for item in route_context_gate.get("present_requirement_ids", [])
+        if str(item)
+    }
+    supplied_worker_categories = (
+        supplied_categories
+        & missing
+        & _TIMELINE_ROUTE_WAIVER_BOOTSTRAP_WORKER_REQUIREMENTS
+    )
+    if supplied_worker_categories:
+        return {"route_context", "route_action_precheck"}.issubset(present)
+
+    return (
+        missing == {"independent_verification_lane"}
+        and "independent_verification_lane" in supplied_categories
     )
 
 
 def _route_gate_marker(value: Any) -> str:
     return re.sub(r"[\s.\-]+", "_", str(value or "").strip().lower())
-
-
-def _route_gate_deep_marker_present(value: Any, markers: set[str]) -> bool:
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            if _route_gate_marker(key) in markers:
-                return True
-            if isinstance(child, str) and _route_gate_marker(child) in markers:
-                return True
-            if _route_gate_deep_marker_present(child, markers):
-                return True
-    elif isinstance(value, list):
-        for child in value:
-            if _route_gate_deep_marker_present(child, markers):
-                return True
-    elif isinstance(value, str):
-        return _route_gate_marker(value) in markers
-    return False
 
 
 def _timeline_route_waiver_block_for_high_risk(
@@ -17137,8 +17234,12 @@ def _timeline_route_waiver_block_for_high_risk(
     ]
     if (
         not identity_mismatch
-        and set(missing_requirement_ids) == {"independent_verification_lane"}
-        and _timeline_event_supplies_independent_verification_lane(body, event)
+        and _timeline_route_waiver_consumption_bootstrap_allowed(
+            body,
+            event,
+            route_context_gate,
+            missing_requirement_ids,
+        )
     ):
         return {}
 
