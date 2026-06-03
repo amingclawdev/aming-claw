@@ -705,6 +705,108 @@ class TestTaskTimeline(unittest.TestCase):
             gate["missing_requirement_ids"],
         )
 
+    def test_mf_parallel_task_scoped_route_waiver_bootstraps_dispatch_from_backlog_route_context(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-TASK-DISPATCH-BOOTSTRAP"
+        worker_task_id = "worker-task-dispatch-bootstrap"
+        contract = self._insert_router_backlog(bug_id)
+        self._record_route_service_context(bug_id)
+        startup_event = _route_context_worker_startup_event()
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=worker_task_id,
+            event_type=startup_event["event_type"],
+            phase=startup_event["phase"],
+            event_kind=startup_event["event_kind"],
+            status=startup_event["status"],
+            payload=startup_event["payload"],
+        )
+        self.conn.commit()
+
+        dispatch_result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    **_route_context_worker_dispatch_event(),
+                    "route_waiver": self._route_waiver_for_existing_identity(
+                        bug_id,
+                        task_id=worker_task_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(dispatch_result["route_token_gate"]["decision"], "route_waiver")
+        self.assertEqual(dispatch_result["event_kind"], "mf_subagent_dispatch")
+        gate = task_timeline.mf_route_context_gate_verification(
+            task_timeline.list_events(self.conn, "proj", backlog_id=bug_id),
+            contract=contract,
+        )
+        self.assertIn(
+            "bounded_implementation_worker_dispatch",
+            gate["present_requirement_ids"],
+        )
+        self.assertIn("mf_subagent_startup", gate["present_requirement_ids"])
+        self.assertEqual(gate["missing_requirement_ids"], ["independent_verification_lane"])
+
+    def test_mf_parallel_task_scoped_route_waiver_bootstraps_qa_lane_from_backlog_route_context(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-TASK-QA-BOOTSTRAP"
+        worker_task_id = "worker-task-qa-bootstrap"
+        contract = self._insert_router_backlog(bug_id)
+        self._record_route_service_context(bug_id)
+        for event in (
+            _route_context_worker_dispatch_event(),
+            _route_context_worker_startup_event(),
+        ):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=worker_task_id,
+                event_type=event["event_type"],
+                phase=event["phase"],
+                event_kind=event["event_kind"],
+                status=event["status"],
+                payload=event["payload"],
+            )
+        self.conn.commit()
+
+        qa_event = _route_context_qa_verification_event()
+        qa_result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    "event_type": "independent_verification.completed",
+                    "event_kind": qa_event["event_kind"],
+                    "phase": qa_event["phase"],
+                    "status": qa_event["status"],
+                    "verification": qa_event["verification"],
+                    "route_waiver": self._route_waiver_for_existing_identity(
+                        bug_id,
+                        task_id=worker_task_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(qa_result["route_token_gate"]["decision"], "route_waiver")
+        self.assertEqual(qa_result["event_kind"], "qa_verification")
+        gate = task_timeline.mf_route_context_gate_verification(
+            task_timeline.list_events(self.conn, "proj", backlog_id=bug_id),
+            contract=contract,
+        )
+        self.assertTrue(gate["passed"], gate)
+        self.assertIn("independent_verification_lane", gate["present_requirement_ids"])
+
     def test_mf_parallel_route_waiver_bootstrap_rejects_event_identity_mismatch(self):
         from agent.governance import server
         from agent.governance.errors import GovernanceError
@@ -1020,6 +1122,22 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(
             raised.exception.details["route_identity_mismatch_fields"],
             ["route_context_hash"],
+        )
+        self.assertEqual(
+            raised.exception.details["route_identity_recovery"]["classification"],
+            "stale_or_mixed_route_evidence",
+        )
+        self.assertEqual(
+            raised.exception.details["route_identity_recovery"]["cleanup_event_kind"],
+            "route_identity_cleanup",
+        )
+        self.assertIn(
+            "supersede",
+            raised.exception.details["route_identity_recovery"]["guidance"],
+        )
+        self.assertIn(
+            "do not delete audit history",
+            raised.exception.details["route_identity_recovery"]["guidance"],
         )
         count = self.conn.execute(
             "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ? AND event_kind = ?",

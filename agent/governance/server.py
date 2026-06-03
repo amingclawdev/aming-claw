@@ -17546,6 +17546,42 @@ def _timeline_route_waiver_consumption_bootstrap_allowed(
     )
 
 
+def _route_gate_present_requirement_ids(route_context_gate: Mapping[str, Any]) -> set[str]:
+    return {
+        str(item)
+        for item in route_context_gate.get("present_requirement_ids", [])
+        if str(item)
+    }
+
+
+def _route_gate_missing_requirement_ids(route_context_gate: Mapping[str, Any]) -> set[str]:
+    return {
+        str(item)
+        for item in route_context_gate.get("missing_requirement_ids", [])
+        if str(item)
+    }
+
+
+def _select_timeline_route_context_gate(
+    scoped_gate: dict,
+    backlog_gate: dict,
+) -> dict:
+    if not backlog_gate.get("required"):
+        return scoped_gate
+    if not scoped_gate.get("required"):
+        return backlog_gate
+    scoped_present = _route_gate_present_requirement_ids(scoped_gate)
+    backlog_present = _route_gate_present_requirement_ids(backlog_gate)
+    backlog_missing = _route_gate_missing_requirement_ids(backlog_gate)
+    if "route_identity_mismatch" in backlog_missing:
+        return backlog_gate
+    if bool(backlog_gate.get("passed")) and not bool(scoped_gate.get("passed")):
+        return backlog_gate
+    if backlog_present and not backlog_present.issubset(scoped_present):
+        return backlog_gate
+    return scoped_gate
+
+
 def _route_gate_marker(value: Any) -> str:
     return re.sub(r"[\s.\-]+", "_", str(value or "").strip().lower())
 
@@ -17607,7 +17643,6 @@ def _timeline_route_waiver_block_for_high_risk(
         scoped_task_id
         and route_context_gate.get("required")
         and not route_context_gate.get("passed")
-        and not route_context_gate.get("present_requirement_ids")
     ):
         backlog_route_context_gate = task_timeline.mf_route_context_gate_verification(
             task_timeline.list_events(
@@ -17619,7 +17654,10 @@ def _timeline_route_waiver_block_for_high_risk(
             contract=contract,
         )
         if backlog_route_context_gate.get("required"):
-            route_context_gate = backlog_route_context_gate
+            route_context_gate = _select_timeline_route_context_gate(
+                route_context_gate,
+                backlog_route_context_gate,
+            )
     if not route_context_gate.get("required"):
         return {}
     identity_mismatch = _route_waiver_identity_mismatch(
@@ -17661,6 +17699,20 @@ def _timeline_route_waiver_block_for_high_risk(
                 "phase": event.get("phase", ""),
             },
             "route_identity_mismatch_fields": identity_mismatch,
+            "route_identity_recovery": {
+                "classification": "stale_or_mixed_route_evidence"
+                if identity_mismatch
+                else "",
+                "cleanup_event_kind": "route_identity_cleanup",
+                "guidance": (
+                    "Record a route_identity_cleanup/route_identity_supersede "
+                    "timeline event for stale or mixed route evidence, or start "
+                    "a fresh service-generated route attempt; do not delete audit "
+                    "history."
+                )
+                if identity_mismatch
+                else "",
+            },
             "route_waiver_recording_allowed": True,
             "waiver_evidence_only": True,
             "blocked_evidence_kinds": [
