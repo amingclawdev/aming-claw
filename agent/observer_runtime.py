@@ -96,6 +96,11 @@ RUNTIME_TEXT_REQUIRED_EVIDENCE = (
     "startup_echo",
     "finish_gate",
 )
+RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS = (
+    "/parallel-branches/allocate",
+    "parallel-branches/allocate",
+    "upsert_branch_context",
+)
 RUNTIME_TEXT_REQUIRED_LANES = (
     "observer_coordinator",
     "bounded_implementation_worker",
@@ -769,6 +774,10 @@ def _runtime_text_branch_runtime_evidence(
         or supplied.get("api_route")
         or ""
     ).strip()
+    registration_ref_valid = bool(
+        registration_ref
+        and any(marker in registration_ref for marker in RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS)
+    )
     supplied_context = supplied.get("context") if isinstance(supplied.get("context"), Mapping) else {}
     supplied_status = str(supplied.get("status") or "").strip().lower()
     supplied_rejected = bool(supplied) and (
@@ -777,14 +786,7 @@ def _runtime_text_branch_runtime_evidence(
         or bool(supplied.get("allocation_required"))
         or supplied_status in {"allocation_required", "rejected", "failed", "error"}
     )
-    if (
-        not registration_ref
-        and supplied_context
-        and (supplied.get("ok") is True or supplied.get("registered") is True)
-        and not supplied_rejected
-    ):
-        registration_ref = f"/api/graph-governance/{project_id}/parallel-branches/allocate"
-    if not registration_ref:
+    if not registration_ref_valid:
         return {
             "schema_version": "mf_subagent_branch_runtime.v1",
             "status": "allocation_required",
@@ -793,10 +795,12 @@ def _runtime_text_branch_runtime_evidence(
             "present": False,
             "source": "observer_runtime_text_prepare",
             "message": (
-                "Call MCP parallel_branch_allocate or "
+                "Call MCP parallel_branch_allocate, "
                 f"POST /api/graph-governance/{project_id}/parallel-branches/allocate, "
-                "then pass branch_runtime_registration_ref or branch_runtime_evidence."
+                "or upsert_branch_context, then pass branch_runtime_registration_ref "
+                "or branch_runtime_evidence with a valid source_ref/registration_ref."
             ),
+            "supplied_source_ref": registration_ref,
             "planned_context": {
                 "task_id": context.task_id,
                 "parent_task_id": parent_task_id,

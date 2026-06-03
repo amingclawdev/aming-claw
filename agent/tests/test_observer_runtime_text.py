@@ -113,6 +113,42 @@ def test_runtime_text_builder_requires_supplied_branch_allocation_evidence(tmp_p
     assert "/api/graph-governance/aming-claw/parallel-branches/allocate" in evidence["message"]
 
 
+def test_runtime_text_builder_rejects_weak_branch_runtime_evidence_without_ref(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            branch_runtime_registration_ref="",
+            branch_runtime_evidence={
+                "ok": True,
+                "registered": True,
+                "context": {
+                    "task_id": "AC-RUNTIME-TEXT-impl-1",
+                    "parent_task_id": "AC-RUNTIME-TEXT",
+                    "fence_token": "fence-runtime-text",
+                    "worktree_path": str(
+                        tmp_path / "workers" / "worktrees" / "runtime-text"
+                    ),
+                    "base_commit": "base123",
+                    "target_head_commit": "target123",
+                    "merge_queue_id": "mq-runtime-text",
+                },
+            },
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "allocation_required"
+    assert result["persistent_evidence"]["dispatch_ready"] is False
+    validation = result["dispatch_gate_validation"]
+    assert validation["allowed"] is False
+    assert validation["allocation_required"] is True
+    evidence = result["branch_runtime_evidence"]
+    assert evidence["registered"] is False
+    assert evidence["allocation_required"] is True
+    assert evidence["supplied_source_ref"] == ""
+    assert "source_ref/registration_ref" in evidence["message"]
+
+
 def test_runtime_text_builder_rejects_missing_graph_trace_identity(tmp_path):
     result = build_observer_runtime_text_context(
         _runtime_text_request(tmp_path, graph_trace_ids=())
