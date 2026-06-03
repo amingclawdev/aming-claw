@@ -18,6 +18,33 @@ explicitly asks to test chain automation or a documented experiment requires
 it. Chain trailers are MF audit anchors on commits; they do not mean
 auto-chain execution is active.
 
+## Standalone Observer Command Poll
+
+Judge-owned or dashboard-owned work can be handed to an ordinary observer
+session through the durable observer command queue. The observer does not need
+ServiceManager, the chain executor, or `task_create` for this path.
+
+Default command:
+
+```bash
+aming-claw observer poll \
+  --project-id aming-claw \
+  --governance-url http://localhost:40000 \
+  --json-output
+```
+
+The command registers an observer session when `--session-id` and
+`--session-token` are omitted, claims the next `execute_backlog_row` command,
+and converts the claimed payload into the same route-bound observer invocation
+contract used by `observer run`. Dry-run poll output is evidence only:
+`calls_models=false`, `service_manager_required=false`,
+`executor_worker_required=false`, and `uses_task_create=false`.
+
+Use `--complete-planned` only for dogfood or explicit dry-run closure, because
+it marks the claimed command completed with the generated plan. Live execution
+still requires `--execute` plus the one-hop dispatch gate required by
+`observer run`.
+
 ## Principles
 
 1. **Observer uses the governance control plane, not direct DB access**: All operations go through MCP tools or the REST API — do not read or write the DB directly.

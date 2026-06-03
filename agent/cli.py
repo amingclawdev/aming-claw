@@ -13,6 +13,7 @@ Usage:
     aming-claw launcher        - write a local launcher HTML artifact
     aming-claw run-executor    - start executor worker
     aming-claw observer run    - build or execute route-bound observer invocation
+    aming-claw observer poll   - claim observer command and plan route-bound work
     aming-claw observer dogfood - plan controlled dogfood observer/subagent run
     aming-claw mf precommit-check - run MF pre-commit guards
     aming-claw mf dispatch-gate - validate MF subagent dispatch evidence
@@ -510,6 +511,336 @@ def plugin_doctor(plugin_root, governance_url, codex_config, codex_home, python_
 def observer():
     """Observer runtime launcher."""
     pass
+
+
+def _observer_poll_session_registration_payload(
+    *,
+    observer_kind: str,
+    session_label: str,
+    cwd: str,
+) -> dict:
+    return {
+        "observer_kind": observer_kind or "codex",
+        "session_label": session_label,
+        "pid": os.getpid(),
+        "cwd": cwd,
+        "capabilities": {
+            "actions": [
+                "observer_session_heartbeat",
+                "observer_session_close",
+                "observer_command_claim",
+                "observer_command_complete",
+                "observer_command_fail",
+            ],
+            "command_types": ["execute_backlog_row"],
+        },
+    }
+
+
+def _observer_poll_public_session(
+    payload: dict,
+    *,
+    print_session_token: bool,
+) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    public = dict(payload)
+    if not print_session_token:
+        public.pop("session_token", None)
+    return public
+
+
+def _observer_poll_completion_result(plan: dict) -> dict:
+    route_identity = plan.get("route_identity") if isinstance(plan.get("route_identity"), dict) else {}
+    return {
+        "ok": bool(plan.get("ok")),
+        "status": str(plan.get("status") or ""),
+        "schema_version": str(plan.get("schema_version") or ""),
+        "observer_command_id": str(plan.get("observer_command_id") or ""),
+        "backlog_id": str(plan.get("backlog_id") or ""),
+        "route_context_hash": str(route_identity.get("route_context_hash") or ""),
+        "prompt_contract_id": str(route_identity.get("prompt_contract_id") or ""),
+        "calls_models": bool(plan.get("calls_models")),
+        "execute": bool(plan.get("execute")),
+        "service_manager_required": False,
+        "executor_worker_required": False,
+        "uses_task_create": False,
+    }
+
+
+def _observer_poll_normalize_claim_response(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "non_object_claim_response"}
+    if isinstance(payload.get("command"), dict) or payload.get("empty") is True:
+        return payload
+    if payload.get("command_id") and payload.get("command_type"):
+        return {
+            "ok": True,
+            "project_id": str(payload.get("project_id") or ""),
+            "observer_session_id": str(payload.get("claimed_by_session_id") or ""),
+            "command": payload,
+            "empty": False,
+            "normalized_from": "raw_command",
+        }
+    return payload
+
+
+@observer.command("poll")
+@click.option("--project-id", required=True, help="Governance project id.")
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance service URL.")
+@click.option("--session-id", default="", help="Existing observer session id. Omit to register one.")
+@click.option(
+    "--session-token",
+    default="",
+    envvar="AMING_CLAW_OBSERVER_SESSION_TOKEN",
+    help="Existing observer session token. Can also use AMING_CLAW_OBSERVER_SESSION_TOKEN.",
+)
+@click.option(
+    "--command-id",
+    default="",
+    help="Specific observer command id to claim. Defaults to next command.",
+)
+@click.option("--observer-kind", default="codex", help="Observer kind used when registering a session.")
+@click.option("--session-label", default="", help="Observer session label used when registering a session.")
+@click.option(
+    "--print-session-token",
+    is_flag=True,
+    help="Include a newly registered session token in JSON output.",
+)
+@click.option("--provider", default="openai", help="Provider name, e.g. openai or anthropic.")
+@click.option("--model", default="", help="Optional provider model override.")
+@click.option(
+    "--backend-mode",
+    default="codex_cli",
+    help="Invocation backend, e.g. codex_cli, claude_cli, openai_api, anthropic_api.",
+)
+@click.option("--workspace", default="", help="Observer workspace. Defaults to current working directory.")
+@click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Optional observer prompt file.",
+)
+@click.option(
+    "--dispatch-gate-file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="MF subagent dispatch gate evidence JSON required for live code-mutating backends.",
+)
+@click.option(
+    "--main-worktree",
+    default="",
+    help="Target/main worktree path blocked by one-hop dispatch policy.",
+)
+@click.option(
+    "--timeout-sec",
+    default=120,
+    type=int,
+    help="Observer invocation timeout if --execute is used.",
+)
+@click.option(
+    "--execute",
+    is_flag=True,
+    help="Actually invoke the configured provider after one-hop gate validation.",
+)
+@click.option(
+    "--complete-planned",
+    is_flag=True,
+    help="Complete the claimed command with the poll/plan result.",
+)
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def observer_poll(
+    project_id,
+    governance_url,
+    session_id,
+    session_token,
+    command_id,
+    observer_kind,
+    session_label,
+    print_session_token,
+    provider,
+    model,
+    backend_mode,
+    workspace,
+    prompt_file,
+    dispatch_gate_file,
+    main_worktree,
+    timeout_sec,
+    execute,
+    complete_planned,
+    json_output,
+):
+    """Claim an observer command and build a standalone route-bound plan."""
+    from agent.observer_runtime import ObserverPollRequest, build_observer_poll_plan
+
+    base_url = governance_url.rstrip("/")
+    encoded_project = urllib.parse.quote(project_id, safe="")
+    cwd = workspace or os.getcwd()
+    result: dict = {
+        "ok": False,
+        "schema_version": "observer_poll_cli.v1",
+        "project_id": project_id,
+        "governance_url": base_url,
+        "execute": execute,
+        "complete_planned": complete_planned,
+        "service_manager_required": False,
+        "executor_worker_required": False,
+        "uses_task_create": False,
+    }
+    active_session_id = session_id
+    active_session_token = session_token
+    registered_session: dict = {}
+
+    if bool(active_session_id) != bool(active_session_token):
+        result.update(
+            {
+                "status": "rejected",
+                "error": "session-id and session-token must be supplied together",
+            }
+        )
+        click.echo(json.dumps(result, indent=2, sort_keys=True) if json_output else result["error"])
+        raise click.exceptions.Exit(1)
+
+    if not active_session_id:
+        register_payload = _observer_poll_session_registration_payload(
+            observer_kind=observer_kind,
+            session_label=session_label,
+            cwd=cwd,
+        )
+        code, registered = _http_json(
+            "POST",
+            f"{base_url}/api/projects/{encoded_project}/observer-sessions/register",
+            register_payload,
+        )
+        registered_session = _observer_poll_public_session(
+            registered,
+            print_session_token=print_session_token,
+        )
+        result["registered_session"] = registered_session
+        if code >= 400 or not registered.get("ok"):
+            result.update(
+                {
+                    "status": "rejected",
+                    "error": "observer session registration failed",
+                    "http_status": code,
+                    "response": registered_session,
+                }
+            )
+            click.echo(json.dumps(result, indent=2, sort_keys=True) if json_output else result["error"])
+            raise click.exceptions.Exit(1)
+        active_session_id = str(registered.get("observer_session_id") or registered.get("session_id") or "")
+        active_session_token = str(registered.get("session_token") or "")
+
+    result["observer_session_id"] = active_session_id
+    prompt = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else ""
+    dispatch_gate = {}
+    if dispatch_gate_file:
+        try:
+            parsed_gate = json.loads(Path(dispatch_gate_file).read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise click.ClickException(f"invalid dispatch gate file: {exc}") from exc
+        if not isinstance(parsed_gate, dict):
+            raise click.ClickException("dispatch gate file must contain a JSON object")
+        dispatch_gate = parsed_gate
+
+    claim_payload = {
+        "session_id": active_session_id,
+        "session_token": active_session_token,
+    }
+    claim_endpoint = "claim" if command_id else "next"
+    if command_id:
+        claim_payload["command_id"] = command_id
+    claim_code, raw_claim_response = _http_json(
+        "POST",
+        f"{base_url}/api/projects/{encoded_project}/observer-commands/{claim_endpoint}",
+        claim_payload,
+    )
+    claim_response = _observer_poll_normalize_claim_response(raw_claim_response)
+    if claim_code >= 400 or not claim_response.get("ok"):
+        result.update(
+            {
+                "status": "rejected",
+                "error": "observer command claim failed",
+                "http_status": claim_code,
+                "response": raw_claim_response,
+            }
+        )
+        click.echo(json.dumps(result, indent=2, sort_keys=True) if json_output else result["error"])
+        raise click.exceptions.Exit(1)
+
+    command = claim_response.get("command") if isinstance(claim_response.get("command"), dict) else None
+    plan = build_observer_poll_plan(
+        ObserverPollRequest(
+            project_id=project_id,
+            observer_session_id=active_session_id,
+            command=command,
+            provider=provider,
+            model=model,
+            backend_mode=backend_mode,
+            workspace=cwd,
+            prompt=prompt,
+            timeout_sec=timeout_sec,
+            dispatch_gate=dispatch_gate,
+            main_worktree=main_worktree or cwd,
+        ),
+        execute=execute,
+    )
+    result.update(
+        {
+            "ok": bool(plan.get("ok")),
+            "status": plan.get("status") or "planned",
+            "empty": bool(plan.get("empty")),
+            "claim": {
+                "http_status": claim_code,
+                "empty": bool(claim_response.get("empty")),
+                "observer_command_id": str((command or {}).get("command_id") or ""),
+            },
+            "observer_poll": plan,
+        }
+    )
+    if complete_planned and command and plan.get("ok"):
+        complete_payload = {
+            "session_id": active_session_id,
+            "session_token": active_session_token,
+            "result": _observer_poll_completion_result(plan),
+        }
+        complete_code, complete_response = _http_json(
+            "POST",
+            (
+                f"{base_url}/api/projects/{encoded_project}/observer-commands/"
+                f"{urllib.parse.quote(str(command.get('command_id') or ''), safe='')}/complete"
+            ),
+            complete_payload,
+        )
+        result["completion"] = {
+            "http_status": complete_code,
+            "ok": bool(complete_response.get("ok")),
+            "observer_command_id": str((complete_response.get("command") or {}).get("command_id") or ""),
+        }
+        if complete_code >= 400 or not complete_response.get("ok"):
+            result["ok"] = False
+            result["status"] = "rejected"
+            result["error"] = "observer command completion failed"
+            result["completion"]["response"] = complete_response
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            f"observer poll: {result.get('status')} project={project_id} "
+            f"session={active_session_id}"
+        )
+        poll = result.get("observer_poll") or {}
+        if poll.get("observer_command_id"):
+            click.echo(f"command: {poll.get('observer_command_id')} backlog={poll.get('backlog_id')}")
+        click.echo(f"execute={execute} calls_models={poll.get('calls_models', False)}")
+        if not result.get("ok"):
+            click.echo(
+                f"error: {result.get('error') or poll.get('error') or 'observer poll rejected'}",
+                err=True,
+            )
+    if not result.get("ok"):
+        raise click.exceptions.Exit(1)
 
 
 @observer.command("run")

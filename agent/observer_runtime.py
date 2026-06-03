@@ -8,6 +8,7 @@ HTTP endpoints can call the same functions without depending on click.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -52,8 +53,17 @@ else:  # pragma: no cover - direct module import path
 
 
 OBSERVER_RUN_SCHEMA_VERSION = "observer_run.v1"
+OBSERVER_POLL_SCHEMA_VERSION = "observer_poll.v1"
 DOGFOOD_OBSERVER_PLAN_SCHEMA_VERSION = "observer_dogfood_plan.v1"
 ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION = "observer_one_hop_execution_gate.v1"
+EXECUTE_BACKLOG_ROW_COMMAND_TYPE = "execute_backlog_row"
+EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS = (
+    "backlog_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "visible_injection_manifest_hash",
+)
 ONE_HOP_REQUIRED_BACKENDS = {
     BACKEND_CODEX_CLI,
     BACKEND_CLAUDE_CLI,
@@ -130,6 +140,21 @@ class DogfoodObserverPlanRequest:
     visible_injection_manifest_hash: str = ""
 
 
+@dataclass
+class ObserverPollRequest:
+    project_id: str
+    command: Mapping[str, Any] | None = None
+    observer_session_id: str = ""
+    provider: str = "openai"
+    model: str = ""
+    backend_mode: str = "codex_cli"
+    workspace: str = ""
+    prompt: str = ""
+    timeout_sec: int = 120
+    dispatch_gate: Mapping[str, Any] = field(default_factory=dict)
+    main_worktree: str = ""
+
+
 def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
     missing: list[str] = []
     if not request.project_id:
@@ -145,6 +170,153 @@ def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
     if not request.backend_mode:
         missing.append("backend_mode")
     return missing
+
+
+def _command_payload(command: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not command:
+        return {}
+    payload = command.get("payload")
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    payload_json = command.get("payload_json")
+    if isinstance(payload_json, str):
+        try:
+            parsed = json.loads(payload_json)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _missing_execute_backlog_payload_fields(payload: Mapping[str, Any]) -> list[str]:
+    return [
+        field
+        for field in EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS
+        if not str(payload.get(field) or "").strip()
+    ]
+
+
+def _route_from_command_payload(payload: Mapping[str, Any]) -> RoutePromptContract:
+    return RoutePromptContract(
+        route_context_hash=str(payload.get("route_context_hash") or ""),
+        prompt_contract_id=str(payload.get("prompt_contract_id") or ""),
+        prompt_contract_hash=str(payload.get("prompt_contract_hash") or ""),
+        route_token_ref=str(payload.get("route_token_ref") or ""),
+    )
+
+
+def _observer_poll_base_result(request: ObserverPollRequest) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "schema_version": OBSERVER_POLL_SCHEMA_VERSION,
+        "project_id": request.project_id,
+        "observer_session_id": request.observer_session_id,
+        "execute": False,
+        "calls_models": False,
+        "service_manager_required": False,
+        "executor_worker_required": False,
+        "uses_task_create": False,
+    }
+
+
+def build_observer_poll_plan(
+    request: ObserverPollRequest,
+    *,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Convert a claimed observer command into a route-bound observer plan.
+
+    This is the standalone observer-session entrypoint: it consumes the durable
+    command payload directly and deliberately avoids ServiceManager, executor,
+    and task_create dependencies.
+    """
+
+    result = _observer_poll_base_result(request)
+    result["execute"] = execute
+    command = request.command
+    if not command:
+        result.update(
+            {
+                "ok": True,
+                "status": "empty",
+                "empty": True,
+                "auth_status": "not_invoked",
+            }
+        )
+        return result
+
+    command_id = str(command.get("command_id") or "")
+    command_type = str(command.get("command_type") or "")
+    payload = _command_payload(command)
+    backlog_id = str(payload.get("backlog_id") or "")
+    route = _route_from_command_payload(payload)
+    route_identity = {
+        "route_id": str(payload.get("route_id") or ""),
+        "route_context_hash": route.route_context_hash,
+        "prompt_contract_id": route.prompt_contract_id,
+        "prompt_contract_hash": route.prompt_contract_hash,
+        "route_token_ref": route.route_token_ref,
+        "visible_injection_manifest_hash": str(
+            payload.get("visible_injection_manifest_hash") or ""
+        ),
+        "raw_private_context_exposed": False,
+    }
+    result.update(
+        {
+            "status": "rejected",
+            "empty": False,
+            "observer_command_id": command_id,
+            "command_type": command_type,
+            "command_status": str(command.get("status") or ""),
+            "backlog_id": backlog_id,
+            "route_identity": route_identity,
+            "payload_keys": sorted(str(key) for key in payload.keys()),
+        }
+    )
+    if command_type != EXECUTE_BACKLOG_ROW_COMMAND_TYPE:
+        result["error"] = (
+            "observer poll supports only execute_backlog_row commands in standalone mode"
+        )
+        return result
+
+    missing = _missing_execute_backlog_payload_fields(payload)
+    if missing:
+        result["missing"] = missing
+        result["error"] = "execute_backlog_row payload is missing route/backlog fields"
+        return result
+
+    observer_request = ObserverRunRequest(
+        project_id=request.project_id,
+        backlog_id=backlog_id,
+        route=route,
+        provider=request.provider,
+        model=request.model,
+        backend_mode=request.backend_mode,
+        workspace=request.workspace or str(Path.cwd()),
+        prompt=request.prompt,
+        timeout_sec=request.timeout_sec,
+        dispatch_gate=request.dispatch_gate,
+        main_worktree=request.main_worktree or str(Path.cwd()),
+    )
+    observer_result = run_observer(observer_request, execute=execute)
+    invocation = (
+        observer_result.get("invocation")
+        or observer_result.get("invocation_request")
+        or {}
+    )
+    result.update(
+        {
+            "ok": bool(observer_result.get("ok")),
+            "status": observer_result.get("status") or "planned",
+            "observer_run": observer_result,
+            "planned_invocation": invocation,
+            "calls_models": bool(invocation.get("calls_models")),
+            "auth_status": invocation.get("auth_status", "not_invoked"),
+        }
+    )
+    if not result["ok"]:
+        result["missing"] = observer_result.get("missing") or []
+    return result
 
 
 def _stable_suffix(*parts: str, length: int = 12) -> str:

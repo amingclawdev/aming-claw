@@ -208,6 +208,211 @@ def test_observer_run_execute_rejects_incomplete_dispatch_gate(tmp_path):
         assert field in gate["error"]
 
 
+def _observer_poll_command(command_id="cmd-route-1"):
+    return {
+        "command_id": command_id,
+        "command_type": "execute_backlog_row",
+        "status": "claimed",
+        "payload": {
+            "backlog_id": "AC-ROUTE-HANDOFF",
+            "route_id": "route-20260603-test",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-test",
+            "visible_injection_manifest_hash": "sha256:visible",
+        },
+    }
+
+
+def test_observer_poll_registers_claims_and_plans_without_service_manager(monkeypatch):
+    calls = []
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/register"):
+            return 201, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "session_id": "obs-1",
+                "session_token": "secret-token",
+            }
+        if url.endswith("/observer-commands/next"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": _observer_poll_command(),
+                "empty": False,
+            }
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--governance-url",
+            "http://governance.local",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["status"] == "planned"
+    assert payload["registered_session"]["observer_session_id"] == "obs-1"
+    assert "session_token" not in payload["registered_session"]
+    poll = payload["observer_poll"]
+    assert poll["service_manager_required"] is False
+    assert poll["executor_worker_required"] is False
+    assert poll["uses_task_create"] is False
+    assert poll["observer_command_id"] == "cmd-route-1"
+    assert poll["route_identity"]["route_context_hash"] == "sha256:route"
+    assert poll["observer_run"]["invocation"]["calls_models"] is False
+
+    register_payload = calls[0][2]
+    assert register_payload["capabilities"]["command_types"] == ["execute_backlog_row"]
+    assert calls[1][1].endswith("/api/projects/aming-claw/observer-commands/next")
+    assert calls[1][2]["session_id"] == "obs-1"
+    assert calls[1][2]["session_token"] == "secret-token"
+
+
+def test_observer_poll_can_complete_planned_command(monkeypatch):
+    calls = []
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-commands/claim"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": _observer_poll_command("cmd-complete"),
+                "empty": False,
+            }
+        if url.endswith("/observer-commands/cmd-complete/complete"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": {"command_id": "cmd-complete", "status": "completed"},
+            }
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--governance-url",
+            "http://governance.local",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--command-id",
+            "cmd-complete",
+            "--complete-planned",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["completion"]["ok"] is True
+    assert payload["completion"]["observer_command_id"] == "cmd-complete"
+    complete_payload = calls[-1][2]
+    assert complete_payload["session_id"] == "obs-1"
+    assert complete_payload["session_token"] == "secret-token"
+    assert complete_payload["result"]["status"] == "planned"
+    assert complete_payload["result"]["service_manager_required"] is False
+    assert complete_payload["result"]["executor_worker_required"] is False
+    assert complete_payload["result"]["uses_task_create"] is False
+
+
+def test_observer_poll_reports_empty_queue(monkeypatch):
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        if url.endswith("/observer-commands/next"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": None,
+                "empty": True,
+            }
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["status"] == "empty"
+    assert payload["empty"] is True
+    assert payload["observer_poll"]["service_manager_required"] is False
+
+
+def test_observer_poll_accepts_reconnect_raw_claim_response(monkeypatch):
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        if url.endswith("/observer-commands/next"):
+            command = _observer_poll_command("cmd-owned")
+            command["claimed_by_session_id"] = "obs-1"
+            return 200, command
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["claim"]["observer_command_id"] == "cmd-owned"
+    assert payload["observer_poll"]["observer_command_id"] == "cmd-owned"
+    assert payload["observer_poll"]["status"] == "planned"
+
+
 DOGFOOD_BACKLOG_ID = "AC-OBSERVER-CLI-LAUNCHER-JUDGE-OBSERVER-SUBAGENT-20260602"
 DOGFOOD_ROUTE_CONTEXT_HASH = "sha256:206c6621998609402a7f4276bf33eb9b6d9468f2096116505d388670dab6e352"
 DOGFOOD_PROMPT_CONTRACT_ID = "rprompt-205a50783038d2f0"

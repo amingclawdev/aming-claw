@@ -1,7 +1,7 @@
 # Aming Claw — Deployment Guide
 
 > **Canonical deployment document** — Host-based deployment for local V1 usage.
-> Last updated: 2026-05-21 | V1 dashboard/graph control-plane alignment
+> Last updated: 2026-06-03 | V1 dashboard/graph/observer control-plane alignment
 
 ## V1 Local Plugin Path
 
@@ -12,6 +12,8 @@ For V1 users, the recommended deployment is local plugin mode:
 3. Open `http://localhost:40000/dashboard`.
 4. Load the Codex or Claude Code skill/MCP in a new session.
 5. Bootstrap a target project from the dashboard and build/update its graph.
+6. For judge-to-observer handoff, use `aming-claw observer poll` against the
+   governance observer command queue.
 
 This path requires governance and packaged dashboard static assets. It does not
 require ServiceManager, executor, Redis, Telegram, or dbservice for the main
@@ -124,7 +126,29 @@ curl http://localhost:40000/api/health
 # Expected: {"status": "ok", "version": "...", "pid": ...}
 ```
 
-## 5. Executor Lifecycle (Advanced / Experimental In V1)
+## 5. Observer Command Poll
+
+The standalone observer poll path lets a Codex or Claude observer session claim
+route-owned backlog work from governance without starting ServiceManager or the
+chain executor.
+
+```bash
+aming-claw observer poll \
+  --project-id aming-claw \
+  --governance-url http://localhost:40000 \
+  --json-output
+```
+
+If no session id/token is supplied, the command registers a temporary observer
+session and claims the next `execute_backlog_row` command. The dry-run result
+is a traceable route-bound plan with `calls_models=false`,
+`service_manager_required=false`, `executor_worker_required=false`, and
+`uses_task_create=false`.
+
+Use `--complete-planned` only for dogfood or explicit dry-run closure. Use
+`--execute` only with a valid one-hop dispatch gate, as with `observer run`.
+
+## 6. Executor Lifecycle (Advanced / Experimental In V1)
 
 The V1 dashboard/graph/backlog path does not require the executor. If you are
 testing chain automation, the executor worker **must be launched under
@@ -178,7 +202,7 @@ When the Claude Code session ends:
 
 To stop the full stack, either use `start.ps1` teardown (if it exposes one) or kill ServiceManager (which stops the supervised executor) and the governance process explicitly.
 
-## 6. Telegram Gateway
+## 7. Telegram Gateway
 
 ### Start via Docker Compose
 
@@ -202,7 +226,7 @@ Telegram → Gateway (:40010) → Governance (:40000) → Executor → Reply via
 This is an optional remote task flow. It is not the primary V1 dashboard/graph
 review path.
 
-## 7. Redis Setup
+## 8. Redis Setup
 
 ### Via Docker Compose (Recommended)
 
@@ -222,7 +246,7 @@ redis-cli -p 40079 ping
 # Expected: PONG
 ```
 
-## 8. Docker Compose for Optional Services
+## 9. Docker Compose for Optional Services
 
 ```bash
 # Start all optional services
@@ -250,7 +274,7 @@ docker compose -f docker-compose.governance.yml logs -f telegram-gateway
 | Telegram GW | 40010 | Governance, Redis | Optional |
 | dbservice | 40002 | — | Optional (for semantic search) |
 
-## 9. First-Time Setup
+## 10. First-Time Setup
 
 ### V1 Plugin Setup
 
@@ -280,7 +304,7 @@ docker compose -f docker-compose.governance.yml up -d redis
 python -m agent.service_manager --project aming-claw --governance-url http://localhost:40000 --workspace "$PWD"
 ```
 
-## 10. Workspace and Worktree Routing
+## 11. Workspace and Worktree Routing
 
 > Experimental in V1 — worktrees are used by the chain-automation executor. Manual Fix flows commit on the main worktree and do not require worktree isolation.
 
@@ -298,7 +322,7 @@ dev task completes → worktree preserved for merge
 merge task → cherry-pick to main → worktree cleaned up
 ```
 
-## 11. Restart and Recovery
+## 12. Restart and Recovery
 
 ### After Host Reboot
 
@@ -325,7 +349,7 @@ If governance DB becomes locked (known issue after version-update):
 # This clears WAL locks and restores normal operation
 ```
 
-## 12. Monitoring
+## 13. Monitoring
 
 ### Health Endpoints
 
@@ -353,7 +377,7 @@ Use MCP tools in Claude Code:
 - `task_list` — all tasks with status
 - `wf_summary` — node status counts
 
-## 13. Known Issues
+## 14. Known Issues
 
 ### Active
 
@@ -369,7 +393,7 @@ Use MCP tools in Claude Code:
 | VERSION file lags 1 commit | `chain_version` is derived from the git `Chain-Source-Stage` trailer; no VERSION file involved. |
 | Dirty workspace gate false positive | `.claude/` filter (D5) + short/full hash prefix-match (B35) ship in current main. |
 
-## 14. Data Persistence
+## 15. Data Persistence
 
 | Data | Location | Backup Strategy |
 |------|----------|----------------|
