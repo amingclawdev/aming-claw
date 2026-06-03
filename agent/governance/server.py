@@ -1268,12 +1268,14 @@ def handle_observer_command_list(ctx: RequestContext):
         status=status,
         limit=limit,
     )
+    summary = observer_session.command_summary(conn, project_id=project_id, limit=limit)
     return {
         "ok": True,
         "project_id": project_id,
         "observer_commands": commands,
         "count": len(commands),
-        "summary": observer_session.command_summary(conn, project_id=project_id, limit=limit),
+        "summary": summary,
+        "observer_consumer_recovery": summary.get("observer_consumer_recovery"),
     }
 
 

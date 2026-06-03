@@ -233,7 +233,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "observer_command_list",
-        "description": "List durable observer command queue rows for a project.",
+        "description": "List durable observer command queue rows for a project, including observer-consumer recovery diagnostics for notified execute_backlog_row commands.",
         "inputSchema": {
             "type": "object",
             "properties": {

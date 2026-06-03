@@ -53,6 +53,43 @@ def _actual_startup_result() -> dict:
     }
 
 
+def _insert_legacy_execute_command(
+    conn: sqlite3.Connection,
+    *,
+    payload: dict,
+    command_id: str = "cmd-legacy-execute",
+    project_id: str = "demo",
+    target_session_id: str = "",
+    created_at: str = "2026-06-03T00:00:00Z",
+) -> dict:
+    conn.execute(
+        """
+        INSERT INTO observer_command_queue (
+            command_id, project_id, command_type, payload_json, status,
+            target_session_id, claimed_by_session_id, created_by, created_at,
+            notified_at, claimed_at, completed_at, result_json, error
+        ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, '', '', '{}', '')
+        """,
+        (
+            command_id,
+            project_id,
+            observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            observer_session._json_dumps(payload),
+            observer_session.COMMAND_STATUS_NOTIFIED,
+            target_session_id,
+            "legacy_dashboard",
+            created_at,
+            created_at,
+        ),
+    )
+    conn.commit()
+    return observer_session.get_command(
+        conn,
+        project_id=project_id,
+        command_id=command_id,
+    )
+
+
 def test_command_enqueue_and_list_preserve_business_payload_in_db():
     conn = _conn()
 
@@ -199,6 +236,257 @@ def test_execute_backlog_row_rejects_missing_route_payload_fields():
             command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
             payload={"backlog_id": "AC-ROUTE-HANDOFF"},
         )
+
+
+def test_notified_execute_recovery_reports_no_active_consumer_without_claiming():
+    conn = _conn()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        notify=True,
+        now="2026-06-03T00:00:00Z",
+    )
+
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:00:45Z",
+    )
+    persisted = observer_session.get_command(
+        conn,
+        project_id="demo",
+        command_id=command["command_id"],
+    )
+    summary = observer_session.command_summary(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:00:45Z",
+    )
+
+    assert recovery["schema_version"] == (
+        observer_session.OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION
+    )
+    assert recovery["recovery_required"] is True
+    assert recovery["status"] == "blocked"
+    assert recovery["classification"] == "no_active_consumer_session"
+    assert recovery["latest_notified_command_age_sec"] == 45.0
+    assert recovery["target_session_id"] == ""
+    assert recovery["eligible_consumer_count"] == 0
+    assert recovery["next_legal_action"]["tool"] == "observer_session_register"
+    assert persisted["status"] == observer_session.COMMAND_STATUS_NOTIFIED
+    assert summary["observer_consumer_recovery"]["classification"] == (
+        "no_active_consumer_session"
+    )
+
+
+def test_active_consumer_claim_records_route_and_precheck_evidence():
+    conn = _conn()
+    payload = {
+        **_execute_backlog_row_payload(),
+        "prompt_contract_hash": "sha256:prompt-contract",
+        "precheck_run_id": "precheck-route-action",
+    }
+    session = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-active",
+        now="2026-06-03T00:00:30Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+        now="2026-06-03T00:00:00Z",
+    )
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:00:45Z",
+    )
+
+    assert recovery["status"] == "action_required"
+    assert recovery["classification"] == "eligible_consumer_available"
+    assert recovery["eligible_session_ids"] == [session["session_id"]]
+    assert observer_session.get_command(
+        conn,
+        project_id="demo",
+        command_id=command["command_id"],
+    )["status"] == observer_session.COMMAND_STATUS_NOTIFIED
+
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:46Z",
+    )
+    evidence = claimed["command"]["result"]["observer_claim_evidence"]
+
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert evidence["schema_version"] == (
+        observer_session.OBSERVER_COMMAND_CLAIM_EVIDENCE_SCHEMA_VERSION
+    )
+    assert evidence["route_identity"]["route_context_hash"] == payload["route_context_hash"]
+    assert evidence["route_identity"]["prompt_contract_hash"] == "sha256:prompt-contract"
+    assert evidence["precheck_evidence"]["precheck_run_id"] == "precheck-route-action"
+    assert evidence["precheck_evidence"]["present"] is True
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result=_actual_startup_result(),
+        now="2026-06-03T00:00:47Z",
+    )
+
+    assert completed["command"]["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert completed["command"]["result"]["observer_claim_evidence"] == evidence
+
+
+def test_invalid_legacy_execute_payload_reports_validation_blocker_and_fails_on_claim():
+    conn = _conn()
+    session = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-active",
+        now="2026-06-03T00:00:30Z",
+    )
+    command = _insert_legacy_execute_command(
+        conn,
+        payload={"backlog_id": "AC-ROUTE-HANDOFF"},
+        created_at="2026-06-03T00:00:00Z",
+    )
+
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:01:00Z",
+    )
+
+    assert recovery["status"] == "blocked"
+    assert recovery["classification"] == "claim_validation_error"
+    assert recovery["blocker"]["blocker_id"] == "execute_backlog_row_invalid_route_payload"
+    assert "route_id" in recovery["blocker"]["missing_required_fields"]
+    assert recovery["next_legal_action"]["tool"] == "observer_command_fail"
+
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:01:01Z",
+    )
+
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert claimed["command"]["claimed_by_session_id"] == session["session_id"]
+    assert claimed["command"]["error"] == "execute_backlog_row_invalid_route_payload"
+    assert claimed["claim_blocker"]["missing_required_fields"] == (
+        claimed["command"]["result"]["claim_blocker"]["missing_required_fields"]
+    )
+
+
+def test_targeted_notified_execute_diagnostic_reports_target_unavailable_then_claimable():
+    conn = _conn()
+    target = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-target",
+        now="2026-06-03T00:00:00Z",
+    )
+    wrong = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-wrong",
+        now="2026-06-03T00:02:30Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        target_session_id=target["session_id"],
+        created_by="judgment_brain",
+        notify=True,
+        now="2026-06-03T00:00:01Z",
+    )
+
+    blocked = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:00Z",
+    )
+
+    assert blocked["classification"] == "target_session_unavailable"
+    assert blocked["target_session_id"] == target["session_id"]
+    assert blocked["target_session"]["computed_status"] == "stale"
+    assert blocked["eligible_consumer_count"] == 0
+    assert blocked["next_legal_action"]["tool"] == "observer_session_heartbeat"
+    assert [
+        item for item in blocked["consumer_sessions"] if item["session_id"] == wrong["session_id"]
+    ][0]["target_allowed"] is False
+
+    observer_session.heartbeat_session(
+        conn,
+        project_id="demo",
+        session_id=target["session_id"],
+        session_token=target["session_token"],
+        now="2026-06-03T00:03:01Z",
+    )
+    claimable = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:02Z",
+    )
+
+    assert claimable["classification"] == "eligible_consumer_available"
+    assert claimable["eligible_session_ids"] == [target["session_id"]]
+    assert observer_session.get_command(
+        conn,
+        project_id="demo",
+        command_id=command["command_id"],
+    )["status"] == observer_session.COMMAND_STATUS_NOTIFIED
+
+
+def test_api_command_list_exposes_observer_consumer_recovery_summary():
+    from agent.governance import server
+
+    conn = _conn()
+    observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        notify=True,
+        now="2026-06-03T00:00:00Z",
+    )
+    ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={"status": "notified"},
+        body={},
+        get_project_id=lambda: "demo",
+    )
+
+    with patch("agent.governance.server.get_connection", return_value=conn):
+        response = server.handle_observer_command_list(ctx)
+
+    assert response["ok"] is True
+    assert response["observer_consumer_recovery"] == (
+        response["summary"]["observer_consumer_recovery"]
+    )
+    assert response["observer_consumer_recovery"]["schema_version"] == (
+        observer_session.OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION
+    )
 
 
 def test_mcp_observer_command_enqueue_schema_accepts_execute_backlog_row():

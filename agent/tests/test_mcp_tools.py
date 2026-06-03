@@ -139,6 +139,12 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
     }.issubset(names)
 
 
+def test_mcp_observer_command_list_advertises_consumer_recovery_diagnostics():
+    tool = next(tool for tool in TOOLS if tool.get("name") == "observer_command_list")
+
+    assert "observer-consumer recovery diagnostics" in tool["description"]
+
+
 def test_mcp_observer_repair_run_route_evidence_routes_to_governance_api():
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)

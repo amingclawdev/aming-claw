@@ -13,7 +13,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 HEARTBEAT_INTERVAL_SEC = 30
@@ -21,6 +21,9 @@ IDLE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2
 STALE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 4
 CLAIMED_TO_STARTUP_TIMEOUT_SEC = STALE_AFTER_SEC
 CLAIMED_TO_STARTUP_TIMEOUT_STATUS = "claimed_to_startup_timeout"
+NOTIFIED_UNCLAIMED_RECOVERY_THRESHOLD_SEC = HEARTBEAT_INTERVAL_SEC
+OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION = "observer_command_consumer_recovery.v1"
+OBSERVER_COMMAND_CLAIM_EVIDENCE_SCHEMA_VERSION = "observer_command_claim_evidence.v1"
 
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
@@ -397,12 +400,34 @@ def _missing_startup_surface_blocker(command: dict[str, Any], *, now: str) -> di
     }
 
 
+def _route_identity_from_payload(payload: Mapping[str, Any] | dict[str, Any]) -> dict[str, str]:
+    return {
+        "route_id": str(payload.get("route_id") or ""),
+        "route_context_hash": str(payload.get("route_context_hash") or ""),
+        "prompt_contract_id": str(payload.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(payload.get("prompt_contract_hash") or ""),
+        "route_token_ref": str(payload.get("route_token_ref") or ""),
+        "precheck_run_id": str(payload.get("precheck_run_id") or ""),
+        "visible_injection_manifest_hash": str(
+            payload.get("visible_injection_manifest_hash") or ""
+        ),
+    }
+
+
 def _command_claim_age_sec(command: dict[str, Any], *, now: str) -> float | None:
     claimed_at = _parse_utc(str(command.get("claimed_at") or ""))
     now_dt = _parse_utc(now)
     if not claimed_at or not now_dt:
         return None
     return max(0.0, (now_dt - claimed_at).total_seconds())
+
+
+def _command_notified_age_sec(command: dict[str, Any], *, now: str) -> float | None:
+    notified_at = _parse_utc(str(command.get("notified_at") or command.get("created_at") or ""))
+    now_dt = _parse_utc(now)
+    if not notified_at or not now_dt:
+        return None
+    return max(0.0, (now_dt - notified_at).total_seconds())
 
 
 def _claimed_execute_startup_timeout_status(
@@ -430,26 +455,92 @@ def _merge_result_with_durable_takeover(
 ) -> dict[str, Any]:
     incoming = dict(result or {})
     existing = _command_result(command)
-    for key in ("takeover", "takeover_status"):
+    for key in (
+        "takeover",
+        "takeover_status",
+        "observer_claim_evidence",
+        "claim_blocker",
+    ):
         if key not in incoming and key in existing:
             incoming[key] = existing[key]
     return incoming
 
 
+def _execute_backlog_payload_missing_fields(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return list(EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS)
+    return [
+        field
+        for field in EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS
+        if not str(payload.get(field) or "").strip()
+    ]
+
+
+def _execute_backlog_payload_blocker(
+    command: dict[str, Any],
+    *,
+    now: str,
+    missing: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    missing_fields = missing if missing is not None else _execute_backlog_payload_missing_fields(payload)
+    return {
+        "blocker_id": "execute_backlog_row_invalid_route_payload",
+        "dispatch_blocker": True,
+        "terminal_dispatch_blocker": True,
+        "status": "blocked",
+        "observer_command_id": str(command.get("command_id") or ""),
+        "command_status": str(command.get("status") or ""),
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "target_session_id": str(command.get("target_session_id") or ""),
+        "route_identity": _route_identity_from_payload(payload),
+        "missing_required_fields": missing_fields,
+        "failed_at": now,
+        "reason": (
+            "execute_backlog_row command cannot be claimed because its route-bound "
+            "payload is missing required route/backlog evidence"
+        ),
+    }
+
+
+def _execute_backlog_claim_evidence(
+    command: dict[str, Any],
+    *,
+    session_id: str,
+    now: str,
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    route_identity = _route_identity_from_payload(payload)
+    return {
+        "schema_version": OBSERVER_COMMAND_CLAIM_EVIDENCE_SCHEMA_VERSION,
+        "observer_command_id": str(command.get("command_id") or ""),
+        "observer_session_id": session_id,
+        "claimed_at": now,
+        "command_type": str(command.get("command_type") or ""),
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "target_session_id": str(command.get("target_session_id") or ""),
+        "route_identity": route_identity,
+        "precheck_evidence": {
+            "precheck_run_id": route_identity["precheck_run_id"],
+            "present": bool(route_identity["precheck_run_id"]),
+            "visible_injection_manifest_hash": route_identity[
+                "visible_injection_manifest_hash"
+            ],
+        },
+        "next_expected_evidence": "mf_subagent_startup_or_terminal_dispatch_blocker",
+    }
+
+
 def _validate_command_payload(command_type: str, payload: Any) -> None:
     if command_type != COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
         return
+    missing = _execute_backlog_payload_missing_fields(payload)
     if not isinstance(payload, dict):
         missing = ", ".join(EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS)
         raise ValueError(
             "execute_backlog_row payload must be an object with required fields: "
             + missing
         )
-    missing = [
-        field
-        for field in EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS
-        if not str(payload.get(field) or "").strip()
-    ]
     if missing:
         raise ValueError(
             "execute_backlog_row payload missing required fields: "
@@ -758,6 +849,321 @@ def connection_summary(
     }
 
 
+def _consumer_session_diagnostic(
+    session: dict[str, Any],
+    command: dict[str, Any],
+) -> dict[str, Any]:
+    session_id = str(session.get("session_id") or "")
+    computed_status = str(session.get("computed_status") or "")
+    capabilities = session.get("capabilities") if isinstance(session.get("capabilities"), dict) else {}
+    command_type = str(command.get("command_type") or "")
+    connected = computed_status in {SESSION_STATUS_ACTIVE, "idle"}
+    target_allowed = _command_target_allows(command, session_id)
+    capability_allowed = capabilities_allow(
+        capabilities,
+        ACTION_COMMAND_CLAIM,
+        command_type=command_type,
+    )
+    reasons: list[str] = []
+    if not connected:
+        reasons.append(f"session_{computed_status or 'unavailable'}")
+    if not target_allowed:
+        reasons.append("target_session_mismatch")
+    if not capability_allowed:
+        reasons.append("capability_missing")
+    return {
+        "session_id": session_id,
+        "observer_kind": str(session.get("observer_kind") or ""),
+        "session_label": str(session.get("session_label") or ""),
+        "computed_status": computed_status,
+        "last_seen_at": str(session.get("last_seen_at") or ""),
+        "target_allowed": target_allowed,
+        "capability_allowed": capability_allowed,
+        "claim_eligible": connected and target_allowed and capability_allowed,
+        "unavailable_reasons": reasons,
+    }
+
+
+def _observer_command_summary_item(command: dict[str, Any], *, now: str) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    return {
+        "command_id": str(command.get("command_id") or ""),
+        "command_type": str(command.get("command_type") or ""),
+        "status": str(command.get("status") or ""),
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "target_session_id": str(command.get("target_session_id") or ""),
+        "notified_at": str(command.get("notified_at") or ""),
+        "created_at": str(command.get("created_at") or ""),
+        "notified_age_sec": _command_notified_age_sec(command, now=now),
+        "route_identity": _route_identity_from_payload(payload),
+    }
+
+
+def _latest_notified_execute_commands(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """SELECT * FROM observer_command_queue
+            WHERE project_id = ?
+              AND command_type = ?
+              AND status = ?
+            ORDER BY notified_at DESC, created_at DESC
+            LIMIT ?""",
+        (
+            (project_id or "").strip(),
+            COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            COMMAND_STATUS_NOTIFIED,
+            max(1, min(int(limit or 50), 1000)),
+        ),
+    ).fetchall()
+    return [_command_row_to_dict(row) for row in rows]
+
+
+def observer_command_consumer_recovery(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    now: str | None = None,
+    threshold_sec: int = NOTIFIED_UNCLAIMED_RECOVERY_THRESHOLD_SEC,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Diagnose route-bound execute commands that were notified but unclaimed."""
+    ensure_schema(conn)
+    pid = (project_id or "").strip()
+    timestamp = now or _utc_now()
+    threshold = max(0, int(threshold_sec))
+    commands = _latest_notified_execute_commands(conn, project_id=pid, limit=limit)
+    latest = commands[0] if commands else None
+    stale_commands = [
+        command
+        for command in commands
+        if (_command_notified_age_sec(command, now=timestamp) or 0.0) >= threshold
+    ]
+    diagnosed = max(
+        stale_commands or ([latest] if latest else []),
+        key=lambda item: _command_notified_age_sec(item, now=timestamp) or -1.0,
+        default=None,
+    )
+    base: dict[str, Any] = {
+        "schema_version": OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION,
+        "project_id": pid,
+        "generated_at": timestamp,
+        "threshold_sec": threshold,
+        "notified_execute_backlog_row_count": len(commands),
+        "stale_notified_execute_backlog_row_count": len(stale_commands),
+        "latest_notified_command_age_sec": (
+            _command_notified_age_sec(latest, now=timestamp) if latest else None
+        ),
+        "latest_notified_command": (
+            _observer_command_summary_item(latest, now=timestamp) if latest else None
+        ),
+        "diagnosed_command": (
+            _observer_command_summary_item(diagnosed, now=timestamp) if diagnosed else None
+        ),
+        "recovery_required": bool(diagnosed and diagnosed in stale_commands),
+    }
+    if not diagnosed:
+        base.update(
+            {
+                "status": "idle",
+                "classification": "no_notified_execute_backlog_row",
+                "next_legal_action": {
+                    "action": "none",
+                    "description": "No notified execute_backlog_row command is waiting for an observer consumer.",
+                },
+            }
+        )
+        return base
+
+    payload = diagnosed.get("payload") if isinstance(diagnosed.get("payload"), dict) else {}
+    missing = _execute_backlog_payload_missing_fields(payload)
+    sessions = list_sessions(conn, project_id=pid, limit=100, now=timestamp)
+    consumers = [_consumer_session_diagnostic(session, diagnosed) for session in sessions]
+    connected = [
+        consumer
+        for consumer in consumers
+        if consumer.get("computed_status") in {SESSION_STATUS_ACTIVE, "idle"}
+    ]
+    eligible = [consumer for consumer in consumers if consumer.get("claim_eligible")]
+    target_session_id = str(diagnosed.get("target_session_id") or "")
+    target_session = None
+    if target_session_id:
+        target_session = next(
+            (
+                consumer
+                for consumer in consumers
+                if consumer.get("session_id") == target_session_id
+            ),
+            None,
+        )
+        if target_session is None:
+            row = _raw_session_row(conn, target_session_id)
+            if row is not None and str(row["project_id"]) == pid:
+                item = _session_row_to_dict(row)
+                item["computed_status"] = computed_session_status(row, now=timestamp)
+                target_session = _consumer_session_diagnostic(item, diagnosed)
+
+    base.update(
+        {
+            "target_session_id": target_session_id,
+            "target_session": target_session,
+            "connected_consumer_count": len(connected),
+            "eligible_consumer_count": len(eligible),
+            "eligible_session_ids": [str(item.get("session_id") or "") for item in eligible],
+            "consumer_sessions": consumers,
+        }
+    )
+
+    if missing:
+        blocker = _execute_backlog_payload_blocker(
+            diagnosed,
+            now=timestamp,
+            missing=missing,
+        )
+        base.update(
+            {
+                "status": "blocked",
+                "classification": "claim_validation_error",
+                "blocker": blocker,
+                "next_legal_action": {
+                    "tool": "observer_command_fail",
+                    "description": (
+                        "Fail or supersede the malformed command with a complete "
+                        "route-bound execute_backlog_row payload."
+                    ),
+                    "command_id": str(diagnosed.get("command_id") or ""),
+                    "requires_session_token": True,
+                },
+            }
+        )
+        return base
+
+    if not base["recovery_required"]:
+        base.update(
+            {
+                "status": "waiting_for_threshold",
+                "classification": "notified_within_threshold",
+                "next_legal_action": {
+                    "tool": "observer_command_claim",
+                    "description": (
+                        "An eligible observer may claim now; otherwise keep watching "
+                        "until the notified-unclaimed threshold is exceeded."
+                    ),
+                    "command_id": str(diagnosed.get("command_id") or ""),
+                    "eligible_session_ids": [str(item.get("session_id") or "") for item in eligible],
+                    "requires_session_token": True,
+                },
+            }
+        )
+        return base
+
+    if not connected:
+        base.update(
+            {
+                "status": "blocked",
+                "classification": "no_active_consumer_session",
+                "blocker": {
+                    "blocker_id": "observer_command_no_active_consumer_session",
+                    "observer_command_id": str(diagnosed.get("command_id") or ""),
+                    "target_session_id": target_session_id,
+                    "notified_age_sec": _command_notified_age_sec(diagnosed, now=timestamp),
+                    "threshold_sec": threshold,
+                    "reason": (
+                        "No active or idle observer session is available to claim "
+                        "the notified execute_backlog_row command."
+                    ),
+                },
+                "next_legal_action": {
+                    "tool": "observer_session_register",
+                    "description": (
+                        "Register or heartbeat an observer session, then call "
+                        "observer_command_claim for the notified command."
+                    ),
+                    "followup_tool": "observer_command_claim",
+                    "command_id": str(diagnosed.get("command_id") or ""),
+                    "requires_session_token": True,
+                },
+            }
+        )
+        return base
+
+    if target_session_id and not eligible:
+        base.update(
+            {
+                "status": "blocked",
+                "classification": "target_session_unavailable",
+                "blocker": {
+                    "blocker_id": "observer_command_target_session_unavailable",
+                    "observer_command_id": str(diagnosed.get("command_id") or ""),
+                    "target_session_id": target_session_id,
+                    "target_session": target_session,
+                    "reason": (
+                        "The command is targeted, but the target session is not "
+                        "currently eligible to claim it."
+                    ),
+                },
+                "next_legal_action": {
+                    "tool": "observer_session_heartbeat",
+                    "description": (
+                        "Recover the target observer session, or enqueue a new "
+                        "untargeted/retargeted command with the same route evidence."
+                    ),
+                    "target_session_id": target_session_id,
+                    "requires_session_token": True,
+                },
+            }
+        )
+        return base
+
+    if not eligible:
+        base.update(
+            {
+                "status": "blocked",
+                "classification": "claim_validation_error",
+                "blocker": {
+                    "blocker_id": "observer_command_no_eligible_consumer_session",
+                    "observer_command_id": str(diagnosed.get("command_id") or ""),
+                    "reason": (
+                        "Observer sessions exist, but none can claim this command "
+                        "with the required action, command type, and target."
+                    ),
+                },
+                "next_legal_action": {
+                    "tool": "observer_session_register",
+                    "description": (
+                        "Register an observer session with observer_command_claim "
+                        "and execute_backlog_row capability, then claim the command."
+                    ),
+                    "followup_tool": "observer_command_claim",
+                    "command_id": str(diagnosed.get("command_id") or ""),
+                    "requires_session_token": True,
+                },
+            }
+        )
+        return base
+
+    base.update(
+        {
+            "status": "action_required",
+            "classification": "eligible_consumer_available",
+            "next_legal_action": {
+                "tool": "observer_command_claim",
+                "description": (
+                    "An eligible observer session can claim this route-bound "
+                    "execute_backlog_row command now."
+                ),
+                "command_id": str(diagnosed.get("command_id") or ""),
+                "eligible_session_ids": [str(item.get("session_id") or "") for item in eligible],
+                "requires_session_token": True,
+            },
+        }
+    )
+    return base
+
+
 def enqueue_command(
     conn: sqlite3.Connection,
     *,
@@ -854,7 +1260,13 @@ def list_commands(
     return [_command_row_to_dict(row) for row in rows]
 
 
-def command_summary(conn: sqlite3.Connection, *, project_id: str, limit: int = 50) -> dict[str, Any]:
+def command_summary(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    limit: int = 50,
+    now: str | None = None,
+) -> dict[str, Any]:
     commands = list_commands(conn, project_id=project_id, limit=limit)
     counts = {status: 0 for status in [
         COMMAND_STATUS_QUEUED,
@@ -876,6 +1288,12 @@ def command_summary(conn: sqlite3.Connection, *, project_id: str, limit: int = 5
         "count": sum(counts.values()),
         "counts": counts,
         "items": commands,
+        "observer_consumer_recovery": observer_command_consumer_recovery(
+            conn,
+            project_id=project_id,
+            now=now,
+            limit=limit,
+        ),
     }
 
 
@@ -1000,6 +1418,11 @@ def claim_command(
                 "observer_session_id": sid,
                 "command": None,
                 "empty": True,
+                "observer_consumer_recovery": observer_command_consumer_recovery(
+                    conn,
+                    project_id=pid,
+                    now=timestamp,
+                ),
             }
 
     if not _command_target_allows(command, sid):
@@ -1019,9 +1442,70 @@ def claim_command(
     if command.get("status") not in CLAIMABLE_COMMAND_STATUSES:
         raise ObserverCommandConflict("observer command is already claimed")
 
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    missing = (
+        _execute_backlog_payload_missing_fields(payload)
+        if str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        else []
+    )
+    if missing:
+        blocker = _execute_backlog_payload_blocker(
+            command,
+            now=timestamp,
+            missing=missing,
+        )
+        result_payload = _command_result(command)
+        result_payload["ok"] = False
+        result_payload["claim_blocker"] = blocker
+        cursor = conn.execute(
+            """UPDATE observer_command_queue
+                  SET status = ?,
+                      claimed_by_session_id = ?,
+                      claimed_at = ?,
+                      completed_at = ?,
+                      result_json = ?,
+                      error = ?
+                WHERE project_id = ?
+                  AND command_id = ?
+                  AND status IN (?, ?)
+                  AND (target_session_id = '' OR target_session_id = ?)""",
+            (
+                COMMAND_STATUS_FAILED,
+                sid,
+                timestamp,
+                timestamp,
+                _json_dumps(result_payload),
+                blocker["blocker_id"],
+                pid,
+                command["command_id"],
+                COMMAND_STATUS_QUEUED,
+                COMMAND_STATUS_NOTIFIED,
+                sid,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount != 1:
+            raise ObserverCommandConflict("observer command claim validation lost race")
+        return {
+            "ok": True,
+            "project_id": pid,
+            "observer_session_id": sid,
+            "command": get_command(conn, project_id=pid, command_id=command["command_id"]),
+            "empty": False,
+            "claim_blocker": blocker,
+        }
+
+    result_payload = _command_result(command)
+    if str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
+        result_payload["observer_claim_evidence"] = _execute_backlog_claim_evidence(
+            command,
+            session_id=sid,
+            now=timestamp,
+        )
+
     cursor = conn.execute(
         """UPDATE observer_command_queue
-              SET status = ?, claimed_by_session_id = ?, claimed_at = ?
+              SET status = ?, claimed_by_session_id = ?, claimed_at = ?, result_json = ?
             WHERE project_id = ?
               AND command_id = ?
               AND status IN (?, ?)
@@ -1030,6 +1514,7 @@ def claim_command(
             COMMAND_STATUS_CLAIMED,
             sid,
             timestamp,
+            _json_dumps(result_payload),
             pid,
             command["command_id"],
             COMMAND_STATUS_QUEUED,
