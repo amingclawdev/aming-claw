@@ -577,6 +577,132 @@ def test_analyze_complete_projects_raw_requirement_to_confirmation():
     assert "REQ-QUEUE-PROMOTE" in updated["note"]
 
 
+def test_api_takeover_rejects_active_owner_then_allows_closed_owner_terminal_fail():
+    from agent.governance import server
+
+    conn = _conn()
+
+    def ctx(path_params: dict, body: dict | None = None):
+        return SimpleNamespace(
+            path_params=path_params,
+            query={},
+            body=body or {},
+            get_project_id=lambda: "demo",
+        )
+
+    with (
+        patch("agent.governance.server.get_connection", return_value=conn),
+        patch("agent.governance.server.audit_service.record", return_value={"ok": True}),
+    ):
+        owner_code, owner = server.handle_observer_session_register(
+            ctx(
+                {"project_id": "demo"},
+                {
+                    "observer_kind": "codex",
+                    "session_id": "obs-owner",
+                    "session_label": "owner",
+                },
+            )
+        )
+        fallback_code, fallback = server.handle_observer_session_register(
+            ctx(
+                {"project_id": "demo"},
+                {
+                    "observer_kind": "codex",
+                    "session_id": "obs-fallback",
+                    "session_label": "fallback",
+                },
+            )
+        )
+        enqueue_code, enqueue = server.handle_observer_command_enqueue(
+            ctx(
+                {"project_id": "demo"},
+                {
+                    "command_type": observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+                    "payload": _execute_backlog_row_payload(),
+                    "created_by": "judgment_brain",
+                },
+            )
+        )
+        command_id = enqueue["observer_command"]["command_id"]
+
+        claimed = server.handle_observer_command_claim(
+            ctx(
+                {"project_id": "demo"},
+                {
+                    "session_id": owner["session_id"],
+                    "session_token": owner["session_token"],
+                    "command_id": command_id,
+                },
+            )
+        )
+        active_takeover_code, active_takeover = server.handle_observer_command_takeover(
+            ctx(
+                {"project_id": "demo", "command_id": command_id},
+                {
+                    "session_id": fallback["session_id"],
+                    "session_token": fallback["session_token"],
+                    "reason": "fallback observer tries to steal active command",
+                },
+            )
+        )
+
+        closed = server.handle_observer_session_close(
+            ctx(
+                {"project_id": "demo", "session_id": owner["session_id"]},
+                {
+                    "session_token": owner["session_token"],
+                },
+            )
+        )
+        takeover = server.handle_observer_command_takeover(
+            ctx(
+                {"project_id": "demo", "command_id": command_id},
+                {
+                    "session_id": fallback["session_id"],
+                    "session_token": fallback["session_token"],
+                    "reason": "fallback observer resolves closed owner",
+                },
+            )
+        )
+        failed = server.handle_observer_command_fail(
+            ctx(
+                {"project_id": "demo", "command_id": command_id},
+                {
+                    "session_id": fallback["session_id"],
+                    "session_token": fallback["session_token"],
+                    "error": "fallback completed stale owner takeover",
+                    "result": {"takeover": takeover["takeover"]},
+                },
+            )
+        )
+
+    assert owner_code == 201
+    assert fallback_code == 201
+    assert enqueue_code == 201
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert claimed["command"]["claimed_by_session_id"] == owner["session_id"]
+
+    assert active_takeover_code == 409
+    assert active_takeover["error"] == "observer_command_conflict"
+    assert "not stale: active" in active_takeover["message"]
+
+    assert closed["status"] == observer_session.SESSION_STATUS_CLOSED
+    assert takeover["ok"] is True
+    assert takeover["observer_session_id"] == fallback["session_id"]
+    assert takeover["command"]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert takeover["command"]["claimed_by_session_id"] == fallback["session_id"]
+    assert takeover["takeover"]["previous_session_id"] == owner["session_id"]
+    assert takeover["takeover"]["previous_session_status"] == observer_session.SESSION_STATUS_CLOSED
+
+    assert failed["observer_session_id"] == fallback["session_id"]
+    assert failed["command"]["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert failed["command"]["claimed_by_session_id"] == fallback["session_id"]
+    assert failed["command"]["result"]["takeover"]["previous_session_status"] == (
+        observer_session.SESSION_STATUS_CLOSED
+    )
+
+
 def test_api_smoke_capture_enqueue_claim_complete_reflects_project_inbox():
     from agent.governance import server
 
