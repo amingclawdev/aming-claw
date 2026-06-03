@@ -157,6 +157,21 @@ def _without_prompt_contract_hash(value):
     return value
 
 
+def _replace_route_identity(value, identity):
+    if isinstance(value, dict):
+        replaced = {
+            key: _replace_route_identity(item, identity)
+            for key, item in value.items()
+        }
+        for key in ROUTE_IDENTITY:
+            if key in replaced:
+                replaced[key] = identity[key]
+        return replaced
+    if isinstance(value, list):
+        return [_replace_route_identity(item, identity) for item in value]
+    return value
+
+
 def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", project_id="proj"):
     scope = {"project_id": project_id, "backlog_id": bug_id}
     if task_id:
@@ -1947,6 +1962,82 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn(
             "route_identity_mismatch",
             blocked["route_context_gate"]["missing_requirement_ids"],
+        )
+
+    def test_mf_parallel_close_gate_accepts_route_identity_cleanup(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-CLEANUP",
+        }
+        stale_identity = {
+            "route_context_hash": "sha256:stale-route-context",
+            "prompt_contract_id": "rprompt-stale-route",
+            "prompt_contract_hash": "sha256:stale-prompt-contract",
+        }
+        stale_events = _replace_route_identity(
+            [*_route_context_consumption_events(), _route_context_qa_verification_event()],
+            stale_identity,
+        )
+        current_events = [
+            *_route_context_consumption_events(),
+            _route_context_qa_verification_event(),
+        ]
+        close_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [*close_events, *stale_events, *current_events],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn(
+            "route_identity_mismatch",
+            blocked["route_context_gate"]["missing_requirement_ids"],
+        )
+
+        cleanup = {
+            "event_kind": "route_identity_cleanup",
+            "phase": "identity_recovery",
+            "status": "accepted",
+            "payload": {
+                "route_identity_cleanup": {
+                    **ROUTE_IDENTITY,
+                    "reason": "Supersede stale hand-written route evidence with the fresh service-generated route attempt.",
+                }
+            },
+        }
+        ready = task_timeline.mf_close_gate_verification(
+            [*close_events, *stale_events, *current_events, cleanup],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(
+            ready["route_context_gate"]["route_identity"],
+            ROUTE_IDENTITY,
+        )
+        self.assertTrue(
+            ready["route_context_gate"]["route_identity_cleanup"]["applied"]
+        )
+        self.assertGreater(
+            ready["route_context_gate"]["route_identity_cleanup"][
+                "superseded_event_count"
+            ],
+            0,
+        )
+        self.assertIn(
+            "superseded_route_identity",
+            {
+                item["reason"]
+                for item in ready["route_context_gate"]["ignored_route_events"]
+            },
         )
 
     def test_mf_close_gate_blocks_observer_direct_when_subagent_lane_required(self):

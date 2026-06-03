@@ -43,6 +43,7 @@ TERMINAL_COMMAND_STATUSES = {
 COMMAND_TYPE_ANALYZE_REQUIREMENTS = "analyze_requirements"
 COMMAND_TYPE_CONFIRM_REQUIREMENT = "confirm_requirement"
 COMMAND_TYPE_MOVE_TO_EXECUTION_QUEUE = "move_to_execution_queue"
+COMMAND_TYPE_EXECUTE_BACKLOG_ROW = "execute_backlog_row"
 COMMAND_TYPE_PAUSE_WORKER = "pause_worker"
 COMMAND_TYPE_CONTINUE_WORKER = "continue_worker"
 COMMAND_TYPE_CANCEL_WORKER = "cancel_worker"
@@ -51,10 +52,19 @@ VALID_COMMAND_TYPES = {
     COMMAND_TYPE_ANALYZE_REQUIREMENTS,
     COMMAND_TYPE_CONFIRM_REQUIREMENT,
     COMMAND_TYPE_MOVE_TO_EXECUTION_QUEUE,
+    COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
     COMMAND_TYPE_PAUSE_WORKER,
     COMMAND_TYPE_CONTINUE_WORKER,
     COMMAND_TYPE_CANCEL_WORKER,
 }
+
+EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS = (
+    "backlog_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "visible_injection_manifest_hash",
+)
 
 ACTION_SESSION_HEARTBEAT = "observer_session_heartbeat"
 ACTION_SESSION_CLOSE = "observer_session_close"
@@ -226,6 +236,27 @@ def _command_row_to_dict(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data["payload"] = _json_loads_object(data.get("payload_json"))
     data["result"] = _json_loads_object(data.get("result_json"))
     return data
+
+
+def _validate_command_payload(command_type: str, payload: Any) -> None:
+    if command_type != COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
+        return
+    if not isinstance(payload, dict):
+        missing = ", ".join(EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS)
+        raise ValueError(
+            "execute_backlog_row payload must be an object with required fields: "
+            + missing
+        )
+    missing = [
+        field
+        for field in EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS
+        if not str(payload.get(field) or "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "execute_backlog_row payload missing required fields: "
+            + ", ".join(missing)
+        )
 
 
 def computed_session_status(
@@ -548,6 +579,7 @@ def enqueue_command(
         raise ValueError("project_id is required")
     if ctype not in VALID_COMMAND_TYPES:
         raise ValueError(f"invalid command_type: {ctype!r}")
+    _validate_command_payload(ctype, payload)
 
     target = (target_session_id or "").strip()
     if target:

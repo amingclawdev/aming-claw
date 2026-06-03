@@ -257,6 +257,7 @@ TOOLS: list[dict] = [
                         "analyze_requirements",
                         "confirm_requirement",
                         "move_to_execution_queue",
+                        "execute_backlog_row",
                         "pause_worker",
                         "continue_worker",
                         "cancel_worker",

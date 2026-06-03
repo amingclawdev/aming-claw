@@ -21,6 +21,17 @@ def _register(conn: sqlite3.Connection, project_id: str = "demo") -> dict:
     return observer_session.register_session(conn, project_id=project_id)
 
 
+def _execute_backlog_row_payload() -> dict:
+    return {
+        "backlog_id": "AC-ROUTE-HANDOFF",
+        "route_id": "route-20260602-9cbbd7a9fd",
+        "route_context_hash": "sha256:f1641a8d28b2a9211a14d90fed8dda4c40bb87380557f64a81e29e332568c27b",
+        "prompt_contract_id": "rprompt-7417905f707deac2",
+        "visible_injection_manifest_hash": "sha256:30e229df0e1948f6c206d954c8226acd9272816a4168216a4258a8ebf0328810",
+        "subsystem": "observer",
+    }
+
+
 def test_command_enqueue_and_list_preserve_business_payload_in_db():
     conn = _conn()
 
@@ -47,6 +58,88 @@ def test_command_enqueue_and_list_preserve_business_payload_in_db():
             "description": "claim the next pending observer command",
         },
     }
+
+
+def test_execute_backlog_row_claim_complete_preserves_payload_without_reminder_leak():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+
+    assert observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW in observer_session.VALID_COMMAND_TYPES
+    assert (
+        observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        in observer_session.DEFAULT_CAPABILITIES["command_types"]
+    )
+
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={"ok": True, "backlog_id": payload["backlog_id"]},
+    )
+
+    reminder = observer_session.command_pending_reminder("demo")
+
+    assert command["payload"] == payload
+    assert claimed["command"]["payload"] == payload
+    assert completed["command"]["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert completed["command"]["payload"] == payload
+    assert completed["command"]["result"] == {"ok": True, "backlog_id": payload["backlog_id"]}
+    assert reminder["payload_included"] is False
+    assert "payload" not in reminder
+    assert payload["backlog_id"] not in str(reminder)
+
+
+def test_execute_backlog_row_rejects_missing_route_payload_fields():
+    conn = _conn()
+
+    with pytest.raises(ValueError, match="payload must be an object.*backlog_id"):
+        observer_session.enqueue_command(
+            conn,
+            project_id="demo",
+            command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            payload=None,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "missing required fields: route_id, route_context_hash, "
+            "prompt_contract_id, visible_injection_manifest_hash"
+        ),
+    ):
+        observer_session.enqueue_command(
+            conn,
+            project_id="demo",
+            command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            payload={"backlog_id": "AC-ROUTE-HANDOFF"},
+        )
+
+
+def test_mcp_observer_command_enqueue_schema_accepts_execute_backlog_row():
+    from agent.mcp.tools import TOOLS
+
+    enqueue_tool = next(tool for tool in TOOLS if tool.get("name") == "observer_command_enqueue")
+    command_type = enqueue_tool["inputSchema"]["properties"]["command_type"]
+
+    assert observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW in command_type["enum"]
 
 
 def test_claim_requires_valid_token_and_project_match():

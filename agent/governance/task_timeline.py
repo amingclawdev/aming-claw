@@ -152,6 +152,12 @@ MF_ROUTE_IDENTITY_REQUIREMENTS = (
     "same_route_identity",
     "route_identity_cleanup",
 )
+MF_ROUTE_IDENTITY_CLEANUP_MARKERS = {
+    "route_identity_cleanup",
+    "route_identity_recovery",
+    "route_identity_supersede",
+    "route_identity_superseded",
+}
 
 
 def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
@@ -934,6 +940,18 @@ def _route_identity_key(identity: dict[str, str]) -> tuple[str, ...]:
     return tuple(identity.get(field, "") for field in MF_ROUTE_IDENTITY_FIELDS)
 
 
+def _route_identity_matches_filter(
+    identity: dict[str, str],
+    filter_identity: dict[str, str],
+) -> bool:
+    if not filter_identity:
+        return True
+    if _route_identity_key(identity) != _route_identity_key(filter_identity):
+        return False
+    expected_prompt_hash = filter_identity.get("prompt_contract_hash", "")
+    return not expected_prompt_hash or identity.get("prompt_contract_hash", "") == expected_prompt_hash
+
+
 def _route_visible_manifest_present(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -946,6 +964,11 @@ def _route_visible_manifest_present(value: Any) -> bool:
 def _route_event_passed(event: dict[str, Any]) -> bool:
     status = str(event.get("status") or event.get("decision") or "").strip().lower()
     return bool(event.get("passed")) or status in MF_ROUTE_CONTEXT_PASS_STATUSES
+
+
+def _route_event_is_identity_cleanup(event: dict[str, Any]) -> bool:
+    markers = {_route_marker(marker) for marker in _route_event_markers(event)}
+    return bool(markers.intersection(MF_ROUTE_IDENTITY_CLEANUP_MARKERS))
 
 
 def _route_event_markers(event: dict[str, Any]) -> set[str]:
@@ -973,6 +996,9 @@ def _route_event_markers(event: dict[str, Any]) -> set[str]:
             "dispatch_evidence",
             "startup_evidence",
             "contract_evidence",
+            "route_identity_cleanup",
+            "route_identity_recovery",
+            "route_identity_supersede",
             "architecture_review_lane",
             "architecture_review",
             "architecture_data_continuity_review",
@@ -1101,10 +1127,37 @@ def mf_route_context_gate_verification(
         req_id: [] for req_id in required_requirement_ids
     }
     ignored: list[dict[str, Any]] = []
+    cleanup_event: dict[str, Any] = {}
+    cleanup_identity: dict[str, str] = {}
+
+    for raw_event in rows:
+        event = _mapping(raw_event)
+        if not event or not _route_event_is_identity_cleanup(event):
+            continue
+        identity = _route_identity(event)
+        if identity and _route_event_passed(event):
+            cleanup_identity = identity
+            cleanup_event = {
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "phase": event.get("phase"),
+                "status": event.get("status") or event.get("decision"),
+            }
+        else:
+            ignored.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "invalid_route_identity_cleanup",
+                "categories": ["route_identity_cleanup"],
+            })
+    superseded_event_count = 0
 
     for raw_event in rows:
         event = _mapping(raw_event)
         if not event:
+            continue
+        if _route_event_is_identity_cleanup(event):
             continue
         identity = _route_identity(event)
         categories = _route_event_categories(event)
@@ -1116,6 +1169,16 @@ def mf_route_context_gate_verification(
                 "event_kind": event.get("event_kind"),
                 "status": event.get("status") or event.get("decision"),
                 "reason": "missing_route_identity",
+                "categories": sorted(categories),
+            })
+            continue
+        if cleanup_identity and not _route_identity_matches_filter(identity, cleanup_identity):
+            superseded_event_count += 1
+            ignored.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "superseded_route_identity",
                 "categories": sorted(categories),
             })
             continue
@@ -1188,6 +1251,12 @@ def mf_route_context_gate_verification(
         "topology_policy": topology_policy,
         "route_identity": route_identity,
         "same_route_identity": same_route_identity,
+        "route_identity_cleanup": {
+            "applied": bool(cleanup_identity),
+            "event": cleanup_event,
+            "route_identity": cleanup_identity,
+            "superseded_event_count": superseded_event_count,
+        },
         "evidence_events": {
             req_id: present[req_id] for req_id in required_requirement_ids
         },
@@ -1209,6 +1278,7 @@ def mf_route_context_gate_verification(
             ),
             "same_route_identity": same_route_identity,
             "same_optional_prompt_contract_hash": same_optional_prompt_contract_hash,
+            "route_identity_cleanup_applied": bool(cleanup_identity),
         },
     }
 
