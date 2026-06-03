@@ -4689,11 +4689,79 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         conn.close()
 
 
+def _parallel_branch_runtime_contract_route_identity(source: Mapping[str, Any]) -> dict:
+    return {
+        key: source.get(key)
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+            "selected_project",
+            "selected_backlog_id",
+        )
+        if source.get(key)
+    }
+
+
+def _parallel_branch_runtime_contract_response(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    context,
+    role: str,
+) -> dict:
+    from .mf_subagent_contract import build_mf_subagent_runtime_contract_view
+    from .parallel_branch_runtime import (
+        branch_contract_revision_to_dict,
+        get_latest_branch_contract_revision,
+        runtime_context_id_for_branch_context,
+    )
+
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    latest_revision_payload = (
+        branch_contract_revision_to_dict(latest_revision) if latest_revision else {}
+    )
+    latest_revision_id = str(latest_revision.revision_id if latest_revision else "")
+    known_revision_id = str(
+        ctx.query.get("known_revision_id")
+        or ctx.query.get("contract_revision_id")
+        or ""
+    )
+    route_identity = (
+        latest_revision_payload.get("route_identity")
+        if latest_revision_payload
+        else _parallel_branch_runtime_contract_route_identity(ctx.query)
+    )
+    view = build_mf_subagent_runtime_contract_view(
+        context,
+        role=role,
+        contract_version=str(
+            ctx.query.get("contract_version")
+            or (latest_revision.contract_version if latest_revision else "")
+            or "mf_parallel.v1"
+        ),
+        latest_revision_id=latest_revision_id,
+        known_revision_id=known_revision_id,
+        poll_after_sec=_query_int(ctx.query, "poll_after_sec", 15),
+        latest_revision=latest_revision_payload or None,
+        route_identity=route_identity if isinstance(route_identity, Mapping) else {},
+    )
+    return {"ok": True, "project_id": project_id, "runtime_contract": view}
+
+
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
 def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext):
     """Return a role-scoped runtime/contract view for one bounded worker lane."""
     project_id = ctx.get_project_id()
-    from .mf_subagent_contract import build_mf_subagent_runtime_contract_view
     from .parallel_branch_runtime import (
         BranchRuntimeFenceError,
         get_branch_context,
@@ -4746,28 +4814,181 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
                     {"task_id": task_id},
                 )
 
-        route_identity = {
-            key: ctx.query.get(key)
-            for key in (
-                "route_id",
-                "route_context_hash",
-                "prompt_contract_id",
-                "prompt_contract_hash",
-                "route_token_ref",
-                "visible_injection_manifest_hash",
-                "selected_project",
-                "selected_backlog_id",
-            )
-            if ctx.query.get(key)
-        }
-        view = build_mf_subagent_runtime_contract_view(
-            context,
+        return _parallel_branch_runtime_contract_response(
+            ctx,
+            conn,
+            project_id=project_id,
+            context=context,
             role=role,
-            contract_version=str(ctx.query.get("contract_version") or "mf_parallel.v1"),
-            contract_revision_id=str(ctx.query.get("contract_revision_id") or ""),
-            route_identity=route_identity,
         )
-        return {"ok": True, "project_id": project_id, "runtime_contract": view}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/runtime-contract")
+def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: RequestContext):
+    """Return a worker contract view by runtime_context_id plus current fence."""
+    project_id = ctx.get_project_id()
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        get_branch_context_by_runtime_context_id,
+        validate_mf_subagent_runtime_context_lookup,
+    )
+    from .permissions import session_role
+
+    runtime_context_id = str(
+        ctx.path_params.get("runtime_context_id") or ctx.query.get("runtime_context_id") or ""
+    ).strip()
+    if not runtime_context_id:
+        raise ValidationError("runtime_context_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        session = _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.runtime-contract",
+        )
+        role = session_role(session)
+        if role == "mf_sub":
+            fence_token = str(ctx.query.get("fence_token") or "").strip()
+            if not fence_token:
+                raise ValidationError("fence_token is required for mf_sub runtime contract query")
+            try:
+                context = validate_mf_subagent_runtime_context_lookup(
+                    conn,
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id,
+                    parent_task_id=str(ctx.query.get("parent_task_id") or ""),
+                    worker_role="mf_sub",
+                    fence_token=fence_token,
+                )
+            except BranchRuntimeFenceError as exc:
+                raise GovernanceError(
+                    "fence_invalidated_or_unknown",
+                    "mf_subagent runtime contract fence is invalidated or unknown",
+                    403,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "reason": "fence_invalidated_or_unknown",
+                    },
+                ) from exc
+        else:
+            context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if context is None:
+                raise GovernanceError(
+                    "runtime_context_not_found",
+                    f"branch runtime context not found: {project_id}/{runtime_context_id}",
+                    404,
+                    {"runtime_context_id": runtime_context_id},
+                )
+
+        return _parallel_branch_runtime_contract_response(
+            ctx,
+            conn,
+            project_id=project_id,
+            context=context,
+            role=role,
+        )
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract/revisions")
+def handle_graph_governance_parallel_branch_runtime_contract_revision_append(ctx: RequestContext):
+    """Append a public-safe runtime contract revision for a bounded worker lane."""
+    project_id = ctx.get_project_id()
+    from .parallel_branch_runtime import (
+        append_branch_contract_revision,
+        branch_contract_revision_to_dict,
+        get_branch_context,
+        runtime_context_id_for_branch_context,
+    )
+
+    task_id = str(ctx.path_params.get("task_id") or ctx.body.get("task_id") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.append-contract-revision",
+        )
+        context = get_branch_context(conn, project_id, task_id)
+        if context is None:
+            raise GovernanceError(
+                "runtime_context_not_found",
+                f"branch runtime context not found: {project_id}/{task_id}",
+                404,
+                {"task_id": task_id},
+            )
+        runtime_context_id = runtime_context_id_for_branch_context(context)
+        supplied_runtime_context_id = str(ctx.body.get("runtime_context_id") or "").strip()
+        if supplied_runtime_context_id and supplied_runtime_context_id != runtime_context_id:
+            raise ValidationError("runtime_context_id does not match task runtime context")
+
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="append_contract_revision",
+            backlog_id=context.backlog_id,
+            task_id=task_id,
+        )
+        revision_payload = (
+            ctx.body.get("contract_revision")
+            or ctx.body.get("revision")
+            or ctx.body.get("payload")
+            or {}
+        )
+        if not isinstance(revision_payload, Mapping):
+            raise ValidationError("contract revision payload must be an object")
+        route_identity = _parallel_branch_runtime_contract_route_identity(ctx.body)
+        with sqlite_write_lock():
+            try:
+                revision = append_branch_contract_revision(
+                    conn,
+                    context,
+                    revision_id=str(ctx.body.get("revision_id") or ""),
+                    contract_version=str(
+                        ctx.body.get("contract_version") or "mf_parallel.v1"
+                    ),
+                    payload=revision_payload,
+                    route_gate=route_gate,
+                    route_identity=route_identity,
+                    route_evidence_type=str(route_gate.get("decision") or ""),
+                    actor=str(ctx.body.get("actor") or route_gate.get("caller_role") or ""),
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GovernanceError(
+                    "contract_revision_already_exists",
+                    "runtime contract revision already exists",
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "revision_id": str(ctx.body.get("revision_id") or ""),
+                    },
+                ) from exc
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                backlog_id=context.backlog_id,
+                task_id=task_id,
+            )
+            conn.commit()
+        return 201, {
+            "ok": True,
+            "project_id": project_id,
+            "runtime_context_id": runtime_context_id,
+            "revision": branch_contract_revision_to_dict(revision),
+            "route_token_gate": route_gate,
+        }
     finally:
         conn.close()
 

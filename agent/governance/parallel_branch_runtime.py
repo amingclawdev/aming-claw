@@ -7,19 +7,21 @@ runtime context needed to make observer recovery replay-ready after restart.
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     project_id        TEXT NOT NULL,
     task_id           TEXT NOT NULL,
+    runtime_context_id TEXT NOT NULL DEFAULT '',
     batch_id          TEXT NOT NULL DEFAULT '',
     backlog_id        TEXT NOT NULL DEFAULT '',
     chain_id          TEXT NOT NULL DEFAULT '',
@@ -61,6 +63,25 @@ CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_batch
   ON parallel_branch_runtime_contexts(project_id, batch_id, status);
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_branch
   ON parallel_branch_runtime_contexts(project_id, branch_ref);
+
+CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contract_revisions (
+    project_id        TEXT NOT NULL,
+    runtime_context_id TEXT NOT NULL,
+    revision_id       TEXT NOT NULL,
+    task_id           TEXT NOT NULL DEFAULT '',
+    parent_task_id    TEXT NOT NULL DEFAULT '',
+    backlog_id        TEXT NOT NULL DEFAULT '',
+    contract_version  TEXT NOT NULL DEFAULT '',
+    payload_json      TEXT NOT NULL DEFAULT '{}',
+    route_identity_json TEXT NOT NULL DEFAULT '{}',
+    route_gate_json   TEXT NOT NULL DEFAULT '{}',
+    route_evidence_type TEXT NOT NULL DEFAULT '',
+    actor             TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, runtime_context_id, revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_contract_revisions_context
+  ON parallel_branch_runtime_contract_revisions(project_id, runtime_context_id, created_at);
 
 CREATE TABLE IF NOT EXISTS parallel_branch_merge_queue_items (
     project_id        TEXT NOT NULL,
@@ -274,6 +295,7 @@ class BranchTaskRuntimeContext:
     task_id: str
     branch_ref: str
     status: str
+    runtime_context_id: str = ""
     batch_id: str = ""
     backlog_id: str = ""
     chain_id: str = ""
@@ -320,6 +342,23 @@ class BranchTaskRuntimeContext:
             replay_source=self.replay_source,
             merge_epoch=self.merge_queue_id,
         )
+
+
+@dataclass(frozen=True)
+class BranchRuntimeContractRevision:
+    project_id: str
+    runtime_context_id: str
+    revision_id: str
+    task_id: str
+    parent_task_id: str
+    backlog_id: str
+    contract_version: str
+    payload: dict[str, Any]
+    route_identity: dict[str, Any]
+    route_gate: dict[str, Any]
+    route_evidence_type: str
+    actor: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -572,19 +611,63 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def branch_runtime_context_id(project_id: str, task_id: str, attempt: int | str = 1) -> str:
+    seed = "\0".join((str(project_id or ""), str(task_id or ""), str(attempt or 1)))
+    return "mfrctx-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def runtime_context_id_for_branch_context(context: BranchTaskRuntimeContext) -> str:
+    return context.runtime_context_id or branch_runtime_context_id(
+        context.project_id,
+        context.task_id,
+        context.attempt,
+    )
+
+
 def ensure_branch_runtime_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL)
     _ensure_branch_runtime_context_columns(conn)
     _ensure_branch_merge_queue_columns(conn)
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_runtime_context
+          ON parallel_branch_runtime_contexts(project_id, runtime_context_id)
+        """
+    )
 
 
 def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
     rows = conn.execute("PRAGMA table_info(parallel_branch_runtime_contexts)").fetchall()
     columns = {str(row["name"] if hasattr(row, "keys") else row[1]) for row in rows}
+    if "runtime_context_id" not in columns:
+        conn.execute(
+            "ALTER TABLE parallel_branch_runtime_contexts "
+            "ADD COLUMN runtime_context_id TEXT NOT NULL DEFAULT ''"
+        )
+        columns.add("runtime_context_id")
     if "retry_round" not in columns:
         conn.execute(
             "ALTER TABLE parallel_branch_runtime_contexts "
             "ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0"
+        )
+    rows = conn.execute(
+        """
+        SELECT project_id, task_id, attempt
+        FROM parallel_branch_runtime_contexts
+        WHERE runtime_context_id = ''
+        """
+    ).fetchall()
+    for row in rows:
+        project_id = str(row["project_id"] if hasattr(row, "keys") else row[0])
+        task_id = str(row["task_id"] if hasattr(row, "keys") else row[1])
+        attempt = int((row["attempt"] if hasattr(row, "keys") else row[2]) or 1)
+        conn.execute(
+            """
+            UPDATE parallel_branch_runtime_contexts
+            SET runtime_context_id = ?
+            WHERE project_id = ? AND task_id = ?
+            """,
+            (branch_runtime_context_id(project_id, task_id, attempt), project_id, task_id),
         )
 
 
@@ -638,10 +721,108 @@ def _parse_json_array(raw: str | None) -> tuple[str, ...]:
     return tuple(str(item) for item in parsed)
 
 
+def _parse_json_object(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _json_object(value: Mapping[str, Any] | dict[str, Any] | None) -> str:
+    payload = dict(value) if isinstance(value, Mapping) else {}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+_PRIVATE_CONTRACT_REVISION_KEYS = {
+    "hidden_context",
+    "observer_only_context",
+    "private_context",
+    "private_route_body",
+    "raw_context_body",
+    "raw_private_context",
+    "raw_private_context_body",
+    "raw_private_route_body",
+    "raw_route_body",
+    "unmanifested_prompt_text",
+}
+
+
+_SAFE_CONTRACT_REVISION_ROUTE_KEYS = {
+    "action",
+    "caller_role",
+    "decision",
+    "expires_at",
+    "prompt_contract_hash",
+    "prompt_contract_id",
+    "route_context_hash",
+    "route_id",
+    "route_token_hash",
+    "route_token_ref",
+    "selected_backlog_id",
+    "selected_project",
+    "status",
+    "visible_injection_manifest_hash",
+    "waiver_hash",
+    "waiver_type",
+}
+
+
+def _sanitize_public_contract_revision_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key)
+            if key_text in _PRIVATE_CONTRACT_REVISION_KEYS:
+                continue
+            sanitized[key_text] = _sanitize_public_contract_revision_value(child)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_public_contract_revision_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_public_contract_revision_value(item) for item in value]
+    return value
+
+
+def public_contract_revision_payload(value: Any) -> dict[str, Any]:
+    sanitized = _sanitize_public_contract_revision_value(value)
+    return dict(sanitized) if isinstance(sanitized, Mapping) else {}
+
+
+def public_contract_revision_route_identity(
+    route_gate: Mapping[str, Any] | None = None,
+    route_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for source in (route_identity or {}, route_gate or {}):
+        if not isinstance(source, Mapping):
+            continue
+        for key in _SAFE_CONTRACT_REVISION_ROUTE_KEYS:
+            value = source.get(key)
+            if value:
+                safe[key] = value
+    gate_scope = (route_gate or {}).get("scope") if isinstance(route_gate, Mapping) else None
+    if isinstance(gate_scope, Mapping):
+        safe["scope"] = {
+            key: str(gate_scope.get(key) or "")
+            for key in ("project_id", "backlog_id", "task_id")
+            if gate_scope.get(key)
+        }
+    safe["raw_private_context_exposed"] = False
+    return safe
+
+
 def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
+    runtime_context_id = ""
+    if "runtime_context_id" in row.keys():
+        runtime_context_id = row["runtime_context_id"] or ""
     return BranchTaskRuntimeContext(
         project_id=row["project_id"],
         task_id=row["task_id"],
+        runtime_context_id=runtime_context_id
+        or branch_runtime_context_id(row["project_id"], row["task_id"], int(row["attempt"] or 1)),
         batch_id=row["batch_id"] or "",
         backlog_id=row["backlog_id"] or "",
         chain_id=row["chain_id"] or "",
@@ -680,7 +861,18 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
 
 def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     payload = asdict(context)
+    payload["runtime_context_id"] = runtime_context_id_for_branch_context(context)
     payload["depends_on"] = list(context.depends_on)
+    return payload
+
+
+def branch_contract_revision_to_dict(
+    revision: BranchRuntimeContractRevision,
+) -> dict[str, Any]:
+    payload = asdict(revision)
+    payload["payload"] = dict(revision.payload)
+    payload["route_identity"] = dict(revision.route_identity)
+    payload["route_gate"] = dict(revision.route_gate)
     return payload
 
 
@@ -746,10 +938,11 @@ def upsert_branch_context(
 ) -> BranchTaskRuntimeContext:
     ensure_branch_runtime_schema(conn)
     now = now_iso or utc_now()
+    runtime_context_id = runtime_context_id_for_branch_context(context)
     conn.execute(
         """
         INSERT INTO parallel_branch_runtime_contexts (
-            project_id, task_id, batch_id, backlog_id, chain_id, root_task_id,
+            project_id, task_id, runtime_context_id, batch_id, backlog_id, chain_id, root_task_id,
             stage_task_id, stage_type, retry_round, agent_id, worker_id, attempt, lease_id,
             lease_expires_at, fence_token, branch_ref, ref_name, worktree_id,
             worktree_path, base_commit, head_commit, target_head_commit,
@@ -758,10 +951,11 @@ def upsert_branch_context(
             checkpoint_id, replay_source, last_recovery_action,
             created_at, updated_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
+            runtime_context_id = excluded.runtime_context_id,
             batch_id = excluded.batch_id,
             backlog_id = excluded.backlog_id,
             chain_id = excluded.chain_id,
@@ -798,6 +992,7 @@ def upsert_branch_context(
         (
             context.project_id,
             context.task_id,
+            runtime_context_id,
             context.batch_id,
             context.backlog_id,
             context.chain_id,
@@ -853,6 +1048,130 @@ def get_branch_context(
         (project_id, task_id),
     ).fetchone()
     return _context_from_row(row) if row else None
+
+
+def get_branch_context_by_runtime_context_id(
+    conn: sqlite3.Connection,
+    project_id: str,
+    runtime_context_id: str,
+) -> BranchTaskRuntimeContext | None:
+    ensure_branch_runtime_schema(conn)
+    runtime_id = str(runtime_context_id or "").strip()
+    if not runtime_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND runtime_context_id = ?
+        ORDER BY updated_at DESC, task_id
+        LIMIT 1
+        """,
+        (project_id, runtime_id),
+    ).fetchone()
+    return _context_from_row(row) if row else None
+
+
+def _contract_revision_from_row(row: sqlite3.Row) -> BranchRuntimeContractRevision:
+    return BranchRuntimeContractRevision(
+        project_id=row["project_id"],
+        runtime_context_id=row["runtime_context_id"],
+        revision_id=row["revision_id"],
+        task_id=row["task_id"] or "",
+        parent_task_id=row["parent_task_id"] or "",
+        backlog_id=row["backlog_id"] or "",
+        contract_version=row["contract_version"] or "",
+        payload=_parse_json_object(row["payload_json"]),
+        route_identity=_parse_json_object(row["route_identity_json"]),
+        route_gate=_parse_json_object(row["route_gate_json"]),
+        route_evidence_type=row["route_evidence_type"] or "",
+        actor=row["actor"] or "",
+        created_at=row["created_at"] or "",
+    )
+
+
+def _parent_task_id_for_context(context: BranchTaskRuntimeContext) -> str:
+    return (
+        context.root_task_id
+        or context.chain_id
+        or context.stage_task_id
+        or context.task_id
+    )
+
+
+def append_branch_contract_revision(
+    conn: sqlite3.Connection,
+    context: BranchTaskRuntimeContext,
+    *,
+    revision_id: str = "",
+    contract_version: str = "mf_parallel.v1",
+    payload: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
+    route_identity: Mapping[str, Any] | None = None,
+    route_evidence_type: str = "",
+    actor: str = "",
+    now_iso: str = "",
+) -> BranchRuntimeContractRevision:
+    """Append one runtime contract revision. Existing rows are never updated."""
+
+    ensure_branch_runtime_schema(conn)
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    created_at = now_iso or utc_now()
+    revision = str(revision_id or "").strip() or f"crev-{uuid.uuid4().hex[:12]}"
+    public_payload = public_contract_revision_payload(payload or {})
+    public_route_identity = public_contract_revision_route_identity(route_gate, route_identity)
+    public_route_gate = public_contract_revision_payload(route_gate or {})
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_runtime_contract_revisions (
+            project_id, runtime_context_id, revision_id, task_id, parent_task_id,
+            backlog_id, contract_version, payload_json, route_identity_json,
+            route_gate_json, route_evidence_type, actor, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            context.project_id,
+            runtime_context_id,
+            revision,
+            context.task_id,
+            _parent_task_id_for_context(context),
+            context.backlog_id,
+            str(contract_version or ""),
+            _json_object(public_payload),
+            _json_object(public_route_identity),
+            _json_object(public_route_gate),
+            str(route_evidence_type or public_route_gate.get("decision") or ""),
+            str(actor or public_route_gate.get("caller_role") or ""),
+            created_at,
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+        """,
+        (context.project_id, runtime_context_id, revision),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"contract revision was not persisted: {revision}")
+    return _contract_revision_from_row(row)
+
+
+def get_latest_branch_contract_revision(
+    conn: sqlite3.Connection,
+    project_id: str,
+    runtime_context_id: str,
+) -> BranchRuntimeContractRevision | None:
+    ensure_branch_runtime_schema(conn)
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ?
+        ORDER BY created_at DESC, revision_id DESC
+        LIMIT 1
+        """,
+        (project_id, runtime_context_id),
+    ).fetchone()
+    return _contract_revision_from_row(row) if row else None
 
 
 def list_branch_contexts(
@@ -1485,6 +1804,57 @@ def validate_mf_subagent_graph_query_identity(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     context = get_branch_context(conn, project_id, task)
+    if context is None or not context.fence_token:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    try:
+        _require_current_fence(context, fence)
+    except BranchRuntimeFenceError as exc:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+
+    if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.lease_expires_at and context.lease_expires_at < utc_now():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    parent = str(parent_task_id or "").strip()
+    if parent:
+        allowed_parent_ids = {
+            value
+            for value in (
+                context.root_task_id,
+                context.chain_id,
+                context.stage_task_id,
+                context.task_id,
+                context.backlog_id,
+            )
+            if value
+        }
+        if allowed_parent_ids and parent not in allowed_parent_ids:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    return context
+
+
+def validate_mf_subagent_runtime_context_lookup(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    fence_token: str,
+    parent_task_id: str = "",
+    worker_role: str = "",
+) -> BranchTaskRuntimeContext:
+    """Validate runtime_context_id + fence identity for worker contract polling."""
+
+    ensure_branch_runtime_schema(conn)
+    runtime_id = str(runtime_context_id or "").strip()
+    fence = str(fence_token or "").strip()
+    role = str(worker_role or "").strip().lower().replace("-", "_")
+    if role and role != "mf_sub":
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if not runtime_id or not fence:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
     if context is None or not context.fence_token:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     try:

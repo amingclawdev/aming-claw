@@ -13,7 +13,10 @@ from agent.governance.asset_binding_proposals import (
     PRECHECK_SCHEMA_VERSION as ASSET_BINDING_PRECHECK_SCHEMA_VERSION,
     PROPOSAL_SCHEMA_VERSION as ASSET_BINDING_PROPOSAL_SCHEMA_VERSION,
 )
-from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
+from agent.governance.parallel_branch_runtime import (
+    BranchTaskRuntimeContext,
+    runtime_context_id_for_branch_context,
+)
 
 
 MF_SUB_ROLE = "mf_sub"
@@ -426,14 +429,7 @@ def _safe_route_identity(route_identity: Mapping[str, Any] | None) -> dict[str, 
 
 
 def mf_subagent_runtime_context_id(context: BranchTaskRuntimeContext) -> str:
-    seed = "\0".join(
-        (
-            context.project_id,
-            context.task_id,
-            str(context.attempt or 1),
-        )
-    )
-    return "mfrctx-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return runtime_context_id_for_branch_context(context)
 
 
 def build_mf_subagent_runtime_contract_view(
@@ -442,6 +438,10 @@ def build_mf_subagent_runtime_contract_view(
     role: str = MF_SUB_ROLE,
     contract_version: str = "mf_parallel.v1",
     contract_revision_id: str = "",
+    latest_revision_id: str = "",
+    known_revision_id: str = "",
+    poll_after_sec: int = 15,
+    latest_revision: Mapping[str, Any] | None = None,
     route_identity: Mapping[str, Any] | None = None,
     required_evidence: Sequence[str] | None = None,
 ) -> dict[str, Any]:
@@ -456,6 +456,16 @@ def build_mf_subagent_runtime_contract_view(
         or context.task_id
     )
     runtime_context_id = mf_subagent_runtime_context_id(context)
+    latest_revision_text = _string(latest_revision_id or contract_revision_id)
+    known_revision_text = _string(known_revision_id)
+    contract_changed = bool(
+        latest_revision_text and known_revision_text != latest_revision_text
+    )
+    try:
+        poll_after = int(poll_after_sec)
+    except (TypeError, ValueError):
+        poll_after = 15
+    poll_after = max(1, poll_after)
     evidence_ids = tuple(
         _string(item)
         for item in (required_evidence or _DEFAULT_RUNTIME_CONTRACT_EVIDENCE)
@@ -501,7 +511,7 @@ def build_mf_subagent_runtime_contract_view(
 
     contract = {
         "contract_version": _string(contract_version) or "mf_parallel.v1",
-        "contract_revision_id": _string(contract_revision_id),
+        "contract_revision_id": latest_revision_text,
         "backend_contract": BACKEND_CONTRACT,
         "dispatch_default": DISPATCH_DEFAULT,
         "worktree_policy": WORKTREE_POLICY_MODE,
@@ -525,6 +535,14 @@ def build_mf_subagent_runtime_contract_view(
                 "/api/graph-governance/{project_id}/parallel-branches/"
                 "{task_id}/runtime-contract"
             ),
+            "runtime_contract_by_context": (
+                "/api/graph-governance/{project_id}/parallel-branches/"
+                "runtime-contexts/{runtime_context_id}/runtime-contract"
+            ),
+            "append_contract_revision": (
+                "/api/graph-governance/{project_id}/parallel-branches/"
+                "{task_id}/runtime-contract/revisions"
+            ),
             "graph_query": "/api/graph-governance/{project_id}/query",
             "checkpoint": "/api/graph-governance/{project_id}/parallel-branches/checkpoint",
             "finish_gate": (
@@ -537,12 +555,18 @@ def build_mf_subagent_runtime_contract_view(
             "worker_poll_required": True,
             "worker_receives_runtime_context_id": True,
             "raw_prompt_as_runtime_source": False,
+            "append_only_revisions": True,
         },
     }
 
     view: dict[str, Any] = {
         "schema_version": RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
+        "latest_revision_id": latest_revision_text,
+        "known_revision_id": known_revision_text,
+        "contract_changed": contract_changed,
+        "must_ack_revision": contract_changed,
+        "poll_after_sec": poll_after,
         "role_scope": "worker" if is_worker else "operator",
         "runtime_context": runtime_context,
         "contract": contract,
@@ -560,15 +584,19 @@ def build_mf_subagent_runtime_contract_view(
             "runtime_context_id": runtime_context_id,
             "contract_version": contract["contract_version"],
             "contract_revision_id": contract["contract_revision_id"],
+            "known_revision_id": known_revision_text,
+            "poll_after_sec": poll_after,
             "task_id": context.task_id,
             "fence_token_required": True,
             "query_source": "contract_service",
         },
     }
+    if latest_revision:
+        view["latest_revision"] = dict(latest_revision)
     if not is_worker:
         view["observer_controls"] = {
             "can_append_contract_revision": True,
-            "can_update_dispatch_intent": True,
+            "can_update_dispatch_intent": False,
             "can_mark_blocker": True,
             "must_not_directly_implement_worker_code": True,
         }

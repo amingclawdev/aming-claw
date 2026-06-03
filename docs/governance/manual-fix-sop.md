@@ -262,6 +262,17 @@ nontrivial, Judge-routed, or parent-route-bound workers. Without this
 registration, `query_source=mf_subagent` graph queries fail fence validation as
 `fence_invalidated_or_unknown`.
 
+The registered branch runtime exposes a deterministic `runtime_context_id`.
+Workers may poll the runtime contract by `runtime_context_id` plus
+`fence_token`; governance must reject stale or wrong fences just as it does for
+audited graph queries. Runtime contract responses include `latest_revision_id`,
+`known_revision_id`, `contract_changed`, `must_ack_revision`, and
+`poll_after_sec`. Observer/operator redirects must append a new contract
+revision through the contract service with route-token or explicit route-waiver
+evidence scoped to the worker task/backlog. Stored revision route identity is
+public-safe only; raw private route/context bodies must not be persisted.
+Existing contract revisions are not updated or deleted.
+
 Close/precheck lane ownership is contract-driven. When `chain_trigger_json`
 requires `bounded_implementation_subagent` evidence or blocks observer-direct
 file edits, observer-authored implementation rows alone do not satisfy the MF

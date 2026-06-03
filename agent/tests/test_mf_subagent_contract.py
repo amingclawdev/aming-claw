@@ -226,6 +226,56 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
     assert view["worker_runtime_query"]["fence_token_required"] is True
 
 
+def test_runtime_contract_view_reports_revision_polling_state() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-runtime-revision",
+        root_task_id="task-parent",
+        backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
+        worker_id="worker-1",
+        attempt=1,
+        branch_ref="refs/heads/codex/task-runtime-revision",
+        worktree_path="/repo/.worktrees/task-runtime-revision",
+        base_commit="base123",
+        target_head_commit="target123",
+        merge_queue_id="mq-1",
+        fence_token="fence-runtime",
+        status="running",
+    )
+
+    changed = build_mf_subagent_runtime_contract_view(
+        context,
+        latest_revision_id="crev-2",
+        known_revision_id="crev-1",
+        poll_after_sec=3,
+        latest_revision={
+            "revision_id": "crev-2",
+            "payload": {"summary": "updated evidence request"},
+            "route_identity": {"route_context_hash": "sha256:route"},
+        },
+    )
+
+    assert changed["latest_revision_id"] == "crev-2"
+    assert changed["known_revision_id"] == "crev-1"
+    assert changed["contract_changed"] is True
+    assert changed["must_ack_revision"] is True
+    assert changed["poll_after_sec"] == 3
+    assert changed["contract"]["contract_revision_id"] == "crev-2"
+    assert changed["worker_runtime_query"]["known_revision_id"] == "crev-1"
+    assert changed["latest_revision"]["payload"]["summary"] == "updated evidence request"
+
+    unchanged = build_mf_subagent_runtime_contract_view(
+        context,
+        latest_revision_id="crev-2",
+        known_revision_id="crev-2",
+    )
+
+    assert unchanged["latest_revision_id"] == "crev-2"
+    assert unchanged["known_revision_id"] == "crev-2"
+    assert unchanged["contract_changed"] is False
+    assert unchanged["must_ack_revision"] is False
+
+
 def test_mf_workflow_runtime_template_names_graph_service_architecture_and_qa_lanes() -> None:
     template_path = (
         _repo_root

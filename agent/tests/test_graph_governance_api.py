@@ -1025,6 +1025,11 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
     assert result["ok"] is True
     assert view["schema_version"] == "mf_subagent_runtime_contract_view.v1"
     assert view["role_scope"] == "worker"
+    assert view["latest_revision_id"] == ""
+    assert view["known_revision_id"] == ""
+    assert view["contract_changed"] is False
+    assert view["must_ack_revision"] is False
+    assert view["poll_after_sec"] == 15
     assert view["runtime_context"]["task_id"] == "runtime-contract-task"
     assert view["runtime_context"]["parent_task_id"] == "runtime-contract-parent"
     assert view["runtime_context"]["fence_token"] == "fence-runtime"
@@ -1033,6 +1038,220 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
     assert view["route_identity"]["prompt_contract_id"] == "rprompt-runtime"
     assert view["route_identity"]["raw_private_context_exposed"] is False
     assert "raw_private_context" not in view["route_identity"]
+
+
+def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_poll(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-contract-revision-task",
+            root_task_id="runtime-contract-revision-parent",
+            backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
+            branch_ref="refs/heads/codex/runtime-contract-revision-task",
+            worktree_path="/repo/.worktrees/runtime-contract-revision-task",
+            base_commit="base123",
+            target_head_commit="target123",
+            merge_queue_id="mq-runtime",
+            fence_token="fence-revision",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-03T10:00:00Z",
+    )
+
+    with pytest.raises(GovernanceError) as missing_gate:
+        server.handle_graph_governance_parallel_branch_runtime_contract_revision_append(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "task_id": "runtime-contract-revision-task",
+                },
+                "observer",
+                method="POST",
+                body={
+                    "revision_id": "crev-missing-gate",
+                    "runtime_context_id": context.runtime_context_id,
+                    "contract_revision": {"summary": "missing route evidence"},
+                },
+            )
+        )
+    assert missing_gate.value.code == "route_token_required"
+
+    status, appended = (
+        server.handle_graph_governance_parallel_branch_runtime_contract_revision_append(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "task_id": "runtime-contract-revision-task",
+                },
+                "observer",
+                method="POST",
+                body={
+                    "revision_id": "crev-1",
+                    "runtime_context_id": context.runtime_context_id,
+                    "contract_version": "mf_parallel.v1",
+                    "contract_revision": {
+                        "summary": "worker should poll by runtime_context_id",
+                        "raw_private_context": "must not persist",
+                        "nested": {
+                            "visible": "kept",
+                            "hidden_context": "must not persist",
+                        },
+                    },
+                    "route_token": _route_token(
+                        "append_contract_revision",
+                        task_id="runtime-contract-revision-task",
+                        backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
+                    ),
+                    "raw_private_context": "must-not-leak",
+                    "now_iso": "2026-06-03T10:01:00Z",
+                },
+            )
+        )
+    )
+
+    assert status == 201
+    revision = appended["revision"]
+    assert revision["revision_id"] == "crev-1"
+    assert revision["runtime_context_id"] == context.runtime_context_id
+    assert revision["payload"]["summary"] == "worker should poll by runtime_context_id"
+    assert "raw_private_context" not in revision["payload"]
+    assert "hidden_context" not in revision["payload"]["nested"]
+    assert revision["route_identity"]["route_context_hash"].startswith("sha256:")
+    assert revision["route_identity"]["prompt_contract_id"] == (
+        "prompt-contract-append_contract_revision"
+    )
+    assert revision["route_identity"]["raw_private_context_exposed"] is False
+    serialized_revision = json.dumps(revision, sort_keys=True)
+    assert "must-not-leak" not in serialized_revision
+    assert "must not persist" not in serialized_revision
+
+    changed = server.handle_graph_governance_parallel_branch_runtime_contract_by_context(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "runtime-contract-revision-parent",
+                "fence_token": "fence-revision",
+            },
+        )
+    )
+    changed_view = changed["runtime_contract"]
+    assert changed_view["runtime_context"]["task_id"] == "runtime-contract-revision-task"
+    assert changed_view["latest_revision_id"] == "crev-1"
+    assert changed_view["known_revision_id"] == ""
+    assert changed_view["contract_changed"] is True
+    assert changed_view["must_ack_revision"] is True
+    assert changed_view["latest_revision"]["payload"]["nested"]["visible"] == "kept"
+
+    no_change = server.handle_graph_governance_parallel_branch_runtime_contract_by_context(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "runtime-contract-revision-parent",
+                "fence_token": "fence-revision",
+                "known_revision_id": "crev-1",
+                "poll_after_sec": "9",
+            },
+        )
+    )
+    no_change_view = no_change["runtime_contract"]
+    assert no_change_view["latest_revision_id"] == "crev-1"
+    assert no_change_view["known_revision_id"] == "crev-1"
+    assert no_change_view["contract_changed"] is False
+    assert no_change_view["must_ack_revision"] is False
+    assert no_change_view["poll_after_sec"] == 9
+
+    status, appended_waiver = (
+        server.handle_graph_governance_parallel_branch_runtime_contract_revision_append(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "task_id": "runtime-contract-revision-task",
+                },
+                "observer",
+                method="POST",
+                body={
+                    "revision_id": "crev-2",
+                    "runtime_context_id": context.runtime_context_id,
+                    "contract_revision": {"summary": "explicit waiver redirect"},
+                    "route_waiver": _route_waiver(
+                        "append_contract_revision",
+                        task_id="runtime-contract-revision-task",
+                        backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
+                    ),
+                    "now_iso": "2026-06-03T10:02:00Z",
+                },
+            )
+        )
+    )
+    assert status == 201
+    assert appended_waiver["revision"]["revision_id"] == "crev-2"
+    assert appended_waiver["revision"]["route_evidence_type"] == "route_waiver"
+
+    changed_again = server.handle_graph_governance_parallel_branch_runtime_contract_by_context(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "runtime-contract-revision-parent",
+                "fence_token": "fence-revision",
+                "known_revision_id": "crev-1",
+            },
+        )
+    )
+    changed_again_view = changed_again["runtime_contract"]
+    assert changed_again_view["latest_revision_id"] == "crev-2"
+    assert changed_again_view["known_revision_id"] == "crev-1"
+    assert changed_again_view["contract_changed"] is True
+
+
+def test_parallel_branch_runtime_context_contract_route_rejects_wrong_fence(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-context-wrong-fence-task",
+            root_task_id="runtime-context-wrong-fence-parent",
+            branch_ref="refs/heads/codex/runtime-context-wrong-fence-task",
+            worktree_path="/repo/.worktrees/runtime-context-wrong-fence-task",
+            base_commit="base123",
+            target_head_commit="target123",
+            merge_queue_id="mq-runtime",
+            fence_token="fence-current",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-03T10:00:00Z",
+    )
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_parallel_branch_runtime_contract_by_context(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-context-wrong-fence-parent",
+                    "fence_token": "fence-stale",
+                },
+            )
+        )
+    assert exc_info.value.code == "fence_invalidated_or_unknown"
+    assert exc_info.value.status == 403
 
 
 def test_parallel_branch_runtime_contract_route_rejects_wrong_worker_fence(conn):
