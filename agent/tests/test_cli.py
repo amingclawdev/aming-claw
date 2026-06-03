@@ -223,6 +223,10 @@ def _observer_poll_command(command_id="cmd-route-1"):
     }
 
 
+def _observer_poll_timeline_calls(calls):
+    return [call for call in calls if call[1].endswith("/api/task/aming-claw/timeline")]
+
+
 def test_observer_poll_registers_claims_and_plans_without_service_manager(monkeypatch):
     calls = []
 
@@ -243,6 +247,8 @@ def test_observer_poll_registers_claims_and_plans_without_service_manager(monkey
                 "command": _observer_poll_command(),
                 "empty": False,
             }
+        if url.endswith("/api/task/aming-claw/timeline"):
+            return 200, {"ok": True, "event_id": len(_observer_poll_timeline_calls(calls))}
         raise AssertionError(f"unexpected call: {method} {url}")
 
     monkeypatch.setattr("agent.cli._http_json", fake_http)
@@ -280,6 +286,24 @@ def test_observer_poll_registers_claims_and_plans_without_service_manager(monkey
     assert calls[1][1].endswith("/api/projects/aming-claw/observer-commands/next")
     assert calls[1][2]["session_id"] == "obs-1"
     assert calls[1][2]["session_token"] == "secret-token"
+    timeline_calls = _observer_poll_timeline_calls(calls)
+    assert [call[2]["event_type"] for call in timeline_calls] == [
+        "observer_poll_claimed",
+        "observer_poll_planned",
+    ]
+    assert [call[2]["task_id"] for call in timeline_calls] == ["cmd-route-1", "cmd-route-1"]
+    planned_payload = timeline_calls[-1][2]["payload"]
+    assert planned_payload["observer_command_id"] == "cmd-route-1"
+    assert planned_payload["backlog_id"] == "AC-ROUTE-HANDOFF"
+    assert planned_payload["route_id"] == "route-20260603-test"
+    assert planned_payload["route_context_hash"] == "sha256:route"
+    assert planned_payload["prompt_contract_id"] == "rprompt-test"
+    assert planned_payload["visible_injection_manifest_hash"] == "sha256:visible"
+    assert planned_payload["execute"] is False
+    assert planned_payload["calls_models"] is False
+    assert planned_payload["service_manager_required"] is False
+    assert planned_payload["executor_worker_required"] is False
+    assert planned_payload["uses_task_create"] is False
 
 
 def test_observer_poll_can_complete_planned_command(monkeypatch):
@@ -302,6 +326,8 @@ def test_observer_poll_can_complete_planned_command(monkeypatch):
                 "observer_session_id": "obs-1",
                 "command": {"command_id": "cmd-complete", "status": "completed"},
             }
+        if url.endswith("/api/task/aming-claw/timeline"):
+            return 200, {"ok": True, "event_id": len(_observer_poll_timeline_calls(calls))}
         raise AssertionError(f"unexpected call: {method} {url}")
 
     monkeypatch.setattr("agent.cli._http_json", fake_http)
@@ -332,13 +358,41 @@ def test_observer_poll_can_complete_planned_command(monkeypatch):
     assert payload["ok"] is True
     assert payload["completion"]["ok"] is True
     assert payload["completion"]["observer_command_id"] == "cmd-complete"
-    complete_payload = calls[-1][2]
+    complete_payload = next(
+        call[2]
+        for call in calls
+        if call[1].endswith("/observer-commands/cmd-complete/complete")
+    )
     assert complete_payload["session_id"] == "obs-1"
     assert complete_payload["session_token"] == "secret-token"
     assert complete_payload["result"]["status"] == "planned"
+    assert complete_payload["result"]["route_id"] == "route-20260603-test"
+    assert complete_payload["result"]["visible_injection_manifest_hash"] == "sha256:visible"
     assert complete_payload["result"]["service_manager_required"] is False
     assert complete_payload["result"]["executor_worker_required"] is False
     assert complete_payload["result"]["uses_task_create"] is False
+    timeline_calls = _observer_poll_timeline_calls(calls)
+    assert [call[2]["event_type"] for call in timeline_calls] == [
+        "observer_poll_claimed",
+        "observer_poll_planned",
+        "observer_poll_completed",
+    ]
+    assert [call[2]["task_id"] for call in timeline_calls] == [
+        "cmd-complete",
+        "cmd-complete",
+        "cmd-complete",
+    ]
+    completed_payload = timeline_calls[-1][2]["payload"]
+    assert completed_payload["observer_command_id"] == "cmd-complete"
+    assert completed_payload["route_id"] == "route-20260603-test"
+    assert completed_payload["route_context_hash"] == "sha256:route"
+    assert completed_payload["prompt_contract_id"] == "rprompt-test"
+    assert completed_payload["visible_injection_manifest_hash"] == "sha256:visible"
+    assert completed_payload["execute"] is False
+    assert completed_payload["calls_models"] is False
+    assert completed_payload["service_manager_required"] is False
+    assert completed_payload["executor_worker_required"] is False
+    assert completed_payload["uses_task_create"] is False
 
 
 def test_observer_poll_reports_empty_queue(monkeypatch):
@@ -380,11 +434,16 @@ def test_observer_poll_reports_empty_queue(monkeypatch):
 
 
 def test_observer_poll_accepts_reconnect_raw_claim_response(monkeypatch):
+    calls = []
+
     def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
         if url.endswith("/observer-commands/next"):
             command = _observer_poll_command("cmd-owned")
             command["claimed_by_session_id"] = "obs-1"
             return 200, command
+        if url.endswith("/api/task/aming-claw/timeline"):
+            return 200, {"ok": True, "event_id": len(_observer_poll_timeline_calls(calls))}
         raise AssertionError(f"unexpected call: {method} {url}")
 
     monkeypatch.setattr("agent.cli._http_json", fake_http)
@@ -411,6 +470,13 @@ def test_observer_poll_accepts_reconnect_raw_claim_response(monkeypatch):
     assert payload["claim"]["observer_command_id"] == "cmd-owned"
     assert payload["observer_poll"]["observer_command_id"] == "cmd-owned"
     assert payload["observer_poll"]["status"] == "planned"
+    timeline_calls = _observer_poll_timeline_calls(calls)
+    assert [call[2]["event_type"] for call in timeline_calls] == [
+        "observer_poll_claimed",
+        "observer_poll_planned",
+    ]
+    assert [call[2]["task_id"] for call in timeline_calls] == ["cmd-owned", "cmd-owned"]
+    assert timeline_calls[-1][2]["payload"]["observer_command_id"] == "cmd-owned"
 
 
 DOGFOOD_BACKLOG_ID = "AC-OBSERVER-CLI-LAUNCHER-JUDGE-OBSERVER-SUBAGENT-20260602"

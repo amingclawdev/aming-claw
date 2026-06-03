@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+
 from agent.observer_runtime import (
     EXECUTE_BACKLOG_ROW_COMMAND_TYPE,
     OBSERVER_POLL_SCHEMA_VERSION,
+    OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION,
     ObserverPollRequest,
     build_observer_poll_plan,
+    observer_poll_timeline_payload,
 )
 
 
@@ -52,6 +56,74 @@ def test_build_observer_poll_plan_turns_claimed_command_into_dry_run_plan(tmp_pa
     assert result["route_identity"]["visible_injection_manifest_hash"] == "sha256:visible"
     assert result["route_identity"]["raw_private_context_exposed"] is False
     assert result["observer_run"]["invocation"]["calls_models"] is False
+
+
+def test_observer_poll_timeline_payload_preserves_route_identity_from_plan_and_result(tmp_path):
+    command = _execute_backlog_command()
+    plan = build_observer_poll_plan(
+        ObserverPollRequest(
+            project_id="aming-claw",
+            observer_session_id="obs-1",
+            command=command,
+            workspace=str(tmp_path),
+            main_worktree=str(tmp_path),
+        )
+    )
+    result = {
+        "observer_command_id": "cmd-route-1",
+        "backlog_id": "AC-ROUTE-HANDOFF",
+        "route_id": "route-from-result",
+        "route_context_hash": "sha256:result-route",
+        "prompt_contract_id": "rprompt-result",
+        "visible_injection_manifest_hash": "sha256:result-visible",
+        "execute": False,
+        "calls_models": False,
+        "service_manager_required": False,
+        "executor_worker_required": False,
+        "uses_task_create": False,
+    }
+
+    payload = observer_poll_timeline_payload(
+        observer_command_id="cmd-route-1",
+        command=command,
+        plan=plan,
+        result=result,
+        event="complete",
+    )
+
+    assert payload["schema_version"] == OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION
+    assert payload["event"] == "complete"
+    assert payload["observer_command_id"] == "cmd-route-1"
+    assert payload["backlog_id"] == "AC-ROUTE-HANDOFF"
+    assert payload["route_id"] == "route-20260603-test"
+    assert payload["route_context_hash"] == "sha256:route"
+    assert payload["prompt_contract_id"] == "rprompt-test"
+    assert payload["visible_injection_manifest_hash"] == "sha256:visible"
+    assert payload["execute"] is False
+    assert payload["calls_models"] is False
+    assert payload["service_manager_required"] is False
+    assert payload["executor_worker_required"] is False
+    assert payload["uses_task_create"] is False
+
+
+def test_observer_poll_timeline_payload_reads_payload_json_for_reconnect():
+    command = _execute_backlog_command()
+    command["payload_json"] = json_payload = json.dumps(command.pop("payload"))
+
+    payload = observer_poll_timeline_payload(
+        observer_command_id="cmd-route-1",
+        command=command,
+        event="claim",
+    )
+
+    assert json_payload
+    assert payload["observer_command_id"] == "cmd-route-1"
+    assert payload["backlog_id"] == "AC-ROUTE-HANDOFF"
+    assert payload["route_id"] == "route-20260603-test"
+    assert payload["route_context_hash"] == "sha256:route"
+    assert payload["prompt_contract_id"] == "rprompt-test"
+    assert payload["visible_injection_manifest_hash"] == "sha256:visible"
+    assert payload["execute"] is False
 
 
 def test_build_observer_poll_plan_rejects_missing_route_payload_fields():
