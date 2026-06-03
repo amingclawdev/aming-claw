@@ -4,9 +4,12 @@ import json
 
 from agent.observer_runtime import (
     EXECUTE_BACKLOG_ROW_COMMAND_TYPE,
+    OBSERVER_POLL_LOOP_SCHEMA_VERSION,
     OBSERVER_POLL_SCHEMA_VERSION,
     OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION,
+    ObserverPollLoopConfig,
     ObserverPollRequest,
+    build_observer_poll_loop_metadata,
     build_observer_poll_plan,
     observer_poll_timeline_payload,
 )
@@ -49,6 +52,8 @@ def test_build_observer_poll_plan_turns_claimed_command_into_dry_run_plan(tmp_pa
     assert result["service_manager_required"] is False
     assert result["executor_worker_required"] is False
     assert result["uses_task_create"] is False
+    assert result["payload_free_reminder"] is True
+    assert result["reminder_payload_required"] is False
     assert result["observer_command_id"] == "cmd-route-1"
     assert result["backlog_id"] == "AC-ROUTE-HANDOFF"
     assert result["route_identity"]["route_context_hash"] == "sha256:route"
@@ -104,6 +109,8 @@ def test_observer_poll_timeline_payload_preserves_route_identity_from_plan_and_r
     assert payload["service_manager_required"] is False
     assert payload["executor_worker_required"] is False
     assert payload["uses_task_create"] is False
+    assert payload["payload_free_reminder"] is True
+    assert payload["reminder_payload_required"] is False
 
 
 def test_observer_poll_timeline_payload_reads_payload_json_for_reconnect():
@@ -154,6 +161,8 @@ def test_build_observer_poll_plan_reports_empty_queue_without_runtime_dependenci
     assert result["calls_models"] is False
     assert result["service_manager_required"] is False
     assert result["executor_worker_required"] is False
+    assert result["payload_free_reminder"] is True
+    assert result["reminder_payload_required"] is False
 
 
 def test_build_observer_poll_plan_rejects_non_execute_command_in_standalone_mode():
@@ -175,3 +184,26 @@ def test_build_observer_poll_plan_rejects_non_execute_command_in_standalone_mode
     assert result["observer_command_id"] == "cmd-other"
     assert result["service_manager_required"] is False
     assert "execute_backlog_row" in result["error"]
+
+
+def test_build_observer_poll_loop_metadata_is_bounded_and_dependency_free():
+    metadata = build_observer_poll_loop_metadata(
+        ObserverPollLoopConfig(
+            watch=True,
+            max_commands=2,
+            idle_timeout_sec=0,
+            poll_interval_sec=-1,
+        )
+    )
+
+    assert metadata["schema_version"] == OBSERVER_POLL_LOOP_SCHEMA_VERSION
+    assert metadata["watch"] is True
+    assert metadata["once"] is False
+    assert metadata["effective_max_commands"] == 2
+    assert metadata["idle_timeout_sec"] == 0
+    assert metadata["poll_interval_sec"] == 0
+    assert metadata["payload_free_reminder"] is True
+    assert metadata["reminder_payload_required"] is False
+    assert metadata["service_manager_required"] is False
+    assert metadata["executor_worker_required"] is False
+    assert metadata["uses_task_create"] is False

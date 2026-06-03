@@ -56,6 +56,7 @@ else:  # pragma: no cover - direct module import path
 
 OBSERVER_RUN_SCHEMA_VERSION = "observer_run.v1"
 OBSERVER_POLL_SCHEMA_VERSION = "observer_poll.v1"
+OBSERVER_POLL_LOOP_SCHEMA_VERSION = "observer_poll_loop.v1"
 OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION = "observer_poll_timeline_payload.v1"
 DOGFOOD_OBSERVER_PLAN_SCHEMA_VERSION = "observer_dogfood_plan.v1"
 OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION = "observer_runtime_text_context.v1"
@@ -225,6 +226,41 @@ class ObserverPollRequest:
     main_worktree: str = ""
 
 
+@dataclass
+class ObserverPollLoopConfig:
+    watch: bool = False
+    max_commands: int = 0
+    idle_timeout_sec: float = 0.0
+    poll_interval_sec: float = 5.0
+
+
+def build_observer_poll_loop_metadata(config: ObserverPollLoopConfig) -> dict[str, Any]:
+    """Normalize bounded observer poll loop settings for CLI/API evidence."""
+
+    max_commands = max(0, int(config.max_commands or 0))
+    idle_timeout_sec = max(0.0, float(config.idle_timeout_sec or 0.0))
+    poll_interval_sec = max(0.0, float(config.poll_interval_sec or 0.0))
+    effective_max_commands = max_commands if config.watch else 1
+    return {
+        "schema_version": OBSERVER_POLL_LOOP_SCHEMA_VERSION,
+        "watch": bool(config.watch),
+        "once": not bool(config.watch),
+        "max_commands": max_commands,
+        "effective_max_commands": effective_max_commands,
+        "idle_timeout_sec": idle_timeout_sec,
+        "poll_interval_sec": poll_interval_sec,
+        "heartbeat_count": 0,
+        "claim_attempts": 0,
+        "empty_polls": 0,
+        "processed_count": 0,
+        "payload_free_reminder": True,
+        "reminder_payload_required": False,
+        "service_manager_required": False,
+        "executor_worker_required": False,
+        "uses_task_create": False,
+    }
+
+
 def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
     missing: list[str] = []
     if not request.project_id:
@@ -320,6 +356,8 @@ def observer_poll_timeline_payload(
             )
             or ""
         ),
+        "payload_free_reminder": True,
+        "reminder_payload_required": False,
     }
     for field in OBSERVER_POLL_TIMELINE_ROUTE_FIELDS:
         timeline[field] = str(
@@ -352,6 +390,8 @@ def _observer_poll_base_result(request: ObserverPollRequest) -> dict[str, Any]:
         "service_manager_required": False,
         "executor_worker_required": False,
         "uses_task_create": False,
+        "payload_free_reminder": True,
+        "reminder_payload_required": False,
     }
 
 

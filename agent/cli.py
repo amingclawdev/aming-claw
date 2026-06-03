@@ -23,6 +23,7 @@ import os
 import sys
 import logging
 import json
+import time
 import webbrowser
 import socket
 import subprocess
@@ -569,6 +570,8 @@ def _observer_poll_completion_result(plan: dict) -> dict:
         "service_manager_required": False,
         "executor_worker_required": False,
         "uses_task_create": False,
+        "payload_free_reminder": True,
+        "reminder_payload_required": False,
     }
 
 
@@ -625,6 +628,37 @@ def _observer_poll_append_timeline(
     if not ok:
         result["response"] = response
     return result
+
+
+def _observer_poll_heartbeat(
+    *,
+    base_url: str,
+    project_id: str,
+    session_id: str,
+    session_token: str,
+) -> dict[str, Any]:
+    encoded_project = urllib.parse.quote(project_id, safe="")
+    encoded_session = urllib.parse.quote(session_id, safe="")
+    try:
+        code, response = _http_json(
+            "POST",
+            (
+                f"{base_url}/api/projects/{encoded_project}/observer-sessions/"
+                f"{encoded_session}/heartbeat"
+            ),
+            {"session_id": session_id, "session_token": session_token},
+        )
+    except Exception as exc:  # pragma: no cover - defensive fail-soft CLI guard
+        return {"ok": False, "http_status": 0, "error": str(exc)}
+    return {
+        "ok": code < 400 and response.get("ok", True) is not False,
+        "http_status": code,
+        "observer_session_id": str(
+            response.get("observer_session_id") or response.get("session_id") or session_id
+        ),
+        "heartbeat_interval_sec": response.get("heartbeat_interval_sec"),
+        "response": response if code >= 400 or response.get("ok", True) is False else {},
+    }
 
 
 def _observer_poll_normalize_claim_response(payload: dict) -> dict:
@@ -703,6 +737,29 @@ def _observer_poll_normalize_claim_response(payload: dict) -> dict:
     help="Actually invoke the configured provider after one-hop gate validation.",
 )
 @click.option(
+    "--watch/--once",
+    default=False,
+    help="Keep polling until --max-commands or --idle-timeout-sec is reached. Defaults to --once.",
+)
+@click.option(
+    "--max-commands",
+    default=0,
+    type=int,
+    help="Maximum commands to process in --watch mode. Use 0 for no command limit.",
+)
+@click.option(
+    "--idle-timeout-sec",
+    default=None,
+    type=float,
+    help="Exit --watch after this many idle seconds. Defaults to 60; use 0 to exit on first empty poll.",
+)
+@click.option(
+    "--poll-interval-sec",
+    default=5.0,
+    type=float,
+    help="Seconds between empty --watch polls.",
+)
+@click.option(
     "--complete-planned",
     is_flag=True,
     help="Complete the claimed command with the poll/plan result.",
@@ -726,12 +783,18 @@ def observer_poll(
     main_worktree,
     timeout_sec,
     execute,
+    watch,
+    max_commands,
+    idle_timeout_sec,
+    poll_interval_sec,
     complete_planned,
     json_output,
 ):
     """Claim an observer command and build a standalone route-bound plan."""
     from agent.observer_runtime import (
+        ObserverPollLoopConfig,
         ObserverPollRequest,
+        build_observer_poll_loop_metadata,
         build_observer_poll_plan,
         observer_poll_timeline_payload,
     )
@@ -739,21 +802,47 @@ def observer_poll(
     base_url = governance_url.rstrip("/")
     encoded_project = urllib.parse.quote(project_id, safe="")
     cwd = workspace or os.getcwd()
+    effective_idle_timeout_sec = 60.0 if idle_timeout_sec is None and watch else (idle_timeout_sec or 0.0)
+    loop = build_observer_poll_loop_metadata(
+        ObserverPollLoopConfig(
+            watch=bool(watch),
+            max_commands=max_commands,
+            idle_timeout_sec=effective_idle_timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+    )
     result: dict = {
         "ok": False,
         "schema_version": "observer_poll_cli.v1",
         "project_id": project_id,
         "governance_url": base_url,
         "execute": execute,
+        "watch": bool(watch),
         "complete_planned": complete_planned,
         "service_manager_required": False,
         "executor_worker_required": False,
         "uses_task_create": False,
+        "payload_free_reminder": True,
+        "reminder_payload_required": False,
+        "loop": loop,
+        "heartbeats": [],
+        "observer_polls": [],
+        "completions": [],
         "timeline": [],
     }
     active_session_id = session_id
     active_session_token = session_token
     registered_session: dict = {}
+
+    if watch and command_id:
+        result.update(
+            {
+                "status": "rejected",
+                "error": "command-id cannot be combined with --watch",
+            }
+        )
+        click.echo(json.dumps(result, indent=2, sort_keys=True) if json_output else result["error"])
+        raise click.exceptions.Exit(1)
 
     if bool(active_session_id) != bool(active_session_token):
         result.update(
@@ -807,143 +896,216 @@ def observer_poll(
             raise click.ClickException("dispatch gate file must contain a JSON object")
         dispatch_gate = parsed_gate
 
-    claim_payload = {
-        "session_id": active_session_id,
-        "session_token": active_session_token,
-    }
-    claim_endpoint = "claim" if command_id else "next"
-    if command_id:
-        claim_payload["command_id"] = command_id
-    claim_code, raw_claim_response = _http_json(
-        "POST",
-        f"{base_url}/api/projects/{encoded_project}/observer-commands/{claim_endpoint}",
-        claim_payload,
-    )
-    claim_response = _observer_poll_normalize_claim_response(raw_claim_response)
-    if claim_code >= 400 or not claim_response.get("ok"):
-        result.update(
-            {
-                "status": "rejected",
-                "error": "observer command claim failed",
-                "http_status": claim_code,
-                "response": raw_claim_response,
-            }
-        )
-        click.echo(json.dumps(result, indent=2, sort_keys=True) if json_output else result["error"])
-        raise click.exceptions.Exit(1)
-
-    command = claim_response.get("command") if isinstance(claim_response.get("command"), dict) else None
-    if command:
-        observer_command_id = str(command.get("command_id") or "")
-        result["timeline"].append(
-            _observer_poll_append_timeline(
-                base_url=base_url,
-                project_id=project_id,
-                observer_command_id=observer_command_id,
-                event_type="observer_poll_claimed",
-                phase="claim",
-                status="claimed",
-                payload=observer_poll_timeline_payload(
-                    observer_command_id=observer_command_id,
-                    command=command,
-                    event="claim",
-                ),
-            )
-        )
-    plan = build_observer_poll_plan(
-        ObserverPollRequest(
+    last_activity = time.monotonic()
+    next_command_id = command_id
+    stop_reason = ""
+    while True:
+        heartbeat = _observer_poll_heartbeat(
+            base_url=base_url,
             project_id=project_id,
-            observer_session_id=active_session_id,
-            command=command,
-            provider=provider,
-            model=model,
-            backend_mode=backend_mode,
-            workspace=cwd,
-            prompt=prompt,
-            timeout_sec=timeout_sec,
-            dispatch_gate=dispatch_gate,
-            main_worktree=main_worktree or cwd,
-        ),
-        execute=execute,
-    )
-    result.update(
-        {
-            "ok": bool(plan.get("ok")),
-            "status": plan.get("status") or "planned",
-            "empty": bool(plan.get("empty")),
-            "claim": {
-                "http_status": claim_code,
-                "empty": bool(claim_response.get("empty")),
-                "observer_command_id": str((command or {}).get("command_id") or ""),
-            },
-            "observer_poll": plan,
-        }
-    )
-    if command:
-        observer_command_id = str(command.get("command_id") or "")
-        result["timeline"].append(
-            _observer_poll_append_timeline(
-                base_url=base_url,
-                project_id=project_id,
-                observer_command_id=observer_command_id,
-                event_type="observer_poll_planned",
-                phase="plan",
-                status=str(plan.get("status") or "planned"),
-                payload=observer_poll_timeline_payload(
-                    observer_command_id=observer_command_id,
-                    command=command,
-                    plan=plan,
-                    event="plan",
-                ),
-            )
+            session_id=active_session_id,
+            session_token=active_session_token,
         )
-    if complete_planned and command and plan.get("ok"):
-        completion_result = _observer_poll_completion_result(plan)
-        complete_payload = {
+        result["heartbeats"].append(heartbeat)
+        loop["heartbeat_count"] = len(result["heartbeats"])
+        if not heartbeat.get("ok"):
+            result.update(
+                {
+                    "ok": False,
+                    "status": "rejected",
+                    "error": "observer session heartbeat failed",
+                    "heartbeat": heartbeat,
+                }
+            )
+            break
+
+        claim_payload = {
             "session_id": active_session_id,
             "session_token": active_session_token,
-            "result": completion_result,
         }
-        complete_code, complete_response = _http_json(
+        claim_endpoint = "claim" if next_command_id else "next"
+        if next_command_id:
+            claim_payload["command_id"] = next_command_id
+        next_command_id = ""
+        loop["claim_attempts"] += 1
+        claim_code, raw_claim_response = _http_json(
             "POST",
-            (
-                f"{base_url}/api/projects/{encoded_project}/observer-commands/"
-                f"{urllib.parse.quote(str(command.get('command_id') or ''), safe='')}/complete"
-            ),
-            complete_payload,
+            f"{base_url}/api/projects/{encoded_project}/observer-commands/{claim_endpoint}",
+            claim_payload,
         )
-        result["completion"] = {
-            "http_status": complete_code,
-            "ok": bool(complete_response.get("ok")),
-            "observer_command_id": str((complete_response.get("command") or {}).get("command_id") or ""),
-        }
-        if complete_code >= 400 or not complete_response.get("ok"):
-            result["ok"] = False
-            result["status"] = "rejected"
-            result["error"] = "observer command completion failed"
-            result["completion"]["response"] = complete_response
-        observer_command_id = str(command.get("command_id") or "")
-        result["timeline"].append(
-            _observer_poll_append_timeline(
-                base_url=base_url,
-                project_id=project_id,
-                observer_command_id=observer_command_id,
-                event_type="observer_poll_completed",
-                phase="complete",
-                status=(
-                    "completed"
-                    if complete_code < 400 and complete_response.get("ok")
-                    else "completion_failed"
-                ),
-                payload=observer_poll_timeline_payload(
-                    observer_command_id=observer_command_id,
-                    command=command,
-                    plan=plan,
-                    result=completion_result,
-                    event="complete",
-                ),
+        claim_response = _observer_poll_normalize_claim_response(raw_claim_response)
+        if claim_code >= 400 or not claim_response.get("ok"):
+            result.update(
+                {
+                    "ok": False,
+                    "status": "rejected",
+                    "error": "observer command claim failed",
+                    "http_status": claim_code,
+                    "response": raw_claim_response,
+                }
             )
+            stop_reason = "claim_failed"
+            break
+
+        command = (
+            claim_response.get("command")
+            if isinstance(claim_response.get("command"), dict)
+            else None
         )
+        if command:
+            observer_command_id = str(command.get("command_id") or "")
+            result["timeline"].append(
+                _observer_poll_append_timeline(
+                    base_url=base_url,
+                    project_id=project_id,
+                    observer_command_id=observer_command_id,
+                    event_type="observer_poll_claimed",
+                    phase="claim",
+                    status="claimed",
+                    payload=observer_poll_timeline_payload(
+                        observer_command_id=observer_command_id,
+                        command=command,
+                        event="claim",
+                    ),
+                )
+            )
+
+        plan = build_observer_poll_plan(
+            ObserverPollRequest(
+                project_id=project_id,
+                observer_session_id=active_session_id,
+                command=command,
+                provider=provider,
+                model=model,
+                backend_mode=backend_mode,
+                workspace=cwd,
+                prompt=prompt,
+                timeout_sec=timeout_sec,
+                dispatch_gate=dispatch_gate,
+                main_worktree=main_worktree or cwd,
+            ),
+            execute=execute,
+        )
+        result["observer_polls"].append(plan)
+        result.update(
+            {
+                "ok": bool(plan.get("ok")),
+                "status": plan.get("status") or "planned",
+                "empty": bool(plan.get("empty")),
+                "claim": {
+                    "http_status": claim_code,
+                    "empty": bool(claim_response.get("empty")),
+                    "observer_command_id": str((command or {}).get("command_id") or ""),
+                },
+                "observer_poll": plan,
+            }
+        )
+        if command:
+            observer_command_id = str(command.get("command_id") or "")
+            result["timeline"].append(
+                _observer_poll_append_timeline(
+                    base_url=base_url,
+                    project_id=project_id,
+                    observer_command_id=observer_command_id,
+                    event_type="observer_poll_planned",
+                    phase="plan",
+                    status=str(plan.get("status") or "planned"),
+                    payload=observer_poll_timeline_payload(
+                        observer_command_id=observer_command_id,
+                        command=command,
+                        plan=plan,
+                        event="plan",
+                    ),
+                )
+            )
+
+        if not plan.get("ok"):
+            stop_reason = "plan_rejected"
+            break
+
+        if command:
+            loop["processed_count"] += 1
+            last_activity = time.monotonic()
+            if complete_planned:
+                completion_result = _observer_poll_completion_result(plan)
+                complete_payload = {
+                    "session_id": active_session_id,
+                    "session_token": active_session_token,
+                    "result": completion_result,
+                }
+                complete_code, complete_response = _http_json(
+                    "POST",
+                    (
+                        f"{base_url}/api/projects/{encoded_project}/observer-commands/"
+                        f"{urllib.parse.quote(str(command.get('command_id') or ''), safe='')}/complete"
+                    ),
+                    complete_payload,
+                )
+                completion = {
+                    "http_status": complete_code,
+                    "ok": bool(complete_response.get("ok")),
+                    "observer_command_id": str(
+                        (complete_response.get("command") or {}).get("command_id") or ""
+                    ),
+                }
+                result["completion"] = completion
+                result["completions"].append(completion)
+                if complete_code >= 400 or not complete_response.get("ok"):
+                    result["ok"] = False
+                    result["status"] = "rejected"
+                    result["error"] = "observer command completion failed"
+                    completion["response"] = complete_response
+                    stop_reason = "completion_failed"
+                observer_command_id = str(command.get("command_id") or "")
+                result["timeline"].append(
+                    _observer_poll_append_timeline(
+                        base_url=base_url,
+                        project_id=project_id,
+                        observer_command_id=observer_command_id,
+                        event_type="observer_poll_completed",
+                        phase="complete",
+                        status=(
+                            "completed"
+                            if complete_code < 400 and complete_response.get("ok")
+                            else "completion_failed"
+                        ),
+                        payload=observer_poll_timeline_payload(
+                            observer_command_id=observer_command_id,
+                            command=command,
+                            plan=plan,
+                            result=completion_result,
+                            event="complete",
+                        ),
+                    )
+                )
+                if stop_reason:
+                    break
+            elif watch:
+                stop_reason = "claimed_command_left_open"
+                break
+
+            if not watch:
+                stop_reason = "once"
+                break
+            if loop["effective_max_commands"] and loop["processed_count"] >= loop["effective_max_commands"]:
+                stop_reason = "max_commands"
+                break
+            continue
+
+        loop["empty_polls"] += 1
+        if not watch:
+            stop_reason = "empty"
+            break
+        idle_elapsed_sec = max(0.0, time.monotonic() - last_activity)
+        loop["idle_elapsed_sec"] = idle_elapsed_sec
+        if loop["idle_timeout_sec"] <= 0 or idle_elapsed_sec >= loop["idle_timeout_sec"]:
+            stop_reason = "idle_timeout"
+            break
+        sleep_for = min(loop["poll_interval_sec"], loop["idle_timeout_sec"] - idle_elapsed_sec)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    loop["stop_reason"] = stop_reason or result.get("status") or ""
 
     if json_output:
         click.echo(json.dumps(result, indent=2, sort_keys=True))

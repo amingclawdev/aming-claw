@@ -139,14 +139,34 @@ aming-claw observer poll \
   --json-output
 ```
 
+For headless dogfood or a Codex observer session that should wait briefly for
+judge-owned handoff, run a bounded loop:
+
+```bash
+aming-claw observer poll \
+  --project-id aming-claw \
+  --governance-url http://localhost:40000 \
+  --watch \
+  --max-commands 3 \
+  --idle-timeout-sec 120 \
+  --poll-interval-sec 5 \
+  --complete-planned \
+  --json-output
+```
+
 If no session id/token is supplied, the command registers a temporary observer
-session and claims the next `execute_backlog_row` command. The dry-run result
-is a traceable route-bound plan with `calls_models=false`,
+session, heartbeats it before each claim, and claims `execute_backlog_row`
+commands from the durable observer command queue. Hook reminders remain
+payload-free; they only prompt the observer to poll governance. The dry-run
+result is a traceable route-bound plan with `calls_models=false`,
 `service_manager_required=false`, `executor_worker_required=false`, and
-`uses_task_create=false`.
+`uses_task_create=false`, and the claim/plan/complete timeline payloads carry
+the route identity.
 
 Use `--complete-planned` only for dogfood or explicit dry-run closure. Use
 `--execute` only with a valid one-hop dispatch gate, as with `observer run`.
+ServiceManager is optional supervision for advanced chain/executor testing; it
+is not a dependency of standalone observer polling.
 
 ## 6. Executor Lifecycle (Advanced / Experimental In V1)
 

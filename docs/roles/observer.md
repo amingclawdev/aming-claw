@@ -33,17 +33,38 @@ aming-claw observer poll \
   --json-output
 ```
 
+Bounded Codex observer session loop:
+
+```bash
+aming-claw observer poll \
+  --project-id aming-claw \
+  --governance-url http://localhost:40000 \
+  --watch \
+  --max-commands 3 \
+  --idle-timeout-sec 120 \
+  --poll-interval-sec 5 \
+  --complete-planned \
+  --json-output
+```
+
 The command registers an observer session when `--session-id` and
-`--session-token` are omitted, claims the next `execute_backlog_row` command,
-and converts the claimed payload into the same route-bound observer invocation
-contract used by `observer run`. Dry-run poll output is evidence only:
+`--session-token` are omitted, heartbeats that session before each claim,
+claims `execute_backlog_row` commands from the durable queue, and converts each
+claimed payload into the same route-bound observer invocation contract used by
+`observer run`. Queue reminders are payload-free: they only tell the observer
+to poll governance, while route identity stays in the durable command payload
+and in claim/plan/complete timeline evidence. Dry-run poll output is evidence
+only:
 `calls_models=false`, `service_manager_required=false`,
 `executor_worker_required=false`, and `uses_task_create=false`.
 
 Use `--complete-planned` only for dogfood or explicit dry-run closure, because
 it marks the claimed command completed with the generated plan. Live execution
 still requires `--execute` plus the one-hop dispatch gate required by
-`observer run`.
+`observer run`. Without `--complete-planned`, watch mode stops after the first
+claimed command so the observer does not repeatedly re-plan the same open
+claim. ServiceManager may supervise optional advanced chain/executor flows, but
+it is not required for this standalone poll path.
 
 ## Principles
 

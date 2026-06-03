@@ -227,6 +227,10 @@ def _observer_poll_timeline_calls(calls):
     return [call for call in calls if call[1].endswith("/api/task/aming-claw/timeline")]
 
 
+def _observer_poll_heartbeat_calls(calls):
+    return [call for call in calls if "/observer-sessions/obs-1/heartbeat" in call[1]]
+
+
 def test_observer_poll_registers_claims_and_plans_without_service_manager(monkeypatch):
     calls = []
 
@@ -238,6 +242,12 @@ def test_observer_poll_registers_claims_and_plans_without_service_manager(monkey
                 "observer_session_id": "obs-1",
                 "session_id": "obs-1",
                 "session_token": "secret-token",
+            }
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
             }
         if url.endswith("/observer-commands/next"):
             return 200, {
@@ -277,15 +287,18 @@ def test_observer_poll_registers_claims_and_plans_without_service_manager(monkey
     assert poll["service_manager_required"] is False
     assert poll["executor_worker_required"] is False
     assert poll["uses_task_create"] is False
+    assert poll["payload_free_reminder"] is True
+    assert poll["reminder_payload_required"] is False
     assert poll["observer_command_id"] == "cmd-route-1"
     assert poll["route_identity"]["route_context_hash"] == "sha256:route"
     assert poll["observer_run"]["invocation"]["calls_models"] is False
 
     register_payload = calls[0][2]
     assert register_payload["capabilities"]["command_types"] == ["execute_backlog_row"]
-    assert calls[1][1].endswith("/api/projects/aming-claw/observer-commands/next")
-    assert calls[1][2]["session_id"] == "obs-1"
-    assert calls[1][2]["session_token"] == "secret-token"
+    assert _observer_poll_heartbeat_calls(calls)
+    next_call = next(call for call in calls if call[1].endswith("/observer-commands/next"))
+    assert next_call[2]["session_id"] == "obs-1"
+    assert next_call[2]["session_token"] == "secret-token"
     timeline_calls = _observer_poll_timeline_calls(calls)
     assert [call[2]["event_type"] for call in timeline_calls] == [
         "observer_poll_claimed",
@@ -304,6 +317,8 @@ def test_observer_poll_registers_claims_and_plans_without_service_manager(monkey
     assert planned_payload["service_manager_required"] is False
     assert planned_payload["executor_worker_required"] is False
     assert planned_payload["uses_task_create"] is False
+    assert planned_payload["payload_free_reminder"] is True
+    assert planned_payload["reminder_payload_required"] is False
 
 
 def test_observer_poll_can_complete_planned_command(monkeypatch):
@@ -311,6 +326,12 @@ def test_observer_poll_can_complete_planned_command(monkeypatch):
 
     def fake_http(method, url, payload=None, *, timeout=30.0):
         calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
         if url.endswith("/observer-commands/claim"):
             return 200, {
                 "ok": True,
@@ -356,6 +377,7 @@ def test_observer_poll_can_complete_planned_command(monkeypatch):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["ok"] is True
+    assert payload["loop"]["heartbeat_count"] == 1
     assert payload["completion"]["ok"] is True
     assert payload["completion"]["observer_command_id"] == "cmd-complete"
     complete_payload = next(
@@ -397,6 +419,12 @@ def test_observer_poll_can_complete_planned_command(monkeypatch):
 
 def test_observer_poll_reports_empty_queue(monkeypatch):
     def fake_http(method, url, payload=None, *, timeout=30.0):
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
         if url.endswith("/observer-commands/next"):
             return 200, {
                 "ok": True,
@@ -430,6 +458,8 @@ def test_observer_poll_reports_empty_queue(monkeypatch):
     assert payload["ok"] is True
     assert payload["status"] == "empty"
     assert payload["empty"] is True
+    assert payload["loop"]["stop_reason"] == "empty"
+    assert payload["loop"]["empty_polls"] == 1
     assert payload["observer_poll"]["service_manager_required"] is False
 
 
@@ -438,6 +468,12 @@ def test_observer_poll_accepts_reconnect_raw_claim_response(monkeypatch):
 
     def fake_http(method, url, payload=None, *, timeout=30.0):
         calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
         if url.endswith("/observer-commands/next"):
             command = _observer_poll_command("cmd-owned")
             command["claimed_by_session_id"] = "obs-1"
@@ -477,6 +513,158 @@ def test_observer_poll_accepts_reconnect_raw_claim_response(monkeypatch):
     ]
     assert [call[2]["task_id"] for call in timeline_calls] == ["cmd-owned", "cmd-owned"]
     assert timeline_calls[-1][2]["payload"]["observer_command_id"] == "cmd-owned"
+
+
+def test_observer_poll_watch_claims_notified_command_and_completes_planned(monkeypatch):
+    calls = []
+    pending = [_observer_poll_command("cmd-notified")]
+    pending[0]["status"] = "notified"
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
+        if url.endswith("/observer-commands/next"):
+            if pending:
+                command = pending.pop(0)
+                command["status"] = "claimed"
+                command["claimed_by_session_id"] = "obs-1"
+                return 200, {
+                    "ok": True,
+                    "project_id": "aming-claw",
+                    "observer_session_id": "obs-1",
+                    "command": command,
+                    "empty": False,
+                }
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": None,
+                "empty": True,
+            }
+        if url.endswith("/observer-commands/cmd-notified/complete"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": {"command_id": "cmd-notified", "status": "completed"},
+            }
+        if url.endswith("/api/task/aming-claw/timeline"):
+            return 200, {"ok": True, "event_id": len(_observer_poll_timeline_calls(calls))}
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--watch",
+            "--idle-timeout-sec",
+            "0",
+            "--poll-interval-sec",
+            "0",
+            "--complete-planned",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["status"] == "empty"
+    assert payload["loop"]["watch"] is True
+    assert payload["loop"]["processed_count"] == 1
+    assert payload["loop"]["empty_polls"] == 1
+    assert payload["loop"]["heartbeat_count"] == 2
+    assert payload["loop"]["stop_reason"] == "idle_timeout"
+    assert payload["observer_polls"][0]["observer_command_id"] == "cmd-notified"
+    assert payload["observer_polls"][0]["route_identity"]["route_context_hash"] == "sha256:route"
+    assert payload["completion"]["ok"] is True
+    assert payload["completions"][0]["observer_command_id"] == "cmd-notified"
+    timeline_calls = _observer_poll_timeline_calls(calls)
+    assert [call[2]["event_type"] for call in timeline_calls] == [
+        "observer_poll_claimed",
+        "observer_poll_planned",
+        "observer_poll_completed",
+    ]
+    completed_payload = timeline_calls[-1][2]["payload"]
+    assert completed_payload["observer_command_id"] == "cmd-notified"
+    assert completed_payload["route_context_hash"] == "sha256:route"
+    assert completed_payload["payload_free_reminder"] is True
+    assert completed_payload["reminder_payload_required"] is False
+    called_urls = [call[1] for call in calls]
+    assert not any("task_create" in url or "executor" in url for url in called_urls)
+
+
+def test_observer_poll_watch_empty_queue_exits_after_bounded_idle(monkeypatch):
+    calls = []
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
+        if url.endswith("/observer-commands/next"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": None,
+                "empty": True,
+            }
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--watch",
+            "--idle-timeout-sec",
+            "0",
+            "--poll-interval-sec",
+            "0",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["status"] == "empty"
+    assert payload["loop"]["watch"] is True
+    assert payload["loop"]["processed_count"] == 0
+    assert payload["loop"]["empty_polls"] == 1
+    assert payload["loop"]["stop_reason"] == "idle_timeout"
+    assert payload["observer_poll"]["empty"] is True
+    assert len(_observer_poll_heartbeat_calls(calls)) == 1
+    assert not any("task_create" in call[1] or "executor" in call[1] for call in calls)
 
 
 DOGFOOD_BACKLOG_ID = "AC-OBSERVER-CLI-LAUNCHER-JUDGE-OBSERVER-SUBAGENT-20260602"
