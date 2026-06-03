@@ -273,6 +273,25 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
         payload=_startup_payload(str(worktree), worker_id="other-worker"),
         now_iso=NOW,
     )
+    missing_merge_payload = _startup_payload(str(worktree))
+    missing_merge_payload.pop("merge_queue_id")
+    missing_merge_queue = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=missing_merge_payload,
+        now_iso=NOW,
+    )
+    missing_identity_payload = _startup_payload(str(worktree))
+    for key in ("worker_id", "agent_id", "base_commit", "target_head_commit"):
+        missing_identity_payload.pop(key)
+    missing_identity = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=missing_identity_payload,
+        now_iso=NOW,
+    )
 
     assert allocation_only["ok"] is False
     assert allocation_only["blocker_id"] == "no_truthful_bounded_mf_sub_startup_surface_available"
@@ -282,6 +301,17 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
     assert stale_fence["blocker_id"] == "fence_invalidated_or_unknown"
     assert wrong_worker["ok"] is False
     assert wrong_worker["blocker_id"] == "worker_id_mismatch"
+    assert missing_merge_queue["ok"] is False
+    assert missing_merge_queue["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
+    assert "merge_queue_id" in missing_merge_queue["missing"]
+    assert missing_identity["ok"] is False
+    assert missing_identity["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
+    for key in ("worker_id", "agent_id", "base_commit", "target_head_commit"):
+        assert key in missing_identity["missing"]
 
     with pytest.raises(BranchRuntimeFenceError):
         validate_mf_subagent_graph_query_identity(

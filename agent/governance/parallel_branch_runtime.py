@@ -1978,17 +1978,16 @@ def record_mf_subagent_startup(
     worker_role = str(payload.get("worker_role") or payload.get("role") or "").strip()
     worker_role = worker_role.lower().replace("-", "_")
     fence_token = str(payload.get("fence_token") or "").strip()
-    worker_id = str(payload.get("worker_id") or context.worker_id or "").strip()
-    agent_id = str(payload.get("agent_id") or context.agent_id or "").strip()
+    worker_id = str(payload.get("worker_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
     token_evidence = _startup_token_evidence(payload)
     actual_cwd = str(payload.get("actual_cwd") or payload.get("cwd") or "").strip()
     actual_git_root = str(payload.get("actual_git_root") or payload.get("git_root") or "").strip()
     branch = str(payload.get("branch") or payload.get("branch_ref") or "").strip()
     head_commit = str(payload.get("head_commit") or payload.get("branch_head") or "").strip()
-    base_commit = str(payload.get("base_commit") or context.base_commit or "").strip()
-    target_head_commit = str(
-        payload.get("target_head_commit") or context.target_head_commit or ""
-    ).strip()
+    base_commit = str(payload.get("base_commit") or "").strip()
+    target_head_commit = str(payload.get("target_head_commit") or "").strip()
+    merge_queue_id = str(payload.get("merge_queue_id") or "").strip()
     route_id = str(payload.get("route_id") or "").strip()
     route_context_hash = str(payload.get("route_context_hash") or "").strip()
     prompt_contract_id = str(payload.get("prompt_contract_id") or "").strip()
@@ -2013,6 +2012,9 @@ def record_mf_subagent_startup(
         ("actual_git_root", actual_git_root),
         ("branch", branch),
         ("head_commit", head_commit),
+        ("base_commit", base_commit),
+        ("target_head_commit", target_head_commit),
+        ("merge_queue_id", merge_queue_id),
         ("route_id", route_id),
         ("route_context_hash", route_context_hash),
         ("prompt_contract_id", prompt_contract_id),
@@ -2051,6 +2053,13 @@ def record_mf_subagent_startup(
             message="mf_subagent startup worker_id must match branch runtime context",
             context=context,
             details={"worker_id": worker_id, "expected_worker_id": context.worker_id},
+        )
+    if context.agent_id and agent_id != context.agent_id:
+        return _startup_blocker(
+            blocker_id="agent_id_mismatch",
+            message="mf_subagent startup agent_id must match branch runtime context",
+            context=context,
+            details={"agent_id": agent_id, "expected_agent_id": context.agent_id},
         )
     try:
         _require_current_fence(context, fence_token)
@@ -2132,8 +2141,7 @@ def record_mf_subagent_startup(
                 "expected_target_head_commit": context.target_head_commit,
             },
         )
-    merge_queue_id = str(payload.get("merge_queue_id") or "").strip()
-    if context.merge_queue_id and merge_queue_id and merge_queue_id != context.merge_queue_id:
+    if context.merge_queue_id and merge_queue_id != context.merge_queue_id:
         return _startup_blocker(
             blocker_id="merge_queue_id_mismatch",
             message="mf_subagent startup merge_queue_id must match branch runtime context",
