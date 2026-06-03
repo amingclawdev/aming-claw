@@ -66,6 +66,13 @@ claimed command so the observer does not repeatedly re-plan the same open
 claim. ServiceManager may supervise optional advanced chain/executor flows, but
 it is not required for this standalone poll path.
 
+Claimed `execute_backlog_row` commands have a startup safety net. If the owner
+session is still connected but the command remains claim-owned past four
+heartbeat intervals without durable `mf_subagent_startup` evidence or a
+terminal dispatch blocker, a fallback observer may take it over. The takeover
+records `claimed_to_startup_timeout` in the command result so operators can fail
+or close the stuck command without the original owner token.
+
 ## Principles
 
 1. **Observer uses the governance control plane, not direct DB access**: All operations go through MCP tools or the REST API — do not read or write the DB directly.

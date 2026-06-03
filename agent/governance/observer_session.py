@@ -19,6 +19,8 @@ from typing import Any, Iterable
 HEARTBEAT_INTERVAL_SEC = 30
 IDLE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2
 STALE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 4
+CLAIMED_TO_STARTUP_TIMEOUT_SEC = STALE_AFTER_SEC
+CLAIMED_TO_STARTUP_TIMEOUT_STATUS = "claimed_to_startup_timeout"
 
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
@@ -174,6 +176,54 @@ def _json_loads_object(value: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _contains_actual_startup_evidence(value: Any) -> bool:
+    if isinstance(value, dict):
+        lowered = {str(key).lower(): item for key, item in value.items()}
+        if lowered.get("actual_startup_recorded") is True:
+            return True
+        if isinstance(lowered.get("startup_recording"), dict):
+            startup_recording = lowered["startup_recording"]
+            if startup_recording.get("recorded") is True:
+                return True
+
+        event_kind = str(
+            lowered.get("event_kind") or lowered.get("event_type") or ""
+        ).strip()
+        if event_kind == "mf_subagent_startup":
+            if lowered.get("recorded") is False or lowered.get("actual_startup_recorded") is False:
+                return False
+            return True
+
+        return any(_contains_actual_startup_evidence(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_actual_startup_evidence(item) for item in value)
+    return False
+
+
+def _contains_terminal_dispatch_blocker(value: Any) -> bool:
+    if isinstance(value, dict):
+        lowered = {str(key).lower(): item for key, item in value.items()}
+        for key in ("dispatch_blocker", "terminal_dispatch_blocker"):
+            if key in lowered and bool(lowered[key]):
+                return True
+
+        gate = lowered.get("dispatch_gate_validation")
+        if isinstance(gate, dict) and gate.get("allowed") is False:
+            if gate.get("error") or gate.get("status") or gate.get("blocker"):
+                return True
+
+        event_kind = str(
+            lowered.get("event_kind") or lowered.get("event_type") or ""
+        ).strip()
+        if event_kind in {"dispatch_blocker", "terminal_dispatch_blocker"}:
+            return True
+
+        return any(_contains_terminal_dispatch_blocker(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_terminal_dispatch_blocker(item) for item in value)
+    return False
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
 
@@ -238,6 +288,62 @@ def _command_row_to_dict(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data["payload"] = _json_loads_object(data.get("payload_json"))
     data["result"] = _json_loads_object(data.get("result_json"))
     return data
+
+
+def _command_result(command: dict[str, Any]) -> dict[str, Any]:
+    result = command.get("result")
+    if isinstance(result, dict):
+        return dict(result)
+    return _json_loads_object(str(command.get("result_json") or "{}"))
+
+
+def _command_has_startup_or_blocker_evidence(command: dict[str, Any]) -> bool:
+    result = _command_result(command)
+    if _contains_actual_startup_evidence(result):
+        return True
+    if _contains_terminal_dispatch_blocker(result):
+        return True
+    error = str(command.get("error") or "").lower()
+    return "dispatch_blocker" in error or "dispatch blocker" in error
+
+
+def _command_claim_age_sec(command: dict[str, Any], *, now: str) -> float | None:
+    claimed_at = _parse_utc(str(command.get("claimed_at") or ""))
+    now_dt = _parse_utc(now)
+    if not claimed_at or not now_dt:
+        return None
+    return max(0.0, (now_dt - claimed_at).total_seconds())
+
+
+def _claimed_execute_startup_timeout_status(
+    command: dict[str, Any] | None,
+    *,
+    now: str,
+) -> str:
+    if not command:
+        return ""
+    if str(command.get("command_type") or "") != COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
+        return ""
+    if str(command.get("status") or "") not in OWNED_COMMAND_STATUSES:
+        return ""
+    if _command_has_startup_or_blocker_evidence(command):
+        return ""
+    age = _command_claim_age_sec(command, now=now)
+    if age is None or age < CLAIMED_TO_STARTUP_TIMEOUT_SEC:
+        return ""
+    return CLAIMED_TO_STARTUP_TIMEOUT_STATUS
+
+
+def _merge_result_with_durable_takeover(
+    command: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    incoming = dict(result or {})
+    existing = _command_result(command)
+    for key in ("takeover", "takeover_status"):
+        if key not in incoming and key in existing:
+            incoming[key] = existing[key]
+    return incoming
 
 
 def _validate_command_payload(command_type: str, payload: Any) -> None:
@@ -860,13 +966,19 @@ def _owner_session_takeover_status(
     project_id: str,
     owner_session_id: str,
     now: str,
+    command: dict[str, Any] | None = None,
 ) -> str:
     if not owner_session_id:
         return "missing"
     row = _raw_session_row(conn, owner_session_id)
     if row is None or str(row["project_id"]) != project_id:
         return "missing"
-    return computed_session_status(row, now=now)
+    owner_status = computed_session_status(row, now=now)
+    if owner_status not in {"missing", "stale", SESSION_STATUS_CLOSED, SESSION_STATUS_REVOKED}:
+        startup_timeout = _claimed_execute_startup_timeout_status(command, now=now)
+        if startup_timeout:
+            return startup_timeout
+    return owner_status
 
 
 def takeover_command(
@@ -920,15 +1032,46 @@ def takeover_command(
         project_id=pid,
         owner_session_id=previous_session_id,
         now=timestamp,
+        command=command,
     )
-    if previous_status not in {"missing", "stale", SESSION_STATUS_CLOSED, SESSION_STATUS_REVOKED}:
+    takeover_allowed_statuses = {
+        "missing",
+        "stale",
+        SESSION_STATUS_CLOSED,
+        SESSION_STATUS_REVOKED,
+        CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
+    }
+    if previous_status not in takeover_allowed_statuses:
         raise ObserverCommandConflict(
             f"observer command owner is not stale: {previous_status}"
         )
 
+    takeover = {
+        "previous_session_id": previous_session_id,
+        "previous_session_status": previous_status,
+        "reason": takeover_reason,
+        "taken_over_at": timestamp,
+    }
+    if previous_status == CLAIMED_TO_STARTUP_TIMEOUT_STATUS:
+        takeover.update(
+            {
+                "claimed_at": str(command.get("claimed_at") or ""),
+                "timeout_sec": CLAIMED_TO_STARTUP_TIMEOUT_SEC,
+                "startup_evidence": "missing",
+            }
+        )
+    result_payload = _command_result(command)
+    result_payload["takeover"] = takeover
+    result_payload["takeover_status"] = {
+        "status": previous_status,
+        "takeover_eligible": True,
+        "taken_over_at": timestamp,
+        "reason": takeover_reason,
+    }
+
     cursor = conn.execute(
         """UPDATE observer_command_queue
-              SET status = ?, claimed_by_session_id = ?, claimed_at = ?
+              SET status = ?, claimed_by_session_id = ?, claimed_at = ?, result_json = ?
             WHERE project_id = ?
               AND command_id = ?
               AND status IN (?, ?)
@@ -937,6 +1080,7 @@ def takeover_command(
             COMMAND_STATUS_CLAIMED,
             sid,
             timestamp,
+            _json_dumps(result_payload),
             pid,
             cid,
             COMMAND_STATUS_CLAIMED,
@@ -953,12 +1097,7 @@ def takeover_command(
         "project_id": pid,
         "observer_session_id": sid,
         "command": get_command(conn, project_id=pid, command_id=cid),
-        "takeover": {
-            "previous_session_id": previous_session_id,
-            "previous_session_status": previous_status,
-            "reason": takeover_reason,
-            "taken_over_at": timestamp,
-        },
+        "takeover": takeover,
     }
 
 
@@ -1041,7 +1180,7 @@ def complete_command(
         now=timestamp,
     )
     _ensure_command_owned_by_session(command, session_id=sid, action="complete")
-    result_payload = result or {}
+    result_payload = _merge_result_with_durable_takeover(command, result)
     conn.execute(
         """UPDATE observer_command_queue
               SET status = ?, completed_at = ?, result_json = ?, error = ''
@@ -1086,6 +1225,7 @@ def fail_command(
         now=timestamp,
     )
     _ensure_command_owned_by_session(command, session_id=sid, action="fail")
+    result_payload = _merge_result_with_durable_takeover(command, result)
     conn.execute(
         """UPDATE observer_command_queue
               SET status = ?, completed_at = ?, result_json = ?, error = ?
@@ -1093,7 +1233,7 @@ def fail_command(
         (
             COMMAND_STATUS_FAILED,
             timestamp,
-            _json_dumps(result or {}),
+            _json_dumps(result_payload),
             (error or "").strip(),
             pid,
             command_id,
