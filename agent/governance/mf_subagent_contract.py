@@ -1008,6 +1008,11 @@ def _governed_nontrivial_graph_required(
         return True
     if _parent_route_required(payload):
         return True
+    if any(
+        _normalized_action(value) in _PARALLEL_ROUTE_TOPOLOGIES
+        for value in _route_topology_values(payload)
+    ):
+        return True
     for container in _route_machine_containers(payload):
         if any(_bool(container.get(key)) for key in _GOVERNED_NONTRIVIAL_KEYS):
             return True

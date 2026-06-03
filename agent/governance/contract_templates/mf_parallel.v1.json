@@ -274,7 +274,9 @@
         "governed_nontrivial",
         "judge_routed",
         "parent_route_required",
-        "parent_route_lineage_present"
+        "parent_route_lineage_present",
+        "mf_parallel.v1",
+        "observer_led_parallel_lanes"
       ],
       "required_context_fields": [
         "task_id",
@@ -291,7 +293,9 @@
       "required_for": [
         "governed_nontrivial",
         "judge_routed",
-        "parent_route_required"
+        "parent_route_required",
+        "mf_parallel.v1",
+        "observer_led_parallel_lanes"
       ],
       "valid_registration_refs": [
         "/api/graph-governance/{project_id}/parallel-branches/allocate",
@@ -313,13 +317,38 @@
       "required_for": [
         "governed_nontrivial",
         "judge_routed",
-        "parent_route_required"
+        "parent_route_required",
+        "mf_parallel.v1",
+        "observer_led_parallel_lanes"
       ],
       "valid_evidence": [
         "dispatch_command_ref + monitor_ref",
         "documented_host_adapter_boundary + boundary_documentation_ref"
       ],
       "description": "Observer-to-subagent service dispatch must be replayable from command/monitor refs or documented as a host-adapter boundary before governed handoff."
+    },
+    "runtime_text_service": {
+      "schema_version": "observer_runtime_text_service.v1",
+      "required_for": [
+        "host_created_mf_sub_worker",
+        "codex_mf_sub_worker",
+        "mf_parallel.v1",
+        "parent_route_required"
+      ],
+      "entrypoints": [
+        "aming-claw observer runtime-text prepare --json-output",
+        "MCP observer_runtime_text_prepare",
+        "POST /api/projects/{project_id}/observer/runtime-text/prepare"
+      ],
+      "persistence_policy": {
+        "raw_launch_text_persisted": false,
+        "persistent_fields": [
+          "runtime_context_id",
+          "launch_text_hash"
+        ]
+      },
+      "public_boundary": "Worker prompts may include bounded route identity, file fences, branch/runtime identity, and evidence contracts. Raw private route/context-pack content must not be embedded in generated prompts, timeline rows, or persisted evidence.",
+      "description": "Prepares launch text for host/Codex-created mf_sub workers without invoking a model, ServiceManager, or executor worker. Governed dispatch still requires parent_route_lineage, graph_trace_evidence, branch_runtime_evidence, and observer_subagent_service_dispatch evidence."
     },
     "self_precheck": {
       "required": true,

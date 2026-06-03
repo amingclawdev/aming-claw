@@ -134,6 +134,7 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "observer_command_takeover",
         "observer_command_complete",
         "observer_command_fail",
+        "observer_runtime_text_prepare",
     }.issubset(names)
 
 
@@ -704,6 +705,46 @@ def test_mcp_observer_command_tools_route_to_governance_api():
             {"session_token": "tok"},
         ),
     ]
+
+
+def test_mcp_observer_runtime_text_prepare_is_local_dry_run(tmp_path):
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    main = tmp_path / "main"
+    main.mkdir()
+
+    result = dispatcher.dispatch(
+        "observer_runtime_text_prepare",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-RUNTIME-TEXT",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-runtime",
+            "prompt_contract_hash": "sha256:prompt",
+            "route_id": "route-runtime",
+            "visible_injection_manifest_hash": "sha256:visible",
+            "main_worktree": str(main),
+            "workspace_root": str(tmp_path / "workers"),
+            "owned_files": ["agent/observer_runtime.py"],
+            "task_id": "AC-RUNTIME-TEXT-impl-1",
+            "parent_task_id": "AC-RUNTIME-TEXT",
+            "merge_queue_id": "mq-runtime-text",
+            "fence_token": "fence-runtime-text",
+            "graph_trace_ids": ["gqt-runtime-text"],
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+        },
+    )
+
+    assert recorder.calls == []
+    assert result["ok"] is True
+    assert result["calls_models"] is False
+    assert result["service_manager_required"] is False
+    assert result["executor_worker_required"] is False
+    assert result["runtime_context_id"].startswith("orctx-")
+    assert result["launch_text"]
+    assert result["launch_text_hash"].startswith("sha256:")
+    assert result["raw_launch_text_persisted"] is False
 
 
 def test_mcp_graph_tools_route_to_governance_api():

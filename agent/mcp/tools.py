@@ -344,6 +344,42 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_runtime_text_prepare",
+        "description": "Prepare runtime launch text for a host-created mf_sub worker. Dry-run only: no model call, no ServiceManager/executor spawn, and no raw launch text persistence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "route_context_hash": {"type": "string"},
+                "prompt_contract_id": {"type": "string"},
+                "prompt_contract_hash": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "route_id": {"type": "string"},
+                "precheck_run_id": {"type": "string"},
+                "visible_injection_manifest_hash": {"type": "string"},
+                "main_worktree": {"type": "string"},
+                "workspace_root": {"type": "string"},
+                "owned_files": {"type": "array", "items": {"type": "string"}},
+                "task_id": {"type": "string"},
+                "parent_task_id": {"type": "string"},
+                "worker_id": {"type": "string"},
+                "attempt": {"type": "integer"},
+                "worktree_root": {"type": "string"},
+                "branch_prefix": {"type": "string"},
+                "merge_queue_id": {"type": "string"},
+                "fence_token": {"type": "string"},
+                "graph_trace_ids": {"type": "array", "items": {"type": "string"}},
+                "base_commit": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "prompt": {"type": "string"},
+                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "test_commands": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["project_id", "backlog_id", "route_context_hash", "prompt_contract_id"],
+        },
+    },
+    {
         "name": "task_hold",
         "description": "Put a queued task into observer_hold state — pauses executor pickup and auto-chain progression. Use before claiming a task for manual review.",
         "inputSchema": {
@@ -1429,6 +1465,51 @@ class ToolDispatcher:
             if args.get("result"):
                 body["result"] = args["result"]
             return self._api("POST", f"/api/projects/{pid}/observer-commands/{cid}/fail", body)
+
+        if name == "observer_runtime_text_prepare":
+            from agent.ai_invocation import RoutePromptContract
+            from agent.observer_runtime import (
+                ObserverRuntimeTextPrepareRequest,
+                build_observer_runtime_text_context,
+            )
+
+            request = ObserverRuntimeTextPrepareRequest(
+                project_id=str(args["project_id"]),
+                backlog_id=str(args["backlog_id"]),
+                route=RoutePromptContract(
+                    route_context_hash=str(args.get("route_context_hash") or ""),
+                    prompt_contract_id=str(args.get("prompt_contract_id") or ""),
+                    prompt_contract_hash=str(args.get("prompt_contract_hash") or ""),
+                    route_token_ref=str(args.get("route_token_ref") or ""),
+                ),
+                main_worktree=str(args.get("main_worktree") or self._workspace),
+                workspace_root=str(args.get("workspace_root") or ""),
+                owned_files=tuple(str(item) for item in (args.get("owned_files") or [])),
+                task_id=str(args.get("task_id") or ""),
+                parent_task_id=str(args.get("parent_task_id") or ""),
+                worker_id=str(args.get("worker_id") or ""),
+                attempt=int(args.get("attempt") or 1),
+                worktree_root=str(args.get("worktree_root") or ".worktrees"),
+                branch_prefix=str(args.get("branch_prefix") or "runtime-text"),
+                merge_queue_id=str(args.get("merge_queue_id") or ""),
+                fence_token=str(args.get("fence_token") or ""),
+                graph_trace_ids=tuple(
+                    str(item) for item in (args.get("graph_trace_ids") or [])
+                ),
+                base_commit=str(args.get("base_commit") or ""),
+                target_head_commit=str(args.get("target_head_commit") or ""),
+                prompt=str(args.get("prompt") or ""),
+                acceptance_criteria=tuple(
+                    str(item) for item in (args.get("acceptance_criteria") or [])
+                ),
+                test_commands=tuple(str(item) for item in (args.get("test_commands") or [])),
+                route_id=str(args.get("route_id") or ""),
+                precheck_run_id=str(args.get("precheck_run_id") or ""),
+                visible_injection_manifest_hash=str(
+                    args.get("visible_injection_manifest_hash") or ""
+                ),
+            )
+            return build_observer_runtime_text_context(request)
 
         if name == "task_hold":
             pid = args["project_id"]

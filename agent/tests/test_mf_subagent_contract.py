@@ -105,6 +105,12 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
     branch_runtime = worker_contract["branch_runtime"]
     assert branch_runtime["schema_version"] == BRANCH_RUNTIME_SCHEMA_VERSION
     assert "parallel-branches/allocate" in branch_runtime["valid_registration_refs"][0]
+    runtime_text = worker_contract["runtime_text_service"]
+    assert runtime_text["schema_version"] == "observer_runtime_text_service.v1"
+    assert "aming-claw observer runtime-text prepare --json-output" in runtime_text["entrypoints"]
+    assert runtime_text["persistence_policy"]["raw_launch_text_persisted"] is False
+    assert "launch_text_hash" in runtime_text["persistence_policy"]["persistent_fields"]
+    assert "raw private route/context-pack content" in runtime_text["public_boundary"].lower()
 
     timeline_contract = template["timeline_contract"]
     assert "payload.graph_trace_ids" in timeline_contract["trace_id_locations"]
@@ -430,6 +436,29 @@ def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
         == SERVICE_DISPATCH_SCHEMA_VERSION
     )
     assert evidence["service_dispatch_evidence"]["replayable_refs_present"] is True
+
+
+def test_dispatch_gate_requires_governed_evidence_for_mf_parallel_topology() -> None:
+    with pytest.raises(MfSubagentContractError, match="graph trace evidence"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(selected_topology="mf_parallel.v1"),
+            target_worktree_path="/repo",
+        )
+
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            selected_topology="mf_parallel.v1",
+            graph_trace_evidence=_graph_trace_evidence(),
+            branch_runtime_evidence=_branch_runtime_evidence(),
+            service_dispatch_evidence=_service_dispatch_evidence(),
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["governed_evidence_required"] is True
+    assert evidence["graph_trace_evidence"]["query_source"] == "mf_subagent"
+    assert evidence["branch_runtime_evidence"]["registered"] is True
+    assert evidence["service_dispatch_evidence"]["present"] is True
 
 
 def test_dispatch_gate_rejects_governed_work_without_graph_trace() -> None:

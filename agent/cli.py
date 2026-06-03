@@ -1191,6 +1191,132 @@ def observer_dogfood(
         raise click.exceptions.Exit(1)
 
 
+@observer.group("runtime-text")
+def observer_runtime_text():
+    """Observer runtime text preparation."""
+    pass
+
+
+@observer_runtime_text.command("prepare")
+@click.option("--project-id", required=True, help="Governance project id.")
+@click.option("--backlog-id", required=True, help="Backlog id for the bounded worker.")
+@click.option("--route-context-hash", required=True, help="Route context hash for this worker launch.")
+@click.option("--prompt-contract-id", required=True, help="Prompt contract id for this worker launch.")
+@click.option("--prompt-contract-hash", default="", help="Optional prompt contract hash.")
+@click.option("--route-token-ref", default="", help="Optional route token id/ref.")
+@click.option("--route-id", default="", help="Parent route id for route-owned evidence.")
+@click.option("--precheck-run-id", default="", help="Optional route/topology precheck id.")
+@click.option("--visible-injection-manifest-hash", default="", help="Public-safe visible injection manifest hash.")
+@click.option("--main-worktree", default="", help="Target/main worktree path blocked by dispatch policy. Defaults to cwd.")
+@click.option("--workspace-root", default="", help="Parent workspace root for generated worker worktrees. Defaults to main worktree parent.")
+@click.option("--owned-file", "owned_files", multiple=True, help="Owned file fence for the worker. Repeatable.")
+@click.option("--task-id", default="", help="Worker task id. Defaults to backlog id.")
+@click.option("--parent-task-id", default="", help="Parent observer/MF task id. Defaults to backlog id.")
+@click.option("--worker-id", default="", help="Worker id used in deterministic worktree planning.")
+@click.option("--attempt", default=1, type=int, help="Worker attempt number.")
+@click.option("--worktree-root", default=".worktrees", help="Worktree root under workspace-root.")
+@click.option("--branch-prefix", default="runtime-text", help="Generated branch prefix.")
+@click.option("--merge-queue-id", default="", help="Merge queue id. Defaults to a deterministic runtime-text id.")
+@click.option("--fence-token", default="", help="Fence token. Defaults to a deterministic runtime-text token.")
+@click.option("--graph-trace-id", "graph_trace_ids", multiple=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
+@click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
+@click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
+@click.option("--acceptance-criterion", "acceptance_criteria", multiple=True, help="Acceptance criterion for the worker contract. Repeatable.")
+@click.option("--test-command", "test_commands", multiple=True, help="Focused test command for the worker contract. Repeatable.")
+@click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Optional worker prompt file.",
+)
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def observer_runtime_text_prepare(
+    project_id,
+    backlog_id,
+    route_context_hash,
+    prompt_contract_id,
+    prompt_contract_hash,
+    route_token_ref,
+    route_id,
+    precheck_run_id,
+    visible_injection_manifest_hash,
+    main_worktree,
+    workspace_root,
+    owned_files,
+    task_id,
+    parent_task_id,
+    worker_id,
+    attempt,
+    worktree_root,
+    branch_prefix,
+    merge_queue_id,
+    fence_token,
+    graph_trace_ids,
+    base_commit,
+    target_head_commit,
+    acceptance_criteria,
+    test_commands,
+    prompt_file,
+    json_output,
+):
+    """Prepare runtime launch text for a host-created mf_sub worker."""
+    from agent.ai_invocation import RoutePromptContract
+    from agent.observer_runtime import (
+        ObserverRuntimeTextPrepareRequest,
+        build_observer_runtime_text_context,
+    )
+
+    prompt = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else ""
+    request = ObserverRuntimeTextPrepareRequest(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route=RoutePromptContract(
+            route_context_hash=route_context_hash,
+            prompt_contract_id=prompt_contract_id,
+            prompt_contract_hash=prompt_contract_hash,
+            route_token_ref=route_token_ref,
+        ),
+        main_worktree=main_worktree or os.getcwd(),
+        workspace_root=workspace_root,
+        owned_files=tuple(owned_files),
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_id=worker_id,
+        attempt=attempt,
+        worktree_root=worktree_root,
+        branch_prefix=branch_prefix,
+        merge_queue_id=merge_queue_id,
+        fence_token=fence_token,
+        graph_trace_ids=tuple(graph_trace_ids),
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        prompt=prompt,
+        acceptance_criteria=tuple(acceptance_criteria),
+        test_commands=tuple(test_commands),
+        route_id=route_id,
+        precheck_run_id=precheck_run_id,
+        visible_injection_manifest_hash=visible_injection_manifest_hash,
+    )
+    result = build_observer_runtime_text_context(request)
+    if json_output:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            f"observer runtime-text prepare: {result.get('status')} "
+            f"project={project_id} backlog={backlog_id}"
+        )
+        click.echo(f"runtime_context_id: {result.get('runtime_context_id')}")
+        click.echo(f"launch_text_hash: {result.get('launch_text_hash')}")
+        if not result.get("ok"):
+            validation = result.get("dispatch_gate_validation") or {}
+            click.echo(
+                f"error: {result.get('input_error') or validation.get('error') or 'runtime text rejected'}",
+                err=True,
+            )
+    if not result.get("ok"):
+        raise click.exceptions.Exit(1)
+
+
 @main.group()
 def mf():
     """Manual-fix workflow checks."""

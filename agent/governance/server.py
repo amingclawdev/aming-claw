@@ -18115,6 +18115,54 @@ def handle_runtime(ctx: RequestContext):
     }
 
 
+@route("POST", "/api/projects/{project_id}/observer/runtime-text/prepare")
+def handle_observer_runtime_text_prepare(ctx: RequestContext):
+    """Prepare host/Codex mf_sub launch text without persistence or model calls."""
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    from agent.ai_invocation import RoutePromptContract
+    from agent.observer_runtime import (
+        ObserverRuntimeTextPrepareRequest,
+        build_observer_runtime_text_context,
+    )
+
+    request = ObserverRuntimeTextPrepareRequest(
+        project_id=project_id,
+        backlog_id=str(body.get("backlog_id") or ""),
+        route=RoutePromptContract(
+            route_context_hash=str(body.get("route_context_hash") or ""),
+            prompt_contract_id=str(body.get("prompt_contract_id") or ""),
+            prompt_contract_hash=str(body.get("prompt_contract_hash") or ""),
+            route_token_ref=str(body.get("route_token_ref") or ""),
+        ),
+        main_worktree=str(body.get("main_worktree") or body.get("workspace") or ""),
+        workspace_root=str(body.get("workspace_root") or ""),
+        owned_files=tuple(str(item) for item in (body.get("owned_files") or [])),
+        task_id=str(body.get("task_id") or ""),
+        parent_task_id=str(body.get("parent_task_id") or ""),
+        worker_id=str(body.get("worker_id") or ""),
+        attempt=int(body.get("attempt") or 1),
+        worktree_root=str(body.get("worktree_root") or ".worktrees"),
+        branch_prefix=str(body.get("branch_prefix") or "runtime-text"),
+        merge_queue_id=str(body.get("merge_queue_id") or ""),
+        fence_token=str(body.get("fence_token") or ""),
+        graph_trace_ids=tuple(str(item) for item in (body.get("graph_trace_ids") or [])),
+        base_commit=str(body.get("base_commit") or ""),
+        target_head_commit=str(body.get("target_head_commit") or ""),
+        prompt=str(body.get("prompt") or ""),
+        acceptance_criteria=tuple(
+            str(item) for item in (body.get("acceptance_criteria") or [])
+        ),
+        test_commands=tuple(str(item) for item in (body.get("test_commands") or [])),
+        route_id=str(body.get("route_id") or ""),
+        precheck_run_id=str(body.get("precheck_run_id") or ""),
+        visible_injection_manifest_hash=str(
+            body.get("visible_injection_manifest_hash") or ""
+        ),
+    )
+    return build_observer_runtime_text_context(request)
+
+
 @route("POST", "/api/task/{project_id}/progress")
 def handle_task_progress(ctx: RequestContext):
     """Update task progress heartbeat."""

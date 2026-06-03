@@ -786,6 +786,66 @@ def test_observer_dogfood_generated_worker_workspace_differs_from_main(tmp_path)
     assert worker_workspace != main_worktree.resolve()
 
 
+def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_path):
+    runner = CliRunner()
+    main_worktree = tmp_path / "main"
+    main_worktree.mkdir(parents=True)
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "runtime-text",
+            "prepare",
+            "--project-id",
+            "aming-claw",
+            "--backlog-id",
+            DOGFOOD_BACKLOG_ID,
+            "--route-context-hash",
+            DOGFOOD_ROUTE_CONTEXT_HASH,
+            "--prompt-contract-id",
+            DOGFOOD_PROMPT_CONTRACT_ID,
+            "--prompt-contract-hash",
+            "sha256:prompt-contract",
+            "--route-id",
+            "route-20260603-runtime-text",
+            "--visible-injection-manifest-hash",
+            DOGFOOD_VISIBLE_MANIFEST_HASH,
+            "--main-worktree",
+            str(main_worktree),
+            "--workspace-root",
+            str(tmp_path / "workers"),
+            "--owned-file",
+            "agent/observer_runtime.py",
+            "--task-id",
+            f"{DOGFOOD_BACKLOG_ID}-impl-1",
+            "--parent-task-id",
+            DOGFOOD_BACKLOG_ID,
+            "--merge-queue-id",
+            "mq-runtime-text-test",
+            "--fence-token",
+            "fence-runtime-text-test",
+            "--graph-trace-id",
+            "gqt-runtime-text-test",
+            "--base-commit",
+            "base123",
+            "--target-head-commit",
+            "target123",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["runtime_context_id"].startswith("orctx-")
+    assert payload["launch_text"]
+    assert payload["launch_text_hash"].startswith("sha256:")
+    assert payload["raw_launch_text_persisted"] is False
+    assert payload["persistent_evidence"]["launch_text_hash"] == payload["launch_text_hash"]
+    assert "launch_text" not in payload["persistent_evidence"]
+
+
 def _git(args: list[str], cwd):
     proc = subprocess.run(
         ["git", *args],
@@ -1535,6 +1595,7 @@ class TestCliMf:
             "route_context_hash": "sha256:test-route-context",
             "prompt_contract_id": "prompt-contract-test",
             "prompt_contract_hash": "sha256:test-prompt-contract",
+            "visible_injection_manifest_hash": "sha256:test-visible-manifest",
         }
         route_path = tmp_path / "route.json"
         route_path.write_text(json.dumps({
