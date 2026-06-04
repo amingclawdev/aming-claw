@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS graph_query_events (
 QUERY_SOURCES = {
     "dashboard",
     "observer",
+    "qa",
     "mf_subagent",
     "ai_semantic_review",
     "ai_global_review",
@@ -75,6 +76,7 @@ QUERY_PURPOSES = {
     "prompt_context_build",
     "subagent_context_build",
     "gate_validation",
+    "independent_verification",
     "subagent_gate_validation",
     "user_feedback",
     "backlog_filing",
@@ -212,6 +214,12 @@ DEFAULT_BUDGETS: dict[str, dict[str, int]] = {
         "max_file_excerpt_chars": 0,
     },
     "mf_subagent": {
+        "max_queries": 30,
+        "max_result_nodes": 800,
+        "max_result_chars": 80_000,
+        "max_file_excerpt_chars": 20_000,
+    },
+    "qa": {
         "max_queries": 30,
         "max_result_nodes": 800,
         "max_result_chars": 80_000,

@@ -832,6 +832,19 @@ def build_mf_subagent_runtime_contract_view(
             ],
             "trace_ids_required_in_timeline": True,
         },
+        "read_receipt_ordering": {
+            "schema_version": "mf_subagent_read_receipt_ordering.v1",
+            "timeline_event_kind": "mf_subagent_read_receipt",
+            "required_before": [
+                "graph_query",
+                "startup",
+                "implementation",
+                "verification",
+                "close_ready",
+            ],
+            "close_sensitive": True,
+            "post_hoc_receipt_satisfies_gate": False,
+        },
         "service_routes": {
             "runtime_contract": (
                 "/api/graph-governance/{project_id}/parallel-branches/"

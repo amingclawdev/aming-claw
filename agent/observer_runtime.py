@@ -1556,6 +1556,15 @@ def _runtime_text_graph_first_obligations(
     return {
         "schema_version": "mf_subagent_graph_first_obligations.v1",
         "required": True,
+        "read_receipt_required_before": [
+            "graph_query",
+            "startup",
+            "implementation",
+            "verification",
+            "close_ready",
+        ],
+        "read_receipt_timeline_event_kind": "mf_subagent_read_receipt",
+        "post_hoc_read_receipt_satisfies_gate": False,
         "query": {
             "project_id": project_id,
             "query_source": "mf_subagent",
@@ -1566,6 +1575,7 @@ def _runtime_text_graph_first_obligations(
             "fence_token": fence_token,
         },
         "minimum_before_edit": [
+            "record mf_subagent_read_receipt for the visible route contract",
             "graph_query tool=query_schema",
             "graph_query tool=find_node_by_path for owned files",
         ],
@@ -1628,6 +1638,10 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "Persistent evidence must store runtime_context_id and launch_text_hash "
         "only; raw launch text is returned to the host for launch and must not be "
         "persisted in timeline evidence.\n\n"
+        "Before graph query, startup, implementation, verification, or close-ready "
+        "evidence can satisfy close-sensitive gates, record an "
+        "mf_subagent_read_receipt for this visible route contract. A post-hoc "
+        "read receipt after counted evidence does not satisfy the ordering gate.\n\n"
         "Runtime contract JSON:\n"
         + json.dumps(payload, indent=2, sort_keys=True)
     )

@@ -807,16 +807,37 @@ def mf_subagent_read_receipt_gate_verification(
     first_read = min(read_receipts, default=None, key=lambda item: (item[0], item[1]))
     first_counted = min(counted, default=None, key=lambda item: (item[0], item[1]))
     required = bool(counted)
+    read_receipt_order = (first_read[0], first_read[1]) if first_read else None
+    first_counted_order = (first_counted[0], first_counted[1]) if first_counted else None
+    missing_receipt = bool(required and first_read is None)
+    out_of_order = bool(
+        required
+        and read_receipt_order is not None
+        and first_counted_order is not None
+        and read_receipt_order > first_counted_order
+    )
     passed = not required or (
         first_read is not None
         and first_counted is not None
-        and (first_read[0], first_read[1]) <= (first_counted[0], first_counted[1])
+        and read_receipt_order <= first_counted_order
     )
+    status = "passed"
+    failure_reason = ""
+    if not passed:
+        if missing_receipt:
+            status = "missing"
+            failure_reason = "worker_read_receipt_missing_before_counted_evidence"
+        elif out_of_order:
+            status = "out_of_order"
+            failure_reason = "worker_read_receipt_recorded_after_counted_evidence"
+        else:
+            status = "failed"
+            failure_reason = "worker_read_receipt_order_gate_failed"
     return {
         "schema_version": MF_SUBAGENT_READ_RECEIPT_GATE_SCHEMA_VERSION,
         "required": required,
         "passed": passed,
-        "status": "passed" if passed else "missing",
+        "status": status,
         "read_receipt_event_id": first_read[2].get("id") if first_read else None,
         "read_receipt_hash": (
             _read_receipt_hash_from_container(_mapping(first_read[2].get("payload")))
@@ -834,6 +855,12 @@ def mf_subagent_read_receipt_gate_verification(
             if passed
             else "worker_read_receipt_must_precede_graph_query_write_startup_evidence"
         ),
+        "failure_reason": failure_reason,
+        "read_receipt_precedes_counted_evidence": bool(passed and required),
+        "read_receipt_order": list(read_receipt_order) if read_receipt_order else [],
+        "first_counted_evidence_order": list(first_counted_order)
+        if first_counted_order
+        else [],
     }
 
 
@@ -2774,6 +2801,12 @@ def mf_close_gate_verification(
         phase = str(event.get("phase") or "").strip()
         status = str(event.get("status") or "").strip().lower()
         key = kind or phase
+        if (
+            key not in MF_CLOSE_REQUIRED_EVENT_KINDS
+            and phase == "verification"
+            and kind in {"qa_verification", "independent_verification"}
+        ):
+            key = "verification"
         if key in MF_CLOSE_REQUIRED_EVENT_KINDS and status in MF_CLOSE_PASS_STATUSES:
             present.add(key)
         elif key in MF_CLOSE_REQUIRED_EVENT_KINDS:

@@ -2104,6 +2104,53 @@ class TestTaskTimeline(unittest.TestCase):
             projection["read_receipt_gate"]["missing_reason"],
             "worker_read_receipt_must_precede_graph_query_write_startup_evidence",
         )
+        self.assertEqual(
+            projection["read_receipt_gate"]["failure_reason"],
+            "worker_read_receipt_missing_before_counted_evidence",
+        )
+
+    def test_contract_projection_rejects_post_hoc_read_receipt(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:contract-projection-late-receipt"
+        events = [
+            {
+                "id": 10,
+                "event_type": "mf_subagent.graph_query",
+                "event_kind": "graph_query",
+                "phase": "implementation",
+                "status": "passed",
+                "payload": {
+                    "graph_trace_ids": ["gqt-test"],
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
+            },
+            _mf_subagent_read_receipt_event(event_id=11, contract_hash=contract_hash),
+            {"id": 12, "event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"id": 13, "event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-LATE-READ-RECEIPT",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+
+        gate = task_timeline.mf_subagent_read_receipt_gate_verification(events)
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(gate["passed"], gate)
+        self.assertEqual(gate["status"], "out_of_order")
+        self.assertEqual(
+            gate["failure_reason"],
+            "worker_read_receipt_recorded_after_counted_evidence",
+        )
+        self.assertEqual(gate["first_counted_evidence_event_id"], 10)
+        self.assertEqual(gate["read_receipt_event_id"], 11)
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["contract_projection_gate"]["read_receipt_gate_status"],
+            "out_of_order",
+        )
 
     def test_mf_close_gate_requires_instantiated_contract_evidence(self):
         from agent.governance import task_timeline
@@ -2345,6 +2392,69 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertTrue(ready["passed"], ready)
         self.assertEqual(ready["contract_projection_gate"]["status"], "passed")
         self.assertEqual(ready["checks"]["mf_subagent_read_receipt_gate"], "passed")
+
+    def test_20260604_dogfood_sequence_recognizes_read_receipt_and_qa_lane(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:dogfood-read-receipt-contract"
+        route_context, route_action, dispatch, startup = _route_context_consumption_events()
+        route_context["id"] = 1
+        route_action["id"] = 2
+        dispatch["id"] = 3
+        startup["id"] = 5
+        qa_verification = _route_context_qa_verification_event()
+        qa_verification["id"] = 7
+        events = [
+            route_context,
+            route_action,
+            dispatch,
+            _mf_subagent_read_receipt_event(event_id=4, contract_hash=contract_hash),
+            startup,
+            {
+                "id": 6,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                    "canonical_visible_contract_text_hash": contract_hash,
+                    "graph_trace_ids": ["gqt-20260604-dogfood"],
+                },
+            },
+            qa_verification,
+            {"id": 8, "event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-20260604-DOGFOOD",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["missing_event_kinds"], [])
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(
+            ready["route_context_gate"]["present_requirement_ids"],
+            [
+                "route_context",
+                "route_action_precheck",
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+                "independent_verification_lane",
+            ],
+        )
+        self.assertEqual(
+            ready["contract_projection"]["read_receipt_gate"]["status"],
+            "passed",
+        )
+        self.assertEqual(
+            ready["contract_projection"]["read_receipt_gate"][
+                "read_receipt_precedes_counted_evidence"
+            ],
+            True,
+        )
 
     def test_mf_parallel_close_gate_blocks_divergent_contract_projection(self):
         from agent.governance import task_timeline

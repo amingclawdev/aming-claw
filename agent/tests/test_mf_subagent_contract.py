@@ -227,6 +227,19 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
     assert view["runtime_context"]["worktree_path"] == "/repo/.worktrees/task-runtime-contract"
     assert view["contract"]["contract_change_policy"]["source_of_truth"] == "contract_service"
     assert view["contract"]["contract_change_policy"]["raw_prompt_as_runtime_source"] is False
+    assert view["contract"]["read_receipt_ordering"] == {
+        "schema_version": "mf_subagent_read_receipt_ordering.v1",
+        "timeline_event_kind": "mf_subagent_read_receipt",
+        "required_before": [
+            "graph_query",
+            "startup",
+            "implementation",
+            "verification",
+            "close_ready",
+        ],
+        "close_sensitive": True,
+        "post_hoc_receipt_satisfies_gate": False,
+    }
     assert view["contract"]["service_routes"]["finish_gate"].endswith(
         "/parallel-branches/finish-gate"
     )

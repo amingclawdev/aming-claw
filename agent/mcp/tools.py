@@ -764,8 +764,14 @@ TOOLS: list[dict] = [
                 "args": {"type": "object"},
                 "snapshot_id": {"type": "string"},
                 "actor": {"type": "string"},
-                "query_source": {"type": "string"},
-                "query_purpose": {"type": "string"},
+                "query_source": {
+                    "type": "string",
+                    "description": "Audited caller identity; use qa for independent QA verifier lanes.",
+                },
+                "query_purpose": {
+                    "type": "string",
+                    "description": "Audited query purpose; use independent_verification for QA verifier graph checks.",
+                },
                 "repo_root": {"type": "string"},
                 "project_root": {"type": "string"},
                 "task_id": {

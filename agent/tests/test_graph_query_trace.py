@@ -673,7 +673,9 @@ def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
         "limit": 25,
     }
     assert "observer" in result["result"]["query_sources"]
+    assert "qa" in result["result"]["query_sources"]
     assert "prompt_context_build" in result["result"]["query_purposes"]
+    assert "independent_verification" in result["result"]["query_purposes"]
     assert result["result"]["tools"]["high_function_degree"]["args"]["metric"]["enum"] == [
         "fan_in",
         "fan_out",
@@ -707,6 +709,29 @@ def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
         "search_semantic",
     }
     assert "query_schema" in contract_policy["caller_envelope_tools"]
+
+
+def test_qa_independent_verification_graph_query_is_first_class(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="codex-qa-verifier",
+        query_source="qa",
+        query_purpose="independent_verification",
+        tool="query_schema",
+        project_root=project_root,
+    )
+    trace = graph_query_trace.get_trace(conn, PID, result["trace_id"])["trace"]
+
+    assert result["ok"] is True
+    assert "qa" in result["result"]["query_sources"]
+    assert "independent_verification" in result["result"]["query_purposes"]
+    assert trace["actor"] == "codex-qa-verifier"
+    assert trace["query_source"] == "qa"
+    assert trace["query_purpose"] == "independent_verification"
 
 
 def test_snapshot_orphan_file_filter_excludes_attached_rows(conn, tmp_path):

@@ -168,6 +168,22 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["mf_subagent_input"]["role"] == "mf_sub"
     assert result["startup_echo_contract"]["required"] is True
     assert result["graph_first_obligations"]["query"]["query_source"] == "mf_subagent"
+    assert result["graph_first_obligations"]["read_receipt_required_before"] == [
+        "graph_query",
+        "startup",
+        "implementation",
+        "verification",
+        "close_ready",
+    ]
+    assert (
+        result["graph_first_obligations"]["read_receipt_timeline_event_kind"]
+        == "mf_subagent_read_receipt"
+    )
+    assert result["graph_first_obligations"]["post_hoc_read_receipt_satisfies_gate"] is False
+    assert "mf_subagent_read_receipt" in result["launch_text"]
+    assert "post-hoc read receipt after counted evidence does not satisfy" in result[
+        "launch_text"
+    ]
     assert result["finish_gate_contract"]["required"] is True
 
 
