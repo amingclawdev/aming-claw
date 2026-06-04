@@ -20068,13 +20068,22 @@ def _backlog_contract_summary(value: Any) -> dict:
             "contract_instance_id": "",
             "required_evidence_count": 0,
             "optional_evidence_count": 0,
+            "source_of_truth": "Contract/Revision/Event",
+            "projection_schema_version": "mf_contract_projection.v1",
+            "projection_status": "no_contract",
+            "projection_watermark": 0,
+            "stale": False,
+            "divergent": False,
+            "contract_hash": "",
         }
     try:
         from . import task_timeline
 
         requirements = task_timeline.mf_contract_requirements(contract)
+        projection = task_timeline.mf_contract_projection([], contract=contract)
     except Exception:
         requirements = []
+        projection = {}
     required = [item for item in requirements if item.get("required", True)]
     optional = [item for item in requirements if not item.get("required", True)]
     return {
@@ -20083,6 +20092,13 @@ def _backlog_contract_summary(value: Any) -> dict:
         "contract_instance_id": str(root.get("contract_instance_id") or ""),
         "required_evidence_count": len(required),
         "optional_evidence_count": len(optional),
+        "source_of_truth": "Contract/Revision/Event",
+        "projection_schema_version": str(projection.get("schema_version") or ""),
+        "projection_status": str(projection.get("status") or ""),
+        "projection_watermark": projection.get("projection_watermark", 0),
+        "stale": bool(projection.get("stale")),
+        "divergent": bool(projection.get("divergent")),
+        "contract_hash": str(projection.get("contract_hash") or ""),
     }
 
 

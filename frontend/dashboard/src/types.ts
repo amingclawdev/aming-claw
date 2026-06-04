@@ -689,6 +689,27 @@ export interface BacklogContractSummary {
   contract_instance_id?: string;
   required_evidence_count?: number;
   optional_evidence_count?: number;
+  source_of_truth?: string;
+  projection_schema_version?: string;
+  projection_status?: string;
+  projection_watermark?: string | number;
+  stale?: boolean;
+  divergent?: boolean;
+  contract_hash?: string;
+}
+
+export interface AgentTaskContractProjection {
+  schema_version?: string;
+  source_of_truth?: string;
+  projected_surfaces?: string[];
+  contract_derived_status?: string;
+  projection_watermark?: string | number;
+  status?: string;
+  stale?: boolean;
+  divergent?: boolean;
+  contract_hash?: string;
+  observed_contract_hashes?: string[];
+  read_receipt_gate?: Record<string, unknown>;
 }
 
 export interface TaskTimelineResponse {
@@ -726,6 +747,7 @@ export interface MfCloseTimelineGate {
   ignored_required_events?: Record<string, unknown>[];
   contract_gate?: MfContractGate;
   route_context_gate?: MfRouteContextGate;
+  contract_projection?: AgentTaskContractProjection;
   missing_evidence_groups?: MfMissingEvidenceGroups;
   route_context_reminder?: MfRouteContextReminder;
   checks?: Record<string, boolean | number | string>;

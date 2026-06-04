@@ -130,6 +130,20 @@ def _route_context_qa_verification_event():
     }
 
 
+def _mf_subagent_read_receipt_event(event_id=0, contract_hash=""):
+    payload = {"read_receipt_hash": "sha256:test-read-receipt"}
+    if contract_hash:
+        payload["canonical_visible_contract_text_hash"] = contract_hash
+    return {
+        "id": event_id,
+        "event_type": "mf_subagent.read_receipt",
+        "event_kind": "mf_subagent_read_receipt",
+        "phase": "startup",
+        "status": "accepted",
+        "payload": payload,
+    }
+
+
 def _route_context_architecture_review_event():
     return {
         "event_kind": "architecture_review",
@@ -2023,6 +2037,74 @@ class TestTaskTimeline(unittest.TestCase):
             ["close_ready", "implementation", "verification"],
         )
 
+    def test_contract_projection_reports_read_receipt_before_counted_evidence(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-CONTRACT-PROJECTION",
+            "canonical_visible_contract_text_hash": "sha256:contract-projection",
+        }
+        events = [
+            {
+                "id": 1,
+                "event_type": "mf_subagent.read_receipt",
+                "event_kind": "mf_subagent_read_receipt",
+                "phase": "startup",
+                "status": "accepted",
+                "payload": {"read_receipt_hash": "sha256:read-receipt"},
+            },
+            {
+                "id": 2,
+                "event_type": "mf_subagent.startup",
+                "event_kind": "mf_subagent_startup",
+                "phase": "startup_gate",
+                "status": "passed",
+                "payload": {"runtime_context_id": "mfrctx-test"},
+            },
+        ]
+
+        gate = task_timeline.mf_subagent_read_receipt_gate_verification(events)
+        projection = task_timeline.mf_contract_projection(events, contract)
+
+        self.assertTrue(gate["passed"], gate)
+        self.assertEqual(gate["read_receipt_event_id"], 1)
+        self.assertEqual(gate["first_counted_evidence_event_id"], 2)
+        self.assertEqual(projection["schema_version"], "mf_contract_projection.v1")
+        self.assertEqual(projection["source_of_truth"], "Contract/Revision/Event")
+        self.assertEqual(projection["projection_watermark"], 2)
+        self.assertEqual(projection["status"], "current")
+        self.assertFalse(projection["stale"])
+        self.assertFalse(projection["divergent"])
+        self.assertEqual(
+            projection["read_receipt_gate"]["read_receipt_hash"],
+            "sha256:read-receipt",
+        )
+
+    def test_contract_projection_marks_missing_read_receipt_stale(self):
+        from agent.governance import task_timeline
+
+        events = [
+            {
+                "id": 10,
+                "event_type": "mf_subagent.graph_query",
+                "event_kind": "graph_query",
+                "phase": "implementation",
+                "status": "passed",
+                "payload": {"graph_trace_ids": ["gqt-test"]},
+            }
+        ]
+
+        projection = task_timeline.mf_contract_projection(events, contract=None)
+
+        self.assertEqual(projection["status"], "no_contract")
+        self.assertTrue(projection["stale"])
+        self.assertFalse(projection["read_receipt_gate"]["passed"])
+        self.assertEqual(
+            projection["read_receipt_gate"]["missing_reason"],
+            "worker_read_receipt_must_precede_graph_query_write_startup_evidence",
+        )
+
     def test_mf_close_gate_requires_instantiated_contract_evidence(self):
         from agent.governance import task_timeline
 
@@ -2215,6 +2297,218 @@ class TestTaskTimeline(unittest.TestCase):
                 "mf_subagent_startup",
                 "independent_verification_lane",
             ],
+        )
+
+    def test_mf_parallel_close_gate_blocks_missing_read_receipt_for_contract_projection(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:contract-projection-current"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-READ-RECEIPT-GATE",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+        events = [
+            {
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {"canonical_visible_contract_text_hash": contract_hash},
+            },
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events(),
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["contract_projection_gate"]["missing_requirement_ids"],
+            ["contract_projection_current", "mf_subagent_read_receipt_gate"],
+        )
+        self.assertEqual(
+            blocked["contract_projection"]["read_receipt_gate"]["missing_reason"],
+            "worker_read_receipt_must_precede_graph_query_write_startup_evidence",
+        )
+        self.assertEqual(
+            blocked["missing_evidence_groups"]["groups"]["contract_projection"]["missing"],
+            ["contract_projection_current", "mf_subagent_read_receipt_gate"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [_mf_subagent_read_receipt_event(contract_hash=contract_hash), *events],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["contract_projection_gate"]["status"], "passed")
+        self.assertEqual(ready["checks"]["mf_subagent_read_receipt_gate"], "passed")
+
+    def test_mf_parallel_close_gate_blocks_divergent_contract_projection(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-DIVERGENT-PROJECTION",
+            "canonical_visible_contract_text_hash": "sha256:contract-current",
+        }
+        events = [
+            _mf_subagent_read_receipt_event(event_id=1),
+            {
+                "id": 2,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {"canonical_visible_contract_text_hash": "sha256:stale"},
+            },
+            {"id": 3, "event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"id": 4, "event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events(),
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertTrue(blocked["contract_projection"]["divergent"])
+        self.assertIn(
+            "contract_projection_not_divergent",
+            blocked["contract_projection_gate"]["missing_requirement_ids"],
+        )
+
+    def test_mf_close_gate_reports_missing_post_verification_actions(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_workflow_runtime.v1",
+            "contract_instance_id": "BUG-POST-VERIFY-ACTIONS",
+            "route_topology_policy": {"selected_topology": "lightweight_single_lane"},
+            "verification_route_policy": {
+                "post_verification_impact_actions": {
+                    "required": True,
+                    "actions": ["asset_inbox_binding"],
+                    "requires_observer": True,
+                }
+            },
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["post_verification_actions_gate"]["missing_actions"],
+            ["asset_inbox_binding"],
+        )
+        self.assertTrue(
+            blocked["post_verification_actions_gate"]["follow_up"]["required"]
+        )
+        self.assertEqual(
+            blocked["missing_evidence_groups"]["groups"]["post_verification_actions"][
+                "missing"
+            ],
+            ["asset_inbox_binding"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                {
+                    "event_kind": "close_ready",
+                    "phase": "close",
+                    "status": "accepted",
+                    "verification": {
+                        "post_verification_impact_actions": {
+                            "status": "follow_up_filed",
+                            "follow_up_filed": True,
+                            "actions": ["asset_inbox_binding"],
+                        }
+                    },
+                },
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(
+            ready["post_verification_actions_gate"]["present_actions"],
+            ["asset_inbox_binding"],
+        )
+
+    def test_mf_parallel_close_gate_accepts_child_startup_prompt_contract_lineage(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-CHILD-STARTUP-LINEAGE",
+        }
+        route_context, route_action, dispatch, _startup = _route_context_consumption_events()
+        startup = _runtime_text_actual_startup_event(
+            {
+                **ROUTE_IDENTITY,
+                "prompt_contract_id": (
+                    ROUTE_IDENTITY["prompt_contract_id"] + ".child.worker-a"
+                ),
+                "prompt_contract_hash": "sha256:child-prompt-contract",
+            }
+        )
+        startup["payload"]["mf_subagent_startup_gate"].update(
+            {
+                "parent_prompt_contract_id": ROUTE_IDENTITY["prompt_contract_id"],
+                "parent_prompt_contract_hash": ROUTE_IDENTITY["prompt_contract_hash"],
+                "child_prompt_contract_id": (
+                    ROUTE_IDENTITY["prompt_contract_id"] + ".child.worker-a"
+                ),
+                "child_prompt_contract_hash": "sha256:child-prompt-contract",
+                "parent_route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+                "child_route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+                "parent_visible_injection_manifest_hash": "sha256:test-visible-manifest",
+                "child_visible_injection_manifest_hash": "sha256:test-visible-manifest",
+                "visible_injection_manifest_hash": "sha256:test-visible-manifest",
+                "parent_route_lineage": {
+                    **ROUTE_IDENTITY,
+                    "visible_injection_manifest_hash": "sha256:test-visible-manifest",
+                },
+                "child_route_lineage": {
+                    "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+                    "prompt_contract_id": (
+                        ROUTE_IDENTITY["prompt_contract_id"] + ".child.worker-a"
+                    ),
+                    "prompt_contract_hash": "sha256:child-prompt-contract",
+                    "visible_injection_manifest_hash": "sha256:test-visible-manifest",
+                },
+            }
+        )
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            route_context,
+            route_action,
+            dispatch,
+            startup,
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(
+            ready["route_context_gate"]["route_identity"]["prompt_contract_id"],
+            ROUTE_IDENTITY["prompt_contract_id"],
+        )
+        self.assertEqual(
+            ready["route_context_gate"]["accepted_startup_lineages"][0][
+                "child_prompt_contract_id"
+            ],
+            ROUTE_IDENTITY["prompt_contract_id"] + ".child.worker-a",
         )
 
     def test_mf_parallel_close_gate_rejects_generated_runtime_text_startup_intent(self):

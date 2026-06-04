@@ -280,6 +280,14 @@ def test_notified_execute_recovery_reports_no_active_consumer_without_claiming()
     assert summary["observer_consumer_recovery"]["classification"] == (
         "no_active_consumer_session"
     )
+    projection = summary["observer_consumer_recovery"]["latest_notified_command"][
+        "contract_handoff_projection"
+    ]
+    assert projection["source_of_truth"] == "Contract/Revision/Event"
+    assert projection["projected_surface"] == "observer_command_queue"
+    assert projection["contract_derived_status"] == observer_session.COMMAND_STATUS_NOTIFIED
+    assert projection["stale"] is False
+    assert projection["divergent"] is False
 
 
 def test_active_consumer_claim_records_route_and_precheck_evidence():
@@ -337,6 +345,12 @@ def test_active_consumer_claim_records_route_and_precheck_evidence():
     assert evidence["route_identity"]["prompt_contract_hash"] == "sha256:prompt-contract"
     assert evidence["precheck_evidence"]["precheck_run_id"] == "precheck-route-action"
     assert evidence["precheck_evidence"]["present"] is True
+    projection = evidence["contract_handoff_projection"]
+    assert projection["source_of_truth"] == "Contract/Revision/Event"
+    assert projection["projected_surface"] == "observer_command_queue"
+    assert projection["contract_derived_status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert projection["projection_watermark"] == "2026-06-03T00:00:46Z"
+    assert projection["contract_hash"].startswith("sha256:")
 
     completed = observer_session.complete_command(
         conn,

@@ -26,6 +26,9 @@ RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION = "mf_subagent_runtime_contract_view.v1"
+AGENT_TASK_CONTRACT_SCHEMA_VERSION = "observer_owned_agent_task_contract.v1"
+AGENT_TASK_CONTRACT_PROJECTION_SCHEMA_VERSION = "agent_task_contract_projection.v1"
+VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION = "verification_route_policy.v1"
 PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
 ROUTE_LINEAGE_SCHEMA_VERSION = "mf_subagent_route_lineage.v1"
 GRAPH_TRACE_SCHEMA_VERSION = "mf_subagent_graph_trace.v1"
@@ -428,6 +431,231 @@ def _safe_route_identity(route_identity: Mapping[str, Any] | None) -> dict[str, 
     return safe
 
 
+def canonical_contract_hash(value: Any) -> str:
+    """Return a stable SHA-256 hash for compact sorted JSON contract material."""
+
+    try:
+        body = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except TypeError:
+        body = json.dumps(repr(value), sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _string_list_from_mapping(source: Mapping[str, Any], *keys: str) -> list[str]:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+            result = [str(item).strip() for item in value if str(item or "").strip()]
+            if result:
+                return result
+    return []
+
+
+def _first_present_mapping(source: Mapping[str, Any], *keys: str) -> dict[str, Any]:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def verification_route_policy_from_contract(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Separate deterministic gates from tests, fixtures, Docker, AI, and impact actions."""
+
+    source = dict(contract or {})
+    policy = _first_present_mapping(
+        source,
+        "verification_route_policy",
+        "verification_route",
+        "test_flow_route",
+        "test_route",
+        "route_verification_policy",
+    )
+    precheck = _first_present_mapping(source, "precheck", "route_precheck", "precheck_evidence")
+    real_ai = _first_present_mapping(
+        policy,
+        "real_ai_provider_calls",
+        "real_ai",
+        "provider_calls",
+    )
+    explicit_ai_authorized = bool(
+        real_ai.get("authorized")
+        or real_ai.get("allowed")
+        or policy.get("real_ai_authorized")
+        or precheck.get("real_ai_authorized")
+        or precheck.get("provider_calls_authorized")
+    )
+    auth_refs = _string_list_from_mapping(
+        real_ai,
+        "authorization_refs",
+        "authorized_by",
+        "precheck_refs",
+    )
+    auth_refs.extend(
+        item
+        for item in _string_list_from_mapping(
+            precheck,
+            "authorization_refs",
+            "precheck_refs",
+            "evidence_refs",
+        )
+        if item not in auth_refs
+    )
+
+    deterministic = _string_list_from_mapping(
+        policy,
+        "deterministic_gates",
+        "deterministic_gate_ids",
+    ) or ["route_identity", "contract_hash", "fence_token", "dirty_scope"]
+    local_tests = _string_list_from_mapping(policy, "local_tests", "test_commands")
+    fixtures = _first_present_mapping(policy, "fixtures", "fixture_policy")
+    docker = _first_present_mapping(policy, "docker", "docker_policy")
+    impact = _first_present_mapping(
+        policy,
+        "post_verification_impact_actions",
+        "impact_actions",
+    )
+
+    return {
+        "schema_version": VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION,
+        "source": "contract_or_route_precheck",
+        "deterministic_gates": deterministic,
+        "local_tests": {
+            "commands": local_tests,
+            "allowed": True,
+        },
+        "fixtures": {
+            "allowed": bool(fixtures.get("allowed", True)),
+            "required": bool(fixtures.get("required", False)),
+            "ids": _string_list_from_mapping(fixtures, "ids", "fixtures"),
+        },
+        "docker": {
+            "allowed": bool(docker.get("allowed", False)),
+            "requires_explicit_route": bool(docker.get("requires_explicit_route", True)),
+            "services": _string_list_from_mapping(docker, "services", "compose_services"),
+        },
+        "real_ai_provider_calls": {
+            "allowed": explicit_ai_authorized,
+            "authorized": explicit_ai_authorized,
+            "blocked_by_default": not explicit_ai_authorized,
+            "authorization_refs": auth_refs,
+            "providers": _string_list_from_mapping(real_ai, "providers", "provider_ids"),
+            "reason": (
+                "explicit_route_or_precheck_authorized"
+                if explicit_ai_authorized
+                else "blocked_without_explicit_route_or_precheck"
+            ),
+        },
+        "post_verification_impact_actions": {
+            "allowed": bool(impact.get("allowed", False)),
+            "actions": _string_list_from_mapping(impact, "actions", "allowed_actions"),
+            "requires_observer": bool(impact.get("requires_observer", True)),
+        },
+        "policy_separation": {
+            "deterministic_gates_are_not_local_tests": True,
+            "local_tests_are_not_provider_calls": True,
+            "post_verification_impact_actions_are_not_verification": True,
+        },
+    }
+
+
+def build_observer_owned_agent_task_contract(
+    context: BranchTaskRuntimeContext,
+    *,
+    requester: str = "",
+    observer_owner: str = "",
+    executor_lane: str = MF_SUB_ROLE,
+    verifier_lane: str = "qa",
+    route_identity: Mapping[str, Any] | None = None,
+    contract_version: str = "mf_parallel.v1",
+    contract_revision_id: str = "",
+    previous_revision_hash: str = "",
+    actor_role: str = "",
+    actor_session_id: str = "",
+    timestamp: str = "",
+    read_receipt_hash: str = "",
+    gate_receipt_hash: str = "",
+    allowed_actions: Sequence[str] | None = None,
+    blocked_actions: Sequence[str] | None = None,
+    required_evidence: Sequence[str] | None = None,
+    target_files: Sequence[str] | None = None,
+    target_fences: Sequence[str] | None = None,
+    lease_deadline: str = "",
+    lifecycle_state: str = "",
+    visible_injection_manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the public, role-scoped Contract handoff object for a worker lane."""
+
+    route = _safe_route_identity(route_identity)
+    timestamp_text = _string(timestamp) or datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    evidence = [
+        item
+        for item in (required_evidence or _DEFAULT_RUNTIME_CONTRACT_EVIDENCE)
+        if _string(item)
+    ]
+    core = {
+        "schema_version": AGENT_TASK_CONTRACT_SCHEMA_VERSION,
+        "source_of_truth": "Contract/Revision/Event",
+        "contract_version": _string(contract_version) or "mf_parallel.v1",
+        "contract_revision_id": _string(contract_revision_id),
+        "project_id": context.project_id,
+        "backlog_id": context.backlog_id,
+        "task_id": context.task_id,
+        "parent_task_id": _parent_task_id_for_contract_view(context),
+        "requester": _string(requester) or "backlog_route",
+        "observer_owner": _string(observer_owner) or OBSERVER_COORDINATOR_ROLE,
+        "executor_lane": _string(executor_lane) or MF_SUB_ROLE,
+        "verifier_lane": _string(verifier_lane) or "qa",
+        "route_identity": route,
+        "visible_injection_manifest": dict(visible_injection_manifest or {}),
+        "allowed_actions": list(allowed_actions or MF_SUB_ALLOWED_CAPABILITIES),
+        "blocked_actions": list(blocked_actions or MF_SUB_FORBIDDEN_ACTIONS),
+        "required_evidence": evidence,
+        "target_files": [item for item in (target_files or []) if _string(item)],
+        "target_fences": [item for item in (target_fences or []) if _string(item)]
+        or [context.fence_token],
+        "lease": {
+            "lease_id": context.lease_id,
+            "deadline": _string(lease_deadline) or context.lease_expires_at,
+        },
+        "lifecycle_state": _string(lifecycle_state) or context.status,
+        "step_receipt_contract": {
+            "required_fields": [
+                "canonical_visible_contract_text_hash",
+                "previous_revision_hash",
+                "actor_role",
+                "actor_session_id",
+                "timestamp",
+                "read_receipt_hash",
+                "gate_receipt_hash",
+            ],
+            "previous_revision_hash": _string(previous_revision_hash),
+            "actor_role": _string(actor_role),
+            "actor_session_id": _string(actor_session_id),
+            "timestamp": timestamp_text,
+            "read_receipt_hash": _string(read_receipt_hash),
+            "gate_receipt_hash": _string(gate_receipt_hash),
+        },
+    }
+    core["canonical_visible_contract_text_hash"] = canonical_contract_hash(core)
+    return core
+
+
+def _parent_task_id_for_contract_view(context: BranchTaskRuntimeContext) -> str:
+    return (
+        context.root_task_id
+        or context.chain_id
+        or context.stage_task_id
+        or context.task_id
+    )
+
+
 def mf_subagent_runtime_context_id(context: BranchTaskRuntimeContext) -> str:
     return runtime_context_id_for_branch_context(context)
 
@@ -471,6 +699,71 @@ def build_mf_subagent_runtime_contract_view(
         for item in (required_evidence or _DEFAULT_RUNTIME_CONTRACT_EVIDENCE)
         if _string(item)
     )
+    latest_revision_map = dict(latest_revision or {})
+    latest_revision_payload = (
+        dict(latest_revision_map.get("payload"))
+        if isinstance(latest_revision_map.get("payload"), Mapping)
+        else {}
+    )
+    latest_revision_receipt = (
+        dict(latest_revision_payload.get("revision_receipt"))
+        if isinstance(latest_revision_payload.get("revision_receipt"), Mapping)
+        else {}
+    )
+    route_identity_safe = _safe_route_identity(route_identity)
+    agent_task_contract = build_observer_owned_agent_task_contract(
+        context,
+        requester=_string(latest_revision_payload.get("requester")),
+        observer_owner=_string(latest_revision_payload.get("observer_owner")),
+        executor_lane=_string(latest_revision_payload.get("executor_lane")) or MF_SUB_ROLE,
+        verifier_lane=_string(latest_revision_payload.get("verifier_lane")) or "qa",
+        route_identity=route_identity_safe,
+        contract_version=_string(contract_version) or "mf_parallel.v1",
+        contract_revision_id=latest_revision_text,
+        previous_revision_hash=_string(
+            latest_revision_receipt.get("previous_revision_hash")
+        ),
+        actor_role=_string(latest_revision_receipt.get("actor_role")),
+        actor_session_id=_string(latest_revision_receipt.get("actor_session_id")),
+        timestamp=_string(latest_revision_receipt.get("timestamp")),
+        read_receipt_hash=_string(latest_revision_receipt.get("read_receipt_hash")),
+        gate_receipt_hash=_string(latest_revision_receipt.get("gate_receipt_hash")),
+        allowed_actions=_string_list_from_mapping(
+            latest_revision_payload,
+            "allowed_actions",
+        )
+        or MF_SUB_ALLOWED_CAPABILITIES,
+        blocked_actions=_string_list_from_mapping(
+            latest_revision_payload,
+            "blocked_actions",
+        )
+        or MF_SUB_FORBIDDEN_ACTIONS,
+        required_evidence=evidence_ids,
+        target_files=_string_list_from_mapping(
+            latest_revision_payload,
+            "target_files",
+            "owned_files",
+        ),
+        target_fences=[context.fence_token],
+        lease_deadline=context.lease_expires_at,
+        lifecycle_state=context.status,
+        visible_injection_manifest=(
+            latest_revision_payload.get("visible_injection_manifest")
+            if isinstance(latest_revision_payload.get("visible_injection_manifest"), Mapping)
+            else {}
+        ),
+    )
+    projection_watermark = (
+        latest_revision_text
+        or context.checkpoint_id
+        or context.updated_at
+        or context.head_commit
+    )
+    projection_status = "current"
+    if contract_changed:
+        projection_status = "stale"
+    elif not latest_revision_text:
+        projection_status = "no_revision"
 
     runtime_context = {
         "runtime_context_id": runtime_context_id,
@@ -510,8 +803,10 @@ def build_mf_subagent_runtime_contract_view(
     }
 
     contract = {
+        "source_of_truth": "Contract/Revision/Event",
         "contract_version": _string(contract_version) or "mf_parallel.v1",
         "contract_revision_id": latest_revision_text,
+        "agent_task_contract_schema_version": AGENT_TASK_CONTRACT_SCHEMA_VERSION,
         "backend_contract": BACKEND_CONTRACT,
         "dispatch_default": DISPATCH_DEFAULT,
         "worktree_policy": WORKTREE_POLICY_MODE,
@@ -551,6 +846,7 @@ def build_mf_subagent_runtime_contract_view(
         },
         "contract_change_policy": {
             "source_of_truth": "contract_service",
+            "single_handoff_source": "Contract/Revision/Event",
             "observer_mutation": "append_contract_revision_only",
             "worker_poll_required": True,
             "worker_receives_runtime_context_id": True,
@@ -570,7 +866,31 @@ def build_mf_subagent_runtime_contract_view(
         "role_scope": "worker" if is_worker else "operator",
         "runtime_context": runtime_context,
         "contract": contract,
-        "route_identity": _safe_route_identity(route_identity),
+        "agent_task_contract": agent_task_contract,
+        "route_identity": route_identity_safe,
+        "verification_route_policy": verification_route_policy_from_contract(
+            {
+                **latest_revision_payload,
+                "route_identity": route_identity_safe,
+            }
+        ),
+        "contract_projection": {
+            "schema_version": AGENT_TASK_CONTRACT_PROJECTION_SCHEMA_VERSION,
+            "source_of_truth": "Contract/Revision/Event",
+            "projected_surfaces": [
+                "observer_command_queue",
+                "task_timeline",
+                "backlog_runtime_state",
+                "dashboard_cards",
+                "branch_runtime",
+            ],
+            "contract_derived_status": context.status,
+            "projection_watermark": projection_watermark,
+            "status": projection_status,
+            "stale": projection_status == "stale",
+            "divergent": False,
+            "contract_hash": agent_task_contract["canonical_visible_contract_text_hash"],
+        },
         "privacy_boundary": {
             "raw_private_context_exposed": False,
             "redacted_context_sources": [
@@ -3347,6 +3667,15 @@ def build_mf_subagent_input(
         project_id=context.project_id,
         backlog_id=context.backlog_id,
     )
+    agent_task_contract = build_observer_owned_agent_task_contract(
+        context,
+        route_identity=child_route_prompt_contract,
+        contract_version="mf_parallel.v1",
+        required_evidence=_DEFAULT_RUNTIME_CONTRACT_EVIDENCE,
+        target_files=target_files,
+        target_fences=[context.fence_token],
+        lifecycle_state=context.status,
+    )
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
         "role": MF_SUB_ROLE,
@@ -3403,6 +3732,13 @@ def build_mf_subagent_input(
         "route_lineage": _mf_subagent_route_lineage(
             parent_route_lineage=normalized_parent_route_lineage,
             child_route_prompt_contract=child_route_prompt_contract,
+        ),
+        "agent_task_contract": agent_task_contract,
+        "verification_route_policy": verification_route_policy_from_contract(
+            {
+                "route_identity": child_route_prompt_contract,
+                "target_files": list(agent_task_contract["target_files"]),
+            }
         ),
         "capabilities": {
             "can": list(MF_SUB_ALLOWED_CAPABILITIES),
@@ -3555,6 +3891,24 @@ def validate_mf_subagent_finish_gate(
         worker_role=worker_role,
         fence_token=context.fence_token,
     )
+    read_receipt_hash = _dispatch_string(
+        payload,
+        names=("read_receipt_hash", "worker_read_receipt_hash"),
+        nested_keys=(
+            ("read_receipt", ("hash", "read_receipt_hash")),
+            ("worker_contract", ("read_receipt_hash",)),
+            ("evidence", ("read_receipt_hash",)),
+        ),
+    )
+    gate_receipt_hash = _dispatch_string(
+        payload,
+        names=("gate_receipt_hash",),
+        nested_keys=(
+            ("gate_receipt", ("hash", "gate_receipt_hash")),
+            ("worker_contract", ("gate_receipt_hash",)),
+            ("evidence", ("gate_receipt_hash",)),
+        ),
+    )
 
     return {
         "schema_version": FINISH_GATE_SCHEMA_VERSION,
@@ -3578,6 +3932,25 @@ def validate_mf_subagent_finish_gate(
             child_route_prompt_contract=child_route_prompt_contract,
         ),
         "governed_evidence_required": governed_evidence_required,
+        "read_receipt_hash": read_receipt_hash,
+        "gate_receipt_hash": gate_receipt_hash,
+        "receipt_gate": {
+            "schema_version": "mf_subagent_receipt_gate.v1",
+            "read_receipt_required_before_counted_evidence": bool(
+                governed_evidence_required or graph_trace_evidence.get("present")
+            ),
+            "read_receipt_present": bool(read_receipt_hash),
+            "gate_receipt_present": bool(gate_receipt_hash),
+            "status": (
+                "passed"
+                if read_receipt_hash
+                else (
+                    "missing"
+                    if governed_evidence_required or graph_trace_evidence.get("present")
+                    else "not_applicable"
+                )
+            ),
+        },
         "graph_trace_evidence": graph_trace_evidence,
         "changed_files": normalized["changed_files"],
         "new_files": normalized["new_files"],

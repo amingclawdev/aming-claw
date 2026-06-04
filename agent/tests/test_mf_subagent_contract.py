@@ -20,6 +20,8 @@ from agent.governance.mf_subagent_contract import (
     FINISH_GATE_REPLAY_SOURCE,
     FINISH_GATE_SCHEMA_VERSION,
     BRANCH_RUNTIME_SCHEMA_VERSION,
+    AGENT_TASK_CONTRACT_SCHEMA_VERSION,
+    AGENT_TASK_CONTRACT_PROJECTION_SCHEMA_VERSION,
     GRAPH_TRACE_SCHEMA_VERSION,
     MF_SUB_FORBIDDEN_ACTIONS,
     MF_SUB_ROLE,
@@ -30,6 +32,7 @@ from agent.governance.mf_subagent_contract import (
     ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
     RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION,
     SERVICE_DISPATCH_SCHEMA_VERSION,
+    VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
     build_mf_subagent_runtime_contract_view,
@@ -217,6 +220,24 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
     assert view["contract"]["service_routes"]["finish_gate"].endswith(
         "/parallel-branches/finish-gate"
     )
+    assert view["agent_task_contract"]["schema_version"] == AGENT_TASK_CONTRACT_SCHEMA_VERSION
+    assert view["agent_task_contract"]["source_of_truth"] == "Contract/Revision/Event"
+    assert view["agent_task_contract"]["observer_owner"] == OBSERVER_COORDINATOR_ROLE
+    assert view["agent_task_contract"]["executor_lane"] == MF_SUB_ROLE
+    assert view["agent_task_contract"]["verifier_lane"] == "qa"
+    assert view["agent_task_contract"]["target_fences"] == ["fence-runtime"]
+    assert view["contract_projection"]["schema_version"] == (
+        AGENT_TASK_CONTRACT_PROJECTION_SCHEMA_VERSION
+    )
+    assert view["contract_projection"]["source_of_truth"] == "Contract/Revision/Event"
+    assert view["contract_projection"]["contract_hash"] == view[
+        "agent_task_contract"
+    ]["canonical_visible_contract_text_hash"]
+    assert view["contract_projection"]["stale"] is True
+    assert view["verification_route_policy"]["schema_version"] == (
+        VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION
+    )
+    assert view["verification_route_policy"]["real_ai_provider_calls"]["allowed"] is False
     assert view["route_identity"]["route_context_hash"] == "sha256:route"
     assert view["route_identity"]["prompt_contract_id"] == "rprompt-1"
     assert view["route_identity"]["raw_private_context_exposed"] is False
@@ -1874,6 +1895,15 @@ def test_build_input_carries_branch_runtime_identity() -> None:
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
     }
+    assert payload["agent_task_contract"]["schema_version"] == (
+        AGENT_TASK_CONTRACT_SCHEMA_VERSION
+    )
+    assert payload["agent_task_contract"]["source_of_truth"] == "Contract/Revision/Event"
+    assert payload["agent_task_contract"]["target_files"] == [
+        "agent/governance/mf_subagent_contract.py"
+    ]
+    assert payload["agent_task_contract"]["target_fences"] == ["fence-2"]
+    assert payload["verification_route_policy"]["real_ai_provider_calls"]["allowed"] is False
     assert "modify_code" in payload["capabilities"]["can"]
     assert set(MF_SUB_FORBIDDEN_ACTIONS).issubset(payload["capabilities"]["cannot"])
     assert payload["prechecks"]["asset_binding_proposal"]["proposal_schema_version"] == (
@@ -2011,6 +2041,8 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
             "checkpoint_id": "ckpt-finish",
             "fence_token": "fence-2",
             "summary": "Ready.",
+            "read_receipt_hash": "sha256:read-finish",
+            "gate_receipt_hash": "sha256:gate-finish",
         },
         context=_context(),
     )
@@ -2021,6 +2053,9 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["merge_queue_id"] == "mq-1"
     assert gate["replay_source"] == FINISH_GATE_REPLAY_SOURCE
     assert gate["merge_queue_ready"] is True
+    assert gate["read_receipt_hash"] == "sha256:read-finish"
+    assert gate["gate_receipt_hash"] == "sha256:gate-finish"
+    assert gate["receipt_gate"]["status"] == "passed"
 
 
 def test_finish_gate_carries_route_lineage_when_present() -> None:

@@ -5,6 +5,7 @@ import type {
   BacklogResponse,
   BacklogTimelineGateResponse,
   ContentSysDemoVisualizationEvidence,
+  AgentTaskContractProjection,
   MfCloseTimelineGate,
   TaskTimelineEvent,
 } from "../types";
@@ -837,6 +838,7 @@ function BacklogRow({
   const criteria = listFrom(bug.acceptance_criteria);
   const runtime = bug.runtime_state || bug.chain_stage || bug.mf_type || "idle";
   const contract = bug.contract_summary;
+  const projectionStatus = contract?.projection_status || (contract?.divergent ? "divergent" : contract?.stale ? "stale" : "");
   return (
     <>
       <tr>
@@ -901,6 +903,12 @@ function BacklogRow({
           {contract?.has_contract ? (
             <div className="backlog-commit mono" title="Contract evidence requirements">
               contract {contract.template_id || contract.contract_instance_id || "declared"} · req {contract.required_evidence_count ?? 0}
+            </div>
+          ) : null}
+          {projectionStatus ? (
+            <div className="backlog-commit mono" title={`Contract projection from ${contract?.source_of_truth || "Contract/Revision/Event"}`}>
+              projection {projectionStatus}
+              {contract?.projection_watermark ? ` · ${shortProjectionWatermark(contract.projection_watermark)}` : ""}
             </div>
           ) : null}
           {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
@@ -1184,6 +1192,7 @@ function BacklogDetailModal({
 function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTimelineGate }) {
   const contract = gate?.contract_gate;
   const routeGate = gate?.route_context_gate;
+  const projection = contractProjectionForSummary(bug, gate);
   const missing = stableUnique([
     ...(gate?.missing_event_kinds ?? []),
     ...(contract?.missing_requirement_ids ?? []),
@@ -1196,6 +1205,7 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
       <SummaryItem label="Status" value={normalizeStatus(bug.status)} tone={statusClass(bug.status)} />
       <SummaryItem label="Commit" value={bug.commit ? shortCommit(bug.commit) : "none"} mono />
       <SummaryItem label="Contract" value={contract?.status || (bug.contract_summary?.has_contract ? "declared" : "not declared")} tone={contract?.passed ? "status-complete" : contract ? "status-failed" : "status-unknown"} />
+      <SummaryItem label="Projection" value={projection?.status || "not loaded"} tone={projectionTone(projection)} />
       <SummaryItem label="Route context" value={routeGate?.status || (routeGate?.required ? "required" : "not required")} tone={routeGate?.passed ? "status-complete" : routeGate?.required ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Close gate" value={gate?.status || (gate ? (gate.passed ? "passed" : "blocked") : "not loaded")} tone={gate?.passed ? "status-complete" : gate ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Missing" value={missing.length ? String(missing.length) : "none"} tone={missing.length ? "status-failed" : "status-complete"} />
@@ -1205,6 +1215,29 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
       <DetailList label="Provenance / related" values={related} />
     </div>
   );
+}
+
+function contractProjectionForSummary(bug: BacklogBug, gate?: MfCloseTimelineGate): AgentTaskContractProjection | null {
+  if (gate?.contract_projection) return gate.contract_projection;
+  const summary = bug.contract_summary;
+  if (!summary?.projection_status) return null;
+  return {
+    schema_version: summary.projection_schema_version,
+    source_of_truth: summary.source_of_truth,
+    status: summary.projection_status,
+    projection_watermark: summary.projection_watermark,
+    stale: summary.stale,
+    divergent: summary.divergent,
+    contract_hash: summary.contract_hash,
+  };
+}
+
+function projectionTone(projection: AgentTaskContractProjection | null): string {
+  if (!projection) return "status-unknown";
+  if (projection.divergent || projection.status === "divergent") return "status-failed";
+  if (projection.stale || projection.status === "stale") return "status-pending";
+  if (projection.status === "current") return "status-complete";
+  return "status-unknown";
 }
 
 function SummaryItem({ label, value, tone, mono = false }: { label: string; value: string; tone?: string; mono?: boolean }) {
@@ -3314,4 +3347,11 @@ function dateValue(value?: string): number {
 
 function shortCommit(commit: string): string {
   return commit.length > 10 ? commit.slice(0, 7) : commit;
+}
+
+function shortProjectionWatermark(value: string | number): string {
+  const text = String(value || "");
+  if (!text) return "";
+  if (/^\d+$/.test(text)) return `#${text}`;
+  return text.length > 18 ? `${text.slice(0, 18)}...` : text;
 }

@@ -24,6 +24,7 @@ CLAIMED_TO_STARTUP_TIMEOUT_STATUS = "claimed_to_startup_timeout"
 NOTIFIED_UNCLAIMED_RECOVERY_THRESHOLD_SEC = HEARTBEAT_INTERVAL_SEC
 OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION = "observer_command_consumer_recovery.v1"
 OBSERVER_COMMAND_CLAIM_EVIDENCE_SCHEMA_VERSION = "observer_command_claim_evidence.v1"
+OBSERVER_COMMAND_CONTRACT_PROJECTION_SCHEMA_VERSION = "observer_command_contract_projection.v1"
 
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
@@ -527,7 +528,47 @@ def _execute_backlog_claim_evidence(
                 "visible_injection_manifest_hash"
             ],
         },
+        "contract_handoff_projection": _observer_command_contract_projection(
+            command,
+            status=COMMAND_STATUS_CLAIMED,
+            watermark=now,
+        ),
         "next_expected_evidence": "mf_subagent_startup_or_terminal_dispatch_blocker",
+    }
+
+
+def _observer_command_contract_projection(
+    command: dict[str, Any],
+    *,
+    status: str,
+    watermark: str,
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    route_identity = _route_identity_from_payload(payload)
+    material = {
+        "command_id": str(command.get("command_id") or ""),
+        "command_type": str(command.get("command_type") or ""),
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "route_identity": route_identity,
+    }
+    body = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {
+        "schema_version": OBSERVER_COMMAND_CONTRACT_PROJECTION_SCHEMA_VERSION,
+        "source_of_truth": "Contract/Revision/Event",
+        "projected_surface": "observer_command_queue",
+        "projected_surfaces": [
+            "observer_command_queue",
+            "task_timeline",
+            "backlog_runtime_state",
+            "dashboard_cards",
+            "branch_runtime",
+        ],
+        "contract_derived_status": status,
+        "projection_watermark": watermark,
+        "status": status,
+        "stale": False,
+        "divergent": False,
+        "contract_hash": "sha256:" + sha256(body.encode("utf-8")).hexdigest(),
     }
 
 
@@ -896,6 +937,11 @@ def _observer_command_summary_item(command: dict[str, Any], *, now: str) -> dict
         "created_at": str(command.get("created_at") or ""),
         "notified_age_sec": _command_notified_age_sec(command, now=now),
         "route_identity": _route_identity_from_payload(payload),
+        "contract_handoff_projection": _observer_command_contract_projection(
+            command,
+            status=str(command.get("status") or ""),
+            watermark=str(command.get("notified_at") or command.get("created_at") or now),
+        ),
     }
 
 

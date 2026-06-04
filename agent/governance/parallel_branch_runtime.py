@@ -815,6 +815,51 @@ def public_contract_revision_route_identity(
     return safe
 
 
+def _canonical_contract_hash(value: Any) -> str:
+    try:
+        body = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except TypeError:
+        body = json.dumps(repr(value), sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _first_public_string(source: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if value not in (None, "", [], {}):
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _nested_public_string(source: Mapping[str, Any], key: str, *names: str) -> str:
+    child = source.get(key)
+    if not isinstance(child, Mapping):
+        return ""
+    return _first_public_string(child, *names)
+
+
+def _previous_revision_hash(revision: "BranchRuntimeContractRevision | None") -> str:
+    if revision is None:
+        return ""
+    payload = revision.payload if isinstance(revision.payload, Mapping) else {}
+    receipt = payload.get("revision_receipt")
+    if isinstance(receipt, Mapping):
+        existing = _first_public_string(receipt, "canonical_visible_contract_text_hash")
+        if existing:
+            return existing
+    return _canonical_contract_hash(
+        {
+            "payload": payload,
+            "route_identity": revision.route_identity,
+            "contract_version": revision.contract_version,
+        }
+    )
+
+
 def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
     runtime_context_id = ""
     if "runtime_context_id" in row.keys():
@@ -1121,6 +1166,54 @@ def append_branch_contract_revision(
     public_payload = public_contract_revision_payload(payload or {})
     public_route_identity = public_contract_revision_route_identity(route_gate, route_identity)
     public_route_gate = public_contract_revision_payload(route_gate or {})
+    previous_revision = get_latest_branch_contract_revision(
+        conn,
+        context.project_id,
+        runtime_context_id,
+    )
+    read_receipt_hash = (
+        _first_public_string(public_payload, "read_receipt_hash", "worker_read_receipt_hash")
+        or _nested_public_string(public_payload, "read_receipt", "hash", "read_receipt_hash")
+        or _nested_public_string(public_payload, "worker_contract", "read_receipt_hash")
+        or _nested_public_string(public_payload, "evidence", "read_receipt_hash")
+    )
+    gate_receipt_hash = (
+        _first_public_string(public_payload, "gate_receipt_hash")
+        or _nested_public_string(public_payload, "gate_receipt", "hash", "gate_receipt_hash")
+        or _nested_public_string(public_payload, "worker_contract", "gate_receipt_hash")
+        or _nested_public_string(public_payload, "evidence", "gate_receipt_hash")
+        or _first_public_string(public_route_gate, "route_token_hash", "waiver_hash")
+    )
+    receipt_material = {
+        "schema_version": "agent_task_contract_revision_visible_text.v1",
+        "project_id": context.project_id,
+        "runtime_context_id": runtime_context_id,
+        "revision_id": revision,
+        "task_id": context.task_id,
+        "parent_task_id": _parent_task_id_for_context(context),
+        "backlog_id": context.backlog_id,
+        "contract_version": str(contract_version or ""),
+        "payload": public_payload,
+        "route_identity": public_route_identity,
+    }
+    public_payload["source_of_truth"] = "Contract/Revision/Event"
+    public_payload["revision_receipt"] = {
+        "schema_version": "agent_task_contract_revision_receipt.v1",
+        "source_of_truth": "Contract/Revision/Event",
+        "canonical_visible_contract_text_hash": _canonical_contract_hash(receipt_material),
+        "previous_revision_hash": _previous_revision_hash(previous_revision),
+        "actor_role": str(actor or public_route_gate.get("caller_role") or ""),
+        "actor_session_id": str(
+            public_payload.get("actor_session_id")
+            or public_payload.get("worker_id")
+            or public_payload.get("observer_session_id")
+            or public_route_gate.get("caller_session_id")
+            or ""
+        ),
+        "timestamp": created_at,
+        "read_receipt_hash": read_receipt_hash,
+        "gate_receipt_hash": gate_receipt_hash,
+    }
     conn.execute(
         """
         INSERT INTO parallel_branch_runtime_contract_revisions (
