@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -111,6 +112,38 @@ class TestAIInvocationContract(unittest.TestCase):
         self.assertEqual(evidence["route_prompt_contract"]["prompt_contract_id"], "rprompt-1")
         self.assertFalse(evidence["calls_models"])
         self.assertNotIn("private task prompt", str(evidence))
+
+    def test_codex_cli_timeout_returns_blocked_no_output_evidence(self):
+        from ai_invocation import AIInvocationRequest, invoke_ai
+
+        request = AIInvocationRequest(
+            role="observer",
+            provider="openai",
+            backend_mode="codex_cli",
+            cwd="/repo",
+            prompt="private timeout prompt",
+            timeout_sec=1,
+        )
+
+        with patch(
+            "ai_invocation.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["codex", "exec"],
+                timeout=1,
+                output="",
+                stderr="",
+            ),
+        ):
+            result = invoke_ai(request)
+
+        evidence = result.to_evidence()
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(evidence["auth_status"], "cli_timeout")
+        self.assertTrue(evidence["output_empty"])
+        self.assertFalse(evidence["calls_models"])
+        self.assertIn("timed out", evidence["error"])
+        self.assertNotIn("private timeout prompt", str(evidence))
 
 
 if __name__ == "__main__":

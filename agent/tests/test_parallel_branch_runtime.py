@@ -324,6 +324,58 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
         )
 
 
+def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-host-adapter"
+    worktree.mkdir(parents=True)
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="mf-sub-startup",
+            root_task_id="parent-startup",
+            stage_task_id="mf-sub-startup",
+            backlog_id="BUG-STARTUP",
+            worker_id="worker-startup",
+            agent_id="fallback_observer_cli_takeover",
+            branch_ref="refs/heads/codex/mf-sub-startup",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-startup",
+            worktree_path=str(worktree),
+            base_commit="base-startup",
+            target_head_commit="target-startup",
+            merge_queue_id="mq-startup",
+        ),
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            agent_id="codex-exec-pid-19807",
+            session_token="",
+            session_token_surrogate="host-adapter:codex-exec-pid-19807",
+            startup_source="codex_cli_host_adapter",
+            host_startup_id="host-startup-19807",
+        ),
+        now_iso=NOW,
+    )
+
+    gate = result["startup_gate"]
+    saved = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert result["ok"] is True
+    assert saved is not None
+    assert saved.agent_id == "codex-exec-pid-19807"
+    assert gate["agent_id"] == "codex-exec-pid-19807"
+    assert gate["expected_agent_id"] == "fallback_observer_cli_takeover"
+    assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["worker_id"] == "worker-startup"
+
+
 def _pb001_contexts(
     fixture: PB001RestartFixtureProject | None = None,
 ) -> list[BranchTaskRuntimeContext]:

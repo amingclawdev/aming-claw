@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -29,6 +30,7 @@ try:
     from governance.parallel_branch_runtime import (
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
+        runtime_context_id_for_branch_context,
     )
 except ImportError:  # pragma: no cover - package import path
     from agent.ai_invocation import (
@@ -49,6 +51,7 @@ except ImportError:  # pragma: no cover - package import path
     from agent.governance.parallel_branch_runtime import (
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
+        runtime_context_id_for_branch_context,
     )
 else:  # pragma: no cover - direct module import path
     from ai_invocation import BACKEND_CLAUDE_CLI, BACKEND_CODEX_CLI, BACKEND_DOCKER_LIVE_AI
@@ -536,6 +539,86 @@ def _git_worktree_status(worktree: str | Path, *, main_worktree: str | Path) -> 
     }
 
 
+def _git_output_or_empty(args: Sequence[str], *, cwd: str | Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_current_branch(path: str | Path) -> str:
+    branch = _git_output_or_empty(["branch", "--show-current"], cwd=path)
+    return branch or _git_output_or_empty(["rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
+
+
+def _git_status_short_files(path: str | Path) -> list[str]:
+    output = _git_output_or_empty(["status", "--short"], cwd=path)
+    files: list[str] = []
+    for line in output.splitlines():
+        token = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in token:
+            token = token.split(" -> ", 1)[1].strip()
+        if token:
+            files.append(token)
+    return sorted(set(files))
+
+
+def _worker_worktree_diff_scope(
+    *,
+    worktree: str | Path,
+    base_commit: str,
+    owned_files: Sequence[str],
+) -> dict[str, Any]:
+    worktree_path = str(Path(str(worktree)).expanduser().resolve())
+    committed_changed: list[str] = []
+    diff_error = ""
+    if base_commit:
+        try:
+            committed_changed = batch_jobs.git_changed_files(
+                worktree_path,
+                base_ref=base_commit,
+            )
+        except Exception as exc:
+            diff_error = str(exc)
+    dirty_files = _git_status_short_files(worktree_path)
+    all_changed = sorted(set(committed_changed) | set(dirty_files))
+    tool_artifact_files = [
+        path
+        for path in all_changed
+        if path == ".aming-claw" or path.startswith(".aming-claw/")
+    ]
+    implementation_changed = [
+        path for path in all_changed if path not in set(tool_artifact_files)
+    ]
+    owned = {str(item) for item in owned_files if str(item or "").strip()}
+    out_of_scope = [path for path in all_changed if owned and path not in owned]
+    return {
+        "schema_version": "mf_subagent_worktree_diff_scope.v1",
+        "worktree": worktree_path,
+        "base_commit": base_commit,
+        "head_commit": _git_head(Path(worktree_path)),
+        "committed_changed_files": committed_changed,
+        "dirty_files": dirty_files,
+        "changed_files": all_changed,
+        "implementation_changed_files": implementation_changed,
+        "tool_artifact_files": tool_artifact_files,
+        "no_diff": not implementation_changed,
+        "worktree_clean": not dirty_files,
+        "dirty_scope_exact_match": not out_of_scope,
+        "owned_files": sorted(owned),
+        "out_of_scope_files": out_of_scope,
+        "diff_error": diff_error,
+    }
+
+
 def _materialize_worktree(
     *,
     main_worktree: Path,
@@ -822,6 +905,7 @@ def _runtime_text_branch_runtime_evidence(
         or ""
     ).strip()
     planned_context = {
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "fence_token": context.fence_token,
@@ -1220,6 +1304,245 @@ def _runtime_text_startup_intent_event(
             "runtime_context_id": runtime_context_id,
             "launch_text_hash": launch_text_hash,
         },
+    }
+
+
+def _dogfood_host_adapter_startup_evidence(
+    request: DogfoodObserverPlanRequest,
+    *,
+    context: Any,
+    runtime_text: Mapping[str, Any],
+    worker_worktree: str | Path,
+    owned_files: Sequence[str],
+) -> dict[str, Any]:
+    runtime_context_id = str(
+        runtime_text.get("runtime_context_id")
+        or request.runtime_context_id
+        or runtime_context_id_for_branch_context(context)
+    )
+    launch_text_hash = str(runtime_text.get("launch_text_hash") or "")
+    worker_id = str(context.worker_id or request.worker_id or "dogfood-worker")
+    adapter_suffix = _stable_suffix(
+        request.project_id,
+        request.backlog_id,
+        context.task_id,
+        worker_id,
+        request.backend_mode,
+        runtime_context_id,
+        launch_text_hash,
+    )
+    agent_id = f"{request.backend_mode}-host-adapter-{adapter_suffix}"
+    head_commit = _git_head(Path(worker_worktree)) or context.head_commit or context.target_head_commit
+    branch = _git_current_branch(worker_worktree) or context.branch_ref
+    try:
+        actual_git_root = str(batch_jobs.repo_root(worker_worktree))
+    except Exception:
+        actual_git_root = str(Path(str(worker_worktree)).expanduser().resolve())
+    session_token_surrogate = (
+        "host-adapter:"
+        + _stable_suffix(
+            request.route_id,
+            runtime_context_id,
+            context.task_id,
+            worker_id,
+            launch_text_hash,
+            length=24,
+        )
+    )
+    read_receipt_material = {
+        "schema_version": "mf_subagent_read_receipt.v1",
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "worker_id": worker_id,
+        "agent_id": agent_id,
+        "fence_token": context.fence_token,
+        "launch_text_hash": launch_text_hash,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+    }
+    read_receipt_hash = "sha256:" + hashlib.sha256(
+        json.dumps(read_receipt_material, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    agent_id_match_mode = (
+        "exact_or_unallocated"
+        if not context.agent_id or context.agent_id == agent_id
+        else "host_adapter_startup_token_surrogate"
+    )
+    startup_gate = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "prepared",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "started": False,
+        "startup_complete": False,
+        "actual_startup_recorded": False,
+        "actual_startup_prepared": True,
+        "actual_startup_appendable": True,
+        "actual_startup_required": True,
+        "timeline_event_recorded": False,
+        "same_as_expected_worker": True,
+        "fence_token_matches": True,
+        "close_satisfying": False,
+        "raw_launch_text_persisted": False,
+        "startup_evidence_kind": "prepared_appendable",
+        "durable_recording_surface": (
+            f"POST /api/graph-governance/{request.project_id}/parallel-branches/startup"
+        ),
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": request.backlog_id,
+        "worker_role": "mf_sub",
+        "role": "mf_sub",
+        "worker_id": worker_id,
+        "agent_id": agent_id,
+        "expected_agent_id": context.agent_id,
+        "agent_id_match_mode": agent_id_match_mode,
+        "host_adapter_startup_token_accepted": True,
+        "fence_token": context.fence_token,
+        "branch": branch,
+        "branch_ref": context.branch_ref,
+        "worktree": str(Path(str(worker_worktree)).expanduser().resolve()),
+        "worktree_path": str(Path(str(worker_worktree)).expanduser().resolve()),
+        "assigned_worktree": context.worktree_path,
+        "actual_cwd": str(Path(str(worker_worktree)).expanduser().resolve()),
+        "actual_git_root": actual_git_root,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "head_commit": head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "owned_files": list(owned_files),
+        "route_id": request.route_id,
+        "precheck_run_id": request.precheck_run_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "session_token_hash": "",
+        "session_token_surrogate": session_token_surrogate,
+        "session_token_evidence_type": "surrogate",
+        "session_token_present": False,
+        "session_token_persisted": False,
+        "startup_source": f"{request.backend_mode}_host_adapter",
+        "startup_timing": "prepared_before_implementation_wait",
+        "launch_text_hash": launch_text_hash,
+        "read_receipt_hash": read_receipt_hash,
+    }
+    startup_recording = {
+        **startup_gate,
+        "recorded": False,
+        "prepared": True,
+        "appendable": True,
+        "timeline_event_recorded": False,
+        "append_tool": "parallel_branch_startup",
+        "event_kind": "mf_subagent_startup",
+    }
+    read_receipt = {
+        **read_receipt_material,
+        "hash": read_receipt_hash,
+        "read_receipt_hash": read_receipt_hash,
+        "recorded": False,
+        "appendable": True,
+        "prepared_before_implementation_wait": True,
+        "recorded_before_implementation_wait": False,
+    }
+    startup_event = {
+        "schema_version": 2,
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "prepared",
+        "actor": "mf_sub",
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": context.task_id,
+        "attempt_num": context.attempt,
+        "correlation_id": f"host-adapter-startup-{adapter_suffix}",
+        "payload": {
+            "mf_subagent_startup_gate": startup_gate,
+            "read_receipt": read_receipt,
+        },
+        "artifact_refs": {
+            "runtime_context_id": runtime_context_id,
+            "session_token_evidence_type": "surrogate",
+            "read_receipt_hash": read_receipt_hash,
+            "startup_evidence_kind": "prepared_appendable",
+            "timeline_event_recorded": False,
+        },
+        "commit_sha": head_commit,
+    }
+    return {
+        "startup_recording": startup_recording,
+        "startup_timeline_event": startup_event,
+        "read_receipt": read_receipt,
+        "actual_startup_recorded": False,
+        "startup_evidence_kind": "prepared_appendable",
+        "startup_evidence_appendable": True,
+        "timeline_event_recorded": False,
+    }
+
+
+def _dogfood_cli_timeout_blocker(
+    request: DogfoodObserverPlanRequest,
+    *,
+    context: Any,
+    worker_worktree: str | Path,
+    owned_files: Sequence[str],
+    observer_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    invocation = observer_result.get("invocation") if isinstance(observer_result, Mapping) else {}
+    invocation = invocation if isinstance(invocation, Mapping) else {}
+    diff_scope = _worker_worktree_diff_scope(
+        worktree=worker_worktree,
+        base_commit=context.base_commit,
+        owned_files=owned_files,
+    )
+    no_output = bool(invocation.get("output_empty", True))
+    blocker_id = (
+        f"{request.backend_mode}_timeout_no_output_no_finish"
+        if no_output
+        else f"{request.backend_mode}_timeout_no_finish"
+    )
+    terminal_projection = {
+        "schema_version": "observer_command_terminal_projection.v1",
+        "passed": False,
+        "canonical_contract_state": "blocked",
+        "command_projection_status": "blocked",
+        "divergence_reason": blocker_id,
+        "terminal_evidence_refs": [
+            "mf_subagent_startup_prepared",
+            "read_receipt_prepared",
+            "cli_timeout_blocker",
+            "worktree_diff_scope",
+        ],
+        "canonical_route_identity": {
+            "route_id": request.route_id,
+            "route_context_hash": request.route.route_context_hash,
+            "prompt_contract_id": request.route.prompt_contract_id,
+            "prompt_contract_hash": request.route.prompt_contract_hash,
+            "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        },
+    }
+    return {
+        "schema_version": "observer_cli_timeout_blocker.v1",
+        "blocker_id": blocker_id,
+        "terminal_blocker": True,
+        "status": "blocked",
+        "backend_mode": request.backend_mode,
+        "timeout_sec": request.timeout_sec,
+        "no_output": no_output,
+        "no_finish_evidence": True,
+        "calls_models": False,
+        "auth_status": invocation.get("auth_status", "cli_timeout"),
+        "worktree_diff_scope": diff_scope,
+        "terminal_contract_projection": terminal_projection,
+        "reason": (
+            "CLI backend timed out before finish evidence; worker startup/read receipt "
+            "evidence was prepared for append, and the isolated worktree diff scope is reported."
+        ),
     }
 
 
@@ -1688,6 +2011,7 @@ def build_dogfood_observer_run_plan(
         graph_trace_ids=tuple(graph_trace_ids),
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
         branch_runtime_evidence=request.branch_runtime_evidence,
+        runtime_context_id=request.runtime_context_id,
         base_commit=context.base_commit,
         target_head_commit=context.target_head_commit,
         prompt=request.prompt,
@@ -1708,6 +2032,7 @@ def build_dogfood_observer_run_plan(
         parent_task_id=parent_task_id,
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
         branch_runtime_evidence=request.branch_runtime_evidence,
+        runtime_context_id=request.runtime_context_id,
     )
     service_dispatch_evidence = _runtime_text_service_dispatch_evidence()
     dispatch_gate = {
@@ -1788,6 +2113,21 @@ def build_dogfood_observer_run_plan(
     if not route_identity_validation["allowed"]:
         result["error"] = "observer dogfood requires complete route identity evidence"
         return result
+    allocation_required = bool(branch_runtime_evidence.get("allocation_required"))
+    if allocation_required:
+        result["status"] = "allocation_required"
+        result["dispatch_gate_validation"] = {
+            "allowed": False,
+            "status": "allocation_required",
+            "allocation_required": True,
+            "error": (
+                "branch runtime allocation is required before dispatch-ready "
+                "runtime text evidence"
+            ),
+            "branch_runtime_evidence": branch_runtime_evidence,
+        }
+        result["error"] = "branch runtime allocation is required before dispatch-ready runtime text evidence"
+        return result
 
     try:
         gate_validation = validate_mf_subagent_dispatch_gate(
@@ -1867,7 +2207,42 @@ def build_dogfood_observer_run_plan(
         }
         return result
 
+    startup_evidence: dict[str, Any] = {}
+    if execute:
+        startup_evidence = _dogfood_host_adapter_startup_evidence(
+            request,
+            context=context,
+            runtime_text=runtime_text,
+            worker_worktree=worker_worktree,
+            owned_files=owned_files,
+        )
+        result.update(startup_evidence)
+        result["dispatch_gate_validation"] = {
+            **result["dispatch_gate_validation"],
+            "actual_startup_recorded": False,
+            "startup_evidence": "mf_subagent_startup_prepared",
+            "startup_evidence_appendable": True,
+            "timeline_event_recorded": False,
+            "read_receipt_hash": startup_evidence["read_receipt"]["read_receipt_hash"],
+        }
+
     observer_result = run_observer(observer_request, execute=execute)
+    if startup_evidence:
+        observer_result.update(startup_evidence)
+    if execute and observer_result.get("status") == "blocked":
+        timeout_blocker = _dogfood_cli_timeout_blocker(
+            request,
+            context=context,
+            worker_worktree=worker_worktree,
+            owned_files=owned_files,
+            observer_result=observer_result,
+        )
+        projection = timeout_blocker["terminal_contract_projection"]
+        observer_result["cli_timeout_blocker"] = timeout_blocker
+        observer_result["terminal_contract_projection"] = projection
+        observer_result["canonical_contract_state"] = projection["canonical_contract_state"]
+        observer_result["command_projection_status"] = projection["command_projection_status"]
+        observer_result["divergence_reason"] = projection["divergence_reason"]
     invocation = observer_result.get("invocation") or observer_result.get("invocation_request") or {}
     result.update(
         {
@@ -1879,6 +2254,17 @@ def build_dogfood_observer_run_plan(
             "auth_status": invocation.get("auth_status", "not_invoked"),
         }
     )
+    if execute and observer_result.get("status") == "blocked":
+        timeout_blocker = observer_result.get("cli_timeout_blocker") or {}
+        projection = observer_result.get("terminal_contract_projection") or {}
+        result["ok"] = False
+        result["status"] = "blocked"
+        result["calls_models"] = False
+        result["cli_timeout_blocker"] = timeout_blocker
+        result["terminal_contract_projection"] = projection
+        result["canonical_contract_state"] = projection.get("canonical_contract_state", "blocked")
+        result["command_projection_status"] = projection.get("command_projection_status", "blocked")
+        result["divergence_reason"] = projection.get("divergence_reason", "")
     return result
 
 

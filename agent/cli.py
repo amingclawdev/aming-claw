@@ -1239,6 +1239,11 @@ def observer_run(
     help="Allocation source/API/CLI reference; not the worker runtime_context_id.",
 )
 @click.option(
+    "--runtime-context-id",
+    default="",
+    help="Worker runtime_context_id returned by branch allocation.",
+)
+@click.option(
     "--branch-runtime-evidence-file",
     default=None,
     type=click.Path(exists=True, dir_okay=False, readable=True),
@@ -1250,6 +1255,7 @@ def observer_run(
 @click.option("--graph-trace-id", "graph_trace_ids", multiple=True, required=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
 @click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
+@click.option("--timeout-sec", default=120, type=int, help="Observer invocation timeout if --execute is used.")
 @click.option("--gate-output", "--gate-output-path", "gate_output", default="", type=click.Path(dir_okay=False), help="Optional path to write generated dispatch gate JSON.")
 @click.option("--materialize-worktree", is_flag=True, help="Create the gated worker worktree before planning/execution.")
 @click.option("--execute", is_flag=True, help="Invoke the configured provider after gate and worktree preflight. Default is dry-run evidence only.")
@@ -1278,10 +1284,12 @@ def observer_dogfood(
     merge_queue_id,
     fence_token,
     branch_runtime_registration_ref,
+    runtime_context_id,
     branch_runtime_evidence_file,
     graph_trace_ids,
     base_commit,
     target_head_commit,
+    timeout_sec,
     gate_output,
     materialize_worktree,
     execute,
@@ -1328,8 +1336,10 @@ def observer_dogfood(
         graph_trace_ids=tuple(graph_trace_ids),
         branch_runtime_registration_ref=branch_runtime_registration_ref,
         branch_runtime_evidence=branch_runtime_evidence,
+        runtime_context_id=runtime_context_id,
         base_commit=base_commit,
         target_head_commit=target_head_commit,
+        timeout_sec=timeout_sec,
         route_id=route_id,
         precheck_run_id=precheck_run_id,
         visible_injection_manifest_hash=visible_injection_manifest_hash,

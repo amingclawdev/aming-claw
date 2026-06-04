@@ -829,6 +829,51 @@ def test_observer_dogfood_dry_run_generates_valid_gate_and_plan_without_model_ca
     assert evidence["route_prompt_contract"]["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
 
 
+def test_observer_dogfood_requires_branch_runtime_registration_before_runtime_text(tmp_path):
+    runner = CliRunner()
+    args = _without_option(
+        _without_option(_dogfood_args(tmp_path), "--branch-runtime-evidence-file"),
+        "--branch-runtime-registration-ref",
+    )
+
+    result = runner.invoke(main, args)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["status"] == "allocation_required"
+    assert payload["calls_models"] is False
+    validation = payload["dispatch_gate_validation"]
+    assert validation["allowed"] is False
+    assert validation["allocation_required"] is True
+    assert validation["branch_runtime_evidence"]["registered"] is False
+    assert "branch runtime allocation is required" in validation["error"]
+    assert "observer_run" not in payload
+
+
+def test_observer_dogfood_rejects_marker_only_parallel_branch_allocate_registration_ref(tmp_path):
+    runner = CliRunner()
+    args = _without_option(_dogfood_args(tmp_path), "--branch-runtime-evidence-file")
+    args = _replace_option(
+        args,
+        "--branch-runtime-registration-ref",
+        "parallel-branches/allocate:req-dogfood-cli",
+    )
+
+    result = runner.invoke(main, args)
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    branch_runtime = payload["dispatch_gate"]["branch_runtime_evidence"]
+    assert payload["ok"] is False
+    assert payload["status"] == "allocation_required"
+    assert branch_runtime["registered"] is False
+    assert branch_runtime["allocation_required"] is True
+    assert branch_runtime["supplied_source_ref"] == "parallel-branches/allocate:req-dogfood-cli"
+    assert "runtime_context_id" in branch_runtime["missing_fields"]
+    assert payload["dispatch_gate_validation"]["branch_runtime_evidence"]["registered"] is False
+
+
 def test_observer_dogfood_rejects_missing_visible_injection_manifest(tmp_path):
     runner = CliRunner()
     gate_output = tmp_path / "dispatch-gate.json"
@@ -1016,6 +1061,123 @@ def test_observer_dogfood_materialize_worktree_creates_real_git_worktree_without
     assert status["differs_from_main_worktree"] is True
 
 
+def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
+    tmp_path, monkeypatch
+):
+    from agent.ai_invocation import AIInvocationResult
+
+    runner = CliRunner()
+    repo = _init_git_repo(tmp_path)
+    commit = _git(["rev-parse", "HEAD"], repo)
+    args = _dogfood_args(
+        tmp_path,
+        main_worktree=repo,
+        workspace_root=repo,
+        worktree_root=".worktrees",
+        base_commit=commit,
+        target_head_commit=commit,
+    )
+
+    def fake_invoke_ai(request):
+        return AIInvocationResult(
+            request=request,
+            status="completed",
+            output_text='{"status":"review_ready"}',
+            command=["codex", "exec"],
+            returncode=0,
+            provider_backed=True,
+            calls_models=True,
+            auth_status="cli_auth_unknown",
+        )
+
+    monkeypatch.setattr("agent.observer_runtime.invoke_ai", fake_invoke_ai)
+
+    result = runner.invoke(
+        main,
+        args[:-1] + ["--materialize-worktree", "--execute", "--json-output"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    startup_event = payload["startup_timeline_event"]
+    startup_gate = startup_event["payload"]["mf_subagent_startup_gate"]
+    read_receipt = payload["read_receipt"]
+    assert payload["ok"] is True
+    assert payload["status"] == "completed"
+    assert startup_event["event_kind"] == "mf_subagent_startup"
+    assert startup_event["status"] == "prepared"
+    assert startup_gate["status"] == "prepared"
+    assert startup_gate["actual_startup_recorded"] is False
+    assert startup_gate["actual_startup_prepared"] is True
+    assert startup_gate["startup_timing"] == "prepared_before_implementation_wait"
+    assert startup_gate["timeline_event_recorded"] is False
+    assert startup_gate["session_token_evidence_type"] == "surrogate"
+    assert startup_gate["worker_id"] == "worker-a"
+    assert not startup_gate["agent_id"].startswith("fallback_observer")
+    assert read_receipt["read_receipt_hash"].startswith("sha256:")
+    assert read_receipt["prepared_before_implementation_wait"] is True
+    assert read_receipt["recorded_before_implementation_wait"] is False
+    assert payload["observer_run"]["startup_recording"]["recorded"] is False
+    assert payload["observer_run"]["startup_recording"]["appendable"] is True
+
+
+def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monkeypatch):
+    from agent.ai_invocation import AIInvocationResult
+
+    runner = CliRunner()
+    repo = _init_git_repo(tmp_path)
+    commit = _git(["rev-parse", "HEAD"], repo)
+    args = _dogfood_args(
+        tmp_path,
+        main_worktree=repo,
+        workspace_root=repo,
+        worktree_root=".worktrees",
+        base_commit=commit,
+        target_head_commit=commit,
+    )
+
+    def fake_invoke_ai(request):
+        return AIInvocationResult(
+            request=request,
+            status="blocked",
+            output_text="",
+            error="codex_cli invocation timed out after 1s",
+            command=["codex", "exec"],
+            returncode=124,
+            provider_backed=True,
+            calls_models=False,
+            auth_status="cli_timeout",
+        )
+
+    monkeypatch.setattr("agent.observer_runtime.invoke_ai", fake_invoke_ai)
+
+    result = runner.invoke(
+        main,
+        args[:-1]
+        + ["--materialize-worktree", "--execute", "--timeout-sec", "1", "--json-output"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    blocker = payload["cli_timeout_blocker"]
+    diff_scope = blocker["worktree_diff_scope"]
+    projection = payload["terminal_contract_projection"]
+    assert payload["ok"] is False
+    assert payload["status"] == "blocked"
+    assert payload["calls_models"] is False
+    assert payload["auth_status"] == "cli_timeout"
+    assert blocker["no_output"] is True
+    assert blocker["no_finish_evidence"] is True
+    assert diff_scope["no_diff"] is True
+    assert diff_scope["implementation_changed_files"] == []
+    assert diff_scope["worktree_clean"] is True or diff_scope["dirty_files"]
+    assert projection["canonical_contract_state"] == "blocked"
+    assert projection["command_projection_status"] == "blocked"
+    assert payload["startup_timeline_event"]["event_kind"] == "mf_subagent_startup"
+    assert payload["startup_timeline_event"]["status"] == "prepared"
+    assert payload["actual_startup_recorded"] is False
+
+
 def test_observer_dogfood_generated_worker_workspace_differs_from_main(tmp_path):
     runner = CliRunner()
     main_worktree = tmp_path / "main"
@@ -1196,6 +1358,27 @@ def test_observer_runtime_text_prepare_json_requires_branch_allocation_ref(tmp_p
     assert payload["dispatch_gate_validation"]["allowed"] is False
     assert payload["persistent_evidence"]["dispatch_ready"] is False
     assert payload["persistent_evidence"]["allocation_required"] is True
+
+
+def _init_git_repo(tmp_path):
+    repo = (tmp_path / "repo").resolve()
+    repo.mkdir()
+    _git(["init"], repo)
+    (repo / "README.md").write_text("dogfood execution fixture\n", encoding="utf-8")
+    _git(["add", "README.md"], repo)
+    _git(
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial fixture",
+        ],
+        repo,
+    )
+    return repo
 
 
 def _git(args: list[str], cwd):

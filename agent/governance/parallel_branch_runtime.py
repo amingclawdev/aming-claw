@@ -2179,6 +2179,16 @@ def record_mf_subagent_startup(
     launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
     observer_command_id = str(payload.get("observer_command_id") or "").strip()
     host_startup_id = str(payload.get("host_startup_id") or "").strip()
+    startup_source = str(payload.get("startup_source") or "host_created_mf_sub_worker")
+    startup_source_normalized = startup_source.lower().replace("-", "_")
+    host_adapter_startup = bool(
+        token_evidence["session_token_surrogate"]
+        and (
+            "host_adapter" in startup_source_normalized
+            or str(token_evidence["session_token_surrogate"]).startswith("host-adapter:")
+            or payload.get("host_adapter_startup") is True
+        )
+    )
 
     missing: list[str] = []
     for field, value in (
@@ -2233,13 +2243,19 @@ def record_mf_subagent_startup(
             context=context,
             details={"worker_id": worker_id, "expected_worker_id": context.worker_id},
         )
+    agent_id_match_mode = "exact_or_unallocated"
     if context.agent_id and agent_id != context.agent_id:
-        return _startup_blocker(
-            blocker_id="agent_id_mismatch",
-            message="mf_subagent startup agent_id must match branch runtime context",
-            context=context,
-            details={"agent_id": agent_id, "expected_agent_id": context.agent_id},
-        )
+        if host_adapter_startup:
+            agent_id_match_mode = "host_adapter_startup_token_surrogate"
+        else:
+            return _startup_blocker(
+                blocker_id="agent_id_mismatch",
+                message="mf_subagent startup agent_id must match branch runtime context",
+                context=context,
+                details={"agent_id": agent_id, "expected_agent_id": context.agent_id},
+            )
+    elif context.agent_id:
+        agent_id_match_mode = "exact"
     try:
         _require_current_fence(context, fence_token)
     except BranchRuntimeFenceError:
@@ -2367,6 +2383,9 @@ def record_mf_subagent_startup(
         "role": "mf_sub",
         "worker_id": worker_id,
         "agent_id": agent_id,
+        "expected_agent_id": context.agent_id,
+        "agent_id_match_mode": agent_id_match_mode,
+        "host_adapter_startup_token_accepted": host_adapter_startup,
         "fence_token": saved.fence_token,
         "branch": saved.branch_ref,
         "branch_ref": saved.branch_ref,
@@ -2390,7 +2409,7 @@ def record_mf_subagent_startup(
         "session_token_evidence_type": token_evidence["session_token_evidence_type"],
         "session_token_present": token_evidence["session_token_present"],
         "session_token_persisted": False,
-        "startup_source": str(payload.get("startup_source") or "host_created_mf_sub_worker"),
+        "startup_source": startup_source,
         "startup_timing": "actual_worker_started",
         "observer_command_id": observer_command_id,
         "host_startup_id": host_startup_id,

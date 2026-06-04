@@ -364,6 +364,57 @@ def test_execute_backlog_row_complete_without_startup_fails_truthfully():
     assert "runtime-text startup intent" in blocker["reason"]
 
 
+def test_execute_backlog_row_cli_timeout_blocks_even_with_startup_evidence():
+    conn = _conn()
+    session = _register(conn)
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            **_actual_startup_result(),
+            "ok": False,
+            "status": "blocked",
+            "cli_timeout_blocker": {
+                "status": "blocked",
+                "blocker_id": "codex_cli_timeout_no_output_no_finish",
+                "no_output": True,
+                "no_finish_evidence": True,
+            },
+            "terminal_contract_projection": {
+                "canonical_contract_state": "blocked",
+                "command_projection_status": "blocked",
+                "divergence_reason": "codex_cli_timeout_no_output_no_finish",
+            },
+        },
+    )
+
+    command_after = completed["command"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "codex_cli_timeout_no_output_no_finish"
+    assert command_after["result"]["status"] == "blocked"
+    assert command_after["result"]["command_projection_status"] == "blocked"
+    assert command_after["result"]["canonical_contract_state"] == "blocked"
+
+
 def test_execute_backlog_row_completion_projects_terminal_from_canonical_close_evidence():
     conn = _conn()
     session = _register(conn)

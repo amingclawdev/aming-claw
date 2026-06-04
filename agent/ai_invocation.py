@@ -251,6 +251,7 @@ class AIInvocationResult:
             ],
             "prompt_sha256": self.prompt_sha256,
             "output_sha256": self.output_sha256,
+            "output_empty": not bool((self.output_text or "").strip()),
             "raw_output_stored": self.raw_output_stored,
             "no_raw_prompt_output": True,
             "error": redact_text(self.error, max_chars=1000),
@@ -464,6 +465,7 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
     output_path = request.output_path
     temp_dir = ""
     prompt = request.prompt_text()
+    command: list[str] = []
     try:
         if not output_path and backend == BACKEND_CODEX_CLI:
             temp_dir = tempfile.mkdtemp(prefix="aming-claw-ai-invocation-")
@@ -520,11 +522,45 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
             calls_models=result.returncode == 0,
             auth_status="cli_auth_unknown" if result.returncode == 0 else "cli_failed",
         )
+    except subprocess.TimeoutExpired as exc:
+        partial_output = ""
+        if output_path:
+            try:
+                partial_output = Path(output_path).read_text(encoding="utf-8")
+            except OSError:
+                partial_output = ""
+        if not partial_output and exc.stdout:
+            partial_output = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else str(exc.stdout)
+            )
+        partial_error = (
+            exc.stderr.decode("utf-8", "replace")
+            if isinstance(exc.stderr, bytes)
+            else str(exc.stderr or "")
+        ).strip()
+        message = f"{backend} invocation timed out after {request.timeout_sec}s"
+        if partial_error:
+            message = f"{message}: {partial_error}"
+        return AIInvocationResult(
+            request=request,
+            status="blocked",
+            output_text=partial_output,
+            error=message,
+            command=command,
+            returncode=124,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            provider_backed=True,
+            calls_models=False,
+            auth_status="cli_timeout",
+            output_path=output_path,
+        )
     except Exception as exc:
         return _failed_result(
             request,
             error=str(exc),
-            command=[],
+            command=command,
             elapsed_ms=int((time.perf_counter() - started) * 1000),
             auth_status="failed",
         )

@@ -396,6 +396,34 @@ def _result_has_canonical_close_evidence(result: dict[str, Any]) -> bool:
     )
 
 
+def _result_is_terminal_blocked(result: dict[str, Any]) -> bool:
+    status = str(result.get("status") or "").strip().lower()
+    if status == "blocked":
+        return True
+    projection = result.get("terminal_contract_projection")
+    if isinstance(projection, dict):
+        projection_status = str(
+            projection.get("command_projection_status") or ""
+        ).strip().lower()
+        contract_state = str(
+            projection.get("canonical_contract_state") or ""
+        ).strip().lower()
+        if projection_status == "blocked" or contract_state == "blocked":
+            return True
+    for key in (
+        "cli_timeout_blocker",
+        "terminal_blocker",
+        "terminal_dispatch_blocker",
+        "startup_surface_blocker",
+    ):
+        value = result.get(key)
+        if value is True:
+            return True
+        if isinstance(value, dict) and str(value.get("status") or "").lower() == "blocked":
+            return True
+    return False
+
+
 def _command_terminal_projection_from_result(
     command: dict[str, Any],
     result: dict[str, Any],
@@ -1918,6 +1946,38 @@ def complete_command(
         terminal_projection = _command_terminal_projection_from_result(command, result_payload)
         if terminal_projection:
             _attach_command_terminal_projection(result_payload, terminal_projection)
+    if (
+        str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        and _result_is_terminal_blocked(result_payload)
+    ):
+        projection = _command_terminal_projection_from_result(command, result_payload)
+        if projection:
+            _attach_command_terminal_projection(result_payload, projection)
+        blocker = result_payload.get("cli_timeout_blocker")
+        blocker_id = ""
+        if isinstance(blocker, dict):
+            blocker_id = str(blocker.get("blocker_id") or "")
+        conn.execute(
+            """UPDATE observer_command_queue
+                  SET status = ?, completed_at = ?, result_json = ?, error = ?
+                WHERE project_id = ? AND command_id = ?""",
+            (
+                COMMAND_STATUS_FAILED,
+                timestamp,
+                _json_dumps(result_payload),
+                blocker_id or "blocked",
+                pid,
+                command_id,
+            ),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "project_id": pid,
+            "observer_session_id": sid,
+            "command": get_command(conn, project_id=pid, command_id=command_id),
+            "terminal_blocker": result_payload.get("cli_timeout_blocker") or {"status": "blocked"},
+        }
     conn.execute(
         """UPDATE observer_command_queue
               SET status = ?, completed_at = ?, result_json = ?, error = ''
