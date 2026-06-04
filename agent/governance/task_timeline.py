@@ -107,6 +107,7 @@ MF_CLOSE_PASS_STATUSES = {
 
 MF_CONTRACT_SCHEMA_VERSION = "mf_contract_gate.v1"
 MF_CONTRACT_PROJECTION_SCHEMA_VERSION = "mf_contract_projection.v1"
+MF_OBSERVER_COMMAND_TERMINAL_PROJECTION_SCHEMA_VERSION = "observer_command_terminal_projection.v1"
 MF_SUBAGENT_READ_RECEIPT_GATE_SCHEMA_VERSION = "mf_subagent_read_receipt_gate.v1"
 MF_LANE_OWNERSHIP_SCHEMA_VERSION = "mf_lane_ownership_gate.v1"
 MF_BOUNDED_SUBAGENT_LANE_ID = "bounded_implementation_subagent"
@@ -2862,6 +2863,289 @@ def mf_close_gate_verification(
                 _mapping(contract_projection.get("read_receipt_gate")).get("status") or ""
             ),
         },
+    }
+
+
+def _observer_command_route_identity(payload: dict[str, Any] | None) -> dict[str, str]:
+    source = _mapping(payload)
+    identity = {
+        "route_id": str(source.get("route_id") or "").strip(),
+        "route_context_hash": str(source.get("route_context_hash") or "").strip(),
+        "prompt_contract_id": str(source.get("prompt_contract_id") or "").strip(),
+        "prompt_contract_hash": str(source.get("prompt_contract_hash") or "").strip(),
+        "visible_injection_manifest_hash": str(
+            source.get("visible_injection_manifest_hash") or ""
+        ).strip(),
+    }
+    return {key: value for key, value in identity.items() if value}
+
+
+def _observer_command_close_evidence_root(
+    result_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = _mapping(result_payload)
+    for key in (
+        "canonical_close_evidence",
+        "canonical_contract_close_evidence",
+        "contract_close_projection",
+        "task_contract_close_projection",
+    ):
+        value = _mapping(result.get(key))
+        if value:
+            return value
+    return result
+
+
+def _observer_command_terminal_events(
+    evidence: dict[str, Any],
+    result_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    result = _mapping(result_payload)
+    for source in (evidence, result):
+        for key in ("timeline_events", "events", "task_timeline_events"):
+            values = [_mapping(item) for item in _list(source.get(key))]
+            values = [item for item in values if item]
+            if values:
+                return values
+    return []
+
+
+def _observer_command_backlog_close_state(
+    evidence: dict[str, Any],
+    result_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = _mapping(result_payload)
+    close = {}
+    for source in (evidence, result):
+        for key in ("backlog_close", "backlog_close_result", "close_result"):
+            close = _mapping(source.get(key))
+            if close:
+                break
+        if close:
+            break
+    status = (
+        _first_deep_text(close, "backlog_status")
+        or _first_deep_text(close, "new_status")
+        or _first_deep_text(close, "bug_status")
+        or _first_deep_text(evidence, "backlog_status")
+        or _first_deep_text(evidence, "canonical_backlog_status")
+    )
+    request_id = (
+        _first_deep_text(close, "request_id")
+        or _first_deep_text(close, "backlog_close_request_id")
+        or _first_deep_text(evidence, "backlog_close_request_id")
+    )
+    closed = status.strip().lower() in {
+        "fixed",
+        "closed",
+        "complete",
+        "completed",
+        "done",
+    } or _truthy(
+        close.get("backlog_closed") or close.get("closed") or evidence.get("backlog_closed")
+    )
+    return {
+        "status": status,
+        "request_id": request_id,
+        "closed": closed,
+        "evidence": close,
+    }
+
+
+def _observer_command_identity_matches(
+    left: dict[str, str],
+    right: dict[str, str],
+) -> bool:
+    if not left or not right:
+        return False
+    for field in MF_ROUTE_IDENTITY_FIELDS:
+        if left.get(field, "") != right.get(field, ""):
+            return False
+    left_prompt_hash = left.get("prompt_contract_hash", "")
+    right_prompt_hash = right.get("prompt_contract_hash", "")
+    return not left_prompt_hash or not right_prompt_hash or left_prompt_hash == right_prompt_hash
+
+
+def _observer_command_supersession_relation_present(
+    *,
+    evidence: dict[str, Any],
+    route_context_gate: dict[str, Any],
+    command_identity: dict[str, str],
+    canonical_identity: dict[str, str],
+) -> bool:
+    if _observer_command_identity_matches(command_identity, canonical_identity):
+        return True
+    cleanup = _mapping(route_context_gate.get("route_identity_cleanup"))
+    if cleanup.get("applied") and int(cleanup.get("superseded_event_count") or 0) > 0:
+        return True
+    for key in (
+        "route_identity_supersession",
+        "route_identity_supersede",
+        "route_identity_cleanup",
+        "route_identity_reconciliation",
+        "superseding_route_relation",
+    ):
+        relation = _mapping(evidence.get(key))
+        if not relation:
+            continue
+        status = str(
+            relation.get("status") or relation.get("decision") or relation.get("state") or ""
+        ).strip().lower()
+        if status in {"accepted", "passed", "reconciled", "superseded"} or _truthy(
+            relation.get("accepted") or relation.get("reconciled")
+        ):
+            return True
+    return False
+
+
+def _observer_command_event_ref(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in {
+            "id": event.get("id") or event.get("event_id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "status": event.get("status") or event.get("decision"),
+            "request_id": event.get("request_id"),
+        }.items()
+        if value not in (None, "")
+    }
+
+
+def _observer_command_terminal_evidence_refs(
+    events: list[dict[str, Any]],
+    route_context_gate: dict[str, Any],
+    backlog_close_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for event in events:
+        kind = str(event.get("event_kind") or event.get("event_type") or "").strip()
+        if kind in {
+            "implementation",
+            "verification",
+            "close_ready",
+            "backlog_close",
+            "route_identity_cleanup",
+        }:
+            ref = _observer_command_event_ref(event)
+            if ref:
+                refs.append(ref)
+    evidence_events = _mapping(route_context_gate.get("evidence_events"))
+    for values in evidence_events.values():
+        for event_ref in _list(values):
+            ref = _mapping(event_ref)
+            if ref:
+                refs.append(ref)
+    cleanup_event = _mapping(_mapping(route_context_gate.get("route_identity_cleanup")).get("event"))
+    if cleanup_event:
+        refs.append(cleanup_event)
+    request_id = str(backlog_close_state.get("request_id") or "").strip()
+    if request_id:
+        refs.append({
+            "event_kind": "backlog_close",
+            "request_id": request_id,
+            "status": str(backlog_close_state.get("status") or ""),
+        })
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for ref in refs:
+        key = json.dumps(ref, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+    return deduped
+
+
+def observer_command_terminal_projection_from_close_evidence(
+    command_payload: dict[str, Any] | None,
+    result_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Project command terminal state from observer-owned task close evidence."""
+
+    result = _mapping(result_payload)
+    evidence = _observer_command_close_evidence_root(result)
+    command_identity = _observer_command_route_identity(command_payload)
+    events = _observer_command_terminal_events(evidence, result)
+    contract = _mapping(evidence.get("contract") or evidence.get("task_contract"))
+    provided_gate = _mapping(evidence.get("timeline_gate") or result.get("timeline_gate"))
+    close_gate = (
+        provided_gate
+        if provided_gate.get("schema_version") == "mf_close_timeline_gate.v1"
+        else mf_close_gate_verification(events, contract=contract)
+    )
+    route_context_gate = _mapping(close_gate.get("route_context_gate"))
+    canonical_identity = _mapping(
+        evidence.get("canonical_route_identity")
+        or route_context_gate.get("route_identity")
+    )
+    explicit_canonical = _mapping(evidence.get("canonical_route_identity"))
+    if canonical_identity and explicit_canonical.get("route_id"):
+        canonical_identity = {
+            **canonical_identity,
+            "route_id": str(explicit_canonical.get("route_id") or ""),
+        }
+    superseded_identity = _mapping(evidence.get("superseded_route_identity"))
+    if not superseded_identity and command_identity and not _observer_command_identity_matches(
+        command_identity,
+        canonical_identity,
+    ):
+        superseded_identity = command_identity
+    backlog_close_state = _observer_command_backlog_close_state(evidence, result)
+    terminal_refs = _observer_command_terminal_evidence_refs(
+        events,
+        route_context_gate,
+        backlog_close_state,
+    )
+
+    missing: list[str] = []
+    if not bool(close_gate.get("passed")):
+        missing.append("canonical_close_gate_passed")
+    if "close_ready" not in set(close_gate.get("present_event_kinds") or []):
+        missing.append("accepted_close_ready")
+    if not backlog_close_state["closed"]:
+        missing.append("canonical_backlog_fixed_or_closed")
+    if not canonical_identity:
+        missing.append("canonical_route_identity")
+    if command_identity and canonical_identity and not _observer_command_supersession_relation_present(
+        evidence=evidence,
+        route_context_gate=route_context_gate,
+        command_identity=command_identity,
+        canonical_identity=canonical_identity,
+    ):
+        missing.append("superseding_route_or_contract_relation")
+
+    passed = not missing
+    divergence_reason = ""
+    if passed and superseded_identity:
+        divergence_reason = "superseded_route_identity_reconciled"
+    elif missing:
+        divergence_reason = "missing_" + "_and_".join(missing)
+    return {
+        "schema_version": MF_OBSERVER_COMMAND_TERMINAL_PROJECTION_SCHEMA_VERSION,
+        "source_of_truth": "Contract/Revision/Event",
+        "projected_surface": "observer_command_queue",
+        "projected_surfaces": [
+            "observer_command_queue",
+            "task_timeline",
+            "backlog_runtime_state",
+            "dashboard_cards",
+        ],
+        "passed": passed,
+        "status": "projected_completed" if passed else "unresolved",
+        "canonical_contract_state": "closed" if passed else "unresolved",
+        "command_projection_status": "completed" if passed else "unresolved",
+        "divergence_reason": divergence_reason,
+        "canonical_route_identity": canonical_identity,
+        "superseded_route_identity": superseded_identity,
+        "terminal_evidence_refs": terminal_refs,
+        "missing_requirement_ids": missing,
+        "close_gate_status": str(close_gate.get("status") or ""),
+        "backlog_close_request_id": str(backlog_close_state.get("request_id") or ""),
+        "backlog_status": str(backlog_close_state.get("status") or ""),
+        "contract_projection": _mapping(close_gate.get("contract_projection")),
+        "route_context_gate": route_context_gate,
     }
 
 

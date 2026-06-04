@@ -350,6 +350,9 @@ def _command_row_to_dict(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data = {key: row[key] for key in row.keys()} if isinstance(row, sqlite3.Row) else dict(row)
     data["payload"] = _json_loads_object(data.get("payload_json"))
     data["result"] = _json_loads_object(data.get("result_json"))
+    projection = _command_terminal_projection_from_result(data, data["result"])
+    if projection:
+        _apply_command_terminal_projection_fields(data, projection)
     return data
 
 
@@ -374,6 +377,69 @@ def _result_has_startup_or_blocker_evidence(result: dict[str, Any]) -> bool:
     if _contains_terminal_dispatch_blocker(result):
         return True
     return False
+
+
+def _result_has_canonical_close_evidence(result: dict[str, Any]) -> bool:
+    return any(
+        key in result
+        for key in (
+            "canonical_close_evidence",
+            "canonical_contract_close_evidence",
+            "contract_close_projection",
+            "task_contract_close_projection",
+            "timeline_gate",
+            "timeline_events",
+            "task_timeline_events",
+            "backlog_close",
+            "backlog_close_result",
+        )
+    )
+
+
+def _command_terminal_projection_from_result(
+    command: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    for key in (
+        "terminal_contract_projection",
+        "observer_command_terminal_projection",
+        "command_terminal_projection",
+    ):
+        projection = result.get(key)
+        if isinstance(projection, dict):
+            return dict(projection)
+    if not _result_has_canonical_close_evidence(result):
+        return {}
+    try:
+        from . import task_timeline
+
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        return task_timeline.observer_command_terminal_projection_from_close_evidence(
+            payload,
+            result,
+        )
+    except Exception:
+        return {}
+
+
+def _apply_command_terminal_projection_fields(
+    target: dict[str, Any],
+    projection: dict[str, Any],
+) -> None:
+    target["canonical_contract_state"] = projection.get("canonical_contract_state", "")
+    target["command_projection_status"] = projection.get("command_projection_status", "")
+    target["divergence_reason"] = projection.get("divergence_reason", "")
+    target["canonical_route_identity"] = projection.get("canonical_route_identity", {})
+    target["superseded_route_identity"] = projection.get("superseded_route_identity", {})
+    target["terminal_evidence_refs"] = projection.get("terminal_evidence_refs", [])
+
+
+def _attach_command_terminal_projection(
+    result: dict[str, Any],
+    projection: dict[str, Any],
+) -> None:
+    result["terminal_contract_projection"] = projection
+    _apply_command_terminal_projection_fields(result, projection)
 
 
 def _missing_startup_surface_blocker(command: dict[str, Any], *, now: str) -> dict[str, Any]:
@@ -461,6 +527,13 @@ def _merge_result_with_durable_takeover(
         "takeover_status",
         "observer_claim_evidence",
         "claim_blocker",
+        "terminal_contract_projection",
+        "canonical_contract_state",
+        "command_projection_status",
+        "divergence_reason",
+        "canonical_route_identity",
+        "superseded_route_identity",
+        "terminal_evidence_refs",
     ):
         if key not in incoming and key in existing:
             incoming[key] = existing[key]
@@ -1806,30 +1879,45 @@ def complete_command(
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and not _result_has_startup_or_blocker_evidence(result_payload)
     ):
-        blocker = _missing_startup_surface_blocker(command, now=timestamp)
-        result_payload["ok"] = False
-        result_payload["startup_surface_blocker"] = blocker
-        conn.execute(
-            """UPDATE observer_command_queue
-                  SET status = ?, completed_at = ?, result_json = ?, error = ?
-                WHERE project_id = ? AND command_id = ?""",
-            (
-                COMMAND_STATUS_FAILED,
-                timestamp,
-                _json_dumps(result_payload),
-                blocker["blocker_id"],
-                pid,
-                command_id,
-            ),
-        )
-        conn.commit()
-        return {
-            "ok": True,
-            "project_id": pid,
-            "observer_session_id": sid,
-            "command": get_command(conn, project_id=pid, command_id=command_id),
-            "startup_surface_blocker": blocker,
-        }
+        terminal_projection = _command_terminal_projection_from_result(command, result_payload)
+        if terminal_projection.get("passed"):
+            _attach_command_terminal_projection(result_payload, terminal_projection)
+        else:
+            if terminal_projection:
+                _attach_command_terminal_projection(result_payload, terminal_projection)
+            blocker = _missing_startup_surface_blocker(command, now=timestamp)
+            result_payload["ok"] = False
+            result_payload["startup_surface_blocker"] = blocker
+            conn.execute(
+                """UPDATE observer_command_queue
+                      SET status = ?, completed_at = ?, result_json = ?, error = ?
+                    WHERE project_id = ? AND command_id = ?""",
+                (
+                    COMMAND_STATUS_FAILED,
+                    timestamp,
+                    _json_dumps(result_payload),
+                    blocker["blocker_id"],
+                    pid,
+                    command_id,
+                ),
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "project_id": pid,
+                "observer_session_id": sid,
+                "command": get_command(conn, project_id=pid, command_id=command_id),
+                "startup_surface_blocker": blocker,
+                "terminal_contract_projection": terminal_projection,
+            }
+    if (
+        str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        and _result_has_canonical_close_evidence(result_payload)
+        and "terminal_contract_projection" not in result_payload
+    ):
+        terminal_projection = _command_terminal_projection_from_result(command, result_payload)
+        if terminal_projection:
+            _attach_command_terminal_projection(result_payload, terminal_projection)
     conn.execute(
         """UPDATE observer_command_queue
               SET status = ?, completed_at = ?, result_json = ?, error = ''

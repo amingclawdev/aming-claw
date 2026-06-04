@@ -16,6 +16,7 @@ from agent.tests.fixtures.rule_fingerprint_project import (
 from agent.governance import asset_impact
 from agent.governance import graph_correction_patches
 from agent.governance import graph_events
+from agent.governance import observer_session
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
@@ -599,6 +600,74 @@ def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_
     assert check["coverage_claim_allowed_by_kind"]["doc"] is False
     assert check["changed_untrusted_assets_sample"][0]["path"] == "skills/external-protocol/SKILL.md"
     assert "not trusted impact-scope coverage" in " ".join(check["required_actions"])
+
+
+def test_backlog_list_compact_includes_observer_command_terminal_projection(conn):
+    observer_session.ensure_schema(conn)
+    backlog_id = "AC-OBSERVER-COMMAND-TERMINAL-PROJECTION-FROM-CONTRACT-20260604"
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            backlog_id,
+            "Project command terminal status",
+            "FIXED",
+            "2026-06-04T00:00:00Z",
+            "2026-06-04T00:00:00Z",
+        ),
+    )
+    terminal_projection = {
+        "schema_version": "observer_command_terminal_projection.v1",
+        "source_of_truth": "Contract/Revision/Event",
+        "passed": True,
+        "canonical_contract_state": "closed",
+        "command_projection_status": "completed",
+        "divergence_reason": "superseded_route_identity_reconciled",
+        "canonical_route_identity": {"route_id": "route-repair-e97d980211e2dc1c"},
+        "superseded_route_identity": {"route_id": "route-repair-01c5a0404ba10777"},
+        "terminal_evidence_refs": [{"request_id": "req-97cd668efd14"}],
+    }
+    conn.execute(
+        """INSERT INTO observer_command_queue (
+               command_id, project_id, command_type, payload_json, status,
+               target_session_id, claimed_by_session_id, created_by, created_at,
+               notified_at, claimed_at, completed_at, result_json, error
+           ) VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, '')""",
+        (
+            "cmd-d0e3e3bf7893",
+            PID,
+            observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            observer_session._json_dumps({
+                "backlog_id": backlog_id,
+                "route_id": "route-repair-01c5a0404ba10777",
+            }),
+            observer_session.COMMAND_STATUS_COMPLETED,
+            "observer",
+            "2026-06-04T00:00:00Z",
+            "2026-06-04T00:00:01Z",
+            "2026-06-04T00:00:02Z",
+            "2026-06-04T00:00:03Z",
+            observer_session._json_dumps({
+                "ok": True,
+                "terminal_contract_projection": terminal_projection,
+            }),
+        ),
+    )
+    conn.commit()
+
+    result = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={"view": "compact", "include_closed": "true"})
+    )
+
+    bug = result["bugs"][0]
+    projection = bug["observer_command_projection"]
+    assert projection["source_of_truth"] == "Contract/Revision/Event"
+    assert projection["command_id"] == "cmd-d0e3e3bf7893"
+    assert projection["command_projection_status"] == "completed"
+    assert projection["divergence_reason"] == "superseded_route_identity_reconciled"
+    assert projection["canonical_route_identity"]["route_id"] == "route-repair-e97d980211e2dc1c"
+    assert projection["superseded_route_identity"]["route_id"] == "route-repair-01c5a0404ba10777"
 
 
 def test_graph_governance_asset_drift_state_and_proposal_api_are_auditable(conn):

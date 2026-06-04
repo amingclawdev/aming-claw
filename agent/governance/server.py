@@ -20107,6 +20107,54 @@ def _backlog_contract_summary(value: Any) -> dict:
     }
 
 
+def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]) -> None:
+    bug_ids = {str(bug.get("bug_id") or "").strip() for bug in bugs if bug.get("bug_id")}
+    if not bug_ids:
+        return
+    try:
+        rows = conn.execute(
+            """SELECT *
+                FROM observer_command_queue
+               WHERE project_id = ?
+                ORDER BY COALESCE(NULLIF(completed_at, ''), NULLIF(claimed_at, ''), created_at) DESC,
+                         created_at DESC""",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return
+        raise
+    projections: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        command = observer_session._command_row_to_dict(row)
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        backlog_id = str(payload.get("backlog_id") or payload.get("bug_id") or "").strip()
+        if not backlog_id or backlog_id not in bug_ids or backlog_id in projections:
+            continue
+        result = command.get("result") if isinstance(command.get("result"), dict) else {}
+        projection = result.get("terminal_contract_projection")
+        if not isinstance(projection, dict) and not command.get("command_projection_status"):
+            continue
+        projections[backlog_id] = {
+            "schema_version": "observer_command_backlog_projection.v1",
+            "source_of_truth": "Contract/Revision/Event",
+            "command_id": command.get("command_id", ""),
+            "command_status": command.get("status", ""),
+            "command_error": command.get("error", ""),
+            "projection": projection if isinstance(projection, dict) else {},
+            "canonical_contract_state": command.get("canonical_contract_state", ""),
+            "command_projection_status": command.get("command_projection_status", ""),
+            "divergence_reason": command.get("divergence_reason", ""),
+            "canonical_route_identity": command.get("canonical_route_identity", {}),
+            "superseded_route_identity": command.get("superseded_route_identity", {}),
+            "terminal_evidence_refs": command.get("terminal_evidence_refs", []),
+        }
+    for bug in bugs:
+        projection = projections.get(str(bug.get("bug_id") or "").strip())
+        if projection:
+            bug["observer_command_projection"] = projection
+
+
 def _backlog_summary(conn) -> dict:
     by_status = {
         str(row["status"] or "OPEN"): int(row["count"] or 0)
@@ -20210,6 +20258,7 @@ def handle_backlog_list(ctx: RequestContext):
             _backlog_compact_bug(r) if view == "compact" else _backlog_full_bug(r)
             for r in rows
         ]
+        _attach_observer_command_projections(conn, pid, bugs)
         total_count = int(conn.execute("SELECT COUNT(*) AS count FROM backlog_bugs").fetchone()["count"] or 0)
         next_offset = offset + len(bugs)
         has_more = limit is not None and next_offset < filtered_count
