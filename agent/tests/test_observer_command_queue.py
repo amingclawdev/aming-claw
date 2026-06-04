@@ -53,6 +53,158 @@ def _actual_startup_result() -> dict:
     }
 
 
+STALE_BOOTSTRAP_ROUTE = {
+    "route_id": "route-repair-01c5a0404ba10777",
+    "route_context_hash": "sha256:stale-bootstrap-route-context",
+    "prompt_contract_id": "rprompt-repair-01c5a0404ba10777",
+    "prompt_contract_hash": "sha256:stale-bootstrap-prompt-contract",
+    "visible_injection_manifest_hash": "sha256:stale-visible-manifest",
+}
+
+CANONICAL_A3_ROUTE = {
+    "route_id": "route-repair-e97d980211e2dc1c",
+    "route_context_hash": "sha256:6fff2f7365b877da0d6130365c4a5d96c7abb5d151ebb0960e4fc1abc65cec46",
+    "prompt_contract_id": "rprompt-repair-e97d980211e2dc1c",
+    "prompt_contract_hash": "sha256:ad98e3b14698b479dbb6d2c82d91f11758c1e1a26ab3b222b4d6ea9c8962b245",
+    "visible_injection_manifest_hash": "sha256:86e97fdf869553c3a339c7aefbe8dfa548e9899627209c070e541df11d0c69e7",
+}
+
+CANONICAL_CONTRACT_HASH = (
+    "sha256:091f3bd50e9ad762979b8bc46092a31d18572f3d7f32e2e7649de76e4e23db51"
+)
+
+
+def _route_event(kind: str, event_id: int, route: dict, *, status: str = "passed") -> dict:
+    payload_key = {
+        "route_context": "route_context",
+        "route_action_precheck": "route_action_precheck",
+        "mf_subagent_dispatch": "mf_subagent_dispatch_gate",
+        "mf_subagent_startup": "mf_subagent_startup_gate",
+    }[kind]
+    body = {
+        **route,
+        "worker_id": "mf-sub-a3",
+        "bounded": True,
+        "visible_injection_manifest_hash": route["visible_injection_manifest_hash"],
+    }
+    if kind == "mf_subagent_startup":
+        body.update({
+            "fence_token": "fence-a3",
+            "actual_cwd": "/repo/.worktrees/mf-sub-a3",
+            "actual_git_root": "/repo/.worktrees/mf-sub-a3",
+            "branch": "refs/heads/codex/a3",
+            "head_commit": "0f1f83b33251a43066ecdca26427be4fc23aa5f8",
+        })
+    return {
+        "id": event_id,
+        "event_kind": kind,
+        "phase": "startup_gate" if kind == "mf_subagent_startup" else "dispatch",
+        "status": status,
+        "payload": {
+            payload_key: body,
+            "visible_injection_manifest_hash": route["visible_injection_manifest_hash"],
+        },
+    }
+
+
+def _canonical_close_evidence(*, include_close_ready: bool = True, include_cleanup: bool = True) -> dict:
+    events = [
+        {
+            "id": 1810,
+            "event_kind": "mf_subagent_read_receipt",
+            "phase": "startup",
+            "status": "accepted",
+            "payload": {
+                "read_receipt_hash": "sha256:a3-read",
+                "canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH,
+            },
+        },
+        {
+            "id": 1811,
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "accepted",
+            "payload": {"canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH},
+        },
+        {
+            "id": 1817,
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "verification": {
+                **CANONICAL_A3_ROUTE,
+                "contract_evidence": [
+                    {
+                        "requirement_id": "independent_verification_lane",
+                        "status": "passed",
+                        "reviewer_role": "qa",
+                    }
+                ],
+            },
+        },
+        {
+            "id": 1819,
+            "event_kind": "architecture_review",
+            "phase": "architecture_review",
+            "status": "passed",
+            "verification": CANONICAL_A3_ROUTE,
+        },
+        {"id": 1821, "event_kind": "merge_gate", "phase": "merge_gate", "status": "passed"},
+        {"id": 1823, "event_kind": "live_merge", "phase": "live_merge", "status": "passed"},
+        _route_event("route_context", 1801, STALE_BOOTSTRAP_ROUTE),
+        _route_event("route_action_precheck", 1802, STALE_BOOTSTRAP_ROUTE),
+        _route_event("mf_subagent_dispatch", 1803, STALE_BOOTSTRAP_ROUTE),
+        _route_event("route_context", 1825, CANONICAL_A3_ROUTE),
+        _route_event("route_action_precheck", 1826, CANONICAL_A3_ROUTE),
+        _route_event("mf_subagent_dispatch", 1827, CANONICAL_A3_ROUTE),
+        _route_event("mf_subagent_startup", 1828, CANONICAL_A3_ROUTE),
+        {
+            "id": 1833,
+            "event_kind": "contract_projection_reconciled",
+            "phase": "projection",
+            "status": "accepted",
+            "payload": {"canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH},
+        },
+    ]
+    if include_cleanup:
+        events.append({
+            "id": 1824,
+            "event_kind": "route_identity_cleanup",
+            "phase": "identity_recovery",
+            "status": "accepted",
+            "payload": {
+                "route_identity_cleanup": {
+                    **CANONICAL_A3_ROUTE,
+                    "reason": "Supersede stale bootstrap route with canonical A3 route evidence.",
+                }
+            },
+        })
+    if include_close_ready:
+        events.append({
+            "id": 1835,
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "payload": {"canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH},
+        })
+    return {
+        "canonical_close_evidence": {
+            "timeline_events": events,
+            "contract": {
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604",
+                "canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH,
+            },
+            "canonical_route_identity": CANONICAL_A3_ROUTE,
+            "backlog_close": {
+                "ok": True,
+                "request_id": "req-97cd668efd14",
+                "backlog_status": "FIXED",
+            },
+        }
+    }
+
+
 def _insert_legacy_execute_command(
     conn: sqlite3.Connection,
     *,
@@ -210,6 +362,131 @@ def test_execute_backlog_row_complete_without_startup_fails_truthfully():
     assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
     assert blocker["terminal_dispatch_blocker"] is True
     assert "runtime-text startup intent" in blocker["reason"]
+
+
+def test_execute_backlog_row_completion_projects_terminal_from_canonical_close_evidence():
+    conn = _conn()
+    session = _register(conn)
+    payload = {"backlog_id": "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604", **STALE_BOOTSTRAP_ROUTE}
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        command_id="cmd-d0e3e3bf7893",
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={"ok": True, **_canonical_close_evidence()},
+        now="2026-06-04T06:20:00Z",
+    )
+
+    command_after = completed["command"]
+    projection = command_after["result"]["terminal_contract_projection"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert command_after["error"] == ""
+    assert "startup_surface_blocker" not in command_after["result"]
+    assert projection["source_of_truth"] == "Contract/Revision/Event"
+    assert projection["canonical_contract_state"] == "closed"
+    assert projection["command_projection_status"] == "completed"
+    assert projection["divergence_reason"] == "superseded_route_identity_reconciled"
+    assert projection["canonical_route_identity"]["route_id"] == CANONICAL_A3_ROUTE["route_id"]
+    assert projection["superseded_route_identity"]["route_id"] == STALE_BOOTSTRAP_ROUTE["route_id"]
+    assert projection["backlog_close_request_id"] == "req-97cd668efd14"
+    assert command_after["command_projection_status"] == "completed"
+    assert command_after["canonical_route_identity"]["route_context_hash"] == (
+        CANONICAL_A3_ROUTE["route_context_hash"]
+    )
+
+
+def test_execute_backlog_row_completion_does_not_project_without_closed_backlog_state():
+    conn = _conn()
+    session = _register(conn)
+    payload = {"backlog_id": "AC-NO-CLOSE", **STALE_BOOTSTRAP_ROUTE}
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+    evidence = _canonical_close_evidence()
+    evidence["canonical_close_evidence"]["backlog_close"]["backlog_status"] = "IN_PROGRESS"
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={"ok": True, **evidence},
+    )
+
+    command_after = completed["command"]
+    projection = command_after["result"]["terminal_contract_projection"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert projection["command_projection_status"] == "unresolved"
+    assert "canonical_backlog_fixed_or_closed" in projection["missing_requirement_ids"]
+
+
+def test_execute_backlog_row_completion_keeps_blocker_without_superseding_route_relation():
+    conn = _conn()
+    session = _register(conn)
+    payload = {"backlog_id": "AC-NO-SUPERSESSION", **STALE_BOOTSTRAP_ROUTE}
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={"ok": True, **_canonical_close_evidence(include_cleanup=False)},
+    )
+
+    command_after = completed["command"]
+    projection = command_after["result"]["terminal_contract_projection"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert projection["command_projection_status"] == "unresolved"
+    assert "superseding_route_or_contract_relation" in projection["missing_requirement_ids"]
 
 
 def test_execute_backlog_row_rejects_missing_route_payload_fields():

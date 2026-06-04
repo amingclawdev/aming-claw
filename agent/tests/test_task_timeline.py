@@ -3020,12 +3020,82 @@ class TestTaskTimeline(unittest.TestCase):
             ],
             0,
         )
-        self.assertIn(
-            "superseded_route_identity",
+
+    def test_observer_command_terminal_projection_uses_canonical_close_evidence(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:observer-command-terminal-contract"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-COMMAND-TERMINAL-PROJECTION",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+        stale_identity = {
+            "route_id": "route-repair-01c5a0404ba10777",
+            "route_context_hash": "sha256:stale-route-context",
+            "prompt_contract_id": "rprompt-stale-route",
+            "prompt_contract_hash": "sha256:stale-prompt-contract",
+            "visible_injection_manifest_hash": "sha256:stale-visible",
+        }
+        stale_events = _replace_route_identity(
+            _route_context_consumption_events()[:3],
+            stale_identity,
+        )
+        current_events = [
+            *_route_context_consumption_events(),
+            _route_context_qa_verification_event(),
+        ]
+        close_events = [
+            _mf_subagent_read_receipt_event(event_id=0, contract_hash=contract_hash),
             {
-                item["reason"]
-                for item in ready["route_context_gate"]["ignored_route_events"]
+                "id": 1811,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {"canonical_visible_contract_text_hash": contract_hash},
             },
+            {"id": 1817, "event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"id": 1835, "event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        cleanup = {
+            "id": 1824,
+            "event_kind": "route_identity_cleanup",
+            "phase": "identity_recovery",
+            "status": "accepted",
+            "payload": {"route_identity_cleanup": ROUTE_IDENTITY},
+        }
+
+        projection = task_timeline.observer_command_terminal_projection_from_close_evidence(
+            {"backlog_id": "BUG-COMMAND-TERMINAL-PROJECTION", **stale_identity},
+            {
+                "canonical_close_evidence": {
+                    "timeline_events": [*close_events, *stale_events, *current_events, cleanup],
+                    "contract": contract,
+                    "canonical_route_identity": {
+                        "route_id": "route-repair-e97d980211e2dc1c",
+                        **ROUTE_IDENTITY,
+                    },
+                    "backlog_close": {
+                        "request_id": "req-97cd668efd14",
+                        "backlog_status": "FIXED",
+                    },
+                }
+            },
+        )
+
+        self.assertTrue(projection["passed"], projection)
+        self.assertEqual(projection["command_projection_status"], "completed")
+        self.assertEqual(
+            projection["divergence_reason"],
+            "superseded_route_identity_reconciled",
+        )
+        self.assertEqual(
+            projection["canonical_route_identity"]["route_context_hash"],
+            ROUTE_IDENTITY["route_context_hash"],
+        )
+        self.assertEqual(
+            projection["superseded_route_identity"]["route_id"],
+            "route-repair-01c5a0404ba10777",
         )
 
     def test_mf_close_gate_blocks_observer_direct_when_subagent_lane_required(self):

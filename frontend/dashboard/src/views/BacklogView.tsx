@@ -839,6 +839,9 @@ function BacklogRow({
   const runtime = bug.runtime_state || bug.chain_stage || bug.mf_type || "idle";
   const contract = bug.contract_summary;
   const projectionStatus = contract?.projection_status || (contract?.divergent ? "divergent" : contract?.stale ? "stale" : "");
+  const commandProjection = bug.observer_command_projection;
+  const commandProjectionStatus = commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "";
+  const commandDivergence = commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
   return (
     <>
       <tr>
@@ -909,6 +912,12 @@ function BacklogRow({
             <div className="backlog-commit mono" title={`Contract projection from ${contract?.source_of_truth || "Contract/Revision/Event"}`}>
               projection {projectionStatus}
               {contract?.projection_watermark ? ` · ${shortProjectionWatermark(contract.projection_watermark)}` : ""}
+            </div>
+          ) : null}
+          {commandProjectionStatus ? (
+            <div className="backlog-commit mono" title={commandDivergence || "Observer command terminal projection"}>
+              command {commandProjectionStatus}
+              {commandDivergence ? ` · ${compactProjectionReason(commandDivergence)}` : ""}
             </div>
           ) : null}
           {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
@@ -1193,6 +1202,9 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
   const contract = gate?.contract_gate;
   const routeGate = gate?.route_context_gate;
   const projection = contractProjectionForSummary(bug, gate);
+  const commandProjection = bug.observer_command_projection;
+  const commandProjectionStatus = commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "not loaded";
+  const commandDivergence = commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
   const missing = stableUnique([
     ...(gate?.missing_event_kinds ?? []),
     ...(contract?.missing_requirement_ids ?? []),
@@ -1206,6 +1218,7 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
       <SummaryItem label="Commit" value={bug.commit ? shortCommit(bug.commit) : "none"} mono />
       <SummaryItem label="Contract" value={contract?.status || (bug.contract_summary?.has_contract ? "declared" : "not declared")} tone={contract?.passed ? "status-complete" : contract ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Projection" value={projection?.status || "not loaded"} tone={projectionTone(projection)} />
+      <SummaryItem label="Command" value={commandProjectionStatus} tone={commandProjectionTone(commandProjectionStatus, commandDivergence)} />
       <SummaryItem label="Route context" value={routeGate?.status || (routeGate?.required ? "required" : "not required")} tone={routeGate?.passed ? "status-complete" : routeGate?.required ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Close gate" value={gate?.status || (gate ? (gate.passed ? "passed" : "blocked") : "not loaded")} tone={gate?.passed ? "status-complete" : gate ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Missing" value={missing.length ? String(missing.length) : "none"} tone={missing.length ? "status-failed" : "status-complete"} />
@@ -1238,6 +1251,19 @@ function projectionTone(projection: AgentTaskContractProjection | null): string 
   if (projection.stale || projection.status === "stale") return "status-pending";
   if (projection.status === "current") return "status-complete";
   return "status-unknown";
+}
+
+function commandProjectionTone(status: string, divergenceReason = ""): string {
+  const normalized = status.toLowerCase();
+  if (!status || normalized === "not loaded") return "status-unknown";
+  if (normalized === "completed" && !divergenceReason) return "status-complete";
+  if (normalized === "completed" && divergenceReason.includes("reconciled")) return "status-complete";
+  if (normalized === "unresolved" || divergenceReason.startsWith("missing_")) return "status-failed";
+  return "status-pending";
+}
+
+function compactProjectionReason(value: string): string {
+  return value.replace(/^missing_/, "missing ").replaceAll("_", " ");
 }
 
 function SummaryItem({ label, value, tone, mono = false }: { label: string; value: string; tone?: string; mono?: boolean }) {

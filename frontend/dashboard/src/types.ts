@@ -99,6 +99,46 @@ export interface ObserverCommand {
   completed_at?: string;
   result?: Record<string, unknown>;
   error?: string;
+  canonical_contract_state?: string;
+  command_projection_status?: string;
+  divergence_reason?: string;
+  canonical_route_identity?: Record<string, unknown>;
+  superseded_route_identity?: Record<string, unknown>;
+  terminal_evidence_refs?: Record<string, unknown>[];
+}
+
+export interface ObserverCommandTerminalProjection {
+  schema_version?: string;
+  source_of_truth?: string;
+  projected_surface?: string;
+  projected_surfaces?: string[];
+  passed?: boolean;
+  status?: string;
+  canonical_contract_state?: string;
+  command_projection_status?: string;
+  divergence_reason?: string;
+  canonical_route_identity?: Record<string, unknown>;
+  superseded_route_identity?: Record<string, unknown>;
+  terminal_evidence_refs?: Record<string, unknown>[];
+  missing_requirement_ids?: string[];
+  close_gate_status?: string;
+  backlog_close_request_id?: string;
+  backlog_status?: string;
+}
+
+export interface ObserverCommandBacklogProjection {
+  schema_version?: string;
+  source_of_truth?: string;
+  command_id?: string;
+  command_status?: string;
+  command_error?: string;
+  projection?: ObserverCommandTerminalProjection;
+  canonical_contract_state?: string;
+  command_projection_status?: string;
+  divergence_reason?: string;
+  canonical_route_identity?: Record<string, unknown>;
+  superseded_route_identity?: Record<string, unknown>;
+  terminal_evidence_refs?: Record<string, unknown>[];
 }
 
 export interface ObserverCommandSummary {
@@ -680,6 +720,7 @@ export interface BacklogBug {
   required_doc_count?: number;
   provenance_count?: number;
   contract_summary?: BacklogContractSummary;
+  observer_command_projection?: ObserverCommandBacklogProjection;
   compact?: boolean;
 }
 
