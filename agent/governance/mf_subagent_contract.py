@@ -87,7 +87,13 @@ _REQUIRED_CONTEXT_FIELDS = (
     "merge_queue_id",
     "fence_token",
 )
-_READY_STATUSES = {"completed", "succeeded", "ready_for_merge"}
+_READY_STATUSES = {
+    "completed",
+    "succeeded",
+    "ready_for_merge",
+    "review_ready",
+    "waiting_merge",
+}
 _PASS_STATUSES = {"pass", "passed", "ok", "succeeded", "success", "clean"}
 _FAIL_STATUSES = {
     "block",

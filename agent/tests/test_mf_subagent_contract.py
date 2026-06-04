@@ -57,8 +57,18 @@ def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract()
         / "mf_parallel.v1.json"
     )
     template = json.loads(template_path.read_text(encoding="utf-8"))
+    assert {"review_ready", "waiting_merge"}.issubset(
+        set(template["lifecycle_states"])
+    )
 
     worker_contract = template["worker_contract"]
+    assert {"review_ready", "waiting_merge"}.issubset(
+        set(worker_contract["allowed_terminal_states"])
+    )
+    assert set(worker_contract["final_output"]["stop_states"]) == {
+        "review_ready",
+        "waiting_merge",
+    }
     assert set(worker_contract["required_fields"]).issuperset(
         {
             "task_id",
@@ -1950,10 +1960,11 @@ def test_build_input_rejects_missing_required_identity(field: str) -> None:
         build_mf_subagent_input(_context(**{field: ""}), prompt="Do work.")
 
 
-def test_normalize_result_marks_ready_only_after_tests_and_fence_match() -> None:
+@pytest.mark.parametrize("status", ["succeeded", "review_ready", "waiting_merge"])
+def test_normalize_result_marks_ready_only_after_tests_and_fence_match(status: str) -> None:
     normalized = normalize_mf_subagent_result(
         {
-            "status": "succeeded",
+            "status": status,
             "changed_files": ["agent/governance/mf_subagent_contract.py"],
             "test_results": {"status": "passed", "command": "pytest -q"},
             "checkpoint_id": "ckpt-new",
@@ -1964,6 +1975,7 @@ def test_normalize_result_marks_ready_only_after_tests_and_fence_match() -> None
     )
 
     assert normalized["role"] == MF_SUB_ROLE
+    assert normalized["status"] == status
     assert normalized["merge_queue_ready"] is True
     assert normalized["checkpoint_id"] == "ckpt-new"
     assert normalized["changed_files"] == ["agent/governance/mf_subagent_contract.py"]
@@ -2009,7 +2021,7 @@ def test_normalize_result_rejects_forbidden_actions(payload: dict[str, object]) 
 def test_normalize_result_blocks_merge_queue_when_tests_fail() -> None:
     normalized = normalize_mf_subagent_result(
         {
-            "status": "succeeded",
+            "status": "review_ready",
             "changed_files": ["x.py"],
             "test_results": {"status": "failed"},
             "checkpoint_id": "ckpt-new",
@@ -2021,6 +2033,33 @@ def test_normalize_result_blocks_merge_queue_when_tests_fail() -> None:
 
     assert normalized["merge_queue_ready"] is False
     assert normalized["blockers"] == ["test failure"]
+
+
+@pytest.mark.parametrize(
+    ("status", "test_results", "blockers"),
+    [
+        ("waiting_merge", {"status": "passed"}, ["observer follow-up required"]),
+        ("running", {"status": "passed"}, []),
+    ],
+)
+def test_normalize_result_blocks_unready_handoff_states(
+    status: str,
+    test_results: dict[str, object],
+    blockers: list[str],
+) -> None:
+    normalized = normalize_mf_subagent_result(
+        {
+            "status": status,
+            "changed_files": ["x.py"],
+            "test_results": test_results,
+            "checkpoint_id": "ckpt-new",
+            "fence_token": "fence-2",
+            "blockers": blockers,
+        },
+        expected_fence_token="fence-2",
+    )
+
+    assert normalized["merge_queue_ready"] is False
 
 
 def test_finish_gate_returns_validated_checkpoint_evidence() -> None:

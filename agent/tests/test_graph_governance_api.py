@@ -1674,22 +1674,24 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
     assert finished["context"]["head_commit"] == "head-finish"
 
 
-def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn):
+@pytest.mark.parametrize("worker_status", ["succeeded", "review_ready"])
+def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn, worker_status):
+    suffix = worker_status.replace("_", "-")
     upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
             project_id=PID,
-            batch_id="PB-api-finish-mf-sub",
-            task_id="finish-mf-sub-task",
+            batch_id=f"PB-api-finish-mf-sub-{suffix}",
+            task_id=f"finish-mf-sub-task-{suffix}",
             backlog_id="FEAT-FINISH-GATE",
-            branch_ref="refs/heads/codex/finish-mf-sub-task",
+            branch_ref=f"refs/heads/codex/finish-mf-sub-task-{suffix}",
             status="worktree_ready",
-            fence_token="fence-finish-mf-sub",
-            worktree_path="/tmp/nonexistent-finish-mf-sub-task",
+            fence_token=f"fence-finish-mf-sub-{suffix}",
+            worktree_path=f"/tmp/nonexistent-finish-mf-sub-task-{suffix}",
             base_commit="base-finish",
             head_commit="base-finish",
             target_head_commit="target-finish",
-            merge_queue_id="mergeq-api-finish-mf-sub",
+            merge_queue_id=f"mergeq-api-finish-mf-sub-{suffix}",
         ),
         now_iso="2026-05-17T07:30:00Z",
     )
@@ -1701,20 +1703,21 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn):
             method="POST",
             body={
                 "project_id": PID,
-                "task_id": "finish-mf-sub-task",
-                "status": "succeeded",
+                "task_id": f"finish-mf-sub-task-{suffix}",
+                "status": worker_status,
                 "changed_files": ["agent/governance/server.py"],
                 "test_results": {"status": "passed"},
-                "checkpoint_id": "ckpt-finish-mf-sub",
-                "fence_token": "fence-finish-mf-sub",
-                "head_commit": "head-finish-mf-sub",
+                "checkpoint_id": f"ckpt-finish-mf-sub-{suffix}",
+                "fence_token": f"fence-finish-mf-sub-{suffix}",
+                "head_commit": f"head-finish-mf-sub-{suffix}",
                 "agent_id": "codex-subagent-mf-sub",
             },
         )
     )
 
     assert finished["ok"] is True
-    assert finished["context"]["checkpoint_id"] == "ckpt-finish-mf-sub"
+    assert finished["gate"]["merge_queue_ready"] is True
+    assert finished["context"]["checkpoint_id"] == f"ckpt-finish-mf-sub-{suffix}"
     assert finished["context"]["replay_source"] == "mf_sub_finish_gate"
 
 
