@@ -44,7 +44,7 @@ def _make_db():
         CREATE TABLE task_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT NOT NULL,
-            attempt_number INTEGER NOT NULL DEFAULT 1,
+            attempt_num INTEGER NOT NULL DEFAULT 1,
             status TEXT NOT NULL DEFAULT 'running',
             started_at TEXT,
             completed_at TEXT,
@@ -76,14 +76,14 @@ def _insert_coordinator_task(conn, task_id, chat_id="12345"):
         """INSERT INTO tasks (task_id, project_id, status, execution_status,
                               notification_status, type, prompt,
                               related_nodes, created_by, created_at, updated_at,
-                              metadata_json, assigned_to)
+                              metadata_json, assigned_to, attempt_count)
            VALUES (?, 'test-proj', 'claimed', 'claimed', 'none', 'coordinator', 'test',
                    '[]', 'test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-                   ?, 'executor-1')""",
+                   ?, 'executor-1', 1)""",
         (task_id, json.dumps(meta)),
     )
     conn.execute(
-        """INSERT INTO task_attempts (task_id, attempt_number, status, started_at)
+        """INSERT INTO task_attempts (task_id, attempt_num, status, started_at)
            VALUES (?, 1, 'running', '2026-01-01T00:00:00Z')""",
         (task_id,),
     )
@@ -146,13 +146,13 @@ class TestNotificationDedup:
             """INSERT INTO tasks (task_id, project_id, status, execution_status,
                                   notification_status, type, prompt,
                                   related_nodes, created_by, created_at, updated_at,
-                                  metadata_json, assigned_to)
+                                  metadata_json, assigned_to, attempt_count)
                VALUES ('task-coord-003', 'test-proj', 'claimed', 'claimed', 'none', 'dev', 'test',
                        '[]', 'test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-                       '{}', 'executor-1')""",
+                       '{}', 'executor-1', 1)""",
         )
         conn.execute(
-            """INSERT INTO task_attempts (task_id, attempt_number, status, started_at)
+            """INSERT INTO task_attempts (task_id, attempt_num, status, started_at)
                VALUES ('task-coord-003', 1, 'running', '2026-01-01T00:00:00Z')""",
         )
         conn.commit()
