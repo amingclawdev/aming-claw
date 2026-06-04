@@ -73,6 +73,11 @@ def route_context_consumption_events() -> list[dict[str, object]]:
                     **ROUTE_IDENTITY,
                     "worker_id": "mf-sub-test",
                     "fence_token": FENCE_TOKEN,
+                    "worktree": "/repo/.worktrees/mf-sub-test",
+                    "actual_cwd": "/repo/.worktrees/mf-sub-test",
+                    "actual_git_root": "/repo/.worktrees/mf-sub-test",
+                    "branch": "mf/sub-test",
+                    "head_commit": "head-mf-sub-test",
                 }
             },
         },
@@ -100,6 +105,11 @@ def _bounded_startup_evidence() -> dict[str, object]:
         "role": "mf_sub",
         "bounded": True,
         "fence_token": FENCE_TOKEN,
+        "worktree": "/repo/.worktrees/mf-sub-test",
+        "actual_cwd": "/repo/.worktrees/mf-sub-test",
+        "actual_git_root": "/repo/.worktrees/mf-sub-test",
+        "branch": "mf/sub-test",
+        "head_commit": "head-mf-sub-test",
         "same_as_expected_worker": True,
         "fence_token_matches": True,
     }

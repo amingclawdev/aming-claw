@@ -4616,8 +4616,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     from .db import sqlite_write_lock
     from .parallel_branch_runtime import (
         branch_context_to_dict,
+        get_branch_context,
         materialize_branch_worktree,
         plan_branch_runtime_context,
+        preserve_materialized_context_for_allocation,
         upsert_branch_context,
     )
 
@@ -4664,6 +4666,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
         with sqlite_write_lock():
+            if not _query_bool(ctx.body, "create_worktree", False):
+                existing = get_branch_context(conn, project_id, task_id)
+                context = preserve_materialized_context_for_allocation(existing, context)
             saved = upsert_branch_context(
                 conn,
                 context,

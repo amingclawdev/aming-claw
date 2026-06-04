@@ -34,6 +34,8 @@ from agent.governance.parallel_branch_runtime import (
     BatchMergeRuntime,
     MergeQueueItem,
     STATE_MERGE_FAILED,
+    STATE_WORKTREE_READY,
+    get_branch_context,
     upsert_batch_merge_runtime,
     upsert_branch_context,
     upsert_merge_queue_items,
@@ -976,6 +978,87 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["status"] == "worktree_ready"
     assert lanes[0]["worktree_path"] == context["worktree_path"]
     assert lanes[0]["graph_epoch"]["base_commit"]
+
+
+def test_parallel_branch_allocate_without_worktree_preserves_materialized_runtime_context(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="API Branch Task",
+            runtime_context_id="mfrctx-api-branch-task",
+            batch_id="PB-api-alloc",
+            backlog_id="ARCH-PB-ALLOC",
+            root_task_id="root-api-alloc",
+            stage_task_id="API Branch Task",
+            stage_type="mf_sub",
+            agent_id="agent-api",
+            worker_id="worker api",
+            attempt=3,
+            lease_id="lease-existing",
+            lease_expires_at="2026-05-17T08:00:00Z",
+            fence_token="fence-existing",
+            branch_ref="refs/heads/codex/api-branch-task",
+            ref_name="main",
+            worktree_id="wt-api-branch-task",
+            worktree_path="/repo/.worktrees/worker-api/api-branch-task",
+            base_commit="base-existing",
+            head_commit="head-existing",
+            target_head_commit="target-existing",
+            snapshot_id="scope-existing",
+            projection_id="semproj-existing",
+            merge_queue_id="mergeq-existing",
+            merge_preview_id="preview-existing",
+            rollback_epoch="rollback-existing",
+            replay_epoch="replay-existing",
+            status=STATE_WORKTREE_READY,
+            checkpoint_id="checkpoint-existing",
+            replay_source="mf_sub_finish_gate",
+            last_recovery_action="finish_gate_recorded",
+        ),
+        now_iso="2026-05-17T07:10:00Z",
+    )
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "API Branch Task",
+                "batch_id": "PB-api-alloc",
+                "backlog_id": "ARCH-PB-ALLOC",
+                "worker_id": "worker api",
+                "workspace_root": "/repo",
+                "base_commit": "base-new",
+                "target_head_commit": "target-new",
+                "fence_token": "fence-new",
+                "create_worktree": False,
+                "now_iso": "2026-05-17T07:12:00Z",
+            },
+        )
+    )
+
+    assert status == 201
+    context = allocated["context"]
+    assert context["status"] == "worktree_ready"
+    assert context["fence_token"] == "fence-existing"
+    assert context["worktree_id"] == "wt-api-branch-task"
+    assert context["worktree_path"] == "/repo/.worktrees/worker-api/api-branch-task"
+    assert context["base_commit"] == "base-existing"
+    assert context["head_commit"] == "head-existing"
+    assert context["target_head_commit"] == "target-existing"
+    assert context["snapshot_id"] == "scope-existing"
+    assert context["projection_id"] == "semproj-existing"
+    assert context["merge_queue_id"] == "mergeq-existing"
+    assert context["merge_preview_id"] == "preview-existing"
+    assert context["checkpoint_id"] == "checkpoint-existing"
+    assert context["replay_source"] == "mf_sub_finish_gate"
+
+    reloaded = get_branch_context(conn, PID, "API Branch Task")
+    assert reloaded is not None
+    assert reloaded.status == STATE_WORKTREE_READY
+    assert reloaded.head_commit == "head-existing"
+    assert reloaded.checkpoint_id == "checkpoint-existing"
 
 
 def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):

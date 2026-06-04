@@ -190,6 +190,23 @@ STATE_ABANDONED = "abandoned"
 STATE_ROLLBACK_REQUIRED = "rollback_required"
 STATE_ALLOCATED = "allocated"
 STATE_WORKTREE_READY = "worktree_ready"
+MATERIALIZED_RUNTIME_CONTEXT_STATES = {
+    STATE_WORKTREE_READY,
+    STATE_RUNNING,
+    STATE_RECLAIMABLE,
+    STATE_DEPENDENCY_BLOCKED,
+    STATE_WAITING_DEPENDENCY,
+    STATE_VALIDATED,
+    STATE_VALIDATING,
+    STATE_STALE_AFTER_DEPENDENCY_MERGE,
+    STATE_REBASE_REQUIRED,
+    STATE_MERGE_READY,
+    STATE_MERGE_BLOCKED,
+    STATE_MERGING,
+    STATE_MERGED,
+    STATE_MERGE_FAILED,
+    STATE_ROLLBACK_REQUIRED,
+}
 
 BATCH_STATE_OPEN = "open"
 BATCH_STATE_MERGE_IN_PROGRESS = "merge_in_progress"
@@ -622,6 +639,51 @@ def runtime_context_id_for_branch_context(context: BranchTaskRuntimeContext) -> 
         context.project_id,
         context.task_id,
         context.attempt,
+    )
+
+
+def is_materialized_branch_context(context: BranchTaskRuntimeContext | None) -> bool:
+    if context is None:
+        return False
+    return (
+        context.status in MATERIALIZED_RUNTIME_CONTEXT_STATES
+        or bool(context.worktree_path)
+        or bool(context.head_commit)
+        or bool(context.checkpoint_id)
+        or bool(context.snapshot_id)
+        or bool(context.projection_id)
+    )
+
+
+def preserve_materialized_context_for_allocation(
+    existing: BranchTaskRuntimeContext | None,
+    planned: BranchTaskRuntimeContext,
+) -> BranchTaskRuntimeContext:
+    """Keep allocation-only binds from erasing a materialized runtime context."""
+
+    if planned.status != STATE_ALLOCATED or not is_materialized_branch_context(existing):
+        return planned
+    assert existing is not None
+    return replace(
+        existing,
+        runtime_context_id=existing.runtime_context_id or planned.runtime_context_id,
+        batch_id=planned.batch_id or existing.batch_id,
+        backlog_id=planned.backlog_id or existing.backlog_id,
+        chain_id=planned.chain_id or existing.chain_id,
+        root_task_id=planned.root_task_id or existing.root_task_id,
+        stage_task_id=planned.stage_task_id or existing.stage_task_id,
+        stage_type=planned.stage_type or existing.stage_type,
+        retry_round=planned.retry_round or existing.retry_round,
+        agent_id=existing.agent_id or planned.agent_id,
+        worker_id=existing.worker_id or planned.worker_id,
+        attempt=existing.attempt or planned.attempt,
+        lease_id=existing.lease_id or planned.lease_id,
+        lease_expires_at=existing.lease_expires_at or planned.lease_expires_at,
+        fence_token=existing.fence_token or planned.fence_token,
+        ref_name=existing.ref_name or planned.ref_name,
+        merge_queue_id=existing.merge_queue_id or planned.merge_queue_id,
+        depends_on=existing.depends_on or planned.depends_on,
+        created_at=existing.created_at or planned.created_at,
     )
 
 
