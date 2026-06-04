@@ -364,6 +364,69 @@ def test_execute_backlog_row_complete_without_startup_fails_truthfully():
     assert "runtime-text startup intent" in blocker["reason"]
 
 
+def test_execute_backlog_row_prepared_startup_event_does_not_complete():
+    conn = _conn()
+    session = _register(conn)
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    prepared_startup_event = {
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "prepared",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                "schema_version": "mf_subagent_startup_gate.v1",
+                "gate_kind": "mf_subagent.startup",
+                "status": "prepared",
+                "actual_startup_recorded": False,
+                "appendable": True,
+                "worker_role": "mf_sub",
+                "worker_id": "worker-1",
+                "agent_id": "agent-1",
+                "session_token_hash": "sha256:prepared-token",
+                "fence_token": "fence-1",
+                "actual_cwd": "/repo/.worktrees/worker-1",
+                "actual_git_root": "/repo/.worktrees/worker-1",
+                "branch": "refs/heads/codex/worker-1",
+                "head_commit": "head-1",
+            },
+        },
+    }
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={"ok": True, "prepared_startup_event": prepared_startup_event},
+        now="2026-06-03T00:00:03Z",
+    )
+
+    command_after = completed["command"]
+    blocker = command_after["result"]["startup_surface_blocker"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert blocker["status"] == "blocked"
+    assert blocker["terminal_dispatch_blocker"] is True
+    assert command_after["result"]["prepared_startup_event"] == prepared_startup_event
+
+
 def test_execute_backlog_row_cli_timeout_blocks_even_with_startup_evidence():
     conn = _conn()
     session = _register(conn)

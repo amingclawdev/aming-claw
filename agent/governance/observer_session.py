@@ -202,6 +202,15 @@ def _startup_token_present(value: dict[str, Any]) -> bool:
     )
 
 
+def _startup_evidence_is_prepared_or_appendable(value: dict[str, Any]) -> bool:
+    status = str(value.get("status") or value.get("state") or "").strip().lower()
+    return bool(
+        value.get("prepared") is True
+        or value.get("appendable") is True
+        or status in {"prepared", "appendable"}
+    )
+
+
 def _actual_startup_identity_present(value: dict[str, Any]) -> bool:
     actual_runtime = value.get("actual_runtime") if isinstance(value.get("actual_runtime"), dict) else {}
     actual_cwd = _startup_text(value.get("actual_cwd") or actual_runtime.get("cwd"))
@@ -236,6 +245,7 @@ def _contains_actual_startup_evidence(value: Any) -> bool:
             startup_recording = lowered["startup_recording"]
             if (
                 startup_recording.get("recorded") is True
+                and not _startup_evidence_is_prepared_or_appendable(startup_recording)
                 and _actual_startup_identity_present(startup_recording)
             ):
                 return True
@@ -243,16 +253,34 @@ def _contains_actual_startup_evidence(value: Any) -> bool:
         event_kind = str(
             lowered.get("event_kind") or lowered.get("event_type") or ""
         ).strip()
+        if event_kind in {"mf_subagent_read_receipt", "mf_subagent_startup_intent"}:
+            return False
         if event_kind == "mf_subagent_startup":
-            if lowered.get("recorded") is False or lowered.get("actual_startup_recorded") is False:
-                return False
             payload = lowered.get("payload") if isinstance(lowered.get("payload"), dict) else {}
             gate = (
                 payload.get("mf_subagent_startup_gate")
                 if isinstance(payload.get("mf_subagent_startup_gate"), dict)
                 else {}
             )
-            return _actual_startup_identity_present(gate) or _actual_startup_identity_present(lowered)
+            if (
+                lowered.get("recorded") is False
+                or lowered.get("actual_startup_recorded") is False
+                or gate.get("recorded") is False
+                or gate.get("actual_startup_recorded") is False
+                or _startup_evidence_is_prepared_or_appendable(lowered)
+                or _startup_evidence_is_prepared_or_appendable(gate)
+            ):
+                return False
+            return (
+                (
+                    lowered.get("actual_startup_recorded") is True
+                    and _actual_startup_identity_present(lowered)
+                )
+                or (
+                    gate.get("actual_startup_recorded") is True
+                    and _actual_startup_identity_present(gate)
+                )
+            )
 
         if lowered.get("actual_startup_recorded") is True and _actual_startup_identity_present(lowered):
             return True
