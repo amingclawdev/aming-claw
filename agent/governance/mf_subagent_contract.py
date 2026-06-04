@@ -257,6 +257,7 @@ _BRANCH_RUNTIME_CONTAINER_KEYS = (
     "branch_context",
 )
 _BRANCH_RUNTIME_SOURCE_REF_KEYS = {
+    "allocation_source_ref",
     "api_ref",
     "api_route",
     "endpoint",
@@ -1738,6 +1739,7 @@ def _normalize_branch_runtime_evidence(
         "present": bool(source),
         "registered": False,
         "source_ref": source_ref,
+        "runtime_context_id": _context_field(source, "runtime_context_id") if source else "",
         "task_id": _context_field(source, "task_id") if source else "",
         "parent_task_id": (
             _context_field(source, "parent_task_id", "root_task_id", "chain_id")
@@ -1786,6 +1788,8 @@ def _normalize_branch_runtime_evidence(
         for field, expected_value in required_fields.items()
         if expected_value and not normalized[field]
     ]
+    if not normalized["runtime_context_id"]:
+        missing.append("runtime_context_id")
     if missing:
         raise MfSubagentContractError(
             "branch runtime registration evidence missing required fields: "

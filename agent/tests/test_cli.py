@@ -673,10 +673,57 @@ DOGFOOD_PROMPT_CONTRACT_ID = "rprompt-205a50783038d2f0"
 DOGFOOD_VISIBLE_MANIFEST_HASH = "sha256:0603ba125fff6a7fa5267872d3e4e93ec090f6456f8a656ee0e16c77460b7b23"
 
 
-def _dogfood_args(tmp_path, *, main_worktree=None):
+def _dogfood_args(
+    tmp_path,
+    *,
+    main_worktree=None,
+    workspace_root=None,
+    worktree_root="worktrees",
+    base_commit="base123",
+    target_head_commit="head123",
+):
     main = Path(main_worktree or (tmp_path / "main"))
     main.mkdir(parents=True, exist_ok=True)
-    workspace_root = tmp_path / "workers"
+    workspace_root = Path(workspace_root or (tmp_path / "workers"))
+    worker_worktree = (
+        workspace_root
+        / worktree_root
+        / "worker-a"
+        / f"{DOGFOOD_BACKLOG_ID.lower()}-attempt-2"
+    )
+    evidence_file = tmp_path / "dogfood-branch-runtime-evidence.json"
+    evidence_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "mf_subagent_branch_runtime.v1",
+                "status": "allocated",
+                "ok": True,
+                "present": True,
+                "registered": True,
+                "allocation_required": False,
+                "source_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+                "registration_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+                "registration_source": "parallel_branch_allocate",
+                "runtime_context_id": "mfrctx-dogfood-cli",
+                "context": {
+                    "project_id": "aming-claw",
+                    "runtime_context_id": "mfrctx-dogfood-cli",
+                    "task_id": DOGFOOD_BACKLOG_ID,
+                    "parent_task_id": DOGFOOD_BACKLOG_ID,
+                    "backlog_id": DOGFOOD_BACKLOG_ID,
+                    "worker_id": "worker-a",
+                    "attempt": 2,
+                    "branch_ref": f"refs/heads/dogfood/{DOGFOOD_BACKLOG_ID.lower()}-attempt-2",
+                    "worktree_path": str(worker_worktree),
+                    "fence_token": "fence-dogfood-test",
+                    "base_commit": base_commit,
+                    "target_head_commit": target_head_commit,
+                    "merge_queue_id": "mq-dogfood-test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     return [
         "observer",
         "dogfood",
@@ -717,7 +764,7 @@ def _dogfood_args(tmp_path, *, main_worktree=None):
         "--attempt",
         "2",
         "--worktree-root",
-        "worktrees",
+        worktree_root,
         "--branch-prefix",
         "dogfood",
         "--merge-queue-id",
@@ -726,12 +773,14 @@ def _dogfood_args(tmp_path, *, main_worktree=None):
         "fence-dogfood-test",
         "--branch-runtime-registration-ref",
         "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        "--branch-runtime-evidence-file",
+        str(evidence_file),
         "--graph-trace-id",
         "gqt-20260602-testtrace",
         "--base-commit",
-        "base123",
+        base_commit,
         "--target-head-commit",
-        "head123",
+        target_head_commit,
         "--json-output",
     ]
 
@@ -942,11 +991,14 @@ def test_observer_dogfood_materialize_worktree_creates_real_git_worktree_without
         repo,
     )
     commit = _git(["rev-parse", "HEAD"], repo)
-    args = _dogfood_args(tmp_path, main_worktree=repo)
-    args = _replace_option(args, "--workspace-root", str(repo))
-    args = _replace_option(args, "--worktree-root", ".worktrees")
-    args = _replace_option(args, "--base-commit", commit)
-    args = _replace_option(args, "--target-head-commit", commit)
+    args = _dogfood_args(
+        tmp_path,
+        main_worktree=repo,
+        workspace_root=repo,
+        worktree_root=".worktrees",
+        base_commit=commit,
+        target_head_commit=commit,
+    )
     args = _replace_option(args, "--backend-mode", "fixture")
 
     result = runner.invoke(main, args[:-1] + ["--materialize-worktree", "--json-output"])
@@ -980,6 +1032,46 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
     runner = CliRunner()
     main_worktree = tmp_path / "main"
     main_worktree.mkdir(parents=True)
+    worker_worktree = (
+        tmp_path
+        / "workers"
+        / ".worktrees"
+        / "runtime-text-worker"
+        / f"{DOGFOOD_BACKLOG_ID.lower()}-impl-1"
+    )
+    evidence_file = tmp_path / "branch-runtime-evidence.json"
+    evidence_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "mf_subagent_branch_runtime.v1",
+                "status": "worktree_ready",
+                "ok": True,
+                "present": True,
+                "registered": True,
+                "allocation_required": False,
+                "source_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+                "registration_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+                "registration_source": "parallel_branch_allocate",
+                "runtime_context_id": "mfrctx-cli-runtime-text",
+                "context": {
+                    "project_id": "aming-claw",
+                    "runtime_context_id": "mfrctx-cli-runtime-text",
+                    "task_id": f"{DOGFOOD_BACKLOG_ID}-impl-1",
+                    "backlog_id": DOGFOOD_BACKLOG_ID,
+                    "root_task_id": DOGFOOD_BACKLOG_ID,
+                    "worker_id": "runtime-text-worker",
+                    "attempt": 1,
+                    "branch_ref": f"refs/heads/runtime-text/{DOGFOOD_BACKLOG_ID.lower()}-impl-1",
+                    "worktree_path": str(worker_worktree),
+                    "fence_token": "fence-runtime-text-test",
+                    "base_commit": "base123",
+                    "target_head_commit": "target123",
+                    "merge_queue_id": "mq-runtime-text-test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     result = runner.invoke(
         main,
@@ -1017,6 +1109,8 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
             "fence-runtime-text-test",
             "--branch-runtime-registration-ref",
             "/api/graph-governance/aming-claw/parallel-branches/allocate",
+            "--branch-runtime-evidence-file",
+            str(evidence_file),
             "--graph-trace-id",
             "gqt-runtime-text-test",
             "--base-commit",
@@ -1030,7 +1124,8 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["ok"] is True
-    assert payload["runtime_context_id"].startswith("orctx-")
+    assert payload["runtime_context_id"] == "mfrctx-cli-runtime-text"
+    assert payload["runtime_context"]["worktree_path"] == str(worker_worktree)
     assert payload["launch_text"]
     assert payload["launch_text_hash"].startswith("sha256:")
     assert payload["raw_launch_text_persisted"] is False

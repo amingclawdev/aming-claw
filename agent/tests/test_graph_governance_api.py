@@ -1014,6 +1014,12 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert context["branch_ref"] == "refs/heads/codex/api-branch-task"
     assert context["fence_token"].startswith("fence-")
     assert context["worktree_path"] == str(repo / ".worktrees" / "worker-api" / "api-branch-task")
+    allocation_evidence = created["branch_runtime_evidence"]
+    assert allocation_evidence["schema_version"] == "mf_subagent_branch_runtime.v1"
+    assert allocation_evidence["registered"] is True
+    assert allocation_evidence["source_ref"].endswith("/parallel-branches/allocate")
+    assert allocation_evidence["runtime_context_id"] == context["runtime_context_id"]
+    assert allocation_evidence["context"]["worktree_path"] == context["worktree_path"]
     assert created["worktree"]["created"] is True
     assert created["worktree"]["branch_graph"]["status"] == "ready"
 
@@ -1128,6 +1134,157 @@ def test_parallel_branch_allocate_without_worktree_preserves_materialized_runtim
     assert reloaded.status == STATE_WORKTREE_READY
     assert reloaded.head_commit == "head-existing"
     assert reloaded.checkpoint_id == "checkpoint-existing"
+
+
+def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(conn, tmp_path):
+    worktree = tmp_path / "worker"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-text-task",
+            runtime_context_id="mfrctx-runtime-text-api",
+            backlog_id="AC-RUNTIME-TEXT",
+            root_task_id="AC-RUNTIME-TEXT",
+            stage_task_id="runtime-text-task",
+            stage_type="mf_sub",
+            worker_id="worker-api",
+            attempt=1,
+            fence_token="fence-runtime-text-api",
+            branch_ref="refs/heads/codex/runtime-text-task",
+            worktree_id="wt-runtime-text-task",
+            worktree_path=str(worktree),
+            base_commit="base-api",
+            target_head_commit="target-api",
+            merge_queue_id="mq-runtime-text-api",
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    main = tmp_path / "main"
+    main.mkdir()
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "task_id": "runtime-text-task",
+                "parent_task_id": "AC-RUNTIME-TEXT",
+                "runtime_context_id": "mfrctx-runtime-text-api",
+                "fence_token": "fence-runtime-text-api",
+                "worktree_path": str(worktree),
+                "base_commit": "base-api",
+                "target_head_commit": "target-api",
+                "merge_queue_id": "mq-runtime-text-api",
+                "route_context_hash": "sha256:route-api",
+                "route_id": "route-api",
+                "prompt_contract_id": "rprompt-api",
+                "prompt_contract_hash": "sha256:prompt-api",
+                "visible_injection_manifest_hash": "sha256:visible-api",
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-api"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["status"] == "prepared"
+    assert prepared["runtime_context_id"] == "mfrctx-runtime-text-api"
+    assert prepared["runtime_context"]["worktree_path"] == str(worktree)
+    evidence = prepared["branch_runtime_evidence"]
+    assert evidence["registered"] is True
+    assert evidence["registration_source"] == "persisted_branch_runtime_context"
+    assert evidence["context"]["worktree_path"] == str(worktree)
+
+
+def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(conn, tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "task_id": "runtime-text-task",
+                "parent_task_id": "AC-RUNTIME-TEXT",
+                "runtime_context_id": "mfrctx-missing",
+                "fence_token": "fence-runtime-text-api",
+                "base_commit": "base-api",
+                "target_head_commit": "target-api",
+                "merge_queue_id": "mq-runtime-text-api",
+                "route_context_hash": "sha256:route-api",
+                "route_id": "route-api",
+                "prompt_contract_id": "rprompt-api",
+                "visible_injection_manifest_hash": "sha256:visible-api",
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-api"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is False
+    assert prepared["status"] == "allocation_required"
+    assert prepared["branch_runtime_evidence"]["registered"] is False
+    assert "not found" in prepared["branch_runtime_evidence"]["message"]
+
+
+def test_observer_runtime_text_prepare_rejects_runtime_context_identity_mismatch(conn, tmp_path):
+    worktree = tmp_path / "worker"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-text-task",
+            runtime_context_id="mfrctx-runtime-text-api",
+            backlog_id="AC-RUNTIME-TEXT",
+            root_task_id="AC-RUNTIME-TEXT",
+            stage_task_id="runtime-text-task",
+            fence_token="fence-runtime-text-api",
+            branch_ref="refs/heads/codex/runtime-text-task",
+            worktree_path=str(worktree),
+            base_commit="base-api",
+            target_head_commit="target-api",
+            merge_queue_id="mq-runtime-text-api",
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    main = tmp_path / "main"
+    main.mkdir()
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "task_id": "runtime-text-task",
+                "parent_task_id": "AC-RUNTIME-TEXT",
+                "runtime_context_id": "mfrctx-runtime-text-api",
+                "fence_token": "wrong-fence",
+                "worktree_path": str(worktree),
+                "base_commit": "base-api",
+                "target_head_commit": "target-api",
+                "merge_queue_id": "mq-runtime-text-api",
+                "route_context_hash": "sha256:route-api",
+                "route_id": "route-api",
+                "prompt_contract_id": "rprompt-api",
+                "visible_injection_manifest_hash": "sha256:visible-api",
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-api"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is False
+    assert prepared["status"] == "allocation_required"
+    assert prepared["branch_runtime_evidence"]["registered"] is False
+    assert prepared["branch_runtime_evidence"]["mismatches"][0]["field"] == "fence_token"
 
 
 def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):

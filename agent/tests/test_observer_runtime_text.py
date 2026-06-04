@@ -17,6 +17,39 @@ from agent.observer_runtime import (
 )
 
 
+def _branch_runtime_evidence(tmp_path: Path, **context_overrides: object) -> dict[str, object]:
+    context: dict[str, object] = {
+        "runtime_context_id": "mfrctx-runtime-text",
+        "task_id": "AC-RUNTIME-TEXT-impl-1",
+        "parent_task_id": "AC-RUNTIME-TEXT",
+        "backlog_id": "AC-RUNTIME-TEXT",
+        "fence_token": "fence-runtime-text",
+        "worktree_path": str(
+            tmp_path / "workers" / ".worktrees" / "worker-1" / "ac-runtime-text-impl-1"
+        ),
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-runtime-text",
+        "branch_ref": "refs/heads/runtime-text/ac-runtime-text-impl-1",
+        "worktree_id": "wt-ac-runtime-text-impl-1",
+    }
+    context.update(context_overrides)
+    return {
+        "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": "worktree_ready",
+        "ok": True,
+        "present": True,
+        "registered": True,
+        "allocation_required": False,
+        "source_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        "registration_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        "allocation_source_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        "registration_source": "parallel_branch_allocate",
+        "runtime_context_id": context["runtime_context_id"],
+        "context": context,
+    }
+
+
 def _runtime_text_request(tmp_path: Path, **overrides: object) -> ObserverRuntimeTextPrepareRequest:
     main = tmp_path / "main"
     main.mkdir(parents=True, exist_ok=True)
@@ -44,6 +77,7 @@ def _runtime_text_request(tmp_path: Path, **overrides: object) -> ObserverRuntim
         "branch_runtime_registration_ref": (
             "/api/graph-governance/aming-claw/parallel-branches/allocate"
         ),
+        "branch_runtime_evidence": _branch_runtime_evidence(tmp_path),
         "base_commit": "base123",
         "target_head_commit": "target123",
         "route_id": "route-20260603-runtime",
@@ -61,7 +95,10 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
 
     assert result["ok"] is True
     assert result["status"] == "prepared"
-    assert result["runtime_context_id"].startswith("orctx-")
+    assert result["runtime_context_id"] == "mfrctx-runtime-text"
+    assert result["runtime_context"]["worktree_path"].endswith(
+        ".worktrees/worker-1/ac-runtime-text-impl-1"
+    )
     assert result["launch_text"]
     assert result["launch_text_hash"].startswith("sha256:")
     assert result["raw_launch_text_persisted"] is False
@@ -90,6 +127,7 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert gate["graph_trace_evidence"]["query_source"] == "mf_subagent"
     assert gate["graph_trace_evidence"]["trace_ids"] == ["gqt-runtime-text"]
     assert gate["branch_runtime_evidence"]["registered"] is True
+    assert gate["branch_runtime_evidence"]["runtime_context_id"] == "mfrctx-runtime-text"
     assert gate["service_dispatch_evidence"]["documented_host_adapter_boundary"] is True
 
     startup_event = result["startup_intent_event"]
@@ -135,7 +173,11 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
 
 def test_runtime_text_builder_requires_supplied_branch_allocation_evidence(tmp_path):
     result = build_observer_runtime_text_context(
-        _runtime_text_request(tmp_path, branch_runtime_registration_ref="")
+        _runtime_text_request(
+            tmp_path,
+            branch_runtime_registration_ref="",
+            branch_runtime_evidence={},
+        )
     )
 
     assert result["ok"] is False
@@ -154,8 +196,45 @@ def test_runtime_text_builder_requires_supplied_branch_allocation_evidence(tmp_p
     assert evidence["status"] == "allocation_required"
     assert evidence["registered"] is False
     assert evidence["allocation_required"] is True
-    assert "source_ref" not in evidence
     assert "/api/graph-governance/aming-claw/parallel-branches/allocate" in evidence["message"]
+
+
+def test_runtime_text_builder_rejects_marker_only_branch_runtime_ref(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            branch_runtime_registration_ref=(
+                "/api/graph-governance/aming-claw/parallel-branches/allocate"
+            ),
+            branch_runtime_evidence={},
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "allocation_required"
+    evidence = result["branch_runtime_evidence"]
+    assert evidence["registered"] is False
+    assert evidence["allocation_required"] is True
+    assert evidence["supplied_source_ref"].endswith("/parallel-branches/allocate")
+    assert "runtime_context_id" in evidence["missing_fields"]
+    assert "worktree_path" in evidence["missing_fields"]
+
+
+def test_runtime_text_builder_rejects_bare_runtime_context_id_without_server_resolution(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            branch_runtime_registration_ref="mfrctx-missing",
+            branch_runtime_evidence={},
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "allocation_required"
+    evidence = result["branch_runtime_evidence"]
+    assert evidence["registered"] is False
+    assert evidence["runtime_context_id"] == "mfrctx-missing"
+    assert "Bare runtime_context_id" in evidence["message"]
 
 
 def test_runtime_text_builder_rejects_weak_branch_runtime_evidence_without_ref(tmp_path):
@@ -191,8 +270,8 @@ def test_runtime_text_builder_rejects_weak_branch_runtime_evidence_without_ref(t
     evidence = result["branch_runtime_evidence"]
     assert evidence["registered"] is False
     assert evidence["allocation_required"] is True
-    assert evidence["supplied_source_ref"] == ""
-    assert "source_ref/registration_ref" in evidence["message"]
+    assert evidence.get("supplied_source_ref", "") == ""
+    assert "allocation source ref" in evidence["message"]
 
 
 def test_runtime_text_builder_rejects_missing_graph_trace_identity(tmp_path):

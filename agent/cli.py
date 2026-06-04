@@ -1233,12 +1233,19 @@ def observer_run(
 @click.option("--branch-prefix", default="dogfood", help="Generated branch prefix.")
 @click.option("--merge-queue-id", default="", help="Merge queue id. Defaults to a deterministic dogfood id.")
 @click.option("--fence-token", default="", help="Fence token. Defaults to a deterministic dogfood token.")
-@click.option("--branch-runtime-registration-ref", default="", help="Caller-supplied branch runtime allocation evidence ref.")
+@click.option(
+    "--branch-runtime-registration-ref",
+    default="",
+    help="Allocation source/API/CLI reference; not the worker runtime_context_id.",
+)
 @click.option(
     "--branch-runtime-evidence-file",
     default=None,
     type=click.Path(exists=True, dir_okay=False, readable=True),
-    help="Optional JSON object with branch runtime allocation evidence.",
+    help=(
+        "Optional JSON allocation evidence object, including source_ref, "
+        "runtime_context_id, and persisted branch context."
+    ),
 )
 @click.option("--graph-trace-id", "graph_trace_ids", multiple=True, required=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
@@ -1400,12 +1407,24 @@ def observer_runtime_text():
 @click.option("--branch-prefix", default="runtime-text", help="Generated branch prefix.")
 @click.option("--merge-queue-id", default="", help="Merge queue id. Defaults to a deterministic runtime-text id.")
 @click.option("--fence-token", default="", help="Fence token. Defaults to a deterministic runtime-text token.")
-@click.option("--branch-runtime-registration-ref", default="", help="Caller-supplied branch runtime allocation evidence ref.")
+@click.option(
+    "--branch-runtime-registration-ref",
+    default="",
+    help="Allocation source/API/CLI reference; not the worker runtime_context_id.",
+)
+@click.option(
+    "--runtime-context-id",
+    default="",
+    help="Worker contract runtime_context_id from persisted allocation evidence.",
+)
 @click.option(
     "--branch-runtime-evidence-file",
     default=None,
     type=click.Path(exists=True, dir_okay=False, readable=True),
-    help="Optional JSON object with branch runtime allocation evidence.",
+    help=(
+        "Optional JSON allocation evidence object, including source_ref, "
+        "runtime_context_id, and persisted branch context."
+    ),
 )
 @click.option("--graph-trace-id", "graph_trace_ids", multiple=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
@@ -1441,6 +1460,7 @@ def observer_runtime_text_prepare(
     merge_queue_id,
     fence_token,
     branch_runtime_registration_ref,
+    runtime_context_id,
     branch_runtime_evidence_file,
     graph_trace_ids,
     base_commit,
@@ -1490,6 +1510,7 @@ def observer_runtime_text_prepare(
         graph_trace_ids=tuple(graph_trace_ids),
         branch_runtime_registration_ref=branch_runtime_registration_ref,
         branch_runtime_evidence=branch_runtime_evidence,
+        runtime_context_id=runtime_context_id,
         base_commit=base_commit,
         target_head_commit=target_head_commit,
         prompt=prompt,

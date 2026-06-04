@@ -4616,6 +4616,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     from .db import sqlite_write_lock
     from .parallel_branch_runtime import (
         branch_context_to_dict,
+        branch_runtime_allocation_evidence,
         get_branch_context,
         materialize_branch_worktree,
         plan_branch_runtime_context,
@@ -4693,6 +4694,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             "ok": True,
             "project_id": project_id,
             "context": branch_context_to_dict(saved),
+            "branch_runtime_evidence": branch_runtime_allocation_evidence(
+                saved,
+                source_ref=f"/api/graph-governance/{project_id}/parallel-branches/allocate",
+                registration_source="parallel_branch_allocate",
+            ),
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
         }
@@ -18575,6 +18581,137 @@ def handle_runtime(ctx: RequestContext):
     }
 
 
+def _runtime_text_prepare_runtime_context_id(body: Mapping[str, Any]) -> str:
+    direct = str(body.get("runtime_context_id") or "").strip()
+    if direct:
+        return direct
+    evidence = body.get("branch_runtime_evidence")
+    if isinstance(evidence, Mapping):
+        nested = evidence.get("branch_runtime_evidence")
+        if isinstance(nested, Mapping):
+            direct = str(nested.get("runtime_context_id") or "").strip()
+            if direct:
+                return direct
+        direct = str(evidence.get("runtime_context_id") or "").strip()
+        if direct:
+            return direct
+        context = evidence.get("context")
+        if isinstance(context, Mapping):
+            direct = str(context.get("runtime_context_id") or "").strip()
+            if direct:
+                return direct
+    registration_ref = str(body.get("branch_runtime_registration_ref") or "").strip()
+    return registration_ref if registration_ref.startswith("mfrctx-") else ""
+
+
+def _runtime_text_prepare_parent_task_id(context: Any) -> str:
+    return str(
+        getattr(context, "root_task_id", "")
+        or getattr(context, "chain_id", "")
+        or getattr(context, "backlog_id", "")
+        or getattr(context, "task_id", "")
+        or ""
+    )
+
+
+def _runtime_text_prepare_allocation_required_evidence(
+    *,
+    runtime_context_id: str = "",
+    message: str,
+    mismatches: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": "allocation_required",
+        "ok": False,
+        "present": False,
+        "registered": False,
+        "allocation_required": True,
+        "runtime_context_id": runtime_context_id,
+        "source": "observer_runtime_text_prepare",
+        "message": message,
+        "mismatches": mismatches or [],
+    }
+
+
+def _resolve_observer_runtime_text_branch_runtime_evidence(
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    supplied = (
+        body.get("branch_runtime_evidence")
+        if isinstance(body.get("branch_runtime_evidence"), dict)
+        else {}
+    )
+    runtime_context_id = _runtime_text_prepare_runtime_context_id(body)
+    if not runtime_context_id:
+        return dict(supplied)
+
+    from .parallel_branch_runtime import (
+        branch_runtime_allocation_evidence,
+        get_branch_context_by_runtime_context_id,
+    )
+
+    conn = get_connection(project_id)
+    try:
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+    finally:
+        conn.close()
+
+    if context is None:
+        return _runtime_text_prepare_allocation_required_evidence(
+            runtime_context_id=runtime_context_id,
+            message="Persisted branch runtime allocation was not found.",
+        )
+
+    expected_parent = str(body.get("parent_task_id") or body.get("backlog_id") or "")
+    actual_parent = _runtime_text_prepare_parent_task_id(context)
+    comparisons = {
+        "task_id": (str(body.get("task_id") or ""), str(context.task_id or "")),
+        "parent_task_id": (expected_parent, actual_parent),
+        "fence_token": (str(body.get("fence_token") or ""), str(context.fence_token or "")),
+        "worktree_path": (
+            str(
+                body.get("worktree_path")
+                or body.get("worker_worktree_path")
+                or body.get("assigned_worktree")
+                or ""
+            ),
+            str(context.worktree_path or ""),
+        ),
+        "base_commit": (str(body.get("base_commit") or ""), str(context.base_commit or "")),
+        "target_head_commit": (
+            str(body.get("target_head_commit") or ""),
+            str(context.target_head_commit or ""),
+        ),
+        "merge_queue_id": (
+            str(body.get("merge_queue_id") or ""),
+            str(context.merge_queue_id or ""),
+        ),
+    }
+    mismatches = [
+        {"field": field, "expected": expected, "actual": actual}
+        for field, (expected, actual) in comparisons.items()
+        if expected and actual and expected != actual
+    ]
+    if mismatches:
+        return _runtime_text_prepare_allocation_required_evidence(
+            runtime_context_id=runtime_context_id,
+            message="Persisted branch runtime allocation identity mismatch.",
+            mismatches=mismatches,
+        )
+
+    return branch_runtime_allocation_evidence(
+        context,
+        source_ref=f"/api/graph-governance/{project_id}/parallel-branches/allocate",
+        registration_source="persisted_branch_runtime_context",
+    )
+
+
 @route("POST", "/api/projects/{project_id}/observer/runtime-text/prepare")
 def handle_observer_runtime_text_prepare(ctx: RequestContext):
     """Prepare host/Codex mf_sub launch text plus startup intent packet."""
@@ -18586,14 +18723,18 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         build_observer_runtime_text_context,
     )
 
-    branch_runtime_evidence = (
-        body.get("branch_runtime_evidence")
-        if isinstance(body.get("branch_runtime_evidence"), dict)
+    branch_runtime_evidence = _resolve_observer_runtime_text_branch_runtime_evidence(
+        project_id,
+        body,
+    )
+    resolved_context = (
+        branch_runtime_evidence.get("context")
+        if isinstance(branch_runtime_evidence.get("context"), Mapping)
         else {}
     )
     request = ObserverRuntimeTextPrepareRequest(
         project_id=project_id,
-        backlog_id=str(body.get("backlog_id") or ""),
+        backlog_id=str(body.get("backlog_id") or resolved_context.get("backlog_id") or ""),
         route=RoutePromptContract(
             route_context_hash=str(body.get("route_context_hash") or ""),
             prompt_contract_id=str(body.get("prompt_contract_id") or ""),
@@ -18603,21 +18744,35 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         main_worktree=str(body.get("main_worktree") or body.get("workspace") or ""),
         workspace_root=str(body.get("workspace_root") or ""),
         owned_files=tuple(str(item) for item in (body.get("owned_files") or [])),
-        task_id=str(body.get("task_id") or ""),
-        parent_task_id=str(body.get("parent_task_id") or ""),
-        worker_id=str(body.get("worker_id") or ""),
-        attempt=int(body.get("attempt") or 1),
+        task_id=str(body.get("task_id") or resolved_context.get("task_id") or ""),
+        parent_task_id=str(
+            body.get("parent_task_id")
+            or resolved_context.get("parent_task_id")
+            or resolved_context.get("root_task_id")
+            or resolved_context.get("chain_id")
+            or resolved_context.get("backlog_id")
+            or ""
+        ),
+        worker_id=str(body.get("worker_id") or resolved_context.get("worker_id") or ""),
+        attempt=int(body.get("attempt") or resolved_context.get("attempt") or 1),
         worktree_root=str(body.get("worktree_root") or ".worktrees"),
         branch_prefix=str(body.get("branch_prefix") or "runtime-text"),
-        merge_queue_id=str(body.get("merge_queue_id") or ""),
-        fence_token=str(body.get("fence_token") or ""),
+        merge_queue_id=str(
+            body.get("merge_queue_id") or resolved_context.get("merge_queue_id") or ""
+        ),
+        fence_token=str(body.get("fence_token") or resolved_context.get("fence_token") or ""),
         graph_trace_ids=tuple(str(item) for item in (body.get("graph_trace_ids") or [])),
         branch_runtime_registration_ref=str(
             body.get("branch_runtime_registration_ref") or ""
         ),
         branch_runtime_evidence=branch_runtime_evidence,
-        base_commit=str(body.get("base_commit") or ""),
-        target_head_commit=str(body.get("target_head_commit") or ""),
+        runtime_context_id=str(body.get("runtime_context_id") or ""),
+        base_commit=str(body.get("base_commit") or resolved_context.get("base_commit") or ""),
+        target_head_commit=str(
+            body.get("target_head_commit")
+            or resolved_context.get("target_head_commit")
+            or ""
+        ),
         prompt=str(body.get("prompt") or ""),
         acceptance_criteria=tuple(
             str(item) for item in (body.get("acceptance_criteria") or [])

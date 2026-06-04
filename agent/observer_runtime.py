@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -171,6 +171,7 @@ class DogfoodObserverPlanRequest:
     graph_trace_ids: tuple[str, ...] = ()
     branch_runtime_registration_ref: str = ""
     branch_runtime_evidence: Mapping[str, Any] = field(default_factory=dict)
+    runtime_context_id: str = ""
     base_commit: str = ""
     target_head_commit: str = ""
     prompt: str = ""
@@ -199,6 +200,7 @@ class ObserverRuntimeTextPrepareRequest:
     graph_trace_ids: tuple[str, ...] = ()
     branch_runtime_registration_ref: str = ""
     branch_runtime_evidence: Mapping[str, Any] = field(default_factory=dict)
+    runtime_context_id: str = ""
     base_commit: str = ""
     target_head_commit: str = ""
     prompt: str = ""
@@ -804,21 +806,62 @@ def _runtime_text_branch_runtime_evidence(
     parent_task_id: str,
     branch_runtime_registration_ref: str = "",
     branch_runtime_evidence: Mapping[str, Any] | None = None,
+    runtime_context_id: str = "",
 ) -> dict[str, Any]:
     supplied = dict(branch_runtime_evidence or {})
+    nested = supplied.get("branch_runtime_evidence")
+    if isinstance(nested, Mapping):
+        supplied = {**supplied, **dict(nested)}
     registration_ref = str(
         branch_runtime_registration_ref
         or supplied.get("registration_ref")
         or supplied.get("source_ref")
+        or supplied.get("allocation_source_ref")
         or supplied.get("api_ref")
         or supplied.get("api_route")
         or ""
     ).strip()
+    planned_context = {
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": context.fence_token,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+    }
+
+    def _nested_mappings(source: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        mappings: list[Mapping[str, Any]] = [source]
+        for key in (
+            "context",
+            "branch_identity",
+            "branch_context",
+            "parallel_branch_runtime_context",
+        ):
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                mappings.append(value)
+        return mappings
+
+    def _evidence_field(*keys: str) -> str:
+        for source in _nested_mappings(supplied):
+            for key in keys:
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    supplied_runtime_context_id = str(
+        runtime_context_id
+        or (branch_runtime_registration_ref if branch_runtime_registration_ref.startswith("mfrctx-") else "")
+        or ""
+    ).strip()
+    evidence_runtime_context_id = _evidence_field("runtime_context_id")
     registration_ref_valid = bool(
         registration_ref
         and any(marker in registration_ref for marker in RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS)
     )
-    supplied_context = supplied.get("context") if isinstance(supplied.get("context"), Mapping) else {}
     supplied_status = str(supplied.get("status") or "").strip().lower()
     supplied_rejected = bool(supplied) and (
         supplied.get("ok") is False
@@ -826,82 +869,229 @@ def _runtime_text_branch_runtime_evidence(
         or bool(supplied.get("allocation_required"))
         or supplied_status in {"allocation_required", "rejected", "failed", "error"}
     )
-    if not registration_ref_valid:
-        return {
-            "schema_version": "mf_subagent_branch_runtime.v1",
-            "status": "allocation_required",
-            "allocation_required": True,
-            "registered": False,
-            "present": False,
-            "source": "observer_runtime_text_prepare",
-            "message": (
-                "Call MCP parallel_branch_allocate, "
-                f"POST /api/graph-governance/{project_id}/parallel-branches/allocate, "
-                "or upsert_branch_context, then pass branch_runtime_registration_ref "
-                "or branch_runtime_evidence with a valid source_ref/registration_ref."
-            ),
-            "supplied_source_ref": registration_ref,
-            "planned_context": {
-                "task_id": context.task_id,
-                "parent_task_id": parent_task_id,
-                "fence_token": context.fence_token,
-                "worktree_path": context.worktree_path,
-                "base_commit": context.base_commit,
-                "target_head_commit": context.target_head_commit,
-                "merge_queue_id": context.merge_queue_id,
-            },
-        }
     if supplied_rejected:
         return {
             "schema_version": "mf_subagent_branch_runtime.v1",
             "status": "allocation_required",
             "allocation_required": True,
             "registered": False,
-            "present": False,
+            "present": bool(supplied),
             "source": "observer_runtime_text_prepare",
-            "message": "Supplied branch runtime evidence is not a registered allocation.",
+            "message": str(
+                supplied.get("message")
+                or "Supplied branch runtime evidence is not a registered allocation."
+            ),
+            "runtime_context_id": evidence_runtime_context_id or supplied_runtime_context_id,
+            "supplied_source_ref": registration_ref,
             "supplied_evidence_status": supplied_status or supplied.get("status") or "",
-            "planned_context": {
-                "task_id": context.task_id,
-                "parent_task_id": parent_task_id,
-                "fence_token": context.fence_token,
-                "worktree_path": context.worktree_path,
-                "base_commit": context.base_commit,
-                "target_head_commit": context.target_head_commit,
-                "merge_queue_id": context.merge_queue_id,
-            },
+            "supplied_message": str(supplied.get("message") or ""),
+            "mismatches": (
+                list(supplied.get("mismatches"))
+                if isinstance(supplied.get("mismatches"), list)
+                else []
+            ),
+            "planned_context": planned_context,
+        }
+    if not registration_ref_valid:
+        message = (
+            "Bare runtime_context_id must resolve through persisted branch runtime "
+            "allocation evidence before observer runtime text can be dispatch-ready."
+            if supplied_runtime_context_id.startswith("mfrctx-")
+            or evidence_runtime_context_id.startswith("mfrctx-")
+            else (
+                "Call MCP parallel_branch_allocate, "
+                f"POST /api/graph-governance/{project_id}/parallel-branches/allocate, "
+                "or upsert_branch_context, then pass branch_runtime_evidence with "
+                "a valid allocation source ref and runtime_context_id."
+            )
+        )
+        return {
+            "schema_version": "mf_subagent_branch_runtime.v1",
+            "status": "allocation_required",
+            "allocation_required": True,
+            "registered": False,
+            "present": bool(supplied),
+            "source": "observer_runtime_text_prepare",
+            "message": message,
+            "runtime_context_id": evidence_runtime_context_id or supplied_runtime_context_id,
+            "supplied_source_ref": registration_ref,
+            "planned_context": planned_context,
+        }
+
+    observed_context = {
+        "runtime_context_id": evidence_runtime_context_id,
+        "task_id": _evidence_field("task_id"),
+        "parent_task_id": _evidence_field("parent_task_id", "root_task_id", "chain_id"),
+        "fence_token": _evidence_field("fence_token"),
+        "worktree_path": _evidence_field("worktree_path", "worktree"),
+        "base_commit": _evidence_field("base_commit"),
+        "target_head_commit": _evidence_field("target_head_commit"),
+        "merge_queue_id": _evidence_field("merge_queue_id"),
+    }
+    required_fields = {
+        "task_id": context.task_id,
+        "fence_token": context.fence_token,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+    }
+    if parent_task_id:
+        required_fields["parent_task_id"] = parent_task_id
+    missing = [
+        field
+        for field, expected in required_fields.items()
+        if expected and not observed_context.get(field)
+    ]
+    if not observed_context["runtime_context_id"]:
+        missing.append("runtime_context_id")
+    mismatches = [
+        field
+        for field, expected in required_fields.items()
+        if expected
+        and observed_context.get(field)
+        and observed_context[field] != expected
+    ]
+    if (
+        supplied_runtime_context_id
+        and observed_context["runtime_context_id"]
+        and observed_context["runtime_context_id"] != supplied_runtime_context_id
+    ):
+        mismatches.append("runtime_context_id")
+    if missing or mismatches:
+        return {
+            "schema_version": "mf_subagent_branch_runtime.v1",
+            "status": "allocation_required",
+            "allocation_required": True,
+            "registered": False,
+            "present": bool(supplied),
+            "source": "observer_runtime_text_prepare",
+            "message": "Supplied branch runtime evidence is missing persisted context identity.",
+            "runtime_context_id": evidence_runtime_context_id or supplied_runtime_context_id,
+            "supplied_source_ref": registration_ref,
+            "missing_fields": sorted(set(missing)),
+            "mismatch_fields": sorted(set(mismatches)),
+            "planned_context": planned_context,
+            "observed_context": observed_context,
         }
     return {
         "schema_version": "mf_subagent_branch_runtime.v1",
         "source_ref": registration_ref,
         "registration_ref": registration_ref,
+        "runtime_context_id": observed_context["runtime_context_id"],
         "registration_source": str(
             supplied.get("registration_source") or "caller_supplied_allocation_evidence"
         ),
         "allocation_required": False,
         "registered": True,
         "context": {
-            "task_id": str(supplied_context.get("task_id") or context.task_id),
-            "parent_task_id": str(
-                supplied_context.get("parent_task_id")
-                or supplied_context.get("root_task_id")
-                or parent_task_id
-            ),
-            "fence_token": str(supplied_context.get("fence_token") or context.fence_token),
-            "worktree_path": str(
-                supplied_context.get("worktree_path")
-                or supplied_context.get("worktree")
-                or context.worktree_path
-            ),
-            "base_commit": str(supplied_context.get("base_commit") or context.base_commit),
-            "target_head_commit": str(
-                supplied_context.get("target_head_commit") or context.target_head_commit
-            ),
-            "merge_queue_id": str(
-                supplied_context.get("merge_queue_id") or context.merge_queue_id
-            ),
+            "runtime_context_id": observed_context["runtime_context_id"],
+            "task_id": observed_context["task_id"],
+            "parent_task_id": observed_context["parent_task_id"],
+            "fence_token": observed_context["fence_token"],
+            "worktree_path": observed_context["worktree_path"],
+            "base_commit": observed_context["base_commit"],
+            "target_head_commit": observed_context["target_head_commit"],
+            "merge_queue_id": observed_context["merge_queue_id"],
         },
     }
+
+
+def _runtime_text_branch_runtime_packet(
+    branch_runtime_registration_ref: str,
+    branch_runtime_evidence: Mapping[str, Any] | None,
+    runtime_context_id: str = "",
+) -> dict[str, Any]:
+    packet = dict(branch_runtime_evidence or {})
+    nested = packet.get("branch_runtime_evidence")
+    if isinstance(nested, Mapping):
+        packet = {**packet, **dict(nested)}
+    runtime_id = str(runtime_context_id or "").strip()
+    ref = str(branch_runtime_registration_ref or "").strip()
+    if runtime_id:
+        packet.setdefault("runtime_context_id", runtime_id)
+    if ref.startswith("mfrctx-"):
+        packet.setdefault("runtime_context_id", ref)
+    elif ref:
+        packet.setdefault("registration_ref", ref)
+    return packet
+
+
+def _runtime_text_context_parent(context: Mapping[str, Any]) -> str:
+    return str(
+        context.get("parent_task_id")
+        or context.get("root_task_id")
+        or context.get("chain_id")
+        or context.get("backlog_id")
+        or ""
+    )
+
+
+def _runtime_text_apply_branch_runtime_context(
+    context: Any,
+    *,
+    parent_task_id: str,
+    branch_runtime_registration_ref: str = "",
+    branch_runtime_evidence: Mapping[str, Any] | None = None,
+    runtime_context_id: str = "",
+) -> Any:
+    packet = _runtime_text_branch_runtime_packet(
+        branch_runtime_registration_ref,
+        branch_runtime_evidence,
+        runtime_context_id,
+    )
+    source_ref = str(
+        packet.get("registration_ref")
+        or packet.get("source_ref")
+        or packet.get("allocation_source_ref")
+        or packet.get("api_ref")
+        or packet.get("api_route")
+        or ""
+    ).strip()
+    if not any(marker in source_ref for marker in RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS):
+        return context
+    supplied_context = packet.get("context")
+    if not isinstance(supplied_context, Mapping):
+        return context
+    checks = {
+        "task_id": (context.task_id, str(supplied_context.get("task_id") or "")),
+        "parent_task_id": (parent_task_id, _runtime_text_context_parent(supplied_context)),
+        "fence_token": (context.fence_token, str(supplied_context.get("fence_token") or "")),
+        "base_commit": (context.base_commit, str(supplied_context.get("base_commit") or "")),
+        "target_head_commit": (
+            context.target_head_commit,
+            str(supplied_context.get("target_head_commit") or ""),
+        ),
+        "merge_queue_id": (
+            context.merge_queue_id,
+            str(supplied_context.get("merge_queue_id") or ""),
+        ),
+    }
+    if any(expected and actual and expected != actual for expected, actual in checks.values()):
+        return context
+
+    replacements: dict[str, Any] = {}
+    for field_name in (
+        "runtime_context_id",
+        "branch_ref",
+        "ref_name",
+        "worktree_id",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "fence_token",
+        "worker_id",
+        "agent_id",
+        "status",
+    ):
+        if field_name == "runtime_context_id":
+            value = packet.get("runtime_context_id") or supplied_context.get("runtime_context_id")
+        else:
+            value = supplied_context.get(field_name)
+        if value not in (None, ""):
+            replacements[field_name] = value
+    return replace(context, **replacements) if replacements else context
 
 
 def _runtime_text_service_dispatch_evidence() -> dict[str, Any]:
@@ -1166,21 +1356,32 @@ def build_observer_runtime_text_context(
         merge_queue_id=merge_queue_id,
         fence_token=fence_token,
     )
+    context = _runtime_text_apply_branch_runtime_context(
+        context,
+        parent_task_id=parent_task_id,
+        branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+        branch_runtime_evidence=request.branch_runtime_evidence,
+        runtime_context_id=request.runtime_context_id,
+    )
     owned_files = _runtime_text_items(request.owned_files)
     graph_trace_ids = _runtime_text_items(request.graph_trace_ids)
-    runtime_context_id = "orctx-" + _stable_suffix(
-        request.project_id,
-        request.backlog_id,
-        task_id,
-        parent_task_id,
-        context.branch_ref,
-        context.worktree_path,
-        request.route.route_context_hash,
-        request.route.prompt_contract_id,
-        context.fence_token,
-        context.base_commit,
-        context.target_head_commit,
-        length=16,
+    runtime_context_id = (
+        context.runtime_context_id
+        or request.runtime_context_id
+        or "orctx-" + _stable_suffix(
+            request.project_id,
+            request.backlog_id,
+            task_id,
+            parent_task_id,
+            context.branch_ref,
+            context.worktree_path,
+            request.route.route_context_hash,
+            request.route.prompt_contract_id,
+            context.fence_token,
+            context.base_commit,
+            context.target_head_commit,
+            length=16,
+        )
     )
     parent_route_lineage = _runtime_text_parent_route_lineage(request)
     graph_trace_evidence = _runtime_text_graph_trace_evidence(
@@ -1195,6 +1396,7 @@ def build_observer_runtime_text_context(
         parent_task_id=parent_task_id,
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
         branch_runtime_evidence=request.branch_runtime_evidence,
+        runtime_context_id=request.runtime_context_id,
     )
     service_dispatch_evidence = _runtime_text_service_dispatch_evidence()
     dispatch_gate = {

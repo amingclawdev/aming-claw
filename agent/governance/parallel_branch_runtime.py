@@ -974,6 +974,30 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     return payload
 
 
+def branch_runtime_allocation_evidence(
+    context: BranchTaskRuntimeContext,
+    *,
+    source_ref: str,
+    registration_source: str = "parallel_branch_allocate",
+) -> dict[str, Any]:
+    """Return machine-consumable branch runtime allocation evidence."""
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    return {
+        "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": context.status or STATE_ALLOCATED,
+        "ok": True,
+        "present": True,
+        "registered": True,
+        "allocation_required": False,
+        "source_ref": source_ref,
+        "registration_ref": source_ref,
+        "allocation_source_ref": source_ref,
+        "registration_source": registration_source,
+        "runtime_context_id": runtime_context_id,
+        "context": branch_context_to_dict(context),
+    }
+
+
 def branch_contract_revision_to_dict(
     revision: BranchRuntimeContractRevision,
 ) -> dict[str, Any]:

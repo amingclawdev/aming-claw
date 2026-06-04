@@ -464,18 +464,24 @@ def _parent_route_lineage(**overrides: object) -> dict[str, object]:
 
 
 def _branch_runtime_evidence(**overrides: object) -> dict[str, object]:
+    context = {
+        "runtime_context_id": "mfrctx-mf-sub-1",
+        "task_id": "task-mf-sub-1",
+        "root_task_id": "task-mf-parent",
+        "fence_token": "fence-1",
+        "worktree_path": "/repo/.worktrees/mf-subagent-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-1",
+    }
+    context_overrides = overrides.pop("context", None)
+    if isinstance(context_overrides, dict):
+        context.update(context_overrides)
     payload: dict[str, object] = {
         "schema_version": "mf_subagent_branch_runtime.v1",
         "api_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
-        "context": {
-            "task_id": "task-mf-sub-1",
-            "root_task_id": "task-mf-parent",
-            "fence_token": "fence-1",
-            "worktree_path": "/repo/.worktrees/mf-subagent-1",
-            "base_commit": "base123",
-            "target_head_commit": "target123",
-            "merge_queue_id": "mq-1",
-        },
+        "runtime_context_id": context["runtime_context_id"],
+        "context": context,
     }
     payload.update(overrides)
     return payload
