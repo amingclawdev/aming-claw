@@ -158,6 +158,10 @@ class DogfoodObserverPlanRequest:
     project_id: str
     backlog_id: str
     route: RoutePromptContract
+    governance_project_id: str = ""
+    target_project_id: str = ""
+    target_project_root: str = ""
+    allocation_owner: str = ""
     provider: str = "openai"
     model: str = ""
     backend_mode: str = "codex_cli"
@@ -189,6 +193,10 @@ class ObserverRuntimeTextPrepareRequest:
     project_id: str
     backlog_id: str
     route: RoutePromptContract
+    governance_project_id: str = ""
+    target_project_id: str = ""
+    target_project_root: str = ""
+    allocation_owner: str = ""
     main_worktree: str = ""
     workspace_root: str = ""
     owned_files: tuple[str, ...] = ()
@@ -906,6 +914,12 @@ def _runtime_text_branch_runtime_evidence(
     ).strip()
     planned_context = {
         "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "governance_project_id": context.governance_project_id or project_id,
+        "target_project_id": context.target_project_id or project_id,
+        "target_project_root": context.target_project_root,
+        "allocation_owner": context.allocation_owner or context.agent_id,
+        "observer_allocation_owner": context.allocation_owner or context.agent_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "fence_token": context.fence_token,
@@ -1004,6 +1018,18 @@ def _runtime_text_branch_runtime_evidence(
 
     observed_context = {
         "runtime_context_id": evidence_runtime_context_id,
+        "governance_project_id": _evidence_field("governance_project_id"),
+        "target_project_id": _evidence_field("target_project_id"),
+        "target_project_root": _evidence_field("target_project_root"),
+        "allocation_owner": _evidence_field(
+            "allocation_owner",
+            "observer_allocation_owner",
+        ),
+        "observer_allocation_owner": _evidence_field(
+            "observer_allocation_owner",
+            "allocation_owner",
+        ),
+        "worker_slot_id": _evidence_field("worker_slot_id", "worker_id"),
         "task_id": _evidence_field("task_id"),
         "parent_task_id": _evidence_field("parent_task_id", "root_task_id", "chain_id"),
         "fence_token": _evidence_field("fence_token"),
@@ -1070,6 +1096,18 @@ def _runtime_text_branch_runtime_evidence(
         "registered": True,
         "context": {
             "runtime_context_id": observed_context["runtime_context_id"],
+            "governance_project_id": observed_context["governance_project_id"]
+            or planned_context["governance_project_id"],
+            "target_project_id": observed_context["target_project_id"]
+            or planned_context["target_project_id"],
+            "target_project_root": observed_context["target_project_root"]
+            or planned_context["target_project_root"],
+            "allocation_owner": observed_context["allocation_owner"]
+            or planned_context["allocation_owner"],
+            "observer_allocation_owner": observed_context["observer_allocation_owner"]
+            or planned_context["observer_allocation_owner"],
+            "worker_slot_id": observed_context["worker_slot_id"]
+            or planned_context["worker_slot_id"],
             "task_id": observed_context["task_id"],
             "parent_task_id": observed_context["parent_task_id"],
             "fence_token": observed_context["fence_token"],
@@ -1166,7 +1204,15 @@ def _runtime_text_apply_branch_runtime_context(
         "merge_queue_id",
         "fence_token",
         "worker_id",
+        "worker_slot_id",
         "agent_id",
+        "allocation_owner",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "host_session_id",
+        "governance_project_id",
+        "target_project_id",
+        "target_project_root",
         "status",
     ):
         if field_name == "runtime_context_id":
@@ -1209,6 +1255,8 @@ def _runtime_text_startup_echo_contract(
             "task_id",
             "parent_task_id",
             "worker_role",
+            "worker_slot_id",
+            "actual_host_worker_id",
             "fence_token",
             "actual_cwd",
             "actual_git_root",
@@ -1217,9 +1265,16 @@ def _runtime_text_startup_echo_contract(
         ],
         "expected": {
             "project_id": context.project_id,
+            "governance_project_id": context.governance_project_id
+            or context.project_id,
+            "target_project_id": context.target_project_id or context.project_id,
+            "target_project_root": context.target_project_root,
             "task_id": context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
+            "allocation_owner": context.allocation_owner or context.agent_id,
+            "observer_allocation_owner": context.allocation_owner or context.agent_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
             "fence_token": context.fence_token,
             "worktree_path": context.worktree_path,
             "branch_ref": context.branch_ref,
@@ -1249,11 +1304,17 @@ def _runtime_text_startup_intent_event(
         "launch_text_hash": launch_text_hash,
         "raw_launch_text_persisted": False,
         "project_id": request.project_id,
+        "governance_project_id": context.governance_project_id or request.project_id,
+        "target_project_id": context.target_project_id or request.project_id,
+        "target_project_root": context.target_project_root,
         "backlog_id": request.backlog_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "role": "mf_sub",
+        "allocation_owner": context.allocation_owner or context.agent_id,
+        "observer_allocation_owner": context.allocation_owner or context.agent_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
         "fence_token": context.fence_token,
         "worktree_path": context.worktree_path,
         "worktree": context.worktree_path,
@@ -1274,6 +1335,7 @@ def _runtime_text_startup_intent_event(
         "startup_source": "observer_runtime_text_prepare",
         "startup_timing": "generated_prelaunch",
         "actual_startup_must_include": [
+            "actual_host_worker_id",
             "actual_cwd",
             "actual_git_root",
             "fence_token",
@@ -1321,17 +1383,23 @@ def _dogfood_host_adapter_startup_evidence(
         or runtime_context_id_for_branch_context(context)
     )
     launch_text_hash = str(runtime_text.get("launch_text_hash") or "")
-    worker_id = str(context.worker_id or request.worker_id or "dogfood-worker")
+    worker_slot_id = str(
+        context.worker_slot_id
+        or context.worker_id
+        or request.worker_id
+        or "dogfood-worker"
+    )
     adapter_suffix = _stable_suffix(
         request.project_id,
         request.backlog_id,
         context.task_id,
-        worker_id,
+        worker_slot_id,
         request.backend_mode,
         runtime_context_id,
         launch_text_hash,
     )
     agent_id = f"{request.backend_mode}-host-adapter-{adapter_suffix}"
+    actual_host_worker_id = f"{request.backend_mode}-host-worker-{adapter_suffix}"
     head_commit = _git_head(Path(worker_worktree)) or context.head_commit or context.target_head_commit
     branch = _git_current_branch(worker_worktree) or context.branch_ref
     try:
@@ -1344,7 +1412,7 @@ def _dogfood_host_adapter_startup_evidence(
             request.route_id,
             runtime_context_id,
             context.task_id,
-            worker_id,
+            worker_slot_id,
             launch_text_hash,
             length=24,
         )
@@ -1353,7 +1421,9 @@ def _dogfood_host_adapter_startup_evidence(
         "schema_version": "mf_subagent_read_receipt.v1",
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
-        "worker_id": worker_id,
+        "worker_id": worker_slot_id,
+        "worker_slot_id": worker_slot_id,
+        "actual_host_worker_id": actual_host_worker_id,
         "agent_id": agent_id,
         "fence_token": context.fence_token,
         "launch_text_hash": launch_text_hash,
@@ -1365,7 +1435,8 @@ def _dogfood_host_adapter_startup_evidence(
     ).hexdigest()
     agent_id_match_mode = (
         "exact_or_unallocated"
-        if not context.agent_id or context.agent_id == agent_id
+        if not (context.allocation_owner or context.agent_id)
+        or (context.allocation_owner or context.agent_id) == agent_id
         else "host_adapter_startup_token_surrogate"
     )
     startup_gate = {
@@ -1382,7 +1453,7 @@ def _dogfood_host_adapter_startup_evidence(
         "actual_startup_appendable": True,
         "actual_startup_required": True,
         "timeline_event_recorded": False,
-        "same_as_expected_worker": True,
+        "same_as_expected_worker": actual_host_worker_id == worker_slot_id,
         "fence_token_matches": True,
         "close_satisfying": False,
         "raw_launch_text_persisted": False,
@@ -1391,15 +1462,22 @@ def _dogfood_host_adapter_startup_evidence(
             f"POST /api/graph-governance/{request.project_id}/parallel-branches/startup"
         ),
         "project_id": request.project_id,
+        "governance_project_id": context.governance_project_id or request.project_id,
+        "target_project_id": context.target_project_id or request.project_id,
+        "target_project_root": context.target_project_root,
         "backlog_id": request.backlog_id,
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
         "parent_task_id": request.backlog_id,
         "worker_role": "mf_sub",
         "role": "mf_sub",
-        "worker_id": worker_id,
+        "allocation_owner": context.allocation_owner or context.agent_id,
+        "observer_allocation_owner": context.allocation_owner or context.agent_id,
+        "worker_id": worker_slot_id,
+        "worker_slot_id": worker_slot_id,
+        "actual_host_worker_id": actual_host_worker_id,
         "agent_id": agent_id,
-        "expected_agent_id": context.agent_id,
+        "expected_agent_id": context.allocation_owner or context.agent_id,
         "agent_id_match_mode": agent_id_match_mode,
         "host_adapter_startup_token_accepted": True,
         "fence_token": context.fence_token,
@@ -1552,7 +1630,12 @@ def _runtime_text_graph_first_obligations(
     task_id: str,
     parent_task_id: str,
     fence_token: str,
+    governance_project_id: str = "",
+    target_project_id: str = "",
+    target_project_root: str = "",
 ) -> dict[str, Any]:
+    governance_id = governance_project_id or project_id
+    target_id = target_project_id or project_id
     return {
         "schema_version": "mf_subagent_graph_first_obligations.v1",
         "required": True,
@@ -1566,7 +1649,10 @@ def _runtime_text_graph_first_obligations(
         "read_receipt_timeline_event_kind": "mf_subagent_read_receipt",
         "post_hoc_read_receipt_satisfies_gate": False,
         "query": {
-            "project_id": project_id,
+            "project_id": target_id,
+            "governance_project_id": governance_id,
+            "target_project_id": target_id,
+            "target_project_root": target_project_root,
             "query_source": "mf_subagent",
             "query_purpose": "subagent_context_build",
             "task_id": task_id,
@@ -1604,9 +1690,16 @@ def _runtime_text_finish_gate_contract(context: Any) -> dict[str, Any]:
             "task_id": context.task_id,
             "fence_token": context.fence_token,
             "worktree_path": context.worktree_path,
+            "assigned_worktree": context.worktree_path,
             "base_commit": context.base_commit,
             "target_head_commit": context.target_head_commit,
             "merge_queue_id": context.merge_queue_id,
+        },
+        "close_sensitive_precheck": {
+            "parent_main_status_short_must_be_clean": True,
+            "actual_cwd_must_equal_assigned_worktree": True,
+            "actual_git_root_must_equal_assigned_worktree": True,
+            "changed_files_must_be_within_owned_files": True,
         },
     }
 
@@ -1661,6 +1754,9 @@ def build_observer_runtime_text_context(
     task_id = request.task_id or request.backlog_id
     parent_task_id = request.parent_task_id or request.backlog_id
     worker_id = request.worker_id or "runtime-text-worker"
+    allocation_owner = request.allocation_owner or "observer_runtime_text"
+    governance_project_id = request.governance_project_id or request.project_id
+    target_project_id = request.target_project_id or request.project_id
     git_head = _git_head(main_worktree)
     base_commit = request.base_commit or git_head
     target_head_commit = request.target_head_commit or base_commit or git_head
@@ -1684,7 +1780,13 @@ def build_observer_runtime_text_context(
         chain_id=parent_task_id,
         root_task_id=parent_task_id,
         stage_type="mf_sub_runtime_text",
+        agent_id=allocation_owner,
         worker_id=worker_id,
+        allocation_owner=allocation_owner,
+        worker_slot_id=worker_id,
+        governance_project_id=governance_project_id,
+        target_project_id=target_project_id,
+        target_project_root=request.target_project_root,
         attempt=request.attempt,
         branch_prefix=request.branch_prefix,
         worktree_root=request.worktree_root,
@@ -1739,10 +1841,16 @@ def build_observer_runtime_text_context(
     dispatch_gate = {
         "schema_version": "mf_subagent_dispatch_gate.v1",
         "project_id": request.project_id,
+        "governance_project_id": governance_project_id,
+        "target_project_id": target_project_id,
+        "target_project_root": request.target_project_root,
         "backlog_id": request.backlog_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
+        "allocation_owner": context.allocation_owner or allocation_owner,
+        "observer_allocation_owner": context.allocation_owner or allocation_owner,
+        "worker_slot_id": context.worker_slot_id or worker_id,
         "selected_topology": request.selected_topology,
         "recommended_topology": request.recommended_topology,
         "branch": context.branch_ref,
@@ -1818,6 +1926,9 @@ def build_observer_runtime_text_context(
     )
     graph_first_obligations = _runtime_text_graph_first_obligations(
         project_id=request.project_id,
+        governance_project_id=context.governance_project_id or request.project_id,
+        target_project_id=context.target_project_id or request.project_id,
+        target_project_root=context.target_project_root,
         task_id=context.task_id,
         parent_task_id=parent_task_id,
         fence_token=context.fence_token,
@@ -1972,6 +2083,9 @@ def build_dogfood_observer_run_plan(
     )
     task_id = request.task_id or request.backlog_id
     worker_id = request.worker_id or "dogfood-worker"
+    allocation_owner = request.allocation_owner or "dogfood_observer"
+    governance_project_id = request.governance_project_id or request.project_id
+    target_project_id = request.target_project_id or request.project_id
     git_head = _git_head(main_worktree)
     base_commit = request.base_commit or git_head
     target_head_commit = request.target_head_commit or base_commit or git_head
@@ -1993,7 +2107,13 @@ def build_dogfood_observer_run_plan(
         workspace_root=str(workspace_root),
         backlog_id=request.backlog_id,
         stage_type="observer_dogfood",
+        agent_id=allocation_owner,
         worker_id=worker_id,
+        allocation_owner=allocation_owner,
+        worker_slot_id=worker_id,
+        governance_project_id=governance_project_id,
+        target_project_id=target_project_id,
+        target_project_root=request.target_project_root,
         attempt=request.attempt,
         branch_prefix=request.branch_prefix,
         worktree_root=request.worktree_root,
@@ -2011,6 +2131,10 @@ def build_dogfood_observer_run_plan(
         project_id=request.project_id,
         backlog_id=request.backlog_id,
         route=request.route,
+        governance_project_id=governance_project_id,
+        target_project_id=target_project_id,
+        target_project_root=request.target_project_root,
+        allocation_owner=allocation_owner,
         main_worktree=str(main_worktree),
         workspace_root=str(workspace_root),
         owned_files=tuple(owned_files),
@@ -2052,10 +2176,16 @@ def build_dogfood_observer_run_plan(
     dispatch_gate = {
         "schema_version": "mf_subagent_dispatch_gate.v1",
         "project_id": request.project_id,
+        "governance_project_id": governance_project_id,
+        "target_project_id": target_project_id,
+        "target_project_root": request.target_project_root,
         "backlog_id": request.backlog_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
+        "allocation_owner": context.allocation_owner or allocation_owner,
+        "observer_allocation_owner": context.allocation_owner or allocation_owner,
+        "worker_slot_id": context.worker_slot_id or worker_id,
         "selected_topology": RUNTIME_TEXT_DEFAULT_TOPOLOGY,
         "recommended_topology": RUNTIME_TEXT_DEFAULT_TOPOLOGY,
         "branch": context.branch_ref,

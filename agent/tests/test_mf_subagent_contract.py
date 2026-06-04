@@ -1184,6 +1184,29 @@ def test_route_action_gate_blocks_high_risk_worker_when_startup_evidence_incompl
         )
 
 
+def test_route_action_gate_blocks_worker_edit_when_startup_cwd_wrong() -> None:
+    dispatch = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(),
+        target_worktree_path="/repo",
+    )
+
+    with pytest.raises(MfSubagentContractError, match="bounded dispatch/startup evidence"):
+        validate_route_action_gate(
+            _route_action_payload(
+                caller_role=MF_SUB_ROLE,
+                action="apply_patch",
+                mf_subagent_dispatch_gate=dispatch,
+                mf_subagent_startup_gate=_startup_evidence(
+                    worktree_path="/repo/.worktrees/task-1",
+                    assigned_worktree="/repo/.worktrees/task-1",
+                    actual_cwd="/repo",
+                    actual_git_root="/repo/.worktrees/task-1",
+                ),
+                **_high_risk_route_machine_fields(),
+            )
+        )
+
+
 def test_route_action_gate_allows_high_risk_worker_with_bounded_dispatch_and_startup_evidence() -> None:
     dispatch = validate_mf_subagent_dispatch_gate(
         _dispatch_payload(),
@@ -1272,15 +1295,17 @@ def test_route_action_gate_allows_actual_startup_timeline_event_packet() -> None
         "phase": "startup_gate",
         "status": "passed",
         "payload": {
-            "mf_subagent_startup_gate": _startup_evidence(
-                schema_version="mf_subagent_startup_gate.v1",
-                runtime_context_id="orctx-test",
-                launch_text_hash="sha256:launch",
-                project_id="aming-claw",
-                task_id="TASK-impl-1",
-                parent_task_id="TASK",
-                worktree_path="/repo/.worktrees/TASK-impl-1",
-                branch="refs/heads/test/TASK-impl-1",
+                "mf_subagent_startup_gate": _startup_evidence(
+                    schema_version="mf_subagent_startup_gate.v1",
+                    runtime_context_id="orctx-test",
+                    launch_text_hash="sha256:launch",
+                    project_id="aming-claw",
+                    task_id="TASK-impl-1",
+                    parent_task_id="TASK",
+                    worktree_path="/repo/.worktrees/TASK-impl-1",
+                    actual_cwd="/repo/.worktrees/TASK-impl-1",
+                    actual_git_root="/repo/.worktrees/TASK-impl-1",
+                    branch="refs/heads/test/TASK-impl-1",
                 head_commit="target123",
                 base_commit="base123",
                 target_head_commit="target123",
@@ -2114,6 +2139,64 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["read_receipt_hash"] == "sha256:read-finish"
     assert gate["gate_receipt_hash"] == "sha256:gate-finish"
     assert gate["receipt_gate"]["status"] == "passed"
+    assert gate["finish_precheck"]["parent_main_clean"] is True
+    assert gate["finish_precheck"]["owned_file_scope_passed"] is True
+    assert gate["close_ready"] is True
+
+
+def test_finish_gate_rejects_parent_main_checkout_dirtiness() -> None:
+    with pytest.raises(MfSubagentContractError, match="parent/main checkout clean"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "owned_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "parent_main_status_short": " M agent/governance/server.py\n",
+                "worker_worktree_status_short": " M agent/governance/mf_subagent_contract.py\n",
+                "actual_cwd": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "actual_git_root": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_worker_changes_outside_owned_files() -> None:
+    with pytest.raises(MfSubagentContractError, match="outside owned file fence"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "owned_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "worker_worktree_status_short": " M agent/governance/server.py\n",
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
 
 
 def test_finish_gate_carries_route_lineage_when_present() -> None:

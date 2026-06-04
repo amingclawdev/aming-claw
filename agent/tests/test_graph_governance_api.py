@@ -276,10 +276,15 @@ def test_project_bootstrap_route_token_allows_project_scope(conn, monkeypatch):
     assert payload["route_token_gate"]["scope"]["project_id"] == "bootstrap-token-demo"
 
 
-def _activate_basic_graph(conn, snapshot_id: str = "full-query-test") -> None:
+def _activate_basic_graph(
+    conn,
+    snapshot_id: str = "full-query-test",
+    *,
+    project_id: str = PID,
+) -> None:
     snapshot = store.create_graph_snapshot(
         conn,
-        PID,
+        project_id,
         snapshot_id=snapshot_id,
         commit_sha="head",
         snapshot_kind="full",
@@ -287,12 +292,12 @@ def _activate_basic_graph(conn, snapshot_id: str = "full-query-test") -> None:
     )
     store.index_graph_snapshot(
         conn,
-        PID,
+        project_id,
         snapshot["snapshot_id"],
         nodes=_graph()["deps_graph"]["nodes"],
         edges=_graph()["deps_graph"]["edges"],
     )
-    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    store.activate_graph_snapshot(conn, project_id, snapshot["snapshot_id"])
     conn.commit()
 
 
@@ -6738,6 +6743,68 @@ def test_mf_sub_graph_query_valid_active_identity_succeeds_and_records_trace_con
     assert trace["parent_task_id"] == "parent-valid"
     assert trace["run_id"].startswith("mf_subagent:worker-valid:")
     assert "fence-worker-valid" not in json.dumps(trace, sort_keys=True)
+
+
+def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(conn, tmp_path):
+    target_project_id = "target-graph-project"
+    target_root = tmp_path / "target-graph-project"
+    target_root.mkdir()
+    _activate_basic_graph(
+        conn,
+        "full-query-mf-sub-target-project",
+        project_id=target_project_id,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=target_project_id,
+            target_project_root=str(target_root),
+            task_id="worker-target-project",
+            root_task_id="parent-target-project",
+            stage_task_id="worker-target-project",
+            worker_id="worker-target-project",
+            worker_slot_id="worker-target-project",
+            branch_ref="refs/heads/codex/worker-target-project",
+            status="worktree_ready",
+            fence_token="fence-target-project",
+        ),
+    )
+    conn.commit()
+
+    queried = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": target_project_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "query_schema",
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "task_id": "worker-target-project",
+                "parent_task_id": "parent-target-project",
+                "worker_role": "mf_sub",
+                "fence_token": "fence-target-project",
+                "governance_project_id": PID,
+                "target_project_id": target_project_id,
+                "target_project_root": str(target_root),
+            },
+        )
+    )
+
+    assert queried["ok"] is True
+    fetched = server.handle_graph_governance_query_trace_get(
+        _ctx_with_role(
+            {"project_id": target_project_id, "trace_id": queried["trace_id"]},
+            "mf_sub",
+        )
+    )
+    trace = fetched["trace"]
+    assert trace["query_source"] == "mf_subagent"
+    assert trace["parent_task_id"] == "parent-target-project"
+    assert trace["run_id"].startswith("mf_subagent:worker-target-project:")
 
 
 def test_mf_sub_graph_query_accepts_context_allocated_by_parallel_branch_api(conn):

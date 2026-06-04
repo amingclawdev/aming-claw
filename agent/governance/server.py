@@ -3799,6 +3799,8 @@ def handle_reconcile_file_inventory_list(ctx: RequestContext):
 def _graph_governance_project_root(project_id: str, body: dict) -> Path:
     raw = (
         body.get("project_root")
+        or body.get("target_project_root")
+        or body.get("target_graph_root")
         or body.get("worktree_path")
         or body.get("workspace_path")
         or body.get("repo_root")
@@ -4107,6 +4109,24 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     parent_task_id = str(body.get("parent_task_id") or "").strip()
     worker_role = str(body.get("worker_role") or "").strip().lower().replace("-", "_")
     fence_token = str(body.get("fence_token") or "").strip()
+    target_project_id = str(
+        body.get("target_project_id")
+        or body.get("graph_project_id")
+        or ctx.get_project_id()
+    ).strip()
+    governance_project_id = str(
+        body.get("governance_project_id")
+        or body.get("backlog_project_id")
+        or ctx.get_project_id()
+    ).strip()
+    target_project_root = str(
+        body.get("target_project_root")
+        or body.get("target_graph_root")
+        or body.get("project_root")
+        or body.get("workspace_path")
+        or body.get("repo_root")
+        or ""
+    ).strip()
     if not task_id:
         raise ValidationError("task_id is required for mf_subagent graph query")
     if not parent_task_id:
@@ -4127,6 +4147,9 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             parent_task_id=parent_task_id,
             worker_role=worker_role,
             fence_token=fence_token,
+            governance_project_id=governance_project_id,
+            target_project_id=target_project_id,
+            target_project_root=target_project_root,
         )
     except BranchRuntimeFenceError as exc:
         raise GovernanceError(
@@ -4136,12 +4159,18 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             {
                 "task_id": task_id,
                 "parent_task_id": parent_task_id,
+                "governance_project_id": governance_project_id,
+                "target_project_id": target_project_id,
                 "reason": "fence_invalidated_or_unknown",
             },
         ) from exc
     fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
     body["task_id"] = context.task_id
     body["parent_task_id"] = parent_task_id or context.root_task_id or context.task_id
+    body["governance_project_id"] = context.governance_project_id or context.project_id
+    body["target_project_id"] = context.target_project_id or ctx.get_project_id()
+    if context.target_project_root and not body.get("target_project_root"):
+        body["target_project_root"] = context.target_project_root
     body["query_source"] = "mf_subagent"
     body["run_id"] = str(body.get("run_id") or "") or f"mf_subagent:{context.task_id}:fence:{fence_hash}"
     return session
@@ -4641,6 +4670,24 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         target_head_commit = base_commit
 
     allocation_fence_token = str(ctx.body.get("fence_token") or f"fence-{uuid.uuid4().hex[:12]}")
+    allocation_owner = str(
+        ctx.body.get("allocation_owner")
+        or ctx.body.get("observer_allocation_owner")
+        or ctx.body.get("agent_id")
+        or ctx.body.get("actor")
+        or ""
+    )
+    worker_slot_id = str(ctx.body.get("worker_slot_id") or ctx.body.get("worker_id") or "")
+    governance_project_id = str(
+        ctx.body.get("governance_project_id")
+        or ctx.body.get("backlog_project_id")
+        or project_id
+    )
+    target_project_id = str(
+        ctx.body.get("target_project_id")
+        or ctx.body.get("graph_project_id")
+        or project_id
+    )
     context = plan_branch_runtime_context(
         project_id=project_id,
         task_id=task_id,
@@ -4651,8 +4698,17 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         root_task_id=str(ctx.body.get("root_task_id") or ctx.body.get("parent_task_id") or ""),
         stage_task_id=str(ctx.body.get("stage_task_id") or task_id),
         stage_type=str(ctx.body.get("stage_type") or "mf_sub"),
-        agent_id=str(ctx.body.get("agent_id") or ctx.body.get("actor") or ""),
-        worker_id=str(ctx.body.get("worker_id") or ""),
+        agent_id=allocation_owner,
+        worker_id=worker_slot_id,
+        allocation_owner=allocation_owner,
+        worker_slot_id=worker_slot_id,
+        governance_project_id=governance_project_id,
+        target_project_id=target_project_id,
+        target_project_root=str(
+            ctx.body.get("target_project_root")
+            or ctx.body.get("target_graph_root")
+            or ""
+        ),
         attempt=_query_int(ctx.body, "attempt", 1),
         branch_prefix=str(ctx.body.get("branch_prefix") or "codex"),
         worktree_root=str(ctx.body.get("worktree_root") or ".worktrees"),
@@ -4688,7 +4744,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             conn.commit()
-            saved = saved.__class__(**worktree_result["context"])
+            saved = get_branch_context(conn, project_id, task_id) or saved
 
         return 201, {
             "ok": True,
@@ -4739,9 +4795,10 @@ def _parallel_branch_runtime_contract_response(
     )
 
     runtime_context_id = runtime_context_id_for_branch_context(context)
+    context_project_id = getattr(context, "project_id", project_id)
     latest_revision = get_latest_branch_contract_revision(
         conn,
-        project_id,
+        context_project_id,
         runtime_context_id,
     )
     latest_revision_payload = (
@@ -4772,7 +4829,13 @@ def _parallel_branch_runtime_contract_response(
         latest_revision=latest_revision_payload or None,
         route_identity=route_identity if isinstance(route_identity, Mapping) else {},
     )
-    return {"ok": True, "project_id": project_id, "runtime_contract": view}
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "governance_project_id": context_project_id,
+        "target_project_id": getattr(context, "target_project_id", "") or project_id,
+        "runtime_contract": view,
+    }
 
 
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
@@ -4810,6 +4873,21 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
                     parent_task_id=str(ctx.query.get("parent_task_id") or ""),
                     worker_role="mf_sub",
                     fence_token=fence_token,
+                    governance_project_id=str(
+                        ctx.query.get("governance_project_id")
+                        or ctx.query.get("backlog_project_id")
+                        or project_id
+                    ),
+                    target_project_id=str(
+                        ctx.query.get("target_project_id")
+                        or ctx.query.get("graph_project_id")
+                        or project_id
+                    ),
+                    target_project_root=str(
+                        ctx.query.get("target_project_root")
+                        or ctx.query.get("target_graph_root")
+                        or ""
+                    ),
                 )
             except BranchRuntimeFenceError as exc:
                 raise GovernanceError(
@@ -4818,6 +4896,16 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
                     403,
                     {
                         "task_id": task_id,
+                        "governance_project_id": str(
+                            ctx.query.get("governance_project_id")
+                            or ctx.query.get("backlog_project_id")
+                            or project_id
+                        ),
+                        "target_project_id": str(
+                            ctx.query.get("target_project_id")
+                            or ctx.query.get("graph_project_id")
+                            or project_id
+                        ),
                         "reason": "fence_invalidated_or_unknown",
                     },
                 ) from exc
@@ -4879,6 +4967,21 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
                     parent_task_id=str(ctx.query.get("parent_task_id") or ""),
                     worker_role="mf_sub",
                     fence_token=fence_token,
+                    governance_project_id=str(
+                        ctx.query.get("governance_project_id")
+                        or ctx.query.get("backlog_project_id")
+                        or project_id
+                    ),
+                    target_project_id=str(
+                        ctx.query.get("target_project_id")
+                        or ctx.query.get("graph_project_id")
+                        or project_id
+                    ),
+                    target_project_root=str(
+                        ctx.query.get("target_project_root")
+                        or ctx.query.get("target_graph_root")
+                        or ""
+                    ),
                 )
             except BranchRuntimeFenceError as exc:
                 raise GovernanceError(
@@ -4887,6 +4990,16 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
                     403,
                     {
                         "runtime_context_id": runtime_context_id,
+                        "governance_project_id": str(
+                            ctx.query.get("governance_project_id")
+                            or ctx.query.get("backlog_project_id")
+                            or project_id
+                        ),
+                        "target_project_id": str(
+                            ctx.query.get("target_project_id")
+                            or ctx.query.get("graph_project_id")
+                            or project_id
+                        ),
                         "reason": "fence_invalidated_or_unknown",
                     },
                 ) from exc
@@ -9443,6 +9556,8 @@ def handle_graph_governance_query(ctx: RequestContext):
     root = None
     if (
         body.get("project_root")
+        or body.get("target_project_root")
+        or body.get("target_graph_root")
         or body.get("workspace_path")
         or body.get("repo_root")
         or tool in {"search_docs", "get_file_excerpt"}

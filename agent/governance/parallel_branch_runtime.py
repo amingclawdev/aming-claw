@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     retry_round       INTEGER NOT NULL DEFAULT 0,
     agent_id          TEXT NOT NULL DEFAULT '',
     worker_id         TEXT NOT NULL DEFAULT '',
+    allocation_owner  TEXT NOT NULL DEFAULT '',
+    worker_slot_id    TEXT NOT NULL DEFAULT '',
+    actual_host_worker_id TEXT NOT NULL DEFAULT '',
+    host_startup_id   TEXT NOT NULL DEFAULT '',
+    host_session_id   TEXT NOT NULL DEFAULT '',
+    governance_project_id TEXT NOT NULL DEFAULT '',
+    target_project_id TEXT NOT NULL DEFAULT '',
+    target_project_root TEXT NOT NULL DEFAULT '',
     attempt           INTEGER NOT NULL DEFAULT 1,
     lease_id          TEXT NOT NULL DEFAULT '',
     lease_expires_at  TEXT NOT NULL DEFAULT '',
@@ -323,6 +331,14 @@ class BranchTaskRuntimeContext:
     retry_round: int = 0
     agent_id: str = ""
     worker_id: str = ""
+    allocation_owner: str = ""
+    worker_slot_id: str = ""
+    actual_host_worker_id: str = ""
+    host_startup_id: str = ""
+    host_session_id: str = ""
+    governance_project_id: str = ""
+    target_project_id: str = ""
+    target_project_root: str = ""
     attempt: int = 1
     lease_id: str = ""
     lease_expires_at: str = ""
@@ -676,6 +692,16 @@ def preserve_materialized_context_for_allocation(
         retry_round=planned.retry_round or existing.retry_round,
         agent_id=existing.agent_id or planned.agent_id,
         worker_id=existing.worker_id or planned.worker_id,
+        allocation_owner=existing.allocation_owner or planned.allocation_owner,
+        worker_slot_id=existing.worker_slot_id or planned.worker_slot_id,
+        actual_host_worker_id=existing.actual_host_worker_id
+        or planned.actual_host_worker_id,
+        host_startup_id=existing.host_startup_id or planned.host_startup_id,
+        host_session_id=existing.host_session_id or planned.host_session_id,
+        governance_project_id=existing.governance_project_id
+        or planned.governance_project_id,
+        target_project_id=existing.target_project_id or planned.target_project_id,
+        target_project_root=existing.target_project_root or planned.target_project_root,
         attempt=existing.attempt or planned.attempt,
         lease_id=existing.lease_id or planned.lease_id,
         lease_expires_at=existing.lease_expires_at or planned.lease_expires_at,
@@ -713,6 +739,23 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
             "ALTER TABLE parallel_branch_runtime_contexts "
             "ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0"
         )
+        columns.add("retry_round")
+    for column in (
+        "allocation_owner",
+        "worker_slot_id",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "host_session_id",
+        "governance_project_id",
+        "target_project_id",
+        "target_project_root",
+    ):
+        if column not in columns:
+            conn.execute(
+                "ALTER TABLE parallel_branch_runtime_contexts "
+                f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            )
+            columns.add(column)
     rows = conn.execute(
         """
         SELECT project_id, task_id, attempt
@@ -924,8 +967,11 @@ def _previous_revision_hash(revision: "BranchRuntimeContractRevision | None") ->
 
 def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
     runtime_context_id = ""
-    if "runtime_context_id" in row.keys():
+    row_keys = set(row.keys())
+    if "runtime_context_id" in row_keys:
         runtime_context_id = row["runtime_context_id"] or ""
+    agent_id = row["agent_id"] or ""
+    worker_id = row["worker_id"] or ""
     return BranchTaskRuntimeContext(
         project_id=row["project_id"],
         task_id=row["task_id"],
@@ -938,8 +984,44 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
         stage_task_id=row["stage_task_id"] or "",
         stage_type=row["stage_type"] or "",
         retry_round=int(row["retry_round"] or 0),
-        agent_id=row["agent_id"] or "",
-        worker_id=row["worker_id"] or "",
+        agent_id=agent_id,
+        worker_id=worker_id,
+        allocation_owner=(
+            row["allocation_owner"] if "allocation_owner" in row_keys else ""
+        )
+        or agent_id,
+        worker_slot_id=(
+            row["worker_slot_id"] if "worker_slot_id" in row_keys else ""
+        )
+        or worker_id,
+        actual_host_worker_id=(
+            row["actual_host_worker_id"]
+            if "actual_host_worker_id" in row_keys
+            else ""
+        )
+        or "",
+        host_startup_id=(
+            row["host_startup_id"] if "host_startup_id" in row_keys else ""
+        )
+        or "",
+        host_session_id=(
+            row["host_session_id"] if "host_session_id" in row_keys else ""
+        )
+        or "",
+        governance_project_id=(
+            row["governance_project_id"]
+            if "governance_project_id" in row_keys
+            else ""
+        )
+        or row["project_id"],
+        target_project_id=(
+            row["target_project_id"] if "target_project_id" in row_keys else ""
+        )
+        or row["project_id"],
+        target_project_root=(
+            row["target_project_root"] if "target_project_root" in row_keys else ""
+        )
+        or "",
         attempt=int(row["attempt"] or 1),
         lease_id=row["lease_id"] or "",
         lease_expires_at=row["lease_expires_at"] or "",
@@ -971,6 +1053,11 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     payload = asdict(context)
     payload["runtime_context_id"] = runtime_context_id_for_branch_context(context)
     payload["depends_on"] = list(context.depends_on)
+    payload["allocation_owner"] = context.allocation_owner or context.agent_id
+    payload["observer_allocation_owner"] = payload["allocation_owner"]
+    payload["worker_slot_id"] = context.worker_slot_id or context.worker_id
+    payload["governance_project_id"] = context.governance_project_id or context.project_id
+    payload["target_project_id"] = context.target_project_id or context.project_id
     return payload
 
 
@@ -1075,7 +1162,10 @@ def upsert_branch_context(
         """
         INSERT INTO parallel_branch_runtime_contexts (
             project_id, task_id, runtime_context_id, batch_id, backlog_id, chain_id, root_task_id,
-            stage_task_id, stage_type, retry_round, agent_id, worker_id, attempt, lease_id,
+            stage_task_id, stage_type, retry_round, agent_id, worker_id,
+            allocation_owner, worker_slot_id, actual_host_worker_id,
+            host_startup_id, host_session_id, governance_project_id,
+            target_project_id, target_project_root, attempt, lease_id,
             lease_expires_at, fence_token, branch_ref, ref_name, worktree_id,
             worktree_path, base_commit, head_commit, target_head_commit,
             snapshot_id, projection_id, merge_queue_id, merge_preview_id,
@@ -1084,7 +1174,7 @@ def upsert_branch_context(
             created_at, updated_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
             runtime_context_id = excluded.runtime_context_id,
@@ -1097,6 +1187,14 @@ def upsert_branch_context(
             retry_round = excluded.retry_round,
             agent_id = excluded.agent_id,
             worker_id = excluded.worker_id,
+            allocation_owner = excluded.allocation_owner,
+            worker_slot_id = excluded.worker_slot_id,
+            actual_host_worker_id = excluded.actual_host_worker_id,
+            host_startup_id = excluded.host_startup_id,
+            host_session_id = excluded.host_session_id,
+            governance_project_id = excluded.governance_project_id,
+            target_project_id = excluded.target_project_id,
+            target_project_root = excluded.target_project_root,
             attempt = excluded.attempt,
             lease_id = excluded.lease_id,
             lease_expires_at = excluded.lease_expires_at,
@@ -1134,6 +1232,14 @@ def upsert_branch_context(
             context.retry_round,
             context.agent_id,
             context.worker_id,
+            context.allocation_owner or context.agent_id,
+            context.worker_slot_id or context.worker_id,
+            context.actual_host_worker_id,
+            context.host_startup_id,
+            context.host_session_id,
+            context.governance_project_id or context.project_id,
+            context.target_project_id or context.project_id,
+            context.target_project_root,
             context.attempt,
             context.lease_id,
             context.lease_expires_at,
@@ -1972,6 +2078,9 @@ def validate_mf_subagent_graph_query_identity(
     fence_token: str,
     parent_task_id: str = "",
     worker_role: str = "",
+    governance_project_id: str = "",
+    target_project_id: str = "",
+    target_project_root: str = "",
 ) -> BranchTaskRuntimeContext:
     """Validate the task/fence identity an mf_sub worker presents for graph reads."""
     ensure_branch_runtime_schema(conn)
@@ -1983,7 +2092,9 @@ def validate_mf_subagent_graph_query_identity(
     if not task or not fence:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
-    context = get_branch_context(conn, project_id, task)
+    query_project_id = str(project_id or "").strip()
+    context_project_id = str(governance_project_id or query_project_id).strip()
+    context = get_branch_context(conn, context_project_id, task)
     if context is None or not context.fence_token:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     try:
@@ -1994,6 +2105,22 @@ def validate_mf_subagent_graph_query_identity(
     if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.lease_expires_at and context.lease_expires_at < utc_now():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    requested_target_project_id = str(target_project_id or query_project_id).strip()
+    context_governance_project_id = context.governance_project_id or context.project_id
+    context_target_project_id = context.target_project_id or context.project_id
+    if context_project_id != context.project_id:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if governance_project_id and governance_project_id != context_governance_project_id:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if query_project_id not in {context.project_id, context_target_project_id}:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if requested_target_project_id != context_target_project_id:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    requested_target_root = _startup_path_text(target_project_root)
+    context_target_root = _startup_path_text(context.target_project_root)
+    if requested_target_root and context_target_root and requested_target_root != context_target_root:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     parent = str(parent_task_id or "").strip()
@@ -2105,7 +2232,11 @@ def _startup_blocker(
             "task_id": context.task_id,
             "parent_task_id": _parent_task_id_for_context(context),
             "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "actual_host_worker_id": context.actual_host_worker_id,
             "agent_id": context.agent_id,
+            "allocation_owner": context.allocation_owner or context.agent_id,
+            "observer_allocation_owner": context.allocation_owner or context.agent_id,
             "fence_token": context.fence_token,
             "branch": context.branch_ref,
             "worktree": context.worktree_path,
@@ -2113,6 +2244,10 @@ def _startup_blocker(
             "target_head_commit": context.target_head_commit,
             "merge_queue_id": context.merge_queue_id,
             "status": context.status,
+            "governance_project_id": context.governance_project_id
+            or context.project_id,
+            "target_project_id": context.target_project_id or context.project_id,
+            "target_project_root": context.target_project_root,
         }
     if details:
         payload["details"] = dict(details)
@@ -2157,8 +2292,27 @@ def record_mf_subagent_startup(
     worker_role = str(payload.get("worker_role") or payload.get("role") or "").strip()
     worker_role = worker_role.lower().replace("-", "_")
     fence_token = str(payload.get("fence_token") or "").strip()
-    worker_id = str(payload.get("worker_id") or "").strip()
+    reported_worker_id = str(payload.get("worker_id") or "").strip()
+    worker_slot_id = str(
+        payload.get("worker_slot_id")
+        or context.worker_slot_id
+        or context.worker_id
+        or ""
+    ).strip()
+    actual_host_worker_id = str(
+        payload.get("actual_host_worker_id")
+        or payload.get("host_worker_id")
+        or reported_worker_id
+        or ""
+    ).strip()
     agent_id = str(payload.get("agent_id") or "").strip()
+    allocation_owner = str(
+        payload.get("allocation_owner")
+        or payload.get("observer_allocation_owner")
+        or context.allocation_owner
+        or context.agent_id
+        or ""
+    ).strip()
     token_evidence = _startup_token_evidence(payload)
     actual_cwd = str(payload.get("actual_cwd") or payload.get("cwd") or "").strip()
     actual_git_root = str(payload.get("actual_git_root") or payload.get("git_root") or "").strip()
@@ -2179,6 +2333,30 @@ def record_mf_subagent_startup(
     launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
     observer_command_id = str(payload.get("observer_command_id") or "").strip()
     host_startup_id = str(payload.get("host_startup_id") or "").strip()
+    host_session_id = str(
+        payload.get("host_session_id")
+        or payload.get("session_id")
+        or token_evidence["session_token_surrogate"]
+        or ""
+    ).strip()
+    governance_project_id = str(
+        payload.get("governance_project_id")
+        or payload.get("backlog_project_id")
+        or context.governance_project_id
+        or project_id
+    ).strip()
+    target_project_id = str(
+        payload.get("target_project_id")
+        or payload.get("graph_project_id")
+        or context.target_project_id
+        or project_id
+    ).strip()
+    target_project_root = str(
+        payload.get("target_project_root")
+        or payload.get("target_graph_root")
+        or context.target_project_root
+        or ""
+    ).strip()
     startup_source = str(payload.get("startup_source") or "host_created_mf_sub_worker")
     startup_source_normalized = startup_source.lower().replace("-", "_")
     host_adapter_startup = bool(
@@ -2194,7 +2372,7 @@ def record_mf_subagent_startup(
     for field, value in (
         ("parent_task_id", parent_task_id),
         ("worker_role", worker_role),
-        ("worker_id", worker_id),
+        ("actual_host_worker_id", actual_host_worker_id),
         ("agent_id", agent_id),
         ("fence_token", fence_token),
         ("actual_cwd", actual_cwd),
@@ -2210,6 +2388,8 @@ def record_mf_subagent_startup(
         ("prompt_contract_hash", prompt_contract_hash),
         ("visible_injection_manifest_hash", visible_manifest),
         ("owned_files", owned_files),
+        ("governance_project_id", governance_project_id),
+        ("target_project_id", target_project_id),
     ):
         if not value:
             missing.append(field)
@@ -2236,26 +2416,25 @@ def record_mf_subagent_startup(
             context=context,
             details={"worker_role": worker_role},
         )
-    if context.worker_id and worker_id != context.worker_id:
+    if (
+        payload.get("worker_slot_id") is not None
+        and (context.worker_slot_id or context.worker_id)
+        and worker_slot_id != (context.worker_slot_id or context.worker_id)
+    ):
         return _startup_blocker(
-            blocker_id="worker_id_mismatch",
-            message="mf_subagent startup worker_id must match branch runtime context",
+            blocker_id="worker_slot_id_mismatch",
+            message="mf_subagent startup worker_slot_id must match branch runtime context",
             context=context,
-            details={"worker_id": worker_id, "expected_worker_id": context.worker_id},
+            details={
+                "worker_slot_id": worker_slot_id,
+                "expected_worker_slot_id": context.worker_slot_id or context.worker_id,
+            },
         )
-    agent_id_match_mode = "exact_or_unallocated"
-    if context.agent_id and agent_id != context.agent_id:
-        if host_adapter_startup:
-            agent_id_match_mode = "host_adapter_startup_token_surrogate"
-        else:
-            return _startup_blocker(
-                blocker_id="agent_id_mismatch",
-                message="mf_subagent startup agent_id must match branch runtime context",
-                context=context,
-                details={"agent_id": agent_id, "expected_agent_id": context.agent_id},
-            )
-    elif context.agent_id:
-        agent_id_match_mode = "exact"
+    agent_id_match_mode = "actual_host_worker_bound"
+    if allocation_owner and agent_id == allocation_owner:
+        agent_id_match_mode = "same_as_allocation_owner"
+    elif host_adapter_startup:
+        agent_id_match_mode = "host_adapter_startup_token_surrogate"
     try:
         _require_current_fence(context, fence_token)
     except BranchRuntimeFenceError:
@@ -2297,15 +2476,10 @@ def record_mf_subagent_startup(
                     "expected_worktree": expected_worktree,
                 },
             )
-        actual_cwd_path = _startup_path_text(actual_cwd)
-        expected_path = _startup_path_text(expected_worktree)
-        if actual_cwd_path and expected_path and not (
-            actual_cwd_path == expected_path
-            or actual_cwd_path.startswith(expected_path + "/")
-        ):
+        if not _startup_path_matches(actual_cwd, expected_worktree):
             return _startup_blocker(
-                blocker_id="actual_cwd_outside_worktree",
-                message="mf_subagent startup actual_cwd must be inside assigned worktree",
+                blocker_id="actual_cwd_mismatch",
+                message="mf_subagent startup actual_cwd must match assigned worktree",
                 context=context,
                 details={
                     "actual_cwd": actual_cwd,
@@ -2346,14 +2520,41 @@ def record_mf_subagent_startup(
                 "expected_merge_queue_id": context.merge_queue_id,
             },
         )
+    if (context.governance_project_id or project_id) != governance_project_id:
+        return _startup_blocker(
+            blocker_id="governance_project_id_mismatch",
+            message="mf_subagent startup governance_project_id must match branch context",
+            context=context,
+            details={
+                "governance_project_id": governance_project_id,
+                "expected_governance_project_id": context.governance_project_id
+                or project_id,
+            },
+        )
+    if (context.target_project_id or project_id) != target_project_id:
+        return _startup_blocker(
+            blocker_id="target_project_id_mismatch",
+            message="mf_subagent startup target_project_id must match branch context",
+            context=context,
+            details={
+                "target_project_id": target_project_id,
+                "expected_target_project_id": context.target_project_id or project_id,
+            },
+        )
 
     saved = upsert_branch_context(
         conn,
         replace(
             context,
             status=STATE_RUNNING,
-            worker_id=worker_id,
-            agent_id=agent_id,
+            allocation_owner=allocation_owner,
+            worker_slot_id=worker_slot_id,
+            actual_host_worker_id=actual_host_worker_id,
+            host_startup_id=host_startup_id,
+            host_session_id=host_session_id,
+            governance_project_id=governance_project_id,
+            target_project_id=target_project_id,
+            target_project_root=target_project_root,
             head_commit=head_commit,
             last_recovery_action="mf_subagent_startup_recorded",
         ),
@@ -2370,20 +2571,27 @@ def record_mf_subagent_startup(
         "startup_complete": True,
         "actual_startup_recorded": True,
         "actual_startup_required": False,
-        "same_as_expected_worker": True,
+        "same_as_expected_worker": bool(actual_host_worker_id == worker_slot_id),
         "fence_token_matches": True,
         "close_satisfying": True,
         "raw_launch_text_persisted": False,
         "project_id": project_id,
+        "governance_project_id": saved.governance_project_id or project_id,
+        "target_project_id": saved.target_project_id or project_id,
+        "target_project_root": saved.target_project_root,
         "backlog_id": saved.backlog_id,
         "runtime_context_id": runtime_context_id,
         "task_id": saved.task_id,
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "role": "mf_sub",
-        "worker_id": worker_id,
+        "allocation_owner": allocation_owner,
+        "observer_allocation_owner": allocation_owner,
+        "worker_slot_id": worker_slot_id,
+        "worker_id": worker_slot_id,
+        "actual_host_worker_id": actual_host_worker_id,
         "agent_id": agent_id,
-        "expected_agent_id": context.agent_id,
+        "expected_agent_id": allocation_owner,
         "agent_id_match_mode": agent_id_match_mode,
         "host_adapter_startup_token_accepted": host_adapter_startup,
         "fence_token": saved.fence_token,
@@ -2413,6 +2621,7 @@ def record_mf_subagent_startup(
         "startup_timing": "actual_worker_started",
         "observer_command_id": observer_command_id,
         "host_startup_id": host_startup_id,
+        "host_session_id": host_session_id,
     }
     if launch_text_hash:
         gate["launch_text_hash"] = launch_text_hash
@@ -2458,6 +2667,9 @@ def validate_mf_subagent_runtime_context_lookup(
     fence_token: str,
     parent_task_id: str = "",
     worker_role: str = "",
+    governance_project_id: str = "",
+    target_project_id: str = "",
+    target_project_root: str = "",
 ) -> BranchTaskRuntimeContext:
     """Validate runtime_context_id + fence identity for worker contract polling."""
 
@@ -2470,7 +2682,9 @@ def validate_mf_subagent_runtime_context_lookup(
     if not runtime_id or not fence:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
-    context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
+    query_project_id = str(project_id or "").strip()
+    context_project_id = str(governance_project_id or query_project_id).strip()
+    context = get_branch_context_by_runtime_context_id(conn, context_project_id, runtime_id)
     if context is None or not context.fence_token:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     try:
@@ -2481,6 +2695,20 @@ def validate_mf_subagent_runtime_context_lookup(
     if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.lease_expires_at and context.lease_expires_at < utc_now():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    requested_target_project_id = str(target_project_id or query_project_id).strip()
+    context_governance_project_id = context.governance_project_id or context.project_id
+    context_target_project_id = context.target_project_id or context.project_id
+    if governance_project_id and governance_project_id != context_governance_project_id:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if query_project_id not in {context.project_id, context_target_project_id}:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if requested_target_project_id != context_target_project_id:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    requested_target_root = _startup_path_text(target_project_root)
+    context_target_root = _startup_path_text(context.target_project_root)
+    if requested_target_root and context_target_root and requested_target_root != context_target_root:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     parent = str(parent_task_id or "").strip()
@@ -2677,6 +2905,14 @@ def plan_branch_runtime_context(
     stage_type: str = "",
     agent_id: str = "",
     worker_id: str = "",
+    allocation_owner: str = "",
+    worker_slot_id: str = "",
+    actual_host_worker_id: str = "",
+    host_startup_id: str = "",
+    host_session_id: str = "",
+    governance_project_id: str = "",
+    target_project_id: str = "",
+    target_project_root: str = "",
     attempt: int = 1,
     branch_prefix: str = "codex",
     worktree_root: str = ".worktrees",
@@ -2689,7 +2925,8 @@ def plan_branch_runtime_context(
 ) -> BranchTaskRuntimeContext:
     """Plan deterministic branch/worktree identity without invoking git."""
     task_slug = _safe_slug(task_id, "task")
-    worker_slug = _safe_slug(worker_id, "") if worker_id else ""
+    slot_id = worker_slot_id or worker_id
+    worker_slug = _safe_slug(slot_id, "") if slot_id else ""
     prefix = _safe_slug(branch_prefix, "codex")
     try:
         attempt_num = max(1, int(attempt or 1))
@@ -2711,6 +2948,14 @@ def plan_branch_runtime_context(
         stage_type=stage_type,
         agent_id=agent_id,
         worker_id=worker_id,
+        allocation_owner=allocation_owner or agent_id,
+        worker_slot_id=slot_id,
+        actual_host_worker_id=actual_host_worker_id,
+        host_startup_id=host_startup_id,
+        host_session_id=host_session_id,
+        governance_project_id=governance_project_id or project_id,
+        target_project_id=target_project_id or project_id,
+        target_project_root=target_project_root,
         attempt=attempt_num,
         branch_ref=branch_ref,
         ref_name=ref_name,
@@ -2919,6 +3164,14 @@ def branch_context_from_chain_stage(
     backlog_id: str = "",
     agent_id: str = "",
     worker_id: str = "",
+    allocation_owner: str = "",
+    worker_slot_id: str = "",
+    actual_host_worker_id: str = "",
+    host_startup_id: str = "",
+    host_session_id: str = "",
+    governance_project_id: str = "",
+    target_project_id: str = "",
+    target_project_root: str = "",
     status: str = STATE_RUNNING,
     ref_name: str = "main",
     worktree_id: str = "",
@@ -2957,6 +3210,14 @@ def branch_context_from_chain_stage(
         retry_round=round_num,
         agent_id=agent_id,
         worker_id=worker_id,
+        allocation_owner=allocation_owner or agent_id,
+        worker_slot_id=worker_slot_id or worker_id,
+        actual_host_worker_id=actual_host_worker_id,
+        host_startup_id=host_startup_id,
+        host_session_id=host_session_id,
+        governance_project_id=governance_project_id or project_id,
+        target_project_id=target_project_id or project_id,
+        target_project_root=target_project_root,
         attempt=attempt if attempt is not None else round_num + 1,
         lease_id=lease_id,
         lease_expires_at=lease_expires_at,

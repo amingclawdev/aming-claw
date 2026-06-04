@@ -612,6 +612,9 @@ def build_observer_owned_agent_task_contract(
         "contract_version": _string(contract_version) or "mf_parallel.v1",
         "contract_revision_id": _string(contract_revision_id),
         "project_id": context.project_id,
+        "governance_project_id": context.governance_project_id or context.project_id,
+        "target_project_id": context.target_project_id or context.project_id,
+        "target_project_root": context.target_project_root,
         "backlog_id": context.backlog_id,
         "task_id": context.task_id,
         "parent_task_id": _parent_task_id_for_contract_view(context),
@@ -775,12 +778,21 @@ def build_mf_subagent_runtime_contract_view(
     runtime_context = {
         "runtime_context_id": runtime_context_id,
         "project_id": context.project_id,
+        "governance_project_id": context.governance_project_id or context.project_id,
+        "target_project_id": context.target_project_id or context.project_id,
+        "target_project_root": context.target_project_root,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "backlog_id": context.backlog_id,
         "worker_role": MF_SUB_ROLE,
         "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "actual_host_worker_id": context.actual_host_worker_id,
         "agent_id": context.agent_id,
+        "allocation_owner": context.allocation_owner or context.agent_id,
+        "observer_allocation_owner": context.allocation_owner or context.agent_id,
+        "host_startup_id": context.host_startup_id,
+        "host_session_id": context.host_session_id,
         "attempt": context.attempt,
         "branch_ref": context.branch_ref,
         "ref_name": context.ref_name,
@@ -824,11 +836,16 @@ def build_mf_subagent_runtime_contract_view(
         "graph_query": {
             "query_source": "mf_subagent",
             "schema_version": GRAPH_TRACE_SCHEMA_VERSION,
+            "governance_project_id": context.governance_project_id or context.project_id,
+            "target_project_id": context.target_project_id or context.project_id,
+            "target_project_root": context.target_project_root,
             "required_context_fields": [
                 "task_id",
                 "parent_task_id",
                 "worker_role",
                 "fence_token",
+                "governance_project_id",
+                "target_project_id",
             ],
             "trace_ids_required_in_timeline": True,
         },
@@ -1753,6 +1770,32 @@ def _normalize_branch_runtime_evidence(
         "registered": False,
         "source_ref": source_ref,
         "runtime_context_id": _context_field(source, "runtime_context_id") if source else "",
+        "governance_project_id": _context_field(source, "governance_project_id")
+        if source
+        else "",
+        "target_project_id": _context_field(source, "target_project_id")
+        if source
+        else "",
+        "target_project_root": _context_field(source, "target_project_root")
+        if source
+        else "",
+        "allocation_owner": _context_field(
+            source,
+            "allocation_owner",
+            "observer_allocation_owner",
+        )
+        if source
+        else "",
+        "observer_allocation_owner": _context_field(
+            source,
+            "observer_allocation_owner",
+            "allocation_owner",
+        )
+        if source
+        else "",
+        "worker_slot_id": _context_field(source, "worker_slot_id", "worker_id")
+        if source
+        else "",
         "task_id": _context_field(source, "task_id") if source else "",
         "parent_task_id": (
             _context_field(source, "parent_task_id", "root_task_id", "chain_id")
@@ -2275,6 +2318,20 @@ def _actual_startup_identity_present(evidence: Mapping[str, Any]) -> bool:
     actual_git_root = _string(
         evidence.get("actual_git_root") or actual_runtime.get("git_root")
     )
+    worktree = _string(
+        evidence.get("assigned_worktree")
+        or evidence.get("worktree_path")
+        or evidence.get("worktree")
+        or actual_runtime.get("assigned_worktree")
+        or actual_runtime.get("worktree_path")
+        or actual_runtime.get("worktree")
+    )
+    if worktree:
+        normalized_worktree = _normalize_worktree_path(worktree)
+        if actual_cwd and _normalize_worktree_path(actual_cwd) != normalized_worktree:
+            return False
+        if actual_git_root and _normalize_worktree_path(actual_git_root) != normalized_worktree:
+            return False
     branch = _string(
         evidence.get("branch")
         or evidence.get("branch_ref")
@@ -3466,6 +3523,36 @@ def validate_mf_subagent_dispatch_gate(
             ("worker_contract", ("project_id",)),
         ),
     )
+    governance_project_id = _dispatch_string(
+        payload,
+        names=("governance_project_id", "backlog_project_id"),
+        nested_keys=(
+            ("scope", ("governance_project_id", "backlog_project_id")),
+            ("selected_scope", ("governance_project_id", "backlog_project_id")),
+            ("worker_contract", ("governance_project_id",)),
+            ("graph_identity", ("governance_project_id",)),
+        ),
+    ) or project_id
+    target_project_id = _dispatch_string(
+        payload,
+        names=("target_project_id", "graph_project_id"),
+        nested_keys=(
+            ("scope", ("target_project_id", "graph_project_id")),
+            ("selected_scope", ("target_project_id", "graph_project_id")),
+            ("worker_contract", ("target_project_id",)),
+            ("graph_identity", ("target_project_id",)),
+        ),
+    ) or project_id
+    target_project_root = _dispatch_string(
+        payload,
+        names=("target_project_root", "target_graph_root"),
+        nested_keys=(
+            ("scope", ("target_project_root", "target_graph_root")),
+            ("selected_scope", ("target_project_root", "target_graph_root")),
+            ("worker_contract", ("target_project_root",)),
+            ("graph_identity", ("target_project_root",)),
+        ),
+    )
     backlog_id = _dispatch_string(
         payload,
         names=("backlog_id",),
@@ -3500,6 +3587,24 @@ def validate_mf_subagent_dispatch_gate(
             ("worker_contract", ("worker_role", "role")),
         ),
     ) or MF_SUB_ROLE
+    allocation_owner = _dispatch_string(
+        payload,
+        names=("allocation_owner", "observer_allocation_owner"),
+        nested_keys=(
+            ("runtime_identity", ("allocation_owner", "observer_allocation_owner")),
+            ("branch_context", ("allocation_owner", "observer_allocation_owner")),
+            ("worker_contract", ("allocation_owner", "observer_allocation_owner")),
+        ),
+    )
+    worker_slot_id = _dispatch_string(
+        payload,
+        names=("worker_slot_id", "worker_id"),
+        nested_keys=(
+            ("runtime_identity", ("worker_slot_id", "worker_id")),
+            ("branch_context", ("worker_slot_id", "worker_id")),
+            ("worker_contract", ("worker_slot_id", "worker_id")),
+        ),
+    )
     values = {
         "branch": branch,
         "worktree": worktree,
@@ -3623,6 +3728,14 @@ def validate_mf_subagent_dispatch_gate(
         "role": MF_SUB_ROLE,
         "dispatch_default": DISPATCH_DEFAULT,
         "worktree_policy": WORKTREE_POLICY_MODE,
+        "project_id": project_id,
+        "governance_project_id": governance_project_id,
+        "target_project_id": target_project_id,
+        "target_project_root": target_project_root,
+        "backlog_id": backlog_id,
+        "allocation_owner": allocation_owner,
+        "observer_allocation_owner": allocation_owner,
+        "worker_slot_id": worker_slot_id,
         "branch": branch,
         "worktree": worktree,
         "base_commit": base_commit,
@@ -3705,6 +3818,9 @@ def build_mf_subagent_input(
         "backend": backend,
         "backend_contract": BACKEND_CONTRACT,
         "project_id": context.project_id,
+        "governance_project_id": context.governance_project_id or context.project_id,
+        "target_project_id": context.target_project_id or context.project_id,
+        "target_project_root": context.target_project_root,
         "task_id": context.task_id,
         "batch_id": context.batch_id,
         "backlog_id": context.backlog_id,
@@ -3720,6 +3836,12 @@ def build_mf_subagent_input(
         "runtime_identity": {
             "agent_id": context.agent_id,
             "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "allocation_owner": context.allocation_owner or context.agent_id,
+            "observer_allocation_owner": context.allocation_owner or context.agent_id,
+            "actual_host_worker_id": context.actual_host_worker_id,
+            "host_startup_id": context.host_startup_id,
+            "host_session_id": context.host_session_id,
             "attempt": context.attempt,
             "lease_id": context.lease_id,
             "fence_token": context.fence_token,
@@ -3734,6 +3856,9 @@ def build_mf_subagent_input(
             "retry_round": context.retry_round,
         },
         "graph_identity": {
+            "governance_project_id": context.governance_project_id or context.project_id,
+            "target_project_id": context.target_project_id or context.project_id,
+            "target_project_root": context.target_project_root,
             "snapshot_id": context.snapshot_id,
             "projection_id": context.projection_id,
             "merge_queue_id": context.merge_queue_id,
@@ -3840,6 +3965,141 @@ def normalize_mf_subagent_result(
     }
 
 
+def _status_short_files(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        lines = value.splitlines()
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        lines = [str(item) for item in value]
+    else:
+        return []
+    files: list[str] = []
+    for line in lines:
+        text = str(line or "").strip("\n")
+        if not text.strip():
+            continue
+        path = text[3:] if len(text) > 3 else text
+        files.append(path.strip())
+    return files
+
+
+def _finish_status_files(payload: Mapping[str, Any], *keys: str) -> list[str]:
+    for key in keys:
+        files = _status_short_files(payload.get(key))
+        if files:
+            return files
+    return []
+
+
+def _finish_nested_status_files(payload: Mapping[str, Any], key: str) -> list[str]:
+    source = _nested_mapping(payload, key)
+    if not source:
+        return []
+    return (
+        _status_short_files(source.get("status_short"))
+        or _status_short_files(source.get("short"))
+        or _string_list_from_mapping(source, "dirty_files", "changed_files", "files")
+    )
+
+
+def _finish_owned_files(payload: Mapping[str, Any]) -> list[str]:
+    return _dedupe_strings(
+        _string_list_from_mapping(
+            payload,
+            "owned_files",
+            "target_files",
+            "write_scope",
+        )
+    )
+
+
+def _validate_finish_scope_precheck(
+    payload: Mapping[str, Any],
+    *,
+    context: BranchTaskRuntimeContext,
+    changed_files: Sequence[str],
+    new_files: Sequence[str],
+) -> dict[str, Any]:
+    parent_files = (
+        _finish_status_files(
+            payload,
+            "parent_main_status_short",
+            "main_worktree_status_short",
+            "parent_worktree_status_short",
+        )
+        or _finish_nested_status_files(payload, "parent_main_status")
+        or _finish_nested_status_files(payload, "main_worktree_status")
+        or _finish_nested_status_files(payload, "parent_checkout")
+    )
+    if parent_files:
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires parent/main checkout clean"
+        )
+
+    worker_files = (
+        _finish_status_files(
+            payload,
+            "worker_worktree_status_short",
+            "worktree_status_short",
+            "worker_status_short",
+        )
+        or _finish_nested_status_files(payload, "worker_worktree_status")
+        or _finish_nested_status_files(payload, "worktree_diff_scope")
+    )
+    claimed_files = _dedupe_strings([*changed_files, *new_files])
+    owned_files = _finish_owned_files(payload)
+    if owned_files:
+        outside_owned = sorted(set(claimed_files).difference(owned_files))
+        if outside_owned:
+            raise MfSubagentContractError(
+                "MF subagent finish gate changed files outside owned file fence: "
+                + ", ".join(outside_owned)
+            )
+    if worker_files:
+        unclaimed_worker_files = sorted(set(worker_files).difference(claimed_files))
+        if unclaimed_worker_files:
+            raise MfSubagentContractError(
+                "MF subagent finish gate worker worktree status has unclaimed files: "
+                + ", ".join(unclaimed_worker_files)
+            )
+        if owned_files:
+            outside_worker_owned = sorted(set(worker_files).difference(owned_files))
+            if outside_worker_owned:
+                raise MfSubagentContractError(
+                    "MF subagent finish gate worker worktree changed files outside owned "
+                    "file fence: " + ", ".join(outside_worker_owned)
+                )
+    actual_cwd = _string(payload.get("actual_cwd"))
+    actual_git_root = _string(payload.get("actual_git_root") or payload.get("git_root"))
+    expected_worktree = _normalize_worktree_path(context.worktree_path)
+    cwd_ok = True
+    git_root_ok = True
+    if actual_cwd:
+        cwd_ok = _normalize_worktree_path(actual_cwd) == expected_worktree
+    if actual_git_root:
+        git_root_ok = _normalize_worktree_path(actual_git_root) == expected_worktree
+    if not cwd_ok or not git_root_ok:
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires actual_cwd and actual_git_root to "
+            "match assigned worktree"
+        )
+    return {
+        "schema_version": "mf_subagent_finish_scope_precheck.v1",
+        "parent_main_clean": True,
+        "parent_main_status_short": [],
+        "worker_worktree_files": worker_files,
+        "claimed_files": claimed_files,
+        "owned_files": owned_files,
+        "owned_file_scope_passed": True,
+        "assigned_worktree": context.worktree_path,
+        "actual_cwd": actual_cwd,
+        "actual_git_root": actual_git_root,
+        "cwd_matches_assigned_worktree": cwd_ok,
+        "git_root_matches_assigned_worktree": git_root_ok,
+    }
+
+
 def validate_mf_subagent_finish_gate(
     payload: Mapping[str, Any],
     *,
@@ -3875,6 +4135,12 @@ def validate_mf_subagent_finish_gate(
     checkpoint_id = str(normalized.get("checkpoint_id") or "").strip()
     if not checkpoint_id:
         raise MfSubagentContractError("checkpoint_id is required")
+    finish_precheck = _validate_finish_scope_precheck(
+        payload,
+        context=context,
+        changed_files=normalized["changed_files"],
+        new_files=normalized["new_files"],
+    )
     parent_route_lineage = _parent_route_lineage_from_payload(
         payload,
         project_id=context.project_id,
@@ -3937,6 +4203,9 @@ def validate_mf_subagent_finish_gate(
         "schema_version": FINISH_GATE_SCHEMA_VERSION,
         "role": MF_SUB_ROLE,
         "project_id": context.project_id,
+        "governance_project_id": context.governance_project_id or context.project_id,
+        "target_project_id": context.target_project_id or context.project_id,
+        "target_project_root": context.target_project_root,
         "task_id": context.task_id,
         "backlog_id": context.backlog_id,
         "branch_ref": context.branch_ref,
@@ -3948,6 +4217,7 @@ def validate_mf_subagent_finish_gate(
         "checkpoint_id": checkpoint_id,
         "fence_token": context.fence_token,
         "replay_source": FINISH_GATE_REPLAY_SOURCE,
+        "finish_precheck": finish_precheck,
         "route_prompt_contract": child_route_prompt_contract,
         "parent_route_lineage": parent_route_lineage,
         "route_lineage": _mf_subagent_route_lineage(
@@ -3982,4 +4252,5 @@ def validate_mf_subagent_finish_gate(
         "summary": normalized["summary"],
         "evidence": normalized["evidence"],
         "merge_queue_ready": True,
+        "close_ready": True,
     }

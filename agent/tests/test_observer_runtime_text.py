@@ -145,9 +145,14 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert startup_intent["close_satisfying"] is False
     assert startup_intent["actual_startup_required"] is True
     assert startup_intent["project_id"] == "aming-claw"
+    assert startup_intent["governance_project_id"] == "aming-claw"
+    assert startup_intent["target_project_id"] == "aming-claw"
     assert startup_intent["task_id"] == "AC-RUNTIME-TEXT-impl-1"
     assert startup_intent["parent_task_id"] == "AC-RUNTIME-TEXT"
     assert startup_intent["worker_role"] == "mf_sub"
+    assert startup_intent["worker_slot_id"] == "worker-1"
+    assert startup_intent["allocation_owner"] == "observer_runtime_text"
+    assert "actual_host_worker_id" in startup_intent["actual_startup_must_include"]
     assert startup_intent["fence_token"] == "fence-runtime-text"
     assert startup_intent["assigned_worktree"] == result["runtime_context"]["worktree_path"]
     assert startup_intent["branch"] == result["runtime_context"]["branch_ref"]
@@ -168,6 +173,8 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["mf_subagent_input"]["role"] == "mf_sub"
     assert result["startup_echo_contract"]["required"] is True
     assert result["graph_first_obligations"]["query"]["query_source"] == "mf_subagent"
+    assert result["graph_first_obligations"]["query"]["governance_project_id"] == "aming-claw"
+    assert result["graph_first_obligations"]["query"]["target_project_id"] == "aming-claw"
     assert result["graph_first_obligations"]["read_receipt_required_before"] == [
         "graph_query",
         "startup",
@@ -185,6 +192,14 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         "launch_text"
     ]
     assert result["finish_gate_contract"]["required"] is True
+    assert result["finish_gate_contract"]["close_sensitive_precheck"][
+        "parent_main_status_short_must_be_clean"
+    ] is True
+    assert result["mf_subagent_input"]["runtime_identity"]["worker_slot_id"] == "worker-1"
+    assert (
+        result["mf_subagent_input"]["runtime_identity"]["allocation_owner"]
+        == "observer_runtime_text"
+    )
 
 
 def test_runtime_text_builder_requires_supplied_branch_allocation_evidence(tmp_path):

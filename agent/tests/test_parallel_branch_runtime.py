@@ -209,7 +209,14 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
     assert saved is not None
     assert saved.status == STATE_RUNNING
     assert saved.head_commit == "head-startup"
+    assert saved.worker_slot_id == "worker-startup"
+    assert saved.actual_host_worker_id == "worker-startup"
+    assert saved.allocation_owner == "agent-startup"
     assert gate["actual_startup_recorded"] is True
+    assert gate["worker_slot_id"] == "worker-startup"
+    assert gate["actual_host_worker_id"] == "worker-startup"
+    assert gate["allocation_owner"] == "agent-startup"
+    assert gate["observer_allocation_owner"] == "agent-startup"
     assert gate["session_token_hash"].startswith("sha256:")
     assert gate["session_token_persisted"] is False
     assert "secret-worker-session-token" not in str(result)
@@ -266,11 +273,18 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
         payload=_startup_payload(str(worktree), fence_token="stale-fence"),
         now_iso=NOW,
     )
-    wrong_worker = record_mf_subagent_startup(
+    wrong_slot = record_mf_subagent_startup(
         conn,
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
-        payload=_startup_payload(str(worktree), worker_id="other-worker"),
+        payload=_startup_payload(str(worktree), worker_slot_id="other-slot"),
+        now_iso=NOW,
+    )
+    wrong_cwd = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), actual_cwd=str(worktree / "subdir")),
         now_iso=NOW,
     )
     missing_merge_payload = _startup_payload(str(worktree))
@@ -299,8 +313,10 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
     assert "actual_cwd" in allocation_only["missing"]
     assert stale_fence["ok"] is False
     assert stale_fence["blocker_id"] == "fence_invalidated_or_unknown"
-    assert wrong_worker["ok"] is False
-    assert wrong_worker["blocker_id"] == "worker_id_mismatch"
+    assert wrong_slot["ok"] is False
+    assert wrong_slot["blocker_id"] == "worker_slot_id_mismatch"
+    assert wrong_cwd["ok"] is False
+    assert wrong_cwd["blocker_id"] == "actual_cwd_mismatch"
     assert missing_merge_queue["ok"] is False
     assert missing_merge_queue["blocker_id"] == (
         "no_truthful_bounded_mf_sub_startup_surface_available"
@@ -310,7 +326,7 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
     assert missing_identity["blocker_id"] == (
         "no_truthful_bounded_mf_sub_startup_surface_available"
     )
-    for key in ("worker_id", "agent_id", "base_commit", "target_head_commit"):
+    for key in ("actual_host_worker_id", "agent_id", "base_commit", "target_head_commit"):
         assert key in missing_identity["missing"]
 
     with pytest.raises(BranchRuntimeFenceError):
@@ -355,6 +371,8 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
         task_id="mf-sub-startup",
         payload=_startup_payload(
             str(worktree),
+            worker_slot_id="worker-startup",
+            actual_host_worker_id="codex-host-worker-19807",
             agent_id="codex-exec-pid-19807",
             session_token="",
             session_token_surrogate="host-adapter:codex-exec-pid-19807",
@@ -368,12 +386,60 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
     saved = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
     assert result["ok"] is True
     assert saved is not None
-    assert saved.agent_id == "codex-exec-pid-19807"
+    assert saved.agent_id == "fallback_observer_cli_takeover"
+    assert saved.worker_id == "worker-startup"
+    assert saved.worker_slot_id == "worker-startup"
+    assert saved.actual_host_worker_id == "codex-host-worker-19807"
+    assert saved.host_startup_id == "host-startup-19807"
     assert gate["agent_id"] == "codex-exec-pid-19807"
     assert gate["expected_agent_id"] == "fallback_observer_cli_takeover"
+    assert gate["worker_id"] == "worker-startup"
+    assert gate["worker_slot_id"] == "worker-startup"
+    assert gate["actual_host_worker_id"] == "codex-host-worker-19807"
     assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
     assert gate["host_adapter_startup_token_accepted"] is True
-    assert gate["worker_id"] == "worker-startup"
+    assert gate["same_as_expected_worker"] is False
+
+
+def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(tmp_path) -> None:
+    conn = _runtime_conn()
+    target_root = tmp_path / "target-project"
+    target_root.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id="aming-claw",
+            governance_project_id="aming-claw",
+            target_project_id="judgment-brain",
+            target_project_root=str(target_root),
+            task_id="mf-sub-cross-project",
+            root_task_id="parent-cross-project",
+            stage_task_id="mf-sub-cross-project",
+            backlog_id="BUG-CROSS-PROJECT",
+            worker_id="worker-slot-cross-project",
+            worker_slot_id="worker-slot-cross-project",
+            branch_ref="refs/heads/codex/mf-sub-cross-project",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-cross-project",
+            worktree_path=str(tmp_path / "worker"),
+        ),
+        now_iso=NOW,
+    )
+
+    accepted = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id="judgment-brain",
+        governance_project_id="aming-claw",
+        target_project_id="judgment-brain",
+        target_project_root=str(target_root),
+        task_id="mf-sub-cross-project",
+        parent_task_id="parent-cross-project",
+        worker_role="mf_sub",
+        fence_token="fence-cross-project",
+    )
+
+    assert accepted.project_id == "aming-claw"
+    assert accepted.target_project_id == "judgment-brain"
 
 
 def _pb001_contexts(
