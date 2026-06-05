@@ -766,11 +766,66 @@ def _is_mf_subagent_read_receipt_event(event: dict[str, Any]) -> bool:
     )
 
 
+def _container_has_marker_key(value: Any, marker_keys: set[str], *, depth: int = 0) -> bool:
+    if depth > 5:
+        return False
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if _normalize_token(key) in marker_keys:
+                return True
+            if _container_has_marker_key(child, marker_keys, depth=depth + 1):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _container_has_marker_key(child, marker_keys, depth=depth + 1)
+            for child in value
+        )
+    return False
+
+
+def _is_observer_planning_or_dispatch_event(event: dict[str, Any]) -> bool:
+    marker = _event_marker(event)
+    marker_fragments = (
+        "route_context",
+        "route_action",
+        "route_token_gate",
+        "route_gate",
+        "pre_mutation",
+        "mf_subagent_dispatch",
+        "bounded_implementation_worker_dispatch",
+        "dispatch_gate",
+        "startup_intent",
+        "observer_runtime_text",
+    )
+    if any(fragment in marker for fragment in marker_fragments):
+        return True
+    planning_keys = {
+        "route_context",
+        "route_prompt_bundle",
+        "prompt_alert_bundle",
+        "visible_injection_manifest",
+        "route_action_gate",
+        "route_action_precheck",
+        "route_token_gate",
+        "mf_subagent_dispatch_gate",
+        "bounded_implementation_worker_dispatch",
+        "dispatch_evidence",
+        "mf_subagent_startup_intent",
+        "startup_intent",
+    }
+    return any(
+        _container_has_marker_key(_mapping(event.get(key)), planning_keys)
+        for key in ("payload", "verification", "artifact_refs")
+    )
+
+
 def _is_counted_mf_subagent_evidence_event(event: dict[str, Any]) -> bool:
     if _is_mf_subagent_read_receipt_event(event):
         return False
     marker = _event_marker(event)
     if "progress" in marker:
+        return False
+    if _is_observer_planning_or_dispatch_event(event):
         return False
     evidence_markers = (
         "startup",

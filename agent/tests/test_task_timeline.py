@@ -357,6 +357,26 @@ def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", 
     }
 
 
+def _route_token_gate_event(
+    event_id=0,
+    action="task_timeline_append",
+    bug_id="BUG-ROUTE",
+    task_id="",
+):
+    gate = _route_token(action, bug_id, task_id=task_id)
+    gate.update({"decision": "route_token", "status": "accepted"})
+    return {
+        "id": event_id,
+        "event_type": f"route_token_gate.{action}",
+        "event_kind": "verification",
+        "phase": "route_gate",
+        "actor": "observer",
+        "status": "accepted",
+        "payload": {"route_token_gate": gate},
+        "verification": gate,
+    }
+
+
 def _route_waiver(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", project_id="proj"):
     scope = {"project_id": project_id, "backlog_id": bug_id}
     if task_id:
@@ -2080,6 +2100,61 @@ class TestTaskTimeline(unittest.TestCase):
             projection["read_receipt_gate"]["read_receipt_hash"],
             "sha256:read-receipt",
         )
+
+    def test_close_precheck_read_receipt_gate_ignores_route_token_dispatch_before_startup(self):
+        from agent.governance import task_timeline
+
+        route_context, route_action, dispatch, startup = _route_context_consumption_events()
+        route_context["id"] = 2005
+        route_action["id"] = 2006
+        dispatch["id"] = 2008
+        startup["id"] = 2010
+        events = [
+            route_context,
+            route_action,
+            _route_token_gate_event(event_id=2007),
+            dispatch,
+            _mf_subagent_read_receipt_event(event_id=2009),
+            startup,
+        ]
+
+        gate = task_timeline.mf_subagent_read_receipt_gate_verification(events)
+
+        self.assertTrue(gate["passed"], gate)
+        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(gate["read_receipt_event_id"], 2009)
+        self.assertEqual(gate["first_counted_evidence_event_id"], 2010)
+        self.assertEqual(gate["counted_evidence_event_ids"], [2010])
+        self.assertNotIn(2007, gate["counted_evidence_event_ids"])
+        self.assertNotIn(2008, gate["counted_evidence_event_ids"])
+
+    def test_close_precheck_read_receipt_gate_rejects_post_hoc_after_real_worker_graph_startup(self):
+        from agent.governance import task_timeline
+
+        startup = _route_context_worker_startup_event()
+        startup["id"] = 2008
+        events = [
+            {
+                "id": 2007,
+                "event_type": "mf_subagent.graph_query",
+                "event_kind": "graph_query",
+                "phase": "implementation",
+                "actor": "mf_sub",
+                "status": "passed",
+                "payload": {"graph_trace_ids": ["gqt-real-worker-query"]},
+            },
+            startup,
+            _mf_subagent_read_receipt_event(event_id=2009),
+        ]
+
+        gate = task_timeline.mf_subagent_read_receipt_gate_verification(events)
+
+        self.assertFalse(gate["passed"], gate)
+        self.assertEqual(gate["status"], "out_of_order")
+        self.assertEqual(gate["failure_reason"], "worker_read_receipt_recorded_after_counted_evidence")
+        self.assertEqual(gate["first_counted_evidence_event_id"], 2007)
+        self.assertEqual(gate["read_receipt_event_id"], 2009)
+        self.assertEqual(gate["counted_evidence_event_ids"], [2007, 2008])
 
     def test_contract_projection_marks_missing_read_receipt_stale(self):
         from agent.governance import task_timeline
