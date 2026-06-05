@@ -2500,6 +2500,153 @@ class TestTaskTimeline(unittest.TestCase):
             "mfrctx-current-attempt",
         )
 
+    def test_read_receipt_lineage_infers_parent_task_from_backlog_root(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:contract-projection-a2-backlog-root-lineage"
+        parent_task_id = "AC-MF-PROTECTED-EVIDENCE-LINEAGE-ROUTE-TOKEN-GAP-20260605"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": parent_task_id,
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+        stale_lineage = {
+            "runtime_context_id": "mfrctx-stale-a1",
+            "task_id": f"{parent_task_id}-A1",
+            "parent_task_id": parent_task_id,
+            "worker_slot_id": "mfsub-stale-a1",
+            "fence_token": "fence-stale-a1",
+        }
+        current_lineage = {
+            "runtime_context_id": "mfrctx-18ba3d772941f4a2",
+            "task_id": f"{parent_task_id}-A2",
+            "parent_task_id": parent_task_id,
+            "worker_slot_id": "mfsub-read-receipt-lineage-fallback-20260605-a2",
+            "fence_token": "fence-ac-read-receipt-lineage-fallback-20260605-a2",
+        }
+
+        stale_route_events = [
+            _add_attempt_lineage(event, **stale_lineage)
+            for event in _route_context_consumption_events()
+        ]
+        for event_id, event in zip((4100, 4101, 4102, 4104), stale_route_events):
+            event["id"] = event_id
+            event["backlog_id"] = parent_task_id
+        stale_read_receipt = _mf_subagent_read_receipt_event(
+            event_id=4103,
+            contract_hash=contract_hash,
+            identity={
+                **ROUTE_IDENTITY,
+                "runtime_context_id": stale_lineage["runtime_context_id"],
+                "task_id": stale_lineage["task_id"],
+                "worker_slot_id": stale_lineage["worker_slot_id"],
+                "fence_token": stale_lineage["fence_token"],
+            },
+        )
+        stale_read_receipt["task_id"] = stale_lineage["task_id"]
+        stale_read_receipt["backlog_id"] = parent_task_id
+
+        current_route_events = [
+            _add_attempt_lineage(event, **current_lineage)
+            for event in _route_context_consumption_events()
+        ]
+        for event_id, event in zip((4110, 4111, 4112, 4114), current_route_events):
+            event["id"] = event_id
+            event["backlog_id"] = parent_task_id
+        current_read_receipt = _mf_subagent_read_receipt_event(
+            event_id=4113,
+            contract_hash=contract_hash,
+            identity={
+                **ROUTE_IDENTITY,
+                "runtime_context_id": current_lineage["runtime_context_id"],
+                "task_id": current_lineage["task_id"],
+                "worker_slot_id": current_lineage["worker_slot_id"],
+                "fence_token": current_lineage["fence_token"],
+            },
+        )
+        current_read_receipt["task_id"] = current_lineage["task_id"]
+        current_read_receipt["backlog_id"] = parent_task_id
+        self.assertNotIn("parent_task_id", current_read_receipt["payload"])
+
+        cleanup = {
+            "id": 4115,
+            "event_kind": "route_identity_cleanup",
+            "phase": "identity_recovery",
+            "status": "accepted",
+            "backlog_id": parent_task_id,
+            "payload": {"route_identity_cleanup": ROUTE_IDENTITY},
+        }
+        current_qa = _add_attempt_lineage(
+            _route_context_qa_verification_event(),
+            **current_lineage,
+        )
+        current_qa["id"] = 4117
+        current_qa["backlog_id"] = parent_task_id
+        close_events = [
+            _add_attempt_lineage(
+                {
+                    "id": 4116,
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "accepted",
+                    "backlog_id": parent_task_id,
+                    "payload": {
+                        **ROUTE_IDENTITY,
+                        "canonical_visible_contract_text_hash": contract_hash,
+                    },
+                },
+                **current_lineage,
+            ),
+            _add_attempt_lineage(
+                {
+                    "id": 4118,
+                    "event_kind": "verification",
+                    "phase": "verification",
+                    "status": "passed",
+                    "backlog_id": parent_task_id,
+                    "payload": {**ROUTE_IDENTITY},
+                },
+                **current_lineage,
+            ),
+            _add_attempt_lineage(
+                {
+                    "id": 4119,
+                    "event_kind": "close_ready",
+                    "phase": "close",
+                    "status": "accepted",
+                    "backlog_id": parent_task_id,
+                    "payload": {**ROUTE_IDENTITY},
+                },
+                **current_lineage,
+            ),
+        ]
+        events = [
+            *stale_route_events,
+            stale_read_receipt,
+            *current_route_events[:3],
+            current_read_receipt,
+            current_route_events[3],
+            cleanup,
+            close_events[0],
+            current_qa,
+            *close_events[1:],
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        read_gate = ready["contract_projection"]["read_receipt_gate"]
+        self.assertEqual(read_gate["status"], "passed")
+        self.assertEqual(read_gate["read_receipt_event_id"], 4113)
+        self.assertEqual(read_gate["first_counted_evidence_event_id"], 4114)
+        self.assertEqual(
+            read_gate["lineage_attempt_filter"]["parent_task_id"],
+            parent_task_id,
+        )
+        self.assertIn(4103, read_gate["lineage_ignored_event_ids"])
+        self.assertNotIn(4104, read_gate["counted_evidence_event_ids"])
+        self.assertIn(4114, read_gate["counted_evidence_event_ids"])
+
     def test_mf_close_gate_requires_instantiated_contract_evidence(self):
         from agent.governance import task_timeline
 

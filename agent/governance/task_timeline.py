@@ -1549,10 +1549,15 @@ def _route_identity(value: Any) -> dict[str, str]:
 
 
 def _route_attempt_lineage(value: Any) -> dict[str, str]:
+    runtime_context_id = _first_deep_text(value, "runtime_context_id")
+    task_id = _first_deep_text(value, "task_id")
+    parent_task_id = _first_deep_text(value, "parent_task_id")
+    if not parent_task_id and runtime_context_id and task_id and isinstance(value, dict):
+        parent_task_id = str(value.get("backlog_id") or "").strip()
     lineage = {
-        "runtime_context_id": _first_deep_text(value, "runtime_context_id"),
-        "task_id": _first_deep_text(value, "task_id"),
-        "parent_task_id": _first_deep_text(value, "parent_task_id"),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
         "worker_slot_id": (
             _first_deep_text(value, "worker_slot_id")
             or _first_deep_text(value, "worker_id")
