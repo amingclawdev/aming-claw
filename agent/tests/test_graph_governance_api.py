@@ -133,6 +133,38 @@ def _route_token(
     }
 
 
+def _finish_gate_evidence(
+    *,
+    fence_token: str,
+    worktree_path: str,
+    branch_ref: str,
+    head_commit: str,
+    nested_key: str = "startup_evidence",
+) -> dict:
+    return {
+        nested_key: {
+            "schema_version": "mf_subagent_startup_gate.v1",
+            "gate_kind": "mf_subagent.startup",
+            "status": "passed",
+            "ok": True,
+            "allowed": True,
+            "bounded": True,
+            "started": True,
+            "startup_complete": True,
+            "actual_startup_recorded": True,
+            "worker_role": "mf_sub",
+            "worker_id": "codex-subagent-api",
+            "fence_token": fence_token,
+            "actual_cwd": worktree_path,
+            "actual_git_root": worktree_path,
+            "worktree_path": worktree_path,
+            "branch_ref": branch_ref,
+            "head_commit": head_commit,
+        },
+        "read_receipt_hash": f"sha256:read-{fence_token}",
+    }
+
+
 def _bare_handler():
     handler = object.__new__(server.GovernanceHandler)
     handler.path = "/api/health"
@@ -2031,6 +2063,12 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
                 "fence_token": "fence-finish-current",
                 "agent_id": "codex-subagent-1",
                 "now_iso": "2026-05-17T07:31:00Z",
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-finish-current",
+                    worktree_path="/tmp/nonexistent-finish-task",
+                    branch_ref="refs/heads/codex/finish-task",
+                    head_commit="head-finish",
+                ),
             },
         )
     )
@@ -2081,6 +2119,13 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn, worker_status)
                 "fence_token": f"fence-finish-mf-sub-{suffix}",
                 "head_commit": f"head-finish-mf-sub-{suffix}",
                 "agent_id": "codex-subagent-mf-sub",
+                "evidence": _finish_gate_evidence(
+                    fence_token=f"fence-finish-mf-sub-{suffix}",
+                    worktree_path=f"/tmp/nonexistent-finish-mf-sub-task-{suffix}",
+                    branch_ref=f"refs/heads/codex/finish-mf-sub-task-{suffix}",
+                    head_commit=f"head-finish-mf-sub-{suffix}",
+                    nested_key="bounded_startup_evidence",
+                ),
             },
         )
     )
@@ -2453,6 +2498,13 @@ def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_
                     "checkpoint_id": "ckpt-finish-diff-bad",
                     "fence_token": "fence-finish-diff",
                     "head_commit": head,
+                    "evidence": _finish_gate_evidence(
+                        fence_token="fence-finish-diff",
+                        worktree_path=str(repo),
+                        branch_ref="refs/heads/codex/finish-diff-task",
+                        head_commit=head,
+                        nested_key="mf_subagent_startup_gate",
+                    ),
                 },
             )
         )
@@ -2469,6 +2521,13 @@ def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_
                 "checkpoint_id": "ckpt-finish-diff",
                 "fence_token": "fence-finish-diff",
                 "head_commit": head,
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-finish-diff",
+                    worktree_path=str(repo),
+                    branch_ref="refs/heads/codex/finish-diff-task",
+                    head_commit=head,
+                    nested_key="mf_subagent_startup_gate",
+                ),
             },
         )
     )
@@ -2525,6 +2584,12 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
                 "checkpoint_id": "ckpt-mf-sub",
                 "fence_token": "fence-mf-sub",
                 "head_commit": "head",
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-mf-sub",
+                    worktree_path="/tmp/nonexistent-mf-sub-queue-task",
+                    branch_ref="refs/heads/codex/mf-sub-queue-task",
+                    head_commit="head",
+                ),
             },
         )
     )

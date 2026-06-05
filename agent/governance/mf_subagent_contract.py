@@ -2515,6 +2515,15 @@ def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     )
     if direct:
         return direct
+    evidence = _mapping(payload.get("evidence"), field_name="evidence")
+    nested = _mapping(
+        evidence.get("bounded_startup_evidence")
+        or evidence.get("startup_evidence")
+        or evidence.get("mf_subagent_startup_gate"),
+        field_name="evidence.startup_evidence",
+    )
+    if nested:
+        return nested
     for key in ("startup_timeline_event", "generated_startup_timeline_event"):
         event = _mapping(payload.get(key), field_name=key)
         if not event:

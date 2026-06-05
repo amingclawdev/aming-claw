@@ -2198,6 +2198,42 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["close_ready"] is True
 
 
+@pytest.mark.parametrize(
+    "nested_key",
+    ["startup_evidence", "bounded_startup_evidence", "mf_subagent_startup_gate"],
+)
+def test_finish_gate_accepts_nested_startup_evidence_object(nested_key: str) -> None:
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": f"ckpt-finish-{nested_key}",
+            "fence_token": "fence-2",
+            "summary": "Ready.",
+            "evidence": {
+                nested_key: _finish_startup_evidence(),
+                "read_receipt_hash": "sha256:read-finish",
+            },
+        },
+        context=_context(),
+    )
+
+    assert gate["startup_evidence"]["schema_version"] == "mf_subagent_startup_gate.v1"
+    assert gate["read_receipt_hash"] == "sha256:read-finish"
+    assert gate["receipt_gate"]["startup_present"] is True
+    assert gate["close_ready"] is True
+
+
 def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> None:
     base_payload = {
         "project_id": "aming-claw",
@@ -2226,6 +2262,37 @@ def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> No
     with pytest.raises(MfSubagentContractError, match="mf_subagent_read_receipt"):
         validate_mf_subagent_finish_gate(
             {**base_payload, "mf_subagent_startup_gate": _finish_startup_evidence()},
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_nested_startup_intent_only_evidence() -> None:
+    with pytest.raises(MfSubagentContractError, match="mf_subagent_startup"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-startup-intent",
+                "fence_token": "fence-2",
+                "summary": "Ready.",
+                "evidence": {
+                    "startup_evidence": _finish_startup_evidence(
+                        schema_version="mf_subagent_startup_intent.v1",
+                        intent_kind="mf_subagent.startup_intent",
+                    ),
+                    "read_receipt_hash": "sha256:read-finish",
+                },
+            },
             context=_context(),
         )
 
