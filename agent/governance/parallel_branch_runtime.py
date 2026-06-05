@@ -2337,9 +2337,11 @@ def record_mf_subagent_startup(
         or context.worker_id
         or ""
     ).strip()
+    explicit_actual_host_worker_id = str(
+        payload.get("actual_host_worker_id") or payload.get("host_worker_id") or ""
+    ).strip()
     actual_host_worker_id = str(
-        payload.get("actual_host_worker_id")
-        or payload.get("host_worker_id")
+        explicit_actual_host_worker_id
         or reported_worker_id
         or ""
     ).strip()
@@ -2401,14 +2403,28 @@ def record_mf_subagent_startup(
     ).strip()
     startup_source = str(payload.get("startup_source") or "host_created_mf_sub_worker")
     startup_source_normalized = startup_source.lower().replace("-", "_")
+    session_token_surrogate = str(token_evidence["session_token_surrogate"] or "")
     host_adapter_startup = bool(
-        token_evidence["session_token_surrogate"]
+        session_token_surrogate
         and (
             "host_adapter" in startup_source_normalized
-            or str(token_evidence["session_token_surrogate"]).startswith("host-adapter:")
+            or "multi_agent" in startup_source_normalized
+            or "spawn_agent" in startup_source_normalized
+            or session_token_surrogate.startswith("host-adapter:")
+            or session_token_surrogate.startswith("codex_desktop_multi_agent_v1:")
+            or session_token_surrogate.startswith("multi_agent_v1:")
+            or (host_startup_id and host_startup_id.startswith("multi_agent_v1.spawn_agent:"))
             or payload.get("host_adapter_startup") is True
         )
     )
+    if (
+        host_adapter_startup
+        and agent_id
+        and allocation_owner
+        and agent_id != allocation_owner
+        and not explicit_actual_host_worker_id
+    ):
+        actual_host_worker_id = agent_id
 
     missing: list[str] = []
     for field, value in (

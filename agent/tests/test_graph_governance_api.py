@@ -37,6 +37,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_MERGE_FAILED,
     STATE_WORKTREE_READY,
     get_branch_context,
+    runtime_context_id_for_branch_context,
     upsert_batch_merge_runtime,
     upsert_branch_context,
     upsert_merge_queue_items,
@@ -1955,26 +1956,27 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn, worker_status)
 def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_path):
     worktree = tmp_path / "worker-startup"
     worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        batch_id="PB-api-startup",
+        task_id="startup-mf-sub-task",
+        root_task_id="startup-parent",
+        stage_task_id="startup-mf-sub-task",
+        backlog_id="FEAT-STARTUP-GATE",
+        branch_ref="refs/heads/codex/startup-mf-sub-task",
+        status="worktree_ready",
+        worker_id="startup-worker",
+        agent_id="startup-agent",
+        fence_token="fence-startup-mf-sub",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        head_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mergeq-api-startup",
+    )
     upsert_branch_context(
         conn,
-        BranchTaskRuntimeContext(
-            project_id=PID,
-            batch_id="PB-api-startup",
-            task_id="startup-mf-sub-task",
-            root_task_id="startup-parent",
-            stage_task_id="startup-mf-sub-task",
-            backlog_id="FEAT-STARTUP-GATE",
-            branch_ref="refs/heads/codex/startup-mf-sub-task",
-            status="worktree_ready",
-            worker_id="startup-worker",
-            agent_id="startup-agent",
-            fence_token="fence-startup-mf-sub",
-            worktree_path=str(worktree),
-            base_commit="base-startup",
-            head_commit="base-startup",
-            target_head_commit="target-startup",
-            merge_queue_id="mergeq-api-startup",
-        ),
+        runtime_context,
         now_iso="2026-06-03T07:30:00Z",
     )
 
@@ -1989,6 +1991,9 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "worker_role": "mf_sub",
                 "worker_id": "startup-worker",
                 "agent_id": "startup-agent",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
                 "session_token_surrogate": "host-session:019-startup",
                 "fence_token": "fence-startup-mf-sub",
                 "actual_cwd": str(worktree),
@@ -2022,6 +2027,157 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
     assert started["timeline_event_recorded"]["event_kind"] == "mf_subagent_startup"
     assert len(events) == 1
     assert events[0]["payload"]["mf_subagent_startup_gate"]["worker_role"] == "mf_sub"
+
+
+def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allocation(
+    conn, tmp_path
+):
+    worktree = tmp_path / "worker-host-startup"
+    worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        batch_id="PB-api-host-startup",
+        task_id="host-startup-mf-sub-task",
+        root_task_id="host-startup-parent",
+        stage_task_id="host-startup-mf-sub-task",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        branch_ref="refs/heads/codex/host-startup-mf-sub-task",
+        status="worktree_ready",
+        worker_id="host-startup-worker-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        worker_slot_id="host-startup-worker-slot",
+        fence_token="fence-host-startup-mf-sub",
+        worktree_path=str(worktree),
+        base_commit="base-host-startup",
+        head_commit="base-host-startup",
+        target_head_commit="target-host-startup",
+        merge_queue_id="mergeq-api-host-startup",
+    )
+    upsert_branch_context(
+        conn,
+        runtime_context,
+        now_iso="2026-06-05T04:30:00Z",
+    )
+
+    started = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "host-startup-mf-sub-task",
+                "parent_task_id": "host-startup-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "host-startup-worker-slot",
+                "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "host_startup_id": (
+                    "multi_agent_v1.spawn_agent:"
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "session_token_surrogate": (
+                    "codex_desktop_multi_agent_v1:"
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "startup_source": "codex_desktop_multi_agent_v1.spawn_agent",
+                "fence_token": "fence-host-startup-mf-sub",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/host-startup-mf-sub-task",
+                "head_commit": "head-host-startup",
+                "base_commit": "base-host-startup",
+                "target_head_commit": "target-host-startup",
+                "merge_queue_id": "mergeq-api-host-startup",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                "route_id": "route-host-startup",
+                "route_context_hash": "sha256:route-host-startup",
+                "prompt_contract_id": "rprompt-host-startup",
+                "prompt_contract_hash": "sha256:prompt-host-startup",
+                "visible_injection_manifest_hash": "sha256:visible-host-startup",
+                "observer_command_id": "cmd-host-startup",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    assert started["startup_gate"]["allocation_owner"] == "observer-allocation-owner"
+    assert (
+        started["startup_gate"]["actual_host_worker_id"]
+        == "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+    )
+    assert started["startup_gate"]["agent_id_match_mode"] == (
+        "host_adapter_startup_token_surrogate"
+    )
+    assert started["startup_gate"]["host_adapter_startup_token_accepted"] is True
+
+
+def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
+    conn, tmp_path
+):
+    worktree = tmp_path / "worker-host-startup-mismatch"
+    worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="host-startup-mismatch-task",
+        root_task_id="host-startup-parent",
+        stage_task_id="host-startup-mismatch-task",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        branch_ref="refs/heads/codex/host-startup-mismatch-task",
+        status="worktree_ready",
+        worker_id="host-startup-worker-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        worker_slot_id="host-startup-worker-slot",
+        fence_token="fence-host-startup-mismatch",
+        worktree_path=str(worktree),
+        base_commit="base-host-startup",
+        target_head_commit="target-host-startup",
+        merge_queue_id="mergeq-api-host-startup",
+    )
+    upsert_branch_context(
+        conn,
+        runtime_context,
+    )
+
+    blocked = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "host-startup-mismatch-task",
+                "parent_task_id": "host-startup-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "host-startup-worker-slot",
+                "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "session_token_surrogate": "plain-host-session",
+                "fence_token": "fence-host-startup-mismatch",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/host-startup-mismatch-task",
+                "head_commit": "head-host-startup",
+                "base_commit": "base-host-startup",
+                "target_head_commit": "target-host-startup",
+                "merge_queue_id": "mergeq-api-host-startup",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                "route_id": "route-host-startup",
+                "route_context_hash": "sha256:route-host-startup",
+                "prompt_contract_id": "rprompt-host-startup",
+                "prompt_contract_hash": "sha256:prompt-host-startup",
+                "visible_injection_manifest_hash": "sha256:visible-host-startup",
+                "observer_command_id": "cmd-host-startup",
+            },
+        )
+    )
+
+    assert blocked["ok"] is False
+    assert blocked["blocker_id"] == "agent_id_mismatch"
 
 
 def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tmp_path):
