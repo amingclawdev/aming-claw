@@ -2171,6 +2171,47 @@ def _startup_branch_name(value: str) -> str:
     return text[len(prefix):] if text.startswith(prefix) else text
 
 
+def _startup_identity_text(value: str) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _startup_host_identity_has_allowed_prefix(value: str) -> bool:
+    text = _startup_identity_text(value)
+    return bool(
+        text
+        and text.startswith(
+            (
+                "host_adapter:",
+                "codex_desktop_multi_agent_v1:",
+                "multi_agent_v1:",
+                "multi_agent_v1.spawn_agent:",
+                "codex_cli_thread:",
+                "codex_cli_exec:",
+                "codex_cli_host_adapter:",
+                "codex_exec:",
+                "codex_exec_pid:",
+            )
+        )
+    )
+
+
+def _startup_host_adapter_identity(
+    *,
+    startup_source: str,
+    session_token_surrogate: str,
+    host_startup_id: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    _ = (startup_source, payload)
+    identity_present = bool(session_token_surrogate or host_startup_id)
+    if not identity_present:
+        return False
+    return any(
+        _startup_host_identity_has_allowed_prefix(value)
+        for value in (session_token_surrogate, host_startup_id)
+    )
+
+
 def _startup_token_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     session_token = str(payload.get("session_token") or "").strip()
     surrogate = str(
@@ -2402,20 +2443,12 @@ def record_mf_subagent_startup(
         or ""
     ).strip()
     startup_source = str(payload.get("startup_source") or "host_created_mf_sub_worker")
-    startup_source_normalized = startup_source.lower().replace("-", "_")
     session_token_surrogate = str(token_evidence["session_token_surrogate"] or "")
-    host_adapter_startup = bool(
-        session_token_surrogate
-        and (
-            "host_adapter" in startup_source_normalized
-            or "multi_agent" in startup_source_normalized
-            or "spawn_agent" in startup_source_normalized
-            or session_token_surrogate.startswith("host-adapter:")
-            or session_token_surrogate.startswith("codex_desktop_multi_agent_v1:")
-            or session_token_surrogate.startswith("multi_agent_v1:")
-            or (host_startup_id and host_startup_id.startswith("multi_agent_v1.spawn_agent:"))
-            or payload.get("host_adapter_startup") is True
-        )
+    host_adapter_startup = _startup_host_adapter_identity(
+        startup_source=startup_source,
+        session_token_surrogate=session_token_surrogate,
+        host_startup_id=host_startup_id,
+        payload=payload,
     )
     if (
         host_adapter_startup
@@ -2456,8 +2489,9 @@ def record_mf_subagent_startup(
     if not (
         token_evidence["session_token_hash"]
         or token_evidence["session_token_surrogate"]
+        or (host_adapter_startup and host_startup_id)
     ):
-        missing.append("session_token_or_surrogate")
+        missing.append("session_token_surrogate_or_host_startup_id")
     if missing:
         return _startup_blocker(
             blocker_id="no_truthful_bounded_mf_sub_startup_surface_available",
