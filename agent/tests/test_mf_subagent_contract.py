@@ -212,6 +212,8 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
             "route_id": "route-1",
             "route_context_hash": "sha256:route",
             "prompt_contract_id": "rprompt-1",
+            "prompt_contract_hash": "sha256:prompt-1",
+            "route_token_ref": "rtok-worker-visible",
             "visible_injection_manifest_hash": "sha256:visible",
             "raw_private_context": "do not expose",
             "hidden_context": "do not expose",
@@ -243,6 +245,29 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
     assert view["contract"]["service_routes"]["finish_gate"].endswith(
         "/parallel-branches/finish-gate"
     )
+    append_policy = view["contract"]["protected_timeline_append"]
+    assert append_policy["protected_action"] == "task_timeline_append"
+    assert "implementation" in append_policy["protected_event_kinds"]
+    assert append_policy["route_token"]["preferred"] is True
+    assert append_policy["route_token"]["route_token_ref"] == "rtok-worker-visible"
+    assert append_policy["route_token"]["route_identity"]["raw_private_context_exposed"] is False
+    waiver_path = append_policy["task_scoped_route_waiver"]
+    assert waiver_path["must_be_accepted"] is True
+    assert waiver_path["scope"] == {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-CONTRACT-RUNTIME-SERVICE-SHARED-CONTEXT-20260603",
+        "task_id": "task-runtime-contract",
+        "runtime_context_id": view["runtime_context_id"],
+        "fence_token": "fence-runtime",
+    }
+    assert waiver_path["accepted_waiver_template"]["scope"] == {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-CONTRACT-RUNTIME-SERVICE-SHARED-CONTEXT-20260603",
+        "task_id": "task-runtime-contract",
+    }
+    assert waiver_path["accepted_waiver_template"]["route_context_hash"] == "sha256:route"
+    assert waiver_path["accepted_waiver_template"]["prompt_contract_id"] == "rprompt-1"
+    assert waiver_path["accepted_waiver_template"]["timeline_evidence_required"] is True
     assert view["agent_task_contract"]["schema_version"] == AGENT_TASK_CONTRACT_SCHEMA_VERSION
     assert view["agent_task_contract"]["source_of_truth"] == "Contract/Revision/Event"
     assert view["agent_task_contract"]["observer_owner"] == OBSERVER_COORDINATOR_ROLE

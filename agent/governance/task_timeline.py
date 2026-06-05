@@ -129,6 +129,18 @@ MF_ROUTE_IDENTITY_FIELDS = (
     "prompt_contract_id",
 )
 MF_ROUTE_OPTIONAL_IDENTITY_FIELDS = ("prompt_contract_hash",)
+MF_ROUTE_ATTEMPT_LINEAGE_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_slot_id",
+    "fence_token",
+)
+MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+)
 MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS = (
     "route_context",
     "route_action_precheck",
@@ -871,18 +883,74 @@ def _read_receipt_gate_route_identity(event: dict[str, Any]) -> dict[str, str]:
     return identity
 
 
+def _read_receipt_gate_attempt_lineage(event: dict[str, Any]) -> dict[str, str]:
+    return _route_attempt_lineage(event)
+
+
 def _read_receipt_lineage_filter_from_route_gate(
     route_context_gate: dict[str, Any] | None,
 ) -> dict[str, str]:
-    cleanup = _mapping(_mapping(route_context_gate).get("route_identity_cleanup"))
-    if not cleanup.get("applied"):
+    gate = _mapping(route_context_gate)
+    cleanup = _mapping(gate.get("route_identity_cleanup"))
+    attempt = _mapping(_mapping(gate.get("attempt_lineage")).get("lineage"))
+    if not any(
+        str(attempt.get(field) or "").strip()
+        for field in MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS
+    ):
+        attempt = {}
+    if not cleanup.get("applied") and not attempt:
         return {}
-    identity = _mapping(cleanup.get("route_identity"))
-    return {
+    if cleanup.get("applied"):
+        identity_source = cleanup.get("route_identity")
+    else:
+        identity_source = gate.get("route_identity")
+    identity = _mapping(identity_source)
+    lineage_filter = {
         field: str(identity.get(field) or "").strip()
         for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
         if str(identity.get(field) or "").strip()
     }
+    lineage_filter.update({
+        field: str(attempt.get(field) or "").strip()
+        for field in MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS
+        if str(attempt.get(field) or "").strip()
+    })
+    return lineage_filter
+
+
+def _read_receipt_filter_route_identity(
+    lineage_filter: dict[str, str],
+) -> dict[str, str]:
+    return {
+        field: str(lineage_filter.get(field) or "").strip()
+        for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+        if str(lineage_filter.get(field) or "").strip()
+    }
+
+
+def _read_receipt_filter_attempt_lineage(
+    lineage_filter: dict[str, str],
+) -> dict[str, str]:
+    return {
+        field: str(lineage_filter.get(field) or "").strip()
+        for field in MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS
+        if str(lineage_filter.get(field) or "").strip()
+    }
+
+
+def _attempt_lineage_matches_filter(
+    lineage: dict[str, str],
+    filter_lineage: dict[str, str],
+) -> bool:
+    if not filter_lineage:
+        return True
+    if not lineage:
+        return False
+    return all(
+        lineage.get(field, "") == expected
+        for field, expected in filter_lineage.items()
+        if expected
+    )
 
 
 def mf_subagent_read_receipt_gate_verification(
@@ -892,6 +960,8 @@ def mf_subagent_read_receipt_gate_verification(
 ) -> dict[str, Any]:
     rows = [event for event in (events or []) if isinstance(event, dict)]
     lineage_filter = _mapping(route_identity_filter)
+    identity_filter = _read_receipt_filter_route_identity(lineage_filter)
+    attempt_lineage_filter = _read_receipt_filter_attempt_lineage(lineage_filter)
     read_receipts: list[tuple[int, int, dict[str, Any]]] = []
     counted: list[tuple[int, int, dict[str, Any]]] = []
     lineage_ignored: list[dict[str, Any]] = []
@@ -902,7 +972,7 @@ def mf_subagent_read_receipt_gate_verification(
         counted_evidence_event = _is_counted_mf_subagent_evidence_event(event)
         if not read_receipt_event and not counted_evidence_event:
             continue
-        if lineage_filter:
+        if identity_filter:
             identity = _read_receipt_gate_route_identity(event)
             if not identity:
                 lineage_ignored.append(
@@ -912,7 +982,7 @@ def mf_subagent_read_receipt_gate_verification(
                     )
                 )
                 continue
-            if not _route_identity_matches_filter(identity, lineage_filter):
+            if not _route_identity_matches_filter(identity, identity_filter):
                 lineage_ignored.append(
                     _read_receipt_gate_event_ref(
                         event,
@@ -920,6 +990,28 @@ def mf_subagent_read_receipt_gate_verification(
                     )
                 )
                 continue
+        if attempt_lineage_filter:
+            attempt_lineage = _read_receipt_gate_attempt_lineage(event)
+            if not attempt_lineage:
+                lineage_ignored.append(
+                    _read_receipt_gate_event_ref(
+                        event,
+                        reason="missing_attempt_lineage_for_current_route",
+                    )
+                )
+                continue
+            if not _attempt_lineage_matches_filter(
+                attempt_lineage,
+                attempt_lineage_filter,
+            ):
+                lineage_ignored.append(
+                    _read_receipt_gate_event_ref(
+                        event,
+                        reason="superseded_attempt_lineage",
+                    )
+                )
+                continue
+        if lineage_filter:
             lineage_matched.append(_read_receipt_gate_event_ref(event))
         if read_receipt_event:
             read_receipts.append((order, index, event))
@@ -984,6 +1076,8 @@ def mf_subagent_read_receipt_gate_verification(
         else [],
         "lineage_filter_applied": bool(lineage_filter),
         "lineage_route_identity": lineage_filter,
+        "lineage_identity_filter": identity_filter,
+        "lineage_attempt_filter": attempt_lineage_filter,
         "lineage_matched_event_ids": [
             item.get("id") for item in lineage_matched if item.get("id") is not None
         ],
@@ -1454,6 +1548,24 @@ def _route_identity(value: Any) -> dict[str, str]:
     return identity if all(identity.values()) else {}
 
 
+def _route_attempt_lineage(value: Any) -> dict[str, str]:
+    lineage = {
+        "runtime_context_id": _first_deep_text(value, "runtime_context_id"),
+        "task_id": _first_deep_text(value, "task_id"),
+        "parent_task_id": _first_deep_text(value, "parent_task_id"),
+        "worker_slot_id": (
+            _first_deep_text(value, "worker_slot_id")
+            or _first_deep_text(value, "worker_id")
+        ),
+        "fence_token": _first_deep_text(value, "fence_token"),
+    }
+    return {
+        field: token
+        for field, token in lineage.items()
+        if field in MF_ROUTE_ATTEMPT_LINEAGE_FIELDS and token
+    }
+
+
 def _route_identity_key(identity: dict[str, str]) -> tuple[str, ...]:
     return tuple(identity.get(field, "") for field in MF_ROUTE_IDENTITY_FIELDS)
 
@@ -1790,6 +1902,7 @@ def mf_route_context_gate_verification(
     cleanup_event: dict[str, Any] = {}
     cleanup_identity: dict[str, str] = {}
     accepted_startup_lineages: list[dict[str, Any]] = []
+    attempt_lineage_candidates: list[dict[str, Any]] = []
 
     for raw_event in rows:
         event = _mapping(raw_event)
@@ -1814,7 +1927,7 @@ def mf_route_context_gate_verification(
             })
     superseded_event_count = 0
 
-    for raw_event in rows:
+    for index, raw_event in enumerate(rows):
         event = _mapping(raw_event)
         if not event:
             continue
@@ -1901,6 +2014,14 @@ def mf_route_context_gate_verification(
             "phase": event.get("phase"),
             "status": event.get("status") or event.get("decision"),
         }
+        attempt_lineage = _route_attempt_lineage(event)
+        if attempt_lineage and categories.intersection(MF_ROUTE_WORKER_REQUIREMENTS):
+            attempt_lineage_candidates.append({
+                "_order": _event_numeric_id(event) or index + 1,
+                "event": event_ref,
+                "categories": sorted(categories),
+                "lineage": attempt_lineage,
+            })
         for category in categories:
             if category in present:
                 present[category].append(event_ref)
@@ -1935,6 +2056,19 @@ def mf_route_context_gate_verification(
         }
         if len(prompt_hashes) == 1:
             route_identity["prompt_contract_hash"] = next(iter(prompt_hashes))
+    current_attempt_lineage: dict[str, Any] = {}
+    if attempt_lineage_candidates:
+        selected_attempt = max(
+            attempt_lineage_candidates,
+            key=lambda item: int(item.get("_order") or 0),
+        )
+        current_attempt_lineage = {
+            key: value for key, value in selected_attempt.items() if key != "_order"
+        }
+    public_attempt_lineage_candidates = [
+        {key: value for key, value in candidate.items() if key != "_order"}
+        for candidate in attempt_lineage_candidates
+    ]
     return {
         "schema_version": MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION,
         "passed": passed,
@@ -1952,6 +2086,8 @@ def mf_route_context_gate_verification(
             "route_identity": cleanup_identity,
             "superseded_event_count": superseded_event_count,
         },
+        "attempt_lineage": current_attempt_lineage,
+        "attempt_lineage_candidates": public_attempt_lineage_candidates,
         "accepted_startup_lineages": accepted_startup_lineages,
         "evidence_events": {
             req_id: present[req_id] for req_id in required_requirement_ids

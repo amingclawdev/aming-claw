@@ -890,6 +890,69 @@ def build_mf_subagent_runtime_contract_view(
             "raw_prompt_as_runtime_source": False,
             "append_only_revisions": True,
         },
+        "protected_timeline_append": {
+            "schema_version": "mf_subagent_protected_timeline_append.v1",
+            "protected_action": "task_timeline_append",
+            "protected_event_kinds": [
+                "implementation",
+                "verification",
+                "close_ready",
+                "checkpoint",
+                "review_ready",
+            ],
+            "route_token": {
+                "preferred": True,
+                "route_token_ref": route_identity_safe.get("route_token_ref", ""),
+                "required_fields": list(_ROUTE_TOKEN_REQUIRED_FIELDS),
+                "allowed_action": "task_timeline_append",
+                "route_identity": route_identity_safe,
+            },
+            "task_scoped_route_waiver": {
+                "usable_when": (
+                    "route token is unavailable and matching bounded dispatch, startup, "
+                    "and independent verification timeline refs exist"
+                ),
+                "must_be_accepted": True,
+                "allowed_action": "task_timeline_append",
+                "required_fields": [
+                    "route_waiver.accepted",
+                    "route_waiver.waiver_type",
+                    "route_waiver.reason",
+                    "route_waiver.route_context_hash",
+                    "route_waiver.prompt_contract_id",
+                    "route_waiver.caller_role",
+                    "route_waiver.scope.project_id",
+                    "route_waiver.scope.backlog_id",
+                    "route_waiver.scope.task_id",
+                    "route_waiver.timeline_evidence",
+                    "route_waiver.allowed_action",
+                ],
+                "scope": {
+                    "project_id": context.governance_project_id or context.project_id,
+                    "backlog_id": context.backlog_id,
+                    "task_id": context.task_id,
+                    "runtime_context_id": runtime_context_id,
+                    "fence_token": context.fence_token,
+                },
+                "accepted_waiver_template": {
+                    "accepted": True,
+                    "waiver_type": "manual_fix",
+                    "manual_fix": True,
+                    "allowed_action": "task_timeline_append",
+                    "caller_role": MF_SUB_ROLE,
+                    "reason": "Task-scoped protected append after bounded worker evidence.",
+                    "route_context_hash": route_identity_safe.get("route_context_hash", ""),
+                    "prompt_contract_id": route_identity_safe.get("prompt_contract_id", ""),
+                    "prompt_contract_hash": route_identity_safe.get("prompt_contract_hash", ""),
+                    "scope": {
+                        "project_id": context.governance_project_id or context.project_id,
+                        "backlog_id": context.backlog_id,
+                        "task_id": context.task_id,
+                    },
+                    "timeline_evidence_required": True,
+                },
+            },
+        },
     }
 
     view: dict[str, Any] = {
