@@ -17743,6 +17743,69 @@ def _timeline_route_waiver_consumption_bootstrap_allowed(
     )
 
 
+def _timeline_route_waiver_ordered_worker_lineage_allowed(
+    events: list[dict[str, Any]],
+    body: dict,
+    event: dict,
+    route_context_gate: dict,
+    missing_requirement_ids: list[str],
+) -> bool:
+    waiver = _route_waiver_payload(body)
+    if not _route_waiver_is_manual_fix(waiver):
+        return False
+    if _timeline_event_blocked_evidence_markers(event):
+        return False
+
+    from . import task_timeline
+
+    candidate = _timeline_event_route_consumption_candidate(body, event)
+    summary = task_timeline.route_context_consumption_event_summary(candidate)
+    if not summary.get("passed"):
+        return False
+    supplied_categories = {
+        str(item)
+        for item in summary.get("categories", [])
+        if str(item)
+    }
+    missing = {str(item) for item in missing_requirement_ids if str(item)}
+    if "bounded_implementation_worker_dispatch" not in supplied_categories:
+        return False
+    if "bounded_implementation_worker_dispatch" not in missing:
+        return False
+
+    present = _route_gate_present_requirement_ids(route_context_gate)
+    if "mf_subagent_startup" not in present:
+        return False
+
+    event_identity = summary.get("route_identity")
+    expected_identity = route_context_gate.get("route_identity")
+    if not isinstance(event_identity, Mapping) or not event_identity:
+        return False
+    if not isinstance(expected_identity, Mapping) or not expected_identity:
+        return False
+    if _route_identity_mismatch_fields(
+        expected_identity,
+        event_identity,
+        require_required_fields=True,
+    ):
+        return False
+
+    lineage_filter = task_timeline.read_receipt_lineage_filter_from_route_gate(
+        route_context_gate
+    )
+    if not lineage_filter:
+        lineage_filter = _route_identity_public_summary(expected_identity)
+    read_receipt_gate = task_timeline.mf_subagent_read_receipt_gate_verification(
+        events,
+        route_identity_filter=lineage_filter,
+    )
+    return bool(
+        read_receipt_gate.get("required")
+        and read_receipt_gate.get("passed")
+        and read_receipt_gate.get("read_receipt_precedes_counted_evidence")
+    )
+
+
 def _route_gate_present_requirement_ids(route_context_gate: Mapping[str, Any]) -> set[str]:
     return {
         str(item)
@@ -17826,28 +17889,31 @@ def _timeline_route_waiver_block_for_high_risk(
         }
 
     scoped_task_id = str(body.get("task_id") or "").strip()
+    scoped_events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=scoped_task_id,
+        limit=1000,
+    )
     route_context_gate = task_timeline.mf_route_context_gate_verification(
-        task_timeline.list_events(
-            conn,
-            project_id,
-            backlog_id=backlog_id,
-            task_id=scoped_task_id,
-            limit=1000,
-        ),
+        scoped_events,
         contract=contract,
     )
+    selected_events = scoped_events
     if (
         scoped_task_id
         and route_context_gate.get("required")
         and not route_context_gate.get("passed")
     ):
+        backlog_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
         backlog_route_context_gate = task_timeline.mf_route_context_gate_verification(
-            task_timeline.list_events(
-                conn,
-                project_id,
-                backlog_id=backlog_id,
-                limit=1000,
-            ),
+            backlog_events,
             contract=contract,
         )
         if backlog_route_context_gate.get("required"):
@@ -17855,6 +17921,8 @@ def _timeline_route_waiver_block_for_high_risk(
                 route_context_gate,
                 backlog_route_context_gate,
             )
+            if route_context_gate is backlog_route_context_gate:
+                selected_events = backlog_events
     if not route_context_gate.get("required"):
         return {}
     identity_mismatch = _route_waiver_identity_mismatch(
@@ -17870,21 +17938,40 @@ def _timeline_route_waiver_block_for_high_risk(
     ]
     if (
         not identity_mismatch
-        and _timeline_route_waiver_consumption_bootstrap_allowed(
-            body,
-            event,
-            route_context_gate,
-            missing_requirement_ids,
+        and (
+            _timeline_route_waiver_consumption_bootstrap_allowed(
+                body,
+                event,
+                route_context_gate,
+                missing_requirement_ids,
+            )
+            or _timeline_route_waiver_ordered_worker_lineage_allowed(
+                selected_events,
+                body,
+                event,
+                route_context_gate,
+                missing_requirement_ids,
+            )
         )
     ):
         return {}
 
+    present_requirement_ids = route_context_gate.get("present_requirement_ids", [])
+    has_startup = "mf_subagent_startup" in {
+        str(item) for item in present_requirement_ids if str(item)
+    }
     reason = (
         "route_waiver route identity does not match existing bounded worker "
         "route-context evidence"
         if identity_mismatch
-        else "generic route_waiver cannot append protected mf_parallel evidence "
-        "before bounded worker route-context consumption exists"
+        else (
+            "generic route_waiver cannot append protected mf_parallel evidence "
+            "before an accepted route token issuer or ordered read-receipt/startup "
+            "lineage exists"
+            if has_startup
+            else "generic route_waiver cannot append protected mf_parallel evidence "
+            "before bounded worker route-context consumption exists"
+        )
     )
     return route_token_required_failure_details(
         action="task_timeline_append",
@@ -17928,6 +18015,7 @@ def _timeline_route_waiver_block_for_high_risk(
             "missing_requirement_ids": route_context_gate.get(
                 "missing_requirement_ids", []
             ),
+            "present_requirement_ids": present_requirement_ids,
         },
     )
 

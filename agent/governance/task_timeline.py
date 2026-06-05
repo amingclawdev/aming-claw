@@ -918,6 +918,12 @@ def _read_receipt_lineage_filter_from_route_gate(
     return lineage_filter
 
 
+def read_receipt_lineage_filter_from_route_gate(
+    route_context_gate: dict[str, Any] | None,
+) -> dict[str, str]:
+    return _read_receipt_lineage_filter_from_route_gate(route_context_gate)
+
+
 def _read_receipt_filter_route_identity(
     lineage_filter: dict[str, str],
 ) -> dict[str, str]:

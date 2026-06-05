@@ -811,6 +811,163 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("mf_subagent_startup", gate["present_requirement_ids"])
         self.assertEqual(gate["missing_requirement_ids"], ["independent_verification_lane"])
 
+    def test_mf_parallel_route_waiver_bootstraps_dispatch_after_read_receipt_startup_lineage(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-DISPATCH-READ-STARTUP"
+        worker_task_id = "worker-task-read-startup"
+        contract = self._insert_router_backlog(bug_id)
+        read_receipt = _mf_subagent_read_receipt_event(identity=ROUTE_IDENTITY)
+        startup_event = _route_context_worker_startup_event()
+        for event in (read_receipt, startup_event):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=worker_task_id,
+                event_type=event.get("event_type") or event.get("event_kind"),
+                phase=event.get("phase", ""),
+                event_kind=event.get("event_kind", ""),
+                status=event.get("status", ""),
+                payload=event.get("payload") or {},
+                verification=event.get("verification") or {},
+            )
+        self.conn.commit()
+
+        dispatch_result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    **_route_context_worker_dispatch_event(),
+                    "route_waiver": self._route_waiver_for_existing_identity(
+                        bug_id,
+                        task_id=worker_task_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(dispatch_result["route_token_gate"]["decision"], "route_waiver")
+        self.assertEqual(dispatch_result["event_kind"], "mf_subagent_dispatch")
+        gate = task_timeline.mf_route_context_gate_verification(
+            task_timeline.list_events(
+                self.conn,
+                "proj",
+                backlog_id=bug_id,
+                task_id=worker_task_id,
+            ),
+            contract=contract,
+        )
+        self.assertIn(
+            "bounded_implementation_worker_dispatch",
+            gate["present_requirement_ids"],
+        )
+        self.assertIn("mf_subagent_startup", gate["present_requirement_ids"])
+
+    def test_mf_parallel_route_waiver_rejects_dispatch_when_read_receipt_lineage_missing(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-DISPATCH-NO-READ"
+        worker_task_id = "worker-task-no-read"
+        self._insert_router_backlog(bug_id)
+        startup_event = _route_context_worker_startup_event()
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=worker_task_id,
+            event_type=startup_event["event_type"],
+            phase=startup_event["phase"],
+            event_kind=startup_event["event_kind"],
+            status=startup_event["status"],
+            payload=startup_event["payload"],
+        )
+        self.conn.commit()
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": bug_id,
+                        "task_id": worker_task_id,
+                        **_route_context_worker_dispatch_event(),
+                        "route_waiver": self._route_waiver_for_existing_identity(
+                            bug_id,
+                            task_id=worker_task_id,
+                        ),
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        self.assertIn("ordered read-receipt/startup lineage", str(raised.exception))
+        self.assertIn(
+            "mf_subagent_startup",
+            raised.exception.details["present_requirement_ids"],
+        )
+        self.assertIn(
+            "bounded_implementation_worker_dispatch",
+            raised.exception.details["missing_requirement_ids"],
+        )
+
+    def test_mf_parallel_route_waiver_rejects_dispatch_when_waiver_identity_mismatches_lineage(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-DISPATCH-WAIVER-MISMATCH"
+        worker_task_id = "worker-task-waiver-mismatch"
+        self._insert_router_backlog(bug_id)
+        read_receipt = _mf_subagent_read_receipt_event(identity=ROUTE_IDENTITY)
+        startup_event = _route_context_worker_startup_event()
+        for event in (read_receipt, startup_event):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=worker_task_id,
+                event_type=event.get("event_type") or event.get("event_kind"),
+                phase=event.get("phase", ""),
+                event_kind=event.get("event_kind", ""),
+                status=event.get("status", ""),
+                payload=event.get("payload") or {},
+                verification=event.get("verification") or {},
+            )
+        self.conn.commit()
+        waiver = self._route_waiver_for_existing_identity(
+            bug_id,
+            task_id=worker_task_id,
+        )
+        waiver["route_context_hash"] = "sha256:mismatched-route-waiver"
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": bug_id,
+                        "task_id": worker_task_id,
+                        **_route_context_worker_dispatch_event(),
+                        "route_waiver": waiver,
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        self.assertEqual(
+            raised.exception.details["route_identity_mismatch_fields"],
+            ["route_context_hash"],
+        )
+        self.assertIn("route identity does not match", str(raised.exception))
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ? AND event_kind = ?",
+            (bug_id, "mf_subagent_dispatch"),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
     def test_mf_parallel_task_scoped_route_waiver_bootstraps_qa_lane_from_backlog_route_context(self):
         from agent.governance import server, task_timeline
 
