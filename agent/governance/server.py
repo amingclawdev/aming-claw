@@ -17529,6 +17529,75 @@ def _route_waiver_identity_mismatch(
     return mismatched
 
 
+def _route_identity_public_summary(value: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    summary: dict[str, str] = {}
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        text = str(value.get(field) or "").strip()
+        if text:
+            summary[field] = text
+    return summary
+
+
+def _backlog_close_route_waiver_identity_block(
+    route_gate: Mapping[str, Any],
+    timeline_gate: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    if str(route_gate.get("decision") or "") != "route_waiver":
+        return {}
+    route_context_gate = timeline_gate.get("route_context_gate")
+    if not isinstance(route_context_gate, Mapping):
+        return {}
+    expected_identity = route_context_gate.get("route_identity")
+    if not isinstance(expected_identity, Mapping) or not expected_identity:
+        return {}
+
+    waiver = _route_waiver_payload(dict(body) if isinstance(body, Mapping) else {})
+    supplied_identity: dict[str, Any] = {**dict(waiver)}
+    for field in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+        if not supplied_identity.get(field) and route_gate.get(field):
+            supplied_identity[field] = route_gate.get(field)
+
+    mismatched = _route_identity_mismatch_fields(
+        expected_identity,
+        supplied_identity,
+    )
+    mismatched = [
+        field
+        for field in mismatched
+        if field in {"route_context_hash", "prompt_contract_id"}
+    ]
+    if not mismatched:
+        return {}
+
+    return {
+        "route_identity_mismatch_fields": mismatched,
+        "expected_route_identity": _route_identity_public_summary(expected_identity),
+        "supplied_route_identity": _route_identity_public_summary(supplied_identity),
+        "selected_route_identity_source": (
+            "mf_close_timeline_gate.route_context_gate.route_identity"
+        ),
+        "route_identity_recovery": {
+            "classification": "stale_or_mixed_route_evidence",
+            "cleanup_event_kind": "route_identity_cleanup",
+            "guidance": (
+                "Record a route_identity_cleanup/route_identity_supersede timeline "
+                "event for stale or mixed route evidence, or retry backlog_close "
+                "with a route_waiver matching the selected close timeline route "
+                "identity."
+            ),
+        },
+    }
+
+
 _TIMELINE_ROUTE_WAIVER_BOOTSTRAP_WORKER_REQUIREMENTS = {
     "bounded_implementation_worker_dispatch",
     "mf_subagent_startup",
@@ -21311,6 +21380,31 @@ def handle_backlog_close(ctx: RequestContext):
             action="backlog_close",
             backlog_id=bug_id,
         )
+        timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
+        identity_block = _backlog_close_route_waiver_identity_block(
+            route_gate,
+            timeline_gate,
+            body,
+        )
+        if identity_block:
+            from .mf_subagent_contract import route_token_required_failure_details
+
+            raise GovernanceError(
+                "route_token_required",
+                (
+                    "route_waiver route identity does not match selected "
+                    "MF close timeline route-context evidence"
+                ),
+                422,
+                route_token_required_failure_details(
+                    action="backlog_close",
+                    reason=(
+                        "route_waiver route identity does not match selected "
+                        "MF close timeline route-context evidence"
+                    ),
+                    extra=identity_block,
+                ),
+            )
         _record_route_token_gate_event(
             conn,
             pid,
@@ -21318,7 +21412,6 @@ def handle_backlog_close(ctx: RequestContext):
             backlog_id=bug_id,
             commit_sha=commit_sha,
         )
-        timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
         close_impact_check = _build_backlog_close_impact_check(conn, pid, body)
 
         # Determine chain_stage based on prior status

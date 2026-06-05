@@ -97,6 +97,10 @@ def _route_context_consumption_events():
                     **identity,
                     "worker_id": "mf-sub-test",
                     "fence_token": "fence-test",
+                    "actual_cwd": "/repo/.worktrees/mf-sub-test",
+                    "actual_git_root": "/repo/.worktrees/mf-sub-test",
+                    "branch": "refs/heads/codex/mf-sub-test",
+                    "head_commit": "head-test",
                 }
             },
         },
@@ -509,6 +513,70 @@ def test_mf_close_instantiated_contract_evidence_passes(_mock_subprocess, _mock_
         "dashboard_e2e",
         "unit_tests",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("route_context_hash", "sha256:wrong-close-route-context"),
+        ("prompt_contract_id", "rprompt-wrong-close-contract"),
+    ],
+)
+@patch("agent.governance.server.subprocess.run")
+def test_mf_close_rejects_route_waiver_identity_mismatch_before_status_update(
+    _mock_subprocess,
+    _mock_db,
+    _mock_audit,
+    field,
+    wrong_value,
+):
+    """A stale close waiver cannot override the route identity selected by timeline evidence."""
+    from agent.governance.errors import GovernanceError
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    _mock_db.execute.return_value.fetchone.return_value = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "priority": "P1",
+        "target_files": '["agent/governance/server.py"]',
+        "mf_type": "observer_hotfix",
+        "bypass_policy_json": "{}",
+        "chain_stage": "",
+        "chain_trigger_json": "{}",
+    }
+    events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "passed"},
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        *_route_context_consumption_events(),
+    ]
+    ctx = _make_ctx(commit="abc123")
+    ctx.body["route_waiver"][field] = wrong_value
+
+    with patch("agent.governance.task_timeline.list_events", return_value=events):
+        with pytest.raises(GovernanceError) as exc_info:
+            handle_backlog_close(ctx)
+
+    assert exc_info.value.code == "route_token_required"
+    assert exc_info.value.status == 422
+    assert exc_info.value.details["route_identity_mismatch_fields"] == [field]
+    assert (
+        exc_info.value.details["expected_route_identity"][field]
+        == _valid_route_token()[field]
+    )
+    assert exc_info.value.details["supplied_route_identity"][field] == wrong_value
+    assert (
+        exc_info.value.details["selected_route_identity_source"]
+        == "mf_close_timeline_gate.route_context_gate.route_identity"
+    )
+    executed_sql = [
+        str(call.args[0])
+        for call in _mock_db.execute.call_args_list
+        if call.args
+    ]
+    assert not any("UPDATE backlog_bugs" in sql for sql in executed_sql)
+    _mock_db.commit.assert_not_called()
 
 
 @patch("agent.governance.server.subprocess.run")
