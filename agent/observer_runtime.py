@@ -78,6 +78,7 @@ ONE_HOP_REQUIRED_BACKENDS = {
     BACKEND_CLAUDE_CLI,
     BACKEND_DOCKER_LIVE_AI,
 }
+WORKER_LAUNCH_BACKENDS = ONE_HOP_REQUIRED_BACKENDS
 OBSERVER_POLL_TIMELINE_ROUTE_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -408,6 +409,56 @@ def _observer_poll_base_result(request: ObserverPollRequest) -> dict[str, Any]:
     }
 
 
+def _observer_poll_terminal_blocker(
+    *,
+    request: ObserverPollRequest,
+    observer_command_id: str,
+    backlog_id: str,
+    route_identity: Mapping[str, Any],
+    observer_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    invocation = (
+        observer_result.get("invocation")
+        or observer_result.get("invocation_request")
+        or {}
+    )
+    invocation = invocation if isinstance(invocation, Mapping) else {}
+    blocker_id = str(
+        observer_result.get("divergence_reason")
+        or invocation.get("blocker_id")
+        or invocation.get("auth_status")
+        or observer_result.get("status")
+        or "observer_command_terminal_blocker"
+    )
+    return {
+        "schema_version": "observer_command_terminal_blocker.v1",
+        "ok": False,
+        "status": "blocked",
+        "terminal_dispatch_blocker": True,
+        "blocker_id": blocker_id,
+        "observer_command_id": observer_command_id,
+        "backlog_id": backlog_id,
+        "route_id": str(route_identity.get("route_id") or ""),
+        "route_context_hash": str(route_identity.get("route_context_hash") or ""),
+        "prompt_contract_id": str(route_identity.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(route_identity.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            route_identity.get("visible_injection_manifest_hash") or ""
+        ),
+        "backend_mode": request.backend_mode,
+        "auth_status": str(invocation.get("auth_status") or "blocked"),
+        "startup_recorded": False,
+        "read_receipt_recorded": False,
+        "command_projection_status": "failed",
+        "canonical_contract_state": "blocked",
+        "failure_evidence_appended": True,
+        "reason": (
+            "observer command reached a terminal blocker before startup/read receipt "
+            "could become close-satisfying evidence"
+        ),
+    }
+
+
 def build_observer_poll_plan(
     request: ObserverPollRequest,
     *,
@@ -505,6 +556,26 @@ def build_observer_poll_plan(
     )
     if not result["ok"]:
         result["missing"] = observer_result.get("missing") or []
+        if execute and observer_result.get("status") == "blocked":
+            terminal_blocker = _observer_poll_terminal_blocker(
+                request=request,
+                observer_command_id=command_id,
+                backlog_id=backlog_id,
+                route_identity=route_identity,
+                observer_result=observer_result,
+            )
+            result["terminal_dispatch_blocker"] = True
+            result["terminal_contract_projection"] = {
+                "schema_version": "observer_command_terminal_projection.v1",
+                "passed": False,
+                "canonical_contract_state": "blocked",
+                "command_projection_status": "failed",
+                "divergence_reason": terminal_blocker["blocker_id"],
+                "observer_command_id": command_id,
+            }
+            result["failure_evidence"] = terminal_blocker
+            result["command_projection_status"] = "failed"
+            result["canonical_contract_state"] = "blocked"
     return result
 
 
@@ -1417,18 +1488,28 @@ def _dogfood_host_adapter_startup_evidence(
             length=24,
         )
     )
+    observer_command_id = request.task_id or context.task_id
     read_receipt_material = {
         "schema_version": "mf_subagent_read_receipt.v1",
+        "observer_command_id": observer_command_id,
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
+        "route_id": request.route_id,
         "worker_id": worker_slot_id,
         "worker_slot_id": worker_slot_id,
         "actual_host_worker_id": actual_host_worker_id,
         "agent_id": agent_id,
         "fence_token": context.fence_token,
+        "branch": branch,
+        "branch_ref": context.branch_ref,
+        "worktree": str(Path(str(worker_worktree)).expanduser().resolve()),
+        "worktree_path": str(Path(str(worker_worktree)).expanduser().resolve()),
+        "owned_files": list(owned_files),
         "launch_text_hash": launch_text_hash,
         "route_context_hash": request.route.route_context_hash,
         "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
     }
     read_receipt_hash = "sha256:" + hashlib.sha256(
         json.dumps(read_receipt_material, sort_keys=True).encode("utf-8")
@@ -1499,6 +1580,7 @@ def _dogfood_host_adapter_startup_evidence(
         "prompt_contract_id": request.route.prompt_contract_id,
         "prompt_contract_hash": request.route.prompt_contract_hash,
         "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "observer_command_id": observer_command_id,
         "session_token_hash": "",
         "session_token_surrogate": session_token_surrogate,
         "session_token_evidence_type": "surrogate",
@@ -1508,6 +1590,7 @@ def _dogfood_host_adapter_startup_evidence(
         "startup_timing": "prepared_before_implementation_wait",
         "launch_text_hash": launch_text_hash,
         "read_receipt_hash": read_receipt_hash,
+        "read_receipt": read_receipt_material,
     }
     startup_recording = {
         **startup_gate,
@@ -1579,6 +1662,7 @@ def _dogfood_cli_timeout_blocker(
         owned_files=owned_files,
     )
     no_output = bool(invocation.get("output_empty", True))
+    observer_command_id = request.task_id or context.task_id
     blocker_id = (
         f"{request.backend_mode}_timeout_no_output_no_finish"
         if no_output
@@ -1588,7 +1672,7 @@ def _dogfood_cli_timeout_blocker(
         "schema_version": "observer_command_terminal_projection.v1",
         "passed": False,
         "canonical_contract_state": "blocked",
-        "command_projection_status": "blocked",
+        "command_projection_status": "failed",
         "divergence_reason": blocker_id,
         "terminal_evidence_refs": [
             "mf_subagent_startup_prepared",
@@ -1603,16 +1687,34 @@ def _dogfood_cli_timeout_blocker(
             "prompt_contract_hash": request.route.prompt_contract_hash,
             "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
         },
+        "observer_command_id": observer_command_id,
     }
     return {
         "schema_version": "observer_cli_timeout_blocker.v1",
         "blocker_id": blocker_id,
         "terminal_blocker": True,
+        "terminal_dispatch_blocker": True,
         "status": "blocked",
+        "observer_command_id": observer_command_id,
+        "task_id": context.task_id,
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "branch": context.branch_ref,
+        "worktree": str(Path(str(worker_worktree)).expanduser().resolve()),
+        "fence_token": context.fence_token,
+        "owned_files": list(owned_files),
         "backend_mode": request.backend_mode,
         "timeout_sec": request.timeout_sec,
         "no_output": no_output,
         "no_finish_evidence": True,
+        "startup_recorded": False,
+        "read_receipt_recorded": False,
+        "read_receipt_recorded_before_implementation_wait": False,
+        "failure_evidence_appended": True,
+        "command_projection_status": "failed",
         "calls_models": False,
         "auth_status": invocation.get("auth_status", "cli_timeout"),
         "worktree_diff_scope": diff_scope,
@@ -1620,6 +1722,45 @@ def _dogfood_cli_timeout_blocker(
         "reason": (
             "CLI backend timed out before finish evidence; worker startup/read receipt "
             "evidence was prepared for append, and the isolated worktree diff scope is reported."
+        ),
+    }
+
+
+def _dogfood_launch_backend_blocker(
+    request: DogfoodObserverPlanRequest,
+    *,
+    context: Any,
+    owned_files: Sequence[str],
+) -> dict[str, Any]:
+    if request.backend_mode in WORKER_LAUNCH_BACKENDS:
+        return {}
+    observer_command_id = request.task_id or context.task_id
+    return {
+        "schema_version": "observer_worker_launch_backend_blocker.v1",
+        "ok": False,
+        "status": "blocked",
+        "terminal_dispatch_blocker": True,
+        "blocker_id": "missing_cli_launch_backend",
+        "observer_command_id": observer_command_id,
+        "task_id": context.task_id,
+        "backlog_id": request.backlog_id,
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "backend_mode": request.backend_mode,
+        "configured_launch_backends": sorted(WORKER_LAUNCH_BACKENDS),
+        "branch": context.branch_ref,
+        "worktree": context.worktree_path,
+        "fence_token": context.fence_token,
+        "owned_files": list(owned_files),
+        "actual_startup_recorded": False,
+        "read_receipt_recorded": False,
+        "worktree_materialization_allowed": False,
+        "reason": (
+            "execute requested for a bounded mf_sub worker but no CLI/executor "
+            "launch backend is configured for host worker startup"
         ),
     }
 
@@ -2304,6 +2445,39 @@ def build_dogfood_observer_run_plan(
             or "observer runtime text preparation failed"
         )
         return result
+
+    if execute:
+        launch_backend_blocker = _dogfood_launch_backend_blocker(
+            request,
+            context=context,
+            owned_files=owned_files,
+        )
+        if launch_backend_blocker:
+            result["status"] = "blocked"
+            result["launch_backend_blocker"] = launch_backend_blocker
+            result["terminal_dispatch_blocker"] = True
+            result["terminal_contract_projection"] = {
+                "schema_version": "observer_command_terminal_projection.v1",
+                "passed": False,
+                "canonical_contract_state": "blocked",
+                "command_projection_status": "failed",
+                "divergence_reason": launch_backend_blocker["blocker_id"],
+                "observer_command_id": launch_backend_blocker["observer_command_id"],
+            }
+            result["dispatch_gate_validation"] = {
+                **result["dispatch_gate_validation"],
+                "allowed": False,
+                "status": "blocked",
+                "terminal_dispatch_blocker": True,
+                "blocker_id": launch_backend_blocker["blocker_id"],
+            }
+            result["worktree_materialization"] = {
+                "status": "skipped_terminal_dispatch_blocker",
+                "materialized": False,
+                "worktree": context.worktree_path,
+            }
+            result["error"] = launch_backend_blocker["reason"]
+            return result
 
     worker_worktree = Path(context.worktree_path).expanduser().resolve()
     worker_status = _git_worktree_status(worker_worktree, main_worktree=main_worktree)

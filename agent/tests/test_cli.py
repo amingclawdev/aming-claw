@@ -417,6 +417,111 @@ def test_observer_poll_can_complete_planned_command(monkeypatch):
     assert completed_payload["uses_task_create"] is False
 
 
+def test_observer_poll_fails_terminal_blocked_command(monkeypatch):
+    calls = []
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
+        if url.endswith("/observer-commands/claim"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": _observer_poll_command("cmd-terminal"),
+                "empty": False,
+            }
+        if url.endswith("/observer-commands/cmd-terminal/fail"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": {"command_id": "cmd-terminal", "status": "failed"},
+            }
+        if url.endswith("/api/task/aming-claw/timeline"):
+            return 200, {"ok": True, "event_id": len(_observer_poll_timeline_calls(calls))}
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    def fake_build_plan(request, *, execute=False):
+        assert execute is True
+        return {
+            "ok": False,
+            "schema_version": "observer_poll.v1",
+            "status": "blocked",
+            "observer_command_id": "cmd-terminal",
+            "backlog_id": "AC-ROUTE-HANDOFF",
+            "execute": True,
+            "calls_models": False,
+            "terminal_dispatch_blocker": True,
+            "command_projection_status": "failed",
+            "canonical_contract_state": "blocked",
+            "route_identity": {
+                "route_id": "route-20260603-test",
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-test",
+                "visible_injection_manifest_hash": "sha256:visible",
+            },
+            "terminal_contract_projection": {
+                "command_projection_status": "failed",
+                "canonical_contract_state": "blocked",
+                "divergence_reason": "codex_cli_timeout_no_finish",
+            },
+            "failure_evidence": {
+                "blocker_id": "codex_cli_timeout_no_finish",
+                "observer_command_id": "cmd-terminal",
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-test",
+                "visible_injection_manifest_hash": "sha256:visible",
+            },
+        }
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    monkeypatch.setattr("agent.observer_runtime.build_observer_poll_plan", fake_build_plan)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--command-id",
+            "cmd-terminal",
+            "--execute",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "blocked"
+    assert payload["failure"]["ok"] is True
+    assert payload["failure"]["observer_command_id"] == "cmd-terminal"
+    assert payload["loop"]["stop_reason"] == "command_failed"
+    fail_payload = next(
+        call[2] for call in calls if call[1].endswith("/observer-commands/cmd-terminal/fail")
+    )
+    assert fail_payload["result"]["command_projection_status"] == "failed"
+    assert fail_payload["result"]["terminal_dispatch_blocker"] is True
+    timeline_calls = _observer_poll_timeline_calls(calls)
+    assert [call[2]["event_type"] for call in timeline_calls] == [
+        "observer_poll_claimed",
+        "observer_poll_planned",
+        "observer_poll_failed",
+    ]
+    assert timeline_calls[-1][2]["payload"]["observer_command_id"] == "cmd-terminal"
+
+
 def test_observer_poll_reports_empty_queue(monkeypatch):
     def fake_http(method, url, payload=None, *, timeout=30.0):
         if url.endswith("/observer-sessions/obs-1/heartbeat"):
@@ -1061,6 +1166,38 @@ def test_observer_dogfood_materialize_worktree_creates_real_git_worktree_without
     assert status["differs_from_main_worktree"] is True
 
 
+def test_observer_dogfood_execute_blocks_missing_cli_launch_backend_before_materialization(tmp_path):
+    runner = CliRunner()
+    repo = _init_git_repo(tmp_path)
+    commit = _git(["rev-parse", "HEAD"], repo)
+    args = _dogfood_args(
+        tmp_path,
+        main_worktree=repo,
+        workspace_root=repo,
+        worktree_root=".worktrees",
+        base_commit=commit,
+        target_head_commit=commit,
+    )
+    args = _replace_option(args, "--backend-mode", "fixture")
+
+    result = runner.invoke(
+        main,
+        args[:-1] + ["--materialize-worktree", "--execute", "--json-output"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    blocker = payload["launch_backend_blocker"]
+    assert payload["ok"] is False
+    assert payload["status"] == "blocked"
+    assert payload["terminal_dispatch_blocker"] is True
+    assert blocker["blocker_id"] == "missing_cli_launch_backend"
+    assert blocker["worktree_materialization_allowed"] is False
+    assert payload["worktree_materialization"]["status"] == "skipped_terminal_dispatch_blocker"
+    assert payload["worktree_materialization"]["materialized"] is False
+    assert not Path(payload["runtime_context"]["worktree_path"]).exists()
+
+
 def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
     tmp_path, monkeypatch
 ):
@@ -1114,7 +1251,21 @@ def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
     assert startup_gate["session_token_evidence_type"] == "surrogate"
     assert startup_gate["worker_id"] == "worker-a"
     assert not startup_gate["agent_id"].startswith("fallback_observer")
+    assert startup_gate["observer_command_id"] == DOGFOOD_BACKLOG_ID
+    assert startup_gate["route_id"]
+    assert startup_gate["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
+    assert startup_gate["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
     assert read_receipt["read_receipt_hash"].startswith("sha256:")
+    assert read_receipt["observer_command_id"] == DOGFOOD_BACKLOG_ID
+    assert read_receipt["task_id"] == DOGFOOD_BACKLOG_ID
+    assert read_receipt["route_id"] == startup_gate["route_id"]
+    assert read_receipt["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
+    assert read_receipt["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
+    assert read_receipt["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
+    assert read_receipt["branch_ref"] == startup_gate["branch_ref"]
+    assert read_receipt["worktree_path"] == startup_gate["worktree_path"]
+    assert read_receipt["fence_token"] == "fence-dogfood-test"
+    assert read_receipt["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
     assert read_receipt["prepared_before_implementation_wait"] is True
     assert read_receipt["recorded_before_implementation_wait"] is False
     assert payload["observer_run"]["startup_recording"]["recorded"] is False
@@ -1168,11 +1319,24 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
     assert payload["auth_status"] == "cli_timeout"
     assert blocker["no_output"] is True
     assert blocker["no_finish_evidence"] is True
+    assert blocker["terminal_dispatch_blocker"] is True
+    assert blocker["failure_evidence_appended"] is True
+    assert blocker["command_projection_status"] == "failed"
+    assert blocker["read_receipt_recorded_before_implementation_wait"] is False
+    assert blocker["observer_command_id"] == DOGFOOD_BACKLOG_ID
+    assert blocker["task_id"] == DOGFOOD_BACKLOG_ID
+    assert blocker["route_id"]
+    assert blocker["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
+    assert blocker["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
+    assert blocker["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
+    assert blocker["fence_token"] == "fence-dogfood-test"
+    assert blocker["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
     assert diff_scope["no_diff"] is True
     assert diff_scope["implementation_changed_files"] == []
     assert diff_scope["worktree_clean"] is True or diff_scope["dirty_files"]
     assert projection["canonical_contract_state"] == "blocked"
-    assert projection["command_projection_status"] == "blocked"
+    assert projection["command_projection_status"] == "failed"
+    assert projection["observer_command_id"] == DOGFOOD_BACKLOG_ID
     assert payload["startup_timeline_event"]["event_kind"] == "mf_subagent_startup"
     assert payload["startup_timeline_event"]["status"] == "prepared"
     assert payload["actual_startup_recorded"] is False

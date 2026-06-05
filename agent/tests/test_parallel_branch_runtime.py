@@ -29,7 +29,9 @@ from agent.governance.parallel_branch_runtime import (
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
+    append_branch_contract_revision,
     branch_context_from_chain_stage,
+    branch_runtime_context_id,
     decide_restart_recovery,
     ensure_branch_runtime_schema,
     get_branch_context,
@@ -150,6 +152,7 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
         "worker_id": "worker-startup",
         "agent_id": "agent-startup",
         "session_token": "secret-worker-session-token",
+        "runtime_context_id": branch_runtime_context_id(PROJECT_ID, "mf-sub-startup"),
         "fence_token": "fence-startup",
         "actual_cwd": worktree,
         "actual_git_root": worktree,
@@ -165,6 +168,7 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
         "prompt_contract_hash": "sha256:prompt-startup",
         "visible_injection_manifest_hash": "sha256:visible-startup",
         "observer_command_id": "cmd-startup",
+        "read_receipt_hash": "sha256:read-startup",
     }
     payload.update(overrides)
     return payload
@@ -174,24 +178,37 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup"
     worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        agent_id="agent-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
     upsert_branch_context(
         conn,
-        BranchTaskRuntimeContext(
-            project_id=PROJECT_ID,
-            task_id="mf-sub-startup",
-            root_task_id="parent-startup",
-            stage_task_id="mf-sub-startup",
-            backlog_id="BUG-STARTUP",
-            worker_id="worker-startup",
-            agent_id="agent-startup",
-            branch_ref="refs/heads/codex/mf-sub-startup",
-            status=STATE_WORKTREE_READY,
-            fence_token="fence-startup",
-            worktree_path=str(worktree),
-            base_commit="base-startup",
-            target_head_commit="target-startup",
-            merge_queue_id="mq-startup",
-        ),
+        context,
+        now_iso=NOW,
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
         now_iso=NOW,
     )
 
@@ -219,6 +236,14 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
     assert gate["observer_allocation_owner"] == "agent-startup"
     assert gate["session_token_hash"].startswith("sha256:")
     assert gate["session_token_persisted"] is False
+    assert gate["runtime_context_id"] == branch_runtime_context_id(PROJECT_ID, "mf-sub-startup")
+    assert gate["observer_command_id"] == "cmd-startup"
+    assert gate["route_id"] == "route-startup"
+    assert gate["visible_injection_manifest_hash"] == "sha256:visible-startup"
+    assert gate["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
+    assert gate["read_receipt_hash"] == "sha256:read-startup"
+    assert gate["identity_join"]["runtime_context_id_matches"] is True
+    assert gate["identity_join"]["route_identity_matches_latest_contract"] is True
     assert "secret-worker-session-token" not in str(result)
     assert result["timeline_event"]["event_kind"] == "mf_subagent_startup"
     assert result["timeline_event"]["payload"]["mf_subagent_startup_gate"] == gate
@@ -232,6 +257,60 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
         fence_token="fence-startup",
     )
     assert accepted.task_id == "mf-sub-startup"
+
+
+def test_mf_sub_startup_blocks_route_identity_mismatch_with_contract_revision(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-route-mismatch"
+    worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        agent_id="agent-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), route_context_hash="sha256:other-route"),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == "route_identity_mismatch"
+    mismatches = result["details"]["route_identity_mismatches"]
+    assert mismatches == [
+        {
+            "field": "route_context_hash",
+            "expected": "sha256:route-startup",
+            "actual": "sha256:other-route",
+        }
+    ]
 
 
 def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None:
@@ -287,6 +366,20 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
         payload=_startup_payload(str(worktree), actual_cwd=str(worktree / "subdir")),
         now_iso=NOW,
     )
+    wrong_agent = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), agent_id="other-agent"),
+        now_iso=NOW,
+    )
+    wrong_runtime_context = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), runtime_context_id="mfrctx-other"),
+        now_iso=NOW,
+    )
     missing_merge_payload = _startup_payload(str(worktree))
     missing_merge_payload.pop("merge_queue_id")
     missing_merge_queue = record_mf_subagent_startup(
@@ -317,6 +410,10 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
     assert wrong_slot["blocker_id"] == "worker_slot_id_mismatch"
     assert wrong_cwd["ok"] is False
     assert wrong_cwd["blocker_id"] == "actual_cwd_mismatch"
+    assert wrong_agent["ok"] is False
+    assert wrong_agent["blocker_id"] == "agent_id_mismatch"
+    assert wrong_runtime_context["ok"] is False
+    assert wrong_runtime_context["blocker_id"] == "runtime_context_id_mismatch"
     assert missing_merge_queue["ok"] is False
     assert missing_merge_queue["blocker_id"] == (
         "no_truthful_bounded_mf_sub_startup_surface_available"

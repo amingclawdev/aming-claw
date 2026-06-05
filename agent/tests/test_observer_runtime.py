@@ -186,6 +186,48 @@ def test_build_observer_poll_plan_rejects_non_execute_command_in_standalone_mode
     assert "execute_backlog_row" in result["error"]
 
 
+def test_build_observer_poll_plan_marks_execute_timeout_terminal(monkeypatch, tmp_path):
+    from agent.ai_invocation import AIInvocationResult
+
+    def fake_invoke_ai(request):
+        return AIInvocationResult(
+            request=request,
+            status="blocked",
+            output_text="",
+            error="fixture invocation timed out",
+            command=["fixture", "exec"],
+            returncode=124,
+            provider_backed=False,
+            calls_models=False,
+            auth_status="cli_timeout",
+        )
+
+    monkeypatch.setattr("agent.observer_runtime.invoke_ai", fake_invoke_ai)
+
+    result = build_observer_poll_plan(
+        ObserverPollRequest(
+            project_id="aming-claw",
+            observer_session_id="obs-1",
+            command=_execute_backlog_command(),
+            provider="fixture",
+            backend_mode="fixture",
+            workspace=str(tmp_path),
+            main_worktree=str(tmp_path),
+            timeout_sec=1,
+        ),
+        execute=True,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["terminal_dispatch_blocker"] is True
+    assert result["command_projection_status"] == "failed"
+    assert result["terminal_contract_projection"]["command_projection_status"] == "failed"
+    assert result["failure_evidence"]["observer_command_id"] == "cmd-route-1"
+    assert result["failure_evidence"]["read_receipt_recorded"] is False
+    assert result["failure_evidence"]["route_context_hash"] == "sha256:route"
+
+
 def test_build_observer_poll_loop_metadata_is_bounded_and_dependency_free():
     metadata = build_observer_poll_loop_metadata(
         ObserverPollLoopConfig(

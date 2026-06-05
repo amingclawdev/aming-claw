@@ -2254,6 +2254,44 @@ def _startup_blocker(
     return payload
 
 
+def _startup_route_identity(payload: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "route_id": str(payload.get("route_id") or "").strip(),
+        "route_context_hash": str(payload.get("route_context_hash") or "").strip(),
+        "prompt_contract_id": str(payload.get("prompt_contract_id") or "").strip(),
+        "prompt_contract_hash": str(payload.get("prompt_contract_hash") or "").strip(),
+        "visible_injection_manifest_hash": str(
+            payload.get("visible_injection_manifest_hash") or ""
+        ).strip(),
+    }
+
+
+def _startup_route_identity_mismatches(
+    *,
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    mismatches: list[dict[str, str]] = []
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        expected_value = str(expected.get(field) or "").strip()
+        actual_value = str(actual.get(field) or "").strip()
+        if expected_value and actual_value and expected_value != actual_value:
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": expected_value,
+                    "actual": actual_value,
+                }
+            )
+    return mismatches
+
+
 def record_mf_subagent_startup(
     conn: sqlite3.Connection,
     *,
@@ -2327,11 +2365,15 @@ def record_mf_subagent_startup(
     prompt_contract_hash = str(payload.get("prompt_contract_hash") or "").strip()
     visible_manifest = str(payload.get("visible_injection_manifest_hash") or "").strip()
     owned_files = _startup_string_list(payload.get("owned_files"))
-    runtime_context_id = str(
-        payload.get("runtime_context_id") or runtime_context_id_for_branch_context(context)
-    ).strip()
+    supplied_runtime_context_id = str(payload.get("runtime_context_id") or "").strip()
+    expected_runtime_context_id = runtime_context_id_for_branch_context(context)
+    runtime_context_id = supplied_runtime_context_id or expected_runtime_context_id
     launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
     observer_command_id = str(payload.get("observer_command_id") or "").strip()
+    read_receipt_hash = str(
+        payload.get("read_receipt_hash") or payload.get("worker_read_receipt_hash") or ""
+    ).strip()
+    read_receipt = payload.get("read_receipt") if isinstance(payload.get("read_receipt"), Mapping) else {}
     host_startup_id = str(payload.get("host_startup_id") or "").strip()
     host_session_id = str(
         payload.get("host_session_id")
@@ -2382,12 +2424,14 @@ def record_mf_subagent_startup(
         ("base_commit", base_commit),
         ("target_head_commit", target_head_commit),
         ("merge_queue_id", merge_queue_id),
+        ("runtime_context_id", supplied_runtime_context_id),
         ("route_id", route_id),
         ("route_context_hash", route_context_hash),
         ("prompt_contract_id", prompt_contract_id),
         ("prompt_contract_hash", prompt_contract_hash),
         ("visible_injection_manifest_hash", visible_manifest),
         ("owned_files", owned_files),
+        ("observer_command_id", observer_command_id),
         ("governance_project_id", governance_project_id),
         ("target_project_id", target_project_id),
     ):
@@ -2416,6 +2460,16 @@ def record_mf_subagent_startup(
             context=context,
             details={"worker_role": worker_role},
         )
+    if supplied_runtime_context_id != expected_runtime_context_id:
+        return _startup_blocker(
+            blocker_id="runtime_context_id_mismatch",
+            message="mf_subagent startup runtime_context_id must match branch runtime context",
+            context=context,
+            details={
+                "runtime_context_id": supplied_runtime_context_id,
+                "expected_runtime_context_id": expected_runtime_context_id,
+            },
+        )
     if (
         payload.get("worker_slot_id") is not None
         and (context.worker_slot_id or context.worker_id)
@@ -2435,6 +2489,20 @@ def record_mf_subagent_startup(
         agent_id_match_mode = "same_as_allocation_owner"
     elif host_adapter_startup:
         agent_id_match_mode = "host_adapter_startup_token_surrogate"
+    elif allocation_owner:
+        return _startup_blocker(
+            blocker_id="agent_id_mismatch",
+            message=(
+                "mf_subagent startup agent_id must match allocation_owner unless "
+                "a host-adapter startup token surrogate joins the worker identity"
+            ),
+            context=context,
+            details={
+                "agent_id": agent_id,
+                "expected_agent_id": allocation_owner,
+                "agent_id_match_mode": "blocked_without_host_adapter_surrogate",
+            },
+        )
     try:
         _require_current_fence(context, fence_token)
     except BranchRuntimeFenceError:
@@ -2542,6 +2610,35 @@ def record_mf_subagent_startup(
             },
         )
 
+    route_identity = _startup_route_identity(payload)
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        project_id,
+        expected_runtime_context_id,
+    )
+    expected_route_identity = (
+        latest_revision.route_identity
+        if latest_revision is not None and isinstance(latest_revision.route_identity, Mapping)
+        else {}
+    )
+    route_mismatches = _startup_route_identity_mismatches(
+        expected=expected_route_identity,
+        actual=route_identity,
+    )
+    if route_mismatches:
+        return _startup_blocker(
+            blocker_id="route_identity_mismatch",
+            message="mf_subagent startup route identity must match latest runtime contract",
+            context=context,
+            details={
+                "runtime_context_id": expected_runtime_context_id,
+                "route_identity_mismatches": route_mismatches,
+                "latest_contract_revision_id": latest_revision.revision_id
+                if latest_revision is not None
+                else "",
+            },
+        )
+
     saved = upsert_branch_context(
         conn,
         replace(
@@ -2620,8 +2717,21 @@ def record_mf_subagent_startup(
         "startup_source": startup_source,
         "startup_timing": "actual_worker_started",
         "observer_command_id": observer_command_id,
+        "read_receipt_hash": read_receipt_hash,
+        "read_receipt": dict(read_receipt),
         "host_startup_id": host_startup_id,
         "host_session_id": host_session_id,
+        "identity_join": {
+            "schema_version": "mf_subagent_startup_identity_join.v1",
+            "runtime_context_id": runtime_context_id,
+            "expected_runtime_context_id": expected_runtime_context_id,
+            "runtime_context_id_matches": runtime_context_id == expected_runtime_context_id,
+            "route_identity_matches_latest_contract": not route_mismatches,
+            "latest_contract_revision_id": latest_revision.revision_id
+            if latest_revision is not None
+            else "",
+            "agent_id_match_mode": agent_id_match_mode,
+        },
     }
     if launch_text_hash:
         gate["launch_text_hash"] = launch_text_hash

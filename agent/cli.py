@@ -575,6 +575,62 @@ def _observer_poll_completion_result(plan: dict) -> dict:
     }
 
 
+def _observer_poll_failure_result(plan: dict) -> dict:
+    route_identity = plan.get("route_identity") if isinstance(plan.get("route_identity"), dict) else {}
+    failure = (
+        plan.get("failure_evidence")
+        if isinstance(plan.get("failure_evidence"), dict)
+        else {}
+    )
+    projection = (
+        plan.get("terminal_contract_projection")
+        if isinstance(plan.get("terminal_contract_projection"), dict)
+        else {}
+    )
+    return {
+        "ok": False,
+        "status": str(plan.get("status") or "blocked"),
+        "schema_version": str(plan.get("schema_version") or ""),
+        "observer_command_id": str(plan.get("observer_command_id") or ""),
+        "backlog_id": str(plan.get("backlog_id") or ""),
+        "route_id": str(route_identity.get("route_id") or failure.get("route_id") or ""),
+        "route_context_hash": str(
+            route_identity.get("route_context_hash")
+            or failure.get("route_context_hash")
+            or ""
+        ),
+        "prompt_contract_id": str(
+            route_identity.get("prompt_contract_id")
+            or failure.get("prompt_contract_id")
+            or ""
+        ),
+        "visible_injection_manifest_hash": str(
+            route_identity.get("visible_injection_manifest_hash")
+            or failure.get("visible_injection_manifest_hash")
+            or ""
+        ),
+        "terminal_dispatch_blocker": bool(plan.get("terminal_dispatch_blocker")),
+        "blocker_id": str(failure.get("blocker_id") or projection.get("divergence_reason") or ""),
+        "command_projection_status": str(
+            projection.get("command_projection_status")
+            or plan.get("command_projection_status")
+            or "failed"
+        ),
+        "canonical_contract_state": str(
+            projection.get("canonical_contract_state")
+            or plan.get("canonical_contract_state")
+            or "blocked"
+        ),
+        "calls_models": bool(plan.get("calls_models")),
+        "execute": bool(plan.get("execute")),
+        "service_manager_required": False,
+        "executor_worker_required": False,
+        "uses_task_create": False,
+        "payload_free_reminder": True,
+        "reminder_payload_required": False,
+    }
+
+
 def _observer_poll_append_timeline(
     *,
     base_url: str,
@@ -829,6 +885,7 @@ def observer_poll(
         "observer_polls": [],
         "completions": [],
         "timeline": [],
+        "failures": [],
     }
     active_session_id = session_id
     active_session_token = session_token
@@ -1020,7 +1077,66 @@ def observer_poll(
             )
 
         if not plan.get("ok"):
-            stop_reason = "plan_rejected"
+            if command and plan.get("terminal_dispatch_blocker"):
+                failure_result = _observer_poll_failure_result(plan)
+                fail_payload = {
+                    "session_id": active_session_id,
+                    "session_token": active_session_token,
+                    "error": failure_result.get("blocker_id")
+                    or plan.get("error")
+                    or "observer command terminal blocker",
+                    "result": failure_result,
+                }
+                fail_code, fail_response = _http_json(
+                    "POST",
+                    (
+                        f"{base_url}/api/projects/{encoded_project}/observer-commands/"
+                        f"{urllib.parse.quote(str(command.get('command_id') or ''), safe='')}/fail"
+                    ),
+                    fail_payload,
+                )
+                failure = {
+                    "http_status": fail_code,
+                    "ok": bool(fail_response.get("ok")),
+                    "observer_command_id": str(
+                        (fail_response.get("command") or {}).get("command_id")
+                        or command.get("command_id")
+                        or ""
+                    ),
+                    "blocker_id": failure_result.get("blocker_id"),
+                }
+                result["failure"] = failure
+                result["failures"].append(failure)
+                if fail_code >= 400 or not fail_response.get("ok"):
+                    failure["response"] = fail_response
+                    result["error"] = "observer command failure projection failed"
+                    stop_reason = "command_fail_failed"
+                else:
+                    stop_reason = "command_failed"
+                observer_command_id = str(command.get("command_id") or "")
+                result["timeline"].append(
+                    _observer_poll_append_timeline(
+                        base_url=base_url,
+                        project_id=project_id,
+                        observer_command_id=observer_command_id,
+                        event_type="observer_poll_failed",
+                        phase="fail",
+                        status=(
+                            "failed"
+                            if fail_code < 400 and fail_response.get("ok")
+                            else "fail_projection_failed"
+                        ),
+                        payload=observer_poll_timeline_payload(
+                            observer_command_id=observer_command_id,
+                            command=command,
+                            plan=plan,
+                            result=failure_result,
+                            event="fail",
+                        ),
+                    )
+                )
+            else:
+                stop_reason = "plan_rejected"
             break
 
         if command:

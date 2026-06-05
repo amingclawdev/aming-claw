@@ -1924,6 +1924,33 @@ def _context(**overrides: object) -> BranchTaskRuntimeContext:
     return BranchTaskRuntimeContext(**fields)
 
 
+def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "started": True,
+        "startup_complete": True,
+        "actual_startup_recorded": True,
+        "worker_role": "mf_sub",
+        "worker_id": "codex-subagent-1",
+        "fence_token": "fence-2",
+        "actual_cwd": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "actual_git_root": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "worktree": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "branch": "refs/heads/codex/task-mf-sub-1",
+        "head_commit": "head456",
+        "route_context_hash": "sha256:child-route-context",
+        "prompt_contract_id": "rprompt-child",
+        "prompt_contract_hash": "sha256:child-prompt",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_build_input_carries_branch_runtime_identity() -> None:
     payload = build_mf_subagent_input(
         _context(),
@@ -2124,6 +2151,7 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
             "checkpoint_id": "ckpt-finish",
             "fence_token": "fence-2",
             "summary": "Ready.",
+            "mf_subagent_startup_gate": _finish_startup_evidence(),
             "read_receipt_hash": "sha256:read-finish",
             "gate_receipt_hash": "sha256:gate-finish",
         },
@@ -2139,9 +2167,42 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["read_receipt_hash"] == "sha256:read-finish"
     assert gate["gate_receipt_hash"] == "sha256:gate-finish"
     assert gate["receipt_gate"]["status"] == "passed"
+    assert gate["receipt_gate"]["startup_present"] is True
     assert gate["finish_precheck"]["parent_main_clean"] is True
     assert gate["finish_precheck"]["owned_file_scope_passed"] is True
     assert gate["close_ready"] is True
+
+
+def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> None:
+    base_payload = {
+        "project_id": "aming-claw",
+        "task_id": "task-mf-sub-1",
+        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "branch_ref": "refs/heads/codex/task-mf-sub-1",
+        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-1",
+        "head_commit": "head456",
+        "status": "succeeded",
+        "changed_files": ["agent/governance/mf_subagent_contract.py"],
+        "test_results": {"status": "passed", "command": "pytest -q"},
+        "checkpoint_id": "ckpt-finish",
+        "fence_token": "fence-2",
+        "summary": "Ready.",
+    }
+
+    with pytest.raises(MfSubagentContractError, match="mf_subagent_startup"):
+        validate_mf_subagent_finish_gate(
+            {**base_payload, "read_receipt_hash": "sha256:read-finish"},
+            context=_context(),
+        )
+
+    with pytest.raises(MfSubagentContractError, match="mf_subagent_read_receipt"):
+        validate_mf_subagent_finish_gate(
+            {**base_payload, "mf_subagent_startup_gate": _finish_startup_evidence()},
+            context=_context(),
+        )
 
 
 def test_finish_gate_rejects_parent_main_checkout_dirtiness() -> None:
@@ -2234,6 +2295,8 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
                     "prompt_contract_hash": "sha256:child-prompt",
                 },
             },
+            "mf_subagent_startup_gate": _finish_startup_evidence(),
+            "read_receipt_hash": "sha256:read-finish",
             "summary": "Ready.",
         },
         context=_context(),

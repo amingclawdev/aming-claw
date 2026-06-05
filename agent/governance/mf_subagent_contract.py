@@ -4198,6 +4198,18 @@ def validate_mf_subagent_finish_gate(
             ("evidence", ("gate_receipt_hash",)),
         ),
     )
+    startup_evidence = _route_startup_evidence(payload)
+    startup_present = _bounded_startup_evidence_present(startup_evidence)
+    if not startup_present:
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires actual mf_subagent_startup evidence "
+            "before close-ready"
+        )
+    if not read_receipt_hash:
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires mf_subagent_read_receipt before "
+            "close-ready"
+        )
 
     return {
         "schema_version": FINISH_GATE_SCHEMA_VERSION,
@@ -4225,6 +4237,7 @@ def validate_mf_subagent_finish_gate(
             child_route_prompt_contract=child_route_prompt_contract,
         ),
         "governed_evidence_required": governed_evidence_required,
+        "startup_evidence": startup_evidence,
         "read_receipt_hash": read_receipt_hash,
         "gate_receipt_hash": gate_receipt_hash,
         "receipt_gate": {
@@ -4234,15 +4247,8 @@ def validate_mf_subagent_finish_gate(
             ),
             "read_receipt_present": bool(read_receipt_hash),
             "gate_receipt_present": bool(gate_receipt_hash),
-            "status": (
-                "passed"
-                if read_receipt_hash
-                else (
-                    "missing"
-                    if governed_evidence_required or graph_trace_evidence.get("present")
-                    else "not_applicable"
-                )
-            ),
+            "startup_present": startup_present,
+            "status": "passed",
         },
         "graph_trace_evidence": graph_trace_evidence,
         "changed_files": normalized["changed_files"],
