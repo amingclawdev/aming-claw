@@ -21,10 +21,14 @@ IDLE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2
 STALE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 4
 CLAIMED_TO_STARTUP_TIMEOUT_SEC = STALE_AFTER_SEC
 CLAIMED_TO_STARTUP_TIMEOUT_STATUS = "claimed_to_startup_timeout"
+CLAIMED_TO_PROGRESS_TIMEOUT_SEC = STALE_AFTER_SEC
+CLAIMED_TO_PROGRESS_TIMEOUT_STATUS = "claimed_to_progress_timeout"
 NOTIFIED_UNCLAIMED_RECOVERY_THRESHOLD_SEC = HEARTBEAT_INTERVAL_SEC
 OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION = "observer_command_consumer_recovery.v1"
 OBSERVER_COMMAND_CLAIM_EVIDENCE_SCHEMA_VERSION = "observer_command_claim_evidence.v1"
 OBSERVER_COMMAND_CONTRACT_PROJECTION_SCHEMA_VERSION = "observer_command_contract_projection.v1"
+OBSERVER_COMMAND_FIRST_PROGRESS_SCHEMA_VERSION = "observer_command_first_progress_evidence.v1"
+OBSERVER_COMMAND_NO_PROGRESS_TIMEOUT_SCHEMA_VERSION = "observer_command_no_progress_timeout.v1"
 
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
@@ -44,6 +48,55 @@ TERMINAL_COMMAND_STATUSES = {
     COMMAND_STATUS_COMPLETED,
     COMMAND_STATUS_FAILED,
     COMMAND_STATUS_CANCELLED,
+}
+
+FIRST_PROGRESS_PASS_STATUSES = {
+    "accepted",
+    "ok",
+    "passed",
+    "succeeded",
+    "allow",
+    "allowed",
+    "approved",
+}
+FIRST_PROGRESS_EVENT_TOKENS = {
+    "implementation",
+    "implementation_progress",
+    "review_ready",
+    "verification",
+    "independent_verification",
+    "qa_verification",
+    "close_ready",
+    "checkpoint",
+    "checkpoint_branch_task",
+    "evidence_checkpoint",
+    "finish_gate",
+    "mf_subagent_finish_gate",
+    "route_context",
+    "route_context_consumed",
+    "route_action_precheck",
+    "precheck",
+    "graph_query",
+    "graph_trace",
+    "worktree_dirty",
+    "branch_head_advance",
+}
+FIRST_PROGRESS_BLOCKER_TOKENS = {
+    "blocker",
+    "blocked",
+    "timeout",
+    "no_progress_timeout",
+    "terminal_blocker",
+    "terminal_dispatch_blocker",
+}
+STARTUP_ONLY_EVENT_TOKENS = {
+    "mf_subagent_startup",
+    "mf_subagent_startup_gate",
+    "mf_subagent_startup_intent",
+    "mf_subagent_read_receipt",
+    "bounded_implementation_worker_dispatch",
+    "mf_subagent_dispatch",
+    "mf_subagent_dispatch_gate",
 }
 
 COMMAND_TYPE_ANALYZE_REQUIREMENTS = "analyze_requirements"
@@ -443,6 +496,7 @@ def _result_is_terminal_blocked(result: dict[str, Any]) -> bool:
         "terminal_blocker",
         "terminal_dispatch_blocker",
         "startup_surface_blocker",
+        "no_progress_timeout",
     ):
         value = result.get(key)
         if value is True:
@@ -450,6 +504,560 @@ def _result_is_terminal_blocked(result: dict[str, Any]) -> bool:
         if isinstance(value, dict) and str(value.get("status") or "").lower() == "blocked":
             return True
     return False
+
+
+def _progress_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _progress_tokens_from_text(value: Any) -> set[str]:
+    token = _progress_token(value)
+    if not token:
+        return set()
+    tokens = {token}
+    for part in token.replace(".", "_").replace(":", "_").replace("/", "_").split("_"):
+        if part:
+            tokens.add(part)
+    return tokens
+
+
+def _progress_event_tokens(value: Mapping[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for field in (
+        "event_kind",
+        "event_type",
+        "phase",
+        "schema_version",
+        "gate_kind",
+        "kind",
+        "event",
+        "blocker_id",
+    ):
+        tokens.update(_progress_tokens_from_text(value.get(field)))
+    payload = value.get("payload") if isinstance(value.get("payload"), Mapping) else {}
+    for field in ("event_kind", "event_type", "phase", "schema_version", "gate_kind", "kind"):
+        tokens.update(_progress_tokens_from_text(payload.get(field)))
+    return tokens
+
+
+def _walk_mappings(value: Any) -> Iterable[dict[str, Any]]:
+    seen: set[int] = set()
+    stack: list[Any] = [value]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, Mapping):
+            item = dict(current)
+            yield item
+            stack.extend(item.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+
+
+def _string_list_from_any(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item or "").strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _first_nested_text(value: Any, *keys: str) -> str:
+    for mapping in _walk_mappings(value):
+        for key in keys:
+            text = str(mapping.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _first_nested_int(value: Any, *keys: str) -> int:
+    for mapping in _walk_mappings(value):
+        for key in keys:
+            try:
+                raw = int(mapping.get(key) or 0)
+            except (TypeError, ValueError):
+                raw = 0
+            if raw:
+                return raw
+    return 0
+
+
+def _startup_lineage_from_result(
+    command: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    startup_source: dict[str, Any] = {}
+    for mapping in _walk_mappings(result):
+        if _actual_startup_identity_present(mapping):
+            startup_source = mapping
+            break
+    source = startup_source or result
+    actual_runtime = (
+        source.get("actual_runtime") if isinstance(source.get("actual_runtime"), Mapping) else {}
+    )
+    return {
+        "backlog_id": str(payload.get("backlog_id") or result.get("backlog_id") or ""),
+        "task_id": str(
+            source.get("task_id")
+            or result.get("task_id")
+            or payload.get("task_id")
+            or ""
+        ),
+        "parent_task_id": str(
+            source.get("parent_task_id")
+            or result.get("parent_task_id")
+            or payload.get("parent_task_id")
+            or ""
+        ),
+        "runtime_context_id": str(
+            source.get("runtime_context_id")
+            or result.get("runtime_context_id")
+            or payload.get("runtime_context_id")
+            or ""
+        ),
+        "worker_id": str(
+            source.get("worker_id")
+            or source.get("worker_slot_id")
+            or result.get("worker_id")
+            or ""
+        ),
+        "fence_token": str(
+            source.get("fence_token")
+            or source.get("worker_fence_token")
+            or source.get("actual_fence_token")
+            or result.get("fence_token")
+            or ""
+        ),
+        "worktree": str(
+            source.get("worktree")
+            or source.get("worktree_path")
+            or source.get("actual_cwd")
+            or actual_runtime.get("cwd")
+            or ""
+        ),
+        "branch": str(source.get("branch") or source.get("branch_ref") or ""),
+        "head_commit": str(
+            source.get("head_commit")
+            or source.get("branch_head")
+            or actual_runtime.get("head_commit")
+            or ""
+        ),
+        "base_commit": str(source.get("base_commit") or result.get("base_commit") or ""),
+        "attempt_num": _first_nested_int(source, "attempt_num", "attempt"),
+        "started_at": _first_nested_text(
+            source,
+            "created_at",
+            "started_at",
+            "recorded_at",
+            "startup_recorded_at",
+        ),
+        "startup_event_id": _first_nested_int(
+            source,
+            "timeline_event_id",
+            "event_id",
+            "id",
+        ),
+    }
+
+
+def _lineage_matches(value: Any, lineage: Mapping[str, Any]) -> bool:
+    checks = {
+        "task_id": str(lineage.get("task_id") or ""),
+        "parent_task_id": str(lineage.get("parent_task_id") or ""),
+        "runtime_context_id": str(lineage.get("runtime_context_id") or ""),
+        "fence_token": str(lineage.get("fence_token") or ""),
+    }
+    checks = {key: expected for key, expected in checks.items() if expected}
+    if not checks:
+        return True
+    observed_any = False
+    for mapping in _walk_mappings(value):
+        for key, expected in checks.items():
+            actual = str(mapping.get(key) or "").strip()
+            if not actual:
+                continue
+            observed_any = True
+            if actual == expected:
+                return True
+    return not observed_any
+
+
+def _mapping_has_graph_trace_progress(value: Mapping[str, Any]) -> dict[str, Any]:
+    trace_ids = _string_list_from_any(
+        value.get("trace_ids")
+        or value.get("graph_trace_ids")
+        or value.get("graph_query_trace_ids")
+    )
+    trace_id = str(value.get("trace_id") or "").strip()
+    if trace_id.startswith("gqt-"):
+        trace_ids.append(trace_id)
+    if not trace_ids:
+        return {}
+    has_task_identity = bool(
+        str(value.get("task_id") or "").strip()
+        or str(value.get("parent_task_id") or "").strip()
+    )
+    has_fence_identity = bool(
+        str(value.get("fence_token") or value.get("fence_token_hash") or "").strip()
+    )
+    if not (has_task_identity and has_fence_identity):
+        return {}
+    return {
+        "source": "result.graph_trace",
+        "kind": "graph_trace",
+        "trace_ids": sorted(set(trace_ids)),
+        "task_id": str(value.get("task_id") or ""),
+        "parent_task_id": str(value.get("parent_task_id") or ""),
+        "fence_token_present": has_fence_identity,
+    }
+
+
+def _mapping_has_worktree_progress(value: Mapping[str, Any]) -> dict[str, Any]:
+    changed = _string_list_from_any(value.get("implementation_changed_files"))
+    changed.extend(_string_list_from_any(value.get("changed_files")))
+    dirty = _string_list_from_any(value.get("dirty_files"))
+    tool_artifacts = {
+        path
+        for path in _string_list_from_any(value.get("tool_artifact_files"))
+        if path
+    }
+    implementation_changed = [
+        path
+        for path in sorted(set(changed + dirty))
+        if path and path not in tool_artifacts and not path.startswith(".aming-claw/")
+    ]
+    head_commit = str(value.get("head_commit") or "").strip()
+    base_commit = str(
+        value.get("base_commit") or value.get("target_head_commit") or ""
+    ).strip()
+    head_advanced = bool(head_commit and base_commit and head_commit != base_commit)
+    if not implementation_changed and not head_advanced:
+        return {}
+    return {
+        "source": "result.worktree",
+        "kind": "worktree_or_head_progress",
+        "implementation_changed_files": implementation_changed,
+        "head_advanced": head_advanced,
+        "head_commit": head_commit,
+        "base_commit": base_commit,
+    }
+
+
+def _mapping_has_checkpoint_or_blocker_progress(value: Mapping[str, Any]) -> dict[str, Any]:
+    tokens = _progress_event_tokens(value)
+    if tokens & FIRST_PROGRESS_BLOCKER_TOKENS:
+        return {
+            "source": "result.blocker",
+            "kind": "explicit_blocker",
+            "tokens": sorted(tokens & FIRST_PROGRESS_BLOCKER_TOKENS),
+        }
+    checkpoint_tokens = tokens & {
+        "checkpoint",
+        "checkpoint_branch_task",
+        "evidence_checkpoint",
+        "finish_gate",
+        "mf_subagent_finish_gate",
+    }
+    if checkpoint_tokens:
+        return {
+            "source": "result.checkpoint",
+            "kind": "checkpoint_or_finish_gate",
+            "tokens": sorted(checkpoint_tokens),
+        }
+    return {}
+
+
+def _timeline_event_progress_evidence(
+    event: Mapping[str, Any],
+    *,
+    lineage: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not _lineage_matches(event, lineage):
+        return {}
+    tokens = _progress_event_tokens(event)
+    if tokens & STARTUP_ONLY_EVENT_TOKENS:
+        return {}
+    blocker_tokens = tokens & FIRST_PROGRESS_BLOCKER_TOKENS
+    progress_tokens = tokens & FIRST_PROGRESS_EVENT_TOKENS
+    if not blocker_tokens and not progress_tokens:
+        return {}
+    status = str(event.get("status") or "").strip().lower()
+    if not blocker_tokens and status and status not in FIRST_PROGRESS_PASS_STATUSES:
+        return {}
+    return {
+        "source": "task_timeline",
+        "kind": str(event.get("event_kind") or event.get("event_type") or ""),
+        "event_id": int(event.get("id") or 0),
+        "status": status,
+        "tokens": sorted((blocker_tokens or progress_tokens)),
+    }
+
+
+def _result_first_progress_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    if _result_has_canonical_close_evidence(result):
+        return {
+            "source": "result.canonical_close_evidence",
+            "kind": "canonical_close_evidence",
+        }
+    for mapping in _walk_mappings(result):
+        event_progress = _timeline_event_progress_evidence(mapping, lineage={})
+        if event_progress:
+            event_progress["source"] = "result.timeline_event"
+            return event_progress
+        for checker in (
+            _mapping_has_graph_trace_progress,
+            _mapping_has_worktree_progress,
+            _mapping_has_checkpoint_or_blocker_progress,
+        ):
+            progress = checker(mapping)
+            if progress:
+                return progress
+    return {}
+
+
+def _timeline_first_progress_evidence(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+    lineage: Mapping[str, Any],
+) -> dict[str, Any]:
+    backlog_id = str(lineage.get("backlog_id") or "")
+    if not backlog_id:
+        return {}
+    try:
+        from . import task_timeline
+
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    except Exception as exc:
+        return {
+            "present": False,
+            "source": "task_timeline",
+            "error": str(exc),
+        }
+    startup_events = [
+        event
+        for event in events
+        if _lineage_matches(event, lineage)
+        and (_progress_event_tokens(event) & {"mf_subagent_startup", "mf_subagent_startup_gate"})
+    ]
+    latest_startup = max(
+        startup_events,
+        key=lambda item: int(item.get("id") or 0),
+        default=None,
+    )
+    latest_startup_id = int(latest_startup.get("id") or 0) if latest_startup else 0
+    latest_startup_created_at = str(latest_startup.get("created_at") or "") if latest_startup else ""
+    for event in events:
+        event_id = int(event.get("id") or 0)
+        if latest_startup_id and event_id <= latest_startup_id:
+            continue
+        progress = _timeline_event_progress_evidence(event, lineage=lineage)
+        if not progress:
+            continue
+        route_or_precheck = set(progress.get("tokens") or []) & {
+            "route_context",
+            "route_context_consumed",
+            "route_action_precheck",
+            "precheck",
+        }
+        if route_or_precheck and not latest_startup_id:
+            continue
+        return {
+            **progress,
+            "present": True,
+            "startup_event_id": latest_startup_id,
+            "startup_event_created_at": latest_startup_created_at,
+        }
+    return {
+        "present": False,
+        "source": "task_timeline",
+        "startup_event_id": latest_startup_id,
+        "startup_event_created_at": latest_startup_created_at,
+    }
+
+
+def _command_first_progress_evidence(
+    conn: sqlite3.Connection,
+    command: dict[str, Any],
+    *,
+    now: str,
+) -> dict[str, Any]:
+    result = _command_result(command)
+    lineage = _startup_lineage_from_result(command, result)
+    result_progress = _result_first_progress_evidence(result)
+    if result_progress:
+        return {
+            "schema_version": OBSERVER_COMMAND_FIRST_PROGRESS_SCHEMA_VERSION,
+            "present": True,
+            "generated_at": now,
+            "startup_evidence_present": _contains_actual_startup_evidence(result),
+            "startup_lineage": lineage,
+            "evidence": result_progress,
+            "excluded_as_progress": sorted(STARTUP_ONLY_EVENT_TOKENS),
+        }
+    timeline_progress = _timeline_first_progress_evidence(
+        conn,
+        project_id=str(command.get("project_id") or ""),
+        command=command,
+        lineage=lineage,
+    )
+    if timeline_progress.get("present"):
+        return {
+            "schema_version": OBSERVER_COMMAND_FIRST_PROGRESS_SCHEMA_VERSION,
+            "present": True,
+            "generated_at": now,
+            "startup_evidence_present": _contains_actual_startup_evidence(result),
+            "startup_lineage": lineage,
+            "evidence": timeline_progress,
+            "excluded_as_progress": sorted(STARTUP_ONLY_EVENT_TOKENS),
+        }
+    return {
+        "schema_version": OBSERVER_COMMAND_FIRST_PROGRESS_SCHEMA_VERSION,
+        "present": False,
+        "generated_at": now,
+        "startup_evidence_present": _contains_actual_startup_evidence(result),
+        "startup_lineage": lineage,
+        "timeline": timeline_progress,
+        "expected_sources": [
+            "accepted_graph_trace_with_task_and_fence_identity",
+            "route_or_precheck_event_after_startup",
+            "implementation_or_progress_timeline_event",
+            "fenced_worktree_dirty_diff",
+            "branch_head_advance",
+            "checkpoint_or_finish_gate",
+            "explicit_blocker",
+        ],
+        "excluded_as_progress": sorted(STARTUP_ONLY_EVENT_TOKENS),
+    }
+
+
+def _progress_watch_started_at(
+    command: dict[str, Any],
+    progress: Mapping[str, Any],
+) -> str:
+    timeline = progress.get("timeline") if isinstance(progress.get("timeline"), Mapping) else {}
+    startup_lineage = (
+        progress.get("startup_lineage")
+        if isinstance(progress.get("startup_lineage"), Mapping)
+        else {}
+    )
+    return str(
+        timeline.get("startup_event_created_at")
+        or startup_lineage.get("started_at")
+        or command.get("claimed_at")
+        or ""
+    )
+
+
+def _progress_watch_age_sec(
+    command: dict[str, Any],
+    progress: Mapping[str, Any],
+    *,
+    now: str,
+) -> float | None:
+    started_at = _parse_utc(_progress_watch_started_at(command, progress))
+    now_dt = _parse_utc(now)
+    if not started_at or not now_dt:
+        return None
+    return max(0.0, (now_dt - started_at).total_seconds())
+
+
+def _claimed_execute_takeover_timeout(
+    conn: sqlite3.Connection,
+    command: dict[str, Any] | None,
+    *,
+    now: str,
+) -> dict[str, Any]:
+    if not command:
+        return {}
+    if str(command.get("command_type") or "") != COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
+        return {}
+    if str(command.get("status") or "") not in OWNED_COMMAND_STATUSES:
+        return {}
+    if not _command_has_startup_or_blocker_evidence(command):
+        age = _command_claim_age_sec(command, now=now)
+        if age is None or age < CLAIMED_TO_STARTUP_TIMEOUT_SEC:
+            return {}
+        return {
+            "status": CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
+            "timeout_kind": "startup_timeout",
+            "age_sec": age,
+            "timeout_sec": CLAIMED_TO_STARTUP_TIMEOUT_SEC,
+        }
+    result = _command_result(command)
+    if _contains_terminal_dispatch_blocker(result) or _result_is_terminal_blocked(result):
+        return {}
+    progress = _command_first_progress_evidence(conn, command, now=now)
+    if progress.get("present"):
+        return {}
+    age = _progress_watch_age_sec(command, progress, now=now)
+    if age is None or age < CLAIMED_TO_PROGRESS_TIMEOUT_SEC:
+        return {}
+    return {
+        "schema_version": OBSERVER_COMMAND_NO_PROGRESS_TIMEOUT_SCHEMA_VERSION,
+        "status": CLAIMED_TO_PROGRESS_TIMEOUT_STATUS,
+        "timeout_kind": "no_progress_timeout",
+        "age_sec": age,
+        "timeout_sec": CLAIMED_TO_PROGRESS_TIMEOUT_SEC,
+        "progress_watchdog": progress,
+        "startup_evidence": "present",
+        "progress_evidence": "missing",
+    }
+
+
+def _record_no_progress_timeout_event(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+    timeout: Mapping[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    progress = timeout.get("progress_watchdog") if isinstance(timeout.get("progress_watchdog"), Mapping) else {}
+    lineage = (
+        progress.get("startup_lineage")
+        if isinstance(progress.get("startup_lineage"), Mapping)
+        else {}
+    )
+    try:
+        from . import task_timeline
+
+        return task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=str(payload.get("backlog_id") or lineage.get("backlog_id") or ""),
+            task_id=str(lineage.get("task_id") or payload.get("task_id") or ""),
+            attempt_num=int(lineage.get("attempt_num") or 0),
+            event_type="observer_command.no_progress_timeout",
+            phase="implementation_wait",
+            event_kind="no_progress_timeout",
+            actor="observer_command_watchdog",
+            status="blocked",
+            payload={
+                "schema_version": OBSERVER_COMMAND_NO_PROGRESS_TIMEOUT_SCHEMA_VERSION,
+                "observer_command_id": str(command.get("command_id") or ""),
+                "claimed_by_session_id": str(command.get("claimed_by_session_id") or ""),
+                "route_identity": _route_identity_from_payload(payload),
+                "timeout": dict(timeout),
+                "recorded_at": now,
+            },
+        )
+    except Exception as exc:
+        return {
+            "recorded": False,
+            "error": str(exc),
+        }
 
 
 def _command_terminal_projection_from_result(
@@ -523,6 +1131,37 @@ def _missing_startup_surface_blocker(command: dict[str, Any], *, now: str) -> di
     }
 
 
+def _missing_first_progress_blocker(
+    command: dict[str, Any],
+    *,
+    now: str,
+    progress_watchdog: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    return {
+        "blocker_id": "startup_without_first_progress_evidence",
+        "terminal_blocker": True,
+        "status": "blocked",
+        "observer_command_id": str(command.get("command_id") or ""),
+        "backlog_id": str(payload.get("backlog_id") or ""),
+        "route_id": str(payload.get("route_id") or ""),
+        "route_context_hash": str(payload.get("route_context_hash") or ""),
+        "prompt_contract_id": str(payload.get("prompt_contract_id") or ""),
+        "visible_injection_manifest_hash": str(
+            payload.get("visible_injection_manifest_hash") or ""
+        ),
+        "claimed_at": str(command.get("claimed_at") or ""),
+        "failed_at": now,
+        "progress_watchdog": dict(progress_watchdog),
+        "reason": (
+            "execute_backlog_row completion cannot treat mf_subagent_startup as "
+            "implementation progress; completion requires graph/precheck/route "
+            "progress, worktree/head changes, checkpoint/finish evidence, close "
+            "evidence, or an explicit terminal blocker"
+        ),
+    }
+
+
 def _route_identity_from_payload(payload: Mapping[str, Any] | dict[str, Any]) -> dict[str, str]:
     return {
         "route_id": str(payload.get("route_id") or ""),
@@ -590,6 +1229,8 @@ def _merge_result_with_durable_takeover(
         "canonical_route_identity",
         "superseded_route_identity",
         "terminal_evidence_refs",
+        "progress_watchdog",
+        "no_progress_timeout",
     ):
         if key not in incoming and key in existing:
             incoming[key] = existing[key]
@@ -1725,9 +2366,9 @@ def _owner_session_takeover_status(
         return "missing"
     owner_status = computed_session_status(row, now=now)
     if owner_status not in {"missing", "stale", SESSION_STATUS_CLOSED, SESSION_STATUS_REVOKED}:
-        startup_timeout = _claimed_execute_startup_timeout_status(command, now=now)
-        if startup_timeout:
-            return startup_timeout
+        takeover_timeout = _claimed_execute_takeover_timeout(conn, command, now=now)
+        if takeover_timeout:
+            return str(takeover_timeout.get("status") or "")
     return owner_status
 
 
@@ -1790,6 +2431,7 @@ def takeover_command(
         SESSION_STATUS_CLOSED,
         SESSION_STATUS_REVOKED,
         CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
+        CLAIMED_TO_PROGRESS_TIMEOUT_STATUS,
     }
     if previous_status not in takeover_allowed_statuses:
         raise ObserverCommandConflict(
@@ -1802,12 +2444,33 @@ def takeover_command(
         "reason": takeover_reason,
         "taken_over_at": timestamp,
     }
+    takeover_timeout = _claimed_execute_takeover_timeout(conn, command, now=timestamp)
     if previous_status == CLAIMED_TO_STARTUP_TIMEOUT_STATUS:
         takeover.update(
             {
                 "claimed_at": str(command.get("claimed_at") or ""),
                 "timeout_sec": CLAIMED_TO_STARTUP_TIMEOUT_SEC,
                 "startup_evidence": "missing",
+            }
+        )
+    if previous_status == CLAIMED_TO_PROGRESS_TIMEOUT_STATUS:
+        no_progress_timeout = dict(takeover_timeout)
+        timeline_event = _record_no_progress_timeout_event(
+            conn,
+            project_id=pid,
+            command=command,
+            timeout=no_progress_timeout,
+            now=timestamp,
+        )
+        no_progress_timeout["timeline_event"] = timeline_event
+        takeover.update(
+            {
+                "claimed_at": str(command.get("claimed_at") or ""),
+                "timeout_sec": CLAIMED_TO_PROGRESS_TIMEOUT_SEC,
+                "timeout_kind": "no_progress_timeout",
+                "startup_evidence": "present",
+                "progress_evidence": "missing",
+                "progress_watchdog": no_progress_timeout.get("progress_watchdog") or {},
             }
         )
     result_payload = _command_result(command)
@@ -1818,6 +2481,9 @@ def takeover_command(
         "taken_over_at": timestamp,
         "reason": takeover_reason,
     }
+    if previous_status == CLAIMED_TO_PROGRESS_TIMEOUT_STATUS:
+        result_payload["progress_watchdog"] = takeover.get("progress_watchdog") or {}
+        result_payload["no_progress_timeout"] = no_progress_timeout
 
     cursor = conn.execute(
         """UPDATE observer_command_queue
@@ -1974,6 +2640,50 @@ def complete_command(
         terminal_projection = _command_terminal_projection_from_result(command, result_payload)
         if terminal_projection:
             _attach_command_terminal_projection(result_payload, terminal_projection)
+    if (
+        str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        and _contains_actual_startup_evidence(result_payload)
+        and not _result_has_canonical_close_evidence(result_payload)
+        and not _result_is_terminal_blocked(result_payload)
+    ):
+        progress_command = dict(command)
+        progress_command["result"] = result_payload
+        progress_command["result_json"] = _json_dumps(result_payload)
+        progress_watchdog = _command_first_progress_evidence(
+            conn,
+            progress_command,
+            now=timestamp,
+        )
+        if not progress_watchdog.get("present"):
+            blocker = _missing_first_progress_blocker(
+                command,
+                now=timestamp,
+                progress_watchdog=progress_watchdog,
+            )
+            result_payload["ok"] = False
+            result_payload["progress_watchdog"] = progress_watchdog
+            result_payload["terminal_blocker"] = blocker
+            conn.execute(
+                """UPDATE observer_command_queue
+                      SET status = ?, completed_at = ?, result_json = ?, error = ?
+                    WHERE project_id = ? AND command_id = ?""",
+                (
+                    COMMAND_STATUS_FAILED,
+                    timestamp,
+                    _json_dumps(result_payload),
+                    blocker["blocker_id"],
+                    pid,
+                    command_id,
+                ),
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "project_id": pid,
+                "observer_session_id": sid,
+                "command": get_command(conn, project_id=pid, command_id=command_id),
+                "terminal_blocker": blocker,
+            }
     if (
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and _result_is_terminal_blocked(result_payload)

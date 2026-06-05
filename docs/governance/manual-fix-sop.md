@@ -316,6 +316,17 @@ branch/HEAD/fence token, or if target/main became dirty after dispatch. When
 target/main dirty files overlap the worker's owned files, the observer must
 stop the worker and preserve the evidence before any handoff or merge review.
 
+Startup evidence is not implementation progress. After actual startup is
+recorded, the observer watchdog uses shared evidence surfaces as the source of
+truth: task timeline events, route/precheck events after startup, audited
+`graph_query` traces carrying task/fence identity, fenced worktree dirty diffs,
+branch HEAD advance, checkpoints, finish gates, or explicit blockers. If no
+first progress evidence appears before the configured stage timeout, the
+observer records `event_kind=no_progress_timeout` with attempt lineage, marks
+the command as eligible for fallback takeover/retry/fail, and may close or kill
+the worker. This does not require a separate worker communication system;
+worker self-report is supplemental to timeline/graph/precheck/worktree state.
+
 #### R19.3 Contract-driven MF Workflow Runtime and Unified Precheck Gates
 
 MF workflow workers may drive the deterministic stage graph only when the

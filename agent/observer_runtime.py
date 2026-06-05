@@ -99,6 +99,7 @@ RUNTIME_TEXT_REQUIRED_EVIDENCE = (
     "branch_runtime_evidence",
     "service_dispatch_evidence",
     "startup_echo",
+    "first_progress_evidence",
     "finish_gate",
 )
 RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS = (
@@ -889,6 +890,9 @@ def build_observer_prompt(request: ObserverRunRequest) -> str:
         "execute only in the gated one-hop worktree, dispatch only bounded mf_sub "
         "workers through dispatch gates, record timeline "
         "evidence, and stop before merge/close unless verification gates pass. "
+        "Actual startup evidence proves launch only; after startup, first progress "
+        "must be graph/precheck/route progress, worktree/head changes, checkpoint, "
+        "finish gate, or an explicit blocker. "
         "Do not expose raw private route/context-pack content."
     )
 
@@ -1896,6 +1900,32 @@ def _runtime_text_finish_gate_contract(context: Any) -> dict[str, Any]:
     }
 
 
+def _runtime_text_first_progress_contract(context: Any) -> dict[str, Any]:
+    return {
+        "schema_version": "mf_subagent_first_progress_contract.v1",
+        "required": True,
+        "startup_is_progress": False,
+        "timeout_event_kind": "no_progress_timeout",
+        "observer_progress_sources": [
+            "task_timeline",
+            "route_action_precheck_after_startup",
+            "audited_graph_query_with_task_and_fence_identity",
+            "fenced_worktree_dirty_diff",
+            "branch_head_advance",
+            "checkpoint",
+            "finish_gate",
+            "explicit_blocker",
+        ],
+        "expected": {
+            "task_id": context.task_id,
+            "fence_token": context.fence_token,
+            "worktree_path": context.worktree_path,
+            "base_commit": context.base_commit,
+            "target_head_commit": context.target_head_commit,
+        },
+    }
+
+
 def _runtime_text_worker_prompt(
     request: ObserverRuntimeTextPrepareRequest,
     *,
@@ -2140,6 +2170,7 @@ def build_observer_runtime_text_context(
         fence_token=context.fence_token,
     )
     finish_gate_contract = _runtime_text_finish_gate_contract(context)
+    first_progress_contract = _runtime_text_first_progress_contract(context)
     launch_payload = {
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
@@ -2156,6 +2187,7 @@ def build_observer_runtime_text_context(
         "mf_subagent_input": mf_subagent_input,
         "startup_echo_contract": startup_echo_contract,
         "graph_first_obligations": graph_first_obligations,
+        "first_progress_contract": first_progress_contract,
         "finish_gate_contract": finish_gate_contract,
     }
     launch_text = _runtime_text_launch_text(launch_payload)
@@ -2258,6 +2290,7 @@ def build_observer_runtime_text_context(
         "service_dispatch_evidence": service_dispatch_evidence,
         "startup_echo_contract": startup_echo_contract,
         "graph_first_obligations": graph_first_obligations,
+        "first_progress_contract": first_progress_contract,
         "finish_gate_contract": finish_gate_contract,
         "route_identity": {
             "route_id": request.route_id,

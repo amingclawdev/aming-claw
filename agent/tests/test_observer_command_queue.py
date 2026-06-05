@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.governance import observer_session, raw_requirement
+from agent.governance import observer_session, raw_requirement, task_timeline
 
 
 def _conn() -> sqlite3.Connection:
@@ -49,6 +49,30 @@ def _actual_startup_result() -> dict:
             "actual_git_root": "/repo/.worktrees/worker-1",
             "branch": "refs/heads/codex/worker-1",
             "head_commit": "head-1",
+        },
+    }
+
+
+def _first_progress_result() -> dict:
+    return {
+        "graph_trace_evidence": {
+            "schema_version": "mf_subagent_graph_trace.v1",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "trace_ids": ["gqt-progress-1"],
+            "task_id": "mf-sub-task-1",
+            "parent_task_id": "observer-task-1",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-1",
+        },
+        "worktree_diff_scope": {
+            "schema_version": "mf_subagent_worktree_diff_scope.v1",
+            "worktree": "/repo/.worktrees/worker-1",
+            "base_commit": "base-1",
+            "head_commit": "head-1",
+            "implementation_changed_files": ["agent/example.py"],
+            "dirty_files": [],
+            "no_diff": False,
         },
     }
 
@@ -309,7 +333,11 @@ def test_execute_backlog_row_claim_complete_preserves_payload_without_reminder_l
         session_id=session["session_id"],
         session_token=session["session_token"],
         command_id=command["command_id"],
-        result={**_actual_startup_result(), "backlog_id": payload["backlog_id"]},
+        result={
+            **_actual_startup_result(),
+            **_first_progress_result(),
+            "backlog_id": payload["backlog_id"],
+        },
     )
 
     reminder = observer_session.command_pending_reminder("demo")
@@ -321,9 +349,50 @@ def test_execute_backlog_row_claim_complete_preserves_payload_without_reminder_l
     assert completed["command"]["result"]["ok"] is True
     assert completed["command"]["result"]["backlog_id"] == payload["backlog_id"]
     assert completed["command"]["result"]["startup_gate"]["actual_startup_recorded"] is True
+    assert completed["command"]["result"]["graph_trace_evidence"]["trace_ids"] == [
+        "gqt-progress-1"
+    ]
     assert reminder["payload_included"] is False
     assert "payload" not in reminder
     assert payload["backlog_id"] not in str(reminder)
+
+
+def test_execute_backlog_row_complete_with_startup_only_fails_no_progress():
+    conn = _conn()
+    session = _register(conn)
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result=_actual_startup_result(),
+        now="2026-06-03T00:00:03Z",
+    )
+
+    assert completed["command"]["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert completed["command"]["error"] == "startup_without_first_progress_evidence"
+    watchdog = completed["command"]["result"]["progress_watchdog"]
+    assert watchdog["present"] is False
+    assert watchdog["startup_evidence_present"] is True
+    assert "mf_subagent_startup" in watchdog["excluded_as_progress"]
 
 
 def test_execute_backlog_row_complete_without_startup_fails_truthfully():
@@ -756,7 +825,7 @@ def test_active_consumer_claim_records_route_and_precheck_evidence():
         session_id=session["session_id"],
         session_token=session["session_token"],
         command_id=command["command_id"],
-        result=_actual_startup_result(),
+        result={**_actual_startup_result(), **_first_progress_result()},
         now="2026-06-03T00:00:47Z",
     )
 
@@ -1046,7 +1115,11 @@ def test_stale_claimed_command_can_be_taken_over_by_fallback_session():
         session_id=fallback["session_id"],
         session_token=fallback["session_token"],
         command_id=command["command_id"],
-        result={**_actual_startup_result(), "takeover": takeover["takeover"]},
+        result={
+            **_actual_startup_result(),
+            **_first_progress_result(),
+            "takeover": takeover["takeover"],
+        },
         now="2026-06-03T00:03:04Z",
     )
     assert completed["command"]["status"] == observer_session.COMMAND_STATUS_COMPLETED
@@ -1228,7 +1301,68 @@ def test_active_owner_old_execute_without_startup_can_be_taken_over_and_failed()
     )
 
 
-def test_active_owner_old_execute_with_startup_evidence_cannot_be_taken_over():
+def test_active_owner_old_execute_with_startup_and_progress_cannot_be_taken_over():
+    conn = _conn()
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    conn.execute(
+        """UPDATE observer_command_queue
+              SET result_json = ?
+            WHERE command_id = ?""",
+        (
+            observer_session._json_dumps(
+                {**_actual_startup_result(), **_first_progress_result()}
+            ),
+            command["command_id"],
+        ),
+    )
+    conn.commit()
+    observer_session.heartbeat_session(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        now="2026-06-03T00:03:00Z",
+    )
+
+    with pytest.raises(observer_session.ObserverCommandConflict, match="not stale: active"):
+        observer_session.takeover_command(
+            conn,
+            project_id="demo",
+            session_id=fallback["session_id"],
+            session_token=fallback["session_token"],
+            command_id=command["command_id"],
+            reason="fallback observer tries to steal started worker",
+            now="2026-06-03T00:03:01Z",
+        )
+
+
+def test_active_owner_execute_with_startup_but_no_progress_times_out_for_takeover():
     conn = _conn()
     owner = observer_session.register_session(
         conn,
@@ -1275,6 +1409,120 @@ def test_active_owner_old_execute_with_startup_evidence_cannot_be_taken_over():
         now="2026-06-03T00:03:00Z",
     )
 
+    takeover = observer_session.takeover_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        reason="fallback observer resolves started worker with no observable progress",
+        now="2026-06-03T00:03:01Z",
+    )
+
+    assert takeover["takeover"]["previous_session_status"] == (
+        observer_session.CLAIMED_TO_PROGRESS_TIMEOUT_STATUS
+    )
+    assert takeover["takeover"]["timeout_kind"] == "no_progress_timeout"
+    assert takeover["takeover"]["startup_evidence"] == "present"
+    assert takeover["takeover"]["progress_evidence"] == "missing"
+    result = takeover["command"]["result"]
+    assert result["no_progress_timeout"]["timeout_kind"] == "no_progress_timeout"
+    assert result["no_progress_timeout"]["timeline_event"]["event_kind"] == (
+        "no_progress_timeout"
+    )
+    assert result["progress_watchdog"]["present"] is False
+
+
+def test_active_owner_execute_with_timeline_progress_does_not_time_out():
+    conn = _conn()
+    task_timeline.ensure_schema(conn)
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    startup = _actual_startup_result()
+    startup["startup_gate"].update(
+        {
+            "task_id": "mf-sub-task-1",
+            "parent_task_id": "observer-task-1",
+            "runtime_context_id": "mfrctx-progress-1",
+        }
+    )
+    conn.execute(
+        """UPDATE observer_command_queue
+              SET result_json = ?
+            WHERE command_id = ?""",
+        (
+            observer_session._json_dumps(startup),
+            command["command_id"],
+        ),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=_execute_backlog_row_payload()["backlog_id"],
+        task_id="mf-sub-task-1",
+        attempt_num=1,
+        event_type="mf_subagent.startup",
+        phase="startup_gate",
+        event_kind="mf_subagent_startup",
+        status="passed",
+        payload={
+            "mf_subagent_startup_gate": {
+                **startup["startup_gate"],
+                "runtime_context_id": "mfrctx-progress-1",
+            }
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=_execute_backlog_row_payload()["backlog_id"],
+        task_id="mf-sub-task-1",
+        attempt_num=1,
+        event_type="implementation.progress",
+        phase="implementation",
+        event_kind="implementation",
+        status="accepted",
+        payload={
+            "task_id": "mf-sub-task-1",
+            "runtime_context_id": "mfrctx-progress-1",
+            "fence_token": "fence-1",
+            "changed_files": ["agent/example.py"],
+        },
+    )
+    conn.commit()
+    observer_session.heartbeat_session(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        now="2026-06-03T00:03:00Z",
+    )
+
     with pytest.raises(observer_session.ObserverCommandConflict, match="not stale: active"):
         observer_session.takeover_command(
             conn,
@@ -1282,7 +1530,7 @@ def test_active_owner_old_execute_with_startup_evidence_cannot_be_taken_over():
             session_id=fallback["session_id"],
             session_token=fallback["session_token"],
             command_id=command["command_id"],
-            reason="fallback observer tries to steal started worker",
+            reason="fallback observer should not steal a worker with timeline progress",
             now="2026-06-03T00:03:01Z",
         )
 

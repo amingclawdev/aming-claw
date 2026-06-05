@@ -19,7 +19,9 @@ from agent.observer_runtime import (
     build_observer_runtime_text_context,
     build_observer_poll_loop_metadata,
     build_observer_poll_plan,
+    build_observer_prompt,
     observer_poll_timeline_payload,
+    ObserverRunRequest,
 )
 
 
@@ -106,6 +108,33 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert prepared["startup_intent_event"]["artifact_refs"]["runtime_context_id"] == (
         "mfrctx-runtime-text-a1"
     )
+    assert prepared["first_progress_contract"]["startup_is_progress"] is False
+    assert (
+        "first_progress_evidence"
+        in prepared["mf_subagent_input"]["parent_route_lineage"]["required_evidence"]
+    )
+    assert (
+        "audited_graph_query_with_task_and_fence_identity"
+        in prepared["first_progress_contract"]["observer_progress_sources"]
+    )
+
+
+def test_observer_prompt_says_startup_is_not_progress(tmp_path):
+    prompt = build_observer_prompt(
+        ObserverRunRequest(
+            project_id="aming-claw",
+            backlog_id="AC-ROUTE-HANDOFF",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route",
+                prompt_contract_id="rprompt-test",
+            ),
+            workspace=str(tmp_path),
+            main_worktree=str(tmp_path),
+        )
+    )
+
+    assert "Actual startup evidence proves launch only" in prompt
+    assert "first progress" in prompt
 
 
 def test_build_observer_poll_plan_turns_claimed_command_into_dry_run_plan(tmp_path):
