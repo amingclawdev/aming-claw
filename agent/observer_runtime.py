@@ -711,6 +711,226 @@ def _worker_worktree_diff_scope(
     }
 
 
+def _runtime_monitor_summary(monitor: Mapping[str, Any]) -> dict[str, Any]:
+    monitor = monitor if isinstance(monitor, Mapping) else {}
+    early_progress = monitor.get("early_progress")
+    early_progress = early_progress if isinstance(early_progress, Mapping) else {}
+    return {
+        "schema_version": "observer_cli_runtime_monitor_summary.v1",
+        "present": bool(monitor),
+        "monitor_schema_version": str(monitor.get("schema_version") or ""),
+        "early_progress_timeout_sec": monitor.get("early_progress_timeout_sec", 0),
+        "heartbeat_enabled": bool(monitor.get("heartbeat_enabled")),
+        "heartbeat_count": monitor.get("heartbeat_count", 0),
+        "heartbeat_failures": monitor.get("heartbeat_failures", 0),
+        "progress_observed": bool(monitor.get("progress_observed")),
+        "early_progress_observed": bool(early_progress.get("progress_observed")),
+        "stdout_bytes": early_progress.get("stdout_bytes", 0),
+        "stderr_bytes": early_progress.get("stderr_bytes", 0),
+        "dirty_files": list(early_progress.get("dirty_files") or []),
+        "changed_files": list(early_progress.get("changed_files") or []),
+    }
+
+
+def _startup_read_receipt_recording_status(
+    observer_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    observer_result = observer_result if isinstance(observer_result, Mapping) else {}
+    startup_event = observer_result.get("startup_timeline_event")
+    startup_event = startup_event if isinstance(startup_event, Mapping) else {}
+    startup_recording = observer_result.get("startup_recording")
+    startup_recording = startup_recording if isinstance(startup_recording, Mapping) else {}
+    read_receipt = observer_result.get("read_receipt")
+    read_receipt = read_receipt if isinstance(read_receipt, Mapping) else {}
+    return {
+        "schema_version": "observer_startup_read_receipt_recording_status.v1",
+        "startup_prepared": bool(
+            startup_event
+            or startup_recording
+            or observer_result.get("startup_evidence_appendable")
+        ),
+        "startup_appendable": bool(
+            startup_event or observer_result.get("startup_evidence_appendable")
+        ),
+        "startup_recorded": bool(observer_result.get("actual_startup_recorded")),
+        "startup_timeline_event_recorded": bool(
+            observer_result.get("timeline_event_recorded")
+        ),
+        "startup_event_kind": str(startup_event.get("event_kind") or ""),
+        "startup_status": str(startup_event.get("status") or ""),
+        "read_receipt_prepared": bool(read_receipt),
+        "read_receipt_recorded": bool(observer_result.get("read_receipt_recorded")),
+        "read_receipt_recorded_before_implementation_wait": bool(
+            observer_result.get("read_receipt_recorded_before_implementation_wait")
+        ),
+        "read_receipt_hash": str(
+            read_receipt.get("read_receipt_hash") or read_receipt.get("hash") or ""
+        ),
+        "post_hoc_read_receipt_satisfies_gate": False,
+        "implementation_evidence_recorded": False,
+        "close_ready": False,
+    }
+
+
+def _record_task_timeline_event(
+    *,
+    project_id: str,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        from governance import task_timeline
+        from governance.db import DBContext
+    except ImportError:  # pragma: no cover - package import path
+        from agent.governance import task_timeline
+        from agent.governance.db import DBContext
+
+    with DBContext(project_id) as conn:
+        task_timeline.ensure_schema(conn)
+        return task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            task_id=str(event.get("task_id") or ""),
+            backlog_id=str(event.get("backlog_id") or ""),
+            mf_id=str(event.get("mf_id") or ""),
+            attempt_num=int(event.get("attempt_num") or 0),
+            event_type=str(event.get("event_type") or ""),
+            phase=str(event.get("phase") or ""),
+            event_kind=str(event.get("event_kind") or ""),
+            scenario_id=str(event.get("scenario_id") or ""),
+            parent_event_id=int(event.get("parent_event_id") or 0),
+            correlation_id=str(event.get("correlation_id") or ""),
+            severity=str(event.get("severity") or ""),
+            decision=str(event.get("decision") or ""),
+            schema_version=int(event.get("schema_version") or 2),
+            actor=str(event.get("actor") or ""),
+            status=str(event.get("status") or ""),
+            payload=dict(event.get("payload") or {}),
+            verification=dict(event.get("verification") or {}),
+            artifact_refs=dict(event.get("artifact_refs") or {}),
+            trace_id=str(event.get("trace_id") or ""),
+            commit_sha=str(event.get("commit_sha") or ""),
+        )
+
+
+def _dogfood_terminal_blocker_timeline_event(
+    blocker: Mapping[str, Any],
+) -> dict[str, Any]:
+    blocker = blocker if isinstance(blocker, Mapping) else {}
+    diff_scope = blocker.get("worktree_diff_scope")
+    diff_scope = diff_scope if isinstance(diff_scope, Mapping) else {}
+    runtime_context = blocker.get("runtime_context")
+    runtime_context = runtime_context if isinstance(runtime_context, Mapping) else {}
+    route_identity = blocker.get("route_identity")
+    route_identity = route_identity if isinstance(route_identity, Mapping) else {}
+    startup_status = blocker.get("startup_read_receipt_recording_status")
+    startup_status = startup_status if isinstance(startup_status, Mapping) else {}
+    event_payload = {
+        "schema_version": "observer_dogfood_terminal_blocker_event_payload.v1",
+        "terminal_blocker": dict(blocker),
+        "route_identity": dict(route_identity),
+        "task_identity": {
+            "project_id": str(blocker.get("project_id") or ""),
+            "backlog_id": str(blocker.get("backlog_id") or ""),
+            "task_id": str(blocker.get("task_id") or ""),
+            "attempt_num": int(blocker.get("attempt_num") or 0),
+        },
+        "branch_identity": {
+            "branch": str(blocker.get("branch") or ""),
+            "worktree": str(blocker.get("worktree") or ""),
+            "fence_token": str(blocker.get("fence_token") or ""),
+            "runtime_context_id": str(blocker.get("runtime_context_id") or ""),
+            "base_commit": str(blocker.get("base_commit") or ""),
+            "target_head_commit": str(blocker.get("target_head_commit") or ""),
+            "merge_queue_id": str(blocker.get("merge_queue_id") or ""),
+        },
+        "timeout_no_progress": {
+            "blocker_id": str(blocker.get("blocker_id") or ""),
+            "reason": str(blocker.get("reason") or ""),
+            "timeout_sec": blocker.get("timeout_sec", 0),
+            "early_progress_timeout_sec": blocker.get("early_progress_timeout_sec", 0),
+            "no_output": bool(blocker.get("no_output")),
+            "no_finish_evidence": bool(blocker.get("no_finish_evidence")),
+        },
+        "command_projection": dict(blocker.get("terminal_contract_projection") or {}),
+        "runtime_monitor_summary": dict(blocker.get("runtime_monitor_summary") or {}),
+        "worktree_diff_scope": dict(diff_scope),
+        "startup_read_receipt_recording_status": dict(startup_status),
+        "runtime_context": dict(runtime_context),
+        "service_router_suppress": True,
+    }
+    return {
+        "task_id": str(blocker.get("task_id") or ""),
+        "backlog_id": str(blocker.get("backlog_id") or ""),
+        "attempt_num": int(blocker.get("attempt_num") or 0),
+        "event_type": "observer_dogfood_terminal_blocker",
+        "phase": "implementation_wait",
+        "event_kind": "observer_cli_terminal_blocker",
+        "correlation_id": str(blocker.get("observer_command_id") or ""),
+        "severity": "error",
+        "decision": "blocked",
+        "schema_version": 2,
+        "actor": "observer_dogfood",
+        "status": "blocked",
+        "payload": event_payload,
+        "verification": {
+            "schema_version": "observer_dogfood_terminal_blocker_verification.v1",
+            "passed": False,
+            "canonical_contract_state": "blocked",
+            "command_projection_status": str(
+                blocker.get("command_projection_status") or "failed"
+            ),
+            "startup_recorded": bool(startup_status.get("startup_recorded")),
+            "read_receipt_recorded": bool(startup_status.get("read_receipt_recorded")),
+            "implementation_evidence_recorded": False,
+        },
+        "artifact_refs": {
+            "runtime_context_id": str(blocker.get("runtime_context_id") or ""),
+            "worktree": str(blocker.get("worktree") or ""),
+            "branch": str(blocker.get("branch") or ""),
+            "fence_token": str(blocker.get("fence_token") or ""),
+            "observer_command_id": str(blocker.get("observer_command_id") or ""),
+            "blocker_id": str(blocker.get("blocker_id") or ""),
+        },
+        "commit_sha": str(diff_scope.get("head_commit") or ""),
+    }
+
+
+def _append_dogfood_terminal_blocker_event(
+    blocker: Mapping[str, Any],
+) -> dict[str, Any]:
+    event = _dogfood_terminal_blocker_timeline_event(blocker)
+    project_id = str(blocker.get("project_id") or "")
+    if not project_id:
+        return {
+            "ok": False,
+            "event_type": event["event_type"],
+            "event_kind": event["event_kind"],
+            "phase": event["phase"],
+            "request": event,
+            "error": "missing_project_id",
+        }
+    try:
+        recorded = _record_task_timeline_event(project_id=project_id, event=event)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "event_type": event["event_type"],
+            "event_kind": event["event_kind"],
+            "phase": event["phase"],
+            "request": event,
+            "error": str(exc),
+        }
+    return {
+        "ok": True,
+        "event_type": event["event_type"],
+        "event_kind": event["event_kind"],
+        "phase": event["phase"],
+        "event_id": recorded.get("id") or recorded.get("event_id") or "",
+        "request": event,
+        "event": recorded,
+    }
+
+
 def _materialize_worktree(
     *,
     main_worktree: Path,
@@ -1716,6 +1936,20 @@ def _dogfood_cli_timeout_blocker(
             if no_output
             else f"{request.backend_mode}_timeout_no_finish"
         )
+    runtime_context_id = request.runtime_context_id or runtime_context_id_for_branch_context(
+        context
+    )
+    route_identity = {
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+    }
+    runtime_monitor = invocation.get("runtime_monitor") or {}
+    runtime_monitor = runtime_monitor if isinstance(runtime_monitor, Mapping) else {}
+    startup_status = _startup_read_receipt_recording_status(observer_result)
     terminal_projection = {
         "schema_version": "observer_command_terminal_projection.v1",
         "passed": False,
@@ -1728,49 +1962,54 @@ def _dogfood_cli_timeout_blocker(
             "cli_timeout_blocker",
             "worktree_diff_scope",
         ],
-        "canonical_route_identity": {
-            "route_id": request.route_id,
-            "route_context_hash": request.route.route_context_hash,
-            "prompt_contract_id": request.route.prompt_contract_id,
-            "prompt_contract_hash": request.route.prompt_contract_hash,
-            "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
-        },
+        "canonical_route_identity": route_identity,
         "observer_command_id": observer_command_id,
     }
-    return {
+    blocker = {
         "schema_version": (
             "observer_cli_no_progress_blocker.v1"
             if invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
             else "observer_cli_timeout_blocker.v1"
         ),
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
         "blocker_id": blocker_id,
         "terminal_blocker": True,
         "terminal_dispatch_blocker": True,
         "status": "blocked",
         "observer_command_id": observer_command_id,
         "task_id": context.task_id,
-        "route_id": request.route_id,
-        "route_context_hash": request.route.route_context_hash,
-        "prompt_contract_id": request.route.prompt_contract_id,
-        "prompt_contract_hash": request.route.prompt_contract_hash,
-        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "attempt_num": context.attempt,
+        **route_identity,
+        "route_identity": route_identity,
         "branch": context.branch_ref,
         "worktree": str(Path(str(worker_worktree)).expanduser().resolve()),
         "fence_token": context.fence_token,
+        "runtime_context_id": runtime_context_id,
+        "runtime_context": asdict(context),
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
         "owned_files": list(owned_files),
         "backend_mode": request.backend_mode,
         "timeout_sec": request.timeout_sec,
+        "early_progress_timeout_sec": request.early_progress_timeout_sec,
         "no_output": no_output,
         "no_finish_evidence": True,
-        "startup_recorded": False,
-        "read_receipt_recorded": False,
-        "read_receipt_recorded_before_implementation_wait": False,
-        "failure_evidence_appended": True,
+        "startup_recorded": bool(startup_status.get("startup_recorded")),
+        "read_receipt_recorded": bool(startup_status.get("read_receipt_recorded")),
+        "read_receipt_recorded_before_implementation_wait": bool(
+            startup_status.get("read_receipt_recorded_before_implementation_wait")
+        ),
+        "startup_read_receipt_recording_status": startup_status,
+        "implementation_evidence_recorded": False,
+        "close_ready": False,
         "command_projection_status": "failed",
         "calls_models": False,
         "auth_status": invocation.get("auth_status", "cli_timeout"),
         "invocation_blocker_id": invocation_blocker_id,
-        "runtime_monitor": invocation.get("runtime_monitor") or {},
+        "runtime_monitor": runtime_monitor,
+        "runtime_monitor_summary": _runtime_monitor_summary(runtime_monitor),
         "worktree_diff_scope": diff_scope,
         "terminal_contract_projection": terminal_projection,
         "reason": (
@@ -1779,6 +2018,12 @@ def _dogfood_cli_timeout_blocker(
             "worktree diff scope is reported."
         ),
     }
+    append_result = _append_dogfood_terminal_blocker_event(blocker)
+    blocker["failure_evidence_appended"] = bool(append_result.get("ok"))
+    blocker["failure_evidence_append"] = append_result
+    if not append_result.get("ok"):
+        blocker["failure_evidence_append_error"] = str(append_result.get("error") or "")
+    return blocker
 
 
 def _dogfood_launch_backend_blocker(
