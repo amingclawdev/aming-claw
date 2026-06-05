@@ -181,7 +181,7 @@ class AIInvocationRequest:
         return self.prompt
 
     def to_evidence(self) -> dict[str, Any]:
-        return {
+        evidence = {
             "schema_version": REQUEST_SCHEMA_VERSION,
             "role": self.role,
             "provider": self.provider,
@@ -195,6 +195,10 @@ class AIInvocationRequest:
             "route_prompt_contract": self.route.as_dict(),
             "raw_prompt_exposed": False,
         }
+        monitor_policy = _runtime_monitor_policy(self.metadata)
+        if monitor_policy:
+            evidence["runtime_monitor_policy"] = monitor_policy
+        return evidence
 
 
 @dataclass
@@ -211,6 +215,8 @@ class AIInvocationResult:
     raw_output_stored: bool = False
     auth_status: str = "unknown"
     output_path: str = ""
+    blocker_id: str = ""
+    runtime_monitor: dict[str, Any] = field(default_factory=dict)
 
     @property
     def output_sha256(self) -> str:
@@ -256,6 +262,8 @@ class AIInvocationResult:
             "no_raw_prompt_output": True,
             "error": redact_text(self.error, max_chars=1000),
             "output_path": self.output_path,
+            "blocker_id": self.blocker_id,
+            "runtime_monitor": self.runtime_monitor,
         }
 
 
@@ -334,6 +342,304 @@ def _failed_result(
         calls_models=False,
         auth_status=auth_status,
     )
+
+
+def _metadata_float(metadata: Mapping[str, Any], key: str, *, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(metadata.get(key) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _runtime_monitor_policy(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    early_progress_timeout_sec = _metadata_float(
+        metadata,
+        "early_progress_timeout_sec",
+    )
+    heartbeat_callback = metadata.get("heartbeat_callback")
+    heartbeat_enabled = callable(heartbeat_callback)
+    if not early_progress_timeout_sec and not heartbeat_enabled:
+        return {}
+    return {
+        "schema_version": "ai_invocation_runtime_monitor_policy.v1",
+        "early_progress_timeout_sec": early_progress_timeout_sec,
+        "heartbeat_enabled": heartbeat_enabled,
+        "heartbeat_interval_sec": _metadata_float(
+            metadata,
+            "heartbeat_interval_sec",
+            default=0.0,
+        ),
+    }
+
+
+def _git_status_short(cwd: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--short", "--untracked-files=all"],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def _output_file_nonempty(output_path: str) -> bool:
+    if not output_path:
+        return False
+    try:
+        return Path(output_path).exists() and Path(output_path).stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _codex_cli_progress_snapshot(
+    *,
+    cwd: str,
+    output_path: str,
+    baseline_git_status: str,
+) -> dict[str, Any]:
+    current_git_status = _git_status_short(cwd)
+    git_status_available = bool(baseline_git_status or current_git_status)
+    worktree_changed = (
+        git_status_available
+        and current_git_status != baseline_git_status
+    )
+    output_file_nonempty = _output_file_nonempty(output_path)
+    return {
+        "schema_version": "codex_cli_progress_snapshot.v1",
+        "output_file_nonempty": output_file_nonempty,
+        "worktree_status_available": git_status_available,
+        "worktree_changed": worktree_changed,
+        "progress_observed": output_file_nonempty or worktree_changed,
+    }
+
+
+def _read_temp_file(handle: Any) -> str:
+    try:
+        handle.seek(0)
+        return handle.read()
+    except Exception:
+        return ""
+
+
+def _read_output_text(output_path: str, fallback: str) -> str:
+    if output_path:
+        try:
+            return Path(output_path).read_text(encoding="utf-8")
+        except OSError:
+            return fallback
+    return fallback
+
+
+def _stop_process(process: subprocess.Popen[str], *, terminate_first: bool = True) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if terminate_first:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        process.kill()
+        process.wait(timeout=3)
+    except Exception:
+        return
+
+
+def _call_heartbeat(callback: Any) -> dict[str, Any]:
+    try:
+        payload = callback()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    if isinstance(payload, Mapping):
+        return {
+            "ok": bool(payload.get("ok")),
+            "http_status": payload.get("http_status"),
+            "observer_session_id": str(payload.get("observer_session_id") or ""),
+            "phase": str(payload.get("phase") or "execute_child"),
+        }
+    return {"ok": bool(payload), "phase": "execute_child"}
+
+
+def _invoke_codex_cli_monitored(
+    *,
+    request: AIInvocationRequest,
+    command: list[str],
+    cwd: str,
+    prompt: str,
+    output_path: str,
+    started: float,
+) -> AIInvocationResult:
+    early_progress_timeout_sec = _metadata_float(
+        request.metadata,
+        "early_progress_timeout_sec",
+    )
+    heartbeat_callback = request.metadata.get("heartbeat_callback")
+    heartbeat_enabled = callable(heartbeat_callback)
+    heartbeat_interval_sec = _metadata_float(
+        request.metadata,
+        "heartbeat_interval_sec",
+        default=10.0,
+    )
+    if heartbeat_enabled and heartbeat_interval_sec <= 0:
+        heartbeat_interval_sec = 10.0
+    monitor: dict[str, Any] = {
+        "schema_version": "codex_cli_runtime_monitor.v1",
+        "early_progress_timeout_sec": early_progress_timeout_sec,
+        "heartbeat_enabled": heartbeat_enabled,
+        "heartbeat_interval_sec": heartbeat_interval_sec if heartbeat_enabled else 0.0,
+        "heartbeat_count": 0,
+        "heartbeat_failures": 0,
+        "progress_observed": False,
+    }
+    baseline_git_status = _git_status_short(cwd) if early_progress_timeout_sec else ""
+    stdout_handle = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    stderr_handle = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            cwd=cwd,
+        )
+        if process.stdin is not None:
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+        deadline = started + max(0, int(request.timeout_sec or 0))
+        progress_deadline = (
+            started + early_progress_timeout_sec
+            if early_progress_timeout_sec
+            else 0.0
+        )
+        next_heartbeat = started if heartbeat_enabled else 0.0
+        while process.poll() is None:
+            now = time.perf_counter()
+            if heartbeat_enabled and now >= next_heartbeat:
+                heartbeat = _call_heartbeat(heartbeat_callback)
+                monitor["heartbeat_count"] += 1
+                if not heartbeat.get("ok"):
+                    monitor["heartbeat_failures"] += 1
+                    monitor["last_heartbeat"] = heartbeat
+                    _stop_process(process)
+                    return AIInvocationResult(
+                        request=request,
+                        status="blocked",
+                        output_text="",
+                        error="observer session heartbeat failed while codex_cli worker was active",
+                        command=command,
+                        returncode=126,
+                        elapsed_ms=int((time.perf_counter() - started) * 1000),
+                        provider_backed=True,
+                        calls_models=False,
+                        auth_status="observer_heartbeat_failed",
+                        output_path=output_path,
+                        blocker_id="observer_session_heartbeat_failed_during_cli_worker",
+                        runtime_monitor=monitor,
+                    )
+                monitor["last_heartbeat"] = heartbeat
+                next_heartbeat = now + heartbeat_interval_sec
+
+            if progress_deadline and now >= progress_deadline:
+                progress = _codex_cli_progress_snapshot(
+                    cwd=cwd,
+                    output_path=output_path,
+                    baseline_git_status=baseline_git_status,
+                )
+                monitor["early_progress"] = progress
+                monitor["progress_observed"] = bool(progress.get("progress_observed"))
+                if not progress.get("progress_observed"):
+                    _stop_process(process)
+                    return AIInvocationResult(
+                        request=request,
+                        status="blocked",
+                        output_text="",
+                        error=(
+                            "codex_cli_worker_no_progress_no_read_receipt: no output "
+                            "or worktree changes within early progress timeout"
+                        ),
+                        command=command,
+                        returncode=125,
+                        elapsed_ms=int((time.perf_counter() - started) * 1000),
+                        provider_backed=True,
+                        calls_models=False,
+                        auth_status="cli_no_progress",
+                        output_path=output_path,
+                        blocker_id="codex_cli_worker_no_progress_no_read_receipt",
+                        runtime_monitor=monitor,
+                    )
+                progress_deadline = 0.0
+
+            if request.timeout_sec and now >= deadline:
+                _stop_process(process)
+                partial_output = _read_output_text(output_path, _read_temp_file(stdout_handle))
+                partial_error = _read_temp_file(stderr_handle).strip()
+                message = f"codex_cli invocation timed out after {request.timeout_sec}s"
+                if partial_error:
+                    message = f"{message}: {partial_error}"
+                return AIInvocationResult(
+                    request=request,
+                    status="blocked",
+                    output_text=partial_output,
+                    error=message,
+                    command=command,
+                    returncode=124,
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    provider_backed=True,
+                    calls_models=False,
+                    auth_status="cli_timeout",
+                    output_path=output_path,
+                    blocker_id="codex_cli_timeout",
+                    runtime_monitor=monitor,
+                )
+
+            next_wake = deadline if request.timeout_sec else now + 0.2
+            if progress_deadline:
+                next_wake = min(next_wake, progress_deadline)
+            if heartbeat_enabled:
+                next_wake = min(next_wake, next_heartbeat)
+            sleep_for = max(0.01, min(0.2, next_wake - now))
+            time.sleep(sleep_for)
+
+        stdout_text = _read_temp_file(stdout_handle)
+        stderr_text = _read_temp_file(stderr_handle)
+        output_text = _read_output_text(output_path, stdout_text)
+        return AIInvocationResult(
+            request=request,
+            status="completed" if process.returncode == 0 else "failed",
+            output_text=output_text,
+            error=stderr_text if process.returncode else "",
+            command=command,
+            returncode=int(process.returncode or 0),
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            provider_backed=True,
+            calls_models=process.returncode == 0,
+            auth_status="cli_auth_unknown" if process.returncode == 0 else "cli_failed",
+            output_path=output_path,
+            runtime_monitor=monitor,
+        )
+    finally:
+        if process is not None:
+            _stop_process(process, terminate_first=False)
+        try:
+            stdout_handle.close()
+            stderr_handle.close()
+        except Exception:
+            pass
 
 
 def invoke_fixture(request: AIInvocationRequest) -> AIInvocationResult:
@@ -472,6 +778,18 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
             output_path = str(Path(temp_dir) / "last-message.txt")
         if backend == BACKEND_CODEX_CLI:
             command = build_codex_exec_command(model=request.model, cwd=cwd, output_path=output_path)
+            if (
+                _metadata_float(request.metadata, "early_progress_timeout_sec")
+                or callable(request.metadata.get("heartbeat_callback"))
+            ):
+                return _invoke_codex_cli_monitored(
+                    request=request,
+                    command=command,
+                    cwd=cwd,
+                    prompt=prompt,
+                    output_path=output_path,
+                    started=started,
+                )
             result = subprocess.run(
                 command,
                 input=prompt,

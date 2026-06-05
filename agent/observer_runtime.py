@@ -12,7 +12,7 @@ import json
 import subprocess
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 try:
     from ai_invocation import (
@@ -124,8 +124,11 @@ class ObserverRunRequest:
     workspace: str = ""
     prompt: str = ""
     timeout_sec: int = 120
+    early_progress_timeout_sec: float = 20.0
     dispatch_gate: Mapping[str, Any] = field(default_factory=dict)
     main_worktree: str = ""
+    heartbeat_callback: Callable[[], Mapping[str, Any]] | None = None
+    heartbeat_interval_sec: float = 0.0
 
     @classmethod
     def from_route_token(
@@ -140,6 +143,7 @@ class ObserverRunRequest:
         workspace: str = "",
         prompt: str = "",
         timeout_sec: int = 120,
+        early_progress_timeout_sec: float = 20.0,
     ) -> "ObserverRunRequest":
         return cls(
             project_id=project_id,
@@ -151,6 +155,7 @@ class ObserverRunRequest:
             workspace=workspace,
             prompt=prompt,
             timeout_sec=timeout_sec,
+            early_progress_timeout_sec=early_progress_timeout_sec,
         )
 
 
@@ -184,6 +189,7 @@ class DogfoodObserverPlanRequest:
     target_head_commit: str = ""
     prompt: str = ""
     timeout_sec: int = 120
+    early_progress_timeout_sec: float = 20.0
     route_id: str = ""
     precheck_run_id: str = ""
     visible_injection_manifest_hash: str = ""
@@ -236,8 +242,11 @@ class ObserverPollRequest:
     workspace: str = ""
     prompt: str = ""
     timeout_sec: int = 120
+    early_progress_timeout_sec: float = 20.0
     dispatch_gate: Mapping[str, Any] = field(default_factory=dict)
     main_worktree: str = ""
+    heartbeat_callback: Callable[[], Mapping[str, Any]] | None = None
+    heartbeat_interval_sec: float = 0.0
 
 
 @dataclass
@@ -535,8 +544,11 @@ def build_observer_poll_plan(
         workspace=request.workspace or str(Path.cwd()),
         prompt=request.prompt,
         timeout_sec=request.timeout_sec,
+        early_progress_timeout_sec=request.early_progress_timeout_sec,
         dispatch_gate=request.dispatch_gate,
         main_worktree=request.main_worktree or str(Path.cwd()),
+        heartbeat_callback=request.heartbeat_callback,
+        heartbeat_interval_sec=request.heartbeat_interval_sec,
     )
     observer_result = run_observer(observer_request, execute=execute)
     invocation = (
@@ -883,6 +895,16 @@ def build_observer_prompt(request: ObserverRunRequest) -> str:
 
 def build_observer_invocation_request(request: ObserverRunRequest) -> AIInvocationRequest:
     workspace = request.workspace or str(Path.cwd())
+    metadata: dict[str, Any] = {
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "observer_launcher": True,
+    }
+    if request.early_progress_timeout_sec:
+        metadata["early_progress_timeout_sec"] = float(request.early_progress_timeout_sec)
+    if request.heartbeat_callback:
+        metadata["heartbeat_callback"] = request.heartbeat_callback
+        metadata["heartbeat_interval_sec"] = float(request.heartbeat_interval_sec or 10.0)
     return AIInvocationRequest(
         role="observer",
         provider=request.provider,
@@ -893,11 +915,7 @@ def build_observer_invocation_request(request: ObserverRunRequest) -> AIInvocati
         timeout_sec=request.timeout_sec,
         auth_mode="cli_auth" if request.backend_mode.endswith("_cli") else "api_key_env",
         route=request.route,
-        metadata={
-            "project_id": request.project_id,
-            "backlog_id": request.backlog_id,
-            "observer_launcher": True,
-        },
+        metadata=metadata,
     )
 
 
@@ -1684,12 +1702,16 @@ def _dogfood_cli_timeout_blocker(
         owned_files=owned_files,
     )
     no_output = bool(invocation.get("output_empty", True))
+    invocation_blocker_id = str(invocation.get("blocker_id") or "")
     observer_command_id = request.task_id or context.task_id
-    blocker_id = (
-        f"{request.backend_mode}_timeout_no_output_no_finish"
-        if no_output
-        else f"{request.backend_mode}_timeout_no_finish"
-    )
+    if invocation_blocker_id:
+        blocker_id = invocation_blocker_id
+    else:
+        blocker_id = (
+            f"{request.backend_mode}_timeout_no_output_no_finish"
+            if no_output
+            else f"{request.backend_mode}_timeout_no_finish"
+        )
     terminal_projection = {
         "schema_version": "observer_command_terminal_projection.v1",
         "passed": False,
@@ -1712,7 +1734,11 @@ def _dogfood_cli_timeout_blocker(
         "observer_command_id": observer_command_id,
     }
     return {
-        "schema_version": "observer_cli_timeout_blocker.v1",
+        "schema_version": (
+            "observer_cli_no_progress_blocker.v1"
+            if invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
+            else "observer_cli_timeout_blocker.v1"
+        ),
         "blocker_id": blocker_id,
         "terminal_blocker": True,
         "terminal_dispatch_blocker": True,
@@ -1739,11 +1765,14 @@ def _dogfood_cli_timeout_blocker(
         "command_projection_status": "failed",
         "calls_models": False,
         "auth_status": invocation.get("auth_status", "cli_timeout"),
+        "invocation_blocker_id": invocation_blocker_id,
+        "runtime_monitor": invocation.get("runtime_monitor") or {},
         "worktree_diff_scope": diff_scope,
         "terminal_contract_projection": terminal_projection,
         "reason": (
-            "CLI backend timed out before finish evidence; worker startup/read receipt "
-            "evidence was prepared for append, and the isolated worktree diff scope is reported."
+            "CLI backend reached a terminal blocker before finish evidence; worker "
+            "startup/read receipt evidence was prepared for append, and the isolated "
+            "worktree diff scope is reported."
         ),
     }
 
@@ -1898,6 +1927,12 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "evidence can satisfy close-sensitive gates, record an "
         "mf_subagent_read_receipt for this visible route contract. A post-hoc "
         "read receipt after counted evidence does not satisfy the ordering gate.\n\n"
+        "Before handing off review_ready, run the local task precheck when "
+        "available, normally `python -m agent.cli mf precommit-check --json-output` "
+        "from the assigned worktree. Include the precheck command, exit code, "
+        "result hash or artifact path, and any model-corrected contract repair in "
+        "final evidence; if the precheck is not applicable, record the concrete "
+        "reason.\n\n"
         "Runtime contract JSON:\n"
         + json.dumps(payload, indent=2, sort_keys=True)
     )
@@ -2541,8 +2576,9 @@ def build_dogfood_observer_run_plan(
         model=request.model,
         backend_mode=request.backend_mode,
         workspace=str(worker_worktree),
-        prompt=request.prompt,
+        prompt=str(runtime_text.get("launch_text") or request.prompt),
         timeout_sec=request.timeout_sec,
+        early_progress_timeout_sec=request.early_progress_timeout_sec,
         dispatch_gate=dispatch_gate,
         main_worktree=str(main_worktree),
     )

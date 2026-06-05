@@ -115,6 +115,7 @@ def _canonical_close_evidence(*, include_close_ready: bool = True, include_clean
             "phase": "startup",
             "status": "accepted",
             "payload": {
+                **CANONICAL_A3_ROUTE,
                 "read_receipt_hash": "sha256:a3-read",
                 "canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH,
             },
@@ -124,7 +125,10 @@ def _canonical_close_evidence(*, include_close_ready: bool = True, include_clean
             "event_kind": "implementation",
             "phase": "implementation",
             "status": "accepted",
-            "payload": {"canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH},
+            "payload": {
+                **CANONICAL_A3_ROUTE,
+                "canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH,
+            },
         },
         {
             "id": 1817,
@@ -185,7 +189,10 @@ def _canonical_close_evidence(*, include_close_ready: bool = True, include_clean
             "event_kind": "close_ready",
             "phase": "close",
             "status": "accepted",
-            "payload": {"canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH},
+            "payload": {
+                **CANONICAL_A3_ROUTE,
+                "canonical_visible_contract_text_hash": CANONICAL_CONTRACT_HASH,
+            },
         })
     return {
         "canonical_close_evidence": {

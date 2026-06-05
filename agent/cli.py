@@ -788,6 +788,12 @@ def _observer_poll_normalize_claim_response(payload: dict) -> dict:
     help="Observer invocation timeout if --execute is used.",
 )
 @click.option(
+    "--early-progress-timeout-sec",
+    default=20.0,
+    type=float,
+    help="Fail codex_cli workers that produce no output or worktree changes before this timeout.",
+)
+@click.option(
     "--execute",
     is_flag=True,
     help="Actually invoke the configured provider after one-hop gate validation.",
@@ -838,6 +844,7 @@ def observer_poll(
     dispatch_gate_file,
     main_worktree,
     timeout_sec,
+    early_progress_timeout_sec,
     execute,
     watch,
     max_commands,
@@ -1027,6 +1034,28 @@ def observer_poll(
                 )
             )
 
+        child_heartbeat_interval_sec = 0.0
+        heartbeat_interval = heartbeat.get("heartbeat_interval_sec")
+        try:
+            if heartbeat_interval:
+                child_heartbeat_interval_sec = max(1.0, min(10.0, float(heartbeat_interval) / 2.0))
+        except (TypeError, ValueError):
+            child_heartbeat_interval_sec = 10.0
+        if not child_heartbeat_interval_sec:
+            child_heartbeat_interval_sec = 10.0
+
+        def child_heartbeat() -> dict[str, Any]:
+            child_result = _observer_poll_heartbeat(
+                base_url=base_url,
+                project_id=project_id,
+                session_id=active_session_id,
+                session_token=active_session_token,
+            )
+            child_result["phase"] = "execute_child"
+            result["heartbeats"].append(child_result)
+            loop["heartbeat_count"] = len(result["heartbeats"])
+            return child_result
+
         plan = build_observer_poll_plan(
             ObserverPollRequest(
                 project_id=project_id,
@@ -1038,8 +1067,11 @@ def observer_poll(
                 workspace=cwd,
                 prompt=prompt,
                 timeout_sec=timeout_sec,
+                early_progress_timeout_sec=early_progress_timeout_sec,
                 dispatch_gate=dispatch_gate,
                 main_worktree=main_worktree or cwd,
+                heartbeat_callback=child_heartbeat if execute else None,
+                heartbeat_interval_sec=child_heartbeat_interval_sec,
             ),
             execute=execute,
         )
@@ -1262,6 +1294,13 @@ def observer_poll(
     help="MF subagent dispatch gate evidence JSON required for live code-mutating backends.",
 )
 @click.option("--main-worktree", default="", help="Target/main worktree path blocked by one-hop dispatch policy.")
+@click.option("--timeout-sec", default=120, type=int, help="Observer invocation timeout if --execute is used.")
+@click.option(
+    "--early-progress-timeout-sec",
+    default=20.0,
+    type=float,
+    help="Fail codex_cli workers that produce no output or worktree changes before this timeout.",
+)
 @click.option("--execute", is_flag=True, help="Actually invoke the configured provider. Default is dry-run evidence only.")
 @click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
 def observer_run(
@@ -1278,6 +1317,8 @@ def observer_run(
     prompt_file,
     dispatch_gate_file,
     main_worktree,
+    timeout_sec,
+    early_progress_timeout_sec,
     execute,
     json_output,
 ):
@@ -1309,6 +1350,8 @@ def observer_run(
         backend_mode=backend_mode,
         workspace=workspace or os.getcwd(),
         prompt=prompt,
+        timeout_sec=timeout_sec,
+        early_progress_timeout_sec=early_progress_timeout_sec,
         dispatch_gate=dispatch_gate,
         main_worktree=main_worktree or os.getcwd(),
     )
@@ -1372,6 +1415,12 @@ def observer_run(
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
 @click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
 @click.option("--timeout-sec", default=120, type=int, help="Observer invocation timeout if --execute is used.")
+@click.option(
+    "--early-progress-timeout-sec",
+    default=20.0,
+    type=float,
+    help="Fail codex_cli workers that produce no output or worktree changes before this timeout.",
+)
 @click.option("--gate-output", "--gate-output-path", "gate_output", default="", type=click.Path(dir_okay=False), help="Optional path to write generated dispatch gate JSON.")
 @click.option("--materialize-worktree", is_flag=True, help="Create the gated worker worktree before planning/execution.")
 @click.option("--execute", is_flag=True, help="Invoke the configured provider after gate and worktree preflight. Default is dry-run evidence only.")
@@ -1406,6 +1455,7 @@ def observer_dogfood(
     base_commit,
     target_head_commit,
     timeout_sec,
+    early_progress_timeout_sec,
     gate_output,
     materialize_worktree,
     execute,
@@ -1456,6 +1506,7 @@ def observer_dogfood(
         base_commit=base_commit,
         target_head_commit=target_head_commit,
         timeout_sec=timeout_sec,
+        early_progress_timeout_sec=early_progress_timeout_sec,
         route_id=route_id,
         precheck_run_id=precheck_run_id,
         visible_injection_manifest_hash=visible_injection_manifest_hash,

@@ -61,6 +61,53 @@ def test_observer_run_dry_run_emits_route_bound_invocation():
     assert evidence["raw_output_stored"] is False
 
 
+def test_observer_run_passes_timeout_and_early_progress_to_runtime(monkeypatch):
+    seen = {}
+
+    def fake_run_observer(request, *, execute=False):
+        seen["timeout_sec"] = request.timeout_sec
+        seen["early_progress_timeout_sec"] = request.early_progress_timeout_sec
+        return {
+            "ok": True,
+            "schema_version": "observer_run.v1",
+            "status": "planned",
+            "execute": execute,
+            "invocation": {
+                "calls_models": False,
+                "auth_status": "not_invoked",
+                "backend_mode": request.backend_mode,
+            },
+        }
+
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "run",
+            "--project-id",
+            "aming-claw",
+            "--backlog-id",
+            "AC-TEST",
+            "--route-context-hash",
+            "sha256:route",
+            "--prompt-contract-id",
+            "rprompt-test",
+            "--timeout-sec",
+            "7",
+            "--early-progress-timeout-sec",
+            "3",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["timeout_sec"] == 7
+    assert seen["early_progress_timeout_sec"] == 3.0
+
+
 def test_observer_run_rejects_missing_route_identity():
     runner = CliRunner()
 
@@ -319,6 +366,80 @@ def test_observer_poll_registers_claims_and_plans_without_service_manager(monkey
     assert planned_payload["uses_task_create"] is False
     assert planned_payload["payload_free_reminder"] is True
     assert planned_payload["reminder_payload_required"] is False
+
+
+def test_observer_poll_execute_keeps_session_alive_during_child_run(monkeypatch):
+    calls = []
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        if url.endswith("/observer-sessions/obs-1/heartbeat"):
+            return 200, {
+                "ok": True,
+                "observer_session_id": "obs-1",
+                "heartbeat_interval_sec": 30,
+            }
+        if url.endswith("/observer-commands/claim"):
+            return 200, {
+                "ok": True,
+                "project_id": "aming-claw",
+                "observer_session_id": "obs-1",
+                "command": _observer_poll_command("cmd-execute"),
+                "empty": False,
+            }
+        if url.endswith("/api/task/aming-claw/timeline"):
+            return 200, {"ok": True, "event_id": len(_observer_poll_timeline_calls(calls))}
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+    def fake_run_observer(request, *, execute=False):
+        assert execute is True
+        assert callable(request.heartbeat_callback)
+        assert request.early_progress_timeout_sec == 4.0
+        heartbeat = request.heartbeat_callback()
+        assert heartbeat["ok"] is True
+        assert heartbeat["phase"] == "execute_child"
+        return {
+            "ok": True,
+            "schema_version": "observer_run.v1",
+            "status": "completed",
+            "execute": execute,
+            "invocation": {
+                "calls_models": True,
+                "auth_status": "cli_auth_unknown",
+                "backend_mode": request.backend_mode,
+            },
+        }
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "observer",
+            "poll",
+            "--project-id",
+            "aming-claw",
+            "--session-id",
+            "obs-1",
+            "--session-token",
+            "secret-token",
+            "--command-id",
+            "cmd-execute",
+            "--execute",
+            "--early-progress-timeout-sec",
+            "4",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["loop"]["heartbeat_count"] == 2
+    assert len(_observer_poll_heartbeat_calls(calls)) == 2
+    assert payload["heartbeats"][-1]["phase"] == "execute_child"
 
 
 def test_observer_poll_can_complete_planned_command(monkeypatch):
@@ -1214,8 +1335,11 @@ def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
         base_commit=commit,
         target_head_commit=commit,
     )
+    captured = {}
 
     def fake_invoke_ai(request):
+        captured["prompt"] = request.prompt
+        captured["metadata"] = dict(request.metadata)
         return AIInvocationResult(
             request=request,
             status="completed",
@@ -1241,6 +1365,10 @@ def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
     read_receipt = payload["read_receipt"]
     assert payload["ok"] is True
     assert payload["status"] == "completed"
+    assert captured["prompt"].startswith("You are a bounded mf_sub implementation worker")
+    assert "mf_subagent_read_receipt" in captured["prompt"]
+    assert "precommit-check" in captured["prompt"]
+    assert captured["metadata"]["early_progress_timeout_sec"] == 20.0
     assert startup_event["event_kind"] == "mf_subagent_startup"
     assert startup_event["status"] == "prepared"
     assert startup_gate["status"] == "prepared"

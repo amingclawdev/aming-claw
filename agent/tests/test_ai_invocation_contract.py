@@ -145,6 +145,63 @@ class TestAIInvocationContract(unittest.TestCase):
         self.assertIn("timed out", evidence["error"])
         self.assertNotIn("private timeout prompt", str(evidence))
 
+    def test_codex_cli_early_no_progress_returns_terminal_blocker(self):
+        from ai_invocation import AIInvocationRequest, invoke_ai
+
+        class _FakeStdin:
+            def write(self, value):
+                self.value = value
+
+            def close(self):
+                self.closed = True
+
+        class _HangingProcess:
+            def __init__(self, *args, **kwargs):
+                self.stdin = _FakeStdin()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = -15
+                return self.returncode
+
+        request = AIInvocationRequest(
+            role="observer",
+            provider="openai",
+            backend_mode="codex_cli",
+            cwd=os.getcwd(),
+            prompt="private no progress prompt",
+            timeout_sec=10,
+            metadata={"early_progress_timeout_sec": 0.01},
+        )
+
+        with patch("ai_invocation.subprocess.Popen", _HangingProcess):
+            result = invoke_ai(request)
+
+        evidence = result.to_evidence()
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(evidence["auth_status"], "cli_no_progress")
+        self.assertEqual(
+            evidence["blocker_id"],
+            "codex_cli_worker_no_progress_no_read_receipt",
+        )
+        self.assertFalse(evidence["calls_models"])
+        self.assertFalse(evidence["runtime_monitor"]["progress_observed"])
+        self.assertFalse(evidence["runtime_monitor"]["early_progress"]["progress_observed"])
+        self.assertNotIn("private no progress prompt", str(evidence))
+
 
 if __name__ == "__main__":
     unittest.main()
