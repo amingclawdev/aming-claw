@@ -2124,6 +2124,123 @@ class TestTaskTimeline(unittest.TestCase):
             "sha256:read-receipt",
         )
 
+    def test_contract_projection_accepts_generated_contract_with_current_runtime_receipt(self):
+        from agent.governance import task_timeline
+
+        runtime_hash = "sha256:runtime-visible-contract"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-GENERATED-CONTRACT",
+            "chain_trigger_json": {},
+        }
+        events = [
+            _mf_subagent_read_receipt_event(event_id=1, contract_hash=runtime_hash),
+            {
+                "id": 2,
+                "event_type": "mf_subagent.graph_query",
+                "event_kind": "graph_query",
+                "phase": "implementation",
+                "status": "passed",
+                "payload": {
+                    "graph_trace_ids": ["gqt-runtime-contract"],
+                    "canonical_visible_contract_text_hash": runtime_hash,
+                },
+            },
+        ]
+
+        projection = task_timeline.mf_contract_projection(events, contract)
+        gate = task_timeline.mf_contract_projection_close_gate_verification(projection)
+
+        self.assertEqual(projection["status"], "current")
+        self.assertFalse(projection["stale"])
+        self.assertFalse(projection["divergent"])
+        self.assertFalse(projection["contract_hash_explicit"])
+        self.assertEqual(projection["contract_hash_source"], "generated")
+        self.assertNotEqual(projection["contract_hash"], runtime_hash)
+        self.assertEqual(projection["observed_contract_hashes"], [runtime_hash])
+        self.assertTrue(projection["read_receipt_gate"]["passed"], projection)
+        self.assertTrue(gate["required"], gate)
+        self.assertTrue(gate["passed"], gate)
+
+    def test_contract_projection_rejects_explicit_hash_mismatch_with_runtime_receipt(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:explicit-contract-current"
+        runtime_hash = "sha256:runtime-visible-contract"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-EXPLICIT-CONTRACT-MISMATCH",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+        events = [
+            _mf_subagent_read_receipt_event(event_id=1, contract_hash=runtime_hash),
+            {
+                "id": 2,
+                "event_type": "mf_subagent.graph_query",
+                "event_kind": "graph_query",
+                "phase": "implementation",
+                "status": "passed",
+                "payload": {
+                    "graph_trace_ids": ["gqt-runtime-contract"],
+                    "canonical_visible_contract_text_hash": runtime_hash,
+                },
+            },
+        ]
+
+        projection = task_timeline.mf_contract_projection(events, contract)
+        gate = task_timeline.mf_contract_projection_close_gate_verification(projection)
+
+        self.assertEqual(projection["status"], "divergent")
+        self.assertTrue(projection["stale"])
+        self.assertTrue(projection["divergent"])
+        self.assertTrue(projection["contract_hash_explicit"])
+        self.assertEqual(projection["contract_hash_source"], "explicit")
+        self.assertEqual(projection["contract_hash"], contract_hash)
+        self.assertEqual(projection["observed_contract_hashes"], [runtime_hash])
+        self.assertFalse(gate["passed"], gate)
+        self.assertEqual(
+            gate["missing_requirement_ids"],
+            ["contract_projection_current", "contract_projection_not_divergent"],
+        )
+
+    def test_contract_projection_generated_contract_still_rejects_post_hoc_read_receipt(self):
+        from agent.governance import task_timeline
+
+        runtime_hash = "sha256:runtime-visible-contract"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-GENERATED-CONTRACT-LATE-RECEIPT",
+            "chain_trigger_json": {},
+        }
+        events = [
+            {
+                "id": 10,
+                "event_type": "mf_subagent.graph_query",
+                "event_kind": "graph_query",
+                "phase": "implementation",
+                "status": "passed",
+                "payload": {
+                    "graph_trace_ids": ["gqt-runtime-contract"],
+                    "canonical_visible_contract_text_hash": runtime_hash,
+                },
+            },
+            _mf_subagent_read_receipt_event(event_id=11, contract_hash=runtime_hash),
+        ]
+
+        projection = task_timeline.mf_contract_projection(events, contract)
+        gate = task_timeline.mf_contract_projection_close_gate_verification(projection)
+
+        self.assertEqual(projection["status"], "stale")
+        self.assertTrue(projection["stale"])
+        self.assertFalse(projection["divergent"])
+        self.assertEqual(projection["contract_hash_source"], "generated")
+        self.assertEqual(projection["read_receipt_gate"]["status"], "out_of_order")
+        self.assertFalse(gate["passed"], gate)
+        self.assertEqual(
+            gate["missing_requirement_ids"],
+            ["contract_projection_current", "mf_subagent_read_receipt_gate"],
+        )
+
     def test_close_precheck_read_receipt_gate_ignores_route_token_dispatch_before_startup(self):
         from agent.governance import task_timeline
 

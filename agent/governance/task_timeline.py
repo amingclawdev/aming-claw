@@ -1123,8 +1123,10 @@ def mf_contract_projection(
         or ""
     ).strip()
     contract_hash = explicit_contract_hash
+    contract_hash_source = "explicit" if explicit_contract_hash else ""
     if root and not contract_hash:
         contract_hash = _canonical_contract_hash(root)
+        contract_hash_source = "generated"
     observed_hashes: set[str] = set()
     for event in rows:
         _collect_contract_hashes(_mapping(event.get("payload")), observed_hashes)
@@ -1138,7 +1140,11 @@ def mf_contract_projection(
         rows,
         route_identity_filter=_read_receipt_lineage_filter_from_route_gate(route_gate),
     )
-    divergent = bool(contract_hash and observed_hashes and contract_hash not in observed_hashes)
+    divergent = bool(
+        explicit_contract_hash
+        and observed_hashes
+        and explicit_contract_hash not in observed_hashes
+    )
     stale = bool(
         divergent
         or (root and not rows)
@@ -1167,6 +1173,7 @@ def mf_contract_projection(
         "divergent": divergent,
         "contract_hash": contract_hash,
         "contract_hash_explicit": bool(explicit_contract_hash),
+        "contract_hash_source": contract_hash_source,
         "observed_contract_hashes": sorted(observed_hashes),
         "read_receipt_gate": read_receipt_gate,
     }
