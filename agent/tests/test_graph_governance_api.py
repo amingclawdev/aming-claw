@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.ai_invocation import RoutePromptContract
 from agent.tests.fixtures.parallel_project import create_parallel_fixture_project
 from agent.tests.fixtures.rule_fingerprint_project import (
     create_rule_fingerprint_git_fixture_project,
@@ -27,6 +28,10 @@ from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 from agent.governance.mf_subagent_contract import MfSubagentContractError
+from agent.observer_runtime import (
+    ObserverRuntimeTextPrepareRequest,
+    build_observer_runtime_text_context,
+)
 from agent.governance.parallel_branch_runtime import (
     BATCH_STATE_OPEN,
     BranchRuntimeFenceError,
@@ -1091,6 +1096,120 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["status"] == "worktree_ready"
     assert lanes[0]["worktree_path"] == context["worktree_path"]
     assert lanes[0]["graph_epoch"]["base_commit"]
+
+
+def test_runtime_text_prepare_accepts_parallel_branch_allocate_evidence(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "Runtime Text Allocate Task",
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "parent_task_id": "AC-RUNTIME-TEXT",
+                "workspace_root": str(repo),
+                "worker_id": "worker api",
+                "merge_queue_id": "mq-runtime-text-api",
+                "create_worktree": True,
+                "now_iso": "2026-05-17T07:12:00Z",
+            },
+        )
+    )
+    assert status == 201
+    allocation_evidence = allocated["branch_runtime_evidence"]
+    assert allocation_evidence["status"] == STATE_WORKTREE_READY
+    assert allocation_evidence["registered"] is True
+
+    prepared = build_observer_runtime_text_context(
+        ObserverRuntimeTextPrepareRequest(
+            project_id=PID,
+            backlog_id="AC-RUNTIME-TEXT",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route-api",
+                prompt_contract_id="rprompt-api",
+                prompt_contract_hash="sha256:prompt-api",
+            ),
+            main_worktree=str(main),
+            owned_files=("agent/observer_runtime.py",),
+            task_id=allocated["context"]["task_id"],
+            parent_task_id=allocated["context"]["root_task_id"],
+            worker_id=allocated["context"]["worker_id"],
+            graph_trace_ids=("gqt-runtime-api",),
+            branch_runtime_evidence=allocation_evidence,
+            route_id="route-api",
+            visible_injection_manifest_hash="sha256:visible-api",
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["status"] == "prepared"
+    assert prepared["runtime_context_id"] == allocation_evidence["runtime_context_id"]
+    assert prepared["runtime_context"]["worktree_path"] == allocated["context"]["worktree_path"]
+    assert prepared["branch_runtime_evidence"]["status"] == STATE_WORKTREE_READY
+    assert prepared["branch_runtime_evidence"]["registered"] is True
+    assert prepared["dispatch_gate_validation"]["startup_intent_event_generated"] is True
+
+
+@pytest.mark.parametrize("path_field", ["worktree_root", "worktree_path"])
+def test_parallel_branch_allocate_accepts_final_absolute_worktree_path(
+    conn,
+    tmp_path,
+    path_field,
+):
+    repo = _git_repo(tmp_path)
+    final_worktree = repo / ".worktrees" / "worker-api" / "api-branch-task"
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "API Branch Task",
+                "batch_id": "PB-api-final-path",
+                "backlog_id": "ARCH-PB-ALLOC",
+                "worker_id": "worker api",
+                "workspace_root": str(repo),
+                "base_commit": "base-api",
+                "target_head_commit": "target-api",
+                "merge_queue_id": "mergeq-api-alloc",
+                "create_worktree": False,
+                path_field: str(final_worktree),
+            },
+        )
+    )
+
+    assert status == 201
+    assert allocated["context"]["worktree_path"] == str(final_worktree)
+    assert allocated["branch_runtime_evidence"]["context"]["worktree_path"] == (
+        str(final_worktree)
+    )
+
+
+def test_parallel_branch_allocate_rejects_ambiguous_absolute_worktree_root(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+
+    with pytest.raises(ValidationError, match="worktree_root appears to include"):
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "API Branch Task",
+                    "backlog_id": "ARCH-PB-ALLOC",
+                    "worker_id": "worker api",
+                    "workspace_root": str(repo),
+                    "worktree_root": str(repo / ".worktrees" / "worker-api"),
+                    "base_commit": "base-api",
+                    "target_head_commit": "target-api",
+                    "merge_queue_id": "mergeq-api-alloc",
+                    "create_worktree": False,
+                },
+            )
+        )
 
 
 def test_parallel_branch_allocate_without_worktree_preserves_materialized_runtime_context(conn):

@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 
+from agent.ai_invocation import RoutePromptContract
+from agent.governance.parallel_branch_runtime import (
+    BranchTaskRuntimeContext,
+    STATE_WORKTREE_READY,
+    branch_runtime_allocation_evidence,
+)
 from agent.observer_runtime import (
     EXECUTE_BACKLOG_ROW_COMMAND_TYPE,
     OBSERVER_POLL_LOOP_SCHEMA_VERSION,
     OBSERVER_POLL_SCHEMA_VERSION,
     OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION,
+    ObserverRuntimeTextPrepareRequest,
     ObserverPollLoopConfig,
     ObserverPollRequest,
+    build_observer_runtime_text_context,
     build_observer_poll_loop_metadata,
     build_observer_poll_plan,
     observer_poll_timeline_payload,
@@ -31,6 +39,73 @@ def _execute_backlog_command(payload: dict | None = None) -> dict:
             "visible_injection_manifest_hash": "sha256:visible",
         },
     }
+
+
+def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    worktree = tmp_path / ".worktrees" / "worker-a1" / "task-a1"
+    allocation_context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-a1",
+        runtime_context_id="mfrctx-runtime-text-a1",
+        backlog_id="AC-RUNTIME-TEXT-A1",
+        root_task_id="AC-RUNTIME-TEXT-A1",
+        stage_task_id="task-a1",
+        stage_type="mf_sub",
+        worker_id="worker-a1",
+        worker_slot_id="worker-a1",
+        fence_token="fence-runtime-text-a1",
+        branch_ref="refs/heads/codex/task-a1",
+        worktree_id="wt-task-a1",
+        worktree_path=str(worktree),
+        base_commit="base-a1",
+        target_head_commit="target-a1",
+        merge_queue_id="mq-runtime-text-a1",
+        status=STATE_WORKTREE_READY,
+    )
+    allocation_evidence = branch_runtime_allocation_evidence(
+        allocation_context,
+        source_ref="/api/graph-governance/aming-claw/parallel-branches/allocate",
+    )
+
+    prepared = build_observer_runtime_text_context(
+        ObserverRuntimeTextPrepareRequest(
+            project_id="aming-claw",
+            backlog_id="AC-RUNTIME-TEXT-A1",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route-a1",
+                prompt_contract_id="rprompt-a1",
+                prompt_contract_hash="sha256:prompt-a1",
+            ),
+            main_worktree=str(main),
+            owned_files=("agent/observer_runtime.py",),
+            task_id="task-a1",
+            parent_task_id="AC-RUNTIME-TEXT-A1",
+            worker_id="worker-a1",
+            graph_trace_ids=("gqt-runtime-text-a1",),
+            branch_runtime_evidence=allocation_evidence,
+            route_id="route-a1",
+            visible_injection_manifest_hash="sha256:visible-a1",
+        )
+    )
+
+    assert allocation_evidence["status"] == STATE_WORKTREE_READY
+    assert allocation_evidence["registered"] is True
+    assert prepared["ok"] is True
+    assert prepared["status"] == "prepared"
+    assert prepared["runtime_context_id"] == "mfrctx-runtime-text-a1"
+    assert prepared["runtime_context"]["worktree_path"] == str(worktree)
+    assert prepared["runtime_context"]["fence_token"] == "fence-runtime-text-a1"
+    assert prepared["runtime_context"]["base_commit"] == "base-a1"
+    assert prepared["runtime_context"]["target_head_commit"] == "target-a1"
+    assert prepared["runtime_context"]["merge_queue_id"] == "mq-runtime-text-a1"
+    assert prepared["branch_runtime_evidence"]["status"] == STATE_WORKTREE_READY
+    assert prepared["branch_runtime_evidence"]["registered"] is True
+    assert prepared["dispatch_gate_validation"]["allowed"] is True
+    assert prepared["startup_intent_event"]["artifact_refs"]["runtime_context_id"] == (
+        "mfrctx-runtime-text-a1"
+    )
 
 
 def test_build_observer_poll_plan_turns_claimed_command_into_dry_run_plan(tmp_path):

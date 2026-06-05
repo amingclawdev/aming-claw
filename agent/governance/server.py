@@ -12,7 +12,7 @@ import sys
 import uuid
 import hashlib
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
@@ -4637,6 +4637,74 @@ def handle_graph_governance_parallel_branches(ctx: RequestContext):
         conn.close()
 
 
+def _parallel_branch_allocate_requested_worktree_path(
+    body: Mapping[str, Any],
+) -> tuple[str, str]:
+    for key in ("worktree_path", "worker_worktree_path", "assigned_worktree"):
+        value = str(body.get(key) or "").strip()
+        if value:
+            return key, value
+    return "", ""
+
+
+def _parallel_branch_allocate_normalize_worktree_path(
+    context: Any,
+    body: Mapping[str, Any],
+    *,
+    worktree_root: str,
+) -> Any:
+    """Accept a final absolute worktree path without appending task segments again."""
+
+    requested_key, requested_worktree = _parallel_branch_allocate_requested_worktree_path(body)
+    final_worktree_path = ""
+    if requested_worktree:
+        requested_path = Path(requested_worktree).expanduser()
+        if not requested_path.is_absolute():
+            raise ValidationError(
+                f"{requested_key} must be an absolute final worktree path; "
+                "use worktree_root for a base directory."
+            )
+        final_worktree_path = str(requested_path)
+
+    root_text = str(worktree_root or "").strip()
+    if root_text:
+        root_path = Path(root_text).expanduser()
+        if root_path.is_absolute():
+            planned_path = Path(str(getattr(context, "worktree_path", "") or "")).expanduser()
+            appended_parts: tuple[str, ...] = ()
+            try:
+                appended_parts = planned_path.relative_to(root_path).parts
+            except ValueError:
+                appended_parts = ()
+            if appended_parts:
+                root_parts = root_path.parts
+                if (
+                    len(root_parts) >= len(appended_parts)
+                    and root_parts[-len(appended_parts) :] == appended_parts
+                ):
+                    root_final_path = str(root_path)
+                    if (
+                        final_worktree_path
+                        and Path(final_worktree_path) != Path(root_final_path)
+                    ):
+                        raise ValidationError(
+                            "worktree_root and worktree_path resolve to different "
+                            "final worktree paths; pass one final worktree_path or "
+                            "a base worktree_root."
+                        )
+                    final_worktree_path = root_final_path
+                elif root_parts[-1:] == appended_parts[:1] and len(appended_parts) > 1:
+                    raise ValidationError(
+                        "worktree_root appears to include the worker slot but not "
+                        "the final task path; pass the base worktree directory or "
+                        "use worktree_path for the final absolute worker worktree."
+                    )
+
+    if final_worktree_path:
+        return replace(context, worktree_path=final_worktree_path)
+    return context
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
 def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     """Allocate and optionally materialize one parallel branch runtime context."""
@@ -4688,6 +4756,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         or ctx.body.get("graph_project_id")
         or project_id
     )
+    worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
     context = plan_branch_runtime_context(
         project_id=project_id,
         task_id=task_id,
@@ -4711,12 +4780,17 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ),
         attempt=_query_int(ctx.body, "attempt", 1),
         branch_prefix=str(ctx.body.get("branch_prefix") or "codex"),
-        worktree_root=str(ctx.body.get("worktree_root") or ".worktrees"),
+        worktree_root=worktree_root,
         ref_name=str(ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"),
         base_commit=base_commit,
         target_head_commit=target_head_commit,
         merge_queue_id=str(ctx.body.get("merge_queue_id") or ""),
         fence_token=allocation_fence_token,
+    )
+    context = _parallel_branch_allocate_normalize_worktree_path(
+        context,
+        ctx.body,
+        worktree_root=worktree_root,
     )
 
     conn = get_connection(project_id)

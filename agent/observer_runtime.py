@@ -1162,6 +1162,9 @@ def _runtime_text_branch_runtime_evidence(
         }
     return {
         "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": supplied.get("status") or "registered",
+        "ok": True,
+        "present": True,
         "source_ref": registration_ref,
         "registration_ref": registration_ref,
         "runtime_context_id": observed_context["runtime_context_id"],
@@ -1232,6 +1235,7 @@ def _runtime_text_apply_branch_runtime_context(
     branch_runtime_registration_ref: str = "",
     branch_runtime_evidence: Mapping[str, Any] | None = None,
     runtime_context_id: str = "",
+    explicit_expected_fields: Mapping[str, str] | None = None,
 ) -> Any:
     packet = _runtime_text_branch_runtime_packet(
         branch_runtime_registration_ref,
@@ -1251,17 +1255,30 @@ def _runtime_text_apply_branch_runtime_context(
     supplied_context = packet.get("context")
     if not isinstance(supplied_context, Mapping):
         return context
+    explicit_expected_fields = dict(explicit_expected_fields or {})
     checks = {
-        "task_id": (context.task_id, str(supplied_context.get("task_id") or "")),
-        "parent_task_id": (parent_task_id, _runtime_text_context_parent(supplied_context)),
-        "fence_token": (context.fence_token, str(supplied_context.get("fence_token") or "")),
-        "base_commit": (context.base_commit, str(supplied_context.get("base_commit") or "")),
+        "task_id": (
+            explicit_expected_fields.get("task_id") or context.task_id,
+            str(supplied_context.get("task_id") or ""),
+        ),
+        "parent_task_id": (
+            explicit_expected_fields.get("parent_task_id") or parent_task_id,
+            _runtime_text_context_parent(supplied_context),
+        ),
+        "fence_token": (
+            explicit_expected_fields.get("fence_token") or "",
+            str(supplied_context.get("fence_token") or ""),
+        ),
+        "base_commit": (
+            explicit_expected_fields.get("base_commit") or "",
+            str(supplied_context.get("base_commit") or ""),
+        ),
         "target_head_commit": (
-            context.target_head_commit,
+            explicit_expected_fields.get("target_head_commit") or "",
             str(supplied_context.get("target_head_commit") or ""),
         ),
         "merge_queue_id": (
-            context.merge_queue_id,
+            explicit_expected_fields.get("merge_queue_id") or "",
             str(supplied_context.get("merge_queue_id") or ""),
         ),
     }
@@ -1947,6 +1964,14 @@ def build_observer_runtime_text_context(
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
         branch_runtime_evidence=request.branch_runtime_evidence,
         runtime_context_id=request.runtime_context_id,
+        explicit_expected_fields={
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "fence_token": request.fence_token,
+            "base_commit": request.base_commit,
+            "target_head_commit": request.target_head_commit,
+            "merge_queue_id": request.merge_queue_id,
+        },
     )
     owned_files = _runtime_text_items(request.owned_files)
     graph_trace_ids = _runtime_text_items(request.graph_trace_ids)
