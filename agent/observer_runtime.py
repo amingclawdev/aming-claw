@@ -974,15 +974,20 @@ def _runtime_text_branch_runtime_evidence(
     nested = supplied.get("branch_runtime_evidence")
     if isinstance(nested, Mapping):
         supplied = {**supplied, **dict(nested)}
-    registration_ref = str(
-        branch_runtime_registration_ref
-        or supplied.get("registration_ref")
+    supplied_registration_ref = str(
+        supplied.get("registration_ref")
         or supplied.get("source_ref")
         or supplied.get("allocation_source_ref")
         or supplied.get("api_ref")
         or supplied.get("api_route")
         or ""
     ).strip()
+    requested_registration_ref = str(branch_runtime_registration_ref or "").strip()
+    registration_ref = (
+        supplied_registration_ref
+        if requested_registration_ref.startswith("mfrctx-")
+        else (requested_registration_ref or supplied_registration_ref)
+    )
     planned_context = {
         "runtime_context_id": runtime_context_id_for_branch_context(context),
         "governance_project_id": context.governance_project_id or project_id,

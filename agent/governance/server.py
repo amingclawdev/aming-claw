@@ -18733,6 +18733,7 @@ def _runtime_text_prepare_allocation_required_evidence(
     *,
     runtime_context_id: str = "",
     message: str,
+    missing_fields: list[str] | None = None,
     mismatches: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -18745,6 +18746,7 @@ def _runtime_text_prepare_allocation_required_evidence(
         "runtime_context_id": runtime_context_id,
         "source": "observer_runtime_text_prepare",
         "message": message,
+        "missing_fields": missing_fields or [],
         "mismatches": mismatches or [],
     }
 
@@ -18813,10 +18815,16 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
         for field, (expected, actual) in comparisons.items()
         if expected and actual and expected != actual
     ]
-    if mismatches:
+    missing_fields = [
+        field
+        for field, (expected, actual) in comparisons.items()
+        if expected and not actual
+    ]
+    if missing_fields or mismatches:
         return _runtime_text_prepare_allocation_required_evidence(
             runtime_context_id=runtime_context_id,
             message="Persisted branch runtime allocation identity mismatch.",
+            missing_fields=missing_fields,
             mismatches=mismatches,
         )
 

@@ -1205,6 +1205,68 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert evidence["context"]["worktree_path"] == str(worktree)
 
 
+def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref(conn, tmp_path):
+    workspace = tmp_path / "workers"
+    main = tmp_path / "main"
+    main.mkdir()
+    status_code, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "task_id": "runtime-text-task",
+                "parent_task_id": "AC-RUNTIME-TEXT",
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "worker_id": "worker-api",
+                "workspace_root": str(workspace),
+                "fence_token": "fence-runtime-text-api",
+                "base_commit": "base-api",
+                "target_head_commit": "target-api",
+                "merge_queue_id": "mq-runtime-text-api",
+                "create_worktree": False,
+            },
+        )
+    )
+    assert status_code == 201
+    context = allocated["context"]
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "task_id": context["task_id"],
+                "parent_task_id": context["root_task_id"],
+                "branch_runtime_registration_ref": context["runtime_context_id"],
+                "fence_token": context["fence_token"],
+                "worktree_path": context["worktree_path"],
+                "base_commit": context["base_commit"],
+                "target_head_commit": context["target_head_commit"],
+                "merge_queue_id": context["merge_queue_id"],
+                "route_context_hash": "sha256:route-api",
+                "route_id": "route-api",
+                "prompt_contract_id": "rprompt-api",
+                "prompt_contract_hash": "sha256:prompt-api",
+                "visible_injection_manifest_hash": "sha256:visible-api",
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-api"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["status"] == "prepared"
+    assert prepared["runtime_context_id"] == context["runtime_context_id"]
+    assert prepared["runtime_context"]["worktree_path"] == context["worktree_path"]
+    evidence = prepared["branch_runtime_evidence"]
+    assert evidence["registered"] is True
+    assert evidence["registration_ref"].endswith("/parallel-branches/allocate")
+    assert evidence["registration_source"] == "persisted_branch_runtime_context"
+
+
 def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(conn, tmp_path):
     main = tmp_path / "main"
     main.mkdir()
@@ -1291,6 +1353,82 @@ def test_observer_runtime_text_prepare_rejects_runtime_context_identity_mismatch
     assert prepared["status"] == "allocation_required"
     assert prepared["branch_runtime_evidence"]["registered"] is False
     assert prepared["branch_runtime_evidence"]["mismatches"][0]["field"] == "fence_token"
+
+
+@pytest.mark.parametrize(
+    ("body_field", "expected_field", "wrong_value"),
+    [
+        ("task_id", "task_id", "wrong-runtime-text-task"),
+        ("parent_task_id", "parent_task_id", "wrong-parent"),
+        ("worktree_path", "worktree_path", "/wrong/worktree"),
+        ("base_commit", "base_commit", "wrong-base"),
+        ("target_head_commit", "target_head_commit", "wrong-target"),
+        ("merge_queue_id", "merge_queue_id", "wrong-merge-queue"),
+    ],
+)
+def test_observer_runtime_text_prepare_rejects_persisted_runtime_context_mismatches(
+    conn,
+    tmp_path,
+    body_field,
+    expected_field,
+    wrong_value,
+):
+    worktree = tmp_path / "worker"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-text-task",
+            runtime_context_id="mfrctx-runtime-text-api",
+            backlog_id="AC-RUNTIME-TEXT",
+            root_task_id="AC-RUNTIME-TEXT",
+            stage_task_id="runtime-text-task",
+            fence_token="fence-runtime-text-api",
+            branch_ref="refs/heads/codex/runtime-text-task",
+            worktree_path=str(worktree),
+            base_commit="base-api",
+            target_head_commit="target-api",
+            merge_queue_id="mq-runtime-text-api",
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    main = tmp_path / "main"
+    main.mkdir()
+    body = {
+        "backlog_id": "AC-RUNTIME-TEXT",
+        "task_id": "runtime-text-task",
+        "parent_task_id": "AC-RUNTIME-TEXT",
+        "branch_runtime_registration_ref": "mfrctx-runtime-text-api",
+        "fence_token": "fence-runtime-text-api",
+        "worktree_path": str(worktree),
+        "base_commit": "base-api",
+        "target_head_commit": "target-api",
+        "merge_queue_id": "mq-runtime-text-api",
+        "route_context_hash": "sha256:route-api",
+        "route_id": "route-api",
+        "prompt_contract_id": "rprompt-api",
+        "visible_injection_manifest_hash": "sha256:visible-api",
+        "main_worktree": str(main),
+        "owned_files": ["agent/observer_runtime.py"],
+        "graph_trace_ids": ["gqt-runtime-api"],
+    }
+    body[body_field] = wrong_value
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert prepared["ok"] is False
+    assert prepared["status"] == "allocation_required"
+    assert prepared["branch_runtime_evidence"]["registered"] is False
+    assert any(
+        mismatch["field"] == expected_field
+        for mismatch in prepared["branch_runtime_evidence"]["mismatches"]
+    )
 
 
 def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):
