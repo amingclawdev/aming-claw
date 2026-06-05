@@ -130,10 +130,12 @@ def _route_context_qa_verification_event():
     }
 
 
-def _mf_subagent_read_receipt_event(event_id=0, contract_hash=""):
+def _mf_subagent_read_receipt_event(event_id=0, contract_hash="", identity=None):
     payload = {"read_receipt_hash": "sha256:test-read-receipt"}
     if contract_hash:
         payload["canonical_visible_contract_text_hash"] = contract_hash
+    if identity:
+        payload.update(identity)
     return {
         "id": event_id,
         "event_type": "mf_subagent.read_receipt",
@@ -2227,6 +2229,128 @@ class TestTaskTimeline(unittest.TestCase):
             "out_of_order",
         )
 
+    def test_route_identity_cleanup_scopes_read_receipt_gate_to_current_lineage(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:contract-projection-clean-current-lineage"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-READ-RECEIPT-CLEANUP-LINEAGE",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+        stale_identity = {
+            "route_context_hash": "sha256:stale-a3-route-context",
+            "prompt_contract_id": "rprompt-stale-a3",
+            "prompt_contract_hash": "sha256:stale-a3-prompt",
+        }
+
+        stale_route_events = _replace_route_identity(
+            _route_context_consumption_events(),
+            stale_identity,
+        )
+        for event_id, event in zip(range(2030, 2034), stale_route_events):
+            event["id"] = event_id
+        stale_read_receipt = _mf_subagent_read_receipt_event(
+            event_id=2034,
+            contract_hash=contract_hash,
+            identity=stale_identity,
+        )
+
+        current_route_events = _route_context_consumption_events()
+        for event_id, event in zip((2040, 2041, 2044, 2046), current_route_events):
+            event["id"] = event_id
+        current_read_receipt = _mf_subagent_read_receipt_event(
+            event_id=2045,
+            contract_hash=contract_hash,
+            identity=ROUTE_IDENTITY,
+        )
+        current_qa = _route_context_qa_verification_event()
+        current_qa["id"] = 2047
+        cleanup = {
+            "id": 2048,
+            "event_kind": "route_identity_cleanup",
+            "phase": "identity_recovery",
+            "status": "accepted",
+            "payload": {"route_identity_cleanup": ROUTE_IDENTITY},
+        }
+        close_events = [
+            {
+                "id": 2049,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
+            },
+            {"id": 2050, "event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"id": 2051, "event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        events = [
+            *stale_route_events,
+            stale_read_receipt,
+            *current_route_events[:3],
+            current_read_receipt,
+            current_route_events[3],
+            current_qa,
+            *close_events,
+        ]
+
+        poisoned = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(poisoned["passed"], poisoned)
+        self.assertEqual(poisoned["checks"]["mf_subagent_read_receipt_gate"], "out_of_order")
+        self.assertEqual(
+            poisoned["contract_projection"]["read_receipt_gate"]["first_counted_evidence_event_id"],
+            2033,
+        )
+        self.assertEqual(
+            poisoned["contract_projection"]["read_receipt_gate"]["read_receipt_event_id"],
+            2034,
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [*events, cleanup],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["checks"]["mf_subagent_read_receipt_gate"], "passed")
+        self.assertEqual(
+            ready["contract_projection_gate"]["missing_requirement_ids"],
+            [],
+        )
+        self.assertTrue(
+            ready["route_context_gate"]["route_identity_cleanup"]["applied"]
+        )
+        read_gate = ready["contract_projection"]["read_receipt_gate"]
+        self.assertTrue(read_gate["lineage_filter_applied"], read_gate)
+        self.assertEqual(read_gate["lineage_route_identity"], ROUTE_IDENTITY)
+        self.assertEqual(read_gate["read_receipt_event_id"], 2045)
+        self.assertEqual(read_gate["first_counted_evidence_event_id"], 2046)
+        self.assertEqual(read_gate["status"], "passed")
+        self.assertIn(2033, read_gate["lineage_ignored_event_ids"])
+        self.assertIn(2034, read_gate["lineage_ignored_event_ids"])
+        self.assertIn(2046, read_gate["counted_evidence_event_ids"])
+        self.assertIn(2049, read_gate["counted_evidence_event_ids"])
+        self.assertNotIn(2033, read_gate["counted_evidence_event_ids"])
+
+        missing_current_read = task_timeline.mf_close_gate_verification(
+            [event for event in [*events, cleanup] if event.get("id") != 2045],
+            contract=contract,
+        )
+
+        self.assertFalse(missing_current_read["passed"], missing_current_read)
+        self.assertEqual(
+            missing_current_read["contract_projection"]["read_receipt_gate"]["status"],
+            "missing",
+        )
+        self.assertIn(
+            "mf_subagent_read_receipt_gate",
+            missing_current_read["contract_projection_gate"]["missing_requirement_ids"],
+        )
+
     def test_mf_close_gate_requires_instantiated_contract_evidence(self):
         from agent.governance import task_timeline
 
@@ -3231,13 +3355,20 @@ class TestTaskTimeline(unittest.TestCase):
             _route_context_qa_verification_event(),
         ]
         close_events = [
-            _mf_subagent_read_receipt_event(event_id=0, contract_hash=contract_hash),
+            _mf_subagent_read_receipt_event(
+                event_id=0,
+                contract_hash=contract_hash,
+                identity=ROUTE_IDENTITY,
+            ),
             {
                 "id": 1811,
                 "event_kind": "implementation",
                 "phase": "implementation",
                 "status": "accepted",
-                "payload": {"canonical_visible_contract_text_hash": contract_hash},
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
             },
             {"id": 1817, "event_kind": "verification", "phase": "verification", "status": "passed"},
             {"id": 1835, "event_kind": "close_ready", "phase": "close", "status": "accepted"},

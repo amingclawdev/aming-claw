@@ -847,17 +847,83 @@ def _is_counted_mf_subagent_evidence_event(event: dict[str, Any]) -> bool:
     return bool(payload.get("graph_trace_ids") or payload.get("changed_files"))
 
 
+def _read_receipt_gate_event_ref(
+    event: dict[str, Any],
+    *,
+    reason: str = "",
+) -> dict[str, Any]:
+    ref = {
+        "id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "event_type": event.get("event_type"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+    }
+    if reason:
+        ref["reason"] = reason
+    return {key: value for key, value in ref.items() if value not in (None, "")}
+
+
+def _read_receipt_gate_route_identity(event: dict[str, Any]) -> dict[str, str]:
+    identity = _route_identity(event)
+    if identity and "mf_subagent_startup" in _route_event_categories(event):
+        identity, _lineage = _route_parent_child_startup_identity(event, identity)
+    return identity
+
+
+def _read_receipt_lineage_filter_from_route_gate(
+    route_context_gate: dict[str, Any] | None,
+) -> dict[str, str]:
+    cleanup = _mapping(_mapping(route_context_gate).get("route_identity_cleanup"))
+    if not cleanup.get("applied"):
+        return {}
+    identity = _mapping(cleanup.get("route_identity"))
+    return {
+        field: str(identity.get(field) or "").strip()
+        for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+        if str(identity.get(field) or "").strip()
+    }
+
+
 def mf_subagent_read_receipt_gate_verification(
     events: list[dict[str, Any]] | None,
+    *,
+    route_identity_filter: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     rows = [event for event in (events or []) if isinstance(event, dict)]
+    lineage_filter = _mapping(route_identity_filter)
     read_receipts: list[tuple[int, int, dict[str, Any]]] = []
     counted: list[tuple[int, int, dict[str, Any]]] = []
+    lineage_ignored: list[dict[str, Any]] = []
+    lineage_matched: list[dict[str, Any]] = []
     for index, event in enumerate(rows):
         order = _event_numeric_id(event) or index + 1
-        if _is_mf_subagent_read_receipt_event(event):
+        read_receipt_event = _is_mf_subagent_read_receipt_event(event)
+        counted_evidence_event = _is_counted_mf_subagent_evidence_event(event)
+        if not read_receipt_event and not counted_evidence_event:
+            continue
+        if lineage_filter:
+            identity = _read_receipt_gate_route_identity(event)
+            if not identity:
+                lineage_ignored.append(
+                    _read_receipt_gate_event_ref(
+                        event,
+                        reason="missing_route_identity_for_current_lineage",
+                    )
+                )
+                continue
+            if not _route_identity_matches_filter(identity, lineage_filter):
+                lineage_ignored.append(
+                    _read_receipt_gate_event_ref(
+                        event,
+                        reason="superseded_route_identity",
+                    )
+                )
+                continue
+            lineage_matched.append(_read_receipt_gate_event_ref(event))
+        if read_receipt_event:
             read_receipts.append((order, index, event))
-        elif _is_counted_mf_subagent_evidence_event(event):
+        elif counted_evidence_event:
             counted.append((order, index, event))
     first_read = min(read_receipts, default=None, key=lambda item: (item[0], item[1]))
     first_counted = min(counted, default=None, key=lambda item: (item[0], item[1]))
@@ -916,6 +982,15 @@ def mf_subagent_read_receipt_gate_verification(
         "first_counted_evidence_order": list(first_counted_order)
         if first_counted_order
         else [],
+        "lineage_filter_applied": bool(lineage_filter),
+        "lineage_route_identity": lineage_filter,
+        "lineage_matched_event_ids": [
+            item.get("id") for item in lineage_matched if item.get("id") is not None
+        ],
+        "lineage_ignored_event_ids": [
+            item.get("id") for item in lineage_ignored if item.get("id") is not None
+        ],
+        "lineage_ignored_events": lineage_ignored,
     }
 
 
@@ -943,6 +1018,7 @@ def _collect_contract_hashes(value: Any, hashes: set[str], *, depth: int = 0) ->
 def mf_contract_projection(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
+    route_context_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows = [event for event in (events or []) if isinstance(event, dict)]
     root = _contract_root(contract)
@@ -961,7 +1037,13 @@ def mf_contract_projection(
         _collect_contract_hashes(_mapping(event.get("verification")), observed_hashes)
         _collect_contract_hashes(_mapping(event.get("artifact_refs")), observed_hashes)
     watermark = max((_event_numeric_id(event) for event in rows), default=0) or len(rows)
-    read_receipt_gate = mf_subagent_read_receipt_gate_verification(rows)
+    route_gate = _mapping(route_context_gate)
+    if not route_gate:
+        route_gate = mf_route_context_gate_verification(rows, contract)
+    read_receipt_gate = mf_subagent_read_receipt_gate_verification(
+        rows,
+        route_identity_filter=_read_receipt_lineage_filter_from_route_gate(route_gate),
+    )
     divergent = bool(contract_hash and observed_hashes and contract_hash not in observed_hashes)
     stale = bool(
         divergent
@@ -2875,7 +2957,11 @@ def mf_close_gate_verification(
     contract_gate = mf_contract_gate_verification(rows, contract)
     route_context_gate = mf_route_context_gate_verification(rows, contract)
     lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
-    contract_projection = mf_contract_projection(rows, contract)
+    contract_projection = mf_contract_projection(
+        rows,
+        contract,
+        route_context_gate=route_context_gate,
+    )
     contract_projection_gate = mf_contract_projection_close_gate_verification(
         contract_projection,
         route_context_gate,
