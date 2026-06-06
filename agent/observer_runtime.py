@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -105,6 +109,9 @@ RUNTIME_TEXT_REQUIRED_EVIDENCE = (
 RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS = (
     "/parallel-branches/allocate",
     "parallel-branches/allocate",
+    "/parallel-branches/runtime-contexts/",
+    "parallel-branches/runtime-contexts/",
+    "/runtime-contract",
     "upsert_branch_context",
 )
 RUNTIME_TEXT_REQUIRED_LANES = (
@@ -1560,6 +1567,133 @@ def _runtime_text_allocation_required_evidence(
     }
 
 
+def _runtime_text_governance_url() -> str:
+    return os.getenv("GOVERNANCE_URL", "http://localhost:40000").rstrip("/")
+
+
+def _runtime_text_contract_service_query(
+    *,
+    runtime_context_id: str,
+    task_id: str = "",
+    parent_task_id: str = "",
+    fence_token: str = "",
+) -> dict[str, str]:
+    query = {
+        "runtime_context_id": runtime_context_id,
+        "worker_role": "mf_sub",
+    }
+    if task_id:
+        query["task_id"] = task_id
+    if parent_task_id:
+        query["parent_task_id"] = parent_task_id
+    if fence_token:
+        query["fence_token"] = fence_token
+    return query
+
+
+def _runtime_text_contract_service_url(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    query: Mapping[str, str],
+) -> str:
+    base_url = _runtime_text_governance_url()
+    quoted_project = urllib.parse.quote(project_id, safe="")
+    quoted_runtime = urllib.parse.quote(runtime_context_id, safe="")
+    encoded_query = urllib.parse.urlencode(dict(query))
+    return (
+        f"{base_url}/api/graph-governance/{quoted_project}/parallel-branches/"
+        f"runtime-contexts/{quoted_runtime}/runtime-contract?{encoded_query}"
+    )
+
+
+def _runtime_text_runtime_contract_context(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    contract = payload.get("runtime_contract")
+    contract = contract if isinstance(contract, Mapping) else {}
+    context = contract.get("runtime_context")
+    return context if isinstance(context, Mapping) else {}
+
+
+def _runtime_text_branch_evidence_from_runtime_contract(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    payload: Mapping[str, Any],
+    source_ref: str,
+) -> dict[str, Any]:
+    context = dict(_runtime_text_runtime_contract_context(payload))
+    context_runtime_id = str(context.get("runtime_context_id") or "").strip()
+    if not context or context_runtime_id != runtime_context_id:
+        return {}
+    context.setdefault("project_id", project_id)
+    context.setdefault(
+        "governance_project_id",
+        payload.get("governance_project_id") or project_id,
+    )
+    context.setdefault("target_project_id", payload.get("target_project_id") or project_id)
+    context.setdefault(
+        "allocation_owner",
+        context.get("observer_allocation_owner") or context.get("agent_id") or "",
+    )
+    context.setdefault("observer_allocation_owner", context.get("allocation_owner") or "")
+    context.setdefault("worker_slot_id", context.get("worker_id") or "")
+    return {
+        "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": context.get("status") or "registered",
+        "ok": True,
+        "present": True,
+        "registered": True,
+        "allocation_required": False,
+        "source_ref": source_ref,
+        "registration_ref": source_ref,
+        "allocation_source_ref": source_ref,
+        "registration_source": "runtime_contract_service",
+        "runtime_context_id": runtime_context_id,
+        "context": context,
+    }
+
+
+def _runtime_text_get_service_branch_runtime_evidence(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str = "",
+    parent_task_id: str = "",
+    fence_token: str = "",
+) -> dict[str, Any]:
+    runtime_id = str(runtime_context_id or "").strip()
+    if not runtime_id:
+        return {}
+    query = _runtime_text_contract_service_query(
+        runtime_context_id=runtime_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=fence_token,
+    )
+    url = _runtime_text_contract_service_url(
+        project_id=project_id,
+        runtime_context_id=runtime_id,
+        query=query,
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - local governance URL
+            body = response.read().decode("utf-8")
+    except (OSError, urllib.error.URLError, TimeoutError):
+        return {}
+    try:
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, Mapping) or not payload.get("ok"):
+        return {}
+    return _runtime_text_branch_evidence_from_runtime_contract(
+        project_id=project_id,
+        runtime_context_id=runtime_id,
+        payload=payload,
+        source_ref=url,
+    )
+
+
 def _runtime_text_runtime_context_id_from_packet(
     *,
     branch_runtime_registration_ref: str,
@@ -1689,6 +1823,18 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
     if not lookup_runtime_context_id and not lookup_task_id:
         return packet
 
+    expected = dict(expected_fields or {})
+    if lookup_runtime_context_id:
+        service_packet = _runtime_text_get_service_branch_runtime_evidence(
+            project_id=project_id,
+            runtime_context_id=lookup_runtime_context_id,
+            task_id=lookup_task_id,
+            parent_task_id=str(expected.get("parent_task_id") or ""),
+            fence_token=str(expected.get("fence_token") or ""),
+        )
+        if service_packet:
+            return service_packet
+
     source_ref = str(
         packet.get("registration_ref")
         or packet.get("source_ref")
@@ -1737,7 +1883,7 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
 
     missing, mismatches = _runtime_text_expected_field_mismatches(
         context,
-        expected_fields=expected_fields,
+        expected_fields=expected,
     )
     if missing or mismatches:
         return _runtime_text_allocation_required_evidence(

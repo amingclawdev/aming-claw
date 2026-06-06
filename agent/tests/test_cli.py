@@ -1115,13 +1115,14 @@ def test_observer_dogfood_dry_run_generates_valid_gate_and_plan_without_model_ca
     assert evidence["route_prompt_contract"]["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
 
 
-def test_observer_dogfood_hydrates_persisted_runtime_context_without_evidence_file(
+def test_observer_dogfood_hydrates_runtime_contract_service_after_db_miss(
     monkeypatch,
     tmp_path,
 ):
     from agent.governance.parallel_branch_runtime import (
         BranchTaskRuntimeContext,
         STATE_WORKTREE_READY,
+        branch_runtime_allocation_evidence,
     )
 
     import agent.observer_runtime as observer_runtime
@@ -1155,16 +1156,42 @@ def test_observer_dogfood_hydrates_persisted_runtime_context_without_evidence_fi
         merge_queue_id="mq-dogfood-test",
         status=STATE_WORKTREE_READY,
     )
-    lookups = []
+    service_lookups = []
+    db_lookups = []
 
-    def fake_lookup(*, project_id, runtime_context_id="", task_id=""):
-        lookups.append((project_id, runtime_context_id, task_id))
-        return persisted_context
+    def fake_service_lookup(
+        *,
+        project_id,
+        runtime_context_id,
+        task_id="",
+        parent_task_id="",
+        fence_token="",
+    ):
+        service_lookups.append(
+            (project_id, runtime_context_id, task_id, parent_task_id, fence_token)
+        )
+        return branch_runtime_allocation_evidence(
+            persisted_context,
+            source_ref=(
+                "http://localhost:40000/api/graph-governance/aming-claw/"
+                "parallel-branches/runtime-contexts/mfrctx-dogfood-cli/runtime-contract"
+            ),
+            registration_source="runtime_contract_service",
+        )
+
+    def fake_db_lookup(*, project_id, runtime_context_id="", task_id=""):
+        db_lookups.append((project_id, runtime_context_id, task_id))
+        return None
 
     monkeypatch.setattr(
         observer_runtime,
+        "_runtime_text_get_service_branch_runtime_evidence",
+        fake_service_lookup,
+    )
+    monkeypatch.setattr(
+        observer_runtime,
         "_runtime_text_get_persisted_branch_context",
-        fake_lookup,
+        fake_db_lookup,
     )
     args = _without_option(
         _dogfood_args(tmp_path),
@@ -1176,7 +1203,16 @@ def test_observer_dogfood_hydrates_persisted_runtime_context_without_evidence_fi
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert lookups
+    assert service_lookups == [
+        (
+            "aming-claw",
+            "mfrctx-dogfood-cli",
+            DOGFOOD_BACKLOG_ID,
+            DOGFOOD_BACKLOG_ID,
+            "fence-dogfood-test",
+        )
+    ]
+    assert db_lookups == []
     assert payload["ok"] is True
     assert payload["calls_models"] is False
     assert payload["runtime_context"]["runtime_context_id"] == "mfrctx-dogfood-cli"
@@ -1193,7 +1229,7 @@ def test_observer_dogfood_hydrates_persisted_runtime_context_without_evidence_fi
     branch_runtime = payload["dispatch_gate"]["branch_runtime_evidence"]
     assert branch_runtime["registered"] is True
     assert branch_runtime["allocation_required"] is False
-    assert branch_runtime["registration_source"] == "persisted_branch_runtime_context"
+    assert branch_runtime["registration_source"] == "runtime_contract_service"
     assert payload["dispatch_gate_validation"]["allowed"] is True
     assert payload["runtime_text"]["runtime_context"]["allocation_owner"] == (
         "persisted-observer-owner"

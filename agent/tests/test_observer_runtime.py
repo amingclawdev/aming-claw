@@ -322,6 +322,10 @@ def test_runtime_text_prepare_hydrates_persisted_allocation_from_runtime_context
         "agent.observer_runtime._runtime_text_get_persisted_branch_context",
         fake_lookup,
     )
+    monkeypatch.setattr(
+        "agent.observer_runtime._runtime_text_get_service_branch_runtime_evidence",
+        lambda **_kwargs: {},
+    )
 
     prepared = build_observer_runtime_text_context(
         ObserverRuntimeTextPrepareRequest(
