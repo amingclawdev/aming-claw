@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { normalizeTaskPlaybackTrace } from "../lib/taskPlayback";
+import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
   BacklogResponse,
@@ -33,6 +35,10 @@ const ROUTE_SERVICE_REQUIREMENTS = ["route_context", "route_action_precheck"];
 const ROUTE_WORKER_REQUIREMENTS = ["bounded_implementation_worker_dispatch", "mf_subagent_startup"];
 const ROUTE_QA_REQUIREMENTS = ["independent_verification_lane"];
 const ROUTE_IDENTITY_REQUIREMENTS = ["route_identity_mismatch", "same_route_identity", "route_identity_cleanup"];
+
+function playbackHref(projectId: string): string {
+  return `?project_id=${encodeURIComponent(projectId)}&view=playback`;
+}
 
 export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
   {
@@ -591,9 +597,14 @@ export default function BacklogView({ backlog, projectId }: Props) {
           <strong>Project memory.</strong> Backlog rows live in the local governance DB. Git/plugin updates move code;
           they do not sync backlog rows unless you import a portable export.
         </div>
-        <button className="action-btn" onClick={copySyncCommands} title="Copy portable backlog export/import commands">
-          {copyState === "copied" ? "Copied sync commands" : copyState === "failed" ? "Copy failed" : "Copy sync commands"}
-        </button>
+        <div className="backlog-guidance-actions">
+          <a className="action-btn" href={playbackHref(projectId)} title="Open governed task playback">
+            Task Playback
+          </a>
+          <button className="action-btn" onClick={copySyncCommands} title="Copy portable backlog export/import commands">
+            {copyState === "copied" ? "Copied sync commands" : copyState === "failed" ? "Copy failed" : "Copy sync commands"}
+          </button>
+        </div>
       </div>
 
       <FixtureStreamReplay />
@@ -665,6 +676,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
                   <BacklogRow
                     key={bug.bug_id}
                     bug={bug}
+                    projectId={projectId}
                     timeline={timelineByBug[bug.bug_id]}
                     onToggleTimeline={() => toggleTimeline(bug.bug_id)}
                     onOpenDetail={() => openDetail(bug.bug_id)}
@@ -825,11 +837,13 @@ function ReplayStateItem({ label, value, tone }: { label: string; value: string;
 
 function BacklogRow({
   bug,
+  projectId,
   timeline,
   onToggleTimeline,
   onOpenDetail,
 }: {
   bug: BacklogBug;
+  projectId: string;
   timeline?: TimelineState;
   onToggleTimeline: () => void;
   onOpenDetail: () => void;
@@ -930,7 +944,7 @@ function BacklogRow({
       {timeline?.expanded ? (
         <tr className="backlog-timeline-row">
           <td colSpan={6}>
-            <TimelinePanel timeline={timeline} backlogId={bug.bug_id} />
+            <TimelinePanel timeline={timeline} backlogId={bug.bug_id} projectId={projectId} bug={bug} />
           </td>
         </tr>
       ) : null}
@@ -938,7 +952,7 @@ function BacklogRow({
   );
 }
 
-function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backlogId: string }) {
+function TimelinePanel({ timeline, backlogId, projectId, bug }: { timeline: TimelineState; backlogId: string; projectId: string; bug: BacklogBug }) {
   const count = timeline.count ?? timeline.events.length;
   const gate = timeline.gate?.timeline_gate;
   const lanes = buildTimelineLanes(timeline.events);
@@ -946,6 +960,13 @@ function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backl
   const hasImplementationEvidence = implementationSteps.length > 0;
   const observerEvents = timeline.events.filter(isObserverOrchestrationEvent);
   const gateState = gateEvidenceState(timeline.gate, timeline.events);
+  const playbackTrace = useMemo(() => normalizeTaskPlaybackTrace({
+    projectId,
+    backlog: bug,
+    taskTimeline: { project_id: projectId, backlog_id: backlogId, events: timeline.events, count },
+    gateResponse: timeline.gate ?? null,
+    source: "governed",
+  }), [backlogId, bug, count, projectId, timeline.events, timeline.gate]);
   return (
     <div className={`backlog-timeline-panel ${hasImplementationEvidence ? "implementation-focused" : ""}`}>
       <div className="backlog-timeline-head">
@@ -966,6 +987,9 @@ function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backl
         <GateSummary gate={gate} response={timeline.gate} />
       ) : null}
       {!timeline.loading && !timeline.error && gate ? <RouteContextGuidancePanel gate={gate} /> : null}
+      {!timeline.loading && !timeline.error && timeline.events.length > 0 ? (
+        <TaskPlaybackPanel trace={playbackTrace} compact />
+      ) : null}
       {!timeline.loading && !timeline.error && implementationSteps.length > 0 ? (
         <ImplementationStepGrid steps={implementationSteps} observerEventCount={observerEvents.length} />
       ) : null}

@@ -37,11 +37,12 @@ import OperationsQueueView from "./views/OperationsQueueView";
 import ReviewQueueView from "./views/ReviewQueueView";
 import GraphView from "./views/GraphView";
 import BacklogView from "./views/BacklogView";
+import TaskPlaybackView from "./views/TaskPlaybackView";
 import AssetInboxView from "./views/AssetInboxView";
 import ProjectConsoleView from "./views/ProjectConsoleView";
 import ProjectInboxView from "./views/ProjectInboxView";
 
-export type ViewName = "projects" | "inbox" | "overview" | "graph" | "operations" | "review" | "assets" | "backlog";
+export type ViewName = "projects" | "inbox" | "overview" | "graph" | "operations" | "review" | "assets" | "backlog" | "playback";
 
 const DASHBOARD_PROJECT_STORAGE_KEY = "aming-claw.dashboard.projectId";
 const DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY = "aming-claw.dashboard.sidebarCollapsed";
@@ -51,7 +52,7 @@ const DASHBOARD_VIEW_PARAM = "view";
 const DASHBOARD_MODE_PARAM = "mode";
 const DASHBOARD_SIMPLE_PARAM = "simple";
 const DASHBOARD_WORKSPACE_PARAM = "workspace";
-const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "inbox", "overview", "graph", "operations", "review", "assets", "backlog"];
+const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "inbox", "overview", "graph", "operations", "review", "assets", "backlog", "playback"];
 
 function normalizeProjectId(value: string | null | undefined): string {
   return (value ?? "").trim() || DEFAULT_PROJECT_ID;
@@ -1373,6 +1374,12 @@ export default function App() {
           ) : null}
           {view === "backlog" && data ? (
             <BacklogView
+              backlog={data.backlog}
+              projectId={currentProjectId}
+            />
+          ) : null}
+          {view === "playback" && data ? (
+            <TaskPlaybackView
               backlog={data.backlog}
               projectId={currentProjectId}
             />

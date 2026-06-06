@@ -777,7 +777,11 @@ function verifyAssetRelationGraphOpsContract() {
 
 function verifyBacklogEvidenceContract() {
   phase("backlog evidence contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  const playbackSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.ts"), "utf8");
+  const playbackPanelSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TaskPlaybackPanel.tsx"), "utf8");
+  const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
   const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.tsx"), "utf8");
   const typeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/types.ts"), "utf8");
   const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
@@ -840,6 +844,25 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".backlog-inspector-raw"), "Raw inspector payloads should have stable disclosure CSS");
   assert(cssSource.includes(".fixture-stream-replay"), "Fixture stream replay should have stable layout CSS");
   assert(cssSource.includes(".fixture-stream-progress"), "Fixture stream replay should expose a progress surface");
+  assert(appSource.includes('"playback"'), "Dashboard should register a fixed Task Playback view route");
+  assert(appSource.includes("TaskPlaybackView"), "App should render TaskPlaybackView for the playback route");
+  assert(viewSource.includes("TaskPlaybackPanel"), "Backlog row expansion should reuse the public task playback panel");
+  assert(viewSource.includes("view=playback"), "Backlog view should expose a visible playback entry point");
+  assert(playbackSource.includes("task_playback_trace.v1"), "Task playback should normalize to task_playback_trace.v1");
+  assert(playbackSource.includes("normalizeTaskPlaybackTrace"), "Task playback normalizer should be exported");
+  assert(playbackSource.includes("fallback_sample"), "Task playback fixture data should be marked as fallback sample");
+  assert(playbackSource.includes("host_private_paths: \"redacted\""), "Task playback privacy boundary should redact host-private paths");
+  assert(playbackSource.includes("PRIVATE_EVIDENCE_KEY"), "Task playback normalizer should filter private evidence keys");
+  assert(playbackViewSource.includes("api.taskTimelineFor"), "Playback selection should fetch governed task timeline data");
+  assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");
+  assert(playbackViewSource.includes("Gate candidates"), "Playback selector should expose a gate-oriented filter");
+  assert(playbackViewSource.includes("PLAYBACK_BACKLOG_PARAM"), "Playback row selection should be URL-addressable");
+  assert(playbackPanelSource.includes("No governed timeline events"), "Playback panel should expose the no-timeline state");
+  assert(playbackPanelSource.includes("Blocked close gate"), "Playback panel should expose blocked close-gate state");
+  assert(playbackPanelSource.includes("Private request text not displayed"), "Playback panel should show the public privacy boundary");
+  assert(cssSource.includes(".task-playback-layout"), "Task playback layout should have stable CSS");
+  assert(cssSource.includes(".task-playback-selector"), "Task playback selector should have stable CSS");
+  assert(cssSource.includes(".task-playback-panel"), "Task playback panel should have stable CSS");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }
