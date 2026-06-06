@@ -1105,7 +1105,18 @@ def test_observer_dogfood_dry_run_generates_valid_gate_and_plan_without_model_ca
     assert gate["fence_token"] == "fence-dogfood-test"
     assert gate["isolated_worktree"] is True
     assert set(gate["owned_files"]) == {"agent/observer_runtime.py", "agent/cli.py"}
-    assert payload["dispatch_gate"]["graph_evidence"]["trace_ids"] == ["gqt-20260602-testtrace"]
+    assert payload["dispatch_gate"]["prelaunch_graph_context"]["trace_ids"] == [
+        "gqt-20260602-testtrace"
+    ]
+    assert (
+        payload["dispatch_gate"]["prelaunch_graph_context"][
+            "counts_as_worker_graph_trace_evidence"
+        ]
+        is False
+    )
+    assert payload["dispatch_gate_validation"]["dispatch_graph_obligation"][
+        "finish_gate_requires_worker_graph_trace"
+    ] is True
     assert payload["dispatch_gate"]["route_evidence"]["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
     observer_run = payload["observer_run"]
     assert observer_run["status"] == "planned"
@@ -1330,7 +1341,14 @@ def test_observer_dogfood_writes_gate_output_file(tmp_path):
     assert written["schema_version"] == "mf_subagent_dispatch_gate.v1"
     assert written["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
     assert written["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
-    assert written["graph_evidence"]["trace_ids"] == ["gqt-20260602-testtrace"]
+    assert written["prelaunch_graph_context"]["trace_ids"] == [
+        "gqt-20260602-testtrace"
+    ]
+    assert (
+        written["prelaunch_graph_context"]["counts_as_worker_graph_trace_evidence"]
+        is False
+    )
+    assert written["dispatch_graph_obligation"]["finish_gate_requires_worker_graph_trace"] is True
     payload = json.loads(result.output)
     assert payload["gate_output"] == str(gate_output)
 

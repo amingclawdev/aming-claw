@@ -649,6 +649,33 @@ def _graph_trace_evidence(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def _graph_first_obligations(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "mf_subagent_graph_first_obligations.v1",
+        "required": True,
+        "read_receipt_required_before": [
+            "graph_query",
+            "startup",
+            "implementation",
+            "verification",
+            "close_ready",
+        ],
+        "query": {
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "task_id": "task-mf-sub-1",
+            "parent_task_id": "task-mf-parent",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-1",
+        },
+        "trace_evidence_schema_version": "mf_subagent_graph_trace.v1",
+        "counts_as_worker_graph_trace_evidence": False,
+        "finish_gate_requires_worker_graph_trace": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _service_dispatch_evidence(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": "observer_subagent_service_dispatch.v1",
@@ -745,7 +772,7 @@ def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
 
 
 def test_dispatch_gate_requires_governed_evidence_for_mf_parallel_topology() -> None:
-    with pytest.raises(MfSubagentContractError, match="graph trace evidence"):
+    with pytest.raises(MfSubagentContractError, match="graph-first obligation"):
         validate_mf_subagent_dispatch_gate(
             _dispatch_payload(selected_topology="mf_parallel.v1"),
             target_worktree_path="/repo",
@@ -767,29 +794,56 @@ def test_dispatch_gate_requires_governed_evidence_for_mf_parallel_topology() -> 
     assert evidence["service_dispatch_evidence"]["present"] is True
 
 
-def test_dispatch_gate_rejects_governed_work_without_graph_trace() -> None:
-    with pytest.raises(MfSubagentContractError, match="graph trace evidence"):
+def test_dispatch_gate_accepts_governed_work_with_graph_obligation_only() -> None:
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            governed_nontrivial=True,
+            dispatch_graph_obligation=_graph_first_obligations(),
+            branch_runtime_evidence=_branch_runtime_evidence(),
+            service_dispatch_evidence=_service_dispatch_evidence(),
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["governed_evidence_required"] is True
+    assert evidence["graph_trace_evidence"]["present"] is False
+    assert evidence["dispatch_graph_obligation"]["present"] is True
+    assert (
+        evidence["dispatch_graph_obligation"]["counts_as_worker_graph_trace_evidence"]
+        is False
+    )
+    assert evidence["dispatch_graph_obligation"]["finish_gate_requires_worker_graph_trace"] is True
+    assert evidence["branch_runtime_evidence"]["registered"] is True
+    assert evidence["service_dispatch_evidence"]["present"] is True
+
+
+def test_dispatch_gate_rejects_governed_work_without_graph_obligation() -> None:
+    with pytest.raises(MfSubagentContractError, match="graph-first obligation"):
         validate_mf_subagent_dispatch_gate(
             _dispatch_payload(
                 governed_nontrivial=True,
-                service_dispatch_evidence=_service_dispatch_evidence(),
-            ),
-            target_worktree_path="/repo",
-        )
-
-
-def test_dispatch_gate_rejects_governed_top_level_graph_trace_fields() -> None:
-    with pytest.raises(MfSubagentContractError, match="query_source=mf_subagent"):
-        validate_mf_subagent_dispatch_gate(
-            _dispatch_payload(
-                governed_nontrivial=True,
-                query_source="mf_subagent",
-                graph_query_trace_ids=["gqt-top-level-only"],
                 branch_runtime_evidence=_branch_runtime_evidence(),
                 service_dispatch_evidence=_service_dispatch_evidence(),
             ),
             target_worktree_path="/repo",
         )
+
+
+def test_dispatch_gate_ignores_top_level_graph_trace_fields() -> None:
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            governed_nontrivial=True,
+            query_source="mf_subagent",
+            graph_query_trace_ids=["gqt-top-level-only"],
+            dispatch_graph_obligation=_graph_first_obligations(),
+            branch_runtime_evidence=_branch_runtime_evidence(),
+            service_dispatch_evidence=_service_dispatch_evidence(),
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["graph_trace_evidence"]["present"] is False
+    assert evidence["dispatch_graph_obligation"]["present"] is True
 
 
 def test_dispatch_gate_rejects_governed_work_without_service_dispatch_evidence() -> None:

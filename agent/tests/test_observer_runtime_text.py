@@ -124,8 +124,16 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert gate["actual_startup_recorded"] is False
     assert gate["close_ready"] is False
     assert gate["governed_evidence_required"] is True
-    assert gate["graph_trace_evidence"]["query_source"] == "mf_subagent"
-    assert gate["graph_trace_evidence"]["trace_ids"] == ["gqt-runtime-text"]
+    assert gate["dispatch_graph_obligation"]["query_source"] == "mf_subagent"
+    assert gate["dispatch_graph_obligation"]["query_purpose"] == "subagent_context_build"
+    assert gate["dispatch_graph_obligation"]["counts_as_worker_graph_trace_evidence"] is False
+    assert gate["dispatch_graph_obligation"]["finish_gate_requires_worker_graph_trace"] is True
+    assert "graph_trace_evidence" not in result["dispatch_gate"]
+    assert result["prelaunch_graph_context"]["trace_ids"] == ["gqt-runtime-text"]
+    assert (
+        result["prelaunch_graph_context"]["counts_as_worker_graph_trace_evidence"]
+        is False
+    )
     assert gate["branch_runtime_evidence"]["registered"] is True
     assert gate["branch_runtime_evidence"]["runtime_context_id"] == "mfrctx-runtime-text"
     assert gate["service_dispatch_evidence"]["documented_host_adapter_boundary"] is True
@@ -195,6 +203,11 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["finish_gate_contract"]["close_sensitive_precheck"][
         "parent_main_status_short_must_be_clean"
     ] is True
+    assert result["finish_gate_contract"]["worker_graph_trace_evidence"]["required"] is True
+    assert (
+        result["finish_gate_contract"]["worker_graph_trace_evidence"]["query_purpose"]
+        == "subagent_gate_validation"
+    )
     assert result["mf_subagent_input"]["runtime_identity"]["worker_slot_id"] == "worker-1"
     assert (
         result["mf_subagent_input"]["runtime_identity"]["allocation_owner"]
@@ -265,7 +278,7 @@ def test_runtime_text_builder_rejects_bare_runtime_context_id_without_server_res
     evidence = result["branch_runtime_evidence"]
     assert evidence["registered"] is False
     assert evidence["runtime_context_id"] == "mfrctx-missing"
-    assert "Bare runtime_context_id" in evidence["message"]
+    assert "branch runtime allocation" in evidence["message"]
 
 
 def test_runtime_text_builder_rejects_weak_branch_runtime_evidence_without_ref(tmp_path):
@@ -305,13 +318,24 @@ def test_runtime_text_builder_rejects_weak_branch_runtime_evidence_without_ref(t
     assert "allocation source ref" in evidence["message"]
 
 
-def test_runtime_text_builder_rejects_missing_graph_trace_identity(tmp_path):
+def test_runtime_text_builder_allows_dispatch_before_worker_graph_trace(tmp_path):
     result = build_observer_runtime_text_context(
         _runtime_text_request(tmp_path, graph_trace_ids=())
     )
 
-    assert result["ok"] is False
+    assert result["ok"] is True
+    assert result["status"] == "prepared"
     assert result["raw_launch_text_persisted"] is False
-    assert result["dispatch_gate_validation"]["allowed"] is False
-    assert result["startup_intent_event"] == {}
-    assert "graph trace evidence" in result["dispatch_gate_validation"]["error"]
+    assert result["persistent_evidence"]["dispatch_ready"] is True
+    assert result["dispatch_gate_validation"]["allowed"] is True
+    assert result["startup_intent_event"]["close_satisfying"] is False
+    assert result["prelaunch_graph_context"]["trace_ids"] == []
+    assert "graph_trace_evidence" not in result["dispatch_gate"]
+    obligation = result["dispatch_gate_validation"]["dispatch_graph_obligation"]
+    assert obligation["present"] is True
+    assert obligation["counts_as_worker_graph_trace_evidence"] is False
+    assert obligation["finish_gate_requires_worker_graph_trace"] is True
+    assert result["finish_gate_contract"]["worker_graph_trace_evidence"]["required"] is True
+    assert "Finish gates require worker-owned mf_subagent graph trace evidence" in result[
+        "launch_text"
+    ]

@@ -99,7 +99,8 @@ OBSERVER_POLL_TIMELINE_FLAG_FIELDS = (
 RUNTIME_TEXT_DEFAULT_TOPOLOGY = "mf_parallel.v1"
 RUNTIME_TEXT_REQUIRED_EVIDENCE = (
     "parent_route_lineage",
-    "graph_trace_evidence",
+    "dispatch_graph_first_obligation",
+    "finish_worker_graph_trace_evidence",
     "branch_runtime_evidence",
     "service_dispatch_evidence",
     "startup_echo",
@@ -1350,6 +1351,23 @@ def _runtime_text_graph_trace_evidence(
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "fence_token": fence_token,
+    }
+
+
+def _runtime_text_prelaunch_graph_context(
+    *, graph_trace_ids: Sequence[str]
+) -> dict[str, Any]:
+    trace_ids = _runtime_text_items(graph_trace_ids)
+    return {
+        "schema_version": "observer_prelaunch_graph_context.v1",
+        "trace_ids": trace_ids,
+        "trace_count": len(trace_ids),
+        "counts_as_worker_graph_trace_evidence": False,
+        "message": (
+            "Prelaunch/observer graph context is dispatch context only. "
+            "Finish gates require worker-owned mf_subagent graph trace evidence "
+            "recorded after startup/read receipt."
+        ),
     }
 
 
@@ -2814,6 +2832,11 @@ def _runtime_text_graph_first_obligations(
             "graph_query tool=find_node_by_path for owned files",
         ],
         "trace_evidence_schema_version": "mf_subagent_graph_trace.v1",
+        "dispatch_time_only": True,
+        "counts_as_worker_graph_trace_evidence": False,
+        "finish_gate_requires_worker_graph_trace": True,
+        "finish_gate_query_purpose": "subagent_gate_validation",
+        "finish_gate_trace_evidence_schema_version": "mf_subagent_graph_trace.v1",
     }
 
 
@@ -3162,6 +3185,17 @@ def _runtime_text_finish_gate_contract(context: Any) -> dict[str, Any]:
             "actual_git_root_must_equal_assigned_worktree": True,
             "changed_files_must_be_within_owned_files": True,
         },
+        "worker_graph_trace_evidence": {
+            "required": True,
+            "schema_version": "mf_subagent_graph_trace.v1",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_gate_validation",
+            "recorded_after": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+                "runtime_contract_lookup",
+            ],
+        },
     }
 
 
@@ -3343,8 +3377,14 @@ def build_observer_runtime_text_context(
         )
     )
     parent_route_lineage = _runtime_text_parent_route_lineage(request)
-    graph_trace_evidence = _runtime_text_graph_trace_evidence(
+    prelaunch_graph_context = _runtime_text_prelaunch_graph_context(
         graph_trace_ids=graph_trace_ids,
+    )
+    graph_first_obligations = _runtime_text_graph_first_obligations(
+        project_id=request.project_id,
+        governance_project_id=context.governance_project_id or request.project_id,
+        target_project_id=context.target_project_id or request.project_id,
+        target_project_root=context.target_project_root,
         task_id=context.task_id,
         parent_task_id=parent_task_id,
         fence_token=context.fence_token,
@@ -3400,8 +3440,24 @@ def build_observer_runtime_text_context(
             "checked_paths": owned_files,
         },
         "parent_route_lineage": parent_route_lineage,
-        "graph_trace_evidence": graph_trace_evidence,
-        "graph_evidence": graph_trace_evidence,
+        "dispatch_graph_obligation": graph_first_obligations,
+        "graph_first_obligations": graph_first_obligations,
+        "prelaunch_graph_context": prelaunch_graph_context,
+        "finish_graph_trace_requirement": {
+            "schema_version": "mf_subagent_finish_graph_trace_requirement.v1",
+            "required": True,
+            "counts_as_dispatch_evidence": False,
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_gate_validation",
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "fence_token": context.fence_token,
+            "message": (
+                "Dispatch graph obligation does not satisfy finish gates; the "
+                "worker must record its own graph_trace_evidence after startup."
+            ),
+        },
         "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,
         "route_evidence": {
@@ -3443,15 +3499,6 @@ def build_observer_runtime_text_context(
         runtime_context_id=runtime_context_id,
         context=context,
         parent_task_id=parent_task_id,
-    )
-    graph_first_obligations = _runtime_text_graph_first_obligations(
-        project_id=request.project_id,
-        governance_project_id=context.governance_project_id or request.project_id,
-        target_project_id=context.target_project_id or request.project_id,
-        target_project_root=context.target_project_root,
-        task_id=context.task_id,
-        parent_task_id=parent_task_id,
-        fence_token=context.fence_token,
     )
     self_contract_lookup = _runtime_text_self_contract_lookup(
         project_id=request.project_id,
@@ -3506,6 +3553,7 @@ def build_observer_runtime_text_context(
         },
         "dispatch_gate": dispatch_gate,
         "mf_subagent_input": mf_subagent_input,
+        "prelaunch_graph_context": prelaunch_graph_context,
         "self_contract_lookup": self_contract_lookup,
         "startup_echo_contract": startup_echo_contract,
         "graph_first_obligations": graph_first_obligations,
@@ -3623,6 +3671,7 @@ def build_observer_runtime_text_context(
         "mf_subagent_input": mf_subagent_input,
         "dispatch_gate": dispatch_gate,
         "dispatch_gate_validation": dispatch_gate_validation,
+        "prelaunch_graph_context": prelaunch_graph_context,
         "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,
         "self_contract_lookup": self_contract_lookup,
@@ -3761,8 +3810,14 @@ def build_dogfood_observer_run_plan(
         visible_injection_manifest_hash=request.visible_injection_manifest_hash,
     )
     parent_route_lineage = _runtime_text_parent_route_lineage(runtime_text_request)
-    graph_trace_evidence = _runtime_text_graph_trace_evidence(
+    prelaunch_graph_context = _runtime_text_prelaunch_graph_context(
         graph_trace_ids=graph_trace_ids,
+    )
+    graph_first_obligations = _runtime_text_graph_first_obligations(
+        project_id=request.project_id,
+        governance_project_id=context.governance_project_id or request.project_id,
+        target_project_id=context.target_project_id or request.project_id,
+        target_project_root=context.target_project_root,
         task_id=context.task_id,
         parent_task_id=parent_task_id,
         fence_token=context.fence_token,
@@ -3818,8 +3873,24 @@ def build_dogfood_observer_run_plan(
             "checked_paths": owned_files,
         },
         "parent_route_lineage": parent_route_lineage,
-        "graph_trace_evidence": graph_trace_evidence,
-        "graph_evidence": graph_trace_evidence,
+        "dispatch_graph_obligation": graph_first_obligations,
+        "graph_first_obligations": graph_first_obligations,
+        "prelaunch_graph_context": prelaunch_graph_context,
+        "finish_graph_trace_requirement": {
+            "schema_version": "mf_subagent_finish_graph_trace_requirement.v1",
+            "required": True,
+            "counts_as_dispatch_evidence": False,
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_gate_validation",
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "fence_token": context.fence_token,
+            "message": (
+                "Dispatch graph obligation does not satisfy finish gates; the "
+                "worker must record its own graph_trace_evidence after startup."
+            ),
+        },
         "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,
         "route_evidence": {
@@ -3845,6 +3916,7 @@ def build_dogfood_observer_run_plan(
         "dispatch_gate": dispatch_gate,
         "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,
+        "prelaunch_graph_context": prelaunch_graph_context,
         "source_evidence": {
             "main_worktree": str(main_worktree),
             "workspace_root": str(workspace_root),
@@ -3886,12 +3958,6 @@ def build_dogfood_observer_run_plan(
         result["dispatch_gate_validation"] = {
             "allowed": False,
             "error": str(exc),
-        }
-        return result
-    if not graph_trace_ids:
-        result["dispatch_gate_validation"] = {
-            "allowed": False,
-            "error": "observer dogfood dispatch requires at least one graph_trace_id",
         }
         return result
     result["dispatch_gate_validation"] = gate_validation
