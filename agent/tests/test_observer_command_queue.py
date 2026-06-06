@@ -6,7 +6,12 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.governance import observer_session, raw_requirement, task_timeline
+from agent.governance import (
+    observer_session,
+    parallel_branch_runtime,
+    raw_requirement,
+    task_timeline,
+)
 
 
 def _conn() -> sqlite3.Connection:
@@ -438,6 +443,251 @@ def test_execute_backlog_row_complete_without_startup_fails_truthfully():
     assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
     assert blocker["terminal_dispatch_blocker"] is True
     assert "runtime-text startup intent" in blocker["reason"]
+
+
+def test_execute_backlog_row_complete_resolves_persisted_mf_sub_evidence_refs():
+    conn = _conn()
+    task_timeline.ensure_schema(conn)
+    session = _register(conn)
+    task_id = "mf-sub-durable-complete"
+    runtime_context_id = "mfrctx-durable-complete"
+    checkpoint_id = "ckpt-durable-complete"
+    payload = {
+        **_execute_backlog_row_payload(),
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+    }
+    parallel_branch_runtime.upsert_branch_context(
+        conn,
+        parallel_branch_runtime.BranchTaskRuntimeContext(
+            project_id="demo",
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=payload["backlog_id"],
+            root_task_id=payload["backlog_id"],
+            branch_ref="refs/heads/codex/durable-complete",
+            status=parallel_branch_runtime.STATE_RUNNING,
+            worker_id="worker-1",
+            agent_id="agent-1",
+            worker_slot_id="worker-1",
+            fence_token="fence-1",
+            worktree_path="/repo/.worktrees/worker-1",
+            base_commit="base-1",
+            head_commit="head-1",
+            target_head_commit="base-1",
+            merge_queue_id="mq-durable-complete",
+            checkpoint_id=checkpoint_id,
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso="2026-06-03T00:00:01Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    startup_gate = dict(_actual_startup_result()["startup_gate"])
+    startup_gate.update(
+        {
+            "task_id": task_id,
+            "parent_task_id": payload["backlog_id"],
+            "runtime_context_id": runtime_context_id,
+            "branch": "refs/heads/codex/durable-complete",
+            "branch_ref": "refs/heads/codex/durable-complete",
+            "worktree_path": "/repo/.worktrees/worker-1",
+            "base_commit": "base-1",
+            "target_head_commit": "base-1",
+            "merge_queue_id": "mq-durable-complete",
+            "route_id": payload["route_id"],
+            "route_context_hash": payload["route_context_hash"],
+            "prompt_contract_id": payload["prompt_contract_id"],
+            "prompt_contract_hash": "sha256:prompt-durable-complete",
+            "visible_injection_manifest_hash": payload["visible_injection_manifest_hash"],
+            "owned_files": ["agent/example.py"],
+        }
+    )
+    startup_event = task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=payload["backlog_id"],
+        task_id=task_id,
+        attempt_num=1,
+        event_type="mf_subagent.startup",
+        phase="startup_gate",
+        event_kind="mf_subagent_startup",
+        status="passed",
+        payload={"mf_subagent_startup_gate": startup_gate},
+    )
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=payload["backlog_id"],
+        task_id=task_id,
+        attempt_num=1,
+        event_type="mf_subagent.read_receipt",
+        phase="startup_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        status="accepted",
+        payload={
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": "fence-1",
+            "read_receipt_hash": "sha256:read-durable-complete",
+        },
+    )
+    verification = task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=payload["backlog_id"],
+        task_id=task_id,
+        attempt_num=1,
+        event_type="verification",
+        phase="verification",
+        event_kind="verification",
+        status="passed",
+        payload={
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": "fence-1",
+        },
+    )
+    finish = task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=payload["backlog_id"],
+        task_id=task_id,
+        attempt_num=1,
+        event_type="mf_subagent.finish_gate",
+        phase="finish_gate",
+        event_kind="mf_subagent_finish_gate",
+        status="review_ready",
+        payload={
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": "fence-1",
+            "checkpoint_id": checkpoint_id,
+        },
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "status": "review_ready",
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": "fence-1",
+            "checkpoint_id": checkpoint_id,
+            "timeline_refs": {
+                "startup_event_ref": f"timeline:{startup_event['id']}",
+                "read_receipt_event_ref": f"timeline:{read_receipt['id']}",
+                "verification_event_refs": [f"timeline:{verification['id']}"],
+                "finish_gate_ref": f"timeline:{finish['id']}",
+            },
+        },
+        now="2026-06-03T00:00:04Z",
+    )
+
+    command_after = completed["command"]
+    durable = command_after["result"]["durable_mf_sub_evidence"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert command_after["error"] == ""
+    assert "startup_surface_blocker" not in command_after["result"]
+    assert durable["startup_event_ref"] == f"timeline:{startup_event['id']}"
+    assert durable["read_receipt_event_ref"] == f"timeline:{read_receipt['id']}"
+    assert durable["finish_gate_ref"] == f"timeline:{finish['id']}"
+    assert durable["verification_event_refs"] == [f"timeline:{verification['id']}"]
+
+
+def test_execute_backlog_row_complete_allocation_only_runtime_context_still_blocks():
+    conn = _conn()
+    session = _register(conn)
+    task_id = "mf-sub-allocation-only"
+    runtime_context_id = "mfrctx-allocation-only"
+    checkpoint_id = "ckpt-allocation-only"
+    payload = {
+        **_execute_backlog_row_payload(),
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+    }
+    parallel_branch_runtime.upsert_branch_context(
+        conn,
+        parallel_branch_runtime.BranchTaskRuntimeContext(
+            project_id="demo",
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=payload["backlog_id"],
+            root_task_id=payload["backlog_id"],
+            branch_ref="refs/heads/codex/allocation-only",
+            status=parallel_branch_runtime.STATE_ALLOCATED,
+            worker_id="worker-1",
+            agent_id="agent-1",
+            worker_slot_id="worker-1",
+            fence_token="fence-1",
+            worktree_path="/repo/.worktrees/worker-1",
+            base_commit="base-1",
+            head_commit="base-1",
+            target_head_commit="base-1",
+            merge_queue_id="mq-allocation-only",
+            checkpoint_id=checkpoint_id,
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso="2026-06-03T00:00:01Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "status": "review_ready",
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": "fence-1",
+            "checkpoint_id": checkpoint_id,
+            "branch_runtime_evidence": {"registered": True},
+        },
+        now="2026-06-03T00:00:04Z",
+    )
+
+    command_after = completed["command"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert "durable_mf_sub_evidence" not in command_after["result"]
 
 
 def test_execute_backlog_row_prepared_startup_event_does_not_complete():

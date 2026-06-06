@@ -29,6 +29,9 @@ OBSERVER_COMMAND_CLAIM_EVIDENCE_SCHEMA_VERSION = "observer_command_claim_evidenc
 OBSERVER_COMMAND_CONTRACT_PROJECTION_SCHEMA_VERSION = "observer_command_contract_projection.v1"
 OBSERVER_COMMAND_FIRST_PROGRESS_SCHEMA_VERSION = "observer_command_first_progress_evidence.v1"
 OBSERVER_COMMAND_NO_PROGRESS_TIMEOUT_SCHEMA_VERSION = "observer_command_no_progress_timeout.v1"
+OBSERVER_COMMAND_DURABLE_MF_SUB_EVIDENCE_SCHEMA_VERSION = (
+    "observer_command_durable_mf_sub_evidence.v1"
+)
 
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
@@ -52,8 +55,11 @@ TERMINAL_COMMAND_STATUSES = {
 
 FIRST_PROGRESS_PASS_STATUSES = {
     "accepted",
+    "complete",
+    "completed",
     "ok",
     "passed",
+    "review_ready",
     "succeeded",
     "allow",
     "allowed",
@@ -684,6 +690,441 @@ def _lineage_matches(value: Any, lineage: Mapping[str, Any]) -> bool:
             if actual == expected:
                 return True
     return not observed_any
+
+
+_PRIVATE_DURABLE_EVIDENCE_KEY_MARKERS = (
+    "observer_only",
+    "private",
+    "raw_context",
+    "raw_memory",
+    "raw_prompt",
+    "raw_route",
+    "unmanifested_prompt",
+)
+
+
+def _timeline_ref_id(value: Any) -> int:
+    if isinstance(value, int):
+        return max(0, value)
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if ":" in text:
+        text = text.rsplit(":", 1)[-1]
+    try:
+        return max(0, int(text))
+    except ValueError:
+        return 0
+
+
+def _timeline_ref_ids_from_any(value: Any) -> set[int]:
+    if isinstance(value, Mapping):
+        values = list(value.values())
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    return {ref_id for item in values if (ref_id := _timeline_ref_id(item))}
+
+
+def _nested_timeline_ref_ids(value: Any, *keys: str) -> set[int]:
+    ids: set[int] = set()
+    for mapping in _walk_mappings(value):
+        for key in keys:
+            if key in mapping:
+                ids.update(_timeline_ref_ids_from_any(mapping.get(key)))
+    return ids
+
+
+def _timeline_event_id(event: Mapping[str, Any]) -> int:
+    try:
+        return int(event.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _timeline_event_ref(event: Mapping[str, Any]) -> str:
+    event_id = _timeline_event_id(event)
+    return f"timeline:{event_id}" if event_id else ""
+
+
+def _timeline_event_haystack(event: Mapping[str, Any]) -> str:
+    return " ".join(
+        str(event.get(key) or "").strip().lower()
+        for key in ("event_type", "event_kind", "phase", "schema_version", "status")
+    )
+
+
+def _timeline_event_status_passed(event: Mapping[str, Any]) -> bool:
+    status = str(event.get("status") or "").strip().lower()
+    return not status or status in FIRST_PROGRESS_PASS_STATUSES
+
+
+def _public_durable_evidence_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        public: dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key)
+            normalized = key_text.strip().lower().replace("-", "_")
+            if any(marker in normalized for marker in _PRIVATE_DURABLE_EVIDENCE_KEY_MARKERS):
+                continue
+            public[key_text] = _public_durable_evidence_value(child)
+        return public
+    if isinstance(value, list):
+        return [_public_durable_evidence_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_durable_evidence_value(item) for item in value]
+    return value
+
+
+def _public_timeline_event_evidence(event: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key in (
+        "id",
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "attempt_num",
+        "event_type",
+        "phase",
+        "event_kind",
+        "actor",
+        "status",
+        "payload",
+        "verification",
+        "artifact_refs",
+        "trace_id",
+        "commit_sha",
+        "created_at",
+    ):
+        if key in event:
+            payload[key] = _public_durable_evidence_value(event.get(key))
+    return payload
+
+
+def _select_latest_timeline_event(
+    events: list[dict[str, Any]],
+    *,
+    ref_ids: set[int],
+    lineage: Mapping[str, Any],
+    predicate: Any,
+) -> dict[str, Any]:
+    candidates = []
+    for event in events:
+        event_id = _timeline_event_id(event)
+        if ref_ids and event_id not in ref_ids:
+            continue
+        if not _lineage_matches(event, lineage):
+            continue
+        if predicate(event):
+            candidates.append(event)
+    return max(candidates, key=_timeline_event_id, default={})
+
+
+def _task_timeline_events_for_command(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    backlog_id: str,
+    has_explicit_refs: bool,
+) -> list[dict[str, Any]]:
+    try:
+        from . import task_timeline
+    except Exception:
+        return []
+
+    events_by_id: dict[int, dict[str, Any]] = {}
+
+    def add_events(rows: list[dict[str, Any]]) -> None:
+        for event in rows:
+            event_id = _timeline_event_id(event)
+            if event_id:
+                events_by_id[event_id] = event
+
+    try:
+        if task_id and backlog_id:
+            add_events(
+                task_timeline.list_events(
+                    conn,
+                    project_id,
+                    task_id=task_id,
+                    backlog_id=backlog_id,
+                    limit=1000,
+                )
+            )
+        if task_id:
+            add_events(
+                task_timeline.list_events(
+                    conn,
+                    project_id,
+                    task_id=task_id,
+                    limit=1000,
+                )
+            )
+        if backlog_id:
+            add_events(
+                task_timeline.list_events(
+                    conn,
+                    project_id,
+                    backlog_id=backlog_id,
+                    limit=1000,
+                )
+            )
+        if not events_by_id and has_explicit_refs:
+            add_events(task_timeline.list_events(conn, project_id, limit=1000))
+    except Exception:
+        return []
+    return [events_by_id[key] for key in sorted(events_by_id)]
+
+
+def _command_branch_context_for_durable_evidence(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+) -> Any:
+    try:
+        from .parallel_branch_runtime import (
+            get_branch_context,
+            get_branch_context_by_runtime_context_id,
+        )
+    except Exception:
+        return None
+    try:
+        if runtime_context_id:
+            context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if context is not None:
+                return context
+        if task_id:
+            return get_branch_context(conn, project_id, task_id)
+    except Exception:
+        return None
+    return None
+
+
+def _persisted_mf_sub_evidence_for_command(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    backlog_id = str(payload.get("backlog_id") or result.get("backlog_id") or "")
+    runtime_context_id = _first_nested_text(
+        result,
+        "runtime_context_id",
+        "branch_runtime_registration_ref",
+    ) or str(payload.get("runtime_context_id") or "")
+    task_id = _first_nested_text(result, "task_id") or str(payload.get("task_id") or "")
+
+    context = _command_branch_context_for_durable_evidence(
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if context is not None:
+        runtime_context_id = runtime_context_id or str(
+            getattr(context, "runtime_context_id", "") or ""
+        )
+        task_id = task_id or str(getattr(context, "task_id", "") or "")
+        backlog_id = backlog_id or str(getattr(context, "backlog_id", "") or "")
+
+    startup_ref_ids = _nested_timeline_ref_ids(
+        result,
+        "startup_event_ref",
+        "startup_event_id",
+        "startup_gate_ref",
+    )
+    read_ref_ids = _nested_timeline_ref_ids(
+        result,
+        "read_receipt_event_ref",
+        "read_receipt_event_id",
+        "read_receipt_ref",
+    )
+    finish_ref_ids = _nested_timeline_ref_ids(
+        result,
+        "finish_gate_ref",
+        "finish_gate_event_ref",
+        "finish_event_ref",
+        "finish_event_id",
+    )
+    verification_ref_ids = _nested_timeline_ref_ids(
+        result,
+        "verification_event_refs",
+        "verification_event_ids",
+        "verification_event_ref",
+        "verification_event_id",
+    )
+    has_explicit_refs = bool(
+        startup_ref_ids or read_ref_ids or finish_ref_ids or verification_ref_ids
+    )
+    if not (task_id or backlog_id or runtime_context_id or has_explicit_refs):
+        return {}
+
+    fence_token = _first_nested_text(result, "fence_token", "worker_fence_token")
+    parent_task_id = _first_nested_text(result, "parent_task_id")
+    if context is not None:
+        fence_token = fence_token or str(getattr(context, "fence_token", "") or "")
+        parent_task_id = parent_task_id or str(
+            getattr(context, "root_task_id", "")
+            or getattr(context, "chain_id", "")
+            or getattr(context, "stage_task_id", "")
+            or getattr(context, "backlog_id", "")
+            or ""
+        )
+    lineage = {
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "fence_token": fence_token,
+    }
+    events = _task_timeline_events_for_command(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        has_explicit_refs=has_explicit_refs,
+    )
+    if not events:
+        return {}
+
+    def startup_predicate(event: Mapping[str, Any]) -> bool:
+        haystack = _timeline_event_haystack(event)
+        return (
+            "startup" in haystack
+            and "intent" not in haystack
+            and _timeline_event_status_passed(event)
+            and _contains_actual_startup_evidence(dict(event))
+        )
+
+    def read_receipt_predicate(event: Mapping[str, Any]) -> bool:
+        return (
+            "read_receipt" in _timeline_event_haystack(event)
+            and _timeline_event_status_passed(event)
+        )
+
+    def finish_predicate(event: Mapping[str, Any]) -> bool:
+        return (
+            "finish" in _timeline_event_haystack(event)
+            and _timeline_event_status_passed(event)
+        )
+
+    def verification_predicate(event: Mapping[str, Any]) -> bool:
+        haystack = _timeline_event_haystack(event)
+        return "verification" in haystack and _timeline_event_status_passed(event)
+
+    startup_event = _select_latest_timeline_event(
+        events,
+        ref_ids=startup_ref_ids,
+        lineage=lineage,
+        predicate=startup_predicate,
+    )
+    read_receipt_event = _select_latest_timeline_event(
+        events,
+        ref_ids=read_ref_ids,
+        lineage=lineage,
+        predicate=read_receipt_predicate,
+    )
+    if not startup_event or not read_receipt_event:
+        return {}
+
+    finish_event = _select_latest_timeline_event(
+        events,
+        ref_ids=finish_ref_ids,
+        lineage=lineage,
+        predicate=finish_predicate,
+    )
+    verification_events = [
+        event
+        for event in events
+        if (not verification_ref_ids or _timeline_event_id(event) in verification_ref_ids)
+        and _lineage_matches(event, lineage)
+        and verification_predicate(event)
+    ]
+    checkpoint_id = _first_nested_text(result, "checkpoint_id")
+    context_checkpoint = ""
+    context_replay_source = ""
+    if context is not None:
+        context_checkpoint = str(getattr(context, "checkpoint_id", "") or "")
+        context_replay_source = str(getattr(context, "replay_source", "") or "")
+    finish_gate: dict[str, Any] = {}
+    if finish_event:
+        finish_gate = _public_timeline_event_evidence(finish_event)
+    elif (
+        context_checkpoint
+        and context_replay_source == "mf_sub_finish_gate"
+        and (not checkpoint_id or checkpoint_id == context_checkpoint)
+    ):
+        finish_gate = {
+            "kind": "finish_gate",
+            "event_kind": "finish_gate",
+            "status": "passed",
+            "source": "parallel_branch_runtime.context",
+            "checkpoint_id": context_checkpoint,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "fence_token": fence_token,
+            "replay_source": context_replay_source,
+        }
+
+    evidence = {
+        "schema_version": OBSERVER_COMMAND_DURABLE_MF_SUB_EVIDENCE_SCHEMA_VERSION,
+        "source": "persisted_task_timeline_and_parallel_branch_runtime",
+        "startup_event_ref": _timeline_event_ref(startup_event),
+        "read_receipt_event_ref": _timeline_event_ref(read_receipt_event),
+        "finish_gate_ref": _timeline_event_ref(finish_event)
+        or (
+            f"parallel_branch_runtime:{runtime_context_id}:{context_checkpoint}"
+            if finish_gate and context_checkpoint
+            else ""
+        ),
+        "verification_event_refs": [
+            _timeline_event_ref(event)
+            for event in verification_events
+            if _timeline_event_ref(event)
+        ],
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "fence_token": fence_token,
+        "startup_event": _public_timeline_event_evidence(startup_event),
+        "read_receipt_event": _public_timeline_event_evidence(read_receipt_event),
+        "finish_gate": finish_gate,
+        "verification_events": [
+            _public_timeline_event_evidence(event) for event in verification_events
+        ],
+    }
+    if not _contains_actual_startup_evidence(evidence):
+        return {}
+    return evidence
+
+
+def _hydrate_result_with_persisted_mf_sub_evidence(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    if _result_has_startup_or_blocker_evidence(result):
+        return
+    evidence = _persisted_mf_sub_evidence_for_command(
+        conn,
+        project_id=project_id,
+        command=command,
+        result=result,
+    )
+    if evidence:
+        result["durable_mf_sub_evidence"] = evidence
 
 
 def _mapping_has_graph_trace_progress(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -2597,6 +3038,13 @@ def complete_command(
     )
     _ensure_command_owned_by_session(command, session_id=sid, action="complete")
     result_payload = _merge_result_with_durable_takeover(command, result)
+    if str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
+        _hydrate_result_with_persisted_mf_sub_evidence(
+            conn,
+            project_id=pid,
+            command=command,
+            result=result_payload,
+        )
     if (
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and not _result_has_startup_or_blocker_evidence(result_payload)
