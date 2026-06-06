@@ -112,6 +112,63 @@ RUNTIME_TEXT_REQUIRED_LANES = (
     "bounded_implementation_worker",
     "observer_review_gate",
 )
+RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION = "runtime_context.current.v1"
+RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION = "runtime_context.gate_inputs.v1"
+RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION = "runtime_context.worker_view.v1"
+RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_view.v1"
+RUNTIME_TEXT_RUNTIME_CONTEXT_PROJECTION_CONTRACT = (
+    "Worker A integration point: consume runtime_context.current.v1, "
+    "runtime_context.gate_inputs.v1, runtime_context.worker_view.v1, and "
+    "runtime_context.close_gate_view.v1 when supplied by the Runtime Context "
+    "Service; otherwise use this module's local compatibility projection."
+)
+RUNTIME_TEXT_STARTUP_PROJECTION_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "fence_token",
+    "worktree_path",
+    "branch_ref",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "graph_query_identity",
+)
+RUNTIME_TEXT_FINISH_PROJECTION_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "fence_token",
+    "worktree_path",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
+    "owned_files",
+)
+RUNTIME_TEXT_PROJECTION_FIELD_SOURCES = {
+    "runtime_context_id": (
+        "runtime_context.current.v1.worker_view.runtime_context_id"
+    ),
+    "task_id": "runtime_context.current.v1.worker_view.task_id",
+    "parent_task_id": "runtime_context.current.v1.worker_view.parent_task_id",
+    "worker_role": "runtime_context.worker_view.v1.worker_role",
+    "fence_token": "runtime_context.worker_view.v1.fence_token",
+    "worktree_path": "runtime_context.worker_view.v1.worktree_path",
+    "branch_ref": "runtime_context.worker_view.v1.branch_ref",
+    "base_commit": "runtime_context.worker_view.v1.base_commit",
+    "target_head_commit": "runtime_context.worker_view.v1.target_head_commit",
+    "merge_queue_id": "runtime_context.worker_view.v1.merge_queue_id",
+    "owned_files": "runtime_context.worker_view.v1.target_files",
+    "route_context_hash": "runtime_context.gate_inputs.v1.route_context_hash",
+    "prompt_contract_id": "runtime_context.gate_inputs.v1.prompt_contract_id",
+    "prompt_contract_hash": "runtime_context.gate_inputs.v1.prompt_contract_hash",
+    "graph_query_identity": "runtime_context.worker_view.v1.graph_query_identity",
+}
 
 
 @dataclass
@@ -217,6 +274,7 @@ class ObserverRuntimeTextPrepareRequest:
     merge_queue_id: str = ""
     fence_token: str = ""
     graph_trace_ids: tuple[str, ...] = ()
+    runtime_context_projection: Mapping[str, Any] = field(default_factory=dict)
     branch_runtime_registration_ref: str = ""
     branch_runtime_evidence: Mapping[str, Any] = field(default_factory=dict)
     runtime_context_id: str = ""
@@ -2200,6 +2258,213 @@ def _runtime_text_self_contract_lookup(
     }
 
 
+def _runtime_text_supplied_projection(
+    request: ObserverRuntimeTextPrepareRequest,
+) -> dict[str, Any]:
+    """Return a caller-supplied Runtime Context Service projection, if present."""
+
+    direct = request.runtime_context_projection
+    if isinstance(direct, Mapping) and direct:
+        return dict(direct)
+    evidence = request.branch_runtime_evidence
+    if isinstance(evidence, Mapping):
+        for key in (
+            "runtime_context_projection",
+            "runtime_context_current",
+            "runtime_context_worker_view",
+        ):
+            value = evidence.get(key)
+            if isinstance(value, Mapping) and value:
+                return dict(value)
+        nested = evidence.get("context")
+        if isinstance(nested, Mapping):
+            for key in ("runtime_context_projection", "runtime_context_worker_view"):
+                value = nested.get(key)
+                if isinstance(value, Mapping) and value:
+                    return dict(value)
+    return {}
+
+
+def _runtime_text_projection_containers(
+    projection: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = [projection]
+    for key in (
+        "worker_view",
+        "runtime_context_worker_view",
+        RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
+        "current",
+        "current_state",
+        "runtime_context_current",
+        RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
+        "gate_inputs",
+        "runtime_context_gate_inputs",
+        RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+        "close_gate_view",
+        "runtime_context_close_gate_view",
+        RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+        "branch_identity",
+        "runtime_context",
+        "graph_query_identity",
+    ):
+        value = projection.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    views = projection.get("views")
+    if isinstance(views, Mapping):
+        for value in views.values():
+            if isinstance(value, Mapping):
+                containers.append(value)
+    return containers
+
+
+def _runtime_text_projection_value(
+    projection: Mapping[str, Any],
+    field_name: str,
+) -> Any:
+    for container in _runtime_text_projection_containers(projection):
+        if field_name in container:
+            return container.get(field_name)
+        if field_name == "owned_files" and "target_files" in container:
+            return container.get("target_files")
+        if field_name == "branch_ref" and "branch" in container:
+            return container.get("branch")
+        if field_name == "worktree_path":
+            for alias in ("worktree", "assigned_worktree", "worker_worktree"):
+                if alias in container:
+                    return container.get(alias)
+    return None
+
+
+def _runtime_text_projection_field_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _runtime_text_projection_missing_diagnostic(
+    *,
+    field_name: str,
+    gate: str,
+    producer: str,
+) -> dict[str, str]:
+    return {
+        "schema_version": "runtime_context_missing_field_diagnostic.v1",
+        "field": field_name,
+        "gate": gate,
+        "expected_source": RUNTIME_TEXT_PROJECTION_FIELD_SOURCES.get(field_name, ""),
+        "producer": producer,
+        "consumer": "observer_runtime_text_prepare",
+    }
+
+
+def _runtime_text_local_projection(
+    *,
+    runtime_context_id: str,
+    request: ObserverRuntimeTextPrepareRequest,
+    context: Any,
+    parent_task_id: str,
+    owned_files: Sequence[str],
+    graph_first_obligations: Mapping[str, Any],
+) -> dict[str, Any]:
+    graph_query_identity = dict(graph_first_obligations.get("query") or {})
+    worker_view = {
+        "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
+        "project_id": request.project_id,
+        "governance_project_id": context.governance_project_id or request.project_id,
+        "target_project_id": context.target_project_id or request.project_id,
+        "target_project_root": context.target_project_root,
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "fence_token": context.fence_token,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "owned_files": list(owned_files),
+        "target_files": list(owned_files),
+        "graph_query_identity": graph_query_identity,
+    }
+    gate_inputs = {
+        "schema_version": RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+        **worker_view,
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+    }
+    return {
+        "schema_version": RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
+        "compatibility_projection": True,
+        "integration_contract": RUNTIME_TEXT_RUNTIME_CONTEXT_PROJECTION_CONTRACT,
+        "worker_view": worker_view,
+        "gate_inputs": gate_inputs,
+        "close_gate_view": {
+            "schema_version": RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+            **worker_view,
+        },
+    }
+
+
+def _runtime_text_projection_gate_diagnostics(
+    projection: Mapping[str, Any],
+    *,
+    producer: str,
+) -> dict[str, Any]:
+    gates = {
+        "mf_subagent.startup": RUNTIME_TEXT_STARTUP_PROJECTION_FIELDS,
+        "mf_subagent.finish": RUNTIME_TEXT_FINISH_PROJECTION_FIELDS,
+    }
+    missing: list[dict[str, str]] = []
+    requirement_rows: list[dict[str, str]] = []
+    for gate, fields in gates.items():
+        for field_name in fields:
+            requirement_rows.append(
+                _runtime_text_projection_missing_diagnostic(
+                    field_name=field_name,
+                    gate=gate,
+                    producer=producer,
+                )
+            )
+            if not _runtime_text_projection_field_present(
+                _runtime_text_projection_value(projection, field_name)
+            ):
+                missing.append(
+                    _runtime_text_projection_missing_diagnostic(
+                        field_name=field_name,
+                        gate=gate,
+                        producer=producer,
+                    )
+                )
+    missing_fields = sorted({item["field"] for item in missing})
+    return {
+        "schema_version": "observer_runtime_text_projection_gate_diagnostics.v1",
+        "projection_contract": RUNTIME_TEXT_RUNTIME_CONTEXT_PROJECTION_CONTRACT,
+        "projection_schema_versions": {
+            "current": RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
+            "gate_inputs": RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+            "worker_view": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
+            "close_gate_view": RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+        },
+        "producer": producer,
+        "consumer": "observer_runtime_text_prepare",
+        "gates": sorted(gates),
+        "required_fields": requirement_rows,
+        "missing": missing,
+        "missing_fields": missing_fields,
+        "passed": not missing,
+        "status": "passed" if not missing else "missing_required_projection_fields",
+    }
+
+
 def _runtime_text_finish_gate_contract(context: Any) -> dict[str, Any]:
     return {
         "schema_version": "mf_subagent_finish_gate_contract.v1",
@@ -2522,11 +2787,34 @@ def build_observer_runtime_text_context(
         fence_token=context.fence_token,
         runtime_context_id=runtime_context_id,
     )
+    supplied_projection = _runtime_text_supplied_projection(request)
+    runtime_context_projection = (
+        supplied_projection
+        if supplied_projection
+        else _runtime_text_local_projection(
+            runtime_context_id=runtime_context_id,
+            request=request,
+            context=context,
+            parent_task_id=parent_task_id,
+            owned_files=owned_files,
+            graph_first_obligations=graph_first_obligations,
+        )
+    )
+    runtime_context_projection_diagnostics = _runtime_text_projection_gate_diagnostics(
+        runtime_context_projection,
+        producer=(
+            "runtime_context_service"
+            if supplied_projection
+            else "observer_runtime_text_prepare.compatibility_projection"
+        ),
+    )
     finish_gate_contract = _runtime_text_finish_gate_contract(context)
     first_progress_contract = _runtime_text_first_progress_contract(context)
     launch_payload = {
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
+        "runtime_context_projection": runtime_context_projection,
+        "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
         "runtime_context": asdict(context),
         "branch_identity": {
             "runtime_context_id": runtime_context_id,
@@ -2575,7 +2863,20 @@ def build_observer_runtime_text_context(
             ),
             "branch_runtime_evidence": branch_runtime_evidence,
         }
-    ok = bool(dispatch_gate_validation.get("allowed")) and not input_error
+    projection_missing = not bool(runtime_context_projection_diagnostics.get("passed"))
+    if projection_missing:
+        dispatch_gate_validation = {
+            **dispatch_gate_validation,
+            "allowed": False,
+            "status": "missing_runtime_context_projection_fields",
+            "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
+            "error": "runtime context projection is missing required startup/finish fields",
+        }
+    ok = (
+        bool(dispatch_gate_validation.get("allowed"))
+        and not input_error
+        and not projection_missing
+    )
     startup_intent_event = (
         _runtime_text_startup_intent_event(
             request=request,
@@ -2640,6 +2941,8 @@ def build_observer_runtime_text_context(
         "startup_recording": startup_recording,
         "close_ready": False,
         "runtime_context": asdict(context),
+        "runtime_context_projection": runtime_context_projection,
+        "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
         "branch_identity": launch_payload["branch_identity"],
         "mf_subagent_input": mf_subagent_input,
         "dispatch_gate": dispatch_gate,

@@ -19,6 +19,9 @@ from agent.governance.service_registry import (
 
 
 PRECHECK_RESULT_SCHEMA_VERSION = "mf_workflow_precheck_result.v1"
+RUNTIME_CONTEXT_GATE_REQUIREMENTS_SCHEMA_VERSION = (
+    "runtime_context.gate_requirements.v1"
+)
 
 ALLOW = "allow"
 REVIEW_REQUIRED = "review_required"
@@ -39,6 +42,76 @@ GATE_KINDS = (
 
 PASS_STATUSES = {"accepted", "allow", "ok", "pass", "passed", "succeeded", "success"}
 GIT_EVIDENCE_IGNORED_PATH_LIMIT = 50
+RUNTIME_CONTEXT_GATE_FIELD_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "mf_subagent.dispatch": (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+        "branch_ref",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+    ),
+    "mf_subagent.startup": (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+        "actual_fence_token",
+        "branch_ref",
+        "worktree_path",
+        "actual_git_root",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "graph_query_identity",
+    ),
+    "backlog.close": (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+        "merge_commit",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "timeline_evidence",
+        "graph_query_identity",
+        "close_ready_evidence",
+    ),
+}
+RUNTIME_CONTEXT_FIELD_EXPECTED_SOURCES = {
+    "actual_fence_token": "runtime_context.gate_inputs.v1.startup.actual_fence_token",
+    "actual_git_root": "runtime_context.gate_inputs.v1.startup.actual_git_root",
+    "branch_ref": "runtime_context.worker_view.v1.branch_ref",
+    "base_commit": "runtime_context.worker_view.v1.base_commit",
+    "close_ready_evidence": "runtime_context.close_gate_view.v1.close_ready_evidence",
+    "fence_token": "runtime_context.worker_view.v1.fence_token",
+    "graph_query_identity": "runtime_context.worker_view.v1.graph_query_identity",
+    "merge_commit": "runtime_context.close_gate_view.v1.merge_commit",
+    "merge_queue_id": "runtime_context.worker_view.v1.merge_queue_id",
+    "parent_task_id": "runtime_context.worker_view.v1.parent_task_id",
+    "prompt_contract_hash": "runtime_context.gate_inputs.v1.prompt_contract_hash",
+    "prompt_contract_id": "runtime_context.gate_inputs.v1.prompt_contract_id",
+    "route_context_hash": "runtime_context.gate_inputs.v1.route_context_hash",
+    "runtime_context_id": "runtime_context.current.v1.runtime_context_id",
+    "task_id": "runtime_context.worker_view.v1.task_id",
+    "target_head_commit": "runtime_context.worker_view.v1.target_head_commit",
+    "timeline_evidence": "runtime_context.close_gate_view.v1.timeline_evidence",
+    "worker_role": "runtime_context.worker_view.v1.worker_role",
+    "worktree_path": "runtime_context.worker_view.v1.worktree_path",
+}
 
 
 class PrecheckServiceError(ValueError):
@@ -89,6 +162,111 @@ def run_precheck(
     )
 
 
+def _projection_containers(projection: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = [projection]
+    for key in (
+        "worker_view",
+        "runtime_context_worker_view",
+        "runtime_context.worker_view.v1",
+        "current",
+        "current_state",
+        "runtime_context.current.v1",
+        "gate_inputs",
+        "runtime_context_gate_inputs",
+        "runtime_context.gate_inputs.v1",
+        "startup",
+        "startup_gate",
+        "close_gate_view",
+        "runtime_context.close_gate_view.v1",
+        "branch_identity",
+        "runtime_context",
+        "graph_query_identity",
+    ):
+        value = projection.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    views = projection.get("views")
+    if isinstance(views, Mapping):
+        for value in views.values():
+            if isinstance(value, Mapping):
+                containers.append(value)
+    return containers
+
+
+def _projection_subject(subject: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool]:
+    for key in (
+        "runtime_context_projection",
+        "runtime_context_current",
+        "runtime_context_worker_view",
+        "runtime_context_gate_inputs",
+        "worker_view",
+        "gate_inputs",
+    ):
+        value = subject.get(key)
+        if isinstance(value, Mapping) and value:
+            return value, True
+    return subject, False
+
+
+def _projection_value(projection: Mapping[str, Any], field_name: str) -> Any:
+    for container in _projection_containers(projection):
+        if field_name in container:
+            return container.get(field_name)
+        if field_name == "branch_ref" and "branch" in container:
+            return container.get("branch")
+        if field_name == "worktree_path":
+            for alias in ("worktree", "assigned_worktree", "worker_worktree"):
+                if alias in container:
+                    return container.get(alias)
+        if field_name == "close_ready_evidence" and "close_ready" in container:
+            return container.get("close_ready")
+    return None
+
+
+def _projection_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _runtime_context_gate_requirements(subject: Mapping[str, Any], gate: str) -> dict[str, Any]:
+    projection, explicit_projection = _projection_subject(subject)
+    fields = RUNTIME_CONTEXT_GATE_FIELD_REQUIREMENTS.get(gate, ())
+    requirements = [
+        {
+            "field": field_name,
+            "gate": gate,
+            "expected_source": RUNTIME_CONTEXT_FIELD_EXPECTED_SOURCES.get(field_name, ""),
+            "producer": "runtime_context_service",
+            "consumer": "precheck_service",
+        }
+        for field_name in fields
+    ]
+    missing = [
+        dict(row)
+        for row in requirements
+        if not _projection_present(_projection_value(projection, str(row["field"])))
+    ]
+    return {
+        "schema_version": RUNTIME_CONTEXT_GATE_REQUIREMENTS_SCHEMA_VERSION,
+        "gate_kind": gate,
+        "explicit_projection": explicit_projection,
+        "projection_contract": (
+            "runtime_context.current.v1/runtime_context.gate_inputs.v1/"
+            "runtime_context.worker_view.v1/runtime_context.close_gate_view.v1"
+        ),
+        "requirements": requirements,
+        "missing": missing,
+        "missing_fields": sorted({str(item["field"]) for item in missing}),
+        "passed": not missing,
+        "status": "passed" if not missing else "missing_required_projection_fields",
+    }
+
+
 def _dispatch_gate(
     contract_id: str,
     stage: str,
@@ -98,6 +276,10 @@ def _dispatch_gate(
     errors: list[str] = []
     warnings: list[str] = []
     errors.extend(_contract_errors(subject, contract_id, stage, "mf_subagent.dispatch"))
+    projection_requirements = _runtime_context_gate_requirements(
+        subject,
+        "mf_subagent.dispatch",
+    )
 
     worker_path = _path(subject, "worker_worktree", "worktree")
     target_path = _path(subject, "target_worktree", "main_worktree")
@@ -155,6 +337,9 @@ def _dispatch_gate(
         subject.get("branch_adoption_evidence")
     ):
         errors.append("missing_existing_branch_adoption_evidence")
+    if projection_requirements["explicit_projection"]:
+        for field_name in projection_requirements["missing_fields"]:
+            errors.append(f"missing_runtime_context_projection:{field_name}")
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -184,6 +369,7 @@ def _dispatch_gate(
         ),
         "branch_adoption_mode": adoption_mode,
         "fence_token_present": bool(_text(subject.get("fence_token"))),
+        "runtime_context_projection_requirements": projection_requirements,
     }
 
 
@@ -196,6 +382,10 @@ def _startup_gate(
     errors: list[str] = []
     warnings: list[str] = []
     errors.extend(_contract_errors(subject, contract_id, stage, "mf_subagent.startup"))
+    projection_requirements = _runtime_context_gate_requirements(
+        subject,
+        "mf_subagent.startup",
+    )
 
     expected_worker_path = _path(subject, "worker_worktree", "expected_worker_worktree", "worktree")
     actual_path = _path(
@@ -274,6 +464,9 @@ def _startup_gate(
         errors.append("worker_branch_mismatch")
     if branch_ref and actual_runtime_git["branch"] and actual_runtime_git["branch"] != branch_ref:
         errors.append("actual_branch_mismatch")
+    if projection_requirements["explicit_projection"]:
+        for field_name in projection_requirements["missing_fields"]:
+            errors.append(f"missing_runtime_context_projection:{field_name}")
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -299,6 +492,7 @@ def _startup_gate(
         "fence_token_present": bool(fence_token),
         "actual_fence_token_present": bool(actual_fence_token),
         "fence_token_matches": bool(fence_token and actual_fence_token == fence_token),
+        "runtime_context_projection_requirements": projection_requirements,
     }
 
 
@@ -752,6 +946,7 @@ def _close_gate(
     errors: list[str] = []
     warnings: list[str] = []
     errors.extend(_contract_errors(subject, contract_id, stage, "backlog.close"))
+    projection_requirements = _runtime_context_gate_requirements(subject, "backlog.close")
     current_commit = _text(subject.get("merge_commit") or subject.get("source_commit"))
     errors.extend(_token_errors(subject, current_commit=current_commit))
     missing_evidence = _missing_required_evidence(subject, include_close_ready=True)
@@ -789,6 +984,9 @@ def _close_gate(
     if route_context_gate.get("required") and not route_context_gate.get("passed"):
         for missing in route_context_gate.get("missing_requirement_ids") or []:
             errors.append(_route_context_missing_error(str(missing)))
+    if projection_requirements["explicit_projection"]:
+        for field_name in projection_requirements["missing_fields"]:
+            errors.append(f"missing_runtime_context_projection:{field_name}")
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -806,6 +1004,7 @@ def _close_gate(
         "route_context_consumption_required": bool(route_context_gate.get("required")),
         "independent_verification_required": independent_verification_required,
         "independent_verification_evidence_present": independent_verification_present,
+        "runtime_context_projection_requirements": projection_requirements,
         "close_ready_present": _has_timeline_kind(subject.get("timeline_evidence"), {"close_ready"}),
         "mf_timeline_precheck_compatible": _has_timeline_kind(
             subject.get("timeline_evidence"),

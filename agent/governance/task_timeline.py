@@ -141,6 +141,31 @@ MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS = (
     "task_id",
     "parent_task_id",
 )
+RUNTIME_CONTEXT_TIMELINE_IDENTITY_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_slot_id",
+    "fence_token",
+)
+RUNTIME_CONTEXT_TIMELINE_ROUTE_FIELDS = (
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+)
+RUNTIME_CONTEXT_TIMELINE_STARTUP_FIELDS = (
+    *RUNTIME_CONTEXT_TIMELINE_IDENTITY_FIELDS,
+    *RUNTIME_CONTEXT_TIMELINE_ROUTE_FIELDS,
+    "actual_cwd",
+    "actual_git_root",
+    "branch",
+    "head_commit",
+)
+RUNTIME_CONTEXT_TIMELINE_READ_RECEIPT_FIELDS = (
+    *RUNTIME_CONTEXT_TIMELINE_IDENTITY_FIELDS,
+    *RUNTIME_CONTEXT_TIMELINE_ROUTE_FIELDS,
+    "read_receipt_hash",
+)
 MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS = (
     "route_context",
     "route_action_precheck",
@@ -1084,6 +1109,19 @@ def mf_subagent_read_receipt_gate_verification(
         "lineage_route_identity": lineage_filter,
         "lineage_identity_filter": identity_filter,
         "lineage_attempt_filter": attempt_lineage_filter,
+        "runtime_context_projection_evidence_fields": {
+            "schema_version": "runtime_context.timeline_evidence_fields.v1",
+            "read_receipt": list(RUNTIME_CONTEXT_TIMELINE_READ_RECEIPT_FIELDS),
+            "attempt_lineage_filter": list(MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS),
+            "route_identity_filter": list(
+                (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+            ),
+            "ordering": [
+                "read_receipt_order",
+                "first_counted_evidence_order",
+                "read_receipt_precedes_counted_evidence",
+            ],
+        },
         "lineage_matched_event_ids": [
             item.get("id") for item in lineage_matched if item.get("id") is not None
         ],
@@ -2107,6 +2145,16 @@ def mf_route_context_gate_verification(
         "attempt_lineage": current_attempt_lineage,
         "attempt_lineage_candidates": public_attempt_lineage_candidates,
         "accepted_startup_lineages": accepted_startup_lineages,
+        "runtime_context_projection_evidence_fields": {
+            "schema_version": "runtime_context.timeline_evidence_fields.v1",
+            "startup": list(RUNTIME_CONTEXT_TIMELINE_STARTUP_FIELDS),
+            "read_receipt": list(RUNTIME_CONTEXT_TIMELINE_READ_RECEIPT_FIELDS),
+            "attempt_lineage": list(RUNTIME_CONTEXT_TIMELINE_IDENTITY_FIELDS),
+            "route_identity": list(
+                (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+            ),
+            "required_evidence_ids": list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS),
+        },
         "evidence_events": {
             req_id: present[req_id] for req_id in required_requirement_ids
         },

@@ -224,6 +224,149 @@ def _route_context_worker_startup_event(identity=None):
     }
 
 
+def test_read_receipt_gate_reports_projection_fields_and_ordering_failure():
+    from agent.governance import task_timeline
+
+    implementation_event = _add_attempt_lineage(
+        {
+            "id": 1,
+            "event_type": "mf.implementation",
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "passed",
+            "payload": {**ROUTE_IDENTITY, "changed_files": ["agent/foo.py"]},
+        },
+        runtime_context_id="mfrctx-ordering",
+        task_id="worker-task",
+        parent_task_id="parent-task",
+    )
+    read_receipt_event = _add_attempt_lineage(
+        _mf_subagent_read_receipt_event(event_id=2, identity=ROUTE_IDENTITY),
+        runtime_context_id="mfrctx-ordering",
+        task_id="worker-task",
+        parent_task_id="parent-task",
+    )
+
+    gate = task_timeline.mf_subagent_read_receipt_gate_verification(
+        [implementation_event, read_receipt_event],
+        route_identity_filter={
+            **ROUTE_IDENTITY,
+            "runtime_context_id": "mfrctx-ordering",
+            "task_id": "worker-task",
+            "parent_task_id": "parent-task",
+        },
+    )
+
+    assert gate["required"] is True
+    assert gate["passed"] is False
+    assert gate["status"] == "out_of_order"
+    assert gate["failure_reason"] == "worker_read_receipt_recorded_after_counted_evidence"
+    fields = gate["runtime_context_projection_evidence_fields"]
+    assert fields["schema_version"] == "runtime_context.timeline_evidence_fields.v1"
+    assert "read_receipt_hash" in fields["read_receipt"]
+    assert "runtime_context_id" in fields["attempt_lineage_filter"]
+    assert "read_receipt_order" in fields["ordering"]
+
+
+def test_route_startup_gate_reports_runtime_context_projection_evidence_fields():
+    from agent.governance import task_timeline
+
+    events = [
+        _route_context_worker_dispatch_event(),
+        _route_context_worker_startup_event(),
+    ]
+    gate = task_timeline.mf_route_context_gate_verification(events)
+
+    fields = gate["runtime_context_projection_evidence_fields"]
+    assert fields["schema_version"] == "runtime_context.timeline_evidence_fields.v1"
+    assert "actual_git_root" in fields["startup"]
+    assert "prompt_contract_hash" in fields["route_identity"]
+    assert "mf_subagent_startup" in fields["required_evidence_ids"]
+
+
+def test_precheck_startup_projection_requirements_name_missing_field():
+    from agent.governance import precheck_service
+
+    projection = {
+        "schema_version": "runtime_context.current.v1",
+        "worker_view": {
+            "runtime_context_id": "mfrctx-precheck",
+            "task_id": "worker-task",
+            "parent_task_id": "parent-task",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-precheck",
+            "actual_fence_token": "fence-precheck",
+            "branch_ref": "refs/heads/codex/precheck",
+            "worktree_path": "/repo/.worktrees/precheck",
+            "actual_git_root": "/repo/.worktrees/precheck",
+            "base_commit": "base-precheck",
+            "target_head_commit": "target-precheck",
+            "merge_queue_id": "mq-precheck",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-precheck",
+            "graph_query_identity": {
+                "query_source": "mf_subagent",
+                "parent_task_id": "parent-task",
+            },
+        },
+    }
+
+    result = precheck_service.run_precheck(
+        "mf_subagent.startup",
+        "contract-precheck",
+        "startup_gate",
+        {
+            "runtime_context_projection": projection,
+            "fence_token": "fence-precheck",
+            "actual_fence_token": "fence-precheck",
+        },
+        "worker-b1",
+    )
+
+    evidence = result["evidence"]
+    requirements = evidence["runtime_context_projection_requirements"]
+    assert requirements["explicit_projection"] is True
+    assert "prompt_contract_hash" in requirements["missing_fields"]
+    missing = [
+        item
+        for item in requirements["missing"]
+        if item["field"] == "prompt_contract_hash"
+    ]
+    assert missing
+    assert missing[0]["expected_source"] == (
+        "runtime_context.gate_inputs.v1.prompt_contract_hash"
+    )
+    assert missing[0]["producer"] == "runtime_context_service"
+    assert missing[0]["consumer"] == "precheck_service"
+    assert "missing_runtime_context_projection:prompt_contract_hash" in evidence["errors"]
+
+
+def test_graph_query_identity_fields_are_projection_ready():
+    from agent.governance import graph_query_trace
+
+    identity = graph_query_trace.graph_query_identity(
+        {
+            "trace_id": "gqt-test",
+            "project_id": "aming-claw",
+            "snapshot_id": "scope-test",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "parent_task_id": "parent-task",
+            "runtime_context_id": "mfrctx-graph",
+            "task_id": "worker-task",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-graph",
+            "actor": "subagent-runtime-context-consumers-b1",
+        }
+    )
+
+    assert identity["schema_version"] == "runtime_context.graph_query_identity.v1"
+    assert identity["trace_id"] == "gqt-test"
+    assert identity["runtime_context_id"] == "mfrctx-graph"
+    assert "query_source" in identity["identity_fields"]
+    assert "fence_token" in identity["identity_fields"]
+
+
 def _runtime_text_generated_startup_intent_event(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     launch_text_hash = "sha256:runtime-text-launch"

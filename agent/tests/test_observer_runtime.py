@@ -282,6 +282,106 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     )
 
 
+def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    worktree = tmp_path / ".worktrees" / "worker-a1" / "task-a1"
+    allocation_context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-a1",
+        runtime_context_id="mfrctx-runtime-text-a1",
+        backlog_id="AC-RUNTIME-TEXT-A1",
+        root_task_id="AC-RUNTIME-TEXT-A1",
+        stage_task_id="task-a1",
+        stage_type="mf_sub",
+        worker_id="worker-a1",
+        worker_slot_id="worker-a1",
+        fence_token="fence-runtime-text-a1",
+        branch_ref="refs/heads/codex/task-a1",
+        worktree_id="wt-task-a1",
+        worktree_path=str(worktree),
+        base_commit="base-a1",
+        target_head_commit="target-a1",
+        merge_queue_id="mq-runtime-text-a1",
+        status=STATE_WORKTREE_READY,
+    )
+    allocation_evidence = branch_runtime_allocation_evidence(
+        allocation_context,
+        source_ref="/api/graph-governance/aming-claw/parallel-branches/allocate",
+    )
+    supplied_projection = {
+        "schema_version": "runtime_context.current.v1",
+        "worker_view": {
+            "schema_version": "runtime_context.worker_view.v1",
+            "runtime_context_id": "mfrctx-runtime-text-a1",
+            "task_id": "task-a1",
+            "parent_task_id": "AC-RUNTIME-TEXT-A1",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-runtime-text-a1",
+            "branch_ref": "refs/heads/codex/task-a1",
+            "worktree_path": str(worktree),
+            "base_commit": "base-a1",
+            "target_head_commit": "target-a1",
+            "merge_queue_id": "mq-runtime-text-a1",
+            "owned_files": ["agent/observer_runtime.py"],
+            "graph_query_identity": {
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "parent_task_id": "AC-RUNTIME-TEXT-A1",
+            },
+        },
+        "gate_inputs": {
+            "schema_version": "runtime_context.gate_inputs.v1",
+            "route_context_hash": "sha256:route-a1",
+            "prompt_contract_id": "rprompt-a1",
+        },
+    }
+
+    prepared = build_observer_runtime_text_context(
+        ObserverRuntimeTextPrepareRequest(
+            project_id="aming-claw",
+            backlog_id="AC-RUNTIME-TEXT-A1",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route-a1",
+                prompt_contract_id="rprompt-a1",
+                prompt_contract_hash="sha256:prompt-a1",
+            ),
+            main_worktree=str(main),
+            owned_files=("agent/observer_runtime.py",),
+            task_id="task-a1",
+            parent_task_id="AC-RUNTIME-TEXT-A1",
+            worker_id="worker-a1",
+            graph_trace_ids=("gqt-runtime-text-a1",),
+            branch_runtime_evidence=allocation_evidence,
+            runtime_context_projection=supplied_projection,
+            route_id="route-a1",
+            visible_injection_manifest_hash="sha256:visible-a1",
+        )
+    )
+
+    assert prepared["ok"] is False
+    assert prepared["status"] == "rejected"
+    assert prepared["startup_intent_event"] == {}
+    diagnostics = prepared["runtime_context_projection_diagnostics"]
+    assert diagnostics["status"] == "missing_required_projection_fields"
+    assert "prompt_contract_hash" in diagnostics["missing_fields"]
+    missing = [
+        item
+        for item in diagnostics["missing"]
+        if item["field"] == "prompt_contract_hash"
+    ]
+    assert missing
+    assert {item["gate"] for item in missing} == {"mf_subagent.startup"}
+    assert missing[0]["expected_source"] == (
+        "runtime_context.gate_inputs.v1.prompt_contract_hash"
+    )
+    assert missing[0]["producer"] == "runtime_context_service"
+    assert missing[0]["consumer"] == "observer_runtime_text_prepare"
+    validation = prepared["dispatch_gate_validation"]
+    assert validation["allowed"] is False
+    assert validation["status"] == "missing_runtime_context_projection_fields"
+
+
 def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_path):
     request, allocation_evidence = _dogfood_request_with_worker(tmp_path)
     _patch_dogfood_no_progress(monkeypatch)

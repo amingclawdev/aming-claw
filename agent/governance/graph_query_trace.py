@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS graph_query_traces (
   query_purpose TEXT NOT NULL,
   run_id TEXT NOT NULL DEFAULT '',
   parent_task_id TEXT NOT NULL DEFAULT '',
+  runtime_context_id TEXT NOT NULL DEFAULT '',
+  task_id TEXT NOT NULL DEFAULT '',
+  worker_role TEXT NOT NULL DEFAULT '',
+  fence_token TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   budget_json TEXT NOT NULL DEFAULT '{}',
   usage_json TEXT NOT NULL DEFAULT '{}',
@@ -234,6 +238,27 @@ DEFAULT_BUDGETS: dict[str, dict[str, int]] = {
 }
 
 TERMINAL_TRACE_STATUSES = {"complete", "failed", "cancelled", "budget_exceeded"}
+GRAPH_QUERY_IDENTITY_SCHEMA_VERSION = "runtime_context.graph_query_identity.v1"
+GRAPH_QUERY_IDENTITY_FIELDS = (
+    "trace_id",
+    "project_id",
+    "snapshot_id",
+    "query_source",
+    "query_purpose",
+    "run_id",
+    "parent_task_id",
+    "runtime_context_id",
+    "task_id",
+    "worker_role",
+    "fence_token",
+    "actor",
+)
+_TRACE_IDENTITY_COLUMNS = {
+    "runtime_context_id": "TEXT NOT NULL DEFAULT ''",
+    "task_id": "TEXT NOT NULL DEFAULT ''",
+    "worker_role": "TEXT NOT NULL DEFAULT ''",
+    "fence_token": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 def utc_now() -> str:
@@ -243,6 +268,13 @@ def utc_now() -> str:
 def ensure_schema(conn: sqlite3.Connection) -> None:
     store.ensure_schema(conn)
     conn.executescript(GRAPH_QUERY_TRACE_SCHEMA_SQL)
+    existing = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(graph_query_traces)").fetchall()
+    }
+    for column, ddl in _TRACE_IDENTITY_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE graph_query_traces ADD COLUMN {column} {ddl}")
 
 
 def _json(data: Any) -> str:
@@ -260,6 +292,28 @@ def _decode(raw: Any, default: Any) -> Any:
         except Exception:
             return default
     return default
+
+
+def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the Runtime Context projection identity for one graph query trace."""
+
+    source = trace or {}
+    return {
+        "schema_version": GRAPH_QUERY_IDENTITY_SCHEMA_VERSION,
+        "identity_fields": list(GRAPH_QUERY_IDENTITY_FIELDS),
+        "trace_id": str(source.get("trace_id") or ""),
+        "project_id": str(source.get("project_id") or ""),
+        "snapshot_id": str(source.get("snapshot_id") or ""),
+        "query_source": str(source.get("query_source") or ""),
+        "query_purpose": str(source.get("query_purpose") or ""),
+        "run_id": str(source.get("run_id") or ""),
+        "parent_task_id": str(source.get("parent_task_id") or ""),
+        "runtime_context_id": str(source.get("runtime_context_id") or ""),
+        "task_id": str(source.get("task_id") or ""),
+        "worker_role": str(source.get("worker_role") or ""),
+        "fence_token": str(source.get("fence_token") or ""),
+        "actor": str(source.get("actor") or ""),
+    }
 
 
 def _string_list(raw: Any) -> list[str]:
@@ -459,6 +513,10 @@ def start_trace(
     query_purpose: str,
     run_id: str = "",
     parent_task_id: str = "",
+    runtime_context_id: str = "",
+    task_id: str = "",
+    worker_role: str = "",
+    fence_token: str = "",
     budget: dict[str, Any] | None = None,
     trace_id: str | None = None,
 ) -> dict[str, Any]:
@@ -477,9 +535,10 @@ def start_trace(
         """
         INSERT INTO graph_query_traces
           (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
-           run_id, parent_task_id, status, budget_json, usage_json, artifact_path,
+           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
+           fence_token, status, budget_json, usage_json, artifact_path,
            created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             tid,
@@ -490,6 +549,10 @@ def start_trace(
             purpose,
             str(run_id or ""),
             str(parent_task_id or ""),
+            str(runtime_context_id or ""),
+            str(task_id or ""),
+            str(worker_role or ""),
+            str(fence_token or ""),
             "running",
             _json(budget_json),
             _json(usage),
@@ -505,7 +568,25 @@ def start_trace(
         "snapshot_id": snapshot_id,
         "query_source": source,
         "query_purpose": purpose,
+        "runtime_context_id": str(runtime_context_id or ""),
+        "task_id": str(task_id or ""),
+        "worker_role": str(worker_role or ""),
+        "fence_token": str(fence_token or ""),
         "budget": budget_json,
+        "graph_query_identity": graph_query_identity({
+            "trace_id": tid,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "query_source": source,
+            "query_purpose": purpose,
+            "run_id": str(run_id or ""),
+            "parent_task_id": str(parent_task_id or ""),
+            "runtime_context_id": str(runtime_context_id or ""),
+            "task_id": str(task_id or ""),
+            "worker_role": str(worker_role or ""),
+            "fence_token": str(fence_token or ""),
+            "actor": str(actor or ""),
+        }),
         "ts": now,
     })
     return get_trace(conn, project_id, tid)
@@ -533,6 +614,7 @@ def get_trace(conn: sqlite3.Connection, project_id: str, trace_id: str) -> dict[
     ).fetchall()
     trace["events"] = [dict(event) for event in events]
     trace["event_count"] = len(trace["events"])
+    trace["graph_query_identity"] = graph_query_identity(trace)
     return {"ok": True, "trace": trace}
 
 
@@ -1650,6 +1732,10 @@ def traced_query(
     query_purpose: str = "api_debug",
     run_id: str = "",
     parent_task_id: str = "",
+    runtime_context_id: str = "",
+    task_id: str = "",
+    worker_role: str = "",
+    fence_token: str = "",
     budget: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -1665,6 +1751,10 @@ def traced_query(
             query_purpose=query_purpose,
             run_id=run_id,
             parent_task_id=parent_task_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            worker_role=worker_role,
+            fence_token=fence_token,
             budget=budget,
         )["trace"]
         trace_id = trace["trace_id"]
@@ -1722,6 +1812,7 @@ def traced_query(
     args_hash = _hash(args)
     result_hash = _hash(result)
     now = utc_now()
+    graph_identity = graph_query_identity(trace)
     conn.execute(
         """
         INSERT INTO graph_query_events
@@ -1751,6 +1842,7 @@ def traced_query(
         "result_count": result_count,
         "duration_ms": duration_ms,
         "status": status,
+        "graph_query_identity": graph_identity,
         "ts": now,
     })
     if created_trace:
@@ -1774,6 +1866,8 @@ def traced_query(
         "duration_ms": duration_ms,
         "usage": next_usage,
         "budget": budget_json,
+        "graph_query_identity": graph_identity,
+        "graph_identity_fields": list(GRAPH_QUERY_IDENTITY_FIELDS),
         "budget_exceeded": bool(budget_key),
         "budget_key": budget_key,
         "args_hash": args_hash,
@@ -1782,11 +1876,14 @@ def traced_query(
 
 
 __all__ = [
+    "GRAPH_QUERY_IDENTITY_FIELDS",
+    "GRAPH_QUERY_IDENTITY_SCHEMA_VERSION",
     "QUERY_PURPOSES",
     "QUERY_SOURCES",
     "ensure_schema",
     "finish_trace",
     "get_trace",
+    "graph_query_identity",
     "run_tool",
     "start_trace",
     "traced_query",
