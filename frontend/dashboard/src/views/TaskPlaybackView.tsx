@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import {
   emptyTaskPlaybackTrace,
@@ -40,18 +40,46 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [selectedFrameId, setSelectedFrameId] = useState<string>("");
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
+  const playbackByBugRef = useRef<Record<string, PlaybackLoadState>>({});
+  const selectedBugRef = useRef<BacklogBug | null>(null);
+  const mountedRef = useRef(true);
+  const activeProjectIdRef = useRef(projectId);
+  const inFlightPlaybackKeysRef = useRef<Set<string>>(new Set());
+  const playbackControllersRef = useRef<Map<string, AbortController>>(new Map());
 
   useEffect(() => {
+    playbackByBugRef.current = playbackByBug;
+  }, [playbackByBug]);
+
+  useEffect(() => {
+    activeProjectIdRef.current = projectId;
+    playbackControllersRef.current.forEach((controller) => controller.abort());
+    playbackControllersRef.current.clear();
+    inFlightPlaybackKeysRef.current.clear();
+    playbackByBugRef.current = {};
     setPlaybackByBug({});
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
     setPlaying(false);
   }, [projectId]);
 
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      playbackControllersRef.current.forEach((controller) => controller.abort());
+      playbackControllersRef.current.clear();
+      inFlightPlaybackKeysRef.current.clear();
+    };
+  }, []);
+
   const selectedBug = useMemo(() => {
     if (!selectedBugId) return null;
     return bugs.find((bug) => bug.bug_id === selectedBugId) ?? null;
   }, [bugs, selectedBugId]);
+
+  useEffect(() => {
+    selectedBugRef.current = selectedBug;
+  }, [selectedBug]);
 
   const fallbackTrace = useMemo(() => fallbackTaskPlaybackSampleTrace(projectId), [projectId]);
   const selectedState = selectedBugId ? playbackByBug[selectedBugId] : undefined;
@@ -84,54 +112,80 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   }, [bugs, gateFilter, playbackByBug, query, statusFilter]);
 
   useEffect(() => {
-    if (!selectedBug) return undefined;
-    if (playbackByBug[selectedBug.bug_id]?.loaded || playbackByBug[selectedBug.bug_id]?.loading) return undefined;
+    const bug = selectedBugRef.current;
+    if (!selectedBugId || !bug || bug.bug_id !== selectedBugId) return;
+    const bugId = bug.bug_id;
+    const requestKey = `${projectId}:${bugId}`;
+    const currentState = playbackByBugRef.current[bugId];
+    if (currentState?.loaded || currentState?.loading || inFlightPlaybackKeysRef.current.has(requestKey)) return;
+
     const controller = new AbortController();
-    const bugId = selectedBug.bug_id;
+    inFlightPlaybackKeysRef.current.add(requestKey);
+    playbackControllersRef.current.set(requestKey, controller);
     setPlaybackByBug((states) => ({
       ...states,
       [bugId]: {
         loading: true,
         loaded: false,
         error: "",
-        trace: emptyTaskPlaybackTrace(projectId, selectedBug),
+        trace: emptyTaskPlaybackTrace(projectId, bug),
       },
     }));
 
     Promise.allSettled([
       api.taskTimelineFor(projectId, bugId, PLAYBACK_TIMELINE_LIMIT, controller.signal),
       api.backlogTimelineGateFor(projectId, bugId, PLAYBACK_TIMELINE_LIMIT, controller.signal),
-    ]).then(([timelineResult, gateResult]) => {
-      if (controller.signal.aborted) return;
-      const taskTimeline = timelineResult.status === "fulfilled" ? timelineResult.value : null;
-      const gate = gateResult.status === "fulfilled" ? gateResult.value : null;
-      const errors = [
-        timelineResult.status === "rejected" ? errorMessage(timelineResult.reason) : "",
-        gateResult.status === "rejected" ? errorMessage(gateResult.reason) : "",
-      ].filter(Boolean);
-      const trace = normalizeTaskPlaybackTrace({
-        projectId,
-        backlog: selectedBug,
-        taskTimeline,
-        gateResponse: gate,
-        source: taskTimeline && gate ? "governed" : "governed_partial",
-      });
-      setPlaybackByBug((states) => ({
-        ...states,
-        [bugId]: {
-          loading: false,
-          loaded: true,
-          error: errors.join(" | "),
-          trace,
+    ])
+      .then(([timelineResult, gateResult]) => {
+        if (controller.signal.aborted || !mountedRef.current || activeProjectIdRef.current !== projectId) return;
+        const taskTimeline = timelineResult.status === "fulfilled" ? timelineResult.value : null;
+        const gate = gateResult.status === "fulfilled" ? gateResult.value : null;
+        const errors = [
+          timelineResult.status === "rejected" ? errorMessage(timelineResult.reason) : "",
+          gateResult.status === "rejected" ? errorMessage(gateResult.reason) : "",
+        ].filter(Boolean);
+        const trace = normalizeTaskPlaybackTrace({
+          projectId,
+          backlog: bug,
           taskTimeline,
-          gate,
-        },
-      }));
-      setSelectedFrameId(trace.frames[0]?.id || "");
-    });
-
-    return () => controller.abort();
-  }, [playbackByBug, projectId, selectedBug]);
+          gateResponse: gate,
+          source: taskTimeline && gate ? "governed" : "governed_partial",
+        });
+        setPlaybackByBug((states) => ({
+          ...states,
+          [bugId]: {
+            loading: false,
+            loaded: true,
+            error: errors.join(" | "),
+            trace,
+            taskTimeline,
+            gate,
+          },
+        }));
+        if (selectedBugRef.current?.bug_id === bugId) {
+          setSelectedFrameId((current) => current || trace.frames[0]?.id || "");
+        }
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || !mountedRef.current || activeProjectIdRef.current !== projectId) return;
+        const trace = emptyTaskPlaybackTrace(projectId, bug);
+        setPlaybackByBug((states) => ({
+          ...states,
+          [bugId]: {
+            loading: false,
+            loaded: true,
+            error: errorMessage(error),
+            trace,
+            taskTimeline: null,
+            gate: null,
+          },
+        }));
+      })
+      .finally(() => {
+        inFlightPlaybackKeysRef.current.delete(requestKey);
+        playbackControllersRef.current.delete(requestKey);
+      });
+  }, [projectId, selectedBugId]);
 
   useEffect(() => {
     if (!playing || activeTrace.frames.length <= 1) return undefined;
