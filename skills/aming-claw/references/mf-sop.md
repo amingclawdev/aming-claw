@@ -106,12 +106,19 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      evidence before worker implementation starts and again at finish/handoff.
      The graph lookup must be audited with explicit `query_source=mf_subagent`,
      `task_id`, `parent_task_id`, `worker_role=mf_sub`, and `fence_token`;
-   - for observer-to-subagent dispatch, require
-     `observer_subagent_service_dispatch.v1` evidence with replayable
-     `dispatch_command_ref` plus `monitor_ref`, or a documented host-adapter
-     boundary with a documentation ref;
-   - when route topology or instantiated evidence names
-     `architecture_review_lane` or `qa_evidence_gate_review`, record those
+  - for observer-to-subagent dispatch, require
+    `observer_subagent_service_dispatch.v1` evidence with replayable
+    `dispatch_command_ref` plus `monitor_ref`, or a documented host-adapter
+    boundary with a documentation ref;
+  - before `observer_runtime_text_prepare`, startup, or read-receipt evidence,
+    enqueue or claim the backlog-specific `execute_backlog_row` command for the
+    same backlog and route identity, then pass that command id as
+    `observer_command_id` through CLI/MCP/API and `parallel_branch_startup`.
+    Do not use a blind `observer_command_next` result as lineage unless it is
+    the exact claimed `execute_backlog_row` command for this backlog and route
+    identity;
+  - when route topology or instantiated evidence names
+    `architecture_review_lane` or `qa_evidence_gate_review`, record those
      review lanes as first-class evidence. Do not make architecture review
      mandatory for ordinary `mf_parallel.v1` rows unless the route/contract
      asks for it;

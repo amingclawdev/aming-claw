@@ -212,6 +212,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),
+            observer_command_id="cmd-a1",
             task_id="task-a1",
             parent_task_id="AC-RUNTIME-TEXT-A1",
             worker_id="worker-a1",
@@ -227,6 +228,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert prepared["ok"] is True
     assert prepared["status"] == "prepared"
     assert prepared["runtime_context_id"] == "mfrctx-runtime-text-a1"
+    assert prepared["observer_command_id"] == "cmd-a1"
     assert prepared["runtime_context"]["worktree_path"] == str(worktree)
     assert prepared["runtime_context"]["fence_token"] == "fence-runtime-text-a1"
     assert prepared["runtime_context"]["base_commit"] == "base-a1"
@@ -359,6 +361,7 @@ def test_runtime_text_prepare_hydrates_persisted_allocation_from_runtime_context
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),
+            observer_command_id="cmd-a2",
             task_id="task-a2",
             parent_task_id="AC-RUNTIME-TEXT-A2",
             worker_id="planned-worker",
@@ -423,6 +426,7 @@ def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tm
         "worker_view": {
             "schema_version": "runtime_context.worker_view.v1",
             "runtime_context_id": "mfrctx-runtime-text-a1",
+            "observer_command_id": "cmd-a1",
             "task_id": "task-a1",
             "parent_task_id": "AC-RUNTIME-TEXT-A1",
             "worker_role": "mf_sub",
@@ -441,6 +445,7 @@ def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tm
         },
         "gate_inputs": {
             "schema_version": "runtime_context.gate_inputs.v1",
+            "observer_command_id": "cmd-a1",
             "route_context_hash": "sha256:route-a1",
             "prompt_contract_id": "rprompt-a1",
         },
@@ -457,6 +462,7 @@ def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tm
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),
+            observer_command_id="cmd-a1",
             task_id="task-a1",
             parent_task_id="AC-RUNTIME-TEXT-A1",
             worker_id="worker-a1",

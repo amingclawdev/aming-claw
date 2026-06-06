@@ -757,6 +757,7 @@ def test_mcp_observer_runtime_text_prepare_routes_to_governance_endpoint(tmp_pat
             "main_worktree": str(main),
             "workspace_root": str(tmp_path / "workers"),
             "owned_files": ["agent/observer_runtime.py"],
+            "observer_command_id": "cmd-runtime-text",
             "task_id": "AC-RUNTIME-TEXT-impl-1",
             "parent_task_id": "AC-RUNTIME-TEXT",
             "merge_queue_id": "mq-runtime-text",
@@ -784,6 +785,7 @@ def test_mcp_observer_runtime_text_prepare_routes_to_governance_endpoint(tmp_pat
                 "main_worktree": str(main),
                 "workspace_root": str(tmp_path / "workers"),
                 "owned_files": ["agent/observer_runtime.py"],
+                "observer_command_id": "cmd-runtime-text",
                 "task_id": "AC-RUNTIME-TEXT-impl-1",
                 "parent_task_id": "AC-RUNTIME-TEXT",
                 "merge_queue_id": "mq-runtime-text",
@@ -891,11 +893,22 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     startup = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_startup")
     checkpoint = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_checkpoint")
     finish_gate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_finish_gate")
+    runtime_text = next(
+        tool for tool in TOOLS if tool.get("name") == "observer_runtime_text_prepare"
+    )
 
     allocate_props = allocate["inputSchema"]["properties"]
     startup_props = startup["inputSchema"]["properties"]
     checkpoint_props = checkpoint["inputSchema"]["properties"]
     finish_props = finish_gate["inputSchema"]["properties"]
+    runtime_text_props = runtime_text["inputSchema"]["properties"]
+    assert runtime_text["inputSchema"]["required"] == [
+        "project_id",
+        "backlog_id",
+        "observer_command_id",
+        "route_context_hash",
+        "prompt_contract_id",
+    ]
 
     assert allocate["inputSchema"]["required"] == ["project_id", "task_id"]
     for key in (
@@ -972,6 +985,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         assert props["route_token"]["type"] == "object"
         assert props["route_waiver"]["type"] == "object"
         assert props["route_token_waiver"]["type"] == "object"
+    assert runtime_text_props["observer_command_id"]["type"] == "string"
 
 
 def test_mcp_parallel_branch_tools_route_to_governance_api():

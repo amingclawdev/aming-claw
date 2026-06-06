@@ -65,6 +65,7 @@ def _runtime_text_request(tmp_path: Path, **overrides: object) -> ObserverRuntim
         "main_worktree": str(main),
         "workspace_root": str(tmp_path / "workers"),
         "owned_files": ("agent/observer_runtime.py", "agent/cli.py"),
+        "observer_command_id": "cmd-runtime-text",
         "task_id": "AC-RUNTIME-TEXT-impl-1",
         "parent_task_id": "AC-RUNTIME-TEXT",
         "worker_id": "worker-1",
@@ -96,6 +97,8 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["ok"] is True
     assert result["status"] == "prepared"
     assert result["runtime_context_id"] == "mfrctx-runtime-text"
+    assert result["observer_command_id"] == "cmd-runtime-text"
+    assert result["observer_command_requirement"]["status"] == "present"
     assert result["runtime_context"]["worktree_path"].endswith(
         ".worktrees/worker-1/ac-runtime-text-impl-1"
     )
@@ -104,6 +107,7 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["raw_launch_text_persisted"] is False
     persistent = result["persistent_evidence"]
     assert persistent["runtime_context_id"] == result["runtime_context_id"]
+    assert persistent["observer_command_id"] == "cmd-runtime-text"
     assert persistent["launch_text_hash"] == result["launch_text_hash"]
     assert persistent["raw_launch_text_persisted"] is False
     assert persistent["dispatch_ready"] is True
@@ -148,6 +152,7 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     startup_intent = startup_event["payload"]["mf_subagent_startup_intent"]
     assert startup_intent["schema_version"] == "mf_subagent_startup_intent.v1"
     assert startup_intent["runtime_context_id"] == result["runtime_context_id"]
+    assert startup_intent["observer_command_id"] == "cmd-runtime-text"
     assert startup_intent["launch_text_hash"] == result["launch_text_hash"]
     assert startup_intent["raw_launch_text_persisted"] is False
     assert startup_intent["close_satisfying"] is False
@@ -180,6 +185,10 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
 
     assert result["mf_subagent_input"]["role"] == "mf_sub"
     assert result["startup_echo_contract"]["required"] is True
+    assert (
+        result["startup_echo_contract"]["expected"]["observer_command_id"]
+        == "cmd-runtime-text"
+    )
     assert result["graph_first_obligations"]["query"]["query_source"] == "mf_subagent"
     assert result["graph_first_obligations"]["query"]["governance_project_id"] == "aming-claw"
     assert result["graph_first_obligations"]["query"]["target_project_id"] == "aming-claw"
@@ -196,6 +205,9 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     )
     assert result["graph_first_obligations"]["post_hoc_read_receipt_satisfies_gate"] is False
     assert "mf_subagent_read_receipt" in result["launch_text"]
+    assert "observer_command_id must be the claimed backlog-specific" in result[
+        "launch_text"
+    ]
     assert "post-hoc read receipt after counted evidence does not satisfy" in result[
         "launch_text"
     ]
@@ -212,6 +224,73 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert (
         result["mf_subagent_input"]["runtime_identity"]["allocation_owner"]
         == "observer_runtime_text"
+    )
+
+
+def test_runtime_text_builder_rejects_missing_observer_command_id(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(tmp_path, observer_command_id="")
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "observer_command_required"
+    assert result["observer_command_id"] == ""
+    assert result["observer_command_requirement"]["required_command_type"] == (
+        "execute_backlog_row"
+    )
+    assert result["dispatch_gate_validation"]["allowed"] is False
+    assert result["dispatch_gate_validation"]["status"] == "observer_command_required"
+    assert result["persistent_evidence"]["dispatch_ready"] is False
+    assert "observer_command_id" in result["runtime_context_projection_diagnostics"][
+        "missing_fields"
+    ]
+
+
+def test_runtime_text_rejects_supplied_projection_missing_observer_command_id(tmp_path):
+    stale_projection = {
+        "schema_version": "runtime_context.current.v1",
+        "worker_view": {
+            "runtime_context_id": "mfrctx-runtime-text",
+            "task_id": "AC-RUNTIME-TEXT-impl-1",
+            "parent_task_id": "AC-RUNTIME-TEXT",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-runtime-text",
+            "worktree_path": str(
+                tmp_path / "workers" / ".worktrees" / "worker-1" / "ac-runtime-text-impl-1"
+            ),
+            "branch_ref": "refs/heads/runtime-text/ac-runtime-text-impl-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-runtime-text",
+            "owned_files": ["agent/observer_runtime.py"],
+            "graph_query_identity": {"query_source": "mf_subagent"},
+        },
+        "gate_inputs": {
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-runtime",
+            "prompt_contract_hash": "sha256:prompt",
+        },
+    }
+
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            observer_command_id="cmd-runtime-text",
+            runtime_context_projection=stale_projection,
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "rejected"
+    assert result["observer_command_id"] == "cmd-runtime-text"
+    assert result["runtime_context_projection_diagnostics"]["producer"] == (
+        "runtime_context_service"
+    )
+    assert "observer_command_id" in result["runtime_context_projection_diagnostics"][
+        "missing_fields"
+    ]
+    assert result["dispatch_gate_validation"]["status"] == (
+        "missing_runtime_context_projection_fields"
     )
 
 

@@ -225,12 +225,19 @@ The generated intent is not close-satisfying startup evidence:
 `close_satisfying=false`, `actual_startup_required=true`, and
 `close_ready=false` remain true until the host/worker appends a real
 `event_kind=mf_subagent_startup` after runtime identity is known. That actual
-startup event MUST include `actual_cwd` and/or `actual_git_root`, fence token,
-branch/head/base/target commit identity, runtime context id when available, and
-route identity. Timeline or durable evidence may store `runtime_context_id`,
-`launch_text_hash`, the generated startup intent packet, branch runtime evidence,
-graph trace identity, and service dispatch evidence, but MUST NOT persist raw
-launch text.
+startup event MUST include the claimed backlog-specific
+`execute_backlog_row` `observer_command_id`, `actual_cwd` and/or
+`actual_git_root`, fence token, branch/head/base/target commit identity, runtime
+context id when available, and route identity. Before preparing runtime text or
+startup/read-receipt evidence, the observer MUST enqueue or claim the
+backlog-specific `execute_backlog_row` command for the same backlog and route
+identity, then pass that command id through CLI/MCP/API as
+`observer_command_id`. Do not use an arbitrary `observer_command_next` result as
+lineage; it is valid only when it is the exact claimed `execute_backlog_row`
+command for this backlog and route identity. Timeline or durable evidence may
+store `observer_command_id`, `runtime_context_id`, `launch_text_hash`, the
+generated startup intent packet, branch runtime evidence, graph trace identity,
+and service dispatch evidence, but MUST NOT persist raw launch text.
 The runtime text prepare service consumes branch runtime allocation evidence; it
 does not allocate/register branch runtime context by itself. Dispatch-ready
 prepare requires machine-consumable `mf_subagent_branch_runtime.v1` evidence

@@ -361,6 +361,13 @@ TOOLS: list[dict] = [
                 "main_worktree": {"type": "string"},
                 "workspace_root": {"type": "string"},
                 "owned_files": {"type": "array", "items": {"type": "string"}},
+                "observer_command_id": {
+                    "type": "string",
+                    "description": (
+                        "Claimed backlog-specific execute_backlog_row command id; "
+                        "required for dispatch-ready startup/read-receipt lineage."
+                    ),
+                },
                 "task_id": {"type": "string"},
                 "parent_task_id": {"type": "string"},
                 "worker_id": {"type": "string"},
@@ -378,7 +385,13 @@ TOOLS: list[dict] = [
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                 "test_commands": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["project_id", "backlog_id", "route_context_hash", "prompt_contract_id"],
+            "required": [
+                "project_id",
+                "backlog_id",
+                "observer_command_id",
+                "route_context_hash",
+                "prompt_contract_id",
+            ],
         },
     },
     {

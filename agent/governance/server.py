@@ -19791,6 +19791,9 @@ def _observer_runtime_text_contract_revision_payload(
         "source": "observer_runtime_text_prepare",
         "source_of_truth": "Contract/Revision/Event",
         "runtime_context_id": str(prepared.get("runtime_context_id") or ""),
+        "observer_command_id": str(
+            prepared.get("observer_command_id") or body.get("observer_command_id") or ""
+        ),
         "target_files": owned_files,
         "owned_files": owned_files,
         "acceptance_criteria": _runtime_context_service_query_values(
@@ -19914,6 +19917,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         main_worktree=str(body.get("main_worktree") or body.get("workspace") or ""),
         workspace_root=str(body.get("workspace_root") or ""),
         owned_files=tuple(str(item) for item in (body.get("owned_files") or [])),
+        observer_command_id=str(
+            body.get("observer_command_id")
+            or resolved_context.get("observer_command_id")
+            or ""
+        ),
         task_id=str(body.get("task_id") or resolved_context.get("task_id") or ""),
         parent_task_id=str(
             body.get("parent_task_id")

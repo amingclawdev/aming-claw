@@ -1190,6 +1190,7 @@ def test_runtime_text_prepare_accepts_parallel_branch_allocate_evidence(conn, tm
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),
+            observer_command_id="cmd-runtime-api",
             task_id=allocated["context"]["task_id"],
             parent_task_id=allocated["context"]["root_task_id"],
             worker_id=allocated["context"]["worker_id"],
@@ -1203,6 +1204,7 @@ def test_runtime_text_prepare_accepts_parallel_branch_allocate_evidence(conn, tm
     assert prepared["ok"] is True
     assert prepared["status"] == "prepared"
     assert prepared["runtime_context_id"] == allocation_evidence["runtime_context_id"]
+    assert prepared["observer_command_id"] == "cmd-runtime-api"
     assert prepared["runtime_context"]["worktree_path"] == allocated["context"]["worktree_path"]
     assert prepared["branch_runtime_evidence"]["status"] == STATE_WORKTREE_READY
     assert prepared["branch_runtime_evidence"]["registered"] is True
@@ -1381,6 +1383,7 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
             method="POST",
             body={
                 "backlog_id": "AC-RUNTIME-TEXT",
+                "observer_command_id": "cmd-runtime-text-api",
                 "task_id": "runtime-text-task",
                 "parent_task_id": "AC-RUNTIME-TEXT",
                 "runtime_context_id": "mfrctx-runtime-text-api",
@@ -1404,6 +1407,7 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert prepared["ok"] is True
     assert prepared["status"] == "prepared"
     assert prepared["runtime_context_id"] == "mfrctx-runtime-text-api"
+    assert prepared["observer_command_id"] == "cmd-runtime-text-api"
     assert prepared["runtime_context"]["worktree_path"] == str(worktree)
     evidence = prepared["branch_runtime_evidence"]
     assert evidence["registered"] is True
@@ -1443,6 +1447,7 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
             method="POST",
             body={
                 "backlog_id": "AC-RUNTIME-TEXT",
+                "observer_command_id": "cmd-runtime-text-api",
                 "task_id": context["task_id"],
                 "parent_task_id": context["root_task_id"],
                 "branch_runtime_registration_ref": context["runtime_context_id"],
@@ -1466,6 +1471,7 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert prepared["ok"] is True
     assert prepared["status"] == "prepared"
     assert prepared["runtime_context_id"] == context["runtime_context_id"]
+    assert prepared["observer_command_id"] == "cmd-runtime-text-api"
     assert prepared["runtime_context"]["worktree_path"] == context["worktree_path"]
     evidence = prepared["branch_runtime_evidence"]
     assert evidence["registered"] is True
@@ -1501,13 +1507,16 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert current["route_identity"]["visible_injection_manifest_hash"] == (
         "sha256:visible-api"
     )
+    assert current["identity"]["observer_command_id"] == "cmd-runtime-text-api"
     assert current["work"]["target_files"] == ["agent/observer_runtime.py"]
     assert gate_inputs["route_context_hash"] == "sha256:route-api"
+    assert gate_inputs["observer_command_id"] == "cmd-runtime-text-api"
     assert gate_inputs["prompt_contract_id"] == "rprompt-api"
     assert gate_inputs["prompt_contract_hash"] == "sha256:prompt-api"
     assert gate_inputs["visible_injection_manifest_hash"] == "sha256:visible-api"
     assert gate_inputs["target_files"] == ["agent/observer_runtime.py"]
     assert worker_view["route_context_hash"] == "sha256:route-api"
+    assert worker_view["observer_command_id"] == "cmd-runtime-text-api"
     assert worker_view["prompt_contract_id"] == "rprompt-api"
     assert worker_view["prompt_contract_hash"] == "sha256:prompt-api"
     assert worker_view["visible_injection_manifest_hash"] == "sha256:visible-api"
@@ -1521,12 +1530,20 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
             },
             "mf_sub",
             query={
+                "observer_command_id": "cmd-runtime-text-api",
                 "parent_task_id": context["root_task_id"],
                 "fence_token": context["fence_token"],
             },
         )
     )["runtime_contract"]
     assert contract["route_context_hash"] == "sha256:route-api"
+    assert contract["observer_command_id"] == "cmd-runtime-text-api"
+    assert contract["runtime_context"]["observer_command_id"] == (
+        "cmd-runtime-text-api"
+    )
+    assert contract["contract"]["observer_command"]["observer_command_id"] == (
+        "cmd-runtime-text-api"
+    )
     assert contract["prompt_contract_id"] == "rprompt-api"
     assert contract["prompt_contract_hash"] == "sha256:prompt-api"
     assert contract["visible_injection_manifest_hash"] == "sha256:visible-api"
@@ -1543,6 +1560,7 @@ def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(co
             method="POST",
             body={
                 "backlog_id": "AC-RUNTIME-TEXT",
+                "observer_command_id": "cmd-runtime-text-api",
                 "task_id": "runtime-text-task",
                 "parent_task_id": "AC-RUNTIME-TEXT",
                 "runtime_context_id": "mfrctx-missing",
@@ -1662,6 +1680,7 @@ def test_observer_runtime_text_prepare_rejects_persisted_runtime_context_mismatc
     main.mkdir()
     body = {
         "backlog_id": "AC-RUNTIME-TEXT",
+        "observer_command_id": "cmd-runtime-text-api",
         "task_id": "runtime-text-task",
         "parent_task_id": "AC-RUNTIME-TEXT",
         "branch_runtime_registration_ref": "mfrctx-runtime-text-api",

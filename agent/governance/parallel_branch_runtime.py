@@ -1444,6 +1444,7 @@ def _runtime_context_current_values(
     context: BranchTaskRuntimeContext,
     *,
     runtime_context_id: str,
+    observer_command_id: str,
     route_identity: Mapping[str, Any],
     timeline_refs: Mapping[str, Any],
     graph_trace_refs: Mapping[str, Any],
@@ -1466,6 +1467,7 @@ def _runtime_context_current_values(
         "target_project_id": context.target_project_id or context.project_id,
         "target_project_root": context.target_project_root,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "backlog_id": context.backlog_id,
@@ -1641,6 +1643,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "producer": "parallel_branch_runtime",
             "consumer": "record_mf_subagent_startup",
             "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "observer_command_id",
+            "expected_source": "contract_revision.payload.observer_command_id",
+            "producer": "observer_runtime_text_prepare",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "contract_revision",
         },
         {
             "field": "parent_task_id",
@@ -2021,6 +2030,7 @@ def build_runtime_context_gate_inputs_view(
         "runtime_context_id": _runtime_context_text(
             current_view.get("runtime_context_id")
         ),
+        "observer_command_id": values.get("observer_command_id", ""),
         "task_id": values.get("task_id", ""),
         "route_id": values.get("route_id", ""),
         "route_context_hash": values.get("route_context_hash", ""),
@@ -2095,9 +2105,16 @@ def build_runtime_context_current_view(
     startup = public_contract_revision_payload(startup_gate or {})
     finish = public_contract_revision_payload(finish_gate or {})
     close = public_contract_revision_payload(close_evidence or {})
+    observer_command_id = _runtime_context_text(
+        revision_payload.get("observer_command_id")
+        or startup.get("observer_command_id")
+        or finish.get("observer_command_id")
+        or close.get("observer_command_id")
+    )
     current_values = _runtime_context_current_values(
         context,
         runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
         route_identity=route,
         timeline_refs=timeline,
         graph_trace_refs=graph_trace,
@@ -2136,6 +2153,7 @@ def build_runtime_context_current_view(
                 "target_project_id",
                 "target_project_root",
                 "runtime_context_id",
+                "observer_command_id",
                 "task_id",
                 "parent_task_id",
                 "backlog_id",
@@ -2209,6 +2227,7 @@ def build_runtime_context_close_gate_view(
     )
     close_missing = list(close_gate.get("missing") or [])
     checklist_fields = (
+        ("observer_command", "observer_command_id"),
         ("startup_evidence", "startup_event_ref"),
         ("read_receipt", "read_receipt_event_ref"),
         ("finish_gate", "finish_gate_ref"),
@@ -2236,6 +2255,7 @@ def build_runtime_context_close_gate_view(
     return {
         "schema_version": RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
         "runtime_context_id": current_view.get("runtime_context_id", ""),
+        "observer_command_id": values.get("observer_command_id", ""),
         "task_id": values.get("task_id", ""),
         "merge_queue_id": values.get("merge_queue_id", ""),
         "checkpoint_id": values.get("checkpoint_id", ""),
@@ -2311,6 +2331,7 @@ def build_runtime_context_worker_view(
         "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
         "role": RUNTIME_CONTEXT_WORKER_ROLE,
         "runtime_context_id": current_view.get("runtime_context_id", ""),
+        "observer_command_id": values.get("observer_command_id", ""),
         "route_id": values.get("route_id", ""),
         "route_context_hash": values.get("route_context_hash", ""),
         "prompt_contract_id": values.get("prompt_contract_id", ""),
@@ -2325,6 +2346,7 @@ def build_runtime_context_worker_view(
             key: values.get(key, "")
             for key in (
                 "project_id",
+                "observer_command_id",
                 "governance_project_id",
                 "target_project_id",
                 "target_project_root",

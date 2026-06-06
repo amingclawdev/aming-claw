@@ -1647,6 +1647,14 @@ def observer_runtime_text():
 @click.option("--main-worktree", default="", help="Target/main worktree path blocked by dispatch policy. Defaults to cwd.")
 @click.option("--workspace-root", default="", help="Parent workspace root for generated worker worktrees. Defaults to main worktree parent.")
 @click.option("--owned-file", "owned_files", multiple=True, help="Owned file fence for the worker. Repeatable.")
+@click.option(
+    "--observer-command-id",
+    default="",
+    help=(
+        "Claimed backlog-specific execute_backlog_row command id required for "
+        "startup/read-receipt lineage."
+    ),
+)
 @click.option("--task-id", default="", help="Worker task id. Defaults to backlog id.")
 @click.option("--parent-task-id", default="", help="Parent observer/MF task id. Defaults to backlog id.")
 @click.option("--worker-id", default="", help="Worker id used in deterministic worktree planning.")
@@ -1707,6 +1715,7 @@ def observer_runtime_text_prepare(
     main_worktree,
     workspace_root,
     owned_files,
+    observer_command_id,
     task_id,
     parent_task_id,
     worker_id,
@@ -1755,6 +1764,7 @@ def observer_runtime_text_prepare(
         main_worktree=main_worktree or os.getcwd(),
         workspace_root=workspace_root,
         owned_files=tuple(owned_files),
+        observer_command_id=observer_command_id,
         task_id=task_id,
         parent_task_id=parent_task_id,
         worker_id=worker_id,

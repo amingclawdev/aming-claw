@@ -235,6 +235,8 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
     assert view["contract"]["read_receipt_ordering"] == {
         "schema_version": "mf_subagent_read_receipt_ordering.v1",
         "timeline_event_kind": "mf_subagent_read_receipt",
+        "observer_command_id": "",
+        "required_command_type": "execute_backlog_row",
         "required_before": [
             "graph_query",
             "startup",
@@ -383,6 +385,7 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
             "revision_id": "crev-runtime-context",
             "contract_version": "mf_parallel.v1",
             "payload": {
+                "observer_command_id": "cmd-runtime-context",
                 "target_files": ["agent/governance/mf_subagent_contract.py"],
                 "acceptance_criteria": ["runtime context wrapper is valid"],
                 "private_context": secret,
@@ -429,6 +432,8 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
     assert worker_view["gate_inputs"]["status"] == "ready"
     assert worker_view["close_gate_view"]["ready"] is True
     assert worker_view["route_context_hash"] == "sha256:route-runtime-context"
+    assert worker_view["observer_command_id"] == "cmd-runtime-context"
+    assert worker_view["gate_inputs"]["observer_command_id"] == "cmd-runtime-context"
     assert worker_view["prompt_contract_id"] == "rprompt-runtime-context"
     assert worker_view["prompt_contract_hash"] == "sha256:prompt-runtime-context"
     assert worker_view["visible_injection_manifest_hash"] == (

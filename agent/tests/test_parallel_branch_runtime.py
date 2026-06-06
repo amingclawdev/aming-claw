@@ -263,6 +263,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "revision_id": "crev-runtime-context",
             "contract_version": "mf_parallel.v1",
             "payload": {
+                "observer_command_id": "cmd-runtime-context",
                 "target_files": ["agent/governance/parallel_branch_runtime.py"],
                 "acceptance_criteria": ["worker view is role filtered"],
                 "raw_private_memory": private_secret,
@@ -308,6 +309,8 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
 
     assert worker_view["schema_version"] == RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION
     assert worker_view["task"]["task_id"] == "mf-sub-runtime-context"
+    assert worker_view["observer_command_id"] == "cmd-runtime-context"
+    assert worker_view["gate_inputs"]["observer_command_id"] == "cmd-runtime-context"
     assert worker_view["task"]["fence_token"] == "fence-runtime-context"
     assert worker_view["route_identity"]["prompt_contract_hash"] == (
         "sha256:prompt-runtime-context"

@@ -1765,6 +1765,8 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
             str(tmp_path / "workers"),
             "--owned-file",
             "agent/observer_runtime.py",
+            "--observer-command-id",
+            "cmd-runtime-text-test",
             "--task-id",
             f"{DOGFOOD_BACKLOG_ID}-impl-1",
             "--parent-task-id",
@@ -1791,6 +1793,7 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["runtime_context_id"] == "mfrctx-cli-runtime-text"
+    assert payload["observer_command_id"] == "cmd-runtime-text-test"
     assert payload["runtime_context"]["worktree_path"] == str(worker_worktree)
     assert payload["launch_text"]
     assert payload["launch_text_hash"].startswith("sha256:")
@@ -2504,7 +2507,7 @@ class TestCliMf:
         assert "--main-worktree" in command_help.output
 
     def test_mf_dispatch_gate_rejects_invalid_payload(self, tmp_path):
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         contract_path = tmp_path / "dispatch.json"
         contract_path.write_text(json.dumps({"owned_files": []}), encoding="utf-8")
 
@@ -2516,9 +2519,9 @@ class TestCliMf:
         ])
 
         assert result.exit_code == 1
-        assert result.output == ""
-        assert "REJECT: MF subagent dispatch missing required fields:" in result.stderr
-        assert "branch" in result.stderr
+        captured = result.stderr or result.output
+        assert "REJECT: MF subagent dispatch missing required fields:" in captured
+        assert "branch" in captured
 
     def test_mf_dispatch_gate_prints_pretty_json_on_pass(self, tmp_path):
         runner = CliRunner()

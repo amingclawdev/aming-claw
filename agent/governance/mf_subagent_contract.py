@@ -730,6 +730,7 @@ def build_mf_subagent_runtime_contract_view(
         if isinstance(latest_revision_payload.get("revision_receipt"), Mapping)
         else {}
     )
+    observer_command_id = _string(latest_revision_payload.get("observer_command_id"))
     route_identity_safe = _safe_route_identity(route_identity)
     agent_task_contract = build_observer_owned_agent_task_contract(
         context,
@@ -787,6 +788,7 @@ def build_mf_subagent_runtime_contract_view(
 
     runtime_context = {
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
         "project_id": context.project_id,
         "governance_project_id": context.governance_project_id or context.project_id,
         "target_project_id": context.target_project_id or context.project_id,
@@ -862,6 +864,8 @@ def build_mf_subagent_runtime_contract_view(
         "read_receipt_ordering": {
             "schema_version": "mf_subagent_read_receipt_ordering.v1",
             "timeline_event_kind": "mf_subagent_read_receipt",
+            "observer_command_id": observer_command_id,
+            "required_command_type": "execute_backlog_row",
             "required_before": [
                 "graph_query",
                 "startup",
@@ -871,6 +875,17 @@ def build_mf_subagent_runtime_contract_view(
             ],
             "close_sensitive": True,
             "post_hoc_receipt_satisfies_gate": False,
+        },
+        "observer_command": {
+            "schema_version": "mf_subagent_observer_command_lineage.v1",
+            "required": True,
+            "observer_command_id": observer_command_id,
+            "required_command_type": "execute_backlog_row",
+            "backlog_id": context.backlog_id,
+            "claim_rule": (
+                "Use the claimed backlog-specific execute_backlog_row command id; "
+                "do not substitute an unrelated observer_command_next result."
+            ),
         },
         "service_routes": {
             "runtime_contract": (
@@ -968,6 +983,7 @@ def build_mf_subagent_runtime_contract_view(
     view: dict[str, Any] = {
         "schema_version": RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
         "latest_revision_id": latest_revision_text,
         "known_revision_id": known_revision_text,
         "contract_changed": contract_changed,
@@ -1022,6 +1038,7 @@ def build_mf_subagent_runtime_contract_view(
         },
         "worker_runtime_query": {
             "runtime_context_id": runtime_context_id,
+            "observer_command_id": observer_command_id,
             "contract_version": contract["contract_version"],
             "contract_revision_id": contract["contract_revision_id"],
             "known_revision_id": known_revision_text,

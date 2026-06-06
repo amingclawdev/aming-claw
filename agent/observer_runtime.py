@@ -132,6 +132,7 @@ RUNTIME_TEXT_RUNTIME_CONTEXT_PROJECTION_CONTRACT = (
 )
 RUNTIME_TEXT_STARTUP_PROJECTION_FIELDS = (
     "runtime_context_id",
+    "observer_command_id",
     "task_id",
     "parent_task_id",
     "worker_role",
@@ -148,6 +149,7 @@ RUNTIME_TEXT_STARTUP_PROJECTION_FIELDS = (
 )
 RUNTIME_TEXT_FINISH_PROJECTION_FIELDS = (
     "runtime_context_id",
+    "observer_command_id",
     "task_id",
     "parent_task_id",
     "worker_role",
@@ -161,6 +163,9 @@ RUNTIME_TEXT_FINISH_PROJECTION_FIELDS = (
 RUNTIME_TEXT_PROJECTION_FIELD_SOURCES = {
     "runtime_context_id": (
         "runtime_context.current.v1.worker_view.runtime_context_id"
+    ),
+    "observer_command_id": (
+        "runtime_context.gate_inputs.v1.observer_command_id"
     ),
     "task_id": "runtime_context.current.v1.worker_view.task_id",
     "parent_task_id": "runtime_context.current.v1.worker_view.parent_task_id",
@@ -273,6 +278,7 @@ class ObserverRuntimeTextPrepareRequest:
     main_worktree: str = ""
     workspace_root: str = ""
     owned_files: tuple[str, ...] = ()
+    observer_command_id: str = ""
     task_id: str = ""
     parent_task_id: str = ""
     worker_id: str = ""
@@ -1300,6 +1306,63 @@ def _runtime_text_items(values: Sequence[str] | None) -> list[str]:
     return [str(item) for item in values if str(item or "").strip()]
 
 
+def _runtime_text_observer_command_id(
+    request: ObserverRuntimeTextPrepareRequest,
+    *,
+    branch_runtime_evidence: Mapping[str, Any] | None = None,
+) -> str:
+    evidence = branch_runtime_evidence if isinstance(branch_runtime_evidence, Mapping) else {}
+    evidence_context = (
+        evidence.get("context") if isinstance(evidence.get("context"), Mapping) else {}
+    )
+    supplied_projection = (
+        request.runtime_context_projection
+        if isinstance(request.runtime_context_projection, Mapping)
+        else {}
+    )
+    return str(
+        _first_non_empty(
+            request.observer_command_id,
+            _runtime_text_projection_value(supplied_projection, "observer_command_id"),
+            evidence.get("observer_command_id"),
+            evidence_context.get("observer_command_id"),
+        )
+        or ""
+    ).strip()
+
+
+def _runtime_text_observer_command_requirement(
+    *,
+    observer_command_id: str,
+    backlog_id: str,
+    route_context_hash: str,
+    prompt_contract_id: str,
+) -> dict[str, Any]:
+    missing = not bool(observer_command_id)
+    return {
+        "schema_version": "observer_runtime_text_observer_command_requirement.v1",
+        "required": True,
+        "status": "present" if not missing else "missing",
+        "observer_command_id": observer_command_id,
+        "required_command_type": "execute_backlog_row",
+        "backlog_id": backlog_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "claim_rule": (
+            "Use the claimed backlog-specific execute_backlog_row command id "
+            "for this backlog and route identity."
+        ),
+        "forbidden_substitution": (
+            "Do not use a blind observer_command_next result as startup lineage "
+            "unless it is the exact claimed execute_backlog_row command for this "
+            "backlog and route identity."
+        ),
+        "blocker_id": (
+            "missing_execute_backlog_row_observer_command_id" if missing else ""
+        ),
+    }
+
+
 def _runtime_text_parent_route_lineage(
     request: ObserverRuntimeTextPrepareRequest,
 ) -> dict[str, Any]:
@@ -2129,6 +2192,7 @@ def _runtime_text_service_dispatch_evidence() -> dict[str, Any]:
 def _runtime_text_startup_echo_contract(
     *,
     runtime_context_id: str,
+    observer_command_id: str,
     context: Any,
     parent_task_id: str,
 ) -> dict[str, Any]:
@@ -2138,6 +2202,7 @@ def _runtime_text_startup_echo_contract(
         "runtime_context_id": runtime_context_id,
         "must_echo_fields": [
             "runtime_context_id",
+            "observer_command_id",
             "project_id",
             "task_id",
             "parent_task_id",
@@ -2152,6 +2217,7 @@ def _runtime_text_startup_echo_contract(
         ],
         "expected": {
             "project_id": context.project_id,
+            "observer_command_id": observer_command_id,
             "governance_project_id": context.governance_project_id
             or context.project_id,
             "target_project_id": context.target_project_id or context.project_id,
@@ -2175,6 +2241,7 @@ def _runtime_text_startup_intent_event(
     *,
     request: ObserverRuntimeTextPrepareRequest,
     runtime_context_id: str,
+    observer_command_id: str,
     context: Any,
     parent_task_id: str,
     launch_text_hash: str,
@@ -2188,6 +2255,7 @@ def _runtime_text_startup_intent_event(
         "close_satisfying": False,
         "actual_startup_required": True,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
         "launch_text_hash": launch_text_hash,
         "raw_launch_text_persisted": False,
         "project_id": request.project_id,
@@ -2230,6 +2298,7 @@ def _runtime_text_startup_intent_event(
             "head_commit",
             "route_context_hash",
             "prompt_contract_id",
+            "observer_command_id",
         ],
     }
     return {
@@ -2309,7 +2378,9 @@ def _dogfood_host_adapter_startup_evidence(
         + _stable_suffix(runtime_context_id, context.task_id, worker_slot_id, length=24)
     )
     host_session_id = host_startup_id
-    observer_command_id = request.task_id or context.task_id
+    observer_command_id = str(
+        runtime_text.get("observer_command_id") or request.task_id or context.task_id
+    )
     parent_task_id = (
         _runtime_text_context_parent(asdict(context)) or request.backlog_id
     )
@@ -2843,6 +2914,7 @@ def _runtime_text_graph_first_obligations(
 def _runtime_text_self_contract_lookup(
     *,
     project_id: str,
+    observer_command_id: str,
     task_id: str,
     parent_task_id: str,
     fence_token: str,
@@ -2864,6 +2936,7 @@ def _runtime_text_self_contract_lookup(
         else ""
     )
     required_query_fields = [
+        "observer_command_id",
         "task_id",
         "parent_task_id",
         "worker_role",
@@ -2889,6 +2962,7 @@ def _runtime_text_self_contract_lookup(
         "required_query_fields": required_query_fields,
         "query_identity": {
             "project_id": target_id,
+            "observer_command_id": observer_command_id,
             "governance_project_id": governance_id,
             "target_project_id": target_id,
             "target_project_root": target_project_root,
@@ -2904,6 +2978,7 @@ def _runtime_text_self_contract_lookup(
                 "path": task_route,
                 "query": {
                     "task_id": task_id,
+                    "observer_command_id": observer_command_id,
                     "parent_task_id": parent_task_id,
                     "worker_role": "mf_sub",
                     "fence_token": fence_token,
@@ -2914,6 +2989,7 @@ def _runtime_text_self_contract_lookup(
                 "path": context_route,
                 "query": {
                     "runtime_context_id": runtime_context_id,
+                    "observer_command_id": observer_command_id,
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
                     "worker_role": "mf_sub",
@@ -2932,6 +3008,8 @@ def _runtime_text_self_contract_lookup(
                 governance_id,
                 "--runtime-context-id",
                 runtime_context_id,
+                "--observer-command-id",
+                observer_command_id,
                 "--parent-task-id",
                 parent_task_id,
                 "--fence-token",
@@ -3053,6 +3131,7 @@ def _runtime_text_projection_missing_diagnostic(
 def _runtime_text_local_projection(
     *,
     runtime_context_id: str,
+    observer_command_id: str,
     request: ObserverRuntimeTextPrepareRequest,
     context: Any,
     parent_task_id: str,
@@ -3067,6 +3146,7 @@ def _runtime_text_local_projection(
         "target_project_id": context.target_project_id or request.project_id,
         "target_project_root": context.target_project_root,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
@@ -3254,8 +3334,13 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "persisted in timeline evidence.\n\n"
         "Before graph query, startup, implementation, verification, or close-ready "
         "evidence can satisfy close-sensitive gates, record an "
-        "mf_subagent_read_receipt for this visible route contract. A post-hoc "
-        "read receipt after counted evidence does not satisfy the ordering gate.\n\n"
+        "mf_subagent_read_receipt for this visible route contract using the "
+        "runtime contract's observer_command_id. A post-hoc read receipt after "
+        "counted evidence does not satisfy the ordering gate.\n\n"
+        "The observer_command_id must be the claimed backlog-specific "
+        "execute_backlog_row command for this backlog and route identity. Do not "
+        "substitute a blind observer_command_next result unless it is that exact "
+        "claimed command.\n\n"
         "Before graph query, startup, or implementation, query your own runtime "
         "contract from the runtime contract service. Use either "
         "`/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract` "
@@ -3324,6 +3409,16 @@ def build_observer_runtime_text_context(
             runtime_context_id=request.runtime_context_id,
             expected_fields=expected_branch_fields,
         )
+    )
+    observer_command_id = _runtime_text_observer_command_id(
+        request,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
+    )
+    observer_command_requirement = _runtime_text_observer_command_requirement(
+        observer_command_id=observer_command_id,
+        backlog_id=request.backlog_id,
+        route_context_hash=request.route.route_context_hash,
+        prompt_contract_id=request.route.prompt_contract_id,
     )
     context = plan_branch_runtime_context(
         project_id=request.project_id,
@@ -3405,6 +3500,8 @@ def build_observer_runtime_text_context(
         "target_project_id": target_project_id,
         "target_project_root": request.target_project_root,
         "backlog_id": request.backlog_id,
+        "observer_command_id": observer_command_id,
+        "observer_command_requirement": observer_command_requirement,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
@@ -3450,6 +3547,7 @@ def build_observer_runtime_text_context(
             "query_source": "mf_subagent",
             "query_purpose": "subagent_gate_validation",
             "task_id": context.task_id,
+            "observer_command_id": observer_command_id,
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
             "fence_token": context.fence_token,
@@ -3497,6 +3595,7 @@ def build_observer_runtime_text_context(
 
     startup_echo_contract = _runtime_text_startup_echo_contract(
         runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
         context=context,
         parent_task_id=parent_task_id,
     )
@@ -3505,6 +3604,7 @@ def build_observer_runtime_text_context(
         governance_project_id=context.governance_project_id or request.project_id,
         target_project_id=context.target_project_id or request.project_id,
         target_project_root=context.target_project_root,
+        observer_command_id=observer_command_id,
         task_id=context.task_id,
         parent_task_id=parent_task_id,
         fence_token=context.fence_token,
@@ -3516,6 +3616,7 @@ def build_observer_runtime_text_context(
         if supplied_projection
         else _runtime_text_local_projection(
             runtime_context_id=runtime_context_id,
+            observer_command_id=observer_command_id,
             request=request,
             context=context,
             parent_task_id=parent_task_id,
@@ -3536,11 +3637,14 @@ def build_observer_runtime_text_context(
     launch_payload = {
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "observer_command_requirement": observer_command_requirement,
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
         "runtime_context": asdict(context),
         "branch_identity": {
             "runtime_context_id": runtime_context_id,
+            "observer_command_id": observer_command_id,
             "task_id": context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
@@ -3596,15 +3700,32 @@ def build_observer_runtime_text_context(
             "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
             "error": "runtime context projection is missing required startup/finish fields",
         }
+    observer_command_missing = (
+        observer_command_requirement.get("status") != "present"
+    )
+    if observer_command_missing:
+        dispatch_gate_validation = {
+            **dispatch_gate_validation,
+            "allowed": False,
+            "status": "observer_command_required",
+            "observer_command_requirement": observer_command_requirement,
+            "error": (
+                "observer runtime-text prepare requires a claimed "
+                "execute_backlog_row observer_command_id before startup/read "
+                "receipt evidence can be prepared"
+            ),
+        }
     ok = (
         bool(dispatch_gate_validation.get("allowed"))
         and not input_error
         and not projection_missing
+        and not observer_command_missing
     )
     startup_intent_event = (
         _runtime_text_startup_intent_event(
             request=request,
             runtime_context_id=runtime_context_id,
+            observer_command_id=observer_command_id,
             context=context,
             parent_task_id=parent_task_id,
             launch_text_hash=launch_text_hash,
@@ -3620,6 +3741,8 @@ def build_observer_runtime_text_context(
         "close_ready": False,
         "append_tool": "task_timeline_append",
         "event_kind": "mf_subagent_startup",
+        "observer_command_id": observer_command_id,
+        "observer_command_requirement": observer_command_requirement,
         "intent_event_kind": "mf_subagent_startup_intent",
         "intent_event_ref": "startup_intent_event" if ok else "",
         "close_satisfying": False,
@@ -3641,15 +3764,31 @@ def build_observer_runtime_text_context(
         "ok": ok,
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "service_schema_version": OBSERVER_RUNTIME_TEXT_SERVICE_SCHEMA_VERSION,
-        "status": "prepared" if ok else ("allocation_required" if allocation_required else "rejected"),
+        "status": (
+            "prepared"
+            if ok
+            else (
+                "allocation_required"
+                if allocation_required
+                else (
+                    "observer_command_required"
+                    if observer_command_missing
+                    else "rejected"
+                )
+            )
+        ),
         "project_id": request.project_id,
         "backlog_id": request.backlog_id,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "observer_command_requirement": observer_command_requirement,
         "launch_text": launch_text,
         "launch_text_hash": launch_text_hash,
         "raw_launch_text_persisted": False,
         "persistent_evidence": {
             "runtime_context_id": runtime_context_id,
+            "observer_command_id": observer_command_id,
+            "observer_command_requirement": observer_command_requirement,
             "launch_text_hash": launch_text_hash,
             "raw_launch_text_persisted": False,
             "dispatch_ready": ok,
@@ -3790,6 +3929,7 @@ def build_dogfood_observer_run_plan(
         main_worktree=str(main_worktree),
         workspace_root=str(workspace_root),
         owned_files=tuple(owned_files),
+        observer_command_id=request.task_id or context.task_id,
         task_id=context.task_id,
         parent_task_id=parent_task_id,
         worker_id=worker_id,
