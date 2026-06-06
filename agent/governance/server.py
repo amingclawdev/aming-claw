@@ -4976,6 +4976,9 @@ def _runtime_context_service_timeline_refs(
     close_event: dict[str, Any] = {}
     timeline_graph_trace_ids: list[str] = []
     for event in events:
+        event_task_id = str(event.get("task_id") or "").strip()
+        if task_id and event_task_id and event_task_id != task_id:
+            continue
         event_type = str(event.get("event_type") or "")
         event_kind = str(event.get("event_kind") or "")
         phase = str(event.get("phase") or "")

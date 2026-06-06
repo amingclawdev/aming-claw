@@ -2389,6 +2389,77 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
     assert "gqt-sibling" not in trace_ids
 
 
+def test_runtime_context_timeline_fallback_excludes_sibling_graph_trace_ids(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-task-a",
+            root_task_id="AC-RUNTIME-SHARED",
+            backlog_id="AC-RUNTIME-SHARED",
+            worker_id="worker-task-a",
+            worker_slot_id="worker-task-a",
+            actual_host_worker_id="worker-task-a",
+            agent_id="agent-task-a",
+            allocation_owner="agent-task-a",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-task-a",
+            worktree_path="/repo/.worktrees/runtime-task-a",
+            base_commit="base-a",
+            head_commit="head-a",
+            target_head_commit="target-a",
+            snapshot_id="scope-shared",
+            projection_id="semproj-shared",
+            merge_queue_id="mq-shared",
+            checkpoint_id="ckpt-a",
+            fence_token="fence-task-a",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-06T10:00:00Z",
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-task-b",
+        backlog_id="AC-RUNTIME-SHARED",
+        event_type="verification",
+        event_kind="verification",
+        phase="verification",
+        status="passed",
+        payload={"graph_trace_ids": ["gqt-sibling-timeline"]},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id="AC-RUNTIME-SHARED",
+        event_type="verification",
+        event_kind="verification",
+        phase="verification",
+        status="passed",
+        payload={"graph_trace_ids": ["gqt-backlog-unscoped"]},
+    )
+
+    result = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+
+    current = result["runtime_context_service"]["views"]["current"]
+    assert result["source_refs"]["timeline"]["graph_trace_ids"] == [
+        "gqt-backlog-unscoped"
+    ]
+    assert current["graph_trace_refs"]["trace_ids"] == ["gqt-backlog-unscoped"]
+    assert "gqt-sibling-timeline" not in json.dumps(current, sort_keys=True)
+
+
 def test_parallel_branch_runtime_contract_route_rejects_wrong_worker_fence(conn):
     upsert_branch_context(
         conn,
