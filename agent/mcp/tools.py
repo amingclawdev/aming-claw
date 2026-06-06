@@ -751,6 +751,39 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "stale_artifact_cleanup",
+        "description": "Dry-run stale governance artifact cleanup projection for stale batch worktrees and retained append-only evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "project_root": {"type": "string"},
+                "repo_root": {"type": "string"},
+                "include_unowned": {"type": "boolean", "default": True},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "stale_artifact_cleanup_apply",
+        "description": "Apply explicit safe stale governance artifact cleanup candidates and record timeline evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "project_root": {"type": "string"},
+                "repo_root": {"type": "string"},
+                "candidate_ids": {"type": "array", "items": {"type": "string"}},
+                "actor": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "remove_branch": {"type": "boolean", "default": False},
+            },
+            "required": ["project_id", "candidate_ids"],
+        },
+    },
+    {
         "name": "graph_query",
         "description": "Run an audited graph query. Preferred first step before implementing or inventing modules.",
         "inputSchema": {
@@ -1676,6 +1709,30 @@ class ToolDispatcher:
                     query[key] = "true" if args.get(key) else "false"
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/graph-governance/{pid}/operations/queue{qs}")
+
+        if name == "stale_artifact_cleanup":
+            pid = args["project_id"]
+            query = {}
+            for key in ("project_root", "repo_root"):
+                if args.get(key):
+                    query[key] = args[key]
+            if "include_unowned" in args:
+                query["include_unowned"] = "true" if args.get("include_unowned") else "false"
+            qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+            return self._api("GET", f"/api/graph-governance/{pid}/stale-artifact-cleanup{qs}")
+
+        if name == "stale_artifact_cleanup_apply":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/stale-artifact-cleanup/apply",
+                body,
+            )
 
         if name == "graph_query":
             pid = args["project_id"]

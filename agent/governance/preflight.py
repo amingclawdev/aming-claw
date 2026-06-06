@@ -545,11 +545,13 @@ def check_batch_worktrees(
     """Report stale .worktrees entries not referenced by active batch metadata."""
     try:
         from .batch_jobs import report_stale_worktrees
+        from .stale_artifact_cleanup import cleanup_recommendation
 
         root = Path(project_root).resolve() if project_root else Path(".").resolve()
         details = report_stale_worktrees(conn, project_id, repo_root_path=root)
         details.setdefault("project_root", str(root))
         if details.get("stale_count"):
+            details["cleanup"] = cleanup_recommendation(project_id)
             return _warn(details)
         return _pass(details)
     except Exception as e:

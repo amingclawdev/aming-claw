@@ -6527,6 +6527,54 @@ def handle_graph_governance_parallel_branch_recover_expired(ctx: RequestContext)
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/stale-artifact-cleanup")
+def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
+    """Dry-run stale governance artifact cleanup projection."""
+    project_id = ctx.get_project_id()
+    from . import stale_artifact_cleanup
+
+    root = _graph_governance_project_root(project_id, ctx.query)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
+        return stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+            conn,
+            project_id,
+            repo_root_path=root,
+            include_unowned=_query_bool(ctx.query, "include_unowned", True),
+        )
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/stale-artifact-cleanup/apply")
+def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
+    """Apply explicit safe stale governance artifact cleanup candidates."""
+    project_id = ctx.get_project_id()
+    from . import stale_artifact_cleanup
+
+    root = _graph_governance_project_root(project_id, ctx.body)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.apply")
+        try:
+            return stale_artifact_cleanup.apply_stale_artifact_cleanup(
+                conn,
+                project_id,
+                repo_root_path=root,
+                candidate_ids=[str(item) for item in (ctx.body.get("candidate_ids") or [])],
+                actor=str(ctx.body.get("actor") or "observer"),
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                task_id=str(ctx.body.get("task_id") or ""),
+                reason=str(ctx.body.get("reason") or ""),
+                remove_branch=_query_bool(ctx.body, "remove_branch", False),
+            )
+        except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
+            return 400, exc.payload
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/managed-refs")
 def handle_graph_governance_managed_refs(ctx: RequestContext):
     """List same-project managed refs for existing long-lived branches."""

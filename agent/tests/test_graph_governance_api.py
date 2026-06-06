@@ -16,6 +16,7 @@ from agent.tests.fixtures.rule_fingerprint_project import (
     rule_fingerprint_mismatch_pair,
 )
 from agent.governance import asset_impact
+from agent.governance import batch_jobs
 from agent.governance import graph_correction_patches
 from agent.governance import graph_events
 from agent.governance import graph_query_trace
@@ -8892,6 +8893,59 @@ def test_pending_scope_recover_stale_endpoint_marks_running_failed(conn, monkeyp
     assert result["recovered_count"] == 1
     row = store.list_pending_scope_reconcile(conn, PID, commit_shas=["old-running"])[0]
     assert row["status"] == store.PENDING_STATUS_FAILED
+
+
+def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "README.md").write_text("# test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_args, **_kwargs: repo)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    created = batch_jobs.create_batch_task(
+        conn,
+        PID,
+        "cleanup api",
+        repo_root_path=repo,
+        batch_id="cleanup-api",
+        base_commit=batch_jobs.git_commit(repo),
+    )
+    strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
+    batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    batch_jobs.record_task_batch_state(conn, created["task_id"], "abandoned")
+    conn.commit()
+
+    dry_run = server.handle_graph_governance_stale_artifact_cleanup(_ctx({"project_id": PID}))
+
+    candidate = next(item for item in dry_run["candidates"] if item["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True
+
+    applied = server.handle_graph_governance_stale_artifact_cleanup_apply(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "candidate_ids": [candidate["candidate_id"]],
+                "actor": "test",
+                "reason": "api cleanup",
+            },
+        )
+    )
+
+    assert applied["ok"] is True
+    assert applied["applied_count"] == 1
+    assert not (repo / ".worktrees" / "batch-cleanup-api").exists()
 
 
 def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):

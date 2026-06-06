@@ -113,6 +113,8 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "backlog_import",
         "graph_status",
         "graph_operations_queue",
+        "stale_artifact_cleanup",
+        "stale_artifact_cleanup_apply",
         "graph_query",
         "parallel_branch_allocate",
         "parallel_branch_startup",
@@ -819,6 +821,24 @@ def test_mcp_graph_tools_route_to_governance_api():
         },
     )
     dispatcher.dispatch(
+        "stale_artifact_cleanup",
+        {
+            "project_id": "aming-claw",
+            "repo_root": "/repo",
+            "include_unowned": False,
+        },
+    )
+    dispatcher.dispatch(
+        "stale_artifact_cleanup_apply",
+        {
+            "project_id": "aming-claw",
+            "repo_root": "/repo",
+            "candidate_ids": ["batch_worktree:abc"],
+            "actor": "observer",
+            "reason": "terminal cleanup",
+        },
+    )
+    dispatcher.dispatch(
         "graph_pending_scope_queue",
         {
             "project_id": "aming-claw",
@@ -845,6 +865,21 @@ def test_mcp_graph_tools_route_to_governance_api():
         },
     )
     assert recorder.calls[2] == (
+        "GET",
+        "/api/graph-governance/aming-claw/stale-artifact-cleanup?repo_root=%2Frepo&include_unowned=false",
+        None,
+    )
+    assert recorder.calls[3] == (
+        "POST",
+        "/api/graph-governance/aming-claw/stale-artifact-cleanup/apply",
+        {
+            "repo_root": "/repo",
+            "candidate_ids": ["batch_worktree:abc"],
+            "actor": "observer",
+            "reason": "terminal cleanup",
+        },
+    )
+    assert recorder.calls[4] == (
         "POST",
         "/api/graph-governance/aming-claw/pending-scope",
         {"commit_sha": "head", "parent_commit_sha": "old", "evidence": {"source": "test"}},
