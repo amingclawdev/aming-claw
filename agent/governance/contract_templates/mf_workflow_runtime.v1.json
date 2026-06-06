@@ -26,7 +26,44 @@
         "/api/graph-governance/{project_id}/parallel-branches/allocate",
         "agent.governance.parallel_branch_runtime.upsert_branch_context"
       ],
+      "current_state_refs": [
+        "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/current-state",
+        "aming-claw runtime-context current --project-id {project_id} --runtime-context-id {runtime_context_id} --fence-token {fence_token} --parent-task-id {parent_task_id} --json-output"
+      ],
       "description": "Observer allocates/registers branch runtime context before spawn_agent so mf_subagent graph query fence validation can resolve task_id and fence_token."
+    },
+    "runtime_context_service": {
+      "schema_version": "runtime_context.service.entrypoints.v1",
+      "current_state_schema_version": "runtime_context.current.v1",
+      "gate_inputs_schema_version": "runtime_context.gate_inputs.v1",
+      "worker_view_schema_version": "runtime_context.worker_view.v1",
+      "close_gate_view_schema_version": "runtime_context.close_gate_view.v1",
+      "api_entrypoint": "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/current-state",
+      "mcp_tool": "runtime_context_current",
+      "cli_entrypoint": "aming-claw runtime-context current",
+      "worker_required_query_fields": [
+        "runtime_context_id",
+        "fence_token",
+        "parent_task_id"
+      ],
+      "worker_allowed_sections": [
+        "task",
+        "branch",
+        "route_identity",
+        "work",
+        "graph_query_identity",
+        "gate_inputs",
+        "close_gate_view",
+        "evidence_refs"
+      ],
+      "blocked_sections": [
+        "observer_only_context",
+        "private_context",
+        "raw_source_payloads",
+        "other_worker_contexts"
+      ],
+      "source_policy": "Runtime Context Service exposes current-state projections only; route, timeline, graph trace, branch runtime, and contract revision records remain append-only and owner-owned.",
+      "privacy_policy": "mf_sub worker view is task-scoped and fence-filtered; raw private Judgment Brain memory and other workers' contexts are never returned."
     },
     "required_hash_fields": [
       "route_context_hash",
@@ -774,6 +811,14 @@
       "kind": "branch_runtime",
       "schema_version": "mf_subagent_branch_runtime.v1",
       "description": "Required before spawn_agent for governed mf_sub dispatch; records parallel-branches/allocate or upsert_branch_context evidence matching task/fence/worktree/commit/merge queue identity."
+    },
+    {
+      "id": "runtime_context_current_state",
+      "required": false,
+      "phase": "startup_gate",
+      "kind": "runtime_context_projection",
+      "schema_version": "runtime_context.current_state_response.v1",
+      "description": "Worker-facing lookup for current gate inputs; mf_sub callers must use runtime_context_id plus fence_token and receive only runtime_context.worker_view.v1."
     },
     {
       "id": "observer_subagent_service_dispatch",

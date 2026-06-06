@@ -15,6 +15,7 @@ Usage:
     aming-claw observer run    - build or execute route-bound observer invocation
     aming-claw observer poll   - claim observer command and plan route-bound work
     aming-claw observer dogfood - plan controlled dogfood observer/subagent run
+    aming-claw runtime-context current - inspect Runtime Context Service current-state
     aming-claw mf precommit-check - run MF pre-commit guards
     aming-claw mf dispatch-gate - validate MF subagent dispatch evidence
 """
@@ -374,6 +375,76 @@ def backlog_import_cmd(project_id, governance_url, input_path, on_conflict, dry_
             f"errors={result.get('error_count', 0)}"
         )
     if code >= 400 or not result.get("ok", False):
+        raise click.exceptions.Exit(1)
+
+
+@main.group("runtime-context")
+def runtime_context():
+    """Runtime Context Service views."""
+    pass
+
+
+@runtime_context.command("current")
+@click.option("--project-id", default="aming-claw", help="Governance project id.")
+@click.option("--runtime-context-id", required=True, help="Runtime context id, e.g. mfrctx-...")
+@click.option("--fence-token", default="", help="Fence token required for mf_sub worker view.")
+@click.option("--parent-task-id", default="", help="Parent observer/MF task id for fence validation.")
+@click.option(
+    "--view",
+    default="auto",
+    type=click.Choice(["auto", "current", "gate_inputs", "worker_view", "close_gate_view", "all"]),
+    help="Observer view selector. mf_sub callers always receive worker_view.",
+)
+@click.option("--graph-trace-id", default="", help="Optional graph trace id fallback.")
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance service base URL.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def runtime_context_current(
+    project_id,
+    runtime_context_id,
+    fence_token,
+    parent_task_id,
+    view,
+    graph_trace_id,
+    governance_url,
+    json_output,
+):
+    """Read the canonical current-state projection for a worker runtime context."""
+    query = {
+        key: value
+        for key, value in {
+            "fence_token": fence_token,
+            "parent_task_id": parent_task_id,
+            "view": view,
+            "graph_trace_id": graph_trace_id,
+        }.items()
+        if value
+    }
+    qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+    url = (
+        f"{governance_url.rstrip('/')}/api/graph-governance/"
+        f"{urllib.parse.quote(project_id, safe='')}/parallel-branches/"
+        f"runtime-contexts/{urllib.parse.quote(runtime_context_id, safe='')}"
+        f"/current-state{qs}"
+    )
+    code, payload = _http_json("GET", url)
+    if json_output:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            "runtime context: "
+            f"{payload.get('view', 'unknown')} "
+            f"project={project_id} runtime_context_id={runtime_context_id}"
+        )
+        service = payload.get("runtime_context_service") or {}
+        views = service.get("views") if isinstance(service, dict) else {}
+        if isinstance(views, dict):
+            click.echo("views: " + ", ".join(sorted(views)))
+        if code >= 400 or payload.get("ok") is False:
+            click.echo(
+                f"error: {payload.get('error') or payload.get('message') or 'runtime context lookup failed'}",
+                err=True,
+            )
+    if code >= 400 or payload.get("ok") is False:
         raise click.exceptions.Exit(1)
 
 

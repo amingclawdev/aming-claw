@@ -4912,6 +4912,280 @@ def _parallel_branch_runtime_contract_response(
     }
 
 
+def _runtime_context_event_ref(event: Mapping[str, Any] | None) -> str:
+    if not isinstance(event, Mapping):
+        return ""
+    event_id = str(event.get("id") or "").strip()
+    return f"timeline:{event_id}" if event_id else ""
+
+
+def _runtime_context_event_payload(event: Mapping[str, Any] | None) -> dict:
+    if not isinstance(event, Mapping):
+        return {}
+    from .parallel_branch_runtime import public_contract_revision_payload
+
+    payload = event.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    return {
+        "event_id": _runtime_context_event_ref(event),
+        "event_type": str(event.get("event_type") or ""),
+        "event_kind": str(event.get("event_kind") or ""),
+        "phase": str(event.get("phase") or ""),
+        "status": str(event.get("status") or ""),
+        "created_at": str(event.get("created_at") or ""),
+        "payload": public_contract_revision_payload(payload),
+    }
+
+
+def _runtime_context_service_timeline_refs(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+    backlog_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    from . import task_timeline
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    if not events and backlog_id:
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    refs: dict[str, Any] = {
+        "source": "task_timeline.list_events",
+        "producer": "task_timeline",
+        "implementation_event_refs": [],
+        "verification_event_refs": [],
+    }
+    startup_event: dict[str, Any] = {}
+    finish_event: dict[str, Any] = {}
+    close_event: dict[str, Any] = {}
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        event_kind = str(event.get("event_kind") or "")
+        phase = str(event.get("phase") or "")
+        haystack = " ".join((event_type, event_kind, phase))
+        ref = _runtime_context_event_ref(event)
+        if not ref:
+            continue
+        if not refs.get("startup_event_ref") and "startup" in haystack:
+            refs["startup_event_ref"] = ref
+            startup_event = dict(event)
+        if not refs.get("read_receipt_event_ref") and "read_receipt" in haystack:
+            refs["read_receipt_event_ref"] = ref
+        if not refs.get("finish_event_ref") and "finish" in haystack:
+            refs["finish_event_ref"] = ref
+            finish_event = dict(event)
+        if not refs.get("close_ready_event_ref") and event_kind == "close_ready":
+            refs["close_ready_event_ref"] = ref
+            close_event = dict(event)
+        if event_kind == "implementation":
+            refs["implementation_event_refs"].append(ref)
+        if event_kind in {"verification", "qa_verification"} or phase == "verification":
+            refs["verification_event_refs"].append(ref)
+    return (
+        refs,
+        _runtime_context_event_payload(startup_event),
+        _runtime_context_event_payload(finish_event),
+        _runtime_context_event_payload(close_event),
+    )
+
+
+def _runtime_context_service_graph_trace_refs(
+    conn,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    explicit_trace_ids: list[str],
+) -> dict[str, Any]:
+    trace_ids: list[str] = []
+    seen: set[str] = set()
+    for trace_id in explicit_trace_ids:
+        text = str(trace_id or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            trace_ids.append(text)
+    try:
+        rows = conn.execute(
+            """
+            SELECT trace_id, query_source, query_purpose, worker_role,
+                   parent_task_id, task_id, runtime_context_id
+            FROM graph_query_traces
+            WHERE project_id = ?
+              AND (
+                runtime_context_id = ?
+                OR (runtime_context_id = '' AND task_id = ?)
+              )
+            ORDER BY created_at DESC, trace_id DESC
+            LIMIT 20
+            """,
+            (project_id, runtime_context_id, task_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    for row in rows:
+        trace_id = str(row["trace_id"] if isinstance(row, sqlite3.Row) else row[0])
+        if trace_id and trace_id not in seen:
+            seen.add(trace_id)
+            trace_ids.append(trace_id)
+    return {
+        "source": "graph_query_traces",
+        "producer": "graph_query_trace",
+        "trace_ids": trace_ids,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "query_source": "mf_subagent" if trace_ids else "",
+        "worker_role": "mf_sub" if trace_ids else "",
+    }
+
+
+def _runtime_context_service_query_values(source: Mapping[str, Any], *keys: str) -> list[str]:
+    values: list[str] = []
+    for key in keys:
+        raw = source.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            pieces = raw.replace("\r", "\n").replace(",", "\n").split("\n")
+        elif isinstance(raw, (list, tuple, set)):
+            pieces = list(raw)
+        else:
+            pieces = [raw]
+        values.extend(str(item or "").strip() for item in pieces)
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _runtime_context_projection_response(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    context,
+    role: str,
+) -> dict[str, Any]:
+    from .mf_subagent_contract import build_mf_subagent_runtime_context_projection
+    from .parallel_branch_runtime import (
+        branch_contract_revision_to_dict,
+        get_latest_branch_contract_revision,
+        runtime_context_id_for_branch_context,
+    )
+
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    context_project_id = getattr(context, "project_id", project_id)
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        context_project_id,
+        runtime_context_id,
+    )
+    latest_revision_payload = (
+        branch_contract_revision_to_dict(latest_revision) if latest_revision else {}
+    )
+    route_identity = (
+        latest_revision_payload.get("route_identity")
+        if latest_revision_payload
+        else _parallel_branch_runtime_contract_route_identity(ctx.query)
+    )
+    timeline_refs, startup_gate, finish_gate, close_evidence = (
+        _runtime_context_service_timeline_refs(
+            conn,
+            project_id=context_project_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        )
+    )
+    explicit_trace_ids = _runtime_context_service_query_values(
+        ctx.query,
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+        "trace_ids",
+        "graph_trace_id",
+    )
+    graph_trace_refs = _runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=context_project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+        explicit_trace_ids=explicit_trace_ids,
+    )
+    projection = build_mf_subagent_runtime_context_projection(
+        context,
+        latest_revision=latest_revision,
+        route_identity=route_identity if isinstance(route_identity, Mapping) else {},
+        timeline_refs=timeline_refs,
+        graph_trace_refs=graph_trace_refs,
+        startup_gate=startup_gate,
+        finish_gate=finish_gate,
+        close_evidence=close_evidence,
+        role="mf_sub",
+        fence_token=str(getattr(context, "fence_token", "") or ""),
+    )
+    views = projection.get("views") if isinstance(projection.get("views"), dict) else {}
+    requested_view = str(ctx.query.get("view") or "auto").strip().lower()
+    if role == "mf_sub":
+        exposed_views = {"worker_view": dict(views.get("worker_view") or {})}
+        role_scope = "worker"
+        view_name = "worker_view"
+    else:
+        allowed_views = {"current", "gate_inputs", "worker_view", "close_gate_view"}
+        if requested_view in allowed_views:
+            exposed_views = {requested_view: dict(views.get(requested_view) or {})}
+            view_name = requested_view
+        else:
+            exposed_views = {key: dict(views.get(key) or {}) for key in allowed_views}
+            view_name = "all"
+        role_scope = "observer"
+    return {
+        "ok": True,
+        "schema_version": "runtime_context.current_state_response.v1",
+        "project_id": project_id,
+        "governance_project_id": context_project_id,
+        "target_project_id": getattr(context, "target_project_id", "") or project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": getattr(context, "task_id", ""),
+        "role_scope": role_scope,
+        "view": view_name,
+        "runtime_context_service": {
+            "schema_version": projection.get("schema_version"),
+            "project_id": projection.get("project_id"),
+            "runtime_context_id": runtime_context_id,
+            "views": exposed_views,
+            "source_policy": projection.get("source_policy") or {},
+        },
+        "source_refs": {
+            "branch_runtime": (
+                "parallel_branch_runtime_contexts/"
+                f"{context_project_id}/{runtime_context_id}"
+            ),
+            "contract_revision_id": str(
+                latest_revision.revision_id if latest_revision else ""
+            ),
+            "timeline": timeline_refs,
+            "graph_trace": graph_trace_refs,
+        },
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "other_worker_contexts_exposed": False,
+            "raw_source_of_truth_copied": False,
+        },
+    }
+
+
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
 def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext):
     """Return a role-scoped runtime/contract view for one bounded worker lane."""
@@ -5092,6 +5366,106 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
                 )
 
         return _parallel_branch_runtime_contract_response(
+            ctx,
+            conn,
+            project_id=project_id,
+            context=context,
+            role=role,
+        )
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/current-state")
+def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: RequestContext):
+    """Return Runtime Context Service current-state or role-filtered worker view."""
+    project_id = ctx.get_project_id()
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        get_branch_context_by_runtime_context_id,
+        validate_mf_subagent_runtime_context_lookup,
+    )
+    from .permissions import session_role
+
+    runtime_context_id = str(
+        ctx.path_params.get("runtime_context_id") or ctx.query.get("runtime_context_id") or ""
+    ).strip()
+    if not runtime_context_id:
+        raise ValidationError("runtime_context_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        session = _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.runtime-context.current-state",
+        )
+        role = session_role(session)
+        if role == "mf_sub":
+            fence_token = str(ctx.query.get("fence_token") or "").strip()
+            if not fence_token:
+                raise ValidationError(
+                    "fence_token is required for mf_sub runtime context query"
+                )
+            try:
+                context = validate_mf_subagent_runtime_context_lookup(
+                    conn,
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id,
+                    parent_task_id=str(ctx.query.get("parent_task_id") or ""),
+                    worker_role="mf_sub",
+                    fence_token=fence_token,
+                    governance_project_id=str(
+                        ctx.query.get("governance_project_id")
+                        or ctx.query.get("backlog_project_id")
+                        or project_id
+                    ),
+                    target_project_id=str(
+                        ctx.query.get("target_project_id")
+                        or ctx.query.get("graph_project_id")
+                        or project_id
+                    ),
+                    target_project_root=str(
+                        ctx.query.get("target_project_root")
+                        or ctx.query.get("target_graph_root")
+                        or ""
+                    ),
+                )
+            except BranchRuntimeFenceError as exc:
+                raise GovernanceError(
+                    "fence_invalidated_or_unknown",
+                    "mf_subagent runtime context fence is invalidated or unknown",
+                    403,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "governance_project_id": str(
+                            ctx.query.get("governance_project_id")
+                            or ctx.query.get("backlog_project_id")
+                            or project_id
+                        ),
+                        "target_project_id": str(
+                            ctx.query.get("target_project_id")
+                            or ctx.query.get("graph_project_id")
+                            or project_id
+                        ),
+                        "reason": "fence_invalidated_or_unknown",
+                    },
+                ) from exc
+        else:
+            context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if context is None:
+                raise GovernanceError(
+                    "runtime_context_not_found",
+                    f"branch runtime context not found: {project_id}/{runtime_context_id}",
+                    404,
+                    {"runtime_context_id": runtime_context_id},
+                )
+
+        return _runtime_context_projection_response(
             ctx,
             conn,
             project_id=project_id,

@@ -41,6 +41,7 @@ from agent.governance.parallel_branch_runtime import (
     MergeQueueItem,
     STATE_MERGE_FAILED,
     STATE_WORKTREE_READY,
+    append_branch_contract_revision,
     get_branch_context,
     runtime_context_id_for_branch_context,
     upsert_batch_merge_runtime,
@@ -1857,6 +1858,145 @@ def test_parallel_branch_runtime_context_contract_route_rejects_wrong_fence(conn
         )
     assert exc_info.value.code == "fence_invalidated_or_unknown"
     assert exc_info.value.status == 403
+
+
+def test_runtime_context_current_state_route_role_filters_worker_view(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-current-task",
+            root_task_id="runtime-current-parent",
+            backlog_id="AC-RUNTIME-CURRENT",
+            worker_id="worker-runtime-current",
+            worker_slot_id="worker-runtime-current",
+            actual_host_worker_id="worker-runtime-current",
+            agent_id="agent-runtime-current",
+            allocation_owner="agent-runtime-current",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-current-task",
+            worktree_path="/repo/.worktrees/runtime-current-task",
+            base_commit="base-current",
+            head_commit="head-current",
+            target_head_commit="target-current",
+            snapshot_id="scope-current",
+            projection_id="semproj-current",
+            merge_queue_id="mq-current",
+            fence_token="fence-current",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-06T10:00:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-current",
+        contract_version="mf_parallel.v1",
+        payload={
+            "target_files": ["agent/governance/server.py"],
+            "acceptance_criteria": ["runtime context current state is exposed"],
+            "raw_private_context": "must-not-leak",
+        },
+        route_identity={
+            "route_id": "route-current",
+            "route_context_hash": "sha256:route-current",
+            "prompt_contract_id": "rprompt-current",
+            "prompt_contract_hash": "sha256:prompt-current",
+            "visible_injection_manifest_hash": "sha256:visible-current",
+            "raw_private_context": "must-not-leak",
+        },
+        now_iso="2026-06-06T10:01:00Z",
+    )
+    startup = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-current-task",
+        backlog_id="AC-RUNTIME-CURRENT",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        payload={
+            "mf_subagent_startup_gate": {
+                "runtime_context_id": context.runtime_context_id,
+                "fence_token": "fence-current",
+                "raw_private_context": "must-not-leak",
+            }
+        },
+    )
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-current-task",
+        backlog_id="AC-RUNTIME-CURRENT",
+        event_type="mf_subagent_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="startup_read_receipt",
+        status="ok",
+        payload={"read_receipt_hash": "sha256:read-current"},
+    )
+
+    observer_result = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "observer",
+                query={"graph_trace_id": "gqt-runtime-current", "view": "all"},
+            )
+        )
+    )
+
+    assert observer_result["ok"] is True
+    assert observer_result["role_scope"] == "observer"
+    observer_views = observer_result["runtime_context_service"]["views"]
+    assert {"current", "gate_inputs", "worker_view", "close_gate_view"}.issubset(
+        observer_views
+    )
+    current = observer_views["current"]
+    assert current["route_identity"]["route_context_hash"] == "sha256:route-current"
+    assert current["route_identity"]["prompt_contract_hash"] == "sha256:prompt-current"
+    assert current["timeline_refs"]["startup_event_ref"] == f"timeline:{startup['id']}"
+    assert current["timeline_refs"]["read_receipt_event_ref"] == (
+        f"timeline:{read_receipt['id']}"
+    )
+    assert current["graph_trace_refs"]["trace_ids"] == ["gqt-runtime-current"]
+    assert "must-not-leak" not in json.dumps(observer_result, sort_keys=True)
+
+    worker_result = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-current-parent",
+                    "fence_token": "fence-current",
+                    "graph_trace_id": "gqt-runtime-current",
+                    "view": "all",
+                },
+            )
+        )
+    )
+
+    assert worker_result["ok"] is True
+    assert worker_result["role_scope"] == "worker"
+    worker_views = worker_result["runtime_context_service"]["views"]
+    assert set(worker_views) == {"worker_view"}
+    worker_view = worker_views["worker_view"]
+    assert worker_view["schema_version"] == "runtime_context.worker_view.v1"
+    assert worker_view["task"]["task_id"] == "runtime-current-task"
+    assert worker_view["task"]["fence_token"] == "fence-current"
+    assert worker_view["role_filter_policy"]["raw_private_context_exposed"] is False
+    assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
+    assert "current_values" not in worker_view
+    assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
 
 
 def test_parallel_branch_runtime_contract_route_rejects_wrong_worker_fence(conn):

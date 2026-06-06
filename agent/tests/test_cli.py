@@ -108,6 +108,66 @@ def test_observer_run_passes_timeout_and_early_progress_to_runtime(monkeypatch):
     assert seen["early_progress_timeout_sec"] == 3.0
 
 
+def test_runtime_context_current_cli_calls_current_state_endpoint(monkeypatch):
+    calls = []
+
+    def fake_http(method, url, payload=None, *, timeout=30.0):
+        calls.append((method, url, payload, timeout))
+        return 200, {
+            "ok": True,
+            "view": "worker_view",
+            "runtime_context_id": "mfrctx-cli",
+            "runtime_context_service": {
+                "views": {
+                    "worker_view": {
+                        "schema_version": "runtime_context.worker_view.v1",
+                        "privacy_boundary": {"raw_private_context_exposed": False},
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("agent.cli._http_json", fake_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "runtime-context",
+            "current",
+            "--project-id",
+            "aming-claw",
+            "--runtime-context-id",
+            "mfrctx-cli",
+            "--fence-token",
+            "fence-cli",
+            "--parent-task-id",
+            "AC-PARENT",
+            "--graph-trace-id",
+            "gqt-cli",
+            "--view",
+            "all",
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["runtime_context_service"]["views"]["worker_view"][
+        "schema_version"
+    ] == "runtime_context.worker_view.v1"
+    assert calls == [
+        (
+            "GET",
+            "http://localhost:40000/api/graph-governance/aming-claw/"
+            "parallel-branches/runtime-contexts/mfrctx-cli/current-state?"
+            "fence_token=fence-cli&parent_task_id=AC-PARENT&view=all&graph_trace_id=gqt-cli",
+            None,
+            30.0,
+        )
+    ]
+
+
 def test_observer_run_rejects_missing_route_identity():
     runner = CliRunner()
 

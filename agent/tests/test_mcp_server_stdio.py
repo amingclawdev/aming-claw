@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp.server import AmingClawMCP
 from agent.mcp.tools import ToolDispatcher
 
@@ -140,6 +141,48 @@ def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():
     assert "version_check" in route_properties
     assert "route_token" not in route_properties
     assert "route_waiver" not in route_properties
+
+
+def test_governance_mcp_runtime_context_current_tool_is_read_only(monkeypatch):
+    tool_names = {tool["name"] for tool in governance_mcp_server.TOOLS}
+    assert "runtime_context_current" in tool_names
+    schema = next(
+        tool for tool in governance_mcp_server.TOOLS if tool["name"] == "runtime_context_current"
+    )["inputSchema"]
+    assert schema["required"] == ["project_id", "runtime_context_id"]
+    assert "fence_token" in schema["properties"]
+    assert "parent_task_id" in schema["properties"]
+
+    calls = []
+
+    def fake_http(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return {"ok": True, "view": "worker_view"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "runtime_context_current",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-test",
+            "fence_token": "fence-test",
+            "parent_task_id": "AC-PARENT",
+            "view": "all",
+            "graph_trace_id": "gqt-test",
+        },
+    )
+
+    assert result == {"ok": True, "view": "worker_view"}
+    assert calls == [
+        (
+            "GET",
+            "/api/graph-governance/aming-claw/parallel-branches/runtime-contexts/"
+            "mfrctx-test/current-state?"
+            "fence_token=fence-test&parent_task_id=AC-PARENT&view=all&graph_trace_id=gqt-test",
+            None,
+        )
+    ]
 
 
 def test_mcp_backlog_close_forwards_route_gate_payloads():
