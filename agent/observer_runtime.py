@@ -1518,6 +1518,249 @@ def _runtime_text_branch_runtime_packet(
     return packet
 
 
+def _runtime_text_packet_context(packet: Mapping[str, Any]) -> Mapping[str, Any]:
+    context = packet.get("context")
+    return context if isinstance(context, Mapping) else {}
+
+
+def _runtime_text_packet_registered(packet: Mapping[str, Any]) -> bool:
+    context = _runtime_text_packet_context(packet)
+    return bool(
+        packet
+        and packet.get("registered") is not False
+        and not packet.get("allocation_required")
+        and str(packet.get("status") or "").strip().lower()
+        not in {"allocation_required", "rejected", "failed", "error"}
+        and str(packet.get("runtime_context_id") or context.get("runtime_context_id") or "").strip()
+        and context
+    )
+
+
+def _runtime_text_allocation_required_evidence(
+    *,
+    runtime_context_id: str = "",
+    supplied_source_ref: str = "",
+    message: str,
+    missing_fields: Sequence[str] | None = None,
+    mismatches: Sequence[Mapping[str, str]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": "allocation_required",
+        "ok": False,
+        "present": False,
+        "registered": False,
+        "allocation_required": True,
+        "runtime_context_id": runtime_context_id,
+        "supplied_source_ref": supplied_source_ref,
+        "source": "observer_runtime_text_prepare",
+        "message": message,
+        "missing_fields": list(missing_fields or []),
+        "mismatches": [dict(item) for item in (mismatches or [])],
+    }
+
+
+def _runtime_text_runtime_context_id_from_packet(
+    *,
+    branch_runtime_registration_ref: str,
+    packet: Mapping[str, Any],
+    runtime_context_id: str = "",
+) -> str:
+    direct = str(runtime_context_id or packet.get("runtime_context_id") or "").strip()
+    if direct:
+        return direct
+    context = _runtime_text_packet_context(packet)
+    direct = str(context.get("runtime_context_id") or "").strip()
+    if direct:
+        return direct
+    ref = str(branch_runtime_registration_ref or packet.get("registration_ref") or "").strip()
+    return ref if ref.startswith("mfrctx-") else ""
+
+
+def _runtime_text_task_id_from_packet(
+    *,
+    task_id: str,
+    packet: Mapping[str, Any],
+) -> str:
+    direct = str(task_id or packet.get("task_id") or "").strip()
+    if direct:
+        return direct
+    context = _runtime_text_packet_context(packet)
+    return str(context.get("task_id") or "").strip()
+
+
+def _runtime_text_get_persisted_branch_context(
+    *,
+    project_id: str,
+    runtime_context_id: str = "",
+    task_id: str = "",
+) -> Any:
+    try:
+        from governance.db import get_connection
+        from governance.parallel_branch_runtime import (
+            get_branch_context,
+            get_branch_context_by_runtime_context_id,
+        )
+    except ImportError:  # pragma: no cover - package import path
+        from agent.governance.db import get_connection
+        from agent.governance.parallel_branch_runtime import (
+            get_branch_context,
+            get_branch_context_by_runtime_context_id,
+        )
+
+    conn = get_connection(project_id)
+    try:
+        context = None
+        if runtime_context_id:
+            context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+        if context is None and task_id:
+            context = get_branch_context(conn, project_id, task_id)
+        return context
+    finally:
+        conn.close()
+
+
+def _runtime_text_parent_from_branch_context(context: Any) -> str:
+    return str(
+        getattr(context, "root_task_id", "")
+        or getattr(context, "chain_id", "")
+        or getattr(context, "backlog_id", "")
+        or ""
+    )
+
+
+def _runtime_text_expected_field_mismatches(
+    context: Any,
+    *,
+    expected_fields: Mapping[str, str] | None = None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    expected_fields = dict(expected_fields or {})
+    actual = {
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": _runtime_text_parent_from_branch_context(context),
+        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(getattr(context, "target_head_commit", "") or ""),
+        "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+    }
+    missing = [
+        field
+        for field, expected in expected_fields.items()
+        if str(expected or "").strip() and not actual.get(field)
+    ]
+    mismatches = [
+        {"field": field, "expected": str(expected), "actual": actual[field]}
+        for field, expected in expected_fields.items()
+        if str(expected or "").strip()
+        and actual.get(field)
+        and actual[field] != str(expected)
+    ]
+    return missing, mismatches
+
+
+def _runtime_text_hydrate_persisted_branch_runtime_evidence(
+    *,
+    project_id: str,
+    task_id: str = "",
+    branch_runtime_registration_ref: str = "",
+    branch_runtime_evidence: Mapping[str, Any] | None = None,
+    runtime_context_id: str = "",
+    expected_fields: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    packet = _runtime_text_branch_runtime_packet(
+        branch_runtime_registration_ref,
+        branch_runtime_evidence,
+        runtime_context_id,
+    )
+    if _runtime_text_packet_registered(packet):
+        return packet
+
+    lookup_runtime_context_id = _runtime_text_runtime_context_id_from_packet(
+        branch_runtime_registration_ref=branch_runtime_registration_ref,
+        packet=packet,
+        runtime_context_id=runtime_context_id,
+    )
+    lookup_task_id = _runtime_text_task_id_from_packet(task_id=task_id, packet=packet)
+    if not lookup_runtime_context_id and not lookup_task_id:
+        return packet
+
+    source_ref = str(
+        packet.get("registration_ref")
+        or packet.get("source_ref")
+        or packet.get("allocation_source_ref")
+        or branch_runtime_registration_ref
+        or ""
+    ).strip()
+    try:
+        context = _runtime_text_get_persisted_branch_context(
+            project_id=project_id,
+            runtime_context_id=lookup_runtime_context_id,
+            task_id=lookup_task_id,
+        )
+    except Exception as exc:
+        if not lookup_runtime_context_id:
+            return packet
+        return _runtime_text_allocation_required_evidence(
+            runtime_context_id=lookup_runtime_context_id,
+            supplied_source_ref=source_ref,
+            message=f"Persisted branch runtime allocation lookup failed: {exc}",
+        )
+    if context is None:
+        if not lookup_runtime_context_id:
+            return packet
+        return _runtime_text_allocation_required_evidence(
+            runtime_context_id=lookup_runtime_context_id,
+            supplied_source_ref=source_ref,
+            message="Persisted branch runtime allocation was not found.",
+        )
+
+    if lookup_runtime_context_id:
+        actual_runtime_context_id = runtime_context_id_for_branch_context(context)
+        if actual_runtime_context_id != lookup_runtime_context_id:
+            return _runtime_text_allocation_required_evidence(
+                runtime_context_id=lookup_runtime_context_id,
+                supplied_source_ref=source_ref,
+                message="Persisted branch runtime allocation identity mismatch.",
+                mismatches=[
+                    {
+                        "field": "runtime_context_id",
+                        "expected": lookup_runtime_context_id,
+                        "actual": actual_runtime_context_id,
+                    }
+                ],
+            )
+
+    missing, mismatches = _runtime_text_expected_field_mismatches(
+        context,
+        expected_fields=expected_fields,
+    )
+    if missing or mismatches:
+        return _runtime_text_allocation_required_evidence(
+            runtime_context_id=runtime_context_id_for_branch_context(context),
+            supplied_source_ref=source_ref,
+            message="Persisted branch runtime allocation identity mismatch.",
+            missing_fields=missing,
+            mismatches=mismatches,
+        )
+
+    try:
+        from governance.parallel_branch_runtime import branch_runtime_allocation_evidence
+    except ImportError:  # pragma: no cover - package import path
+        from agent.governance.parallel_branch_runtime import branch_runtime_allocation_evidence
+
+    return branch_runtime_allocation_evidence(
+        context,
+        source_ref=source_ref
+        or f"/api/graph-governance/{project_id}/parallel-branches/allocate",
+        registration_source="persisted_branch_runtime_context",
+    )
+
+
 def _runtime_text_context_parent(context: Mapping[str, Any]) -> str:
     return str(
         context.get("parent_task_id")
@@ -2608,6 +2851,24 @@ def build_observer_runtime_text_context(
             request.route.route_context_hash,
         )
     )
+    expected_branch_fields = {
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": request.fence_token,
+        "base_commit": request.base_commit,
+        "target_head_commit": request.target_head_commit,
+        "merge_queue_id": request.merge_queue_id,
+    }
+    hydrated_branch_runtime_evidence = (
+        _runtime_text_hydrate_persisted_branch_runtime_evidence(
+            project_id=request.project_id,
+            task_id=task_id,
+            branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+            branch_runtime_evidence=request.branch_runtime_evidence,
+            runtime_context_id=request.runtime_context_id,
+            expected_fields=expected_branch_fields,
+        )
+    )
     context = plan_branch_runtime_context(
         project_id=request.project_id,
         task_id=task_id,
@@ -2635,16 +2896,9 @@ def build_observer_runtime_text_context(
         context,
         parent_task_id=parent_task_id,
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
-        branch_runtime_evidence=request.branch_runtime_evidence,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
         runtime_context_id=request.runtime_context_id,
-        explicit_expected_fields={
-            "task_id": task_id,
-            "parent_task_id": parent_task_id,
-            "fence_token": request.fence_token,
-            "base_commit": request.base_commit,
-            "target_head_commit": request.target_head_commit,
-            "merge_queue_id": request.merge_queue_id,
-        },
+        explicit_expected_fields=expected_branch_fields,
     )
     owned_files = _runtime_text_items(request.owned_files)
     graph_trace_ids = _runtime_text_items(request.graph_trace_ids)
@@ -2678,7 +2932,7 @@ def build_observer_runtime_text_context(
         context=context,
         parent_task_id=parent_task_id,
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
-        branch_runtime_evidence=request.branch_runtime_evidence,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
         runtime_context_id=request.runtime_context_id,
     )
     service_dispatch_evidence = _runtime_text_service_dispatch_evidence()
@@ -3002,6 +3256,25 @@ def build_dogfood_observer_run_plan(
             request.route.route_context_hash,
         )
     )
+    parent_task_id = request.backlog_id
+    expected_branch_fields = {
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": request.fence_token,
+        "base_commit": request.base_commit,
+        "target_head_commit": request.target_head_commit,
+        "merge_queue_id": request.merge_queue_id,
+    }
+    hydrated_branch_runtime_evidence = (
+        _runtime_text_hydrate_persisted_branch_runtime_evidence(
+            project_id=request.project_id,
+            task_id=task_id,
+            branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+            branch_runtime_evidence=request.branch_runtime_evidence,
+            runtime_context_id=request.runtime_context_id,
+            expected_fields=expected_branch_fields,
+        )
+    )
     context = plan_branch_runtime_context(
         project_id=request.project_id,
         task_id=task_id,
@@ -3023,11 +3296,18 @@ def build_dogfood_observer_run_plan(
         merge_queue_id=merge_queue_id,
         fence_token=fence_token,
     )
+    context = _runtime_text_apply_branch_runtime_context(
+        context,
+        parent_task_id=parent_task_id,
+        branch_runtime_registration_ref=request.branch_runtime_registration_ref,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
+        runtime_context_id=request.runtime_context_id,
+        explicit_expected_fields=expected_branch_fields,
+    )
     owned_files = [str(item) for item in request.owned_files if str(item or "").strip()]
     graph_trace_ids = [
         str(item) for item in request.graph_trace_ids if str(item or "").strip()
     ]
-    parent_task_id = request.backlog_id
     runtime_text_request = ObserverRuntimeTextPrepareRequest(
         project_id=request.project_id,
         backlog_id=request.backlog_id,
@@ -3035,7 +3315,7 @@ def build_dogfood_observer_run_plan(
         governance_project_id=governance_project_id,
         target_project_id=target_project_id,
         target_project_root=request.target_project_root,
-        allocation_owner=allocation_owner,
+        allocation_owner=context.allocation_owner or allocation_owner,
         main_worktree=str(main_worktree),
         workspace_root=str(workspace_root),
         owned_files=tuple(owned_files),
@@ -3049,7 +3329,7 @@ def build_dogfood_observer_run_plan(
         fence_token=context.fence_token,
         graph_trace_ids=tuple(graph_trace_ids),
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
-        branch_runtime_evidence=request.branch_runtime_evidence,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
         runtime_context_id=request.runtime_context_id,
         base_commit=context.base_commit,
         target_head_commit=context.target_head_commit,
@@ -3070,7 +3350,7 @@ def build_dogfood_observer_run_plan(
         context=context,
         parent_task_id=parent_task_id,
         branch_runtime_registration_ref=request.branch_runtime_registration_ref,
-        branch_runtime_evidence=request.branch_runtime_evidence,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
         runtime_context_id=request.runtime_context_id,
     )
     service_dispatch_evidence = _runtime_text_service_dispatch_evidence()

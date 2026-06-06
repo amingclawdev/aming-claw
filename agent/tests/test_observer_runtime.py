@@ -282,6 +282,90 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     )
 
 
+def test_runtime_text_prepare_hydrates_persisted_allocation_from_runtime_context_id(
+    monkeypatch,
+    tmp_path,
+):
+    main = tmp_path / "main"
+    main.mkdir()
+    worktree = tmp_path / ".worktrees" / "persisted-worker" / "task-a2"
+    allocation_context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-a2",
+        runtime_context_id="mfrctx-runtime-text-a2",
+        backlog_id="AC-RUNTIME-TEXT-A2",
+        root_task_id="AC-RUNTIME-TEXT-A2",
+        stage_task_id="task-a2",
+        stage_type="mf_sub",
+        agent_id="persisted-owner",
+        allocation_owner="persisted-owner",
+        worker_id="persisted-worker",
+        worker_slot_id="persisted-worker",
+        fence_token="fence-runtime-text-a2",
+        branch_ref="refs/heads/codex/task-a2",
+        worktree_id="wt-task-a2",
+        worktree_path=str(worktree),
+        base_commit="base-a2",
+        target_head_commit="target-a2",
+        merge_queue_id="mq-runtime-text-a2",
+        status=STATE_WORKTREE_READY,
+    )
+    seen = {}
+
+    def fake_lookup(*, project_id, runtime_context_id="", task_id=""):
+        seen["project_id"] = project_id
+        seen["runtime_context_id"] = runtime_context_id
+        seen["task_id"] = task_id
+        return allocation_context
+
+    monkeypatch.setattr(
+        "agent.observer_runtime._runtime_text_get_persisted_branch_context",
+        fake_lookup,
+    )
+
+    prepared = build_observer_runtime_text_context(
+        ObserverRuntimeTextPrepareRequest(
+            project_id="aming-claw",
+            backlog_id="AC-RUNTIME-TEXT-A2",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route-a2",
+                prompt_contract_id="rprompt-a2",
+                prompt_contract_hash="sha256:prompt-a2",
+            ),
+            main_worktree=str(main),
+            owned_files=("agent/observer_runtime.py",),
+            task_id="task-a2",
+            parent_task_id="AC-RUNTIME-TEXT-A2",
+            worker_id="planned-worker",
+            graph_trace_ids=("gqt-runtime-text-a2",),
+            runtime_context_id="mfrctx-runtime-text-a2",
+            route_id="route-a2",
+            visible_injection_manifest_hash="sha256:visible-a2",
+        )
+    )
+
+    assert seen == {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-runtime-text-a2",
+        "task_id": "task-a2",
+    }
+    assert prepared["ok"] is True
+    assert prepared["runtime_context_id"] == "mfrctx-runtime-text-a2"
+    assert prepared["runtime_context"]["allocation_owner"] == "persisted-owner"
+    assert prepared["runtime_context"]["worker_id"] == "persisted-worker"
+    assert prepared["runtime_context"]["worktree_path"] == str(worktree)
+    assert prepared["runtime_context"]["fence_token"] == "fence-runtime-text-a2"
+    assert prepared["runtime_context"]["base_commit"] == "base-a2"
+    assert prepared["runtime_context"]["target_head_commit"] == "target-a2"
+    assert prepared["runtime_context"]["merge_queue_id"] == "mq-runtime-text-a2"
+    assert prepared["branch_runtime_evidence"]["registered"] is True
+    assert prepared["branch_runtime_evidence"]["registration_source"] == (
+        "persisted_branch_runtime_context"
+    )
+    assert prepared["dispatch_gate"]["allocation_owner"] == "persisted-owner"
+    assert prepared["dispatch_gate_validation"]["allowed"] is True
+
+
 def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tmp_path):
     main = tmp_path / "main"
     main.mkdir()

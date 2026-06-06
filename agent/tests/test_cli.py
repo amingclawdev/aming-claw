@@ -1115,6 +1115,91 @@ def test_observer_dogfood_dry_run_generates_valid_gate_and_plan_without_model_ca
     assert evidence["route_prompt_contract"]["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
 
 
+def test_observer_dogfood_hydrates_persisted_runtime_context_without_evidence_file(
+    monkeypatch,
+    tmp_path,
+):
+    from agent.governance.parallel_branch_runtime import (
+        BranchTaskRuntimeContext,
+        STATE_WORKTREE_READY,
+    )
+
+    import agent.observer_runtime as observer_runtime
+
+    runner = CliRunner()
+    persisted_worktree = (
+        tmp_path
+        / "workers"
+        / "persisted-worktrees"
+        / "persisted-worker"
+        / f"{DOGFOOD_BACKLOG_ID.lower()}-attempt-2"
+    )
+    persisted_context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id=DOGFOOD_BACKLOG_ID,
+        runtime_context_id="mfrctx-dogfood-cli",
+        backlog_id=DOGFOOD_BACKLOG_ID,
+        root_task_id=DOGFOOD_BACKLOG_ID,
+        stage_task_id=DOGFOOD_BACKLOG_ID,
+        stage_type="observer_dogfood",
+        agent_id="persisted-observer-owner",
+        allocation_owner="persisted-observer-owner",
+        worker_id="persisted-worker",
+        worker_slot_id="persisted-worker",
+        fence_token="fence-dogfood-test",
+        branch_ref=f"refs/heads/dogfood/{DOGFOOD_BACKLOG_ID.lower()}-persisted",
+        worktree_id="wt-dogfood-persisted",
+        worktree_path=str(persisted_worktree),
+        base_commit="base123",
+        target_head_commit="head123",
+        merge_queue_id="mq-dogfood-test",
+        status=STATE_WORKTREE_READY,
+    )
+    lookups = []
+
+    def fake_lookup(*, project_id, runtime_context_id="", task_id=""):
+        lookups.append((project_id, runtime_context_id, task_id))
+        return persisted_context
+
+    monkeypatch.setattr(
+        observer_runtime,
+        "_runtime_text_get_persisted_branch_context",
+        fake_lookup,
+    )
+    args = _without_option(
+        _dogfood_args(tmp_path),
+        "--branch-runtime-evidence-file",
+    )
+    args[-1:-1] = ["--runtime-context-id", "mfrctx-dogfood-cli"]
+
+    result = runner.invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert lookups
+    assert payload["ok"] is True
+    assert payload["calls_models"] is False
+    assert payload["runtime_context"]["runtime_context_id"] == "mfrctx-dogfood-cli"
+    assert payload["runtime_context"]["allocation_owner"] == "persisted-observer-owner"
+    assert payload["runtime_context"]["worker_id"] == "persisted-worker"
+    assert payload["runtime_context"]["worktree_path"] == str(persisted_worktree)
+    assert payload["dispatch_gate"]["allocation_owner"] == "persisted-observer-owner"
+    assert payload["dispatch_gate"]["branch"] == persisted_context.branch_ref
+    assert payload["dispatch_gate"]["worktree"] == str(persisted_worktree)
+    assert payload["dispatch_gate"]["base_commit"] == "base123"
+    assert payload["dispatch_gate"]["target_head_commit"] == "head123"
+    assert payload["dispatch_gate"]["merge_queue_id"] == "mq-dogfood-test"
+    assert payload["dispatch_gate"]["fence_token"] == "fence-dogfood-test"
+    branch_runtime = payload["dispatch_gate"]["branch_runtime_evidence"]
+    assert branch_runtime["registered"] is True
+    assert branch_runtime["allocation_required"] is False
+    assert branch_runtime["registration_source"] == "persisted_branch_runtime_context"
+    assert payload["dispatch_gate_validation"]["allowed"] is True
+    assert payload["runtime_text"]["runtime_context"]["allocation_owner"] == (
+        "persisted-observer-owner"
+    )
+
+
 def test_observer_dogfood_requires_branch_runtime_registration_before_runtime_text(tmp_path):
     runner = CliRunner()
     args = _without_option(
