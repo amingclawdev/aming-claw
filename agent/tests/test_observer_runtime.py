@@ -497,9 +497,10 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     recorded_events = []
 
     def fake_record_task_timeline_event(*, project_id, event):
+        event_id = 17 + len(recorded_events)
         recorded_events.append((project_id, event))
         return {
-            "id": 17,
+            "id": event_id,
             "project_id": project_id,
             **event,
             "created_at": "2026-06-05T00:00:00Z",
@@ -515,10 +516,11 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert result["ok"] is False
     assert result["status"] == "blocked"
     blocker = result["cli_timeout_blocker"]
-    assert blocker["schema_version"] == "observer_cli_no_progress_blocker.v1"
-    assert blocker["blocker_id"] == "codex_cli_worker_no_progress_no_read_receipt"
+    assert blocker["schema_version"] == "observer_cli_timeout_blocker.v1"
+    assert blocker["blocker_id"] == "codex_cli_timeout_no_output_no_finish"
+    assert blocker["invocation_blocker_id"] == "codex_cli_worker_no_progress_no_read_receipt"
     assert blocker["failure_evidence_appended"] is True
-    assert blocker["failure_evidence_append"]["event_id"] == 17
+    assert blocker["failure_evidence_append"]["event_id"] == 19
     assert blocker["route_identity"]["route_id"] == "route-20260605-a3"
     assert blocker["route_identity"]["route_context_hash"] == "sha256:route-a3"
     assert blocker["route_identity"]["prompt_contract_hash"] == "sha256:prompt-a3"
@@ -529,25 +531,52 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
 
     startup_status = blocker["startup_read_receipt_recording_status"]
     assert startup_status["startup_prepared"] is True
-    assert startup_status["startup_recorded"] is False
+    assert startup_status["startup_recorded"] is True
     assert startup_status["read_receipt_prepared"] is True
-    assert startup_status["read_receipt_recorded"] is False
+    assert startup_status["read_receipt_recorded"] is True
+    assert startup_status["read_receipt_recorded_before_implementation_wait"] is True
+    assert startup_status["read_receipt_timeline_event_id"] == 17
+    assert startup_status["startup_timeline_event_id"] == 18
     assert startup_status["implementation_evidence_recorded"] is False
     assert blocker["implementation_evidence_recorded"] is False
     assert blocker["close_ready"] is False
+    assert blocker["read_receipt_timeline_event_id"] == 17
+    assert blocker["startup_timeline_event_id"] == 18
     assert result["read_receipt"]["parent_task_id"] == (
         "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
     )
     assert result["read_receipt"]["worker_role"] == "mf_sub"
+    assert result["read_receipt"]["recorded_before_implementation_wait"] is True
     assert result["startup_recording"]["parent_task_id"] == (
         "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
     )
+    assert result["startup_recording"]["recorded"] is True
+    assert result["startup_recording"]["appendable"] is False
+    assert result["startup_recording"]["actual_startup_recorded"] is True
     assert result["startup_timeline_event"]["parent_task_id"] == (
         "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
     )
+    assert result["startup_timeline_event"]["status"] == "passed"
 
-    assert len(recorded_events) == 1
-    project_id, event = recorded_events[0]
+    assert len(recorded_events) == 3
+    read_project_id, read_event = recorded_events[0]
+    assert read_project_id == "aming-claw"
+    assert read_event["event_type"] == "mf_subagent.read_receipt"
+    assert read_event["event_kind"] == "mf_subagent_read_receipt"
+    assert read_event["payload"]["route_id"] == "route-20260605-a3"
+    assert read_event["payload"]["read_receipt_hash"].startswith("sha256:")
+
+    startup_project_id, startup_event = recorded_events[1]
+    assert startup_project_id == "aming-claw"
+    assert startup_event["event_type"] == "mf_subagent.startup"
+    assert startup_event["event_kind"] == "mf_subagent_startup"
+    assert startup_event["status"] == "passed"
+    startup_gate = startup_event["payload"]["mf_subagent_startup_gate"]
+    assert startup_gate["actual_startup_recorded"] is True
+    assert startup_gate["host_adapter_startup_token_accepted"] is True
+    assert startup_gate["read_receipt"]["timeline_event_id"] == 17
+
+    project_id, event = recorded_events[2]
     assert project_id == "aming-claw"
     assert event["event_type"] == "observer_dogfood_terminal_blocker"
     assert event["event_kind"] == "observer_cli_terminal_blocker"
@@ -565,12 +594,12 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
         "fence-route-gate-fixture-parity-a3"
     )
     assert payload["timeout_no_progress"]["blocker_id"] == (
-        "codex_cli_worker_no_progress_no_read_receipt"
+        "codex_cli_timeout_no_output_no_finish"
     )
     assert payload["command_projection"]["command_projection_status"] == "failed"
     assert payload["worktree_diff_scope"]["no_diff"] is True
-    assert payload["startup_read_receipt_recording_status"]["startup_recorded"] is False
-    assert payload["startup_read_receipt_recording_status"]["read_receipt_recorded"] is False
+    assert payload["startup_read_receipt_recording_status"]["startup_recorded"] is True
+    assert payload["startup_read_receipt_recording_status"]["read_receipt_recorded"] is True
     assert event["verification"]["passed"] is False
     assert event["verification"]["implementation_evidence_recorded"] is False
 
@@ -580,7 +609,14 @@ def test_dogfood_no_progress_terminal_blocker_reports_append_error(monkeypatch, 
     _patch_dogfood_no_progress(monkeypatch)
 
     def fail_record_task_timeline_event(*, project_id, event):
-        raise RuntimeError("timeline append unavailable")
+        if event["event_type"] == "observer_dogfood_terminal_blocker":
+            raise RuntimeError("timeline append unavailable")
+        return {
+            "id": 23 if event["event_type"] == "mf_subagent.read_receipt" else 24,
+            "project_id": project_id,
+            **event,
+            "created_at": "2026-06-05T00:00:00Z",
+        }
 
     monkeypatch.setattr(
         "agent.observer_runtime._record_task_timeline_event",
@@ -606,8 +642,11 @@ def test_dogfood_no_progress_terminal_blocker_reports_append_error(monkeypatch, 
         "command_projection_status"
     ] == "failed"
     startup_status = blocker["startup_read_receipt_recording_status"]
-    assert startup_status["startup_recorded"] is False
-    assert startup_status["read_receipt_recorded"] is False
+    assert startup_status["startup_recorded"] is True
+    assert startup_status["read_receipt_recorded"] is True
+    assert startup_status["read_receipt_recorded_before_implementation_wait"] is True
+    assert startup_status["read_receipt_timeline_event_id"] == 23
+    assert startup_status["startup_timeline_event_id"] == 24
     assert startup_status["implementation_evidence_recorded"] is False
     assert blocker["implementation_evidence_recorded"] is False
 

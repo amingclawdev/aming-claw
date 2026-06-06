@@ -807,6 +807,18 @@ def _startup_read_receipt_recording_status(
     startup_recording = startup_recording if isinstance(startup_recording, Mapping) else {}
     read_receipt = observer_result.get("read_receipt")
     read_receipt = read_receipt if isinstance(read_receipt, Mapping) else {}
+    startup_recording_append = observer_result.get("startup_recording_append")
+    startup_recording_append = (
+        startup_recording_append
+        if isinstance(startup_recording_append, Mapping)
+        else {}
+    )
+    read_receipt_recording_append = observer_result.get("read_receipt_recording_append")
+    read_receipt_recording_append = (
+        read_receipt_recording_append
+        if isinstance(read_receipt_recording_append, Mapping)
+        else {}
+    )
     return {
         "schema_version": "observer_startup_read_receipt_recording_status.v1",
         "startup_prepared": bool(
@@ -821,12 +833,24 @@ def _startup_read_receipt_recording_status(
         "startup_timeline_event_recorded": bool(
             observer_result.get("timeline_event_recorded")
         ),
+        "startup_timeline_event_id": (
+            startup_recording.get("timeline_event_id")
+            or startup_recording_append.get("event_id")
+            or startup_event.get("id")
+            or startup_event.get("event_id")
+            or ""
+        ),
         "startup_event_kind": str(startup_event.get("event_kind") or ""),
         "startup_status": str(startup_event.get("status") or ""),
         "read_receipt_prepared": bool(read_receipt),
         "read_receipt_recorded": bool(observer_result.get("read_receipt_recorded")),
         "read_receipt_recorded_before_implementation_wait": bool(
             observer_result.get("read_receipt_recorded_before_implementation_wait")
+        ),
+        "read_receipt_timeline_event_id": (
+            read_receipt.get("timeline_event_id")
+            or read_receipt_recording_append.get("event_id")
+            or ""
         ),
         "read_receipt_hash": str(
             read_receipt.get("read_receipt_hash") or read_receipt.get("hash") or ""
@@ -875,6 +899,67 @@ def _record_task_timeline_event(
             trace_id=str(event.get("trace_id") or ""),
             commit_sha=str(event.get("commit_sha") or ""),
         )
+
+
+def _append_dogfood_startup_read_receipt_event(
+    *,
+    project_id: str,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        recorded = _record_task_timeline_event(project_id=project_id, event=event)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "event_type": str(event.get("event_type") or ""),
+            "event_kind": str(event.get("event_kind") or ""),
+            "phase": str(event.get("phase") or ""),
+            "request": dict(event),
+            "error": str(exc),
+        }
+    return {
+        "ok": True,
+        "event_type": str(event.get("event_type") or ""),
+        "event_kind": str(event.get("event_kind") or ""),
+        "phase": str(event.get("phase") or ""),
+        "event_id": recorded.get("id") or recorded.get("event_id") or "",
+        "request": dict(event),
+        "event": recorded,
+    }
+
+
+def _dogfood_read_receipt_timeline_event(
+    *,
+    request: DogfoodObserverPlanRequest,
+    context: Any,
+    read_receipt: Mapping[str, Any],
+    read_receipt_hash: str,
+    runtime_context_id: str,
+    host_startup_id: str,
+    launch_text_hash: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "event_type": "mf_subagent.read_receipt",
+        "event_kind": "mf_subagent_read_receipt",
+        "phase": "startup",
+        "status": "ok",
+        "actor": str(read_receipt.get("actual_host_worker_id") or "mf_sub"),
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": str(read_receipt.get("parent_task_id") or ""),
+        "attempt_num": int(getattr(context, "attempt", 0) or 0),
+        "correlation_id": host_startup_id,
+        "payload": dict(read_receipt),
+        "artifact_refs": {
+            "runtime_context_id": runtime_context_id,
+            "host_startup_id": host_startup_id,
+            "launch_text_hash": launch_text_hash,
+            "read_receipt_hash": read_receipt_hash,
+        },
+        "commit_sha": str(read_receipt.get("head_commit") or ""),
+    }
 
 
 def _dogfood_terminal_blocker_timeline_event(
@@ -2201,6 +2286,11 @@ def _dogfood_host_adapter_startup_evidence(
             length=24,
         )
     )
+    host_startup_id = (
+        f"host_adapter:{request.backend_mode}:"
+        + _stable_suffix(runtime_context_id, context.task_id, worker_slot_id, length=24)
+    )
+    host_session_id = host_startup_id
     observer_command_id = request.task_id or context.task_id
     parent_task_id = (
         _runtime_text_context_parent(asdict(context)) or request.backlog_id
@@ -2220,6 +2310,10 @@ def _dogfood_host_adapter_startup_evidence(
         "fence_token": context.fence_token,
         "branch": branch,
         "branch_ref": context.branch_ref,
+        "head_commit": head_commit,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
         "worktree": str(Path(str(worker_worktree)).expanduser().resolve()),
         "worktree_path": str(Path(str(worker_worktree)).expanduser().resolve()),
         "owned_files": list(owned_files),
@@ -2228,6 +2322,7 @@ def _dogfood_host_adapter_startup_evidence(
         "prompt_contract_id": request.route.prompt_contract_id,
         "prompt_contract_hash": request.route.prompt_contract_hash,
         "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "host_startup_id": host_startup_id,
     }
     read_receipt_hash = "sha256:" + hashlib.sha256(
         json.dumps(read_receipt_material, sort_keys=True).encode("utf-8")
@@ -2304,6 +2399,8 @@ def _dogfood_host_adapter_startup_evidence(
         "session_token_evidence_type": "surrogate",
         "session_token_present": False,
         "session_token_persisted": False,
+        "host_startup_id": host_startup_id,
+        "host_session_id": host_session_id,
         "startup_source": f"{request.backend_mode}_host_adapter",
         "startup_timing": "prepared_before_implementation_wait",
         "launch_text_hash": launch_text_hash,
@@ -2354,14 +2451,137 @@ def _dogfood_host_adapter_startup_evidence(
         },
         "commit_sha": head_commit,
     }
-    return {
+    prepared_evidence = {
         "startup_recording": startup_recording,
         "startup_timeline_event": startup_event,
         "read_receipt": read_receipt,
         "actual_startup_recorded": False,
+        "read_receipt_recorded": False,
+        "read_receipt_recorded_before_implementation_wait": False,
         "startup_evidence_kind": "prepared_appendable",
         "startup_evidence_appendable": True,
         "timeline_event_recorded": False,
+    }
+    read_receipt_event = _dogfood_read_receipt_timeline_event(
+        request=request,
+        context=context,
+        read_receipt=read_receipt,
+        read_receipt_hash=read_receipt_hash,
+        runtime_context_id=runtime_context_id,
+        host_startup_id=host_startup_id,
+        launch_text_hash=launch_text_hash,
+    )
+    read_receipt_append = _append_dogfood_startup_read_receipt_event(
+        project_id=request.project_id,
+        event=read_receipt_event,
+    )
+    if not read_receipt_append.get("ok"):
+        return {
+            **prepared_evidence,
+            "read_receipt_recording_append": read_receipt_append,
+            "startup_recording_error": str(read_receipt_append.get("error") or ""),
+            "startup_recording_blocker_id": "mf_subagent_read_receipt_recording_failed",
+        }
+    read_receipt_event_id = (
+        read_receipt_append.get("event_id")
+        or (read_receipt_append.get("event") or {}).get("id")
+        or ""
+    )
+    recorded_read_receipt = {
+        **read_receipt,
+        "recorded": True,
+        "appendable": False,
+        "prepared_before_implementation_wait": True,
+        "recorded_before_implementation_wait": True,
+        "timeline_event_recorded": True,
+        "timeline_event_id": read_receipt_event_id,
+    }
+    startup_event_to_record = {
+        **startup_event,
+        "status": "passed",
+        "recorded": True,
+        "actual_startup_recorded": True,
+        "timeline_event_recorded": True,
+        "payload": {
+            "mf_subagent_startup_gate": {
+                **startup_gate,
+                "status": "passed",
+                "started": True,
+                "startup_complete": True,
+                "actual_startup_recorded": True,
+                "actual_startup_prepared": False,
+                "actual_startup_appendable": False,
+                "actual_startup_required": False,
+                "timeline_event_recorded": True,
+                "startup_evidence_kind": "host_adapter_startup",
+                "startup_timing": "actual_worker_started",
+                "close_satisfying": True,
+                "read_receipt": recorded_read_receipt,
+            },
+            "read_receipt": recorded_read_receipt,
+        },
+        "artifact_refs": {
+            **dict(startup_event.get("artifact_refs") or {}),
+            "read_receipt_event_id": read_receipt_event_id,
+            "startup_evidence_kind": "host_adapter_startup",
+            "timeline_event_recorded": True,
+        },
+    }
+    startup_append = _append_dogfood_startup_read_receipt_event(
+        project_id=request.project_id,
+        event=startup_event_to_record,
+    )
+    if not startup_append.get("ok"):
+        return {
+            **prepared_evidence,
+            "read_receipt": recorded_read_receipt,
+            "read_receipt_recorded": True,
+            "read_receipt_recorded_before_implementation_wait": True,
+            "read_receipt_recording_append": read_receipt_append,
+            "startup_recording_append": startup_append,
+            "startup_recording_error": str(startup_append.get("error") or ""),
+            "startup_recording_blocker_id": "mf_subagent_startup_recording_failed",
+        }
+    startup_recorded_event = startup_append.get("event")
+    startup_recorded_event = (
+        startup_recorded_event if isinstance(startup_recorded_event, Mapping) else {}
+    )
+    startup_event_id = (
+        startup_append.get("event_id")
+        or startup_recorded_event.get("id")
+        or startup_recorded_event.get("event_id")
+        or ""
+    )
+    startup_event_to_record["timeline_event_id"] = startup_event_id
+    startup_event_to_record["artifact_refs"]["startup_event_id"] = startup_event_id
+    recorded_gate = startup_event_to_record["payload"]["mf_subagent_startup_gate"]
+    recorded_startup_recording = {
+        **startup_recording,
+        **recorded_gate,
+        "recorded": True,
+        "prepared": False,
+        "appendable": False,
+        "timeline_event_recorded": True,
+        "timeline_event_id": startup_event_id,
+        "read_receipt_event_id": read_receipt_event_id,
+        "append_tool": "task_timeline.record_event",
+        "event_kind": "mf_subagent_startup",
+    }
+    return {
+        "startup_recording": recorded_startup_recording,
+        "startup_timeline_event": startup_recorded_event or startup_event_to_record,
+        "startup_timeline_event_request": startup_event_to_record,
+        "startup_recording_append": dict(startup_append),
+        "read_receipt": recorded_read_receipt,
+        "read_receipt_recording_append": dict(read_receipt_append),
+        "actual_startup_recorded": True,
+        "read_receipt_recorded": True,
+        "read_receipt_recorded_before_implementation_wait": True,
+        "startup_evidence_kind": "host_adapter_startup",
+        "startup_evidence_appendable": False,
+        "timeline_event_recorded": True,
+        "startup_timeline_event_id": startup_event_id,
+        "read_receipt_timeline_event_id": read_receipt_event_id,
     }
 
 
@@ -2383,9 +2603,23 @@ def _dogfood_cli_timeout_blocker(
     no_output = bool(invocation.get("output_empty", True))
     invocation_blocker_id = str(invocation.get("blocker_id") or "")
     observer_command_id = request.task_id or context.task_id
+    startup_status = _startup_read_receipt_recording_status(observer_result)
+    durable_startup_read_receipt = bool(
+        startup_status.get("startup_recorded")
+        and startup_status.get("read_receipt_recorded")
+    )
     if invocation_blocker_id:
         blocker_id = invocation_blocker_id
     else:
+        blocker_id = (
+            f"{request.backend_mode}_timeout_no_output_no_finish"
+            if no_output
+            else f"{request.backend_mode}_timeout_no_finish"
+        )
+    if (
+        invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
+        and durable_startup_read_receipt
+    ):
         blocker_id = (
             f"{request.backend_mode}_timeout_no_output_no_finish"
             if no_output
@@ -2404,7 +2638,6 @@ def _dogfood_cli_timeout_blocker(
     }
     runtime_monitor = invocation.get("runtime_monitor") or {}
     runtime_monitor = runtime_monitor if isinstance(runtime_monitor, Mapping) else {}
-    startup_status = _startup_read_receipt_recording_status(observer_result)
     terminal_projection = {
         "schema_version": "observer_command_terminal_projection.v1",
         "passed": False,
@@ -2412,8 +2645,12 @@ def _dogfood_cli_timeout_blocker(
         "command_projection_status": "failed",
         "divergence_reason": blocker_id,
         "terminal_evidence_refs": [
-            "mf_subagent_startup_prepared",
-            "read_receipt_prepared",
+            "mf_subagent_startup_recorded"
+            if durable_startup_read_receipt
+            else "mf_subagent_startup_prepared",
+            "mf_subagent_read_receipt_recorded"
+            if durable_startup_read_receipt
+            else "read_receipt_prepared",
             "cli_timeout_blocker",
             "worktree_diff_scope",
         ],
@@ -2423,7 +2660,10 @@ def _dogfood_cli_timeout_blocker(
     blocker = {
         "schema_version": (
             "observer_cli_no_progress_blocker.v1"
-            if invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
+            if (
+                invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
+                and not durable_startup_read_receipt
+            )
             else "observer_cli_timeout_blocker.v1"
         ),
         "project_id": request.project_id,
@@ -2456,6 +2696,12 @@ def _dogfood_cli_timeout_blocker(
         "read_receipt_recorded_before_implementation_wait": bool(
             startup_status.get("read_receipt_recorded_before_implementation_wait")
         ),
+        "startup_timeline_event_id": startup_status.get("startup_timeline_event_id")
+        or "",
+        "read_receipt_timeline_event_id": startup_status.get(
+            "read_receipt_timeline_event_id"
+        )
+        or "",
         "startup_read_receipt_recording_status": startup_status,
         "implementation_evidence_recorded": False,
         "close_ready": False,
@@ -2468,9 +2714,15 @@ def _dogfood_cli_timeout_blocker(
         "worktree_diff_scope": diff_scope,
         "terminal_contract_projection": terminal_projection,
         "reason": (
-            "CLI backend reached a terminal blocker before finish evidence; worker "
-            "startup/read receipt evidence was prepared for append, and the isolated "
+            "CLI backend reached a terminal timeout/no-finish condition after "
+            "durable startup/read receipt evidence was recorded; the isolated "
             "worktree diff scope is reported."
+            if durable_startup_read_receipt
+            else (
+                "CLI backend reached a terminal blocker before finish evidence; "
+                "worker startup/read receipt evidence was prepared for append, "
+                "and the isolated worktree diff scope is reported."
+            )
         ),
     }
     append_result = _append_dogfood_terminal_blocker_event(blocker)
@@ -3746,13 +3998,66 @@ def build_dogfood_observer_run_plan(
             owned_files=owned_files,
         )
         result.update(startup_evidence)
+        startup_recording_status = _startup_read_receipt_recording_status(
+            startup_evidence
+        )
+        if not (
+            startup_recording_status.get("startup_recorded")
+            and startup_recording_status.get(
+                "read_receipt_recorded_before_implementation_wait"
+            )
+        ):
+            blocker_id = str(
+                startup_evidence.get("startup_recording_blocker_id")
+                or "mf_subagent_startup_recording_failed"
+            )
+            result["status"] = "blocked"
+            result["ok"] = False
+            result["terminal_dispatch_blocker"] = True
+            result["startup_recording_status"] = startup_recording_status
+            result["terminal_contract_projection"] = {
+                "schema_version": "observer_command_terminal_projection.v1",
+                "passed": False,
+                "canonical_contract_state": "blocked",
+                "command_projection_status": "failed",
+                "divergence_reason": blocker_id,
+                "terminal_evidence_refs": [
+                    "mf_subagent_startup_recording_attempted",
+                    "mf_subagent_read_receipt_recording_attempted",
+                ],
+                "observer_command_id": request.task_id or context.task_id,
+            }
+            result["dispatch_gate_validation"] = {
+                **result["dispatch_gate_validation"],
+                "allowed": False,
+                "status": "blocked",
+                "terminal_dispatch_blocker": True,
+                "blocker_id": blocker_id,
+                "actual_startup_recorded": False,
+                "startup_evidence": "mf_subagent_startup_recording_failed",
+                "startup_evidence_appendable": False,
+                "timeline_event_recorded": False,
+            }
+            result["error"] = (
+                str(startup_evidence.get("startup_recording_error") or "")
+                or "observer dogfood could not record durable startup/read receipt"
+            )
+            return result
         result["dispatch_gate_validation"] = {
             **result["dispatch_gate_validation"],
-            "actual_startup_recorded": False,
-            "startup_evidence": "mf_subagent_startup_prepared",
-            "startup_evidence_appendable": True,
-            "timeline_event_recorded": False,
+            "actual_startup_recorded": True,
+            "startup_evidence": "mf_subagent_startup_recorded",
+            "startup_evidence_appendable": False,
+            "timeline_event_recorded": True,
             "read_receipt_hash": startup_evidence["read_receipt"]["read_receipt_hash"],
+            "startup_timeline_event_id": startup_recording_status.get(
+                "startup_timeline_event_id"
+            )
+            or "",
+            "read_receipt_timeline_event_id": startup_recording_status.get(
+                "read_receipt_timeline_event_id"
+            )
+            or "",
         }
 
     observer_result = run_observer(observer_request, execute=execute)

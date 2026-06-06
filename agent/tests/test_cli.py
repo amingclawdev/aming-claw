@@ -1551,13 +1551,14 @@ def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
     assert "precommit-check" in captured["prompt"]
     assert captured["metadata"]["early_progress_timeout_sec"] == 20.0
     assert startup_event["event_kind"] == "mf_subagent_startup"
-    assert startup_event["status"] == "prepared"
-    assert startup_gate["status"] == "prepared"
-    assert startup_gate["actual_startup_recorded"] is False
-    assert startup_gate["actual_startup_prepared"] is True
-    assert startup_gate["startup_timing"] == "prepared_before_implementation_wait"
-    assert startup_gate["timeline_event_recorded"] is False
+    assert startup_event["status"] == "passed"
+    assert startup_gate["status"] == "passed"
+    assert startup_gate["actual_startup_recorded"] is True
+    assert startup_gate["actual_startup_prepared"] is False
+    assert startup_gate["startup_timing"] == "actual_worker_started"
+    assert startup_gate["timeline_event_recorded"] is True
     assert startup_gate["session_token_evidence_type"] == "surrogate"
+    assert startup_gate["host_startup_id"].startswith("host_adapter:codex_cli:")
     assert startup_gate["worker_id"] == "worker-a"
     assert not startup_gate["agent_id"].startswith("fallback_observer")
     assert startup_gate["observer_command_id"] == DOGFOOD_BACKLOG_ID
@@ -1576,9 +1577,16 @@ def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
     assert read_receipt["fence_token"] == "fence-dogfood-test"
     assert read_receipt["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
     assert read_receipt["prepared_before_implementation_wait"] is True
-    assert read_receipt["recorded_before_implementation_wait"] is False
-    assert payload["observer_run"]["startup_recording"]["recorded"] is False
-    assert payload["observer_run"]["startup_recording"]["appendable"] is True
+    assert read_receipt["recorded_before_implementation_wait"] is True
+    assert read_receipt["timeline_event_recorded"] is True
+    assert read_receipt["timeline_event_id"]
+    assert payload["observer_run"]["startup_recording"]["recorded"] is True
+    assert payload["observer_run"]["startup_recording"]["appendable"] is False
+    assert payload["observer_run"]["startup_recording"]["actual_startup_recorded"] is True
+    assert payload["observer_run"]["read_receipt_recorded"] is True
+    assert payload["observer_run"][
+        "read_receipt_recorded_before_implementation_wait"
+    ] is True
 
 
 def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monkeypatch):
@@ -1631,7 +1639,11 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
     assert blocker["terminal_dispatch_blocker"] is True
     assert blocker["failure_evidence_appended"] is True
     assert blocker["command_projection_status"] == "failed"
-    assert blocker["read_receipt_recorded_before_implementation_wait"] is False
+    assert blocker["startup_recorded"] is True
+    assert blocker["read_receipt_recorded"] is True
+    assert blocker["read_receipt_recorded_before_implementation_wait"] is True
+    assert blocker["startup_timeline_event_id"]
+    assert blocker["read_receipt_timeline_event_id"]
     assert blocker["observer_command_id"] == DOGFOOD_BACKLOG_ID
     assert blocker["task_id"] == DOGFOOD_BACKLOG_ID
     assert blocker["route_id"]
@@ -1647,8 +1659,9 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
     assert projection["command_projection_status"] == "failed"
     assert projection["observer_command_id"] == DOGFOOD_BACKLOG_ID
     assert payload["startup_timeline_event"]["event_kind"] == "mf_subagent_startup"
-    assert payload["startup_timeline_event"]["status"] == "prepared"
-    assert payload["actual_startup_recorded"] is False
+    assert payload["startup_timeline_event"]["status"] == "passed"
+    assert payload["actual_startup_recorded"] is True
+    assert payload["read_receipt_recorded"] is True
 
 
 def test_observer_dogfood_generated_worker_workspace_differs_from_main(tmp_path):
