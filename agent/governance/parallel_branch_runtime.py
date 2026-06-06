@@ -14,7 +14,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL = """
@@ -271,6 +271,13 @@ ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
     STATE_RUNNING,
 }
 MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION = "mf_subagent_startup_gate.v1"
+RUNTIME_CONTEXT_PROJECTION_SCHEMA_VERSION = "runtime_context.projection.v1"
+RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION = "runtime_context.current.v1"
+RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION = "runtime_context.gate_inputs.v1"
+RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION = "runtime_context.worker_view.v1"
+RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_view.v1"
+RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION = "runtime_context.role_filter_policy.v1"
+RUNTIME_CONTEXT_WORKER_ROLE = "mf_sub"
 MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
 MERGE_REVALIDATION_BLOCKING_STATES = {
@@ -393,6 +400,53 @@ class BranchRuntimeContractRevision:
     route_evidence_type: str
     actor: str
     created_at: str
+
+
+@dataclass(frozen=True)
+class RuntimeContextMissingField:
+    gate: str
+    field: str
+    expected_source: str
+    producer: str
+    consumer: str
+    evidence_ref: str = ""
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if not payload["message"]:
+            payload["message"] = (
+                f"{self.gate} gate missing {self.field} from {self.expected_source}"
+            )
+        return payload
+
+
+@dataclass(frozen=True)
+class RuntimeContextProjection:
+    project_id: str
+    runtime_context_id: str
+    current: dict[str, Any]
+    gate_inputs: dict[str, Any]
+    worker_view: dict[str, Any]
+    close_gate_view: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": RUNTIME_CONTEXT_PROJECTION_SCHEMA_VERSION,
+            "project_id": self.project_id,
+            "runtime_context_id": self.runtime_context_id,
+            "views": {
+                "current": self.current,
+                "gate_inputs": self.gate_inputs,
+                "worker_view": self.worker_view,
+                "close_gate_view": self.close_gate_view,
+            },
+            "source_policy": {
+                "immutable_sources_remain_owner_owned": True,
+                "raw_private_context_exposed": False,
+                "worker_views_are_role_filtered": True,
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -845,15 +899,32 @@ def _json_object(value: Mapping[str, Any] | dict[str, Any] | None) -> str:
 _PRIVATE_CONTRACT_REVISION_KEYS = {
     "hidden_context",
     "observer_only_context",
+    "private_founder",
+    "private_memory",
     "private_context",
     "private_route_body",
     "raw_context_body",
+    "raw_memory",
+    "raw_private_memory",
     "raw_private_context",
     "raw_private_context_body",
     "raw_private_route_body",
     "raw_route_body",
     "unmanifested_prompt_text",
 }
+
+_PRIVATE_CONTRACT_REVISION_KEY_MARKERS = (
+    "observer_only",
+    "context_pack_body",
+    "memory_body",
+    "private_",
+    "raw_private",
+    "raw_context",
+    "raw_memory",
+    "raw_prompt",
+    "raw_route",
+    "unmanifested_prompt",
+)
 
 
 _SAFE_CONTRACT_REVISION_ROUTE_KEYS = {
@@ -881,7 +952,7 @@ def _sanitize_public_contract_revision_value(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
             key_text = str(key)
-            if key_text in _PRIVATE_CONTRACT_REVISION_KEYS:
+            if _is_private_contract_revision_key(key_text):
                 continue
             sanitized[key_text] = _sanitize_public_contract_revision_value(child)
         return sanitized
@@ -890,6 +961,16 @@ def _sanitize_public_contract_revision_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_sanitize_public_contract_revision_value(item) for item in value]
     return value
+
+
+def _is_private_contract_revision_key(key: str) -> bool:
+    key_text = str(key or "")
+    normalized = key_text.strip().lower().replace("-", "_")
+    if normalized in _PRIVATE_CONTRACT_REVISION_KEYS:
+        return True
+    if any(marker in normalized for marker in _PRIVATE_CONTRACT_REVISION_KEY_MARKERS):
+        return True
+    return normalized.startswith("private") or normalized.endswith("_private")
 
 
 def public_contract_revision_payload(value: Any) -> dict[str, Any]:
@@ -1093,6 +1174,1212 @@ def branch_contract_revision_to_dict(
     payload["route_identity"] = dict(revision.route_identity)
     payload["route_gate"] = dict(revision.route_gate)
     return payload
+
+
+def _runtime_context_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _runtime_context_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, Mapping):
+        return [
+            str(item).strip()
+            for item in value.values()
+            if str(item or "").strip()
+        ]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [
+            str(item).strip()
+            for item in value
+            if str(item or "").strip()
+        ]
+    return [str(value).strip()] if str(value or "").strip() else []
+
+
+def _runtime_context_dedupe(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        token = _runtime_context_text(value)
+        if token and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def _runtime_context_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _runtime_context_revision_mapping(
+    revision: BranchRuntimeContractRevision | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(revision, BranchRuntimeContractRevision):
+        return branch_contract_revision_to_dict(revision)
+    return _runtime_context_mapping(revision)
+
+
+def _runtime_context_revision_payload(
+    revision: BranchRuntimeContractRevision | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(revision, BranchRuntimeContractRevision):
+        return public_contract_revision_payload(revision.payload)
+    mapped = _runtime_context_revision_mapping(revision)
+    return public_contract_revision_payload(mapped.get("payload"))
+
+
+def _runtime_context_parent_task_id(context: BranchTaskRuntimeContext) -> str:
+    return (
+        context.root_task_id
+        or context.chain_id
+        or context.stage_task_id
+        or context.task_id
+    )
+
+
+def _runtime_context_route_identity(
+    *,
+    contract_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None = None,
+    route_identity: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    revision = _runtime_context_revision_mapping(contract_revision)
+    revision_route_identity = _runtime_context_mapping(revision.get("route_identity"))
+    revision_route_gate = _runtime_context_mapping(revision.get("route_gate"))
+    revision_payload = _runtime_context_mapping(revision.get("payload"))
+    payload_route_identity = _runtime_context_mapping(revision_payload.get("route_identity"))
+    payload_route_gate = _runtime_context_mapping(revision_payload.get("route_gate"))
+
+    safe: dict[str, Any] = {}
+    for source_route_identity, source_route_gate in (
+        (revision_route_identity, revision_route_gate),
+        (payload_route_identity, payload_route_gate),
+        (_runtime_context_mapping(route_identity), _runtime_context_mapping(route_gate)),
+    ):
+        safe.update(
+            public_contract_revision_route_identity(
+                source_route_gate,
+                source_route_identity,
+            )
+        )
+    safe["raw_private_context_exposed"] = False
+    return safe
+
+
+def _runtime_context_contract_revision_ref(
+    contract_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    revision = _runtime_context_revision_mapping(contract_revision)
+    return {
+        "producer": "parallel_branch_runtime",
+        "source": "parallel_branch_runtime_contract_revisions",
+        "revision_id": _runtime_context_text(revision.get("revision_id")),
+        "contract_version": _runtime_context_text(revision.get("contract_version")),
+        "created_at": _runtime_context_text(revision.get("created_at")),
+        "actor": _runtime_context_text(revision.get("actor")),
+    }
+
+
+def _runtime_context_revision_string_list(
+    payload: Mapping[str, Any],
+    *keys: str,
+) -> list[str]:
+    for key in keys:
+        values = _runtime_context_string_list(payload.get(key))
+        if values:
+            return values
+    return []
+
+
+def _runtime_context_timeline_refs(
+    timeline_refs: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    source = public_contract_revision_payload(timeline_refs or {})
+    normalized: dict[str, Any] = {
+        "producer": "task_timeline",
+        "source": "task_timeline_refs",
+        "dispatch_event_ref": _runtime_context_text(
+            source.get("dispatch_event_ref") or source.get("dispatch_event_id")
+        ),
+        "startup_event_ref": _runtime_context_text(
+            source.get("startup_event_ref") or source.get("startup_event_id")
+        ),
+        "read_receipt_event_ref": _runtime_context_text(
+            source.get("read_receipt_event_ref")
+            or source.get("read_receipt_event_id")
+            or source.get("read_receipt_ref")
+        ),
+        "finish_event_ref": _runtime_context_text(
+            source.get("finish_event_ref") or source.get("finish_event_id")
+        ),
+        "close_ready_event_ref": _runtime_context_text(
+            source.get("close_ready_event_ref") or source.get("close_ready_event_id")
+        ),
+        "implementation_event_refs": _runtime_context_dedupe(
+            _runtime_context_string_list(
+                source.get("implementation_event_refs")
+                or source.get("implementation_event_ids")
+            )
+        ),
+        "verification_event_refs": _runtime_context_dedupe(
+            _runtime_context_string_list(
+                source.get("verification_event_refs")
+                or source.get("verification_event_ids")
+            )
+        ),
+    }
+    return normalized
+
+
+def _runtime_context_graph_trace_refs(
+    graph_trace_refs: Mapping[str, Any] | Sequence[str] | None,
+) -> dict[str, Any]:
+    if isinstance(graph_trace_refs, Mapping):
+        source = public_contract_revision_payload(graph_trace_refs)
+        trace_values: list[str] = []
+        for key in (
+            "trace_ids",
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+            "query_trace_ids",
+            "trace_id",
+            "graph_trace_id",
+        ):
+            trace_values.extend(_runtime_context_string_list(source.get(key)))
+        query_source = _runtime_context_text(source.get("query_source"))
+        worker_role = _runtime_context_text(source.get("worker_role") or source.get("role"))
+        parent_task_id = _runtime_context_text(source.get("parent_task_id"))
+        task_id = _runtime_context_text(source.get("task_id"))
+    else:
+        trace_values = _runtime_context_string_list(graph_trace_refs)
+        query_source = ""
+        worker_role = ""
+        parent_task_id = ""
+        task_id = ""
+    trace_ids = _runtime_context_dedupe(trace_values)
+    return {
+        "producer": "graph_query_trace",
+        "source": "graph_query_trace_refs",
+        "query_source": query_source,
+        "worker_role": worker_role,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "trace_ids": trace_ids,
+        "present": bool(trace_ids),
+    }
+
+
+def _runtime_context_value_present(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _runtime_context_evidence_refs(
+    context: BranchTaskRuntimeContext,
+    *,
+    runtime_context_id: str,
+    contract_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None,
+    route_identity: Mapping[str, Any],
+    timeline_refs: Mapping[str, Any],
+    graph_trace_refs: Mapping[str, Any],
+) -> dict[str, Any]:
+    revision_ref = _runtime_context_contract_revision_ref(contract_revision)
+    return {
+        "branch_runtime": {
+            "producer": "parallel_branch_runtime",
+            "source": "BranchTaskRuntimeContext",
+            "source_ref": (
+                "parallel_branch_runtime_contexts/"
+                f"{context.project_id}/{runtime_context_id}"
+            ),
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+        },
+        "contract_revision": revision_ref,
+        "route_identity": {
+            "producer": "route_prompt_contract",
+            "source": "contract_revision.route_identity",
+            "source_ref": (
+                revision_ref.get("revision_id")
+                or route_identity.get("route_id")
+                or route_identity.get("route_context_hash")
+                or ""
+            ),
+            "route_id": route_identity.get("route_id", ""),
+            "route_context_hash": route_identity.get("route_context_hash", ""),
+            "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
+            "prompt_contract_hash": route_identity.get("prompt_contract_hash", ""),
+        },
+        "timeline": timeline_refs,
+        "graph_trace": graph_trace_refs,
+    }
+
+
+def _runtime_context_current_values(
+    context: BranchTaskRuntimeContext,
+    *,
+    runtime_context_id: str,
+    route_identity: Mapping[str, Any],
+    timeline_refs: Mapping[str, Any],
+    graph_trace_refs: Mapping[str, Any],
+    target_files: Sequence[str],
+    acceptance_criteria: Sequence[str],
+    startup_gate: Mapping[str, Any],
+    finish_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    parent_task_id = _runtime_context_parent_task_id(context)
+    checkpoint_id = context.checkpoint_id or _runtime_context_text(
+        finish_gate.get("checkpoint_id")
+    )
+    verification_event_refs = _runtime_context_string_list(
+        timeline_refs.get("verification_event_refs")
+    )
+    return {
+        "project_id": context.project_id,
+        "governance_project_id": context.governance_project_id or context.project_id,
+        "target_project_id": context.target_project_id or context.project_id,
+        "target_project_root": context.target_project_root,
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": context.backlog_id,
+        "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "actual_host_worker_id": context.actual_host_worker_id,
+        "agent_id": context.agent_id,
+        "allocation_owner": context.allocation_owner or context.agent_id,
+        "attempt": context.attempt,
+        "fence_token": context.fence_token,
+        "branch_ref": context.branch_ref,
+        "ref_name": context.ref_name,
+        "worktree_id": context.worktree_id,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "head_commit": context.head_commit,
+        "target_head_commit": context.target_head_commit,
+        "snapshot_id": context.snapshot_id,
+        "projection_id": context.projection_id,
+        "merge_queue_id": context.merge_queue_id,
+        "merge_preview_id": context.merge_preview_id,
+        "route_id": _runtime_context_text(route_identity.get("route_id")),
+        "route_context_hash": _runtime_context_text(
+            route_identity.get("route_context_hash")
+        ),
+        "prompt_contract_id": _runtime_context_text(
+            route_identity.get("prompt_contract_id")
+        ),
+        "prompt_contract_hash": _runtime_context_text(
+            route_identity.get("prompt_contract_hash")
+        ),
+        "visible_injection_manifest_hash": _runtime_context_text(
+            route_identity.get("visible_injection_manifest_hash")
+        ),
+        "target_files": list(target_files),
+        "acceptance_criteria": list(acceptance_criteria),
+        "graph_query_identity": {
+            "query_source": "mf_subagent",
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+            "fence_token": context.fence_token,
+            "governance_project_id": context.governance_project_id
+            or context.project_id,
+            "target_project_id": context.target_project_id or context.project_id,
+            "target_project_root": context.target_project_root,
+        },
+        "graph_trace_ids": list(graph_trace_refs.get("trace_ids") or []),
+        "dispatch_event_ref": timeline_refs.get("dispatch_event_ref", ""),
+        "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
+        "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
+        "finish_event_ref": timeline_refs.get("finish_event_ref", ""),
+        "close_ready_event_ref": timeline_refs.get("close_ready_event_ref", ""),
+        "verification_event_refs": verification_event_refs,
+        "startup_gate_ref": _runtime_context_text(
+            startup_gate.get("event_id")
+            or startup_gate.get("source_ref")
+            or timeline_refs.get("startup_event_ref")
+        ),
+        "finish_gate_ref": _runtime_context_text(
+            finish_gate.get("event_id")
+            or finish_gate.get("source_ref")
+            or timeline_refs.get("finish_event_ref")
+        ),
+        "checkpoint_id": checkpoint_id,
+        "test_results": public_contract_revision_payload(finish_gate.get("test_results")),
+    }
+
+
+_RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
+    "dispatch": (
+        {
+            "field": "task_id",
+            "expected_source": "branch_runtime.context.task_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "parent_task_id",
+            "expected_source": "branch_runtime.context.parent_task_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worker_role",
+            "expected_source": "runtime_context.role_policy",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "branch_ref",
+            "expected_source": "branch_runtime.context.branch_ref",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worktree_path",
+            "expected_source": "branch_runtime.context.worktree_path",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "base_commit",
+            "expected_source": "branch_runtime.context.base_commit",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "target_head_commit",
+            "expected_source": "branch_runtime.context.target_head_commit",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "merge_queue_id",
+            "expected_source": "branch_runtime.context.merge_queue_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "fence_token",
+            "expected_source": "branch_runtime.context.fence_token",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "route_context_hash",
+            "expected_source": "route_prompt_contract.route_context_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "prompt_contract_id",
+            "expected_source": "route_prompt_contract.prompt_contract_id",
+            "producer": "route_prompt_contract",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "prompt_contract_hash",
+            "expected_source": "route_prompt_contract.prompt_contract_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "target_files",
+            "expected_source": "contract_revision.payload.target_files",
+            "producer": "parallel_branch_runtime",
+            "consumer": "observer_runtime_text_prepare",
+            "evidence_ref": "contract_revision",
+        },
+    ),
+    "startup": (
+        {
+            "field": "runtime_context_id",
+            "expected_source": "branch_runtime.context.runtime_context_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "parent_task_id",
+            "expected_source": "branch_runtime.context.parent_task_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worker_role",
+            "expected_source": "runtime_context.role_policy",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worker_id",
+            "expected_source": "branch_runtime.context.worker_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "agent_id",
+            "expected_source": "branch_runtime.context.agent_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "fence_token",
+            "expected_source": "branch_runtime.context.fence_token",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worktree_path",
+            "expected_source": "branch_runtime.context.worktree_path",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "base_commit",
+            "expected_source": "branch_runtime.context.base_commit",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "target_head_commit",
+            "expected_source": "branch_runtime.context.target_head_commit",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "merge_queue_id",
+            "expected_source": "branch_runtime.context.merge_queue_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "route_id",
+            "expected_source": "route_prompt_contract.route_id",
+            "producer": "route_prompt_contract",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "route_context_hash",
+            "expected_source": "route_prompt_contract.route_context_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "prompt_contract_id",
+            "expected_source": "route_prompt_contract.prompt_contract_id",
+            "producer": "route_prompt_contract",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "prompt_contract_hash",
+            "expected_source": "route_prompt_contract.prompt_contract_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "visible_injection_manifest_hash",
+            "expected_source": "route_prompt_contract.visible_injection_manifest_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "target_files",
+            "expected_source": "contract_revision.payload.target_files",
+            "producer": "parallel_branch_runtime",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "contract_revision",
+        },
+    ),
+    "graph_query": (
+        {
+            "field": "task_id",
+            "expected_source": "branch_runtime.context.task_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "graph_query_trace.validate_mf_subagent_identity",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "parent_task_id",
+            "expected_source": "branch_runtime.context.parent_task_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "graph_query_trace.validate_mf_subagent_identity",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worker_role",
+            "expected_source": "runtime_context.role_policy",
+            "producer": "parallel_branch_runtime",
+            "consumer": "graph_query_trace.validate_mf_subagent_identity",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "fence_token",
+            "expected_source": "branch_runtime.context.fence_token",
+            "producer": "parallel_branch_runtime",
+            "consumer": "graph_query_trace.validate_mf_subagent_identity",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "governance_project_id",
+            "expected_source": "branch_runtime.context.governance_project_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "graph_query_trace.validate_mf_subagent_identity",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "target_project_id",
+            "expected_source": "branch_runtime.context.target_project_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "graph_query_trace.validate_mf_subagent_identity",
+            "evidence_ref": "branch_runtime",
+        },
+    ),
+    "finish": (
+        {
+            "field": "task_id",
+            "expected_source": "branch_runtime.context.task_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "backlog_id",
+            "expected_source": "branch_runtime.context.backlog_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "branch_ref",
+            "expected_source": "branch_runtime.context.branch_ref",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "worktree_path",
+            "expected_source": "branch_runtime.context.worktree_path",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "base_commit",
+            "expected_source": "branch_runtime.context.base_commit",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "target_head_commit",
+            "expected_source": "branch_runtime.context.target_head_commit",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "merge_queue_id",
+            "expected_source": "branch_runtime.context.merge_queue_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "fence_token",
+            "expected_source": "branch_runtime.context.fence_token",
+            "producer": "parallel_branch_runtime",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "startup_event_ref",
+            "expected_source": "task_timeline.mf_subagent_startup",
+            "producer": "task_timeline",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "read_receipt_event_ref",
+            "expected_source": "task_timeline.mf_subagent_read_receipt",
+            "producer": "task_timeline",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "graph_trace_ids",
+            "expected_source": "graph_query_trace.trace_ids",
+            "producer": "graph_query_trace",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "graph_trace",
+        },
+        {
+            "field": "prompt_contract_hash",
+            "expected_source": "route_prompt_contract.prompt_contract_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "route_identity",
+        },
+    ),
+    "close": (
+        {
+            "field": "checkpoint_id",
+            "expected_source": "branch_runtime.context.checkpoint_or_finish_gate",
+            "producer": "parallel_branch_runtime",
+            "consumer": "close_gate",
+            "evidence_ref": "branch_runtime",
+        },
+        {
+            "field": "finish_gate_ref",
+            "expected_source": "task_timeline.finish_gate",
+            "producer": "task_timeline",
+            "consumer": "close_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "verification_event_refs",
+            "expected_source": "task_timeline.verification",
+            "producer": "task_timeline",
+            "consumer": "close_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "graph_trace_ids",
+            "expected_source": "graph_query_trace.trace_ids",
+            "producer": "graph_query_trace",
+            "consumer": "close_gate",
+            "evidence_ref": "graph_trace",
+        },
+        {
+            "field": "route_context_hash",
+            "expected_source": "route_prompt_contract.route_context_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "close_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "prompt_contract_hash",
+            "expected_source": "route_prompt_contract.prompt_contract_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "close_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "merge_queue_id",
+            "expected_source": "branch_runtime.context.merge_queue_id",
+            "producer": "parallel_branch_runtime",
+            "consumer": "close_gate",
+            "evidence_ref": "branch_runtime",
+        },
+    ),
+}
+
+
+def _runtime_context_gate_field_view(
+    *,
+    gate: str,
+    requirement: Mapping[str, str],
+    values: Mapping[str, Any],
+) -> tuple[str, dict[str, Any], RuntimeContextMissingField | None]:
+    field_name = requirement["field"]
+    value = values.get(field_name)
+    present = _runtime_context_value_present(value)
+    field_view = {
+        "value": value,
+        "present": present,
+        "expected_source": requirement["expected_source"],
+        "producer": requirement["producer"],
+        "consumer": requirement["consumer"],
+        "evidence_ref": requirement["evidence_ref"],
+    }
+    if present:
+        return field_name, field_view, None
+    missing = RuntimeContextMissingField(
+        gate=gate,
+        field=field_name,
+        expected_source=requirement["expected_source"],
+        producer=requirement["producer"],
+        consumer=requirement["consumer"],
+        evidence_ref=requirement["evidence_ref"],
+    )
+    return field_name, field_view, missing
+
+
+def build_runtime_context_gate_inputs_view(
+    current_view: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build gate-by-gate current values and missing-field diagnostics."""
+
+    values = _runtime_context_mapping(current_view.get("current_values"))
+    gates: dict[str, Any] = {}
+    all_missing: list[dict[str, Any]] = []
+    for gate, requirements in _RUNTIME_CONTEXT_GATE_REQUIREMENTS.items():
+        fields: dict[str, Any] = {}
+        missing: list[dict[str, Any]] = []
+        for requirement in requirements:
+            field_name, field_view, missing_field = _runtime_context_gate_field_view(
+                gate=gate,
+                requirement=requirement,
+                values=values,
+            )
+            fields[field_name] = field_view
+            if missing_field is not None:
+                missing.append(missing_field.to_dict())
+        gates[gate] = {
+            "gate": gate,
+            "required_fields": [item["field"] for item in requirements],
+            "fields": fields,
+            "missing": missing,
+            "ready": not missing,
+            "status": "ready" if not missing else "missing_required_fields",
+        }
+        all_missing.extend(missing)
+    return {
+        "schema_version": RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+        "runtime_context_id": _runtime_context_text(
+            current_view.get("runtime_context_id")
+        ),
+        "task_id": values.get("task_id", ""),
+        "generated_at": current_view.get("generated_at", ""),
+        "gates": gates,
+        "missing": all_missing,
+        "status": "ready" if not all_missing else "missing_required_fields",
+    }
+
+
+def build_runtime_context_current_view(
+    context: BranchTaskRuntimeContext,
+    *,
+    contract_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None = None,
+    route_identity: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
+    timeline_refs: Mapping[str, Any] | None = None,
+    graph_trace_refs: Mapping[str, Any] | Sequence[str] | None = None,
+    startup_gate: Mapping[str, Any] | None = None,
+    finish_gate: Mapping[str, Any] | None = None,
+    close_evidence: Mapping[str, Any] | None = None,
+    target_files: Sequence[str] | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+    required_evidence: Sequence[str] | None = None,
+    generated_at: str = "",
+) -> dict[str, Any]:
+    """Build the canonical current-state projection for runtime-context gates."""
+
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    revision_payload = _runtime_context_revision_payload(contract_revision)
+    route = _runtime_context_route_identity(
+        contract_revision=contract_revision,
+        route_identity=route_identity,
+        route_gate=route_gate,
+    )
+    timeline = _runtime_context_timeline_refs(timeline_refs)
+    graph_trace = _runtime_context_graph_trace_refs(graph_trace_refs)
+    target_file_values = _runtime_context_dedupe(
+        list(target_files or ())
+        or _runtime_context_revision_string_list(
+            revision_payload,
+            "target_files",
+            "owned_files",
+            "write_scope",
+        )
+    )
+    acceptance_values = _runtime_context_dedupe(
+        list(acceptance_criteria or ())
+        or _runtime_context_revision_string_list(
+            revision_payload,
+            "acceptance_criteria",
+            "acceptance",
+        )
+    )
+    required_evidence_values = _runtime_context_dedupe(
+        list(required_evidence or ())
+        or _runtime_context_revision_string_list(
+            revision_payload,
+            "required_evidence",
+            "required_evidence_ids",
+        )
+    )
+    startup = public_contract_revision_payload(startup_gate or {})
+    finish = public_contract_revision_payload(finish_gate or {})
+    current_values = _runtime_context_current_values(
+        context,
+        runtime_context_id=runtime_context_id,
+        route_identity=route,
+        timeline_refs=timeline,
+        graph_trace_refs=graph_trace,
+        target_files=target_file_values,
+        acceptance_criteria=acceptance_values,
+        startup_gate=startup,
+        finish_gate=finish,
+    )
+    evidence_refs = _runtime_context_evidence_refs(
+        context,
+        runtime_context_id=runtime_context_id,
+        contract_revision=contract_revision,
+        route_identity=route,
+        timeline_refs=timeline,
+        graph_trace_refs=graph_trace,
+    )
+    return {
+        "schema_version": RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
+        "runtime_context_id": runtime_context_id,
+        "project_id": context.project_id,
+        "task_id": context.task_id,
+        "generated_at": generated_at or utc_now(),
+        "source_boundaries": {
+            "route_prompt_identity": "route_prompt_contract",
+            "branch_worktree_fence": "parallel_branch_runtime",
+            "timeline_refs": "task_timeline",
+            "graph_trace_refs": "graph_query_trace",
+            "raw_source_data_copied": False,
+        },
+        "identity": {
+            key: current_values[key]
+            for key in (
+                "project_id",
+                "governance_project_id",
+                "target_project_id",
+                "target_project_root",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "backlog_id",
+                "worker_role",
+                "worker_id",
+                "worker_slot_id",
+                "actual_host_worker_id",
+                "agent_id",
+                "attempt",
+                "fence_token",
+            )
+        },
+        "branch": {
+            key: current_values[key]
+            for key in (
+                "branch_ref",
+                "ref_name",
+                "worktree_id",
+                "worktree_path",
+                "base_commit",
+                "head_commit",
+                "target_head_commit",
+                "snapshot_id",
+                "projection_id",
+                "merge_queue_id",
+                "merge_preview_id",
+            )
+        },
+        "route_identity": route,
+        "work": {
+            "target_files": target_file_values,
+            "acceptance_criteria": acceptance_values,
+            "required_evidence": required_evidence_values,
+        },
+        "graph_query_identity": current_values["graph_query_identity"],
+        "timeline_refs": timeline,
+        "graph_trace_refs": graph_trace,
+        "startup_gate": startup,
+        "finish_gate": finish,
+        "close_evidence": public_contract_revision_payload(close_evidence or {}),
+        "contract_revision": _runtime_context_contract_revision_ref(contract_revision),
+        "evidence_refs": evidence_refs,
+        "current_values": current_values,
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "raw_source_of_truth_copied": False,
+            "redacted_context_sources": [
+                "raw_private_route_body",
+                "observer_only_context",
+                "private_context",
+                "unmanifested_prompt_text",
+            ],
+        },
+    }
+
+
+def build_runtime_context_close_gate_view(
+    current_view: Mapping[str, Any],
+    gate_inputs_view: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the close/merge checklist bound to timeline and graph refs."""
+
+    values = _runtime_context_mapping(current_view.get("current_values"))
+    gate_inputs = (
+        dict(gate_inputs_view)
+        if isinstance(gate_inputs_view, Mapping)
+        else build_runtime_context_gate_inputs_view(current_view)
+    )
+    close_gate = _runtime_context_mapping(
+        _runtime_context_mapping(gate_inputs.get("gates")).get("close")
+    )
+    close_missing = list(close_gate.get("missing") or [])
+    checklist_fields = (
+        ("startup_evidence", "startup_event_ref"),
+        ("read_receipt", "read_receipt_event_ref"),
+        ("finish_gate", "finish_gate_ref"),
+        ("checkpoint", "checkpoint_id"),
+        ("verification", "verification_event_refs"),
+        ("graph_trace", "graph_trace_ids"),
+        ("route_context_hash", "route_context_hash"),
+        ("prompt_contract_hash", "prompt_contract_hash"),
+        ("merge_queue", "merge_queue_id"),
+    )
+    checklist = []
+    for item_id, field_name in checklist_fields:
+        value = values.get(field_name)
+        checklist.append(
+            {
+                "id": item_id,
+                "field": field_name,
+                "status": "present"
+                if _runtime_context_value_present(value)
+                else "missing",
+                "value": value,
+            }
+        )
+    return {
+        "schema_version": RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+        "runtime_context_id": current_view.get("runtime_context_id", ""),
+        "task_id": values.get("task_id", ""),
+        "merge_queue_id": values.get("merge_queue_id", ""),
+        "checkpoint_id": values.get("checkpoint_id", ""),
+        "checklist": checklist,
+        "missing": close_missing,
+        "ready": not close_missing,
+        "status": "ready" if not close_missing else "missing_required_fields",
+        "evidence_refs": {
+            "timeline": current_view.get("timeline_refs", {}),
+            "graph_trace": current_view.get("graph_trace_refs", {}),
+            "branch_runtime": _runtime_context_mapping(
+                current_view.get("evidence_refs")
+            ).get("branch_runtime", {}),
+        },
+    }
+
+
+def build_runtime_context_worker_view(
+    current_view: Mapping[str, Any],
+    *,
+    task_id: str = "",
+    fence_token: str = "",
+    role: str = RUNTIME_CONTEXT_WORKER_ROLE,
+    gate_inputs_view: Mapping[str, Any] | None = None,
+    close_gate_view: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the mf_sub-safe role-filtered view for one worker/fence/task."""
+
+    normalized_role = _runtime_context_text(role).lower().replace("-", "_")
+    if normalized_role not in {RUNTIME_CONTEXT_WORKER_ROLE, "worker"}:
+        raise BranchRuntimeFenceError("runtime_context_worker_view_role_not_allowed")
+    values = _runtime_context_mapping(current_view.get("current_values"))
+    expected_task_id = _runtime_context_text(values.get("task_id"))
+    expected_fence = _runtime_context_text(values.get("fence_token"))
+    requested_task_id = _runtime_context_text(task_id)
+    requested_fence = _runtime_context_text(fence_token)
+    if requested_task_id and requested_task_id != expected_task_id:
+        raise BranchRuntimeFenceError("runtime_context_worker_view_task_mismatch")
+    if requested_fence and requested_fence != expected_fence:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    gate_inputs = (
+        dict(gate_inputs_view)
+        if isinstance(gate_inputs_view, Mapping)
+        else build_runtime_context_gate_inputs_view(current_view)
+    )
+    close_gate = (
+        dict(close_gate_view)
+        if isinstance(close_gate_view, Mapping)
+        else build_runtime_context_close_gate_view(current_view, gate_inputs)
+    )
+    return {
+        "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
+        "role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "runtime_context_id": current_view.get("runtime_context_id", ""),
+        "task": {
+            key: values.get(key, "")
+            for key in (
+                "project_id",
+                "governance_project_id",
+                "target_project_id",
+                "target_project_root",
+                "task_id",
+                "parent_task_id",
+                "backlog_id",
+                "worker_role",
+                "worker_id",
+                "worker_slot_id",
+                "actual_host_worker_id",
+                "agent_id",
+                "attempt",
+                "fence_token",
+            )
+        },
+        "branch": {
+            key: values.get(key, "")
+            for key in (
+                "branch_ref",
+                "ref_name",
+                "worktree_id",
+                "worktree_path",
+                "base_commit",
+                "head_commit",
+                "target_head_commit",
+                "snapshot_id",
+                "projection_id",
+                "merge_queue_id",
+                "merge_preview_id",
+            )
+        },
+        "route_identity": {
+            key: _runtime_context_mapping(current_view.get("route_identity")).get(
+                key,
+                "",
+            )
+            for key in _SAFE_CONTRACT_REVISION_ROUTE_KEYS
+            if _runtime_context_mapping(current_view.get("route_identity")).get(key)
+        }
+        | {"raw_private_context_exposed": False},
+        "work": dict(_runtime_context_mapping(current_view.get("work"))),
+        "graph_query_identity": values.get("graph_query_identity", {}),
+        "gate_inputs": gate_inputs,
+        "close_gate_view": close_gate,
+        "evidence_refs": {
+            key: _runtime_context_mapping(current_view.get("evidence_refs")).get(
+                key,
+                {},
+            )
+            for key in (
+                "branch_runtime",
+                "contract_revision",
+                "route_identity",
+                "timeline",
+                "graph_trace",
+            )
+        },
+        "role_filter_policy": {
+            "schema_version": RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION,
+            "role": RUNTIME_CONTEXT_WORKER_ROLE,
+            "allowed_for_task_id": expected_task_id,
+            "fence_token_required": True,
+            "allowed_sections": [
+                "task",
+                "branch",
+                "route_identity",
+                "work",
+                "graph_query_identity",
+                "gate_inputs",
+                "close_gate_view",
+                "evidence_refs",
+            ],
+            "blocked_sections": [
+                "observer_controls",
+                "observer_only_context",
+                "private_context",
+                "raw_source_payloads",
+                "other_worker_contexts",
+            ],
+            "raw_private_context_exposed": False,
+            "other_worker_contexts_exposed": False,
+        },
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "other_worker_contexts_exposed": False,
+            "raw_source_of_truth_copied": False,
+        },
+    }
+
+
+def build_runtime_context_projection(
+    context: BranchTaskRuntimeContext,
+    *,
+    contract_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None = None,
+    route_identity: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
+    timeline_refs: Mapping[str, Any] | None = None,
+    graph_trace_refs: Mapping[str, Any] | Sequence[str] | None = None,
+    startup_gate: Mapping[str, Any] | None = None,
+    finish_gate: Mapping[str, Any] | None = None,
+    close_evidence: Mapping[str, Any] | None = None,
+    target_files: Sequence[str] | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+    required_evidence: Sequence[str] | None = None,
+    role: str = RUNTIME_CONTEXT_WORKER_ROLE,
+    fence_token: str = "",
+    generated_at: str = "",
+) -> RuntimeContextProjection:
+    """Build all Runtime Context Service projections for internal consumers."""
+
+    current = build_runtime_context_current_view(
+        context,
+        contract_revision=contract_revision,
+        route_identity=route_identity,
+        route_gate=route_gate,
+        timeline_refs=timeline_refs,
+        graph_trace_refs=graph_trace_refs,
+        startup_gate=startup_gate,
+        finish_gate=finish_gate,
+        close_evidence=close_evidence,
+        target_files=target_files,
+        acceptance_criteria=acceptance_criteria,
+        required_evidence=required_evidence,
+        generated_at=generated_at,
+    )
+    gate_inputs = build_runtime_context_gate_inputs_view(current)
+    close_gate = build_runtime_context_close_gate_view(current, gate_inputs)
+    worker_view = build_runtime_context_worker_view(
+        current,
+        task_id=context.task_id,
+        fence_token=fence_token or context.fence_token,
+        role=role,
+        gate_inputs_view=gate_inputs,
+        close_gate_view=close_gate,
+    )
+    return RuntimeContextProjection(
+        project_id=context.project_id,
+        runtime_context_id=runtime_context_id_for_branch_context(context),
+        current=current,
+        gate_inputs=gate_inputs,
+        worker_view=worker_view,
+        close_gate_view=close_gate,
+    )
 
 
 def merge_queue_item_to_dict(item: MergeQueueItem) -> dict[str, Any]:

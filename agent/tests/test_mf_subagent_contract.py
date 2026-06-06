@@ -36,8 +36,11 @@ from agent.governance.mf_subagent_contract import (
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
     build_mf_subagent_runtime_contract_view,
+    build_mf_subagent_runtime_context_projection,
+    build_mf_subagent_worker_runtime_context_view,
     build_mf_subagent_input,
     normalize_mf_subagent_result,
+    validate_mf_subagent_worker_runtime_context_view,
     validate_observer_direct_mutation_exception,
     validate_mf_subagent_dispatch_gate,
     validate_mf_subagent_finish_gate,
@@ -343,6 +346,100 @@ def test_runtime_contract_view_reports_revision_polling_state() -> None:
     assert unchanged["known_revision_id"] == "crev-2"
     assert unchanged["contract_changed"] is False
     assert unchanged["must_ack_revision"] is False
+
+
+def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        governance_project_id="aming-claw",
+        target_project_id="aming-claw",
+        target_project_root="/repo",
+        task_id="task-runtime-context-projection",
+        root_task_id="task-parent",
+        backlog_id="AC-RUNTIME-CONTEXT-SERVICE-ROLE-FILTERED-GATE-VIEWS-20260606",
+        worker_id="worker-runtime-context",
+        worker_slot_id="worker-runtime-context",
+        actual_host_worker_id="worker-runtime-context",
+        agent_id="agent-runtime-context",
+        attempt=1,
+        branch_ref="refs/heads/codex/task-runtime-context-projection",
+        ref_name="main",
+        worktree_id="wt-runtime-context",
+        worktree_path="/repo/.worktrees/task-runtime-context-projection",
+        base_commit="base123",
+        head_commit="head123",
+        target_head_commit="target123",
+        snapshot_id="scope-1",
+        projection_id="semproj-1",
+        merge_queue_id="mq-1",
+        merge_preview_id="mp-1",
+        fence_token="fence-runtime-context",
+        checkpoint_id="ckpt-runtime-context",
+        status="running",
+    )
+    secret = "worker-view-must-not-include-this-private-context"
+    kwargs = {
+        "latest_revision": {
+            "revision_id": "crev-runtime-context",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "target_files": ["agent/governance/mf_subagent_contract.py"],
+                "acceptance_criteria": ["runtime context wrapper is valid"],
+                "private_context": secret,
+            },
+        },
+        "route_identity": {
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+            "raw_private_context": secret,
+        },
+        "timeline_refs": {
+            "startup_event_ref": "timeline:startup",
+            "read_receipt_event_ref": "timeline:read-receipt",
+            "finish_event_ref": "timeline:finish",
+            "verification_event_refs": ["timeline:verification"],
+        },
+        "graph_trace_refs": {
+            "query_source": "mf_subagent",
+            "worker_role": "mf_sub",
+            "task_id": "task-runtime-context-projection",
+            "parent_task_id": "task-parent",
+            "trace_ids": ["gqt-runtime-context"],
+        },
+        "finish_gate": {
+            "checkpoint_id": "ckpt-runtime-context",
+            "test_results": {"status": "passed"},
+        },
+        "generated_at": "2026-06-06T00:00:00Z",
+    }
+
+    projection = build_mf_subagent_runtime_context_projection(context, **kwargs)
+    worker_view = projection["views"]["worker_view"]
+    validation = validate_mf_subagent_worker_runtime_context_view(
+        worker_view,
+        context=context,
+    )
+    worker_view_only = build_mf_subagent_worker_runtime_context_view(context, **kwargs)
+
+    assert projection["schema_version"] == "runtime_context.projection.v1"
+    assert worker_view["schema_version"] == "runtime_context.worker_view.v1"
+    assert worker_view["gate_inputs"]["status"] == "ready"
+    assert worker_view["close_gate_view"]["ready"] is True
+    assert validation["ok"] is True
+    assert validation["missing"] == []
+    assert worker_view_only["runtime_context_id"] == worker_view["runtime_context_id"]
+    assert secret not in json.dumps(worker_view, sort_keys=True)
+
+    tampered = dict(worker_view)
+    tampered["privacy_boundary"] = {
+        **worker_view["privacy_boundary"],
+        "other_worker_contexts_exposed": True,
+    }
+    with pytest.raises(MfSubagentContractError, match="other worker contexts"):
+        validate_mf_subagent_worker_runtime_context_view(tampered, context=context)
 
 
 def test_mf_workflow_runtime_template_names_graph_service_architecture_and_qa_lanes() -> None:

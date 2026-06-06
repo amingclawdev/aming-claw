@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 
@@ -19,6 +20,10 @@ from agent.governance.parallel_branch_runtime import (
     ACTION_RECLAIM_AFTER_DEPENDENCY,
     ACTION_RECLAIM_FROM_CHECKPOINT,
     ACTION_WAIT_FOR_DEPENDENCY,
+    RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_FAILED,
     STATE_MERGED,
@@ -32,6 +37,9 @@ from agent.governance.parallel_branch_runtime import (
     append_branch_contract_revision,
     branch_context_from_chain_stage,
     branch_runtime_context_id,
+    build_runtime_context_current_view,
+    build_runtime_context_gate_inputs_view,
+    build_runtime_context_projection,
     decide_restart_recovery,
     ensure_branch_runtime_schema,
     get_branch_context,
@@ -172,6 +180,157 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext:
+    payload: dict[str, object] = {
+        "project_id": PROJECT_ID,
+        "governance_project_id": PROJECT_ID,
+        "target_project_id": PROJECT_ID,
+        "target_project_root": "/repo",
+        "task_id": "mf-sub-runtime-context",
+        "root_task_id": "parent-runtime-context",
+        "stage_task_id": "mf-sub-runtime-context",
+        "backlog_id": "BUG-RUNTIME-CONTEXT",
+        "worker_id": "worker-runtime-context",
+        "worker_slot_id": "worker-runtime-context",
+        "actual_host_worker_id": "worker-runtime-context",
+        "agent_id": "agent-runtime-context",
+        "branch_ref": "refs/heads/codex/mf-sub-runtime-context",
+        "ref_name": "main",
+        "status": STATE_RUNNING,
+        "fence_token": "fence-runtime-context",
+        "worktree_id": "wt-runtime-context",
+        "worktree_path": "/repo/.worktrees/mf-sub-runtime-context",
+        "base_commit": "base-runtime-context",
+        "head_commit": "head-runtime-context",
+        "target_head_commit": "target-runtime-context",
+        "snapshot_id": "scope-runtime-context",
+        "projection_id": "semproj-runtime-context",
+        "merge_queue_id": "mq-runtime-context",
+        "merge_preview_id": "mp-runtime-context",
+    }
+    payload.update(overrides)
+    return BranchTaskRuntimeContext(**payload)
+
+
+def test_runtime_context_current_view_and_gate_inputs_report_missing_fields() -> None:
+    context = _runtime_projection_context()
+    current = build_runtime_context_current_view(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+        },
+        generated_at=NOW,
+    )
+    gate_inputs = build_runtime_context_gate_inputs_view(current)
+
+    assert current["schema_version"] == RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION
+    assert current["source_boundaries"]["raw_source_data_copied"] is False
+    assert current["identity"]["runtime_context_id"].startswith("mfrctx-")
+    assert current["evidence_refs"]["branch_runtime"]["producer"] == (
+        "parallel_branch_runtime"
+    )
+    assert current["route_identity"]["route_context_hash"] == (
+        "sha256:route-runtime-context"
+    )
+    assert gate_inputs["schema_version"] == RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION
+    assert gate_inputs["status"] == "missing_required_fields"
+
+    missing = {
+        (item["gate"], item["field"]): item for item in gate_inputs["missing"]
+    }
+    prompt_hash = missing[("dispatch", "prompt_contract_hash")]
+    assert prompt_hash["expected_source"] == (
+        "route_prompt_contract.prompt_contract_hash"
+    )
+    assert prompt_hash["producer"] == "route_prompt_contract"
+    assert prompt_hash["consumer"] == (
+        "mf_subagent_contract.validate_mf_subagent_dispatch_gate"
+    )
+    assert ("startup", "target_files") in missing
+
+
+def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -> None:
+    context = _runtime_projection_context(checkpoint_id="ckpt-runtime-context")
+    private_secret = "raw-private-memory-secret"
+    other_worker_secret = "other-worker-context-secret"
+    projection = build_runtime_context_projection(
+        context,
+        contract_revision={
+            "revision_id": "crev-runtime-context",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "target_files": ["agent/governance/parallel_branch_runtime.py"],
+                "acceptance_criteria": ["worker view is role filtered"],
+                "raw_private_memory": private_secret,
+                "other_worker_contexts": [
+                    {"task_id": "other-worker", "secret": other_worker_secret}
+                ],
+            },
+        },
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+            "raw_private_context": private_secret,
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup",
+            "read_receipt_event_ref": "timeline:read-receipt",
+            "finish_event_ref": "timeline:finish",
+            "verification_event_refs": ["timeline:verification"],
+        },
+        graph_trace_refs={
+            "query_source": "mf_subagent",
+            "worker_role": "mf_sub",
+            "task_id": "mf-sub-runtime-context",
+            "parent_task_id": "parent-runtime-context",
+            "trace_ids": ["gqt-runtime-context"],
+        },
+        finish_gate={
+            "checkpoint_id": "ckpt-runtime-context",
+            "test_results": {"status": "passed"},
+        },
+        generated_at=NOW,
+    )
+    payload = projection.to_dict()
+    worker_view = payload["views"]["worker_view"]
+
+    assert worker_view["schema_version"] == RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION
+    assert worker_view["task"]["task_id"] == "mf-sub-runtime-context"
+    assert worker_view["task"]["fence_token"] == "fence-runtime-context"
+    assert worker_view["route_identity"]["prompt_contract_hash"] == (
+        "sha256:prompt-runtime-context"
+    )
+    assert worker_view["gate_inputs"]["status"] == "ready"
+    assert worker_view["close_gate_view"]["schema_version"] == (
+        RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION
+    )
+    assert worker_view["close_gate_view"]["ready"] is True
+    assert worker_view["privacy_boundary"]["raw_private_context_exposed"] is False
+    assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
+
+    serialized = json.dumps(worker_view, sort_keys=True)
+    assert private_secret not in serialized
+    assert other_worker_secret not in serialized
+
+    with pytest.raises(BranchRuntimeFenceError):
+        build_runtime_context_projection(
+            context,
+            route_identity={
+                "route_id": "route-runtime-context",
+                "route_context_hash": "sha256:route-runtime-context",
+                "prompt_contract_id": "rprompt-runtime-context",
+                "prompt_contract_hash": "sha256:prompt-runtime-context",
+                "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+            },
+            fence_token="stale-fence",
+        )
 
 
 def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) -> None:

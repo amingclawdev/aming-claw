@@ -14,7 +14,11 @@ from agent.governance.asset_binding_proposals import (
     PROPOSAL_SCHEMA_VERSION as ASSET_BINDING_PROPOSAL_SCHEMA_VERSION,
 )
 from agent.governance.parallel_branch_runtime import (
+    BranchRuntimeContractRevision,
     BranchTaskRuntimeContext,
+    RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
+    build_runtime_context_projection,
     runtime_context_id_for_branch_context,
 )
 
@@ -1021,6 +1025,124 @@ def build_mf_subagent_runtime_contract_view(
             "must_not_directly_implement_worker_code": True,
         }
     return view
+
+
+def build_mf_subagent_runtime_context_projection(
+    context: BranchTaskRuntimeContext,
+    *,
+    latest_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None = None,
+    route_identity: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
+    timeline_refs: Mapping[str, Any] | None = None,
+    graph_trace_refs: Mapping[str, Any] | Sequence[str] | None = None,
+    startup_gate: Mapping[str, Any] | None = None,
+    finish_gate: Mapping[str, Any] | None = None,
+    close_evidence: Mapping[str, Any] | None = None,
+    target_files: Sequence[str] | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+    required_evidence: Sequence[str] | None = None,
+    role: str = MF_SUB_ROLE,
+    fence_token: str = "",
+    generated_at: str = "",
+) -> dict[str, Any]:
+    """Function contract for API/MCP/CLI Runtime Context Service adapters.
+
+    Worker C can call this wrapper and expose the returned dict without
+    reassembling gate fields or role filters in server.py, mcp_server.py, or
+    cli.py. Source-owned raw records must stay with their owning services.
+    """
+
+    return build_runtime_context_projection(
+        context,
+        contract_revision=latest_revision,
+        route_identity=route_identity,
+        route_gate=route_gate,
+        timeline_refs=timeline_refs,
+        graph_trace_refs=graph_trace_refs,
+        startup_gate=startup_gate,
+        finish_gate=finish_gate,
+        close_evidence=close_evidence,
+        target_files=target_files,
+        acceptance_criteria=acceptance_criteria,
+        required_evidence=required_evidence,
+        role=role,
+        fence_token=fence_token or context.fence_token,
+        generated_at=generated_at,
+    ).to_dict()
+
+
+def build_mf_subagent_worker_runtime_context_view(
+    context: BranchTaskRuntimeContext,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Return only runtime_context.worker_view.v1 for an mf_sub worker."""
+
+    projection = build_mf_subagent_runtime_context_projection(context, **kwargs)
+    return dict(projection["views"]["worker_view"])
+
+
+def validate_mf_subagent_worker_runtime_context_view(
+    view: Mapping[str, Any],
+    *,
+    context: BranchTaskRuntimeContext | None = None,
+    expected_task_id: str = "",
+    expected_fence_token: str = "",
+) -> dict[str, Any]:
+    """Validate a role-filtered worker view before handing it to mf_sub code."""
+
+    source = _mapping(view, field_name="runtime_context_worker_view")
+    if source.get("schema_version") != RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION:
+        raise MfSubagentContractError(
+            "runtime context worker view schema_version mismatch"
+        )
+    if _string(source.get("role")) != MF_SUB_ROLE:
+        raise MfSubagentContractError("runtime context worker view requires role=mf_sub")
+    task = _nested_mapping(source, "task")
+    privacy = _nested_mapping(source, "privacy_boundary")
+    role_policy = _nested_mapping(source, "role_filter_policy")
+    if _bool(privacy.get("raw_private_context_exposed")):
+        raise MfSubagentContractError(
+            "runtime context worker view exposes raw private context"
+        )
+    if _bool(privacy.get("other_worker_contexts_exposed")):
+        raise MfSubagentContractError(
+            "runtime context worker view exposes other worker contexts"
+        )
+    if _bool(role_policy.get("raw_private_context_exposed")):
+        raise MfSubagentContractError(
+            "runtime context role filter exposes raw private context"
+        )
+    if _bool(role_policy.get("other_worker_contexts_exposed")):
+        raise MfSubagentContractError(
+            "runtime context role filter exposes other worker contexts"
+        )
+
+    expected_task = _string(expected_task_id)
+    expected_fence = _string(expected_fence_token)
+    if context is not None:
+        expected_task = expected_task or context.task_id
+        expected_fence = expected_fence or context.fence_token
+    if expected_task and _string(task.get("task_id")) != expected_task:
+        raise MfSubagentContractError("runtime context worker view task_id mismatch")
+    if expected_fence and _string(task.get("fence_token")) != expected_fence:
+        raise MfSubagentContractError("runtime context worker view fence_token mismatch")
+
+    gate_inputs = _nested_mapping(source, "gate_inputs")
+    if gate_inputs.get("schema_version") != RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION:
+        raise MfSubagentContractError(
+            "runtime context worker view gate_inputs schema_version mismatch"
+        )
+    return {
+        "schema_version": "mf_subagent_runtime_context_worker_view_validation.v1",
+        "ok": True,
+        "runtime_context_id": _string(source.get("runtime_context_id")),
+        "task_id": _string(task.get("task_id")),
+        "fence_token_matches": True,
+        "raw_private_context_exposed": False,
+        "other_worker_contexts_exposed": False,
+        "gate_status": _string(gate_inputs.get("status")),
+        "missing": list(gate_inputs.get("missing") or []),
+    }
 
 
 def _deep_field_values(
