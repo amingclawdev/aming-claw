@@ -1003,17 +1003,28 @@ def mf_subagent_read_receipt_gate_verification(
         counted_evidence_event = _is_counted_mf_subagent_evidence_event(event)
         if not read_receipt_event and not counted_evidence_event:
             continue
+        attempt_lineage = _read_receipt_gate_attempt_lineage(event)
+        attempt_lineage_matches = bool(
+            attempt_lineage_filter
+            and _attempt_lineage_matches_filter(
+                attempt_lineage,
+                attempt_lineage_filter,
+            )
+        )
         if identity_filter:
             identity = _read_receipt_gate_route_identity(event)
             if not identity:
-                lineage_ignored.append(
-                    _read_receipt_gate_event_ref(
-                        event,
-                        reason="missing_route_identity_for_current_lineage",
+                if attempt_lineage_matches:
+                    pass
+                else:
+                    lineage_ignored.append(
+                        _read_receipt_gate_event_ref(
+                            event,
+                            reason="missing_route_identity_for_current_lineage",
+                        )
                     )
-                )
-                continue
-            if not _route_identity_matches_filter(identity, identity_filter):
+                    continue
+            elif not _route_identity_matches_filter(identity, identity_filter):
                 lineage_ignored.append(
                     _read_receipt_gate_event_ref(
                         event,
@@ -1022,7 +1033,6 @@ def mf_subagent_read_receipt_gate_verification(
                 )
                 continue
         if attempt_lineage_filter:
-            attempt_lineage = _read_receipt_gate_attempt_lineage(event)
             if not attempt_lineage:
                 lineage_ignored.append(
                     _read_receipt_gate_event_ref(
@@ -1574,6 +1584,22 @@ def _first_deep_mapping(value: Any, key: str) -> dict[str, Any]:
     return {}
 
 
+def _first_deep_value(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        if key in value and value.get(key) not in (None, "", [], {}):
+            return value.get(key)
+        for child in value.values():
+            found = _first_deep_value(child, key)
+            if found not in (None, "", [], {}):
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _first_deep_value(child, key)
+            if found not in (None, "", [], {}):
+                return found
+    return None
+
+
 def _first_deep_text(value: Any, key: str) -> str:
     if isinstance(value, dict):
         if key in value and str(value.get(key) or "").strip():
@@ -1619,6 +1645,53 @@ def _route_attempt_lineage(value: Any) -> dict[str, str]:
         field: token
         for field, token in lineage.items()
         if field in MF_ROUTE_ATTEMPT_LINEAGE_FIELDS and token
+    }
+
+
+def _runtime_dispatch_evidence(value: Any) -> dict[str, Any]:
+    owned_files = _string_list(
+        _first_deep_value(value, "owned_files")
+        or _first_deep_value(value, "target_files")
+        or []
+    )
+    return {
+        "route_id": _first_deep_text(value, "route_id"),
+        "route_context_hash": _first_deep_text(value, "route_context_hash"),
+        "prompt_contract_id": _first_deep_text(value, "prompt_contract_id"),
+        "prompt_contract_hash": _first_deep_text(value, "prompt_contract_hash"),
+        "visible_injection_manifest_hash": _first_deep_text(
+            value,
+            "visible_injection_manifest_hash",
+        ),
+        "runtime_context_id": _first_deep_text(value, "runtime_context_id"),
+        "task_id": _first_deep_text(value, "task_id"),
+        "parent_task_id": _first_deep_text(value, "parent_task_id"),
+        "worker_slot_id": (
+            _first_deep_text(value, "worker_slot_id")
+            or _first_deep_text(value, "worker_id")
+        ),
+        "fence_token": _first_deep_text(value, "fence_token"),
+        "worktree_path": (
+            _first_deep_text(value, "worktree_path")
+            or _first_deep_text(value, "assigned_worktree")
+            or _first_deep_text(value, "worktree")
+        ),
+        "branch": (
+            _first_deep_text(value, "branch")
+            or _first_deep_text(value, "branch_ref")
+        ),
+        "base_commit": _first_deep_text(value, "base_commit"),
+        "target_head_commit": _first_deep_text(value, "target_head_commit"),
+        "merge_queue_id": _first_deep_text(value, "merge_queue_id"),
+        "owned_files": owned_files,
+        "read_receipt_event_id": (
+            _first_deep_text(value, "read_receipt_event_id")
+            or _first_deep_text(value, "read_receipt_event_ref")
+        ),
+        "startup_event_id": (
+            _first_deep_text(value, "startup_event_id")
+            or _first_deep_text(value, "startup_event_ref")
+        ),
     }
 
 
@@ -1913,11 +1986,15 @@ def route_context_consumption_event_summary(
         return {
             "categories": [],
             "route_identity": {},
+            "attempt_lineage": {},
+            "runtime_dispatch_evidence": {},
             "passed": False,
         }
     return {
         "categories": sorted(_route_event_categories(row)),
         "route_identity": _route_identity(row),
+        "attempt_lineage": _route_attempt_lineage(row),
+        "runtime_dispatch_evidence": _runtime_dispatch_evidence(row),
         "passed": _route_event_passed(row),
     }
 

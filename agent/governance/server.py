@@ -4196,6 +4196,32 @@ def _require_graph_query_trace_capability(ctx: RequestContext, conn, trace: dict
     return session
 
 
+def _graph_query_trace_response_payload(result: dict) -> dict:
+    payload = dict(result)
+    trace = dict(payload.get("trace") or {})
+    if str(trace.get("query_source") or "") != "mf_subagent":
+        payload["trace"] = trace
+        return payload
+
+    fence_token = str(trace.get("fence_token") or "")
+    if fence_token:
+        trace["fence_token_hash"] = hashlib.sha256(
+            fence_token.encode("utf-8")
+        ).hexdigest()[:16]
+    trace["fence_token"] = ""
+    trace["fence_token_redacted"] = True
+    identity = trace.get("graph_query_identity")
+    if isinstance(identity, Mapping):
+        identity_payload = dict(identity)
+        identity_payload["fence_token"] = ""
+        identity_payload["fence_token_redacted"] = True
+        if fence_token:
+            identity_payload["fence_token_hash"] = trace["fence_token_hash"]
+        trace["graph_query_identity"] = identity_payload
+    payload["trace"] = trace
+    return payload
+
+
 def _raise_graph_api_validation(exc: Exception):
     from .errors import ValidationError
     raise ValidationError(str(exc)) from exc
@@ -10243,7 +10269,7 @@ def handle_graph_governance_query_trace_get(ctx: RequestContext):
                 result["trace"],
                 "graph-governance.query-trace.get",
             )
-            return result
+            return _graph_query_trace_response_payload(result)
         except KeyError as exc:
             _raise_graph_api_validation(exc)
     finally:
@@ -18250,6 +18276,105 @@ def _timeline_event_blocked_evidence_markers(event: dict) -> set[str]:
     return markers.intersection(_TIMELINE_ROUTE_WAIVER_BLOCKED_EVIDENCE_MARKERS)
 
 
+_TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "fence_token",
+)
+_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS = (
+    "route_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "worktree_path",
+    "branch",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
+)
+
+
+def _timeline_event_requires_ordered_dispatch_lineage(event: dict) -> bool:
+    return any(
+        _route_gate_marker(event.get(key)) == "bounded_implementation_worker_dispatch"
+        for key in ("event_type", "event_kind", "phase")
+    )
+
+
+def _timeline_ref_id_matches(supplied: Any, expected: Any) -> bool:
+    expected_text = str(expected or "").strip()
+    if not expected_text:
+        return True
+    supplied_text = str(supplied or "").strip()
+    return supplied_text in {expected_text, f"timeline:{expected_text}"}
+
+
+def _timeline_first_evidence_event_id(
+    route_context_gate: Mapping[str, Any],
+    requirement_id: str,
+) -> str:
+    evidence_events = route_context_gate.get("evidence_events")
+    if not isinstance(evidence_events, Mapping):
+        return ""
+    events = evidence_events.get(requirement_id)
+    if not isinstance(events, list) or not events:
+        return ""
+    event = events[0] if isinstance(events[0], Mapping) else {}
+    return str(event.get("id") or "").strip()
+
+
+def _timeline_bounded_dispatch_runtime_missing_fields(
+    summary: Mapping[str, Any],
+    route_context_gate: Mapping[str, Any],
+    read_receipt_gate: Mapping[str, Any],
+) -> list[str]:
+    attempt = route_context_gate.get("attempt_lineage")
+    expected_lineage = (
+        attempt.get("lineage") if isinstance(attempt, Mapping) else {}
+    )
+    if not isinstance(expected_lineage, Mapping) or not expected_lineage.get(
+        "runtime_context_id"
+    ):
+        return []
+
+    candidate_lineage = summary.get("attempt_lineage")
+    if not isinstance(candidate_lineage, Mapping):
+        candidate_lineage = {}
+    runtime_evidence = summary.get("runtime_dispatch_evidence")
+    if not isinstance(runtime_evidence, Mapping):
+        runtime_evidence = {}
+
+    missing: list[str] = []
+    for field in _TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS:
+        expected = str(expected_lineage.get(field) or "").strip()
+        observed = str(
+            candidate_lineage.get(field) or runtime_evidence.get(field) or ""
+        ).strip()
+        if expected and observed != expected:
+            missing.append(field)
+        elif not expected and not observed:
+            missing.append(field)
+    for field in _TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS:
+        if not str(runtime_evidence.get(field) or "").strip():
+            missing.append(field)
+    if not runtime_evidence.get("owned_files"):
+        missing.append("owned_files")
+    if not _timeline_ref_id_matches(
+        runtime_evidence.get("read_receipt_event_id"),
+        read_receipt_gate.get("read_receipt_event_id"),
+    ):
+        missing.append("read_receipt_event_id")
+    if not _timeline_ref_id_matches(
+        runtime_evidence.get("startup_event_id"),
+        _timeline_first_evidence_event_id(
+            route_context_gate,
+            "mf_subagent_startup",
+        ),
+    ):
+        missing.append("startup_event_id")
+    return missing
+
+
 def _route_waiver_is_manual_fix(waiver: Mapping[str, Any]) -> bool:
     waiver_type = _route_gate_marker(
         waiver.get("waiver_type") or waiver.get("type") or waiver.get("kind")
@@ -18309,6 +18434,11 @@ def _timeline_route_waiver_consumption_bootstrap_allowed(
         for item in summary.get("categories", [])
         if str(item)
     }
+    if (
+        "bounded_implementation_worker_dispatch" in supplied_categories
+        and _timeline_event_requires_ordered_dispatch_lineage(event)
+    ):
+        return False
     missing = {str(item) for item in missing_requirement_ids if str(item)}
     event_identity = summary.get("route_identity")
     expected_identity = route_context_gate.get("route_identity")
@@ -18398,11 +18528,19 @@ def _timeline_route_waiver_ordered_worker_lineage_allowed(
         events,
         route_identity_filter=lineage_filter,
     )
-    return bool(
+    if not bool(
         read_receipt_gate.get("required")
         and read_receipt_gate.get("passed")
         and read_receipt_gate.get("read_receipt_precedes_counted_evidence")
-    )
+    ):
+        return False
+    if _timeline_event_requires_ordered_dispatch_lineage(event):
+        return not _timeline_bounded_dispatch_runtime_missing_fields(
+            summary,
+            route_context_gate,
+            read_receipt_gate,
+        )
+    return True
 
 
 def _route_gate_present_requirement_ids(route_context_gate: Mapping[str, Any]) -> set[str]:

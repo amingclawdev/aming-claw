@@ -455,6 +455,118 @@ def _runtime_text_actual_startup_event(identity=None):
     }
 
 
+def _runtime_contract_read_receipt_event(
+    *,
+    runtime_context_id="mfrctx-dogfood",
+    task_id="worker-task-dogfood",
+    parent_task_id="BUG-DOGFOOD",
+    fence_token="fence-dogfood",
+    launch_text_hash="sha256:dogfood-launch",
+):
+    return {
+        "event_type": "mf_subagent.read_receipt",
+        "event_kind": "mf_subagent_read_receipt",
+        "phase": "startup",
+        "status": "accepted",
+        "payload": {
+            "schema_version": "mf_subagent_read_receipt.v1",
+            "runtime_context_id": runtime_context_id,
+            "launch_text_hash": launch_text_hash,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "fence_token": fence_token,
+            "raw_launch_text_persisted": False,
+        },
+    }
+
+
+def _runtime_contract_startup_event(
+    identity=None,
+    *,
+    runtime_context_id="mfrctx-dogfood",
+    task_id="worker-task-dogfood",
+    parent_task_id="BUG-DOGFOOD",
+    fence_token="fence-dogfood",
+):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "actor": "mf_sub",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                "schema_version": "mf_subagent_startup_gate.v1",
+                "status": "passed",
+                "bounded": True,
+                **route_identity,
+                "route_id": "route-dogfood",
+                "visible_injection_manifest_hash": "sha256:dogfood-visible",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": "mf_sub",
+                "worker_slot_id": "mfsub-dogfood",
+                "worker_id": "mfsub-dogfood",
+                "fence_token": fence_token,
+                "actual_cwd": "/repo/.worktrees/dogfood",
+                "actual_git_root": "/repo/.worktrees/dogfood",
+                "worktree_path": "/repo/.worktrees/dogfood",
+                "branch": "refs/heads/codex/dogfood",
+                "head_commit": "head-dogfood",
+                "base_commit": "base-dogfood",
+                "target_head_commit": "target-dogfood",
+                "merge_queue_id": "mq-dogfood",
+                "owned_files": ["agent/governance/task_timeline.py"],
+            }
+        },
+    }
+
+
+def _runtime_contract_bounded_dispatch_event(
+    identity=None,
+    *,
+    runtime_context_id="mfrctx-dogfood",
+    task_id="worker-task-dogfood",
+    parent_task_id="BUG-DOGFOOD",
+    fence_token="fence-dogfood",
+    read_receipt_event_id=0,
+    startup_event_id=0,
+):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "event_type": "mf_subagent.dispatch",
+        "event_kind": "bounded_implementation_worker_dispatch",
+        "phase": "dispatch",
+        "status": "accepted",
+        "payload": {
+            "bounded_implementation_worker_dispatch": {
+                "schema_version": "bounded_implementation_worker_dispatch.v1",
+                **route_identity,
+                "route_id": "route-dogfood",
+                "visible_injection_manifest_hash": "sha256:dogfood-visible",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": "mf_sub",
+                "worker_slot_id": "mfsub-dogfood",
+                "fence_token": fence_token,
+                "worktree_path": "/repo/.worktrees/dogfood",
+                "branch": "refs/heads/codex/dogfood",
+                "base_commit": "base-dogfood",
+                "target_head_commit": "target-dogfood",
+                "merge_queue_id": "mq-dogfood",
+                "owned_files": ["agent/governance/task_timeline.py"],
+                "read_receipt_event_id": read_receipt_event_id,
+                "startup_event_id": startup_event_id,
+                "raw_private_context_exposed": False,
+            }
+        },
+    }
+
+
 def _runtime_text_legacy_weak_startup_event(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     return {
@@ -1008,6 +1120,201 @@ class TestTaskTimeline(unittest.TestCase):
             gate["present_requirement_ids"],
         )
         self.assertIn("mf_subagent_startup", gate["present_requirement_ids"])
+
+    def test_bounded_worker_dispatch_accepts_runtime_contract_lineage(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-TL-BOUNDED-DISPATCH-RUNTIME-LINEAGE"
+        worker_task_id = "worker-task-dogfood"
+        runtime_context_id = "mfrctx-dogfood"
+        contract = self._insert_router_backlog(bug_id)
+        self._record_route_service_context(bug_id)
+
+        read_receipt = _runtime_contract_read_receipt_event(
+            runtime_context_id=runtime_context_id,
+            task_id=worker_task_id,
+            parent_task_id=bug_id,
+        )
+        startup_event = _runtime_contract_startup_event(
+            runtime_context_id=runtime_context_id,
+            task_id=worker_task_id,
+            parent_task_id=bug_id,
+        )
+        recorded_read_receipt = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=worker_task_id,
+            event_type=read_receipt["event_type"],
+            phase=read_receipt["phase"],
+            event_kind=read_receipt["event_kind"],
+            status=read_receipt["status"],
+            payload=read_receipt["payload"],
+        )
+        recorded_startup = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=worker_task_id,
+            event_type=startup_event["event_type"],
+            phase=startup_event["phase"],
+            event_kind=startup_event["event_kind"],
+            status=startup_event["status"],
+            actor=startup_event["actor"],
+            payload=startup_event["payload"],
+        )
+        self.conn.commit()
+
+        dispatch_result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    **_runtime_contract_bounded_dispatch_event(
+                        runtime_context_id=runtime_context_id,
+                        task_id=worker_task_id,
+                        parent_task_id=bug_id,
+                        read_receipt_event_id=recorded_read_receipt["id"],
+                        startup_event_id=recorded_startup["id"],
+                    ),
+                    "route_waiver": self._route_waiver_for_existing_identity(
+                        bug_id,
+                        task_id=worker_task_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(dispatch_result["route_token_gate"]["decision"], "route_waiver")
+        self.assertEqual(
+            dispatch_result["event_kind"],
+            "bounded_implementation_worker_dispatch",
+        )
+        dispatch_payload = dispatch_result["payload"][
+            "bounded_implementation_worker_dispatch"
+        ]
+        self.assertEqual(dispatch_payload["runtime_context_id"], runtime_context_id)
+        self.assertEqual(
+            dispatch_payload["read_receipt_event_id"],
+            recorded_read_receipt["id"],
+        )
+        self.assertEqual(dispatch_payload["startup_event_id"], recorded_startup["id"])
+        self.assertNotIn("raw_private_route_context", json.dumps(dispatch_payload))
+
+        for event in [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            _route_context_qa_verification_event(),
+        ]:
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=event.get("task_id", ""),
+                event_type=event.get("event_type") or event.get("event_kind"),
+                phase=event.get("phase", ""),
+                event_kind=event.get("event_kind", ""),
+                status=event.get("status", ""),
+                payload=event.get("payload") or {},
+                verification=event.get("verification") or {},
+            )
+        self.conn.commit()
+
+        events = task_timeline.list_events(self.conn, "proj", backlog_id=bug_id)
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["route_context_gate"]["passed"], ready)
+        self.assertNotIn(
+            "bounded_implementation_worker_dispatch",
+            ready["route_context_gate"]["missing_requirement_ids"],
+        )
+        self.assertEqual(
+            ready["route_context_gate"]["attempt_lineage"]["lineage"][
+                "runtime_context_id"
+            ],
+            runtime_context_id,
+        )
+        self.assertTrue(
+            ready["contract_projection"]["read_receipt_gate"][
+                "read_receipt_precedes_counted_evidence"
+            ],
+            ready,
+        )
+
+    def test_bounded_worker_dispatch_rejects_runtime_contract_lineage_mismatch(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-TL-BOUNDED-DISPATCH-RUNTIME-MISMATCH"
+        worker_task_id = "worker-task-dogfood"
+        runtime_context_id = "mfrctx-dogfood"
+        self._insert_router_backlog(bug_id)
+        self._record_route_service_context(bug_id)
+
+        read_receipt = _runtime_contract_read_receipt_event(
+            runtime_context_id=runtime_context_id,
+            task_id=worker_task_id,
+            parent_task_id=bug_id,
+        )
+        startup_event = _runtime_contract_startup_event(
+            runtime_context_id=runtime_context_id,
+            task_id=worker_task_id,
+            parent_task_id=bug_id,
+        )
+        recorded_read_receipt = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=worker_task_id,
+            event_type=read_receipt["event_type"],
+            phase=read_receipt["phase"],
+            event_kind=read_receipt["event_kind"],
+            status=read_receipt["status"],
+            payload=read_receipt["payload"],
+        )
+        recorded_startup = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=worker_task_id,
+            event_type=startup_event["event_type"],
+            phase=startup_event["phase"],
+            event_kind=startup_event["event_kind"],
+            status=startup_event["status"],
+            payload=startup_event["payload"],
+        )
+        self.conn.commit()
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": bug_id,
+                        "task_id": worker_task_id,
+                        **_runtime_contract_bounded_dispatch_event(
+                            runtime_context_id="mfrctx-wrong",
+                            task_id=worker_task_id,
+                            parent_task_id=bug_id,
+                            read_receipt_event_id=recorded_read_receipt["id"],
+                            startup_event_id=recorded_startup["id"],
+                        ),
+                        "route_waiver": self._route_waiver_for_existing_identity(
+                            bug_id,
+                            task_id=worker_task_id,
+                        ),
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ? AND event_kind = ?",
+            (bug_id, "bounded_implementation_worker_dispatch"),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
 
     def test_mf_parallel_route_waiver_rejects_dispatch_when_read_receipt_lineage_missing(self):
         from agent.governance import server, task_timeline

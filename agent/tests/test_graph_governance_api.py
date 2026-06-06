@@ -8024,6 +8024,9 @@ def test_mf_sub_graph_query_valid_active_identity_succeeds_and_records_trace_con
     assert trace["query_source"] == "mf_subagent"
     assert trace["parent_task_id"] == "parent-valid"
     assert trace["run_id"].startswith("mf_subagent:worker-valid:")
+    assert trace["fence_token_redacted"] is True
+    assert trace["graph_query_identity"]["fence_token_redacted"] is True
+    assert trace["fence_token_hash"]
     assert "fence-worker-valid" not in json.dumps(trace, sort_keys=True)
 
 
