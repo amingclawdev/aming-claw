@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -130,6 +131,62 @@ def test_dry_run_projects_stale_worktree_backlog_and_retained_trace(tmp_path):
     by_type = {item["artifact_type"]: item for item in projection["candidates"]}
     assert by_type["batch_worktree"]["safe_to_apply"] is True
     assert by_type["backlog_worktree_reference"]["safe_to_apply"] is True
+
+
+def test_batch_worktree_refuses_active_backlog_reference_even_with_terminal_task(tmp_path):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    _created, strategy = _terminal_batch_with_worktree(conn, repo, batch_id="active-backlog")
+    _insert_backlog_ref(
+        conn,
+        bug_id="OPT-ACTIVE",
+        worktree_path=strategy.worktree_path,
+        status="OPEN",
+    )
+
+    projection = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn,
+        "proj",
+        repo_root_path=repo,
+    )
+    batch_candidate = next(
+        item for item in projection["candidates"] if item["artifact_type"] == "batch_worktree"
+    )
+
+    assert batch_candidate["safe_to_apply"] is False
+    assert "referenced_by_active_backlog_row" in batch_candidate["refusal_reasons"]
+    assert batch_candidate["details"]["blocked_by_active_backlog_reference"] is True
+    assert batch_candidate["evidence"]["terminal_task_ids"]
+    assert batch_candidate["evidence"]["active_backlog_ids"] == ["OPT-ACTIVE"]
+    assert batch_candidate["evidence"]["active_backlog_references"] == [
+        {
+            "backlog_id": "OPT-ACTIVE",
+            "status": "OPEN",
+            "runtime_state": "",
+            "current_task_id": "",
+            "root_task_id": "",
+        }
+    ]
+
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as excinfo:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn,
+            "proj",
+            repo_root_path=repo,
+            candidate_ids=[batch_candidate["candidate_id"]],
+            actor="test",
+            reason="should refuse active backlog reference",
+        )
+
+    assert excinfo.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    assert (
+        excinfo.value.payload["unsafe_candidates"][0]["candidate_id"]
+        == batch_candidate["candidate_id"]
+    )
+    assert excinfo.value.payload["unsafe_candidates"][0]["evidence"]["active_backlog_ids"] == [
+        "OPT-ACTIVE"
+    ]
+    assert Path(strategy.worktree_path).exists()
 
 
 def test_apply_refuses_unowned_stale_worktree(tmp_path):

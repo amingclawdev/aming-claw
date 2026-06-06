@@ -298,19 +298,40 @@ def build_stale_artifact_cleanup_projection(
         elif path:
             active_tasks_by_path.setdefault(path, []).append(row)
 
+    active_backlog_refs_by_path: dict[str, list[dict[str, Any]]] = {}
+    for row in backlog_rows:
+        path = str(row.get("worktree_path") or "")
+        if path and not row.get("is_terminal"):
+            active_backlog_refs_by_path.setdefault(path, []).append(row)
+
     candidates: list[dict[str, Any]] = []
     for path in sorted(stale_paths):
         terminal_rows = terminal_tasks_by_path.get(path, [])
         active_rows = active_tasks_by_path.get(path, [])
+        active_backlog_rows = active_backlog_refs_by_path.get(path, [])
         path_safe = _path_under_worktrees(root, path)
-        safe = bool(path_safe and terminal_rows and not active_rows)
+        safe = bool(
+            path_safe and terminal_rows and not active_rows and not active_backlog_rows
+        )
         refusal_reasons = []
         if not path_safe:
             refusal_reasons.append("path_outside_worktrees")
         if active_rows:
             refusal_reasons.append("referenced_by_active_batch_task")
+        if active_backlog_rows:
+            refusal_reasons.append("referenced_by_active_backlog_row")
         if not terminal_rows:
             refusal_reasons.append("missing_terminal_batch_task_evidence")
+        active_backlog_evidence = [
+            {
+                "backlog_id": str(item.get("bug_id") or ""),
+                "status": str(item.get("status") or ""),
+                "runtime_state": str(item.get("runtime_state") or ""),
+                "current_task_id": str(item.get("current_task_id") or ""),
+                "root_task_id": str(item.get("root_task_id") or ""),
+            }
+            for item in active_backlog_rows
+        ]
         if safe or include_unowned:
             candidates.append({
                 "candidate_id": _candidate_id("batch_worktree", path),
@@ -319,6 +340,16 @@ def build_stale_artifact_cleanup_projection(
                 "path": path,
                 "safe_to_apply": safe,
                 "refusal_reasons": refusal_reasons,
+                "details": {
+                    "active_backlog_reference_count": len(active_backlog_rows),
+                    "blocked_by_active_backlog_reference": bool(active_backlog_rows),
+                    "operator_note": (
+                        "Worktree removal is blocked while any active/non-terminal "
+                        "backlog row still references the same path."
+                        if active_backlog_rows
+                        else ""
+                    ),
+                },
                 "evidence": {
                     "path_under_worktrees": path_safe,
                     "terminal_task_ids": [str(item.get("task_id") or "") for item in terminal_rows],
@@ -326,6 +357,10 @@ def build_stale_artifact_cleanup_projection(
                         {str(item.get("batch_status") or "") for item in terminal_rows}
                     ),
                     "active_task_ids": [str(item.get("task_id") or "") for item in active_rows],
+                    "active_backlog_ids": [
+                        str(item.get("bug_id") or "") for item in active_backlog_rows
+                    ],
+                    "active_backlog_references": active_backlog_evidence,
                     "exists": Path(path).exists(),
                     "append_only_evidence_retained": True,
                 },
