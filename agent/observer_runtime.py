@@ -1753,11 +1753,16 @@ def _dogfood_host_adapter_startup_evidence(
         )
     )
     observer_command_id = request.task_id or context.task_id
+    parent_task_id = (
+        _runtime_text_context_parent(asdict(context)) or request.backlog_id
+    )
     read_receipt_material = {
         "schema_version": "mf_subagent_read_receipt.v1",
         "observer_command_id": observer_command_id,
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
         "route_id": request.route_id,
         "worker_id": worker_slot_id,
         "worker_slot_id": worker_slot_id,
@@ -1813,7 +1818,7 @@ def _dogfood_host_adapter_startup_evidence(
         "backlog_id": request.backlog_id,
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
-        "parent_task_id": request.backlog_id,
+        "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "role": "mf_sub",
         "allocation_owner": context.allocation_owner or context.agent_id,
@@ -1884,6 +1889,7 @@ def _dogfood_host_adapter_startup_evidence(
         "project_id": request.project_id,
         "backlog_id": request.backlog_id,
         "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
         "attempt_num": context.attempt,
         "correlation_id": f"host-adapter-startup-{adapter_suffix}",
         "payload": {
@@ -2110,6 +2116,90 @@ def _runtime_text_graph_first_obligations(
     }
 
 
+def _runtime_text_self_contract_lookup(
+    *,
+    project_id: str,
+    task_id: str,
+    parent_task_id: str,
+    fence_token: str,
+    runtime_context_id: str = "",
+    governance_project_id: str = "",
+    target_project_id: str = "",
+    target_project_root: str = "",
+) -> dict[str, Any]:
+    governance_id = governance_project_id or project_id
+    target_id = target_project_id or project_id
+    task_route = (
+        f"/api/graph-governance/{governance_id}/parallel-branches/"
+        f"{task_id}/runtime-contract"
+    )
+    context_route = (
+        f"/api/graph-governance/{governance_id}/parallel-branches/"
+        f"runtime-contexts/{runtime_context_id}/runtime-contract"
+        if runtime_context_id
+        else ""
+    )
+    required_query_fields = [
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+    ]
+    if runtime_context_id:
+        required_query_fields.append("runtime_context_id")
+    return {
+        "schema_version": "mf_subagent_self_contract_lookup.v1",
+        "required": True,
+        "must_query_before": [
+            "graph_query",
+            "startup",
+            "implementation",
+            "verification",
+            "close_ready",
+        ],
+        "source_of_truth": "runtime_contract_service",
+        "supported_endpoints": {
+            "by_task_id": task_route,
+            "by_runtime_context_id": context_route,
+        },
+        "required_query_fields": required_query_fields,
+        "query_identity": {
+            "project_id": target_id,
+            "governance_project_id": governance_id,
+            "target_project_id": target_id,
+            "target_project_root": target_project_root,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "fence_token": fence_token,
+            "runtime_context_id": runtime_context_id,
+        },
+        "query_examples": {
+            "by_task_id": {
+                "method": "GET",
+                "path": task_route,
+                "query": {
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": fence_token,
+                },
+            },
+            "by_runtime_context_id": {
+                "method": "GET",
+                "path": context_route,
+                "query": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": fence_token,
+                },
+            },
+        },
+    }
+
+
 def _runtime_text_finish_gate_contract(context: Any) -> dict[str, Any]:
     return {
         "schema_version": "mf_subagent_finish_gate_contract.v1",
@@ -2202,6 +2292,14 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "evidence can satisfy close-sensitive gates, record an "
         "mf_subagent_read_receipt for this visible route contract. A post-hoc "
         "read receipt after counted evidence does not satisfy the ordering gate.\n\n"
+        "Before graph query, startup, or implementation, query your own runtime "
+        "contract from the runtime contract service. Use either "
+        "`/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract` "
+        "or `/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/"
+        "{runtime_context_id}/runtime-contract` when runtime_context_id is available. "
+        "Every lookup must carry task_id, parent_task_id, worker_role=mf_sub, "
+        "fence_token, and runtime_context_id when available. Echo parent_task_id "
+        "in mf_subagent_read_receipt and mf_subagent_startup evidence.\n\n"
         "Before handing off review_ready, run the local task precheck when "
         "available, normally `python -m agent.cli mf precommit-check --json-output` "
         "from the assigned worktree. Include the precheck command, exit code, "
@@ -2414,6 +2512,16 @@ def build_observer_runtime_text_context(
         parent_task_id=parent_task_id,
         fence_token=context.fence_token,
     )
+    self_contract_lookup = _runtime_text_self_contract_lookup(
+        project_id=request.project_id,
+        governance_project_id=context.governance_project_id or request.project_id,
+        target_project_id=context.target_project_id or request.project_id,
+        target_project_root=context.target_project_root,
+        task_id=context.task_id,
+        parent_task_id=parent_task_id,
+        fence_token=context.fence_token,
+        runtime_context_id=runtime_context_id,
+    )
     finish_gate_contract = _runtime_text_finish_gate_contract(context)
     first_progress_contract = _runtime_text_first_progress_contract(context)
     launch_payload = {
@@ -2421,6 +2529,10 @@ def build_observer_runtime_text_context(
         "runtime_context_id": runtime_context_id,
         "runtime_context": asdict(context),
         "branch_identity": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
             "branch_ref": context.branch_ref,
             "worktree_path": context.worktree_path,
             "base_commit": context.base_commit,
@@ -2430,6 +2542,7 @@ def build_observer_runtime_text_context(
         },
         "dispatch_gate": dispatch_gate,
         "mf_subagent_input": mf_subagent_input,
+        "self_contract_lookup": self_contract_lookup,
         "startup_echo_contract": startup_echo_contract,
         "graph_first_obligations": graph_first_obligations,
         "first_progress_contract": first_progress_contract,
@@ -2533,6 +2646,7 @@ def build_observer_runtime_text_context(
         "dispatch_gate_validation": dispatch_gate_validation,
         "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,
+        "self_contract_lookup": self_contract_lookup,
         "startup_echo_contract": startup_echo_contract,
         "graph_first_obligations": graph_first_obligations,
         "first_progress_contract": first_progress_contract,

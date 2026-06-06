@@ -3864,6 +3864,8 @@ def build_mf_subagent_input(
     """Build the stable input payload for a branch-isolated MF subagent."""
 
     _require_context(context)
+    parent_task_id = _parent_task_id_for_contract_view(context)
+    runtime_context_id = mf_subagent_runtime_context_id(context)
     child_route_prompt_contract = _child_route_prompt_contract(
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
@@ -3906,6 +3908,18 @@ def build_mf_subagent_input(
             "target_head_commit": context.target_head_commit,
         },
         "runtime_identity": {
+            "required_fields": [
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "fence_token",
+            ],
+            "runtime_context_id": runtime_context_id,
+            "project_id": context.project_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": context.backlog_id,
+            "worker_role": MF_SUB_ROLE,
             "agent_id": context.agent_id,
             "worker_id": context.worker_id,
             "worker_slot_id": context.worker_slot_id or context.worker_id,

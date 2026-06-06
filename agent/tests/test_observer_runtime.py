@@ -232,6 +232,39 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert prepared["runtime_context"]["base_commit"] == "base-a1"
     assert prepared["runtime_context"]["target_head_commit"] == "target-a1"
     assert prepared["runtime_context"]["merge_queue_id"] == "mq-runtime-text-a1"
+    assert prepared["branch_identity"]["runtime_context_id"] == "mfrctx-runtime-text-a1"
+    assert prepared["branch_identity"]["task_id"] == "task-a1"
+    assert prepared["branch_identity"]["parent_task_id"] == "AC-RUNTIME-TEXT-A1"
+    assert prepared["branch_identity"]["worker_role"] == "mf_sub"
+    assert prepared["mf_subagent_input"]["runtime_identity"]["parent_task_id"] == (
+        "AC-RUNTIME-TEXT-A1"
+    )
+    self_lookup = prepared["self_contract_lookup"]
+    assert self_lookup["required"] is True
+    assert self_lookup["query_identity"] == {
+        "project_id": "aming-claw",
+        "governance_project_id": "aming-claw",
+        "target_project_id": "aming-claw",
+        "target_project_root": "",
+        "task_id": "task-a1",
+        "parent_task_id": "AC-RUNTIME-TEXT-A1",
+        "worker_role": "mf_sub",
+        "fence_token": "fence-runtime-text-a1",
+        "runtime_context_id": "mfrctx-runtime-text-a1",
+    }
+    assert set(self_lookup["required_query_fields"]) == {
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+        "runtime_context_id",
+    }
+    assert "{task_id}/runtime-contract" in prepared["launch_text"]
+    assert "runtime-contexts/{runtime_context_id}/runtime-contract" in prepared[
+        "launch_text"
+    ]
+    assert "parent_task_id" in prepared["launch_text"]
+    assert "Echo parent_task_id in mf_subagent_read_receipt" in prepared["launch_text"]
     assert prepared["branch_runtime_evidence"]["status"] == STATE_WORKTREE_READY
     assert prepared["branch_runtime_evidence"]["registered"] is True
     assert prepared["dispatch_gate_validation"]["allowed"] is True
@@ -293,6 +326,16 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert startup_status["implementation_evidence_recorded"] is False
     assert blocker["implementation_evidence_recorded"] is False
     assert blocker["close_ready"] is False
+    assert result["read_receipt"]["parent_task_id"] == (
+        "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
+    )
+    assert result["read_receipt"]["worker_role"] == "mf_sub"
+    assert result["startup_recording"]["parent_task_id"] == (
+        "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
+    )
+    assert result["startup_timeline_event"]["parent_task_id"] == (
+        "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
+    )
 
     assert len(recorded_events) == 1
     project_id, event = recorded_events[0]

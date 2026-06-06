@@ -1978,7 +1978,7 @@ def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
 
 def test_build_input_carries_branch_runtime_identity() -> None:
     payload = build_mf_subagent_input(
-        _context(),
+        _context(root_task_id="task-mf-parent"),
         prompt="Implement the isolated change.",
         acceptance_criteria=["tests pass"],
         target_files=["agent/governance/mf_subagent_contract.py"],
@@ -1993,6 +1993,16 @@ def test_build_input_carries_branch_runtime_identity() -> None:
     assert payload["project_id"] == "aming-claw"
     assert payload["backlog_id"] == "ARCH-MF-SUBAGENT-BACKEND"
     assert payload["branch"]["worktree_path"] == "/tmp/aming-claw-wt/task-mf-sub-1"
+    assert payload["runtime_identity"]["required_fields"] == [
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+    ]
+    assert payload["runtime_identity"]["runtime_context_id"].startswith("mfrctx-")
+    assert payload["runtime_identity"]["task_id"] == "task-mf-sub-1"
+    assert payload["runtime_identity"]["parent_task_id"] == "task-mf-parent"
+    assert payload["runtime_identity"]["worker_role"] == MF_SUB_ROLE
     assert payload["runtime_identity"]["fence_token"] == "fence-2"
     assert payload["runtime_identity"]["depends_on"] == ["task-foundation"]
     assert payload["work"]["acceptance_criteria"] == ["tests pass"]
