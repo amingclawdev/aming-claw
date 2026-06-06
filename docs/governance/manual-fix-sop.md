@@ -249,6 +249,11 @@ matching persisted allocation row, MUST return `status=allocation_required`,
 `dispatch_gate_validation.allowed=false`, and
 `persistent_evidence.dispatch_ready=false`; this output is not governed dispatch
 evidence.
+`dispatch_graph_obligation` and prelaunch graph context in the generated
+runtime text are dispatch-time instructions only. They MUST NOT count as
+worker-owned finish graph trace evidence, because they are produced before the
+worker has acknowledged the prompt, started in the assigned worktree, resolved
+its runtime contract, or run any audited graph query itself.
 Generated worker prompts may contain bounded route identity, file fences,
 runtime identity, graph-first obligations, and finish-gate contracts only. Raw
 private route/context-pack content must stay outside generated prompts and
@@ -503,7 +508,11 @@ integration/build/E2E evidence after combining branches or worktree changes.
 For governed subagent graph evidence, trace ids alone are insufficient:
 `mf_subagent_graph_trace.v1` must explicitly record `query_source=mf_subagent`
 and matching `task_id`, `parent_task_id`, `worker_role=mf_sub`, and
-`fence_token` inside the graph trace evidence.
+`fence_token` inside the graph trace evidence. Finish or `review_ready` still
+requires worker-owned `mf_subagent_graph_trace.v1` captured after read receipt,
+actual startup, runtime contract lookup, and `graph_query` calls with
+`query_source=mf_subagent` and
+`query_purpose=subagent_gate_validation`.
 The close gate checks the instantiated contract, not just the generic
 `verification` event.
 
