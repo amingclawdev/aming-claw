@@ -428,6 +428,19 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
     assert worker_view["schema_version"] == "runtime_context.worker_view.v1"
     assert worker_view["gate_inputs"]["status"] == "ready"
     assert worker_view["close_gate_view"]["ready"] is True
+    assert worker_view["route_context_hash"] == "sha256:route-runtime-context"
+    assert worker_view["prompt_contract_id"] == "rprompt-runtime-context"
+    assert worker_view["prompt_contract_hash"] == "sha256:prompt-runtime-context"
+    assert worker_view["visible_injection_manifest_hash"] == (
+        "sha256:visible-runtime-context"
+    )
+    assert worker_view["target_files"] == ["agent/governance/mf_subagent_contract.py"]
+    assert worker_view["gate_inputs"]["route_context_hash"] == (
+        "sha256:route-runtime-context"
+    )
+    assert worker_view["gate_inputs"]["target_files"] == [
+        "agent/governance/mf_subagent_contract.py"
+    ]
     assert validation["ok"] is True
     assert validation["missing"] == []
     assert worker_view_only["runtime_context_id"] == worker_view["runtime_context_id"]

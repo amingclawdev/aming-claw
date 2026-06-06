@@ -19440,6 +19440,111 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
     )
 
 
+def _observer_runtime_text_contract_revision_payload(
+    body: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+) -> dict[str, Any]:
+    owned_files = _runtime_context_service_query_values(
+        body,
+        "owned_files",
+        "target_files",
+    )
+    return {
+        "schema_version": "observer_runtime_text_contract_revision.v1",
+        "source": "observer_runtime_text_prepare",
+        "source_of_truth": "Contract/Revision/Event",
+        "runtime_context_id": str(prepared.get("runtime_context_id") or ""),
+        "target_files": owned_files,
+        "owned_files": owned_files,
+        "acceptance_criteria": _runtime_context_service_query_values(
+            body,
+            "acceptance_criteria",
+            "acceptance",
+        ),
+        "test_commands": _runtime_context_service_query_values(
+            body,
+            "test_commands",
+            "test_command",
+        ),
+        "launch_text_hash": str(prepared.get("launch_text_hash") or ""),
+        "raw_launch_text_persisted": False,
+        "startup_intent_event_generated": bool(
+            (prepared.get("persistent_evidence") or {}).get(
+                "startup_intent_event_generated"
+            )
+            if isinstance(prepared.get("persistent_evidence"), Mapping)
+            else False
+        ),
+    }
+
+
+def _persist_observer_runtime_text_contract_revision(
+    project_id: str,
+    body: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not prepared.get("ok"):
+        return {}
+    runtime_context_id = str(prepared.get("runtime_context_id") or "").strip()
+    if not runtime_context_id:
+        return {}
+
+    from .parallel_branch_runtime import (
+        append_branch_contract_revision,
+        branch_contract_revision_to_dict,
+        get_branch_context_by_runtime_context_id,
+    )
+
+    conn = get_connection(project_id)
+    try:
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        if context is None:
+            raise GovernanceError(
+                "runtime_context_not_found",
+                f"branch runtime context not found: {project_id}/{runtime_context_id}",
+                404,
+                {"runtime_context_id": runtime_context_id},
+            )
+        route_identity = (
+            prepared.get("route_identity")
+            if isinstance(prepared.get("route_identity"), Mapping)
+            else _parallel_branch_runtime_contract_route_identity(body)
+        )
+        route_gate = {
+            "schema_version": "observer_runtime_text_route_gate.v1",
+            "source": "observer_runtime_text_prepare",
+            "decision": "prepared",
+            "caller_role": "observer",
+            "allowed_action": "observer_runtime_text_prepare",
+            **(
+                dict(route_identity)
+                if isinstance(route_identity, Mapping)
+                else {}
+            ),
+            "raw_private_context_exposed": False,
+        }
+        with sqlite_write_lock():
+            revision = append_branch_contract_revision(
+                conn,
+                context,
+                contract_version=str(body.get("contract_version") or "mf_parallel.v1"),
+                payload=_observer_runtime_text_contract_revision_payload(body, prepared),
+                route_gate=route_gate,
+                route_identity=route_identity if isinstance(route_identity, Mapping) else {},
+                route_evidence_type="observer_runtime_text_prepare",
+                actor="observer_runtime_text_prepare",
+                now_iso=str(body.get("now_iso") or ""),
+            )
+            conn.commit()
+        return branch_contract_revision_to_dict(revision)
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/projects/{project_id}/observer/runtime-text/prepare")
 def handle_observer_runtime_text_prepare(ctx: RequestContext):
     """Prepare host/Codex mf_sub launch text plus startup intent packet."""
@@ -19512,7 +19617,20 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
             body.get("visible_injection_manifest_hash") or ""
         ),
     )
-    return build_observer_runtime_text_context(request)
+    prepared = build_observer_runtime_text_context(request)
+    revision = _persist_observer_runtime_text_contract_revision(
+        project_id,
+        body,
+        prepared,
+    )
+    if revision:
+        prepared["runtime_contract_revision"] = revision
+        prepared["persistent_evidence"] = {
+            **dict(prepared.get("persistent_evidence") or {}),
+            "contract_revision_id": revision.get("revision_id", ""),
+            "contract_revision_persisted": True,
+        }
+    return prepared
 
 
 @route("POST", "/api/task/{project_id}/progress")

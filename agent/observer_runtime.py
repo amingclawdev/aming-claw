@@ -1811,6 +1811,8 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
         branch_runtime_evidence,
         runtime_context_id,
     )
+    if packet.get("allocation_required"):
+        return packet
     if _runtime_text_packet_registered(packet):
         return packet
 
@@ -2643,6 +2645,28 @@ def _runtime_text_self_contract_lookup(
                     "fence_token": fence_token,
                 },
             },
+        },
+        "cli_examples": {
+            "current_state_by_runtime_context_id": [
+                "python",
+                "-m",
+                "agent.cli",
+                "runtime-context",
+                "current",
+                "--project-id",
+                governance_id,
+                "--runtime-context-id",
+                runtime_context_id,
+                "--parent-task-id",
+                parent_task_id,
+                "--fence-token",
+                fence_token,
+                "--view",
+                "worker_view",
+                "--json-output",
+            ]
+            if runtime_context_id
+            else [],
         },
     }
 

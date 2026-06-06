@@ -259,10 +259,31 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         "fence_token",
         "runtime_context_id",
     }
+    cli_example = self_lookup["cli_examples"]["current_state_by_runtime_context_id"]
+    assert cli_example == [
+        "python",
+        "-m",
+        "agent.cli",
+        "runtime-context",
+        "current",
+        "--project-id",
+        "aming-claw",
+        "--runtime-context-id",
+        "mfrctx-runtime-text-a1",
+        "--parent-task-id",
+        "AC-RUNTIME-TEXT-A1",
+        "--fence-token",
+        "fence-runtime-text-a1",
+        "--view",
+        "worker_view",
+        "--json-output",
+    ]
+    assert "--role" not in cli_example
     assert "{task_id}/runtime-contract" in prepared["launch_text"]
     assert "runtime-contexts/{runtime_context_id}/runtime-contract" in prepared[
         "launch_text"
     ]
+    assert "--role" not in prepared["launch_text"]
     assert "parent_task_id" in prepared["launch_text"]
     assert "Echo parent_task_id in mf_subagent_read_receipt" in prepared["launch_text"]
     assert prepared["branch_runtime_evidence"]["status"] == STATE_WORKTREE_READY

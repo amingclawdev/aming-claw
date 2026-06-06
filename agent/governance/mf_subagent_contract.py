@@ -972,6 +972,16 @@ def build_mf_subagent_runtime_contract_view(
         "contract": contract,
         "agent_task_contract": agent_task_contract,
         "route_identity": route_identity_safe,
+        "route_id": route_identity_safe.get("route_id", ""),
+        "route_context_hash": route_identity_safe.get("route_context_hash", ""),
+        "prompt_contract_id": route_identity_safe.get("prompt_contract_id", ""),
+        "prompt_contract_hash": route_identity_safe.get("prompt_contract_hash", ""),
+        "visible_injection_manifest_hash": route_identity_safe.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "target_files": list(agent_task_contract.get("target_files") or []),
+        "owned_files": list(agent_task_contract.get("target_files") or []),
         "verification_route_policy": verification_route_policy_from_contract(
             {
                 **latest_revision_payload,

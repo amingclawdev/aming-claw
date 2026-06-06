@@ -1417,6 +1417,66 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert evidence["registered"] is True
     assert evidence["registration_ref"].endswith("/parallel-branches/allocate")
     assert evidence["registration_source"] == "persisted_branch_runtime_context"
+    revision = prepared["runtime_contract_revision"]
+    assert revision["route_identity"]["route_context_hash"] == "sha256:route-api"
+    assert revision["route_identity"]["prompt_contract_id"] == "rprompt-api"
+    assert revision["route_identity"]["prompt_contract_hash"] == "sha256:prompt-api"
+    assert revision["route_identity"]["visible_injection_manifest_hash"] == (
+        "sha256:visible-api"
+    )
+    assert revision["payload"]["target_files"] == ["agent/observer_runtime.py"]
+    assert prepared["persistent_evidence"]["contract_revision_persisted"] is True
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+    views = current_state["runtime_context_service"]["views"]
+    current = views["current"]
+    gate_inputs = views["gate_inputs"]
+    worker_view = views["worker_view"]
+    assert current["route_identity"]["route_context_hash"] == "sha256:route-api"
+    assert current["route_identity"]["prompt_contract_id"] == "rprompt-api"
+    assert current["route_identity"]["prompt_contract_hash"] == "sha256:prompt-api"
+    assert current["route_identity"]["visible_injection_manifest_hash"] == (
+        "sha256:visible-api"
+    )
+    assert current["work"]["target_files"] == ["agent/observer_runtime.py"]
+    assert gate_inputs["route_context_hash"] == "sha256:route-api"
+    assert gate_inputs["prompt_contract_id"] == "rprompt-api"
+    assert gate_inputs["prompt_contract_hash"] == "sha256:prompt-api"
+    assert gate_inputs["visible_injection_manifest_hash"] == "sha256:visible-api"
+    assert gate_inputs["target_files"] == ["agent/observer_runtime.py"]
+    assert worker_view["route_context_hash"] == "sha256:route-api"
+    assert worker_view["prompt_contract_id"] == "rprompt-api"
+    assert worker_view["prompt_contract_hash"] == "sha256:prompt-api"
+    assert worker_view["visible_injection_manifest_hash"] == "sha256:visible-api"
+    assert worker_view["target_files"] == ["agent/observer_runtime.py"]
+
+    contract = server.handle_graph_governance_parallel_branch_runtime_contract_by_context(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": context["root_task_id"],
+                "fence_token": context["fence_token"],
+            },
+        )
+    )["runtime_contract"]
+    assert contract["route_context_hash"] == "sha256:route-api"
+    assert contract["prompt_contract_id"] == "rprompt-api"
+    assert contract["prompt_contract_hash"] == "sha256:prompt-api"
+    assert contract["visible_injection_manifest_hash"] == "sha256:visible-api"
+    assert contract["target_files"] == ["agent/observer_runtime.py"]
 
 
 def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(conn, tmp_path):

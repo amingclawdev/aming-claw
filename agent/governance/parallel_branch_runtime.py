@@ -1978,6 +1978,16 @@ def build_runtime_context_gate_inputs_view(
             current_view.get("runtime_context_id")
         ),
         "task_id": values.get("task_id", ""),
+        "route_id": values.get("route_id", ""),
+        "route_context_hash": values.get("route_context_hash", ""),
+        "prompt_contract_id": values.get("prompt_contract_id", ""),
+        "prompt_contract_hash": values.get("prompt_contract_hash", ""),
+        "visible_injection_manifest_hash": values.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "target_files": list(values.get("target_files") or []),
+        "owned_files": list(values.get("target_files") or []),
         "generated_at": current_view.get("generated_at", ""),
         "gates": gates,
         "missing": all_missing,
@@ -2233,6 +2243,16 @@ def build_runtime_context_worker_view(
         "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
         "role": RUNTIME_CONTEXT_WORKER_ROLE,
         "runtime_context_id": current_view.get("runtime_context_id", ""),
+        "route_id": values.get("route_id", ""),
+        "route_context_hash": values.get("route_context_hash", ""),
+        "prompt_contract_id": values.get("prompt_contract_id", ""),
+        "prompt_contract_hash": values.get("prompt_contract_hash", ""),
+        "visible_injection_manifest_hash": values.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "target_files": list(values.get("target_files") or []),
+        "owned_files": list(values.get("target_files") or []),
         "task": {
             key: values.get(key, "")
             for key in (
