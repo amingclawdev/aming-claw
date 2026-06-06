@@ -2314,12 +2314,16 @@ def _runtime_text_startup_intent_event(
         "status": "planned",
         "close_satisfying": False,
         "actual_startup_required": True,
+        "observer_command_id": observer_command_id,
         "payload": {
             "mf_subagent_startup_intent": startup_intent,
+            "observer_command_id": observer_command_id,
+            "runtime_context_id": runtime_context_id,
             "graph_trace_ids": list(graph_trace_ids),
         },
         "artifact_refs": {
             "runtime_context_id": runtime_context_id,
+            "observer_command_id": observer_command_id,
             "launch_text_hash": launch_text_hash,
         },
     }

@@ -149,6 +149,10 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert startup_event["status"] == "planned"
     assert startup_event["close_satisfying"] is False
     assert startup_event["actual_startup_required"] is True
+    assert startup_event["observer_command_id"] == "cmd-runtime-text"
+    assert startup_event["payload"]["observer_command_id"] == "cmd-runtime-text"
+    assert startup_event["payload"]["runtime_context_id"] == result["runtime_context_id"]
+    assert startup_event["artifact_refs"]["observer_command_id"] == "cmd-runtime-text"
     startup_intent = startup_event["payload"]["mf_subagent_startup_intent"]
     assert startup_intent["schema_version"] == "mf_subagent_startup_intent.v1"
     assert startup_intent["runtime_context_id"] == result["runtime_context_id"]
