@@ -4167,6 +4167,11 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
     body["task_id"] = context.task_id
     body["parent_task_id"] = parent_task_id or context.root_task_id or context.task_id
+    from .parallel_branch_runtime import runtime_context_id_for_branch_context
+
+    body["runtime_context_id"] = runtime_context_id_for_branch_context(context)
+    body["worker_role"] = "mf_sub"
+    body["fence_token"] = fence_token
     body["governance_project_id"] = context.governance_project_id or context.project_id
     body["target_project_id"] = context.target_project_id or ctx.get_project_id()
     if context.target_project_root and not body.get("target_project_root"):
@@ -4969,29 +4974,66 @@ def _runtime_context_service_timeline_refs(
     startup_event: dict[str, Any] = {}
     finish_event: dict[str, Any] = {}
     close_event: dict[str, Any] = {}
+    timeline_graph_trace_ids: list[str] = []
     for event in events:
         event_type = str(event.get("event_type") or "")
         event_kind = str(event.get("event_kind") or "")
         phase = str(event.get("phase") or "")
-        haystack = " ".join((event_type, event_kind, phase))
+        event_type_normalized = event_type.strip().lower().replace("-", "_")
+        event_kind_normalized = event_kind.strip().lower().replace("-", "_")
+        phase_normalized = phase.strip().lower().replace("-", "_")
+        haystack = " ".join(
+            (event_type_normalized, event_kind_normalized, phase_normalized)
+        )
         ref = _runtime_context_event_ref(event)
         if not ref:
             continue
-        if not refs.get("startup_event_ref") and "startup" in haystack:
+        is_read_receipt = "read_receipt" in haystack
+        is_startup = (
+            event_kind_normalized == "mf_subagent_startup"
+            or event_type_normalized == "mf_subagent.startup"
+        )
+        if is_startup:
             refs["startup_event_ref"] = ref
             startup_event = dict(event)
-        if not refs.get("read_receipt_event_ref") and "read_receipt" in haystack:
+        elif (
+            not refs.get("startup_event_ref")
+            and "startup" in haystack
+            and not is_read_receipt
+        ):
+            refs["startup_event_ref"] = ref
+            startup_event = dict(event)
+        if not refs.get("read_receipt_event_ref") and is_read_receipt:
             refs["read_receipt_event_ref"] = ref
         if not refs.get("finish_event_ref") and "finish" in haystack:
             refs["finish_event_ref"] = ref
             finish_event = dict(event)
-        if not refs.get("close_ready_event_ref") and event_kind == "close_ready":
+        if (
+            not refs.get("close_ready_event_ref")
+            and event_kind_normalized == "close_ready"
+        ):
             refs["close_ready_event_ref"] = ref
             close_event = dict(event)
-        if event_kind == "implementation":
+        if event_kind_normalized == "implementation":
             refs["implementation_event_refs"].append(ref)
-        if event_kind in {"verification", "qa_verification"} or phase == "verification":
+        is_verification = (
+            event_kind_normalized in {"verification", "qa_verification"}
+            or phase_normalized == "verification"
+        )
+        if is_verification:
             refs["verification_event_refs"].append(ref)
+        if (
+            is_verification
+            or "finish" in haystack
+            or event_kind_normalized == "close_ready"
+        ):
+            timeline_graph_trace_ids.extend(
+                _runtime_context_service_graph_trace_values_from_event(event)
+            )
+    if timeline_graph_trace_ids:
+        refs["graph_trace_ids"] = _runtime_context_service_dedupe(
+            timeline_graph_trace_ids
+        )
     return (
         refs,
         _runtime_context_event_payload(startup_event),
@@ -5006,6 +5048,9 @@ def _runtime_context_service_graph_trace_refs(
     project_id: str,
     runtime_context_id: str,
     task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+    fence_token: str,
     explicit_trace_ids: list[str],
 ) -> dict[str, Any]:
     trace_ids: list[str] = []
@@ -5019,17 +5064,39 @@ def _runtime_context_service_graph_trace_refs(
         rows = conn.execute(
             """
             SELECT trace_id, query_source, query_purpose, worker_role,
-                   parent_task_id, task_id, runtime_context_id
+                   parent_task_id, task_id, runtime_context_id, run_id,
+                   fence_token
             FROM graph_query_traces
             WHERE project_id = ?
               AND (
                 runtime_context_id = ?
-                OR (runtime_context_id = '' AND task_id = ?)
+                OR task_id = ?
+                OR (
+                  query_source = 'mf_subagent'
+                  AND parent_task_id IN (?, ?)
+                  AND (
+                    task_id = ?
+                    OR runtime_context_id = ?
+                    OR worker_role = 'mf_sub'
+                    OR fence_token = ?
+                    OR run_id LIKE ?
+                  )
+                )
               )
             ORDER BY created_at DESC, trace_id DESC
             LIMIT 20
             """,
-            (project_id, runtime_context_id, task_id),
+            (
+                project_id,
+                runtime_context_id,
+                task_id,
+                parent_task_id,
+                backlog_id,
+                task_id,
+                runtime_context_id,
+                fence_token,
+                f"mf_subagent:{task_id}:fence:%",
+            ),
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
@@ -5044,12 +5111,25 @@ def _runtime_context_service_graph_trace_refs(
         "trace_ids": trace_ids,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
         "query_source": "mf_subagent" if trace_ids else "",
         "worker_role": "mf_sub" if trace_ids else "",
+        "source_details": {
+            "graph_query_traces": bool(rows),
+            "timeline_payload": bool(explicit_trace_ids),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": backlog_id,
+        },
     }
 
 
-def _runtime_context_service_query_values(source: Mapping[str, Any], *keys: str) -> list[str]:
+def _runtime_context_service_query_values(
+    source: Mapping[str, Any],
+    *keys: str,
+) -> list[str]:
     values: list[str] = []
     for key in keys:
         raw = source.get(key)
@@ -5069,6 +5149,48 @@ def _runtime_context_service_query_values(source: Mapping[str, Any], *keys: str)
             seen.add(value)
             result.append(value)
     return result
+
+
+def _runtime_context_service_dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _runtime_context_service_graph_trace_values_from_event(
+    event: Mapping[str, Any],
+) -> list[str]:
+    trace_keys = {
+        "graph_trace_id",
+        "graph_trace_ids",
+        "graph_query_trace_id",
+        "graph_query_trace_ids",
+        "query_trace_id",
+        "query_trace_ids",
+        "trace_ids",
+    }
+    values: list[str] = []
+
+    def collect(source: object) -> None:
+        if isinstance(source, Mapping):
+            for key, value in source.items():
+                if str(key).strip().lower() in trace_keys:
+                    values.extend(
+                        _runtime_context_service_query_values({key: value}, key)
+                    )
+                collect(value)
+        elif isinstance(source, (list, tuple, set)):
+            for item in source:
+                collect(item)
+
+    for key in ("payload", "verification", "artifact_refs"):
+        collect(event.get(key))
+    return _runtime_context_service_dedupe(values)
 
 
 def _runtime_context_projection_response(
@@ -5116,11 +5238,30 @@ def _runtime_context_projection_response(
         "trace_ids",
         "graph_trace_id",
     )
+    explicit_trace_ids = _runtime_context_service_dedupe(
+        explicit_trace_ids
+        + _runtime_context_service_query_values(
+            timeline_refs,
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+            "trace_ids",
+            "graph_trace_id",
+        )
+    )
     graph_trace_refs = _runtime_context_service_graph_trace_refs(
         conn,
         project_id=context_project_id,
         runtime_context_id=runtime_context_id,
         task_id=str(getattr(context, "task_id", "") or ""),
+        parent_task_id=str(
+            getattr(context, "root_task_id", "")
+            or getattr(context, "chain_id", "")
+            or getattr(context, "stage_task_id", "")
+            or getattr(context, "task_id", "")
+            or ""
+        ),
+        backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        fence_token=str(getattr(context, "fence_token", "") or ""),
         explicit_trace_ids=explicit_trace_ids,
     )
     projection = build_mf_subagent_runtime_context_projection(
@@ -9981,6 +10122,10 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                     query_purpose=str(body.get("query_purpose") or "api_debug"),
                     run_id=str(body.get("run_id") or ""),
                     parent_task_id=str(body.get("parent_task_id") or ""),
+                    runtime_context_id=str(body.get("runtime_context_id") or ""),
+                    task_id=str(body.get("task_id") or ""),
+                    worker_role=str(body.get("worker_role") or ""),
+                    fence_token=str(body.get("fence_token") or ""),
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     trace_id=body.get("trace_id") or None,
                 )
@@ -10029,6 +10174,10 @@ def handle_graph_governance_query(ctx: RequestContext):
                     query_purpose=str(body.get("query_purpose") or "api_debug"),
                     run_id=str(body.get("run_id") or ""),
                     parent_task_id=str(body.get("parent_task_id") or ""),
+                    runtime_context_id=str(body.get("runtime_context_id") or ""),
+                    task_id=str(body.get("task_id") or ""),
+                    worker_role=str(body.get("worker_role") or ""),
+                    fence_token=str(body.get("fence_token") or ""),
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     project_root=root,
                 )

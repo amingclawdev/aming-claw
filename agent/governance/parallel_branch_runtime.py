@@ -1351,25 +1351,39 @@ def _runtime_context_graph_trace_refs(
         ):
             trace_values.extend(_runtime_context_string_list(source.get(key)))
         query_source = _runtime_context_text(source.get("query_source"))
-        worker_role = _runtime_context_text(source.get("worker_role") or source.get("role"))
+        worker_role = _runtime_context_text(
+            source.get("worker_role") or source.get("role")
+        )
         parent_task_id = _runtime_context_text(source.get("parent_task_id"))
         task_id = _runtime_context_text(source.get("task_id"))
+        runtime_context_id = _runtime_context_text(source.get("runtime_context_id"))
+        backlog_id = _runtime_context_text(source.get("backlog_id"))
+        source_details = public_contract_revision_payload(source.get("source_details"))
     else:
         trace_values = _runtime_context_string_list(graph_trace_refs)
         query_source = ""
         worker_role = ""
         parent_task_id = ""
         task_id = ""
+        runtime_context_id = ""
+        backlog_id = ""
+        source_details = {}
     trace_ids = _runtime_context_dedupe(trace_values)
     return {
         "producer": "graph_query_trace",
-        "source": "graph_query_trace_refs",
+        "source": _runtime_context_text(
+            source.get("source") if isinstance(graph_trace_refs, Mapping) else ""
+        )
+        or "graph_query_trace_refs",
         "query_source": query_source,
         "worker_role": worker_role,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "backlog_id": backlog_id,
         "trace_ids": trace_ids,
         "present": bool(trace_ids),
+        "source_details": source_details,
     }
 
 
@@ -1437,6 +1451,7 @@ def _runtime_context_current_values(
     acceptance_criteria: Sequence[str],
     startup_gate: Mapping[str, Any],
     finish_gate: Mapping[str, Any],
+    close_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     parent_task_id = _runtime_context_parent_task_id(context)
     checkpoint_id = context.checkpoint_id or _runtime_context_text(
@@ -1504,7 +1519,11 @@ def _runtime_context_current_values(
         "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
         "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
         "finish_event_ref": timeline_refs.get("finish_event_ref", ""),
-        "close_ready_event_ref": timeline_refs.get("close_ready_event_ref", ""),
+        "close_ready_event_ref": _runtime_context_text(
+            timeline_refs.get("close_ready_event_ref")
+            or close_evidence.get("event_id")
+            or close_evidence.get("source_ref")
+        ),
         "verification_event_refs": verification_event_refs,
         "startup_gate_ref": _runtime_context_text(
             startup_gate.get("event_id")
@@ -1949,6 +1968,31 @@ def build_runtime_context_gate_inputs_view(
     """Build gate-by-gate current values and missing-field diagnostics."""
 
     values = _runtime_context_mapping(current_view.get("current_values"))
+    current_evidence_refs = _runtime_context_mapping(current_view.get("evidence_refs"))
+    evidence_refs = {
+        "branch_runtime": _runtime_context_mapping(
+            current_evidence_refs.get("branch_runtime")
+        ),
+        "route_identity": _runtime_context_mapping(
+            current_evidence_refs.get("route_identity")
+        ),
+        "timeline": _runtime_context_mapping(current_view.get("timeline_refs")),
+        "graph_trace": _runtime_context_mapping(current_view.get("graph_trace_refs")),
+        "finish_gate": {
+            "producer": "task_timeline",
+            "source": "task_timeline.finish_gate",
+            "payload": public_contract_revision_payload(
+                current_view.get("finish_gate") or {}
+            ),
+        },
+        "close_evidence": {
+            "producer": "task_timeline",
+            "source": "task_timeline.close_ready",
+            "payload": public_contract_revision_payload(
+                current_view.get("close_evidence") or {}
+            ),
+        },
+    }
     gates: dict[str, Any] = {}
     all_missing: list[dict[str, Any]] = []
     for gate, requirements in _RUNTIME_CONTEXT_GATE_REQUIREMENTS.items():
@@ -1989,6 +2033,7 @@ def build_runtime_context_gate_inputs_view(
         "target_files": list(values.get("target_files") or []),
         "owned_files": list(values.get("target_files") or []),
         "generated_at": current_view.get("generated_at", ""),
+        "evidence_refs": evidence_refs,
         "gates": gates,
         "missing": all_missing,
         "status": "ready" if not all_missing else "missing_required_fields",
@@ -2049,6 +2094,7 @@ def build_runtime_context_current_view(
     )
     startup = public_contract_revision_payload(startup_gate or {})
     finish = public_contract_revision_payload(finish_gate or {})
+    close = public_contract_revision_payload(close_evidence or {})
     current_values = _runtime_context_current_values(
         context,
         runtime_context_id=runtime_context_id,
@@ -2059,6 +2105,7 @@ def build_runtime_context_current_view(
         acceptance_criteria=acceptance_values,
         startup_gate=startup,
         finish_gate=finish,
+        close_evidence=close,
     )
     evidence_refs = _runtime_context_evidence_refs(
         context,
@@ -2128,7 +2175,7 @@ def build_runtime_context_current_view(
         "graph_trace_refs": graph_trace,
         "startup_gate": startup,
         "finish_gate": finish,
-        "close_evidence": public_contract_revision_payload(close_evidence or {}),
+        "close_evidence": close,
         "contract_revision": _runtime_context_contract_revision_ref(contract_revision),
         "evidence_refs": evidence_refs,
         "current_values": current_values,
@@ -2165,6 +2212,7 @@ def build_runtime_context_close_gate_view(
         ("startup_evidence", "startup_event_ref"),
         ("read_receipt", "read_receipt_event_ref"),
         ("finish_gate", "finish_gate_ref"),
+        ("close_ready", "close_ready_event_ref"),
         ("checkpoint", "checkpoint_id"),
         ("verification", "verification_event_refs"),
         ("graph_trace", "graph_trace_ids"),
@@ -2191,6 +2239,9 @@ def build_runtime_context_close_gate_view(
         "task_id": values.get("task_id", ""),
         "merge_queue_id": values.get("merge_queue_id", ""),
         "checkpoint_id": values.get("checkpoint_id", ""),
+        "finish_gate_ref": values.get("finish_gate_ref", ""),
+        "close_ready_event_ref": values.get("close_ready_event_ref", ""),
+        "graph_trace_ids": list(values.get("graph_trace_ids") or []),
         "checklist": checklist,
         "missing": close_missing,
         "ready": not close_missing,
@@ -2201,6 +2252,23 @@ def build_runtime_context_close_gate_view(
             "branch_runtime": _runtime_context_mapping(
                 current_view.get("evidence_refs")
             ).get("branch_runtime", {}),
+            "route_identity": _runtime_context_mapping(
+                current_view.get("evidence_refs")
+            ).get("route_identity", {}),
+            "finish_gate": {
+                "producer": "task_timeline",
+                "source": "task_timeline.finish_gate",
+                "payload": public_contract_revision_payload(
+                    current_view.get("finish_gate") or {}
+                ),
+            },
+            "close_evidence": {
+                "producer": "task_timeline",
+                "source": "task_timeline.close_ready",
+                "payload": public_contract_revision_payload(
+                    current_view.get("close_evidence") or {}
+                ),
+            },
         },
     }
 

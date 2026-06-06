@@ -294,7 +294,12 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         },
         finish_gate={
             "checkpoint_id": "ckpt-runtime-context",
+            "event_id": "timeline:finish",
             "test_results": {"status": "passed"},
+        },
+        close_evidence={
+            "event_id": "timeline:close-ready",
+            "payload": {"graph_trace_ids": ["gqt-runtime-context"]},
         },
         generated_at=NOW,
     )
@@ -312,6 +317,26 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION
     )
     assert worker_view["close_gate_view"]["ready"] is True
+    assert worker_view["close_gate_view"]["close_ready_event_ref"] == (
+        "timeline:close-ready"
+    )
+    assert worker_view["close_gate_view"]["evidence_refs"]["route_identity"][
+        "route_context_hash"
+    ] == "sha256:route-runtime-context"
+    assert worker_view["close_gate_view"]["evidence_refs"]["finish_gate"][
+        "payload"
+    ]["event_id"] == "timeline:finish"
+    assert worker_view["close_gate_view"]["evidence_refs"]["close_evidence"][
+        "payload"
+    ]["event_id"] == "timeline:close-ready"
+    close_graph_trace = worker_view["gate_inputs"]["gates"]["close"]["fields"][
+        "graph_trace_ids"
+    ]
+    assert close_graph_trace["producer"] == "graph_query_trace"
+    assert close_graph_trace["consumer"] == "close_gate"
+    assert worker_view["gate_inputs"]["evidence_refs"]["graph_trace"]["trace_ids"] == [
+        "gqt-runtime-context"
+    ]
     assert worker_view["privacy_boundary"]["raw_private_context_exposed"] is False
     assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
 

@@ -17,6 +17,7 @@ from agent.tests.fixtures.rule_fingerprint_project import (
 from agent.governance import asset_impact
 from agent.governance import graph_correction_patches
 from agent.governance import graph_events
+from agent.governance import graph_query_trace
 from agent.governance import observer_session
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
@@ -2057,6 +2058,189 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
     assert "current_values" not in worker_view
     assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
+
+
+def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-a4-task",
+            root_task_id="AC-RUNTIME-A4",
+            backlog_id="AC-RUNTIME-A4",
+            worker_id="worker-runtime-a4",
+            worker_slot_id="worker-runtime-a4",
+            actual_host_worker_id="worker-runtime-a4",
+            agent_id="agent-runtime-a4",
+            allocation_owner="agent-runtime-a4",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-a4-task",
+            worktree_path="/repo/.worktrees/runtime-a4-task",
+            base_commit="base-a4",
+            head_commit="head-a4",
+            target_head_commit="target-a4",
+            snapshot_id="scope-a4",
+            projection_id="semproj-a4",
+            merge_queue_id="mq-a4",
+            checkpoint_id="ckpt-a4",
+            fence_token="fence-a4",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-06T10:00:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-a4",
+        contract_version="mf_parallel.v1",
+        payload={
+            "target_files": ["agent/governance/server.py"],
+            "acceptance_criteria": ["close gate projection is ready"],
+        },
+        route_identity={
+            "route_id": "route-a4",
+            "route_context_hash": "sha256:route-a4",
+            "prompt_contract_id": "rprompt-a4",
+            "prompt_contract_hash": "sha256:prompt-a4",
+            "visible_injection_manifest_hash": "sha256:visible-a4",
+        },
+        now_iso="2026-06-06T10:01:00Z",
+    )
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-a4-task",
+        backlog_id="AC-RUNTIME-A4",
+        event_type="mf_subagent_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="startup_read_receipt",
+        status="ok",
+        payload={"read_receipt_hash": "sha256:read-a4"},
+    )
+    startup = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-a4-task",
+        backlog_id="AC-RUNTIME-A4",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        payload={"runtime_context_id": context.runtime_context_id},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-a4-task",
+        backlog_id="AC-RUNTIME-A4",
+        event_type="mf_subagent.finish_gate",
+        event_kind="mf_subagent_finish_gate",
+        phase="finish_gate",
+        status="passed",
+        payload={"graph_trace_ids": ["gqt-finish-payload"]},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-a4-task",
+        backlog_id="AC-RUNTIME-A4",
+        event_type="verification",
+        event_kind="verification",
+        phase="verification",
+        status="passed",
+        payload={"graph_query_trace_ids": ["gqt-verification"]},
+    )
+    close_ready = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-a4-task",
+        backlog_id="AC-RUNTIME-A4",
+        event_type="close_ready",
+        event_kind="close_ready",
+        phase="close_ready",
+        status="ready",
+        payload={"graph_trace_ids": ["gqt-close-ready"]},
+    )
+    graph_query_trace.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_query_traces
+          (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
+           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
+           fence_token, status, budget_json, usage_json, artifact_path,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "gqt-from-db",
+            PID,
+            "scope-a4",
+            "mcp",
+            "mf_subagent",
+            "prompt_context_build",
+            "mf_subagent:runtime-a4-task:fence:abc123",
+            "AC-RUNTIME-A4",
+            "",
+            "",
+            "",
+            "",
+            "complete",
+            "{}",
+            "{}",
+            "",
+            "2026-06-06T10:02:00Z",
+            "2026-06-06T10:02:00Z",
+        ),
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+
+    views = result["runtime_context_service"]["views"]
+    current = views["current"]
+    close_gate = views["close_gate_view"]
+    gate_inputs = views["gate_inputs"]
+
+    assert current["timeline_refs"]["startup_event_ref"] == f"timeline:{startup['id']}"
+    assert current["timeline_refs"]["read_receipt_event_ref"] == (
+        f"timeline:{read_receipt['id']}"
+    )
+    assert current["timeline_refs"]["startup_event_ref"] != (
+        current["timeline_refs"]["read_receipt_event_ref"]
+    )
+    assert current["timeline_refs"]["close_ready_event_ref"] == (
+        f"timeline:{close_ready['id']}"
+    )
+    assert current["graph_trace_refs"]["trace_ids"] == [
+        "gqt-finish-payload",
+        "gqt-verification",
+        "gqt-close-ready",
+        "gqt-from-db",
+    ]
+    assert close_gate["ready"] is True
+    assert close_gate["graph_trace_ids"] == current["graph_trace_refs"]["trace_ids"]
+    assert close_gate["evidence_refs"]["route_identity"]["route_id"] == "route-a4"
+    assert close_gate["evidence_refs"]["close_evidence"]["payload"]["event_id"] == (
+        f"timeline:{close_ready['id']}"
+    )
+    assert (
+        gate_inputs["gates"]["close"]["fields"]["graph_trace_ids"]["producer"]
+        == "graph_query_trace"
+    )
+    assert gate_inputs["evidence_refs"]["graph_trace"]["source"] == (
+        "graph_query_traces"
+    )
 
 
 def test_parallel_branch_runtime_contract_route_rejects_wrong_worker_fence(conn):
