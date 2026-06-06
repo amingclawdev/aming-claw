@@ -231,6 +231,12 @@ _GRAPH_TRACE_CONTAINER_KEYS = (
     "mf_subagent_graph_trace",
     "graph_evidence",
 )
+_DISPATCH_GRAPH_OBLIGATION_CONTAINER_KEYS = (
+    "dispatch_graph_obligation",
+    "graph_first_obligations",
+    "graph_query_obligation",
+    "mf_subagent_graph_first_obligations",
+)
 _SERVICE_DISPATCH_CONTAINER_KEYS = (
     "service_dispatch_evidence",
     "observer_subagent_service_dispatch",
@@ -1813,8 +1819,14 @@ def _normalize_graph_trace_evidence(
     parent_task_id: str = "",
     worker_role: str = "",
     fence_token: str = "",
+    allow_payload_fallback: bool | None = None,
 ) -> dict[str, Any]:
-    source = _graph_trace_source(payload, allow_payload_fallback=not required)
+    source = _graph_trace_source(
+        payload,
+        allow_payload_fallback=(
+            not required if allow_payload_fallback is None else allow_payload_fallback
+        ),
+    )
     trace_ids = _dedupe_strings(
         trace_id
         for item in _deep_field_values(source, _GRAPH_TRACE_ID_KEYS)
@@ -1903,6 +1915,128 @@ def _normalize_graph_trace_evidence(
         "parent_task_id": observed["parent_task_id"],
         "worker_role": observed["worker_role"],
         "fence_token": observed["fence_token"],
+    }
+
+
+def _dispatch_graph_obligation_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+    for key in _DISPATCH_GRAPH_OBLIGATION_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _normalize_dispatch_graph_obligation(
+    payload: Mapping[str, Any],
+    *,
+    required: bool,
+    task_id: str = "",
+    parent_task_id: str = "",
+    worker_role: str = "",
+    fence_token: str = "",
+) -> dict[str, Any]:
+    source = _dispatch_graph_obligation_source(payload)
+    query = _nested_mapping(source, "query")
+    identity_source: Mapping[str, Any] = query if query else source
+    query_source = _first_deep_string(identity_source, {"query_source"})
+    query_purpose = _first_deep_string(identity_source, {"query_purpose"})
+    embedded_task_id = _first_deep_string(identity_source, {"task_id"})
+    embedded_parent_task_id = _first_deep_string(identity_source, {"parent_task_id"})
+    embedded_worker_role = _first_deep_string(identity_source, {"worker_role", "role"})
+    embedded_fence_token = _first_deep_string(identity_source, {"fence_token"})
+    read_receipt_before = _string_list(
+        source.get("read_receipt_required_before"),
+        field_name="read_receipt_required_before",
+    )
+    trace_schema_version = _first_deep_string(
+        source,
+        {
+            "trace_evidence_schema_version",
+            "finish_gate_trace_evidence_schema_version",
+        },
+    )
+
+    if required and not source:
+        raise MfSubagentContractError(
+            "governed mf_sub dispatch requires graph-first obligation evidence"
+        )
+    if query_source and query_source != "mf_subagent":
+        raise MfSubagentContractError(
+            "dispatch graph obligation must use query_source=mf_subagent"
+        )
+    if required and not query_source:
+        raise MfSubagentContractError(
+            "dispatch graph obligation requires query_source=mf_subagent"
+        )
+    if embedded_worker_role and embedded_worker_role != MF_SUB_ROLE:
+        raise MfSubagentContractError(
+            "dispatch graph obligation must use worker_role=mf_sub"
+        )
+    if (
+        trace_schema_version
+        and trace_schema_version != GRAPH_TRACE_SCHEMA_VERSION
+    ):
+        raise MfSubagentContractError(
+            "dispatch graph obligation must point finish evidence to "
+            f"{GRAPH_TRACE_SCHEMA_VERSION}"
+        )
+
+    observed = {
+        "task_id": embedded_task_id or ("" if required else task_id),
+        "parent_task_id": embedded_parent_task_id
+        or ("" if required else parent_task_id),
+        "worker_role": embedded_worker_role
+        or ("" if required else worker_role or MF_SUB_ROLE),
+        "fence_token": embedded_fence_token or ("" if required else fence_token),
+    }
+    expected = {
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": MF_SUB_ROLE if required else worker_role or MF_SUB_ROLE,
+        "fence_token": fence_token,
+    }
+    mismatches = [
+        field
+        for field, expected_value in expected.items()
+        if expected_value and observed[field] and observed[field] != expected_value
+    ]
+    if mismatches:
+        raise MfSubagentContractError(
+            "dispatch graph obligation identity mismatch: "
+            + ", ".join(sorted(mismatches))
+        )
+    missing_context = [
+        field
+        for field, value in observed.items()
+        if field in {"task_id", "parent_task_id", "worker_role", "fence_token"}
+        and not value
+    ]
+    if required and missing_context:
+        raise MfSubagentContractError(
+            "dispatch graph obligation missing required context: "
+            + ", ".join(sorted(missing_context))
+        )
+    if required and "graph_query" not in read_receipt_before:
+        raise MfSubagentContractError(
+            "dispatch graph obligation must require read receipt before graph_query"
+        )
+
+    return {
+        "schema_version": "mf_subagent_dispatch_graph_obligation.v1",
+        "required": required,
+        "present": bool(source),
+        "counts_as_worker_graph_trace_evidence": False,
+        "finish_gate_requires_worker_graph_trace": bool(required),
+        "query_source": query_source,
+        "query_purpose": query_purpose,
+        "task_id": observed["task_id"],
+        "parent_task_id": observed["parent_task_id"],
+        "worker_role": observed["worker_role"],
+        "fence_token": observed["fence_token"],
+        "read_receipt_required_before": read_receipt_before,
+        "trace_evidence_schema_version": (
+            trace_schema_version or GRAPH_TRACE_SCHEMA_VERSION
+        ),
     }
 
 
@@ -3851,9 +3985,24 @@ def validate_mf_subagent_dispatch_gate(
         raise MfSubagentContractError(
             "governed mf_sub dispatch requires worker_role=mf_sub"
         )
+    graph_trace_source = _graph_trace_source(payload, allow_payload_fallback=False)
+    graph_trace_ids = _dedupe_strings(
+        trace_id
+        for item in _deep_field_values(graph_trace_source, _GRAPH_TRACE_ID_KEYS)
+        for trace_id in _trace_id_strings(item)
+    )
     graph_trace_evidence = _normalize_graph_trace_evidence(
         payload,
-        required=governed_evidence_required,
+        required=bool(governed_evidence_required and graph_trace_ids),
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_role=worker_role,
+        fence_token=fence_token,
+        allow_payload_fallback=False,
+    )
+    dispatch_graph_obligation = _normalize_dispatch_graph_obligation(
+        payload,
+        required=bool(governed_evidence_required and not graph_trace_ids),
         task_id=task_id,
         parent_task_id=parent_task_id,
         worker_role=worker_role,
@@ -3956,6 +4105,7 @@ def validate_mf_subagent_dispatch_gate(
             child_route_prompt_contract=child_route_prompt_contract,
         ),
         "governed_evidence_required": governed_evidence_required,
+        "dispatch_graph_obligation": dispatch_graph_obligation,
         "graph_trace_evidence": graph_trace_evidence,
         "branch_runtime_evidence": branch_runtime_evidence,
         "service_dispatch_evidence": service_dispatch_evidence,

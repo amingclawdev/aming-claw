@@ -1674,7 +1674,15 @@ def observer_runtime_text():
         "runtime_context_id, and persisted branch context."
     ),
 )
-@click.option("--graph-trace-id", "graph_trace_ids", multiple=True, help="Graph query trace id proving graph-first evidence. Repeatable.")
+@click.option(
+    "--graph-trace-id",
+    "graph_trace_ids",
+    multiple=True,
+    help=(
+        "Optional prelaunch graph context trace id. Repeatable; does not satisfy "
+        "worker-owned finish graph_trace_evidence."
+    ),
+)
 @click.option("--base-commit", default="", help="Optional base commit. Defaults to main worktree HEAD.")
 @click.option("--target-head-commit", default="", help="Optional target HEAD commit. Defaults to base commit.")
 @click.option("--acceptance-criterion", "acceptance_criteria", multiple=True, help="Acceptance criterion for the worker contract. Repeatable.")
