@@ -5060,6 +5060,10 @@ def _runtime_context_service_graph_trace_refs(
         if text and text not in seen:
             seen.add(text)
             trace_ids.append(text)
+    current_run_id_like = ""
+    if task_id and fence_token:
+        fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+        current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
     try:
         rows = conn.execute(
             """
@@ -5069,18 +5073,13 @@ def _runtime_context_service_graph_trace_refs(
             FROM graph_query_traces
             WHERE project_id = ?
               AND (
-                runtime_context_id = ?
-                OR task_id = ?
+                (? != '' AND runtime_context_id = ?)
+                OR (? != '' AND task_id = ?)
+                OR (? != '' AND fence_token = ?)
                 OR (
                   query_source = 'mf_subagent'
-                  AND parent_task_id IN (?, ?)
-                  AND (
-                    task_id = ?
-                    OR runtime_context_id = ?
-                    OR worker_role = 'mf_sub'
-                    OR fence_token = ?
-                    OR run_id LIKE ?
-                  )
+                  AND ? != ''
+                  AND run_id LIKE ?
                 )
               )
             ORDER BY created_at DESC, trace_id DESC
@@ -5089,13 +5088,13 @@ def _runtime_context_service_graph_trace_refs(
             (
                 project_id,
                 runtime_context_id,
-                task_id,
-                parent_task_id,
-                backlog_id,
-                task_id,
                 runtime_context_id,
+                task_id,
+                task_id,
                 fence_token,
-                f"mf_subagent:{task_id}:fence:%",
+                fence_token,
+                current_run_id_like,
+                current_run_id_like,
             ),
         ).fetchall()
     except sqlite3.OperationalError:

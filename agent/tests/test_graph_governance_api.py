@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sqlite3
@@ -95,6 +96,57 @@ def _ctx_with_role(
         "scope": [],
     }
     return ctx
+
+
+def _mf_sub_run_id(task_id: str, fence_token: str) -> str:
+    fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+    return f"mf_subagent:{task_id}:fence:{fence_hash}"
+
+
+def _insert_mf_sub_graph_query_trace(
+    conn,
+    *,
+    trace_id: str,
+    parent_task_id: str,
+    snapshot_id: str = "scope-test",
+    runtime_context_id: str = "",
+    task_id: str = "",
+    worker_role: str = "",
+    fence_token: str = "",
+    run_id: str = "",
+    created_at: str = "2026-06-06T10:00:00Z",
+) -> None:
+    graph_query_trace.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_query_traces
+          (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
+           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
+           fence_token, status, budget_json, usage_json, artifact_path,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_id,
+            PID,
+            snapshot_id,
+            "mcp",
+            "mf_subagent",
+            "prompt_context_build",
+            run_id,
+            parent_task_id,
+            runtime_context_id,
+            task_id,
+            worker_role,
+            fence_token,
+            "complete",
+            "{}",
+            "{}",
+            "",
+            created_at,
+            created_at,
+        ),
+    )
 
 
 def _route_waiver(action: str, *, task_id: str = "", backlog_id: str = "") -> dict:
@@ -2180,7 +2232,7 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
             "mcp",
             "mf_subagent",
             "prompt_context_build",
-            "mf_subagent:runtime-a4-task:fence:abc123",
+            _mf_sub_run_id("runtime-a4-task", "fence-a4"),
             "AC-RUNTIME-A4",
             "",
             "",
@@ -2241,6 +2293,100 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
     assert gate_inputs["evidence_refs"]["graph_trace"]["source"] == (
         "graph_query_traces"
     )
+
+
+def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-task-a",
+            root_task_id="AC-RUNTIME-SHARED",
+            backlog_id="AC-RUNTIME-SHARED",
+            worker_id="worker-task-a",
+            worker_slot_id="worker-task-a",
+            actual_host_worker_id="worker-task-a",
+            agent_id="agent-task-a",
+            allocation_owner="agent-task-a",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-task-a",
+            worktree_path="/repo/.worktrees/runtime-task-a",
+            base_commit="base-a",
+            head_commit="head-a",
+            target_head_commit="target-a",
+            snapshot_id="scope-shared",
+            projection_id="semproj-shared",
+            merge_queue_id="mq-shared",
+            checkpoint_id="ckpt-a",
+            fence_token="fence-task-a",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-06T10:00:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-current-runtime",
+        parent_task_id="AC-RUNTIME-SHARED",
+        runtime_context_id=context.runtime_context_id,
+        created_at="2026-06-06T10:01:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-current-task",
+        parent_task_id="AC-RUNTIME-SHARED",
+        task_id="runtime-task-a",
+        created_at="2026-06-06T10:02:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-current-fence",
+        parent_task_id="AC-RUNTIME-SHARED",
+        fence_token="fence-task-a",
+        created_at="2026-06-06T10:03:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-current-run",
+        parent_task_id="AC-RUNTIME-SHARED",
+        run_id=_mf_sub_run_id("runtime-task-a", "fence-task-a"),
+        created_at="2026-06-06T10:04:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-sibling",
+        parent_task_id="AC-RUNTIME-SHARED",
+        runtime_context_id="mfrctx-sibling",
+        task_id="runtime-task-b",
+        worker_role="mf_sub",
+        fence_token="fence-task-b",
+        run_id=_mf_sub_run_id("runtime-task-b", "fence-task-b"),
+        created_at="2026-06-06T10:05:00Z",
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+
+    trace_ids = result["runtime_context_service"]["views"]["current"][
+        "graph_trace_refs"
+    ]["trace_ids"]
+    assert trace_ids == [
+        "gqt-current-run",
+        "gqt-current-fence",
+        "gqt-current-task",
+        "gqt-current-runtime",
+    ]
+    assert "gqt-sibling" not in trace_ids
 
 
 def test_parallel_branch_runtime_contract_route_rejects_wrong_worker_fence(conn):
