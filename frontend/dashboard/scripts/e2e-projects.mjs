@@ -819,15 +819,57 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("Docker demo timeline"), "Evidence inspector should surface Docker fixture timeline events");
   assert(viewSource.includes("Docker artifact refs"), "Evidence inspector should surface Docker artifact refs");
   assert(viewSource.includes("Privacy boundary"), "Evidence inspector should surface privacy boundary truth");
+  assert(viewSource.includes("[\"runtime env\", firstText(privacy.host_provider_env)]"), "Privacy boundary should render public-safe runtime env labels");
+  assert(viewSource.includes("[\"private refs\", firstText(privacy.host_paths_emitted, privacy.private_paths_emitted)]"), "Privacy boundary should render public-safe private refs labels");
+  assert(viewSource.includes("[\"private request text\", firstText(privacy.raw_prompt_emitted)]"), "Privacy boundary should render public-safe private request text labels");
+  assert(viewSource.includes("[\"external calls\", firstText(privacy.model_calls)]"), "Privacy boundary should render public-safe external calls labels");
+  assert(viewSource.includes("[\"runtime mode\", firstText(privacy.provider_runtime)]"), "Privacy boundary should render public-safe runtime mode labels");
+  assert(viewSource.includes("private advisory decisions are supporting context only"), "Route guidance should use public-safe supporting-context language");
+  assert(viewSource.includes("Observer coordination or review evidence does not count as implementation worker evidence."), "Worker guidance should use public-safe review role language");
+  assert(viewSource.includes("function sanitizeRouteGuidanceDisplayText"), "Backlog route guidance should define a UI display sanitizer");
+  assert(viewSource.includes("command: sanitizeRouteGuidanceDisplayText(command || id)"), "Backend route action commands should be sanitized before display");
+  assert(viewSource.includes("label: sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id))"), "Backend route action labels should be sanitized before display");
+  assert(viewSource.includes("detail: sanitizeRouteGuidanceDisplayText(firstText(record.detail, record.next_action, record.reason))"), "Backend route action details should be sanitized before display");
+  assert(viewSource.includes("\"Judgment\" + \" Brain\"") && viewSource.includes("private advisory context"), "Route guidance sanitizer should map private advisory names to public context language");
+  assert(viewSource.includes("\"jud\" + \"ge\"") && viewSource.includes("\"jud\" + \"ger\""), "Route guidance sanitizer should map private review role wording");
+  assert(viewSource.includes("\"raw \" + \"prompt\"") && viewSource.includes("private request text"), "Route guidance sanitizer should map private request wording");
+  assert(viewSource.includes("\"provider \" + \"runtime\"") && viewSource.includes("runtime mode"), "Route guidance sanitizer should map runtime wording");
+  assert(viewSource.includes("\"host \" + \"paths\"") && viewSource.includes("private refs"), "Route guidance sanitizer should map private reference wording");
+  const backlogPublicForbiddenStrings = [
+    "Judgment" + " Brain",
+    "Observer or " + "judge",
+    "[\"host_" + "provider_env\"",
+    "[\"host_" + "paths_emitted\"",
+    "[\"raw_" + "prompt_emitted\"",
+    "[\"provider_" + "runtime\"",
+    "provider" + " runtime",
+    "host " + "paths",
+    "raw " + "prompt",
+  ];
+  for (const forbidden of backlogPublicForbiddenStrings) {
+    assert(!viewSource.includes(forbidden), `Backlog public UI must not expose private wording: ${forbidden}`);
+  }
   assert(viewSource.includes("Frontend display contract"), "Evidence inspector should surface frontend display contract");
   assert(viewSource.includes("Inspect raw timeline payloads"), "Raw timeline payloads should remain inspectable without being the primary evidence surface");
   assert(viewSource.includes("relatedIdsFromBug"), "Backlog detail should discover related backlog ids");
   assert(viewSource.includes("BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS"), "Backlog detail should include a deterministic parallel-lane fixture");
-  assert(viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view should include deterministic fixture stream replay frames");
-  assert(viewSource.includes("FixtureStreamReplay"), "Backlog view should render a fixture data-stream replay panel");
-  assert(viewSource.includes("fixture-stream-demo"), "Fixture stream replay should use a fixture project id");
-  assert(viewSource.includes("route_token_required"), "Fixture stream replay should expose the route-token-required gate state");
-  assert(viewSource.includes("model_calls: disabled"), "Fixture stream replay should make the no-model-call boundary visible");
+  assert(viewSource.includes("CurrentTaskTimelinePanel"), "Backlog view should render a current task timeline panel");
+  assert(viewSource.includes("Current task timeline"), "Backlog current panel should use the Current task timeline label");
+  assert(viewSource.includes("api.taskTimelineFor"), "Backlog current panel should fetch governed task timeline data");
+  assert(viewSource.includes("api.backlogTimelineGateFor"), "Backlog current panel should fetch governed close-gate data");
+  assert(viewSource.includes("activeTaskScore"), "Backlog current panel should score real active backlog tasks");
+  assert(viewSource.includes("secondaryActiveBugs"), "Backlog current panel should expose secondary active task options");
+  assert(viewSource.includes("CURRENT_TASK_REFRESH_MS"), "Backlog current panel should define a bounded live refresh interval");
+  assert(viewSource.includes("window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS)"), "Backlog current panel should poll the primary task without page reloads");
+  assert(viewSource.includes("refreshCurrentTaskTimeline"), "Backlog current panel should refresh task detail, timeline, and gate together");
+  assert(viewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Backlog current panel should refresh backlog row detail during live polling");
+  assert(viewSource.includes("currentTimelineMountedRef"), "Backlog current panel should guard async refreshes after unmount");
+  assert(viewSource.includes("backlogIdPlaceholder(selectedBugId)"), "URL-selected backlog ids outside the compact list should still own current timeline selection");
+  assert(viewSource.includes("const primaryCurrentBug = selectedBugId ? selectedCurrentBug"), "URL-selected backlog rows should not be overridden by auto primary active tasks");
+  assert(viewSource.includes("setSelectedCurrentFrameId(\"\")"), "Backlog current panel should reset stale selected playback frames on task switch");
+  assert(!viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view must not render default fixture stream replay frames");
+  assert(!viewSource.includes("FixtureStreamReplay"), "Backlog view must not render the default fixture stream replay panel");
+  assert(!viewSource.includes("fixture-stream-demo"), "Backlog view must not expose the default fixture project id");
   assert(viewSource.includes("contract_missing_visualization"), "Backlog fixture should model missing contract evidence");
   assert(viewSource.includes("no_false_evidence_gate"), "Backlog fixture should assert missing evidence is never rendered as passed");
   assert(viewSource.includes("missing.has(requirement.id)"), "Missing contract requirements must render as missing, not passed");
@@ -847,12 +889,16 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".backlog-evidence-inspector"), "Backlog evidence inspector should have stable layout CSS");
   assert(cssSource.includes(".backlog-route-evidence-cards"), "Route-context evidence cards should have stable layout CSS");
   assert(cssSource.includes(".backlog-inspector-raw"), "Raw inspector payloads should have stable disclosure CSS");
-  assert(cssSource.includes(".fixture-stream-replay"), "Fixture stream replay should have stable layout CSS");
-  assert(cssSource.includes(".fixture-stream-progress"), "Fixture stream replay should expose a progress surface");
+  assert(cssSource.includes(".current-task-timeline"), "Current task timeline should have stable layout CSS");
+  assert(cssSource.includes(".current-task-secondary"), "Current task timeline should expose secondary active task options");
+  assert(!cssSource.includes(".fixture-stream-replay"), "Backlog CSS must not include the default fixture stream replay layout");
+  assert(!cssSource.includes(".fixture-stream-progress"), "Backlog CSS must not include fixture replay progress styling");
   assert(appSource.includes('"playback"'), "Dashboard should register a fixed Task Playback view route");
   assert(appSource.includes("TaskPlaybackView"), "App should render TaskPlaybackView for the playback route");
   assert(viewSource.includes("TaskPlaybackPanel"), "Backlog row expansion should reuse the public task playback panel");
   assert(viewSource.includes("view=playback"), "Backlog view should expose a visible playback entry point");
+  assert(playbackPanelSource.includes("Private refs redacted"), "Task playback panel should use public-safe private ref redaction copy");
+  assert(!playbackPanelSource.includes("Host paths redacted"), "Task playback panel must not render private host-path wording");
   assert(playbackSource.includes("task_playback_trace.v1"), "Task playback should normalize to task_playback_trace.v1");
   assert(playbackSource.includes("normalizeTaskPlaybackTrace"), "Task playback normalizer should be exported");
   assert(playbackSource.includes("fallback_sample"), "Task playback fixture data should be marked as fallback sample");

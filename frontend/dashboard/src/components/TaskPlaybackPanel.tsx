@@ -120,7 +120,7 @@ export default function TaskPlaybackPanel({
       <div className="task-playback-privacy">
         <strong>Public boundary</strong>
         <span>Private request text not displayed</span>
-        <span>Host paths redacted</span>
+        <span>Private refs redacted</span>
         <span>Aming Claw/content-sys evidence only</span>
       </div>
     </section>

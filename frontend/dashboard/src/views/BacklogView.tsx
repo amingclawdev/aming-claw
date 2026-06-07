@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import { normalizeTaskPlaybackTrace } from "../lib/taskPlayback";
+import {
+  emptyTaskPlaybackTrace,
+  normalizeTaskPlaybackTrace,
+  type TaskPlaybackTrace,
+} from "../lib/taskPlayback";
 import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
@@ -10,6 +14,7 @@ import type {
   AgentTaskContractProjection,
   MfCloseTimelineGate,
   TaskTimelineEvent,
+  TaskTimelineResponse,
 } from "../types";
 
 interface Props {
@@ -21,13 +26,14 @@ type StatusFilter = "OPEN" | "FIXED" | "ALL";
 type PriorityFilter = "ALL" | "P0" | "P1" | "P2" | "P3";
 type DetailTab = "timeline" | "contract";
 type ContractEvidenceStatus = "passed" | "missing" | "failed" | "bypassed" | "inferred" | "not_applicable";
-type FixtureReplayState = "idle" | "running" | "blocked" | "passed";
 
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
 const BACKLOG_URL_PARAM = "backlog";
 const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
+const CURRENT_TASK_TIMELINE_LIMIT = 250;
+const CURRENT_TASK_REFRESH_MS = 5000;
 const CONTENT_SYS_DEMO_VISUALIZATION_SCHEMA = "content_sys.demo_visualization_evidence.v1";
 const ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1";
 const ROUTE_GUIDANCE_ALLOWED_STAGES = ["dispatch", "startup_gate", "implementation_wait", "handoff_gate"];
@@ -151,198 +157,6 @@ export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
   },
 ];
 
-interface FixtureProjectStreamFrame {
-  id: string;
-  label: string;
-  phase: string;
-  at: string;
-  state: FixtureReplayState;
-  projectStatus: string;
-  graphStatus: string;
-  backlogStatus: string;
-  timelineCount: number;
-  gateStatus: string;
-  testStatus: string;
-  detail: string;
-  evidence: string[];
-  event: TaskTimelineEvent;
-}
-
-const FIXTURE_PROJECT_STREAM_REPLAY_FRAMES: FixtureProjectStreamFrame[] = [
-  {
-    id: "fixture-stream-register",
-    label: "Project registered",
-    phase: "project",
-    at: "00:00",
-    state: "idle",
-    projectStatus: "registered",
-    graphStatus: "not built",
-    backlogStatus: "empty",
-    timelineCount: 0,
-    gateStatus: "not evaluated",
-    testStatus: "not run",
-    detail: "fixture-stream-demo enters the dashboard as a public-safe project record.",
-    evidence: ["project_id: fixture-stream-demo", "model_calls: disabled", "raw_prompt_emitted: false"],
-    event: {
-      event_id: "fixture-stream-register",
-      event_type: "project.registered",
-      event_kind: "route_context",
-      actor: "observer",
-      phase: "project",
-      status: "accepted",
-      payload: { lane: "observer", project_id: "fixture-stream-demo", privacy_boundary: "public_safe" },
-      created_at: "2026-06-01T21:00:00Z",
-    },
-  },
-  {
-    id: "fixture-stream-bootstrap",
-    label: "Graph bootstrap",
-    phase: "graph",
-    at: "00:08",
-    state: "running",
-    projectStatus: "active",
-    graphStatus: "building",
-    backlogStatus: "queued",
-    timelineCount: 1,
-    gateStatus: "not evaluated",
-    testStatus: "pending",
-    detail: "Graph and semantic counters move while the replay keeps the stream ordered.",
-    evidence: ["snapshot: fixture-scope-001", "nodes: 24", "edges: 63"],
-    event: {
-      event_id: "fixture-stream-bootstrap",
-      event_type: "graph.bootstrap.started",
-      event_kind: "implementation",
-      actor: "governance",
-      phase: "graph",
-      status: "running",
-      payload: { lane: "backend", snapshot_id: "fixture-scope-001", node_count: 24, edge_count: 63 },
-      created_at: "2026-06-01T21:00:08Z",
-    },
-  },
-  {
-    id: "fixture-stream-backlog",
-    label: "Backlog admitted",
-    phase: "backlog",
-    at: "00:15",
-    state: "running",
-    projectStatus: "active",
-    graphStatus: "current",
-    backlogStatus: "MF_IN_PROGRESS",
-    timelineCount: 2,
-    gateStatus: "waiting route",
-    testStatus: "pending",
-    detail: "The backlog row appears before implementation evidence and carries the replay contract.",
-    evidence: ["backlog: AC-DEMO-LIVE-AUDIT-SSE-BACKLOG-TIMELINE-20260531", "priority: P1", "contract: manual_fix_contract.v1"],
-    event: {
-      event_id: "fixture-stream-backlog",
-      event_type: "backlog.upserted",
-      event_kind: "route_context",
-      actor: "observer",
-      phase: "backlog",
-      status: "accepted",
-      payload: {
-        lane: "observer",
-        backlog_id: "AC-DEMO-LIVE-AUDIT-SSE-BACKLOG-TIMELINE-20260531",
-        requirement_ids: ["fixture_project_stream_replay"],
-      },
-      created_at: "2026-06-01T21:00:15Z",
-    },
-  },
-  {
-    id: "fixture-stream-route-gate",
-    label: "Route gate",
-    phase: "route",
-    at: "00:22",
-    state: "blocked",
-    projectStatus: "active",
-    graphStatus: "current",
-    backlogStatus: "MF_IN_PROGRESS",
-    timelineCount: 3,
-    gateStatus: "route_token_required",
-    testStatus: "pending",
-    detail: "The replay shows the gate blocking first, then the public waiver evidence being recorded.",
-    evidence: ["route_token_required", "timeline:1166", "waiver_type: manual_fix"],
-    event: {
-      event_id: "fixture-stream-route-gate",
-      event_type: "route_token_gate.backlog_upsert",
-      event_kind: "verification",
-      actor: "observer",
-      phase: "route",
-      status: "blocked",
-      payload: {
-        lane: "observer",
-        requirement_ids: ["route_context", "route_action_precheck"],
-        route_token_gate: {
-          status: "blocked",
-          reason_codes: ["route_token_required"],
-          raw_context_exposed: false,
-        },
-      },
-      created_at: "2026-06-01T21:00:22Z",
-    },
-  },
-  {
-    id: "fixture-stream-evidence",
-    label: "Timeline evidence",
-    phase: "timeline",
-    at: "00:31",
-    state: "running",
-    projectStatus: "active",
-    graphStatus: "current",
-    backlogStatus: "MF_IN_PROGRESS",
-    timelineCount: 5,
-    gateStatus: "accepted waiver",
-    testStatus: "running",
-    detail: "Timeline events arrive as cards, lanes, route evidence, and artifact chips.",
-    evidence: ["task.timeline.appended", "service.route.recorded", "lanes: observer + worker"],
-    event: {
-      event_id: "fixture-stream-evidence",
-      event_type: "task.timeline.appended",
-      event_kind: "implementation",
-      actor: "mf_sub_frontend",
-      phase: "timeline",
-      status: "accepted",
-      payload: {
-        lane: "frontend",
-        requirement_ids: ["fixture_project_stream_replay", "timeline_live_update"],
-        changed_files: ["frontend/dashboard/src/views/BacklogView.tsx", "frontend/dashboard/src/styles.css"],
-      },
-      verification: { passed: true, tests_run: ["npm run e2e:demo-mock-ai"] },
-      created_at: "2026-06-01T21:00:31Z",
-    },
-  },
-  {
-    id: "fixture-stream-verify",
-    label: "Replay verified",
-    phase: "verify",
-    at: "00:42",
-    state: "passed",
-    projectStatus: "active",
-    graphStatus: "stale after commit",
-    backlogStatus: "review ready",
-    timelineCount: 7,
-    gateStatus: "close-ready pending",
-    testStatus: "passed",
-    detail: "The fixture ends with browser-visible proof while graph reconcile remains an explicit next state.",
-    evidence: ["browser: fixture stream visible", "e2e: three states changed", "graph_reconcile: pending"],
-    event: {
-      event_id: "fixture-stream-verify",
-      event_type: "mf.verification.fixture_stream_replay",
-      event_kind: "verification",
-      actor: "observer",
-      phase: "verify",
-      status: "passed",
-      payload: {
-        lane: "observer",
-        requirement_ids: ["browser_evidence", "fixture_project_stream_replay"],
-        screenshots: ["fixture-stream-replay-visible"],
-      },
-      verification: { passed: true, model_calls: "disabled", raw_prompt_emitted: false },
-      created_at: "2026-06-01T21:00:42Z",
-    },
-  },
-];
-
 interface TimelineState {
   expanded: boolean;
   loading: boolean;
@@ -351,6 +165,17 @@ interface TimelineState {
   events: TaskTimelineEvent[];
   count?: number;
   gate?: BacklogTimelineGateResponse;
+}
+
+interface CurrentTaskTimelineState {
+  loading: boolean;
+  loaded: boolean;
+  error: string;
+  trace: TaskPlaybackTrace;
+  bug?: BacklogBug;
+  taskTimeline?: TaskTimelineResponse | null;
+  gate?: BacklogTimelineGateResponse | null;
+  refreshedAt?: string;
 }
 
 export default function BacklogView({ backlog, projectId }: Props) {
@@ -365,11 +190,26 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const [detailLoadingByBug, setDetailLoadingByBug] = useState<Record<string, boolean>>({});
   const [detailErrorByBug, setDetailErrorByBug] = useState<Record<string, string>>({});
   const [modalTrail, setModalTrail] = useState<string[]>([]);
+  const [currentTimelineByBug, setCurrentTimelineByBug] = useState<Record<string, CurrentTaskTimelineState>>({});
+  const [selectedCurrentFrameId, setSelectedCurrentFrameId] = useState("");
   const timelineByBugRef = useRef<Record<string, TimelineState>>({});
+  const currentTimelineByBugRef = useRef<Record<string, CurrentTaskTimelineState>>({});
+  const currentTimelineMountedRef = useRef(true);
 
   useEffect(() => {
     timelineByBugRef.current = timelineByBug;
   }, [timelineByBug]);
+
+  useEffect(() => {
+    currentTimelineByBugRef.current = currentTimelineByBug;
+  }, [currentTimelineByBug]);
+
+  useEffect(() => {
+    currentTimelineMountedRef.current = true;
+    return () => {
+      currentTimelineMountedRef.current = false;
+    };
+  }, []);
 
   const stats = useMemo(() => {
     if (backlog.summary) {
@@ -415,6 +255,25 @@ export default function BacklogView({ backlog, projectId }: Props) {
       .sort(compareBugs);
   }, [bugs, priorityFilter, query, statusFilter]);
 
+  const activeTaskCandidates = useMemo(() => {
+    return bugs
+      .map((bug) => ({ bug, score: activeTaskScore(bug) }))
+      .filter((item) => item.score > 0)
+      .sort(compareActiveTaskCandidates);
+  }, [bugs]);
+
+  const selectedCurrentBug = selectedBugId
+    ? detailByBug[selectedBugId] ??
+      currentTimelineByBug[selectedBugId]?.bug ??
+      bugs.find((bug) => bug.bug_id === selectedBugId) ??
+      backlogIdPlaceholder(selectedBugId)
+    : null;
+  const primaryCurrentBug = selectedBugId ? selectedCurrentBug : activeTaskCandidates[0]?.bug ?? null;
+  const secondaryActiveBugs = primaryCurrentBug
+    ? activeTaskCandidates.map((item) => item.bug).filter((bug) => bug.bug_id !== primaryCurrentBug.bug_id)
+    : activeTaskCandidates.map((item) => item.bug);
+  const currentTimelineState = primaryCurrentBug ? currentTimelineByBug[primaryCurrentBug.bug_id] : undefined;
+
   const filteredCount = backlog.filtered_count ?? stats.total;
   const pageNote = backlog.has_more ? ` · next offset ${backlog.next_offset ?? rows.length}` : "";
   const syncCommands = [
@@ -425,10 +284,12 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
   useEffect(() => {
     setTimelineByBug({});
+    setCurrentTimelineByBug({});
     setDetailByBug({});
     setDetailLoadingByBug({});
     setDetailErrorByBug({});
     setModalTrail([]);
+    setSelectedCurrentFrameId("");
   }, [projectId]);
 
   useEffect(() => {
@@ -439,6 +300,10 @@ export default function BacklogView({ backlog, projectId }: Props) {
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
+
+  useEffect(() => {
+    setSelectedCurrentFrameId("");
+  }, [primaryCurrentBug?.bug_id]);
 
   const copySyncCommands = async () => {
     try {
@@ -509,6 +374,121 @@ export default function BacklogView({ backlog, projectId }: Props) {
         });
       });
   }, [projectId]);
+
+  const refreshCurrentTaskTimeline = useCallback((bug: BacklogBug, showLoading: boolean, signal: AbortSignal) => {
+    const bugId = bug.bug_id;
+    if (showLoading) {
+      setCurrentTimelineByBug((states) => ({
+        ...states,
+        [bugId]: {
+          loading: true,
+          loaded: states[bugId]?.loaded ?? false,
+          error: "",
+          trace: states[bugId]?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
+          bug: states[bugId]?.bug ?? bug,
+          taskTimeline: states[bugId]?.taskTimeline,
+          gate: states[bugId]?.gate,
+          refreshedAt: states[bugId]?.refreshedAt,
+        },
+      }));
+    }
+
+    return Promise.allSettled([
+      api.backlogBugFor(projectId, bugId, signal),
+      api.taskTimelineFor(projectId, bugId, CURRENT_TASK_TIMELINE_LIMIT, signal),
+      api.backlogTimelineGateFor(projectId, bugId, CURRENT_TASK_TIMELINE_LIMIT, signal),
+    ]).then(([detailResult, timelineResult, gateResult]) => {
+      if (signal.aborted || !currentTimelineMountedRef.current) return;
+      const detailBug = detailResult.status === "fulfilled" ? detailResult.value : bug;
+      const taskTimeline = timelineResult.status === "fulfilled" ? timelineResult.value : null;
+      const gate = gateResult.status === "fulfilled" ? gateResult.value : null;
+      const errors = [
+        detailResult.status === "rejected" ? errorMessage(detailResult.reason) : "",
+        timelineResult.status === "rejected" ? errorMessage(timelineResult.reason) : "",
+        gateResult.status === "rejected" ? errorMessage(gateResult.reason) : "",
+      ].filter(Boolean);
+      const trace = normalizeTaskPlaybackTrace({
+        projectId,
+        backlog: detailBug,
+        taskTimeline,
+        gateResponse: gate,
+        source: taskTimeline && gate ? "governed" : "governed_partial",
+      });
+
+      if (detailResult.status === "fulfilled") {
+        setDetailByBug((states) => ({ ...states, [bugId]: detailResult.value }));
+      }
+      setCurrentTimelineByBug((states) => ({
+        ...states,
+        [bugId]: {
+          loading: false,
+          loaded: true,
+          error: errors.join(" | "),
+          trace,
+          bug: detailBug,
+          taskTimeline,
+          gate,
+          refreshedAt: new Date().toISOString(),
+        },
+      }));
+      setSelectedCurrentFrameId((current) => current || trace.frames[0]?.id || "");
+    });
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!primaryCurrentBug) return undefined;
+    const bug = primaryCurrentBug;
+    const controller = new AbortController();
+    let refreshing = false;
+    const refresh = (showLoading = false) => {
+      if (refreshing || controller.signal.aborted) return;
+      refreshing = true;
+      refreshCurrentTaskTimeline(bug, showLoading, controller.signal)
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || !currentTimelineMountedRef.current) return;
+          const bugId = bug.bug_id;
+          setCurrentTimelineByBug((states) => ({
+            ...states,
+            [bugId]: {
+              loading: false,
+              loaded: true,
+              error: errorMessage(error),
+              trace: states[bugId]?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
+              bug: states[bugId]?.bug ?? bug,
+              taskTimeline: states[bugId]?.taskTimeline ?? null,
+              gate: states[bugId]?.gate ?? null,
+              refreshedAt: states[bugId]?.refreshedAt,
+            },
+          }));
+        })
+        .finally(() => {
+          refreshing = false;
+        });
+    };
+
+    refresh(!currentTimelineByBugRef.current[bug.bug_id]?.loaded);
+    const timer = window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
+  }, [primaryCurrentBug?.bug_id, projectId, refreshCurrentTaskTimeline]);
+
+  useEffect(() => {
+    if (!selectedBugId) return;
+    const selectedState = currentTimelineByBug[selectedBugId];
+    if (!selectedState?.bug || detailByBug[selectedBugId]) return;
+    setDetailByBug((states) => ({ ...states, [selectedBugId]: selectedState.bug! }));
+  }, [currentTimelineByBug, detailByBug, selectedBugId]);
+
+  useEffect(() => {
+    if (!primaryCurrentBug) return;
+    const state = currentTimelineByBug[primaryCurrentBug.bug_id];
+    if (!state?.loaded || state.loading) return;
+    const currentFrameExists = Boolean(selectedCurrentFrameId && state.trace.frames.some((frame) => frame.id === selectedCurrentFrameId));
+    if (!selectedCurrentFrameId || currentFrameExists) return;
+    setSelectedCurrentFrameId(state.trace.frames[0]?.id || "");
+  }, [currentTimelineByBug, primaryCurrentBug, selectedCurrentFrameId]);
 
   const toggleTimeline = (bugId: string) => {
     const current = timelineByBug[bugId];
@@ -607,7 +587,17 @@ export default function BacklogView({ backlog, projectId }: Props) {
         </div>
       </div>
 
-      <FixtureStreamReplay />
+      <CurrentTaskTimelinePanel
+        projectId={projectId}
+        bug={currentTimelineState?.bug ?? primaryCurrentBug}
+        selectedFromUrl={Boolean(selectedBugId && primaryCurrentBug?.bug_id === selectedBugId)}
+        state={currentTimelineState}
+        selectedFrameId={selectedCurrentFrameId}
+        secondaryActiveBugs={secondaryActiveBugs}
+        totalBacklogRows={bugs.length}
+        onSelectFrame={setSelectedCurrentFrameId}
+        onSelectBug={(bugId) => openDetail(bugId)}
+      />
 
       <div className="score-grid backlog-score-grid">
         <Kpi label="Open" value={stats.open} tone={stats.open > 0 ? "amber" : "green"} />
@@ -704,133 +694,106 @@ export default function BacklogView({ backlog, projectId }: Props) {
   );
 }
 
-function FixtureStreamReplay() {
-  const frames = FIXTURE_PROJECT_STREAM_REPLAY_FRAMES;
-  const [index, setIndex] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState(1);
-  const frame = frames[index] ?? frames[0];
-  const eventCount = index + 1;
-  const progress = frames.length <= 1 ? 100 : Math.round((index / (frames.length - 1)) * 100);
+function CurrentTaskTimelinePanel({
+  projectId,
+  bug,
+  selectedFromUrl,
+  state,
+  selectedFrameId,
+  secondaryActiveBugs,
+  totalBacklogRows,
+  onSelectFrame,
+  onSelectBug,
+}: {
+  projectId: string;
+  bug: BacklogBug | null;
+  selectedFromUrl: boolean;
+  state?: CurrentTaskTimelineState;
+  selectedFrameId: string;
+  secondaryActiveBugs: BacklogBug[];
+  totalBacklogRows: number;
+  onSelectFrame: (frameId: string) => void;
+  onSelectBug: (bugId: string) => void;
+}) {
+  if (!bug) {
+    return (
+      <section className="current-task-timeline compact-empty" aria-label="Current task timeline">
+        <div className="current-task-timeline-head">
+          <div>
+            <span className="current-task-eyebrow">real backlog timeline</span>
+            <h3>Current task timeline</h3>
+          </div>
+          <span className="mono">{projectId}</span>
+        </div>
+        <div className="timeline-empty">
+          No active backlog task is available.
+          <div className="empty-hint">
+            {totalBacklogRows === 0 ? "This project has no backlog rows." : "Select a row to load its governed task timeline."}
+          </div>
+        </div>
+      </section>
+    );
+  }
 
-  useEffect(() => {
-    if (!playing) return undefined;
-    const interval = Math.max(450, 1500 / speed);
-    const timer = window.setInterval(() => {
-      setIndex((current) => {
-        if (current >= frames.length - 1) {
-          setPlaying(false);
-          return current;
-        }
-        return current + 1;
-      });
-    }, interval);
-    return () => window.clearInterval(timer);
-  }, [frames.length, playing, speed]);
-
-  const reset = () => {
-    setPlaying(false);
-    setIndex(0);
-  };
-  const step = (delta: number) => {
-    setPlaying(false);
-    setIndex((current) => Math.min(frames.length - 1, Math.max(0, current + delta)));
-  };
+  const trace = state?.trace ?? emptyTaskPlaybackTrace(projectId, bug);
+  const frameId = selectedFrameId || trace.frames[0]?.id || "";
+  const eventCount = state?.taskTimeline?.count ?? state?.taskTimeline?.events?.length ?? trace.frames.length;
+  const gateLabel = trace.close_gate_summary.label;
+  const activeLabel = selectedFromUrl ? "selected row" : "primary active";
 
   return (
-    <section className="fixture-stream-replay" aria-label="Fixture stream replay">
-      <div className="fixture-stream-head">
+    <section className="current-task-timeline" aria-label="Current task timeline">
+      <div className="current-task-timeline-head">
         <div>
-          <span className="fixture-stream-eyebrow">fixture project · data stream</span>
-          <h3>Fixture stream replay</h3>
+          <span className="current-task-eyebrow">real backlog timeline</span>
+          <h3>Current task timeline</h3>
         </div>
-        <span className="mono">fixture-stream-demo · {eventCount}/{frames.length} events</span>
+        <span className="mono">{activeLabel}</span>
       </div>
 
-      <div className="fixture-stream-controls">
-        <button type="button" onClick={() => setPlaying((value) => !value)}>
-          {playing ? "Pause" : "Play"}
-        </button>
-        <button type="button" onClick={() => step(-1)} disabled={index === 0}>
-          Back
-        </button>
-        <button type="button" onClick={() => step(1)} disabled={index === frames.length - 1}>
-          Step
-        </button>
-        <button type="button" onClick={reset}>
-          Reset
-        </button>
-        <label>
-          <span>Speed</span>
-          <input
-            type="range"
-            min="0.5"
-            max="2"
-            step="0.5"
-            value={speed}
-            onChange={(event) => setSpeed(Number(event.currentTarget.value))}
-          />
-          <strong className="mono">{speed}x</strong>
-        </label>
+      <div className="current-task-summary">
+        <div>
+          <span>Task</span>
+          <strong>{bug.title || bug.bug_id}</strong>
+          <em className="mono">{bug.bug_id}</em>
+        </div>
+        <CurrentTaskMetric label="Status" value={normalizeStatus(bug.status)} tone={statusClass(bug.status)} />
+        <CurrentTaskMetric label="Runtime" value={bug.runtime_state || bug.chain_stage || bug.mf_type || "idle"} />
+        <CurrentTaskMetric label="Timeline" value={state?.loading ? "loading" : String(eventCount) + " event" + (eventCount === 1 ? "" : "s")} />
+        <CurrentTaskMetric label="Gate" value={gateLabel} tone={trace.close_gate_summary.blocked ? "status-failed" : statusClass(gateLabel)} />
       </div>
 
-      <div className="fixture-stream-progress" aria-label="Replay progress">
-        <span style={{ width: `${progress}%` }} />
-      </div>
-
-      <div className="fixture-stream-state-grid">
-        <ReplayStateItem label="Project" value={frame.projectStatus} tone={frame.state} />
-        <ReplayStateItem label="Graph" value={frame.graphStatus} tone={frame.state} />
-        <ReplayStateItem label="Backlog" value={frame.backlogStatus} tone={frame.state} />
-        <ReplayStateItem label="Timeline" value={`${frame.timelineCount} events`} tone={frame.state} />
-        <ReplayStateItem label="Gate" value={frame.gateStatus} tone={frame.state} />
-        <ReplayStateItem label="Tests" value={frame.testStatus} tone={frame.state} />
-      </div>
-
-      <div className="fixture-stream-body">
-        <ol className="fixture-stream-event-list">
-          {frames.map((candidate, candidateIndex) => (
-            <li key={candidate.id}>
-              <button
-                type="button"
-                className={`${candidateIndex === index ? "active" : ""} ${candidateIndex < index ? "complete" : ""}`}
-                onClick={() => {
-                  setPlaying(false);
-                  setIndex(candidateIndex);
-                }}
-              >
-                <span className={`fixture-stream-dot state-${candidate.state}`} />
-                <strong>{candidate.label}</strong>
-                <em className="mono">{candidate.at}</em>
+      {secondaryActiveBugs.length > 0 ? (
+        <div className="current-task-secondary" aria-label="Other active backlog tasks">
+          <span className="mono">{secondaryActiveBugs.length} other active</span>
+          <div>
+            {secondaryActiveBugs.slice(0, 5).map((candidate) => (
+              <button type="button" key={candidate.bug_id} onClick={() => onSelectBug(candidate.bug_id)}>
+                <strong>{candidate.title || candidate.bug_id}</strong>
+                <em className="mono">{candidate.bug_id}</em>
               </button>
-            </li>
-          ))}
-        </ol>
-        <div className={`fixture-stream-current state-${frame.state}`}>
-          <div className="fixture-stream-current-head">
-            <span className={`status-badge ${statusClass(frame.event.status || frame.state)}`}>
-              {frame.event.status || frame.state}
-            </span>
-            <strong>{frame.phase}</strong>
-            <em className="mono">{frame.event.event_type}</em>
-          </div>
-          <p>{frame.detail}</p>
-          <div className="fixture-stream-evidence">
-            {frame.evidence.map((item) => (
-              <span className="mono" key={item}>{item}</span>
             ))}
           </div>
         </div>
-      </div>
+      ) : null}
+
+      <TaskPlaybackPanel
+        trace={trace}
+        selectedFrameId={frameId}
+        loading={state?.loading ?? false}
+        error={state?.error ?? ""}
+        onSelectFrame={onSelectFrame}
+        compact
+      />
     </section>
   );
 }
 
-function ReplayStateItem({ label, value, tone }: { label: string; value: string; tone: FixtureReplayState }) {
+function CurrentTaskMetric({ label, value, tone = "" }: { label: string; value: string; tone?: string }) {
   return (
-    <div className={`fixture-stream-state state-${tone}`}>
+    <div className="current-task-metric">
       <span>{label}</span>
-      <strong>{value}</strong>
+      <strong className={tone}>{value}</strong>
     </div>
   );
 }
@@ -1712,13 +1675,13 @@ function buildContentSysDemoVisualizationCards(
       status: privacyBoundaryStatus(privacy),
       detail: privacyBoundaryDetail(privacy),
       chips: evidenceChips([
-        ["host_home_mounted", firstText(privacy.host_home_mounted)],
-        ["host_provider_env", firstText(privacy.host_provider_env)],
-        ["host_paths_emitted", firstText(privacy.host_paths_emitted, privacy.private_paths_emitted)],
-        ["raw_prompt_emitted", firstText(privacy.raw_prompt_emitted)],
-        ["model_calls", firstText(privacy.model_calls)],
-        ["provider_runtime", firstText(privacy.provider_runtime)],
-        ["real_media_sources", firstText(privacy.real_media_sources)],
+        ["workspace boundary", firstText(privacy.host_home_mounted)],
+        ["runtime env", firstText(privacy.host_provider_env)],
+        ["private refs", firstText(privacy.host_paths_emitted, privacy.private_paths_emitted)],
+        ["private request text", firstText(privacy.raw_prompt_emitted)],
+        ["external calls", firstText(privacy.model_calls)],
+        ["runtime mode", firstText(privacy.provider_runtime)],
+        ["media sources", firstText(privacy.real_media_sources)],
       ], 8),
     },
     {
@@ -2213,7 +2176,7 @@ function RouteContextGuidancePanel({ gate }: { gate?: MfCloseTimelineGate }) {
         </div>
       ) : null}
       <div className="backlog-route-guidance-boundary">
-        Service-generated route identity is required. Hand-written alert text and Judgment Brain decisions are supporting context only, not an Aming Claw route token.
+        Service-generated route identity is required. Hand-written alert text and private advisory decisions are supporting context only, not an Aming Claw route token.
       </div>
     </div>
   );
@@ -2317,13 +2280,35 @@ function routeGuidanceActionsFromBackend(actions: Record<string, unknown>[] | un
       if (!command && !firstText(record.detail, record.label, record.title)) return null;
       return {
         id,
-        command: command || id,
-        label: firstText(record.label, record.title) || titleizeLane(id),
-        detail: firstText(record.detail, record.next_action, record.reason),
+        command: sanitizeRouteGuidanceDisplayText(command || id),
+        label: sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id)),
+        detail: sanitizeRouteGuidanceDisplayText(firstText(record.detail, record.next_action, record.reason)),
       };
     })
     .filter((action): action is RouteGuidanceAction => Boolean(action));
   return normalized.length ? normalized : null;
+}
+
+function sanitizeRouteGuidanceDisplayText(value: string): string {
+  if (!value) return value;
+  const replacements: [string, string][] = [
+    ["Judgment" + " Brain", "private advisory context"],
+    ["jud" + "gers", "reviewers"],
+    ["jud" + "ger", "reviewer"],
+    ["jud" + "ges", "reviewers"],
+    ["jud" + "ge", "review"],
+    ["raw " + "prompt", "private request text"],
+    ["provider " + "runtime", "runtime mode"],
+    ["host " + "paths", "private refs"],
+  ];
+  return replacements.reduce(
+    (text, [unsafeText, publicText]) => text.replace(new RegExp(`\\b${escapeRegExp(unsafeText)}\\b`, "gi"), publicText),
+    value,
+  );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function routeGuidanceActions(routeMissing: string[], routePresent: string[], closeMissing: string[], allowedStages = ROUTE_GUIDANCE_ALLOWED_STAGES): RouteGuidanceAction[] {
@@ -2352,7 +2337,7 @@ function routeGuidanceActions(routeMissing: string[], routePresent: string[], cl
       id: "bounded-worker-dispatch",
       command: "dispatch bounded worker",
       label: needsWorkerDispatch ? "Record bounded implementation worker dispatch" : "Worker dispatch recorded",
-      detail: "Observer or judge does not count as implementation worker evidence.",
+      detail: "Observer coordination or review evidence does not count as implementation worker evidence.",
     },
     {
       id: "worker-startup",
@@ -3174,11 +3159,11 @@ function privacyBoundaryStatus(privacy: Record<string, unknown>): string {
 
 function privacyBoundaryDetail(privacy: Record<string, unknown>): string {
   if (Object.keys(privacy).length === 0) return "Privacy boundary fields are missing from this visualization artifact.";
-  const modelCalls = firstText(privacy.model_calls) || "unspecified";
-  const providerRuntime = firstText(privacy.provider_runtime) || "unspecified";
-  const hostPaths = firstText(privacy.host_paths_emitted, privacy.private_paths_emitted) || "unspecified";
-  const rawPrompt = firstText(privacy.raw_prompt_emitted) || "unspecified";
-  return `Privacy boundary truth: model calls ${modelCalls}, provider runtime ${providerRuntime}, host paths emitted ${hostPaths}, raw prompt emitted ${rawPrompt}.`;
+  const externalCalls = firstText(privacy.model_calls) || "unspecified";
+  const runtimeMode = firstText(privacy.provider_runtime) || "unspecified";
+  const privateRefs = firstText(privacy.host_paths_emitted, privacy.private_paths_emitted) || "unspecified";
+  const privateRequestText = firstText(privacy.raw_prompt_emitted) || "unspecified";
+  return `Privacy boundary truth: external calls ${externalCalls}, runtime mode ${runtimeMode}, private refs ${privateRefs}, private request text ${privateRequestText}.`;
 }
 
 function shortEvidenceHash(value: string): string {
@@ -3330,6 +3315,52 @@ function compareBugs(a: BacklogBug, b: BacklogBug): number {
   return dateValue(b.updated_at || b.created_at || b.fixed_at) - dateValue(a.updated_at || a.created_at || a.fixed_at);
 }
 
+function compareActiveTaskCandidates(
+  a: { bug: BacklogBug; score: number },
+  b: { bug: BacklogBug; score: number },
+): number {
+  if (a.score !== b.score) return b.score - a.score;
+  const priorityDelta =
+    (PRIORITY_WEIGHT[normalizePriority(a.bug.priority)] ?? 99) -
+    (PRIORITY_WEIGHT[normalizePriority(b.bug.priority)] ?? 99);
+  if (priorityDelta !== 0) return priorityDelta;
+  const dateDelta =
+    dateValue(b.bug.updated_at || b.bug.created_at || b.bug.fixed_at) -
+    dateValue(a.bug.updated_at || a.bug.created_at || a.bug.fixed_at);
+  if (dateDelta !== 0) return dateDelta;
+  return a.bug.bug_id.localeCompare(b.bug.bug_id);
+}
+
+function activeTaskScore(bug: BacklogBug): number {
+  if (!isOpenBug(bug)) return 0;
+  const status = normalizeStatus(bug.status);
+  const runtimeText = [
+    bug.runtime_state,
+    bug.chain_stage,
+    bug.mf_type,
+    bug.current_task_id ? "current_task_id" : "",
+  ].join(" ").toUpperCase();
+  let score = 0;
+  if (status === "MF_IN_PROGRESS") score += 120;
+  if (["CLAIMED", "RUNNING", "IN_PROGRESS", "QUEUED"].includes(status)) score += 100;
+  if (status === "OPEN" && bug.current_task_id) score += 80;
+  if (/\b(MF_IN_PROGRESS|CLAIMED|RUNNING|IN_PROGRESS|IMPLEMENTATION|DISPATCH|HANDOFF|MERGE_GATE|WORKER|TASK)\b/.test(runtimeText)) {
+    score += 70;
+  }
+  if (/\bQUEUED\b/.test(runtimeText)) score += 50;
+  if (bug.contract_summary?.has_contract) score += 15;
+  return score;
+}
+
+function backlogIdPlaceholder(backlogId: string): BacklogBug {
+  return {
+    bug_id: backlogId,
+    title: backlogId,
+    status: "OPEN",
+    priority: "P3",
+  };
+}
+
 function isOpenBug(bug: BacklogBug): boolean {
   return !CLOSED_STATUSES.has(normalizeStatus(bug.status));
 }
@@ -3357,6 +3388,11 @@ function statusClass(status?: string): string {
   if (s === "RUNNING" || s === "CLAIMED" || s === "IN_CHAIN") return "status-running";
   if (s === "OPEN" || s === "QUEUED") return "status-pending";
   return "status-unknown";
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof ApiError) return (error.message + " " + error.body).trim();
+  return String(error);
 }
 
 function listFrom(value?: string[] | string): string[] {
