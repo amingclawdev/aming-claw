@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
 
 interface Props {
@@ -18,10 +20,17 @@ export default function TaskPlaybackPanel({
   compact = false,
 }: Props) {
   const selectedFrame = trace.frames.find((frame) => frame.id === selectedFrameId) ?? trace.frames[0] ?? null;
+  const selectedFrameKey = selectedFrame?.id ?? "";
+  const [advancedEvidenceOpenFrameId, setAdvancedEvidenceOpenFrameId] = useState("");
+  const advancedEvidenceOpen = Boolean(selectedFrameKey && advancedEvidenceOpenFrameId === selectedFrameKey);
   const gate = trace.close_gate_summary;
   const selectedEvidence = selectedFrame?.evidence_refs ?? [];
   const selectedArtifacts = selectedFrame?.artifact_refs ?? [];
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
+
+  useEffect(() => {
+    setAdvancedEvidenceOpenFrameId("");
+  }, [selectedFrameKey]);
 
   return (
     <section className={`task-playback-panel${compact ? " compact" : ""}`} aria-label="Task playback trace">
@@ -118,6 +127,8 @@ export default function TaskPlaybackPanel({
                 evidence={selectedEvidence}
                 artifacts={selectedArtifacts}
                 inspector={selectedInspector}
+                open={advancedEvidenceOpen}
+                onOpenChange={(open) => setAdvancedEvidenceOpenFrameId(open ? selectedFrameKey : "")}
               />
             </article>
           ) : null}
@@ -186,15 +197,19 @@ function AdvancedEvidenceDetails({
   evidence,
   artifacts,
   inspector,
+  open,
+  onOpenChange,
 }: {
   evidence: TaskPlaybackFrame["evidence_refs"];
   artifacts: TaskPlaybackFrame["artifact_refs"];
   inspector: TaskPlaybackFrame["detail_inspector"] | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
 }) {
   const hasEvidence = evidence.length > 0 || artifacts.length > 0 || inspector;
   if (!hasEvidence) return null;
   return (
-    <details className="backlog-inspector-raw task-playback-inspector">
+    <details className="backlog-inspector-raw task-playback-inspector" open={open} onToggle={(event) => onOpenChange(event.currentTarget.open)}>
       <summary>Advanced evidence / Details</summary>
       {evidence.length > 0 ? <ChipSection title="Evidence refs" values={evidence.map((ref) => `${ref.label}: ${ref.value}`)} /> : null}
       {artifacts.length > 0 ? <ChipSection title="Artifacts" values={artifacts.map((ref) => `${ref.kind}: ${ref.value}`)} /> : null}

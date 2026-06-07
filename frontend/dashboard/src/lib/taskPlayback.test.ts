@@ -374,6 +374,9 @@ export function taskPlaybackHistoricalSemanticFixtureAssertions(): string[] {
 
 export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   const trace = buildTaskPlaybackNarrativeFocusFixture();
+  const promptContextFrame = trace.frames.find((frame) => frame.title === "Prompt context requested");
+  const routeActionFrame = trace.frames.find((frame) => frame.title === "Route action requested");
+  const serviceRouteFrame = trace.frames.find((frame) => frame.title === "Route service completed");
   const visible = JSON.stringify({
     close_gate_summary: trace.close_gate_summary,
     frames: trace.frames.map((frame) => ({
@@ -384,6 +387,10 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       inspector: frame.detail_inspector,
     })),
   });
+  assertFixture(Boolean(promptContextFrame), "route prompt context frame should exist in the narrative fixture");
+  assertFixture(Boolean(routeActionFrame), "route action frame should exist in the narrative fixture");
+  assertFixture(Boolean(serviceRouteFrame), "route service frame should exist in the narrative fixture");
+  if (!promptContextFrame || !routeActionFrame || !serviceRouteFrame) throw new Error("missing route narrative fixture frames");
   assertFixture(
     trace.close_gate_summary.reason_sentence === "Blocked because implementation, verification, and close-ready evidence have not been recorded; the close gate cannot pass until those events exist.",
     "blocked close gate should show a human-readable reason sentence with missing event kinds",
@@ -393,10 +400,34 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
     "blocked close gate should show the next expected evidence/action",
   );
   assertFixture(
+    promptContextFrame.detail.includes("public task scope") && promptContextFrame.detail.includes("target files"),
+    "route prompt context detail should explain what context was requested",
+  );
+  assertFixture(
+    promptContextFrame.narrative.context.includes("receiving actor") && promptContextFrame.narrative.outcome.includes("close-gate blocker remains visible"),
+    "route prompt context narrative should explain who receives context and what is still missing",
+  );
+  assertFixture(
+    promptContextFrame.semantic_chips.some((chip) => chip.label === "target file" && chip.value === "frontend/dashboard/src/lib/taskPlayback.ts"),
+    "route prompt context chips should show public target file context",
+  );
+  assertFixture(
+    promptContextFrame.semantic_chips.some((chip) => chip.label === "required evidence" && chip.value === "implementation"),
+    "route prompt context chips should show required evidence context",
+  );
+  assertFixture(
+    routeActionFrame.detail.includes("authorized or blocked") && routeActionFrame.narrative.outcome.includes("close-ready evidence"),
+    "route action narrative should explain authorization and remaining evidence",
+  );
+  assertFixture(
+    serviceRouteFrame.detail.includes("evidence implications") && serviceRouteFrame.narrative.outcome.includes("close-gate banner"),
+    "route service completion narrative should explain action outcome and missing evidence",
+  );
+  assertFixture(
     visible.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."),
     "route/context worker story should be visible",
   );
-  assertFixture(visible.includes("Route service requested or delivered bounded task context."), "route context actor story should be visible");
+  assertFixture(visible.includes("Route service requested or delivered bounded task context for the next observer or worker lane."), "route context actor story should be visible");
   assertFixture(visible.includes("Route service completed"), "route service completion should be readable");
   assertFixture(visible.includes("Route evidence blocked"), "route waiver/blocker rows should be readable");
   assertFixture(visible.includes("waiver-only evidence"), "route waiver narrative should explain the evidence implication");

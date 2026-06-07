@@ -77,21 +77,23 @@
       "id": "service.route.completed",
       "match": { "event_type": ["service.route.completed", "route.service.completed", "service.route.action_completed"] },
       "title": "Route service completed",
-      "detail": "The route service finished a scoped action check and recorded the public actor, action, outcome, and next implication.",
+      "detail": "The route service completed a scoped action check for the next observer or worker step and recorded the public service, action, decision, route identity hashes, and evidence implications.",
       "lane": "observer",
       "actor": "Route service",
       "narrative": {
-        "actor": "Route service evaluated the requested governance action for the observer or worker lane.",
-        "information": "It recorded the public service id, action, decision, and route identity hashes when present.",
-        "context": "The visible context is limited to route ids, hashes, action labels, and request ids; private route context bodies are not displayed.",
-        "purpose": "This tells a developer which action was checked and why the next governed step can proceed or must stay blocked.",
-        "outcome": "The outcome is the service decision: allowed actions can continue, while blocked actions need the missing evidence named by the gate."
+        "actor": "Route service completed a scoped governance action check for the observer or worker lane.",
+        "information": "It recorded the public service id, requested action, decision, source event, and route identity hashes when present.",
+        "context": "The visible context is limited to route ids, hashes, action labels, request ids, and source event names; private route context bodies are not displayed.",
+        "purpose": "This tells a developer which action was completed, which actor can use the result, and whether the next governed step can proceed.",
+        "outcome": "Allowed actions can continue under this route context; blocked or incomplete actions still need the missing evidence named by the close-gate banner."
       },
       "chip_paths": [
         { "label": "service", "path": "payload.service_id" },
         { "label": "action", "path": "payload.result.route_action_gate.action" },
         { "label": "decision", "path": "payload.decision" },
+        { "label": "source event", "path": "payload.source_event_type" },
         { "label": "route", "path": "payload.route_id" },
+        { "label": "route hash", "path": "payload.route_context_hash" },
         { "label": "status", "path": "status" },
         { "label": "phase", "path": "phase" }
       ],
@@ -154,19 +156,22 @@
         "event_kind": ["route_context"]
       },
       "title": "Prompt context requested",
-      "detail": "The route service prepared bounded task context for a worker or observer and kept private prompt and route bodies out of view.",
+      "detail": "The route service prepared public task scope for the next observer or bounded worker: target files, acceptance criteria, required evidence, and route identity hashes; private prompt and route bodies stay hidden.",
       "lane": "observer",
       "actor": "Route service",
       "narrative": {
-        "actor": "Route service requested or delivered bounded task context.",
+        "actor": "Route service requested or delivered bounded task context for the next observer or worker lane.",
         "information": "It obtained public task scope such as target files, acceptance criteria, required evidence, route id, prompt contract id, and visible manifest hash when present.",
-        "context": "The context tells the worker or observer what can be done and what evidence is required; private prompt text and route context bodies are hidden.",
+        "context": "The context tells the receiving actor what can be done, which files or criteria are in scope, and what evidence the close gate still expects; private prompt text and route context bodies are hidden.",
         "purpose": "This gives the next actor enough public-safe scope to dispatch, implement, or verify without exposing private route material.",
-        "outcome": "The next implication is a protected dispatch or action request that must reference this route context."
+        "outcome": "The next implication is a protected dispatch or action request; until implementation, verification, and close-ready events exist, the close-gate blocker remains visible."
       },
       "chip_paths": [
         { "label": "intent", "path": "payload.intent" },
         { "label": "topology", "path": "payload.selected_topology" },
+        { "label": "target file", "path": "payload.target_files" },
+        { "label": "acceptance criterion", "path": "payload.acceptance_criteria" },
+        { "label": "required evidence", "path": "payload.required_evidence" },
         { "label": "route", "path": "payload.route_id" },
         { "label": "prompt contract", "path": "payload.prompt_contract_id" },
         { "label": "prompt contract", "path": "payload.prompt_contract.prompt_contract_id" },
@@ -183,6 +188,8 @@
       "detail_paths": [
         { "label": "stage", "path": "payload.stage" },
         { "label": "route hash", "path": "payload.route_context_hash" },
+        { "label": "target file", "path": "payload.target_files" },
+        { "label": "required evidence", "path": "payload.required_evidence" },
         { "label": "task", "path": "task_id" }
       ]
     },
@@ -193,15 +200,15 @@
         "event_kind": ["route_action", "route_action_precheck"]
       },
       "title": "Route action requested",
-      "detail": "A route action check recorded who requested the action, what action was checked, whether it was allowed, and what comes next.",
+      "detail": "A route action check recorded who requested the governed action, which action was authorized or blocked, what route evidence changed, and what evidence must appear before close.",
       "lane": "observer",
       "actor": "Route service",
       "narrative": {
         "actor": "Route service checked a scoped governance action for the requesting actor.",
-        "information": "It produced action-precheck evidence for the action, stage, allowed action, status, route hash, and backlog/task scope when present.",
+        "information": "It produced action-precheck evidence for the requested action, allowed action, stage, decision, route hash, and backlog/task scope when present.",
         "context": "The action request carries public route identity and allowed-action metadata; route tokens and private route bodies are not displayed.",
-        "purpose": "This explains whether the next mutation, dispatch, or evidence append is allowed to proceed.",
-        "outcome": "Allowed actions can continue under the route context; blocked actions need the missing route or worker evidence before the task can move forward."
+        "purpose": "This explains whether the next mutation, dispatch, or evidence append is allowed to proceed and which public route evidence supports it.",
+        "outcome": "Allowed actions can continue under the route context; blocked actions need the missing route, worker, implementation, verification, or close-ready evidence before the task can close."
       },
       "chip_paths": [
         { "label": "service", "path": "payload.service_id" },
@@ -211,6 +218,7 @@
         { "label": "decision", "path": "payload.decision" },
         { "label": "decision", "path": "payload.route_status" },
         { "label": "stage", "path": "payload.stage" },
+        { "label": "route hash", "path": "payload.route_context_hash" },
         { "label": "status", "path": "status" }
       ],
       "evidence_paths": [
@@ -221,6 +229,8 @@
       "detail_paths": [
         { "label": "command", "path": "payload.command" },
         { "label": "request", "path": "payload.request_id" },
+        { "label": "required evidence", "path": "payload.required_evidence" },
+        { "label": "missing event kinds", "path": "payload.missing_event_kinds" },
         { "label": "backlog", "path": "backlog_id" }
       ]
     },
