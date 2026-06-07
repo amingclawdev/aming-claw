@@ -857,7 +857,8 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");
   assert(playbackViewSource.includes("inFlightPlaybackKeysRef"), "Playback loading should track in-flight governed requests outside render state");
   assert(!playbackViewSource.includes("[playbackByBug, projectId, selectedBug]"), "Playback loading effect must not depend on full playback state");
-  assert(playbackViewSource.includes("[projectId, selectedBugId]"), "Playback loading effect should be keyed by project and selected backlog id");
+  assert(playbackViewSource.includes("selectedLoadBugId = selectedBug?.bug_id"), "Playback loading should wait for URL-selected backlog data to become available");
+  assert(playbackViewSource.includes("[projectId, selectedLoadBugId]"), "Playback loading effect should be keyed by project and selected backlog availability");
   assert(playbackViewSource.includes("Gate candidates"), "Playback selector should expose a gate-oriented filter");
   assert(playbackViewSource.includes("PLAYBACK_BACKLOG_PARAM"), "Playback row selection should be URL-addressable");
   assert(playbackPanelSource.includes("No governed timeline events"), "Playback panel should expose the no-timeline state");

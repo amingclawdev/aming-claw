@@ -85,6 +85,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const selectedState = selectedBugId ? playbackByBug[selectedBugId] : undefined;
   const activeTrace = selectedState?.trace ?? (selectedBug ? emptyTaskPlaybackTrace(projectId, selectedBug) : fallbackTrace);
   const activeFrameId = selectedFrameId || activeTrace.frames[0]?.id || "";
+  const selectedLoadBugId = selectedBug?.bug_id || "";
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -113,8 +114,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
 
   useEffect(() => {
     const bug = selectedBugRef.current;
-    if (!selectedBugId || !bug || bug.bug_id !== selectedBugId) return;
-    const bugId = bug.bug_id;
+    if (!selectedLoadBugId || !bug || bug.bug_id !== selectedLoadBugId) return;
+    const bugId = selectedLoadBugId;
     const requestKey = `${projectId}:${bugId}`;
     const currentState = playbackByBugRef.current[bugId];
     if (currentState?.loaded || currentState?.loading || inFlightPlaybackKeysRef.current.has(requestKey)) return;
@@ -185,7 +186,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         inFlightPlaybackKeysRef.current.delete(requestKey);
         playbackControllersRef.current.delete(requestKey);
       });
-  }, [projectId, selectedBugId]);
+  }, [projectId, selectedLoadBugId]);
 
   useEffect(() => {
     if (!playing || activeTrace.frames.length <= 1) return undefined;
