@@ -21,6 +21,7 @@ export default function TaskPlaybackPanel({
   const gate = trace.close_gate_summary;
   const selectedEvidence = selectedFrame?.evidence_refs ?? [];
   const selectedArtifacts = selectedFrame?.artifact_refs ?? [];
+  const selectedInspector = selectedFrame?.detail_inspector ?? null;
 
   return (
     <section className={`task-playback-panel${compact ? " compact" : ""}`} aria-label="Task playback trace">
@@ -107,11 +108,16 @@ export default function TaskPlaybackPanel({
               <div className="task-playback-current-meta">
                 <span>{selectedFrame.actor}</span>
                 <span className="mono">{selectedFrame.event_type}</span>
+                <span className="mono">{selectedFrame.phase}</span>
                 <span className="mono">{selectedFrame.source_event_id}</span>
               </div>
               <p>{selectedFrame.detail}</p>
+              {selectedFrame.semantic_chips.length > 0 ? (
+                <ChipSection title="Public event facts" values={selectedFrame.semantic_chips.map((chip) => `${chip.label}: ${chip.value}`)} />
+              ) : null}
               {selectedEvidence.length > 0 ? <ChipSection title="Evidence refs" values={selectedEvidence.map((ref) => `${ref.label}: ${ref.value}`)} /> : null}
               {selectedArtifacts.length > 0 ? <ChipSection title="Artifacts" values={selectedArtifacts.map((ref) => `${ref.kind}: ${ref.value}`)} /> : null}
+              {selectedInspector ? <SafeEvidenceInspector inspector={selectedInspector} compact={compact} /> : null}
             </article>
           ) : null}
         </div>
@@ -148,6 +154,46 @@ function ChipSection({ title, values }: { title: string; values: string[] }) {
       </div>
     </div>
   );
+}
+
+function SafeEvidenceInspector({
+  inspector,
+  compact,
+}: {
+  inspector: NonNullable<TaskPlaybackFrame["detail_inspector"]>;
+  compact: boolean;
+}) {
+  return (
+    <details className="backlog-inspector-raw task-playback-inspector" open={!compact}>
+      <summary>Safe evidence inspector</summary>
+      <div className="backlog-inspector-grid">
+        {inspector.rows.slice(0, 18).map((row) => (
+          <div key={`${row.kind}:${row.label}:${row.value}`}>
+            <span>{row.label}</span>
+            <strong className="mono">{row.value}</strong>
+          </div>
+        ))}
+        {inspector.redaction_count > 0 ? (
+          <div>
+            <span>redactions</span>
+            <strong className="mono">{inspector.redaction_count}</strong>
+          </div>
+        ) : null}
+      </div>
+      <div className="backlog-inspector-json">
+        {inspector.raw_sections.map((section) => (
+          <div key={section.label}>
+            <span>{section.redacted ? `${section.label} redacted` : section.label}</span>
+            <pre>{formatInspectorValue(section.value)}</pre>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function formatInspectorValue(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value ?? {}, null, 2);
 }
 
 function formatFrameTime(frame: TaskPlaybackFrame): string {

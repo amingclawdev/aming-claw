@@ -786,6 +786,9 @@ function verifyBacklogEvidenceContract() {
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
   const sseSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/sse.ts"), "utf8");
   const playbackSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.ts"), "utf8");
+  const semanticSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskTimelineSemantics.ts"), "utf8");
+  const semanticCatalogSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskTimelineSemanticCatalog.json"), "utf8");
+  const playbackTestSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.test.ts"), "utf8");
   const playbackPanelSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TaskPlaybackPanel.tsx"), "utf8");
   const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
   const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.tsx"), "utf8");
@@ -851,7 +854,7 @@ function verifyBacklogEvidenceContract() {
     assert(!viewSource.includes(forbidden), `Backlog public UI must not expose private wording: ${forbidden}`);
   }
   assert(viewSource.includes("Frontend display contract"), "Evidence inspector should surface frontend display contract");
-  assert(viewSource.includes("Inspect raw timeline payloads"), "Raw timeline payloads should remain inspectable without being the primary evidence surface");
+  assert(viewSource.includes("Inspect public timeline details"), "Timeline payload details should remain inspectable through the public-safe evidence surface");
   assert(viewSource.includes("relatedIdsFromBug"), "Backlog detail should discover related backlog ids");
   assert(viewSource.includes("BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS"), "Backlog detail should include a deterministic parallel-lane fixture");
   assert(viewSource.includes("CurrentTaskTimelinePanel"), "Backlog view should render a current task timeline panel");
@@ -916,11 +919,42 @@ function verifyBacklogEvidenceContract() {
   assert(!playbackPanelSource.includes("Host paths redacted"), "Task playback panel must not render private host-path wording");
   assert(playbackSource.includes("task_playback_trace.v1"), "Task playback should normalize to task_playback_trace.v1");
   assert(playbackSource.includes("normalizeTaskPlaybackTrace"), "Task playback normalizer should be exported");
+  assert(playbackSource.includes("projectTaskTimelineEvent"), "Task playback normalizer should use the shared task timeline semantic projection");
+  assert(viewSource.includes("projectTaskTimelineEvent"), "Backlog detail timeline should use the shared task timeline semantic projection");
+  assert(semanticSource.includes("task_timeline_semantic_projection.v1"), "Task timeline semantics should expose a stable projection schema");
+  assert(semanticSource.includes("sanitizeTimelineInspectorValue"), "Task timeline semantics should sanitize evidence inspector raw sections");
+  assert(semanticCatalogSource.includes("task_timeline_semantic_catalog.v1"), "Task timeline semantics should be backed by a repo-owned JSON catalog");
+  [
+    "route_token_gate.task_timeline_append",
+    "service.route.completed",
+    "mf_subagent.startup",
+    "route.prompt_context.requested",
+    "route.action.requested",
+    "mf_subagent.read_receipt",
+    "route_token_gate.backlog_close",
+    "route_token_gate.backlog_upsert",
+    "mf_subagent.dispatch",
+    "implementation",
+    "verification",
+    "independent_verification.completed",
+    "observer.close_ready",
+    "mf.close_ready",
+    "close_ready",
+  ].forEach((eventFamily) => {
+    assert(semanticCatalogSource.includes(eventFamily), `Semantic catalog should cover ${eventFamily}`);
+  });
+  assert(semanticCatalogSource.includes("System timeline event"), "Unknown timeline events should use the clearer System timeline event fallback");
+  assert(playbackPanelSource.includes("Safe evidence inspector"), "Task playback panel should expose a clickable public-safe evidence inspector");
+  assert(playbackPanelSource.includes("raw_sections"), "Task playback panel should show sanitized/redacted raw evidence sections");
+  assert(viewSource.includes("redaction_count"), "Backlog evidence inspector should report redacted raw timeline fields");
+  assert(playbackTestSource.includes("AC-OBSERVER-COMMAND-QUEUE-ACTIVE-CONSUMER-RECOVERY-20260607"), "Task playback fixture should cover the observer command recovery backlog");
+  assert(playbackTestSource.includes("AC-DOGFOOD-OBSERVER-ONLY-COMMAND-STARTUP-GATE-20260607"), "Task playback fixture should cover the observer-only startup gate backlog");
+  assert(playbackTestSource.includes("System timeline event"), "Task playback fixture should prove unknown events use the system fallback");
   assert(playbackSource.includes("fallback_sample"), "Task playback fixture data should be marked as fallback sample");
   assert(playbackSource.includes("host_private_paths: \"redacted\""), "Task playback privacy boundary should redact host-private paths");
   assert(playbackSource.includes("PRIVATE_EVIDENCE_KEY"), "Task playback normalizer should filter private evidence keys");
-  assert(playbackSource.includes("judgment[-_\\s]?brain") && playbackSource.includes("judge[-_\\s]?(private|route"), "Task playback normalizer should filter private judge labels");
-  assert(playbackSource.includes("judge[-_\\s]?mode") && playbackSource.includes("ac[-_]judge"), "Task playback normalizer should filter judge-mode backlog labels");
+  assert(semanticSource.includes("judgment[-_\\s]?brain") && semanticSource.includes("judge[-_\\s]?(private|route"), "Task timeline semantics should filter private judge labels");
+  assert(semanticSource.includes("judge[-_\\s]?mode") && semanticSource.includes("ac[-_]judge"), "Task timeline semantics should filter judge-mode backlog labels");
   assert(playbackSource.includes("isPrivatePlaybackText"), "Task playback privacy classifier should be exported for selector filtering");
   assert(playbackViewSource.includes("api.taskTimelineFor"), "Playback selection should fetch governed task timeline data");
   assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");

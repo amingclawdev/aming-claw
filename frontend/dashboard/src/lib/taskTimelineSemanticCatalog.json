@@ -1,0 +1,425 @@
+{
+  "schema_version": "task_timeline_semantic_catalog.v1",
+  "fallback": {
+    "title": "System timeline event",
+    "detail": "A governance timeline event was recorded. Public fields are shown in the detail chips.",
+    "chip_paths": [
+      { "label": "event type", "path": "event_type" },
+      { "label": "event kind", "path": "event_kind" },
+      { "label": "phase", "path": "phase" },
+      { "label": "status", "path": "status" },
+      { "label": "actor", "path": "actor" }
+    ],
+    "evidence_paths": [
+      { "kind": "timeline_event", "label": "event", "path": "event_id" },
+      { "kind": "graph_trace", "label": "trace", "path": "trace_id" },
+      { "kind": "commit", "label": "commit", "path": "commit_sha" }
+    ],
+    "artifact_paths": [],
+    "detail_paths": [
+      { "label": "task", "path": "task_id" },
+      { "label": "backlog", "path": "backlog_id" },
+      { "label": "correlation", "path": "correlation_id" }
+    ]
+  },
+  "status_labels": {
+    "accepted": "accepted",
+    "acknowledged": "acknowledged",
+    "blocked": "blocked",
+    "complete": "complete",
+    "completed": "completed",
+    "failed": "failed",
+    "missing": "missing",
+    "passed": "passed",
+    "pending": "pending",
+    "queued": "queued",
+    "ready": "ready",
+    "recorded": "recorded",
+    "requested": "requested",
+    "running": "running",
+    "started": "started",
+    "upserted": "upserted"
+  },
+  "templates": [
+    {
+      "id": "route_token_gate.task_timeline_append",
+      "match": { "event_type": ["route_token_gate.task_timeline_append"] },
+      "title": "Timeline append authorized",
+      "detail": "The route token gate authorized a public task timeline append.",
+      "lane": "gate",
+      "actor": "Route token gate",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "phase", "path": "phase" },
+        { "label": "route", "path": "payload.route_id" },
+        { "label": "route hash", "path": "payload.route_context_hash" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "graph_trace", "label": "trace", "path": "trace_id" },
+        { "kind": "gate", "label": "gate", "path": "status" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "task", "path": "task_id" },
+        { "label": "backlog", "path": "backlog_id" },
+        { "label": "allowed event kind", "path": "payload.event_kind" }
+      ]
+    },
+    {
+      "id": "service.route.completed",
+      "match": { "event_type": ["service.route.completed"] },
+      "title": "Route service completed",
+      "detail": "A route-service step completed and emitted public completion evidence.",
+      "lane": "observer",
+      "actor": "Route service",
+      "chip_paths": [
+        { "label": "route", "path": "payload.route_id" },
+        { "label": "status", "path": "status" },
+        { "label": "phase", "path": "phase" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "graph_trace", "label": "trace", "path": "trace_id" },
+        { "kind": "gate", "label": "route hash", "path": "payload.route_context_hash" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "route action", "path": "payload.action" },
+        { "label": "result", "path": "payload.result" },
+        { "label": "request", "path": "payload.request_id" }
+      ]
+    },
+    {
+      "id": "mf_subagent.startup",
+      "match": { "event_type": ["mf_subagent.startup"] },
+      "title": "Worker startup recorded",
+      "detail": "A bounded manual-fix worker started inside its assigned lane.",
+      "lane": "worker",
+      "actor": "Bounded worker",
+      "chip_paths": [
+        { "label": "worker", "path": "payload.worker_id" },
+        { "label": "lane", "path": "payload.lane" },
+        { "label": "branch", "path": "payload.branch" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "fence", "path": "payload.fence_id" }
+      ],
+      "artifact_paths": [
+        { "kind": "file", "path": "payload.owned_files" }
+      ],
+      "detail_paths": [
+        { "label": "task", "path": "task_id" },
+        { "label": "parent", "path": "payload.parent_task_id" },
+        { "label": "target head", "path": "payload.target_head_commit" }
+      ]
+    },
+    {
+      "id": "route.prompt_context.requested",
+      "match": { "event_type": ["route.prompt_context.requested"] },
+      "title": "Prompt context requested",
+      "detail": "The route service requested prompt context; raw private request text is not displayed.",
+      "lane": "observer",
+      "actor": "Route service",
+      "chip_paths": [
+        { "label": "route", "path": "payload.route_id" },
+        { "label": "prompt contract", "path": "payload.prompt_contract_id" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "prompt hash", "path": "payload.prompt_contract_hash" },
+        { "kind": "gate", "label": "visible manifest", "path": "payload.visible_injection_manifest_hash" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "stage", "path": "payload.stage" },
+        { "label": "route hash", "path": "payload.route_context_hash" },
+        { "label": "task", "path": "task_id" }
+      ]
+    },
+    {
+      "id": "route.action.requested",
+      "match": { "event_type": ["route.action.requested"] },
+      "title": "Route action requested",
+      "detail": "A public route action was requested after route prechecks.",
+      "lane": "observer",
+      "actor": "Route service",
+      "chip_paths": [
+        { "label": "action", "path": "payload.action" },
+        { "label": "stage", "path": "payload.stage" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "route hash", "path": "payload.route_context_hash" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "command", "path": "payload.command" },
+        { "label": "request", "path": "payload.request_id" },
+        { "label": "backlog", "path": "backlog_id" }
+      ]
+    },
+    {
+      "id": "mf_subagent.read_receipt",
+      "match": { "event_type": ["mf_subagent.read_receipt"] },
+      "title": "Worker read receipt",
+      "detail": "The bounded worker acknowledged its public task contract.",
+      "lane": "worker",
+      "actor": "Bounded worker",
+      "chip_paths": [
+        { "label": "worker", "path": "payload.worker_id" },
+        { "label": "receipt", "path": "payload.receipt_id" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "contract hash", "path": "payload.contract_hash" }
+      ],
+      "artifact_paths": [
+        { "kind": "file", "path": "payload.owned_files" }
+      ],
+      "detail_paths": [
+        { "label": "accepted files", "path": "payload.accepted_files" },
+        { "label": "task", "path": "task_id" }
+      ]
+    },
+    {
+      "id": "route_token_gate.backlog_close",
+      "match": { "event_type": ["route_token_gate.backlog_close"] },
+      "title": "Backlog close gate checked",
+      "detail": "The route token gate checked a backlog close request.",
+      "lane": "gate",
+      "actor": "Route token gate",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "backlog", "path": "backlog_id" },
+        { "label": "route", "path": "payload.route_id" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "close gate", "path": "payload.close_gate_status" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "missing event kinds", "path": "payload.missing_event_kinds" },
+        { "label": "can close", "path": "payload.can_close" }
+      ]
+    },
+    {
+      "id": "route_token_gate.upsert",
+      "match": { "event_type": ["route_token_gate.upsert", "route_token_gate.backlog_upsert"] },
+      "title": "Backlog upsert authorized",
+      "detail": "The route token gate authorized a public backlog upsert.",
+      "lane": "gate",
+      "actor": "Route token gate",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "backlog", "path": "backlog_id" },
+        { "label": "route", "path": "payload.route_id" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "upsert", "path": "payload.upsert_id" }
+      ],
+      "artifact_paths": [
+        { "kind": "file", "path": "payload.target_files" }
+      ],
+      "detail_paths": [
+        { "label": "operation", "path": "payload.operation" },
+        { "label": "priority", "path": "payload.priority" }
+      ]
+    },
+    {
+      "id": "mf_subagent.dispatch",
+      "match": { "event_type": ["mf_subagent.dispatch", "mf_subagent.dispatched"] },
+      "title": "Worker dispatch recorded",
+      "detail": "The observer dispatched a bounded worker with public file-fence evidence.",
+      "lane": "observer",
+      "actor": "Observer",
+      "chip_paths": [
+        { "label": "worker", "path": "payload.worker_id" },
+        { "label": "lane", "path": "payload.lane" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "dispatch gate", "path": "payload.dispatch_gate_status" },
+        { "kind": "graph_trace", "label": "graph trace", "path": "payload.graph_query_trace_ids" }
+      ],
+      "artifact_paths": [
+        { "kind": "file", "path": "payload.owned_files" },
+        { "kind": "file", "path": "payload.target_files" }
+      ],
+      "detail_paths": [
+        { "label": "task", "path": "task_id" },
+        { "label": "branch", "path": "payload.branch" }
+      ]
+    },
+    {
+      "id": "implementation",
+      "match": { "event_kind": ["implementation"], "phase": ["implementation"] },
+      "title": "Implementation evidence",
+      "detail": "Implementation work was recorded with public code, node, or test evidence.",
+      "lane": "worker",
+      "actor": "Bounded worker",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "phase", "path": "phase" },
+        { "label": "worker", "path": "payload.worker_id" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "graph_trace", "label": "graph trace", "path": "payload.graph_query_trace_ids" },
+        { "kind": "node", "label": "node", "path": "payload.inspected_node_ids" },
+        { "kind": "commit", "label": "commit", "path": "commit_sha" }
+      ],
+      "artifact_paths": [
+        { "kind": "file", "path": "payload.changed_files" },
+        { "kind": "file", "path": "payload.target_files" },
+        { "kind": "test", "path": "payload.tests_run" },
+        { "kind": "test", "path": "verification.tests_run" }
+      ],
+      "detail_paths": [
+        { "label": "changed files", "path": "payload.changed_files" },
+        { "label": "tests", "path": "payload.tests_run" },
+        { "label": "result", "path": "verification.status" }
+      ]
+    },
+    {
+      "id": "verification",
+      "match": { "event_kind": ["verification"], "phase": ["verification"] },
+      "title": "Verification evidence",
+      "detail": "Verification was recorded with public test or gate evidence.",
+      "lane": "verification",
+      "actor": "Verification",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "passed", "path": "verification.passed" },
+        { "label": "phase", "path": "phase" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "test", "label": "test", "path": "verification.tests_run" },
+        { "kind": "gate", "label": "gate", "path": "verification.status" }
+      ],
+      "artifact_paths": [
+        { "kind": "test", "path": "payload.tests_run" },
+        { "kind": "test", "path": "verification.tests_run" },
+        { "kind": "screenshot", "path": "payload.screenshots" }
+      ],
+      "detail_paths": [
+        { "label": "checks", "path": "verification.checks" },
+        { "label": "warnings", "path": "verification.warnings" },
+        { "label": "errors", "path": "verification.errors" }
+      ]
+    },
+    {
+      "id": "independent_verification.completed",
+      "match": { "event_type": ["independent_verification.completed"] },
+      "title": "Independent verification completed",
+      "detail": "An independent verification lane completed and recorded public evidence.",
+      "lane": "verification",
+      "actor": "Independent verification",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "verifier", "path": "payload.verifier" },
+        { "label": "passed", "path": "verification.passed" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "graph_trace", "label": "graph trace", "path": "payload.graph_query_trace_ids" },
+        { "kind": "test", "label": "test", "path": "verification.tests_run" }
+      ],
+      "artifact_paths": [
+        { "kind": "test", "path": "verification.tests_run" },
+        { "kind": "file", "path": "payload.changed_files" }
+      ],
+      "detail_paths": [
+        { "label": "result", "path": "payload.result" },
+        { "label": "notes", "path": "payload.public_summary" }
+      ]
+    },
+    {
+      "id": "observer.close_ready",
+      "match": { "event_type": ["observer.close_ready"] },
+      "title": "Observer close-ready evidence",
+      "detail": "The observer recorded public close-ready evidence for review.",
+      "lane": "gate",
+      "actor": "Observer",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "backlog", "path": "backlog_id" },
+        { "label": "phase", "path": "phase" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "commit", "label": "commit", "path": "commit_sha" },
+        { "kind": "gate", "label": "close", "path": "payload.close_gate_status" }
+      ],
+      "artifact_paths": [
+        { "kind": "test", "path": "payload.tests_run" },
+        { "kind": "file", "path": "payload.changed_files" }
+      ],
+      "detail_paths": [
+        { "label": "tests", "path": "payload.tests_run" },
+        { "label": "e2e", "path": "payload.e2e_status" }
+      ]
+    },
+    {
+      "id": "mf.close_ready",
+      "match": { "event_type": ["mf.close_ready"] },
+      "title": "Manual fix close-ready evidence",
+      "detail": "Manual-fix close-ready evidence was recorded for the backlog row.",
+      "lane": "gate",
+      "actor": "Aming Claw gate",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "backlog", "path": "backlog_id" },
+        { "label": "phase", "path": "phase" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "commit", "label": "commit", "path": "commit_sha" },
+        { "kind": "gate", "label": "precommit", "path": "payload.precommit_status" }
+      ],
+      "artifact_paths": [
+        { "kind": "test", "path": "payload.tests_run" },
+        { "kind": "file", "path": "payload.changed_files" }
+      ],
+      "detail_paths": [
+        { "label": "verification", "path": "payload.verification_status" },
+        { "label": "risk", "path": "payload.risk" }
+      ]
+    },
+    {
+      "id": "close_ready",
+      "match": { "event_type": ["close_ready"], "event_kind": ["close_ready"], "phase": ["close_ready"] },
+      "title": "Close-ready evidence",
+      "detail": "Close-ready evidence was recorded for this task timeline.",
+      "lane": "gate",
+      "actor": "Aming Claw gate",
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "backlog", "path": "backlog_id" },
+        { "label": "phase", "path": "phase" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "commit", "label": "commit", "path": "commit_sha" },
+        { "kind": "gate", "label": "close", "path": "payload.close_gate_status" }
+      ],
+      "artifact_paths": [
+        { "kind": "test", "path": "payload.tests_run" },
+        { "kind": "file", "path": "payload.changed_files" }
+      ],
+      "detail_paths": [
+        { "label": "missing event kinds", "path": "payload.missing_event_kinds" },
+        { "label": "can close", "path": "payload.can_close" }
+      ]
+    }
+  ]
+}

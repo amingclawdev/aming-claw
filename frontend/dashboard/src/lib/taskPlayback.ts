@@ -1,4 +1,14 @@
 import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
+import {
+  PRIVATE_TIMELINE_TEXT_KEY,
+  isPrivateTimelineText,
+  projectTaskTimelineEvent,
+  sanitizePublicTimelineText,
+  timelineStatusFromEvent,
+  type TaskTimelineEvidenceInspector,
+  type TaskTimelineSemanticChip,
+  type TaskTimelineSemanticProjection,
+} from "./taskTimelineSemantics";
 
 export const TASK_PLAYBACK_TRACE_SCHEMA = "task_playback_trace.v1";
 
@@ -25,10 +35,14 @@ export interface TaskPlaybackFrame {
   source_event_id: string;
   event_type: string;
   event_kind: string;
+  phase: string;
   title: string;
   detail: string;
   status: TaskPlaybackFrameStatus;
   actor: string;
+  semantic_entry_id: string;
+  semantic_chips: TaskTimelineSemanticChip[];
+  detail_inspector: TaskTimelineEvidenceInspector;
   evidence_refs: TaskPlaybackEvidenceRef[];
   artifact_refs: TaskPlaybackArtifactRef[];
 }
@@ -94,11 +108,11 @@ export interface NormalizeTaskPlaybackInput {
 }
 
 const FRAME_STATUS_ORDER: TaskPlaybackFrameStatus[] = ["blocked", "failed", "missing", "running", "waiting", "passed", "recorded", "unknown"];
-const PRIVATE_EVIDENCE_KEY = /(prompt|raw_prompt|hidden|private|secret|token|route_context|route_identity|precheck|provider|filesystem|cwd|worktree_path|host|judgment[-_\s]?brain|\bjb[-_][a-z0-9][a-z0-9_-]*|\bac[-_]judge[-_][a-z0-9][a-z0-9_-]*|private[-_\s]?judge|judge[-_\s]?mode|judge[-_\s]?(private|route|routing|precheck|provider|prompt|context|memory|brain|lineage|contract))/i;
+export const PRIVATE_EVIDENCE_KEY = PRIVATE_TIMELINE_TEXT_KEY;
 const ABSOLUTE_HOST_PATH = /(^|\s)(\/Users\/[^\s,;:]+|\/home\/[^\s,;:]+|\/var\/folders\/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)/g;
 
 export function isPrivatePlaybackText(value?: string | null): boolean {
-  return Boolean(value && PRIVATE_EVIDENCE_KEY.test(value));
+  return isPrivateTimelineText(value);
 }
 
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {
@@ -234,21 +248,26 @@ function mergeTimelineEvents(primary: TaskTimelineEvent[], secondary: TaskTimeli
 }
 
 function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFrame {
-  const status = statusFromEvent(event);
-  const artifactRefs = artifactsFromEvent(event);
+  const semantic = projectTaskTimelineEvent(event, index);
+  const status = timelineStatusFromEvent(event);
+  const artifactRefs = artifactsFromEvent(event, semantic);
   return {
     id: eventIdentity(event, index),
     sequence: index + 1,
     at: event.created_at || "",
-    lane_id: laneIdForEvent(event),
+    lane_id: semantic.lane_id,
     source_event_id: eventDisplayId(event),
-    event_type: publicLabel(event.event_type || "timeline_event", "governed_event"),
-    event_kind: publicLabel(event.event_kind || event.phase || "event", "event"),
-    title: titleForEvent(event, index),
-    detail: detailForEvent(event, artifactRefs),
+    event_type: semantic.event_type_label,
+    event_kind: semantic.event_kind_label,
+    phase: semantic.phase_label,
+    title: semantic.title,
+    detail: semantic.detail,
     status,
-    actor: actorForEvent(event),
-    evidence_refs: evidenceFromEvent(event),
+    actor: semantic.actor_label,
+    semantic_entry_id: semantic.catalog_entry_id,
+    semantic_chips: semantic.chips,
+    detail_inspector: semantic.inspector,
+    evidence_refs: evidenceFromEvent(event, semantic),
     artifact_refs: artifactRefs,
   };
 }
@@ -317,48 +336,11 @@ function summarizeFrames(
   };
 }
 
-function statusFromEvent(event: TaskTimelineEvent): TaskPlaybackFrameStatus {
-  const verification = asRecord(event.verification);
-  const text = [
-    event.status,
-    event.decision,
-    event.event_type,
-    event.event_kind,
-    event.phase,
-    typeof verification.status === "string" ? verification.status : "",
-  ].join(" ").toLowerCase();
-  if (text.includes("blocked")) return "blocked";
-  if (text.includes("missing")) return "missing";
-  if (text.includes("fail") || text.includes("error") || text.includes("reject")) return "failed";
-  if (text.includes("running") || text.includes("claimed") || text.includes("progress")) return "running";
-  if (text.includes("pending") || text.includes("queued") || text.includes("waiting")) return "waiting";
-  if (verification.passed === true || text.includes("pass") || text.includes("success") || text.includes("accepted") || text.includes("complete")) return "passed";
-  if (text.includes("record")) return "recorded";
-  return "unknown";
-}
-
 function aggregateStatus(statuses: TaskPlaybackFrameStatus[]): TaskPlaybackFrameStatus {
   for (const status of FRAME_STATUS_ORDER) {
     if (statuses.includes(status)) return status;
   }
   return "unknown";
-}
-
-function laneIdForEvent(event: TaskTimelineEvent): string {
-  const raw = [
-    stringFrom(asRecord(event.payload).lane),
-    stringFrom(asRecord(event.payload).worker_lane),
-    stringFrom(asRecord(event.payload).agent_lane),
-    event.actor,
-    event.phase,
-    event.event_kind,
-    event.event_type,
-  ].join(" ").toLowerCase();
-  if (/content[-_\s]?sys|docker|fixture/.test(raw)) return "content_sys";
-  if (/gate|close|merge/.test(raw)) return "gate";
-  if (/verify|test|qa|browser|playwright/.test(raw)) return "verification";
-  if (/worker|subagent|mf_sub|front|back|implementation/.test(raw)) return "worker";
-  return "observer";
 }
 
 function laneLabel(id: string): string {
@@ -381,33 +363,7 @@ function laneSort(id: string): number {
   return ["observer", "worker", "verification", "gate", "content_sys"].indexOf(id);
 }
 
-function titleForEvent(event: TaskTimelineEvent, index: number): string {
-  const payload = asRecord(event.payload);
-  const explicit = stringFrom(payload.title) || stringFrom(payload.label) || stringFrom(payload.summary);
-  if (explicit && !PRIVATE_EVIDENCE_KEY.test(explicit)) return safeText(explicit);
-  const kind = event.event_kind || event.phase || event.event_type || `event ${index + 1}`;
-  return titleize(publicLabel(kind, "governed event"));
-}
-
-function detailForEvent(event: TaskTimelineEvent, artifacts: TaskPlaybackArtifactRef[]): string {
-  const payload = asRecord(event.payload);
-  const summary = stringFrom(payload.public_summary) || stringFrom(payload.display_summary) || stringFrom(payload.summary);
-  if (summary && !PRIVATE_EVIDENCE_KEY.test(summary)) return safeText(summary);
-  if (artifacts.length > 0) return `${artifacts.length} public artifact reference${artifacts.length === 1 ? "" : "s"} recorded.`;
-  if (event.task_id) return `Governed task event for ${safeText(event.task_id)}.`;
-  return "Governed timeline event recorded.";
-}
-
-function actorForEvent(event: TaskTimelineEvent): string {
-  const lane = laneIdForEvent(event);
-  if (lane === "worker") return "Bounded worker";
-  if (lane === "gate") return "Aming Claw gate";
-  if (lane === "verification") return "Verification";
-  if (lane === "content_sys") return "content-sys";
-  return (event.actor || "").toLowerCase().includes("observer") ? "Observer" : publicLabel(event.actor || "Aming Claw", "Aming Claw");
-}
-
-function evidenceFromEvent(event: TaskTimelineEvent): TaskPlaybackEvidenceRef[] {
+function evidenceFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSemanticProjection): TaskPlaybackEvidenceRef[] {
   const refs: TaskPlaybackEvidenceRef[] = [
     { kind: "timeline_event", label: "event", value: eventDisplayId(event) },
   ];
@@ -429,10 +385,15 @@ function evidenceFromEvent(event: TaskTimelineEvent): TaskPlaybackEvidenceRef[] 
     label: "evidence",
     value,
   })));
+  refs.push(...semantic.evidence.map((chip) => ({
+    kind: evidenceKindFromSemanticChip(chip),
+    label: chip.label,
+    value: chip.value,
+  })));
   return stableEvidence(refs.filter((ref) => Boolean(ref.value)));
 }
 
-function artifactsFromEvent(event: TaskTimelineEvent): TaskPlaybackArtifactRef[] {
+function artifactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSemanticProjection): TaskPlaybackArtifactRef[] {
   const containers = [event.payload, event.verification, event.artifact_refs].map(asRecord);
   const files = collectPublicStrings(containers, ["changed_files", "target_files", "modified_files", "updated_files", "files"]);
   const tests = collectPublicStrings(containers, ["tests_run", "test_commands", "tests_written", "test_files", "commands"]);
@@ -450,7 +411,29 @@ function artifactsFromEvent(event: TaskTimelineEvent): TaskPlaybackArtifactRef[]
     })),
   ];
   if (event.commit_sha) refs.push({ kind: "commit", value: shortCommit(event.commit_sha) });
+  refs.push(...semantic.artifacts.map((chip) => ({
+    kind: artifactKindFromSemanticChip(chip),
+    value: chip.value,
+  })));
   return stableArtifacts(refs);
+}
+
+function evidenceKindFromSemanticChip(chip: TaskTimelineSemanticChip): TaskPlaybackEvidenceRef["kind"] {
+  if (chip.kind === "graph_trace") return "graph_trace";
+  if (chip.kind === "commit") return "commit";
+  if (chip.kind === "file") return "file";
+  if (chip.kind === "test") return "test";
+  if (chip.kind === "node") return "node";
+  if (chip.kind === "route" || chip.kind === "worker" || chip.kind === "timeline") return "gate";
+  return "artifact";
+}
+
+function artifactKindFromSemanticChip(chip: TaskTimelineSemanticChip): TaskPlaybackArtifactRef["kind"] {
+  if (chip.kind === "file") return "file";
+  if (chip.kind === "test") return "test";
+  if (chip.kind === "graph_trace") return "graph";
+  if (chip.kind === "commit") return "commit";
+  return chip.value.toLowerCase().includes("content") ? "content_sys" : "artifact";
 }
 
 function collectPublicStrings(containers: Record<string, unknown>[], keys: string[]): string[] {
@@ -487,12 +470,7 @@ function compactUnknown(value: unknown): string {
 }
 
 function safeText(value: string): string {
-  return value.replace(ABSOLUTE_HOST_PATH, "$1[local path redacted]").replace(/\s+/g, " ").trim();
-}
-
-function publicLabel(value: string, fallback: string): string {
-  const text = safeText(value);
-  return text && !PRIVATE_EVIDENCE_KEY.test(text) ? text : fallback;
+  return sanitizePublicTimelineText(value).replace(ABSOLUTE_HOST_PATH, "$1[local path redacted]").replace(/\s+/g, " ").trim();
 }
 
 function stringFrom(value: unknown): string {

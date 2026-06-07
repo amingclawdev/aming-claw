@@ -6,6 +6,11 @@ import {
   normalizeTaskPlaybackTrace,
   type TaskPlaybackTrace,
 } from "../lib/taskPlayback";
+import {
+  projectTaskTimelineEvent,
+  sanitizePublicTimelineText,
+  sanitizeTimelineInspectorValue,
+} from "../lib/taskTimelineSemantics";
 import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
@@ -1487,21 +1492,34 @@ function ArtifactPills({ summary, compact = false }: { summary: EventArtifactSum
 
 function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
   const event = node?.event;
+  const semantic = event ? projectTaskTimelineEvent(event) : null;
   const artifacts = event ? timelineEventArtifacts(event) : emptyArtifactSummary();
   const routeEvidenceCards = event ? buildRouteEvidenceCards(event) : [];
-  const rows = [
-    ["event_type", event?.event_type],
-    ["event_kind", event?.event_kind],
-    ["actor", event?.actor],
-    ["display_actor", event ? displayActorForEvent(event) : ""],
-    ["raw_lane", event ? rawLaneKeyForEvent(event) : node?.rawLane],
-    ["phase", event?.phase],
-    ["status", event?.status ?? node?.statusLabel],
-    ["created_at", event?.created_at],
-    ["commit_sha", event?.commit_sha],
-    ["task_id", event?.task_id],
-    ["attempt_num", event?.attempt_num],
+  const rows = stableInspectorRows([
+    { label: "event_type", value: event?.event_type },
+    { label: "event_kind", value: event?.event_kind },
+    { label: "actor", value: event?.actor },
+    { label: "display_actor", value: event ? displayActorForEvent(event) : "" },
+    { label: "raw_lane", value: event ? rawLaneKeyForEvent(event) : node?.rawLane },
+    { label: "phase", value: semantic?.phase_label ?? event?.phase },
+    { label: "status", value: semantic?.status_label ?? event?.status ?? node?.statusLabel },
+    { label: "created_at", value: event?.created_at },
+    { label: "commit_sha", value: event?.commit_sha },
+    { label: "backlog_id", value: event?.backlog_id },
+    { label: "task_id", value: event?.task_id },
+    { label: "attempt_num", value: event?.attempt_num },
+    ...(semantic?.inspector.rows ?? []),
+  ]);
+  const fallbackVerification = sanitizeTimelineInspectorValue(event?.verification ?? node?.syntheticVerification ?? {});
+  const fallbackArtifacts = sanitizeTimelineInspectorValue(event?.artifact_refs ?? {});
+  const fallbackPayload = sanitizeTimelineInspectorValue(event?.payload ?? node?.syntheticPayload ?? {});
+  const rawSections = semantic?.inspector.raw_sections ?? [
+    { label: "verification", value: fallbackVerification.value, redacted: fallbackVerification.redaction_count > 0 },
+    { label: "artifact_refs", value: fallbackArtifacts.value, redacted: fallbackArtifacts.redaction_count > 0 },
+    { label: "payload", value: fallbackPayload.value, redacted: fallbackPayload.redaction_count > 0 },
   ];
+  const redactionCount = semantic?.inspector.redaction_count
+    ?? fallbackVerification.redaction_count + fallbackArtifacts.redaction_count + fallbackPayload.redaction_count;
   return (
     <div className="backlog-evidence-inspector">
       <div className="backlog-modal-section-head">
@@ -1511,30 +1529,30 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
       {node ? (
         <>
           <div className="backlog-inspector-grid">
-            {rows.map(([key, value]) => (
-              <div key={key}>
-                <span>{key}</span>
-                <strong className="mono">{value == null || value === "" ? "-" : String(value)}</strong>
+            {rows.map((row) => (
+              <div key={`${row.label}:${row.value}`}>
+                <span>{row.label}</span>
+                <strong className="mono">{row.value == null || row.value === "" ? "-" : String(row.value)}</strong>
               </div>
             ))}
+            {redactionCount > 0 ? (
+              <div>
+                <span>redactions</span>
+                <strong className="mono">{redactionCount}</strong>
+              </div>
+            ) : null}
           </div>
           <ArtifactPills summary={artifacts} />
           {routeEvidenceCards.length > 0 ? <RouteEvidenceCards cards={routeEvidenceCards} /> : null}
           <details className="backlog-inspector-raw">
-            <summary>Inspect raw timeline payloads</summary>
+            <summary>Inspect public timeline details</summary>
             <div className="backlog-inspector-json">
-              <div>
-                <span>verification</span>
-                <pre>{JSON.stringify(event?.verification ?? node.syntheticVerification ?? {}, null, 2)}</pre>
-              </div>
-              <div>
-                <span>artifact_refs</span>
-                <pre>{JSON.stringify(event?.artifact_refs ?? {}, null, 2)}</pre>
-              </div>
-              <div>
-                <span>raw payload</span>
-                <pre>{JSON.stringify(event?.payload ?? node.syntheticPayload ?? {}, null, 2)}</pre>
-              </div>
+              {rawSections.map((section) => (
+                <div key={section.label}>
+                  <span>{section.redacted ? `${section.label} redacted` : section.label}</span>
+                  <pre>{JSON.stringify(section.value ?? {}, null, 2)}</pre>
+                </div>
+              ))}
             </div>
           </details>
         </>
@@ -1543,6 +1561,19 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
       )}
     </div>
   );
+}
+
+function stableInspectorRows(rows: Array<{ label: string; value: unknown }>): Array<{ label: string; value: unknown }> {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (row.value == null || row.value === "") return false;
+    const safeValue = sanitizePublicTimelineText(String(row.value));
+    const key = `${row.label}:${safeValue}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    row.value = safeValue;
+    return true;
+  }).slice(0, 32);
 }
 
 interface RouteEvidenceCard {
@@ -1680,7 +1711,7 @@ function buildRouteEvidenceCards(event: TaskTimelineEvent): RouteEvidenceCard[] 
       id: "final-drift-prompt",
       title: "Final drift prompt",
       status: firstText(finalDriftPrompt.status, finalDriftPrompt.decision) || "shown",
-      detail: firstText(finalDriftPrompt.message, finalDriftPrompt.prompt, finalDriftPrompt.summary)
+      detail: firstText(finalDriftPrompt.message, finalDriftPrompt.summary)
         || "Final drift prompt was shown before close.",
       chips: evidenceChips([
         ["drift", firstText(finalDriftPrompt.drift_state, finalDriftPrompt.state)],
@@ -2326,7 +2357,7 @@ function RouteContextGuidancePanel({ gate }: { gate?: MfCloseTimelineGate }) {
       ) : null}
       {guidance.ignoredRouteEventCount > 0 ? (
         <div className="backlog-route-guidance-warning">
-          {guidance.ignoredRouteEventCount} route event{guidance.ignoredRouteEventCount === 1 ? "" : "s"} ignored by the gate; inspect raw timeline payloads before close.
+          {guidance.ignoredRouteEventCount} route event{guidance.ignoredRouteEventCount === 1 ? "" : "s"} ignored by the gate; inspect public timeline details before close.
         </div>
       ) : null}
       <div className="backlog-route-guidance-boundary">
@@ -2599,6 +2630,7 @@ function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], _
   const orderedEvents = events.slice().sort(compareTimelineEvents);
   const laneContext = buildTimelineLaneContext(orderedEvents);
   orderedEvents.forEach((event, index) => {
+    const semantic = projectTaskTimelineEvent(event, index);
     const phase = phaseLabelForEvent(event, index);
     const lane = timelineLaneIdForEvent(event, laneContext);
     const eventNode: TimelineDagNode = {
@@ -2609,7 +2641,7 @@ function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], _
       phase,
       phaseIndex: phaseIndex(phaseLabels, phase),
       status: dagStatusForEvent(event),
-      statusLabel: event.status || event.decision || event.event_kind || "event",
+      statusLabel: semantic.status_label || event.status || event.decision || event.event_kind || "event",
       event,
       inferred: isInferredLane(event),
     };
@@ -2652,11 +2684,7 @@ function phaseIndex(phases: string[], phase: string): number {
 }
 
 function phaseLabelForEvent(event: TaskTimelineEvent, index: number): string {
-  const payload = asRecord(event.payload);
-  const explicit = event.phase || stringField(payload, "phase") || stringField(payload, "stage");
-  if (explicit) return explicit.replace(/_/g, " ");
-  if (event.event_kind) return event.event_kind.replace(/_/g, " ");
-  return `event ${index + 1}`;
+  return projectTaskTimelineEvent(event, index).phase_label;
 }
 
 function dagStatusForEvent(event: TaskTimelineEvent): TimelineDagNode["status"] {
@@ -2846,10 +2874,7 @@ function isWorkerTimelineEvent(event: TaskTimelineEvent): boolean {
 }
 
 function displayActorForEvent(event: TaskTimelineEvent): string {
-  if (!event.actor) return "actor unknown";
-  if (isWorkerTimelineEvent(event)) return "Subagent worker";
-  if (event.actor.toLowerCase().includes("observer")) return "Observer";
-  return titleizeLane(event.actor.replace(/[^a-zA-Z0-9]+/g, "_"));
+  return projectTaskTimelineEvent(event).actor_label || "actor unknown";
 }
 
 function timelineNodeLabel(event: TaskTimelineEvent, index: number): string {
@@ -2857,13 +2882,11 @@ function timelineNodeLabel(event: TaskTimelineEvent, index: number): string {
     const ids = evidenceRequirementIds(event);
     return ids.length > 0 ? `contract_evidence · ${ids[0]}` : "contract_evidence";
   }
-  const ids = evidenceRequirementIds(event);
-  const base = event.event_type || event.event_kind || `event ${index + 1}`;
-  return base === "contract_evidence" || ids.length === 0 ? base : `${base}`;
+  return projectTaskTimelineEvent(event, index).title;
 }
 
 function contractEvidenceLabel(event: TaskTimelineEvent, index: number, requirementId: string): string {
-  const base = event.event_type || event.event_kind || `event ${index + 1}`;
+  const base = projectTaskTimelineEvent(event, index).title;
   return `${base} · ${requirementId}`;
 }
 
@@ -3176,7 +3199,7 @@ function collectStringFields(containers: Record<string, unknown>[], keys: string
       values.push(...stringsFromUnknown(container[key]));
     }
   }
-  return stableUnique(values.map((value) => value.trim()).filter(Boolean));
+  return stableUnique(values.map((value) => sanitizePublicTimelineText(value.trim())).filter(Boolean));
 }
 
 function stringsFromUnknown(value: unknown): string[] {
@@ -3249,7 +3272,7 @@ function stringField(record: Record<string, unknown>, key: string): string {
 
 function firstText(...values: unknown[]): string {
   for (const value of values) {
-    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "string" && value.trim()) return sanitizePublicTimelineText(value.trim());
     if (typeof value === "number" || typeof value === "boolean") return String(value);
   }
   return "";
