@@ -338,12 +338,12 @@ def _dashboard_dist_dir() -> Path:
     override = str(os.environ.get("GOVERNANCE_DASHBOARD_DIST") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    repo_dist = _repo_dashboard_dist_dir()
-    if (repo_dist / "index.html").is_file():
-        return repo_dist
     packaged_dist = _packaged_dashboard_dist_dir()
     if packaged_dist is not None:
         return packaged_dist
+    repo_dist = _repo_dashboard_dist_dir()
+    if (repo_dist / "index.html").is_file():
+        return repo_dist
     return repo_dist
 
 

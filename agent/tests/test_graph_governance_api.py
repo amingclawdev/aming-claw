@@ -286,6 +286,53 @@ def _graph(node_id: str = "L7.1") -> dict:
     }
 
 
+def _write_dashboard_dist(root: Path, asset_name: str) -> Path:
+    (root / "assets").mkdir(parents=True, exist_ok=True)
+    (root / "index.html").write_text(
+        f'<script type="module" src="/dashboard/assets/{asset_name}"></script>',
+        encoding="utf-8",
+    )
+    (root / "assets" / asset_name).write_text("console.log('dashboard');", encoding="utf-8")
+    return root
+
+
+def test_dashboard_dist_dir_installed_runtime_prefers_packaged_over_stale_repo_dist(
+    tmp_path, monkeypatch
+):
+    stale_repo_dist = _write_dashboard_dist(
+        tmp_path / "runtime-checkout" / "frontend" / "dashboard" / "dist",
+        "index-stale.js",
+    )
+    packaged_dist = _write_dashboard_dist(
+        tmp_path / "runtime-checkout" / "agent" / "governance" / "dashboard_dist",
+        "index-current.js",
+    )
+    monkeypatch.delenv("GOVERNANCE_DASHBOARD_DIST", raising=False)
+    monkeypatch.setattr(server, "_repo_dashboard_dist_dir", lambda: stale_repo_dist)
+    monkeypatch.setattr(server, "_packaged_dashboard_dist_dir", lambda: packaged_dist)
+
+    assert server._dashboard_dist_dir() == packaged_dist
+
+
+def test_dashboard_dist_dir_explicit_override_wins_over_packaged_and_repo_dist(
+    tmp_path, monkeypatch
+):
+    stale_repo_dist = _write_dashboard_dist(
+        tmp_path / "runtime-checkout" / "frontend" / "dashboard" / "dist",
+        "index-stale.js",
+    )
+    packaged_dist = _write_dashboard_dist(
+        tmp_path / "runtime-checkout" / "agent" / "governance" / "dashboard_dist",
+        "index-current.js",
+    )
+    override_dist = _write_dashboard_dist(tmp_path / "override-dist", "index-override.js")
+    monkeypatch.setenv("GOVERNANCE_DASHBOARD_DIST", str(override_dist))
+    monkeypatch.setattr(server, "_repo_dashboard_dist_dir", lambda: stale_repo_dist)
+    monkeypatch.setattr(server, "_packaged_dashboard_dist_dir", lambda: packaged_dist)
+
+    assert server._dashboard_dist_dir() == override_dist.resolve()
+
+
 def test_project_bootstrap_requires_route_token_or_waiver(conn, monkeypatch):
     def fail_bootstrap(**_kwargs):
         raise AssertionError("bootstrap_project must not run without route gate evidence")
