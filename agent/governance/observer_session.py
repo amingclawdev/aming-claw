@@ -32,6 +32,9 @@ OBSERVER_COMMAND_NO_PROGRESS_TIMEOUT_SCHEMA_VERSION = "observer_command_no_progr
 OBSERVER_COMMAND_DURABLE_MF_SUB_EVIDENCE_SCHEMA_VERSION = (
     "observer_command_durable_mf_sub_evidence.v1"
 )
+OBSERVER_COMMAND_OBSERVER_ONLY_MONITOR_EVIDENCE_SCHEMA_VERSION = (
+    "observer_command_observer_only_monitor_terminal_evidence.v1"
+)
 
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
@@ -109,6 +112,16 @@ STARTUP_ONLY_EVENT_TOKENS = {
     "bounded_implementation_worker_dispatch",
     "mf_subagent_dispatch",
     "mf_subagent_dispatch_gate",
+}
+OBSERVER_ONLY_MONITOR_KIND_TOKENS = {
+    "dashboard_monitor",
+    "monitor",
+    "observer_monitor",
+    "observer_only_dashboard_monitor",
+    "observer_only_monitor",
+    "dashboard_current_task_monitor",
+    "current_task_monitor",
+    "current_task_dashboard_monitor",
 }
 
 COMMAND_TYPE_ANALYZE_REQUIREMENTS = "analyze_requirements"
@@ -516,6 +529,158 @@ def _result_is_terminal_blocked(result: dict[str, Any]) -> bool:
         if isinstance(value, dict) and str(value.get("status") or "").lower() == "blocked":
             return True
     return False
+
+
+def _terminal_blocker_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    for key in (
+        "cli_timeout_blocker",
+        "terminal_blocker",
+        "terminal_dispatch_blocker",
+        "startup_surface_blocker",
+        "no_progress_timeout",
+    ):
+        value = result.get(key)
+        if isinstance(value, dict):
+            blocker = dict(value)
+            blocker.setdefault("status", "blocked")
+            blocker.setdefault("blocker_id", key)
+            return blocker
+        if value is True:
+            return {"status": "blocked", "blocker_id": key}
+    return {"status": "blocked", "blocker_id": "blocked"}
+
+
+def _observer_only_monitor_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    evidence = result.get("observer_only_monitor_evidence")
+    if not isinstance(evidence, Mapping):
+        return {}
+    return dict(evidence)
+
+
+def _observer_only_monitor_kind_present(evidence: Mapping[str, Any]) -> bool:
+    tokens: set[str] = set()
+    for key in (
+        "command_kind",
+        "command_mode",
+        "command_classification",
+        "monitor_kind",
+        "mode",
+        "purpose",
+    ):
+        token = _progress_token(evidence.get(key))
+        if token:
+            tokens.add(token)
+    for key in ("monitor_command", "dashboard_monitor", "observer_only_monitor"):
+        if evidence.get(key) is True:
+            tokens.add("monitor" if key == "monitor_command" else key)
+    return bool(tokens & OBSERVER_ONLY_MONITOR_KIND_TOKENS)
+
+
+def _observer_only_monitor_evidence_refs(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for key in (
+        "timeline_event_ref",
+        "timeline_event_refs",
+        "terminal_evidence_refs",
+        "evidence_refs",
+    ):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            refs.append({"kind": key, "ref": value.strip()})
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    refs.append({"kind": key, "ref": text})
+    for key in ("timeline_event_id", "event_id"):
+        event_id = _timeline_ref_id(evidence.get(key))
+        if event_id:
+            refs.append({"kind": key, "ref": f"timeline:{event_id}"})
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for ref in refs:
+        identity = (str(ref.get("kind") or ""), str(ref.get("ref") or ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(ref)
+    return deduped
+
+
+def _observer_only_monitor_terminal_projection(
+    command: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    now: str,
+) -> dict[str, Any]:
+    if result.get("ok") is False or _result_is_terminal_blocked(result):
+        return {}
+    evidence = _observer_only_monitor_evidence(result)
+    if not evidence:
+        return {}
+    if evidence.get("no_implementation_worker_required") is not True:
+        return {}
+    if evidence.get("implementation_worker_required") is True:
+        return {}
+    observer_only = bool(
+        evidence.get("observer_only") is True
+        or evidence.get("observer_only_command") is True
+    )
+    if not observer_only or not _observer_only_monitor_kind_present(evidence):
+        return {}
+    evidence_status = str(evidence.get("status") or "passed").strip().lower()
+    if evidence_status and evidence_status not in FIRST_PROGRESS_PASS_STATUSES:
+        return {}
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    for key in (
+        "backlog_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "visible_injection_manifest_hash",
+    ):
+        expected = str(payload.get(key) or "").strip()
+        observed = str(evidence.get(key) or "").strip()
+        if expected and observed != expected:
+            return {}
+    observed_command_id = str(evidence.get("observer_command_id") or "").strip()
+    command_id = str(command.get("command_id") or "").strip()
+    if observed_command_id and observed_command_id != command_id:
+        return {}
+    route_identity = _route_identity_from_payload(payload)
+    return {
+        "schema_version": "observer_command_terminal_projection.v1",
+        "source_of_truth": "observer_command_queue/task_timeline",
+        "projected_surface": "observer_command_queue",
+        "projected_surfaces": [
+            "observer_command_queue",
+            "task_timeline",
+            "dashboard_cards",
+        ],
+        "passed": True,
+        "status": "projected_completed",
+        "canonical_contract_state": "completed",
+        "command_projection_status": "completed",
+        "divergence_reason": "",
+        "canonical_route_identity": route_identity,
+        "superseded_route_identity": {},
+        "terminal_evidence_refs": _observer_only_monitor_evidence_refs(evidence),
+        "missing_requirement_ids": [],
+        "observer_only_monitor": {
+            "schema_version": OBSERVER_COMMAND_OBSERVER_ONLY_MONITOR_EVIDENCE_SCHEMA_VERSION,
+            "no_implementation_worker_required": True,
+            "observer_only": True,
+            "monitor_kind": str(
+                evidence.get("command_kind")
+                or evidence.get("monitor_kind")
+                or evidence.get("command_mode")
+                or ""
+            ),
+            "observer_command_id": command_id,
+            "backlog_id": str(payload.get("backlog_id") or ""),
+            "completed_at": now,
+        },
+    }
 
 
 def _progress_token(value: Any) -> str:
@@ -3306,33 +3471,45 @@ def complete_command(
         if terminal_projection.get("passed"):
             _attach_command_terminal_projection(result_payload, terminal_projection)
         else:
-            if terminal_projection:
-                _attach_command_terminal_projection(result_payload, terminal_projection)
-            blocker = _missing_startup_surface_blocker(command, now=timestamp)
-            result_payload["ok"] = False
-            result_payload["startup_surface_blocker"] = blocker
-            conn.execute(
-                """UPDATE observer_command_queue
-                      SET status = ?, completed_at = ?, result_json = ?, error = ?
-                    WHERE project_id = ? AND command_id = ?""",
-                (
-                    COMMAND_STATUS_FAILED,
-                    timestamp,
-                    _json_dumps(result_payload),
-                    blocker["blocker_id"],
-                    pid,
-                    command_id,
-                ),
-            )
-            conn.commit()
-            return {
-                "ok": True,
-                "project_id": pid,
-                "observer_session_id": sid,
-                "command": get_command(conn, project_id=pid, command_id=command_id),
-                "startup_surface_blocker": blocker,
-                "terminal_contract_projection": terminal_projection,
-            }
+            observer_only_projection = {}
+            if not terminal_projection:
+                observer_only_projection = _observer_only_monitor_terminal_projection(
+                    command,
+                    result_payload,
+                    now=timestamp,
+                )
+            if observer_only_projection.get("passed"):
+                result_payload["ok"] = True
+                result_payload["status"] = "completed"
+                _attach_command_terminal_projection(result_payload, observer_only_projection)
+            else:
+                if terminal_projection:
+                    _attach_command_terminal_projection(result_payload, terminal_projection)
+                blocker = _missing_startup_surface_blocker(command, now=timestamp)
+                result_payload["ok"] = False
+                result_payload["startup_surface_blocker"] = blocker
+                conn.execute(
+                    """UPDATE observer_command_queue
+                          SET status = ?, completed_at = ?, result_json = ?, error = ?
+                        WHERE project_id = ? AND command_id = ?""",
+                    (
+                        COMMAND_STATUS_FAILED,
+                        timestamp,
+                        _json_dumps(result_payload),
+                        blocker["blocker_id"],
+                        pid,
+                        command_id,
+                    ),
+                )
+                conn.commit()
+                return {
+                    "ok": True,
+                    "project_id": pid,
+                    "observer_session_id": sid,
+                    "command": get_command(conn, project_id=pid, command_id=command_id),
+                    "startup_surface_blocker": blocker,
+                    "terminal_contract_projection": terminal_projection,
+                }
     if (
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and _result_has_canonical_close_evidence(result_payload)
@@ -3392,10 +3569,10 @@ def complete_command(
         projection = _command_terminal_projection_from_result(command, result_payload)
         if projection:
             _attach_command_terminal_projection(result_payload, projection)
-        blocker = result_payload.get("cli_timeout_blocker")
-        blocker_id = ""
-        if isinstance(blocker, dict):
-            blocker_id = str(blocker.get("blocker_id") or "")
+        blocker = _terminal_blocker_from_result(result_payload)
+        blocker_id = str(blocker.get("blocker_id") or "")
+        result_payload["ok"] = False
+        result_payload.setdefault("status", "blocked")
         conn.execute(
             """UPDATE observer_command_queue
                   SET status = ?, completed_at = ?, result_json = ?, error = ?
@@ -3415,7 +3592,7 @@ def complete_command(
             "project_id": pid,
             "observer_session_id": sid,
             "command": get_command(conn, project_id=pid, command_id=command_id),
-            "terminal_blocker": result_payload.get("cli_timeout_blocker") or {"status": "blocked"},
+            "terminal_blocker": blocker,
         }
     conn.execute(
         """UPDATE observer_command_queue
