@@ -853,6 +853,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("fallback_sample"), "Task playback fixture data should be marked as fallback sample");
   assert(playbackSource.includes("host_private_paths: \"redacted\""), "Task playback privacy boundary should redact host-private paths");
   assert(playbackSource.includes("PRIVATE_EVIDENCE_KEY"), "Task playback normalizer should filter private evidence keys");
+  assert(playbackSource.includes("judgment[-_\\s]?brain") && playbackSource.includes("judge[-_\\s]?(private|route"), "Task playback normalizer should filter private judge labels");
   assert(playbackViewSource.includes("api.taskTimelineFor"), "Playback selection should fetch governed task timeline data");
   assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");
   assert(playbackViewSource.includes("inFlightPlaybackKeysRef"), "Playback loading should track in-flight governed requests outside render state");
