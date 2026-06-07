@@ -64,6 +64,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   }, [projectId]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       playbackControllersRef.current.forEach((controller) => controller.abort());
