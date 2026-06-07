@@ -1084,6 +1084,85 @@ def _read_receipt_gate_attempt_lineage(event: dict[str, Any]) -> dict[str, str]:
     return _route_attempt_lineage(event)
 
 
+def _read_receipt_route_identities_compatible(
+    first: dict[str, str],
+    second: dict[str, str],
+) -> bool:
+    if not first or not second:
+        return False
+    if _route_identity_key(first) != _route_identity_key(second):
+        return False
+    first_prompt_hash = first.get("prompt_contract_hash", "")
+    second_prompt_hash = second.get("prompt_contract_hash", "")
+    return not (
+        first_prompt_hash
+        and second_prompt_hash
+        and first_prompt_hash != second_prompt_hash
+    )
+
+
+def _read_receipt_startup_order_is_harmless(
+    startup_event: dict[str, Any],
+    read_receipt_event: dict[str, Any],
+    *,
+    identity_filter: dict[str, str],
+    attempt_lineage_filter: dict[str, str],
+) -> bool:
+    if "mf_subagent_startup" not in _route_event_categories(startup_event):
+        return False
+    if not _route_actual_startup_identity_present(startup_event):
+        return False
+    if not identity_filter and not attempt_lineage_filter:
+        return False
+
+    startup_identity = _read_receipt_gate_route_identity(startup_event)
+    read_identity = _read_receipt_gate_route_identity(read_receipt_event)
+    if identity_filter:
+        if startup_identity and not _route_identity_matches_filter(
+            startup_identity,
+            identity_filter,
+        ):
+            return False
+        if read_identity and not _route_identity_matches_filter(
+            read_identity,
+            identity_filter,
+        ):
+            return False
+    elif not _read_receipt_route_identities_compatible(
+        startup_identity,
+        read_identity,
+    ):
+        return False
+
+    startup_lineage = _read_receipt_gate_attempt_lineage(startup_event)
+    read_lineage = _read_receipt_gate_attempt_lineage(read_receipt_event)
+    if attempt_lineage_filter:
+        if startup_lineage and not _attempt_lineage_matches_filter(
+            startup_lineage,
+            attempt_lineage_filter,
+        ):
+            return False
+        if read_lineage and not _attempt_lineage_matches_filter(
+            read_lineage,
+            attempt_lineage_filter,
+        ):
+            return False
+    elif startup_lineage and read_lineage:
+        for field in MF_ROUTE_ATTEMPT_LINEAGE_FILTER_FIELDS:
+            left = startup_lineage.get(field, "")
+            right = read_lineage.get(field, "")
+            if left and right and left != right:
+                return False
+
+    for field in ("actual_cwd", "actual_git_root", "branch", "head_commit"):
+        startup_value = _first_deep_text(startup_event, field)
+        read_value = _first_deep_text(read_receipt_event, field)
+        if startup_value and read_value and startup_value != read_value:
+            return False
+
+    return True
+
+
 def _read_receipt_lineage_filter_from_route_gate(
     route_context_gate: dict[str, Any] | None,
 ) -> dict[str, str]:
@@ -1231,7 +1310,26 @@ def mf_subagent_read_receipt_gate_verification(
         elif counted_evidence_event:
             counted.append((order, index, event))
     first_read = min(read_receipts, default=None, key=lambda item: (item[0], item[1]))
-    first_counted = min(counted, default=None, key=lambda item: (item[0], item[1]))
+    harmless_startup_event_ids: list[Any] = []
+    order_counted = counted
+    if first_read is not None:
+        order_counted = []
+        for item in counted:
+            if (
+                (item[0], item[1]) < (first_read[0], first_read[1])
+                and _read_receipt_startup_order_is_harmless(
+                    item[2],
+                    first_read[2],
+                    identity_filter=identity_filter,
+                    attempt_lineage_filter=attempt_lineage_filter,
+                )
+            ):
+                event_id = item[2].get("id")
+                if event_id is not None:
+                    harmless_startup_event_ids.append(event_id)
+                continue
+            order_counted.append(item)
+    first_counted = min(order_counted, default=None, key=lambda item: (item[0], item[1]))
     required = bool(counted)
     read_receipt_order = (first_read[0], first_read[1]) if first_read else None
     first_counted_order = (first_counted[0], first_counted[1]) if first_counted else None
@@ -1283,6 +1381,7 @@ def mf_subagent_read_receipt_gate_verification(
         ),
         "failure_reason": failure_reason,
         "read_receipt_precedes_counted_evidence": bool(passed and required),
+        "harmless_startup_before_read_receipt_event_ids": harmless_startup_event_ids,
         "read_receipt_order": list(read_receipt_order) if read_receipt_order else [],
         "first_counted_evidence_order": list(first_counted_order)
         if first_counted_order

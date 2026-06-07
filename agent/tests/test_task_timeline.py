@@ -3070,6 +3070,189 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(gate["read_receipt_event_id"], 2009)
         self.assertEqual(gate["counted_evidence_event_ids"], [2007, 2008])
 
+    def test_close_precheck_accepts_startup_before_read_receipt_for_same_route_worktree_commit(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:startup-before-read-receipt-contract"
+        route_context, route_action, dispatch, startup = _route_context_consumption_events()
+        route_context["id"] = 2101
+        route_action["id"] = 2102
+        dispatch["id"] = 2103
+        startup["id"] = 2104
+        worker_runtime = {
+            "actual_cwd": "/repo/.worktrees/mf-sub-test",
+            "actual_git_root": "/repo/.worktrees/mf-sub-test",
+            "branch": "refs/heads/codex/mf-sub-test",
+            "head_commit": "head-test",
+        }
+        lineage = {
+            "runtime_context_id": "mfrctx-startup-before-read",
+            "task_id": "mf-sub-startup-before-read",
+            "parent_task_id": "BUG-STARTUP-BEFORE-READ-RECEIPT",
+        }
+        _add_attempt_lineage(startup, **lineage)
+        read_receipt = _add_attempt_lineage(
+            _mf_subagent_read_receipt_event(
+                event_id=2105,
+                contract_hash=contract_hash,
+                identity={**ROUTE_IDENTITY, **worker_runtime},
+            ),
+            **lineage,
+        )
+        implementation = _add_attempt_lineage(
+            {
+                "id": 2106,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    **worker_runtime,
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
+            },
+            **lineage,
+        )
+        qa = _add_attempt_lineage(
+            {**_route_context_qa_verification_event(), "id": 2107},
+            **lineage,
+        )
+        close_ready = _add_attempt_lineage(
+            {
+                "id": 2108,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "status": "accepted",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
+            },
+            **lineage,
+        )
+        events = [
+            route_context,
+            route_action,
+            dispatch,
+            startup,
+            read_receipt,
+            implementation,
+            qa,
+            close_ready,
+        ]
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-STARTUP-BEFORE-READ-RECEIPT",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        read_gate = ready["contract_projection"]["read_receipt_gate"]
+        self.assertEqual(read_gate["status"], "passed")
+        self.assertEqual(read_gate["read_receipt_event_id"], 2105)
+        self.assertEqual(read_gate["first_counted_evidence_event_id"], 2106)
+        self.assertEqual(
+            read_gate["harmless_startup_before_read_receipt_event_ids"],
+            [2104],
+        )
+        self.assertIn(2104, read_gate["counted_evidence_event_ids"])
+        self.assertIn(2106, read_gate["counted_evidence_event_ids"])
+        self.assertNotIn("raw_private_route_context", json.dumps(ready))
+
+    def test_close_precheck_accepts_read_receipt_before_startup_for_same_route_worktree_commit(self):
+        from agent.governance import task_timeline
+
+        contract_hash = "sha256:read-receipt-before-startup-contract"
+        route_context, route_action, dispatch, startup = _route_context_consumption_events()
+        route_context["id"] = 2121
+        route_action["id"] = 2122
+        dispatch["id"] = 2123
+        startup["id"] = 2125
+        worker_runtime = {
+            "actual_cwd": "/repo/.worktrees/mf-sub-test",
+            "actual_git_root": "/repo/.worktrees/mf-sub-test",
+            "branch": "refs/heads/codex/mf-sub-test",
+            "head_commit": "head-test",
+        }
+        lineage = {
+            "runtime_context_id": "mfrctx-read-before-startup",
+            "task_id": "mf-sub-read-before-startup",
+            "parent_task_id": "BUG-READ-RECEIPT-BEFORE-STARTUP",
+        }
+        _add_attempt_lineage(startup, **lineage)
+        read_receipt = _add_attempt_lineage(
+            _mf_subagent_read_receipt_event(
+                event_id=2124,
+                contract_hash=contract_hash,
+                identity={**ROUTE_IDENTITY, **worker_runtime},
+            ),
+            **lineage,
+        )
+        implementation = _add_attempt_lineage(
+            {
+                "id": 2126,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    **worker_runtime,
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
+            },
+            **lineage,
+        )
+        qa = _add_attempt_lineage(
+            {**_route_context_qa_verification_event(), "id": 2127},
+            **lineage,
+        )
+        close_ready = _add_attempt_lineage(
+            {
+                "id": 2128,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "status": "accepted",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "canonical_visible_contract_text_hash": contract_hash,
+                },
+            },
+            **lineage,
+        )
+        events = [
+            route_context,
+            route_action,
+            dispatch,
+            read_receipt,
+            startup,
+            implementation,
+            qa,
+            close_ready,
+        ]
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-READ-RECEIPT-BEFORE-STARTUP",
+            "canonical_visible_contract_text_hash": contract_hash,
+        }
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        read_gate = ready["contract_projection"]["read_receipt_gate"]
+        self.assertEqual(read_gate["status"], "passed")
+        self.assertEqual(read_gate["read_receipt_event_id"], 2124)
+        self.assertEqual(read_gate["first_counted_evidence_event_id"], 2125)
+        self.assertEqual(
+            read_gate["harmless_startup_before_read_receipt_event_ids"],
+            [],
+        )
+        self.assertIn(2125, read_gate["counted_evidence_event_ids"])
+        self.assertIn(2126, read_gate["counted_evidence_event_ids"])
+
     def test_contract_projection_marks_missing_read_receipt_stale(self):
         from agent.governance import task_timeline
 
@@ -3669,8 +3852,8 @@ class TestTaskTimeline(unittest.TestCase):
         ])
         support_context = reminder["boundary"]["supporting_context_not_route_token"]
         self.assertIn("private_route_provider_context", support_context)
-        self.assertNotIn("judgment_brain", support_context)
-        self.assertNotIn("judgment_brain", repr(reminder))
+        self.assertNotIn("raw_private_route_context", support_context)
+        self.assertNotIn("raw_private_route_context", repr(reminder))
 
         advisory_only = task_timeline.mf_close_gate_verification(
             [
