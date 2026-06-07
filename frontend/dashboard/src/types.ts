@@ -126,6 +126,34 @@ export interface ObserverCommandTerminalProjection {
   backlog_status?: string;
 }
 
+export interface ObserverCommandRecoveryProjection {
+  schema_version?: string;
+  status?: string;
+  classification?: string;
+  blocked_command_id?: string;
+  target_session_id?: string;
+  target_session_status?: string;
+  notified_age_sec?: number | null;
+  threshold_sec?: number | null;
+  affected_newer_notified_commands?: Array<{
+    command_id?: string;
+    command_type?: string;
+    status?: string;
+    backlog_id?: string;
+    target_session_id?: string;
+    notified_age_sec?: number | null;
+  }>;
+  next_legal_action?: {
+    tool?: string;
+    action?: string;
+    description?: string;
+    followup_tool?: string;
+    command_id?: string;
+    target_session_id?: string;
+    requires_session_token?: boolean;
+  };
+}
+
 export interface ObserverCommandBacklogProjection {
   schema_version?: string;
   source_of_truth?: string;
@@ -139,6 +167,7 @@ export interface ObserverCommandBacklogProjection {
   canonical_route_identity?: Record<string, unknown>;
   superseded_route_identity?: Record<string, unknown>;
   terminal_evidence_refs?: Record<string, unknown>[];
+  recovery?: ObserverCommandRecoveryProjection;
 }
 
 export interface ObserverCommandSummary {

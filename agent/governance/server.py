@@ -21523,6 +21523,69 @@ def _backlog_contract_summary(value: Any) -> dict:
     }
 
 
+def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) -> dict[str, Any]:
+    if not isinstance(recovery, Mapping):
+        return {}
+    if str(recovery.get("classification") or "") != "target_session_recovery_required":
+        return {}
+    blocker = recovery.get("blocker") if isinstance(recovery.get("blocker"), Mapping) else {}
+    next_action = (
+        recovery.get("next_legal_action")
+        if isinstance(recovery.get("next_legal_action"), Mapping)
+        else {}
+    )
+    affected = recovery.get("affected_newer_notified_commands")
+    if not isinstance(affected, list):
+        affected = []
+    safe_affected = []
+    for item in affected:
+        if not isinstance(item, Mapping):
+            continue
+        safe_affected.append(
+            {
+                "command_id": str(item.get("command_id") or ""),
+                "command_type": str(item.get("command_type") or ""),
+                "status": str(item.get("status") or ""),
+                "backlog_id": str(item.get("backlog_id") or ""),
+                "target_session_id": str(item.get("target_session_id") or ""),
+                "notified_age_sec": item.get("notified_age_sec"),
+            }
+        )
+    return {
+        "schema_version": "observer_command_recovery_projection.v1",
+        "status": str(recovery.get("status") or ""),
+        "classification": str(recovery.get("classification") or ""),
+        "blocked_command_id": str(
+            recovery.get("blocked_command_id")
+            or blocker.get("blocked_command_id")
+            or blocker.get("observer_command_id")
+            or ""
+        ),
+        "target_session_id": str(
+            recovery.get("target_session_id")
+            or blocker.get("target_session_id")
+            or ""
+        ),
+        "target_session_status": str(
+            recovery.get("target_session_computed_status")
+            or blocker.get("target_session_status")
+            or ""
+        ),
+        "notified_age_sec": blocker.get("notified_age_sec"),
+        "threshold_sec": recovery.get("threshold_sec"),
+        "affected_newer_notified_commands": safe_affected,
+        "next_legal_action": {
+            "tool": str(next_action.get("tool") or ""),
+            "action": str(next_action.get("action") or ""),
+            "description": str(next_action.get("description") or ""),
+            "followup_tool": str(next_action.get("followup_tool") or ""),
+            "command_id": str(next_action.get("command_id") or ""),
+            "target_session_id": str(next_action.get("target_session_id") or ""),
+            "requires_session_token": bool(next_action.get("requires_session_token")),
+        },
+    }
+
+
 def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]) -> None:
     bug_ids = {str(bug.get("bug_id") or "").strip() for bug in bugs if bug.get("bug_id")}
     if not bug_ids:
@@ -21540,6 +21603,16 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
         if "no such table" in str(exc).lower():
             return
         raise
+    try:
+        recovery_projection = _observer_command_recovery_projection(
+            observer_session.observer_command_consumer_recovery(conn, project_id=project_id)
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            recovery_projection = {}
+        else:
+            raise
+    recovery_command_id = str(recovery_projection.get("blocked_command_id") or "")
     projections: dict[str, dict[str, Any]] = {}
     for row in rows:
         command = observer_session._command_row_to_dict(row)
@@ -21549,12 +21622,18 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
             continue
         result = command.get("result") if isinstance(command.get("result"), dict) else {}
         projection = result.get("terminal_contract_projection")
-        if not isinstance(projection, dict) and not command.get("command_projection_status"):
+        command_id = str(command.get("command_id") or "")
+        is_recovery_command = bool(recovery_command_id and command_id == recovery_command_id)
+        if (
+            not isinstance(projection, dict)
+            and not command.get("command_projection_status")
+            and not is_recovery_command
+        ):
             continue
-        projections[backlog_id] = {
+        backlog_projection = {
             "schema_version": "observer_command_backlog_projection.v1",
             "source_of_truth": "Contract/Revision/Event",
-            "command_id": command.get("command_id", ""),
+            "command_id": command_id,
             "command_status": command.get("status", ""),
             "command_error": command.get("error", ""),
             "projection": projection if isinstance(projection, dict) else {},
@@ -21565,6 +21644,13 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
             "superseded_route_identity": command.get("superseded_route_identity", {}),
             "terminal_evidence_refs": command.get("terminal_evidence_refs", []),
         }
+        if is_recovery_command:
+            backlog_projection["recovery"] = recovery_projection
+            if not backlog_projection["command_projection_status"]:
+                backlog_projection["command_projection_status"] = recovery_projection["classification"]
+            if not backlog_projection["divergence_reason"]:
+                backlog_projection["divergence_reason"] = "target_session_unavailable"
+        projections[backlog_id] = backlog_projection
     for bug in bugs:
         projection = projections.get(str(bug.get("bug_id") or "").strip())
         if projection:

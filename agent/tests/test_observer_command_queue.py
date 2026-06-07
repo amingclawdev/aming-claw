@@ -1157,11 +1157,17 @@ def test_targeted_notified_execute_diagnostic_reports_target_unavailable_then_cl
         now="2026-06-03T00:03:00Z",
     )
 
-    assert blocked["classification"] == "target_session_unavailable"
+    assert blocked["classification"] == "target_session_recovery_required"
+    assert blocked["blocked_command_id"] == command["command_id"]
     assert blocked["target_session_id"] == target["session_id"]
+    assert blocked["target_session_computed_status"] == "stale"
     assert blocked["target_session"]["computed_status"] == "stale"
     assert blocked["eligible_consumer_count"] == 0
-    assert blocked["next_legal_action"]["tool"] == "observer_session_heartbeat"
+    assert blocked["blocker"]["blocked_command_id"] == command["command_id"]
+    assert blocked["blocker"]["target_session_status"] == "stale"
+    assert blocked["blocker"]["active_recovery_session_ids"] == [wrong["session_id"]]
+    assert blocked["next_legal_action"]["tool"] == "observer_command_takeover"
+    assert blocked["next_legal_action"]["action"] == "retarget_and_claim"
     assert [
         item for item in blocked["consumer_sessions"] if item["session_id"] == wrong["session_id"]
     ][0]["target_allowed"] is False
@@ -1188,6 +1194,84 @@ def test_targeted_notified_execute_diagnostic_reports_target_unavailable_then_cl
     )["status"] == observer_session.COMMAND_STATUS_NOTIFIED
 
 
+def test_targeted_notified_execute_can_be_recovered_by_active_observer_takeover():
+    conn = _conn()
+    target = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-target",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        target_session_id=target["session_id"],
+        created_by="dashboard",
+        notify=True,
+        now="2026-06-03T00:00:01Z",
+    )
+
+    with pytest.raises(observer_session.ObserverPermissionError, match="different session"):
+        observer_session.claim_command(
+            conn,
+            project_id="demo",
+            session_id=fallback["session_id"],
+            session_token=fallback["session_token"],
+            command_id=command["command_id"],
+            now="2026-06-03T00:03:01Z",
+        )
+
+    takeover = observer_session.takeover_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        reason="fallback observer recovers stale targeted command",
+        now="2026-06-03T00:03:02Z",
+    )
+    recovered = takeover["command"]
+
+    assert recovered["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert recovered["target_session_id"] == fallback["session_id"]
+    assert recovered["claimed_by_session_id"] == fallback["session_id"]
+    assert takeover["takeover"]["previous_session_id"] == target["session_id"]
+    assert takeover["takeover"]["previous_session_status"] == "stale"
+    assert takeover["takeover"]["recovery_kind"] == "target_session_reassignment"
+    assert recovered["result"]["target_session_recovery"]["blocked_command_id"] == command["command_id"]
+    assert recovered["result"]["target_session_recovery"]["target_session_id"] == target["session_id"]
+    assert recovered["result"]["target_session_recovery"]["recovered_by_session_id"] == (
+        fallback["session_id"]
+    )
+
+    failed = observer_session.fail_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        error="stale target command recovered and terminally marked",
+        result={"ok": False},
+        now="2026-06-03T00:03:03Z",
+    )
+
+    assert failed["command"]["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert failed["command"]["result"]["takeover"]["recovery_kind"] == (
+        "target_session_reassignment"
+    )
+    assert failed["command"]["result"]["target_session_recovery"]["recovered_by_session_id"] == (
+        fallback["session_id"]
+    )
+
+
 def test_api_command_list_exposes_observer_consumer_recovery_summary():
     from agent.governance import server
 
@@ -1208,7 +1292,10 @@ def test_api_command_list_exposes_observer_consumer_recovery_summary():
         get_project_id=lambda: "demo",
     )
 
-    with patch("agent.governance.server.get_connection", return_value=conn):
+    with (
+        patch("agent.governance.server.get_connection", return_value=conn),
+        patch("agent.governance.observer_session._utc_now", return_value="2026-06-03T00:03:00Z"),
+    ):
         response = server.handle_observer_command_list(ctx)
 
     assert response["ok"] is True
@@ -1218,6 +1305,70 @@ def test_api_command_list_exposes_observer_consumer_recovery_summary():
     assert response["observer_consumer_recovery"]["schema_version"] == (
         observer_session.OBSERVER_COMMAND_CONSUMER_RECOVERY_SCHEMA_VERSION
     )
+
+
+def test_api_command_list_exposes_target_recovery_public_safe_fields():
+    from agent.governance import server
+
+    conn = _conn()
+    target = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-target",
+        now="2026-06-03T00:00:00Z",
+    )
+    active = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-active",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        target_session_id=target["session_id"],
+        created_by="dashboard",
+        notify=True,
+        now="2026-06-03T00:00:01Z",
+    )
+    ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={"status": "notified"},
+        body={},
+        get_project_id=lambda: "demo",
+    )
+
+    with (
+        patch("agent.governance.server.get_connection", return_value=conn),
+        patch("agent.governance.observer_session._utc_now", return_value="2026-06-03T00:03:00Z"),
+    ):
+        response = server.handle_observer_command_list(ctx)
+
+    recovery = response["observer_consumer_recovery"]
+    blocker = recovery["blocker"]
+    next_action = recovery["next_legal_action"]
+
+    assert recovery["classification"] == "target_session_recovery_required"
+    assert recovery["blocked_command_id"] == command["command_id"]
+    assert blocker["blocked_command_id"] == command["command_id"]
+    assert blocker["target_session_id"] == target["session_id"]
+    assert blocker["target_session_status"] == "stale"
+    assert blocker["notified_age_sec"] is not None
+    assert blocker["active_recovery_session_ids"] == [active["session_id"]]
+    assert next_action["tool"] == "observer_command_takeover"
+    assert next_action["command_id"] == command["command_id"]
+    assert "route_identity" not in blocker
+    assert set(next_action) == {
+        "tool",
+        "action",
+        "description",
+        "command_id",
+        "target_session_id",
+        "eligible_session_ids",
+        "requires_session_token",
+    }
 
 
 def test_mcp_observer_command_enqueue_schema_accepts_execute_backlog_row():

@@ -36,6 +36,12 @@ OBSERVER_COMMAND_DURABLE_MF_SUB_EVIDENCE_SCHEMA_VERSION = (
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_CLOSED = "closed"
 SESSION_STATUS_REVOKED = "revoked"
+TARGET_SESSION_RECOVERY_STATUSES = {
+    "missing",
+    "stale",
+    SESSION_STATUS_CLOSED,
+    SESSION_STATUS_REVOKED,
+}
 
 COMMAND_STATUS_QUEUED = "queued"
 COMMAND_STATUS_NOTIFIED = "notified"
@@ -1661,6 +1667,7 @@ def _merge_result_with_durable_takeover(
     for key in (
         "takeover",
         "takeover_status",
+        "target_session_recovery",
         "observer_claim_evidence",
         "claim_blocker",
         "terminal_contract_projection",
@@ -2136,6 +2143,79 @@ def _consumer_session_diagnostic(
     }
 
 
+def _target_session_recovery_status(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    target_session_id: str,
+    now: str,
+) -> str:
+    target = (target_session_id or "").strip()
+    if not target:
+        return ""
+    row = _raw_session_row(conn, target)
+    if row is None or str(row["project_id"]) != (project_id or "").strip():
+        return "missing"
+    return computed_session_status(row, now=now)
+
+
+def _active_recovery_session_ids(
+    sessions: list[dict[str, Any]],
+    command: dict[str, Any],
+) -> list[str]:
+    command_type = str(command.get("command_type") or "")
+    active_ids: list[str] = []
+    for session in sessions:
+        if str(session.get("computed_status") or "") not in {SESSION_STATUS_ACTIVE, "idle"}:
+            continue
+        capabilities = (
+            session.get("capabilities")
+            if isinstance(session.get("capabilities"), dict)
+            else {}
+        )
+        if capabilities_allow(
+            capabilities,
+            ACTION_COMMAND_TAKEOVER,
+            command_type=command_type,
+        ):
+            active_ids.append(str(session.get("session_id") or ""))
+    return active_ids
+
+
+def _newer_notified_command_summaries(
+    commands: list[dict[str, Any]],
+    diagnosed: dict[str, Any],
+    *,
+    now: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    diagnosed_age = _command_notified_age_sec(diagnosed, now=now)
+    if diagnosed_age is None:
+        return []
+    newer: list[dict[str, Any]] = []
+    diagnosed_id = str(diagnosed.get("command_id") or "")
+    for command in commands:
+        if str(command.get("command_id") or "") == diagnosed_id:
+            continue
+        age = _command_notified_age_sec(command, now=now)
+        if age is None or age >= diagnosed_age:
+            continue
+        summary = _observer_command_summary_item(command, now=now)
+        newer.append(
+            {
+                "command_id": summary["command_id"],
+                "command_type": summary["command_type"],
+                "status": summary["status"],
+                "backlog_id": summary["backlog_id"],
+                "target_session_id": summary["target_session_id"],
+                "notified_age_sec": summary["notified_age_sec"],
+            }
+        )
+        if len(newer) >= max(1, int(limit or 10)):
+            break
+    return newer
+
+
 def _observer_command_summary_item(command: dict[str, Any], *, now: str) -> dict[str, Any]:
     payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
     return {
@@ -2147,7 +2227,6 @@ def _observer_command_summary_item(command: dict[str, Any], *, now: str) -> dict
         "notified_at": str(command.get("notified_at") or ""),
         "created_at": str(command.get("created_at") or ""),
         "notified_age_sec": _command_notified_age_sec(command, now=now),
-        "route_identity": _route_identity_from_payload(payload),
         "contract_handoff_projection": _observer_command_contract_projection(
             command,
             status=str(command.get("status") or ""),
@@ -2247,7 +2326,14 @@ def observer_command_consumer_recovery(
     eligible = [consumer for consumer in consumers if consumer.get("claim_eligible")]
     target_session_id = str(diagnosed.get("target_session_id") or "")
     target_session = None
+    target_session_status = ""
     if target_session_id:
+        target_session_status = _target_session_recovery_status(
+            conn,
+            project_id=pid,
+            target_session_id=target_session_id,
+            now=timestamp,
+        )
         target_session = next(
             (
                 consumer
@@ -2262,11 +2348,13 @@ def observer_command_consumer_recovery(
                 item = _session_row_to_dict(row)
                 item["computed_status"] = computed_session_status(row, now=timestamp)
                 target_session = _consumer_session_diagnostic(item, diagnosed)
+                target_session_status = str(item.get("computed_status") or target_session_status)
 
     base.update(
         {
             "target_session_id": target_session_id,
             "target_session": target_session,
+            "target_session_computed_status": target_session_status,
             "connected_consumer_count": len(connected),
             "eligible_consumer_count": len(eligible),
             "eligible_session_ids": [str(item.get("session_id") or "") for item in eligible],
@@ -2294,6 +2382,76 @@ def observer_command_consumer_recovery(
                     "command_id": str(diagnosed.get("command_id") or ""),
                     "requires_session_token": True,
                 },
+            }
+        )
+        return base
+
+    target_recovery_required = bool(
+        target_session_id
+        and str(diagnosed.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        and str(diagnosed.get("status") or "") == COMMAND_STATUS_NOTIFIED
+        and not str(diagnosed.get("claimed_by_session_id") or "")
+        and target_session_status in TARGET_SESSION_RECOVERY_STATUSES
+    )
+    if target_recovery_required:
+        active_recovery_session_ids = _active_recovery_session_ids(sessions, diagnosed)
+        notified_age = _command_notified_age_sec(diagnosed, now=timestamp)
+        affected_newer = _newer_notified_command_summaries(
+            commands,
+            diagnosed,
+            now=timestamp,
+        )
+        if active_recovery_session_ids:
+            next_legal_action = {
+                "tool": "observer_command_takeover",
+                "action": "retarget_and_claim",
+                "description": (
+                    "An active observer may recover this stale targeted command "
+                    "through takeover, then complete or fail it with evidence."
+                ),
+                "command_id": str(diagnosed.get("command_id") or ""),
+                "target_session_id": target_session_id,
+                "eligible_session_ids": active_recovery_session_ids,
+                "requires_session_token": True,
+            }
+        else:
+            next_legal_action = {
+                "tool": "observer_session_register",
+                "action": "register_active_observer_then_recover",
+                "description": (
+                    "Register or heartbeat an active observer session, then recover "
+                    "this stale targeted command through observer_command_takeover."
+                ),
+                "followup_tool": "observer_command_takeover",
+                "command_id": str(diagnosed.get("command_id") or ""),
+                "target_session_id": target_session_id,
+                "requires_session_token": True,
+            }
+        base.update(
+            {
+                "status": "blocked",
+                "classification": "target_session_recovery_required",
+                "recovery_required": True,
+                "blocked_command_id": str(diagnosed.get("command_id") or ""),
+                "affected_newer_notified_commands": affected_newer,
+                "blocker": {
+                    "blocker_id": "observer_command_target_session_recovery_required",
+                    "observer_command_id": str(diagnosed.get("command_id") or ""),
+                    "blocked_command_id": str(diagnosed.get("command_id") or ""),
+                    "target_session_id": target_session_id,
+                    "target_session_status": target_session_status,
+                    "target_session": target_session,
+                    "notified_age_sec": notified_age,
+                    "threshold_sec": threshold,
+                    "active_recovery_session_ids": active_recovery_session_ids,
+                    "affected_newer_notified_command_count": len(affected_newer),
+                    "reason": (
+                        "The command targets an observer session that is unavailable; "
+                        "a different active observer cannot claim it normally and "
+                        "must recover it through observer_command_takeover."
+                    ),
+                },
+                "next_legal_action": next_legal_action,
             }
         )
         return base
@@ -2813,6 +2971,31 @@ def _owner_session_takeover_status(
     return owner_status
 
 
+def _targeted_notified_takeover_status(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+    now: str,
+) -> str:
+    if str(command.get("command_type") or "") != COMMAND_TYPE_EXECUTE_BACKLOG_ROW:
+        return ""
+    if str(command.get("status") or "") != COMMAND_STATUS_NOTIFIED:
+        return ""
+    if str(command.get("claimed_by_session_id") or ""):
+        return ""
+    target_session_id = str(command.get("target_session_id") or "")
+    if not target_session_id:
+        return ""
+    target_status = _target_session_recovery_status(
+        conn,
+        project_id=project_id,
+        target_session_id=target_session_id,
+        now=now,
+    )
+    return target_status if target_status in TARGET_SESSION_RECOVERY_STATUSES else ""
+
+
 def takeover_command(
     conn: sqlite3.Connection,
     *,
@@ -2846,8 +3029,78 @@ def takeover_command(
     )
 
     previous_session_id = str(command.get("claimed_by_session_id") or "")
+    target_recovery_status = _targeted_notified_takeover_status(
+        conn,
+        project_id=pid,
+        command=command,
+        now=timestamp,
+    )
     if command.get("status") in TERMINAL_COMMAND_STATUSES:
         raise ObserverCommandConflict("observer command is already terminal")
+    if target_recovery_status:
+        previous_target_session_id = str(command.get("target_session_id") or "")
+        takeover = {
+            "previous_session_id": previous_target_session_id,
+            "previous_target_session_id": previous_target_session_id,
+            "previous_session_status": target_recovery_status,
+            "target_session_status": target_recovery_status,
+            "new_target_session_id": sid,
+            "recovery_kind": "target_session_reassignment",
+            "reason": takeover_reason,
+            "taken_over_at": timestamp,
+        }
+        result_payload = _command_result(command)
+        result_payload["takeover"] = takeover
+        result_payload["takeover_status"] = {
+            "status": target_recovery_status,
+            "takeover_eligible": True,
+            "taken_over_at": timestamp,
+            "reason": takeover_reason,
+            "recovery_kind": "target_session_reassignment",
+        }
+        result_payload["target_session_recovery"] = {
+            "schema_version": "observer_command_target_session_recovery.v1",
+            "blocked_command_id": cid,
+            "target_session_id": previous_target_session_id,
+            "target_session_status": target_recovery_status,
+            "recovered_by_session_id": sid,
+            "recovered_at": timestamp,
+            "next_expected_action": "complete_or_fail_with_evidence",
+        }
+        cursor = conn.execute(
+            """UPDATE observer_command_queue
+                  SET status = ?,
+                      target_session_id = ?,
+                      claimed_by_session_id = ?,
+                      claimed_at = ?,
+                      result_json = ?
+                WHERE project_id = ?
+                  AND command_id = ?
+                  AND status = ?
+                  AND claimed_by_session_id = ''
+                  AND target_session_id = ?""",
+            (
+                COMMAND_STATUS_CLAIMED,
+                sid,
+                sid,
+                timestamp,
+                _json_dumps(result_payload),
+                pid,
+                cid,
+                COMMAND_STATUS_NOTIFIED,
+                previous_target_session_id,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount != 1:
+            raise ObserverCommandConflict("observer command target recovery lost race")
+        return {
+            "ok": True,
+            "project_id": pid,
+            "observer_session_id": sid,
+            "command": get_command(conn, project_id=pid, command_id=cid),
+            "takeover": takeover,
+        }
     if command.get("status") not in OWNED_COMMAND_STATUSES:
         raise ObserverCommandConflict("observer command is not claimed")
     if previous_session_id == sid:

@@ -14,6 +14,7 @@ import type {
   ContentSysDemoVisualizationEvidence,
   AgentTaskContractProjection,
   MfCloseTimelineGate,
+  ObserverCommandRecoveryProjection,
   TaskTimelineEvent,
   TaskTimelineResponse,
 } from "../types";
@@ -924,8 +925,9 @@ function BacklogRow({
   const contract = bug.contract_summary;
   const projectionStatus = contract?.projection_status || (contract?.divergent ? "divergent" : contract?.stale ? "stale" : "");
   const commandProjection = bug.observer_command_projection;
-  const commandProjectionStatus = commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "";
-  const commandDivergence = commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
+  const commandRecovery = commandProjection?.recovery;
+  const commandProjectionStatus = commandRecovery?.classification || commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "";
+  const commandDivergence = commandRecovery ? "target_session_unavailable" : commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
   return (
     <>
       <tr>
@@ -1002,6 +1004,11 @@ function BacklogRow({
             <div className="backlog-commit mono" title={commandDivergence || "Observer command terminal projection"}>
               command {commandProjectionStatus}
               {commandDivergence ? ` · ${compactProjectionReason(commandDivergence)}` : ""}
+            </div>
+          ) : null}
+          {commandRecovery ? (
+            <div className="backlog-commit mono" title={commandRecoveryTitle(commandRecovery)}>
+              {commandRecoveryLine(commandRecovery)}
             </div>
           ) : null}
           {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
@@ -1297,8 +1304,9 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
   const routeGate = gate?.route_context_gate;
   const projection = contractProjectionForSummary(bug, gate);
   const commandProjection = bug.observer_command_projection;
-  const commandProjectionStatus = commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "not loaded";
-  const commandDivergence = commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
+  const commandRecovery = commandProjection?.recovery;
+  const commandProjectionStatus = commandRecovery?.classification || commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "not loaded";
+  const commandDivergence = commandRecovery ? "target_session_unavailable" : commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
   const missing = stableUnique([
     ...(gate?.missing_event_kinds ?? []),
     ...(contract?.missing_requirement_ids ?? []),
@@ -1320,6 +1328,7 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
       <DetailList label="Tests" values={listFrom(bug.test_files)} />
       <DetailList label="Required docs" values={listFrom(bug.required_docs)} />
       <DetailList label="Provenance / related" values={related} />
+      {commandRecovery ? <DetailList label="Command recovery" values={commandRecoveryDetailValues(commandRecovery)} /> : null}
     </div>
   );
 }
@@ -1352,12 +1361,50 @@ function commandProjectionTone(status: string, divergenceReason = ""): string {
   if (!status || normalized === "not loaded") return "status-unknown";
   if (normalized === "completed" && !divergenceReason) return "status-complete";
   if (normalized === "completed" && divergenceReason.includes("reconciled")) return "status-complete";
+  if (normalized.includes("recovery_required") || normalized === "blocked") return "status-failed";
   if (normalized === "unresolved" || divergenceReason.startsWith("missing_")) return "status-failed";
   return "status-pending";
 }
 
 function compactProjectionReason(value: string): string {
   return value.replace(/^missing_/, "missing ").replaceAll("_", " ");
+}
+
+function commandRecoveryLine(recovery: ObserverCommandRecoveryProjection): string {
+  return [
+    `blocked ${shortProjectionWatermark(recovery.blocked_command_id || "")}`,
+    `target ${shortProjectionWatermark(recovery.target_session_id || "")}`,
+    `age ${formatAgeSeconds(recovery.notified_age_sec)}`,
+    `next ${commandRecoveryAction(recovery)}`,
+  ].filter(Boolean).join(" · ");
+}
+
+function commandRecoveryTitle(recovery: ObserverCommandRecoveryProjection): string {
+  return commandRecoveryDetailValues(recovery).join(" | ");
+}
+
+function commandRecoveryDetailValues(recovery: ObserverCommandRecoveryProjection): string[] {
+  const next = recovery.next_legal_action;
+  return [
+    `blocked_command_id=${recovery.blocked_command_id || "unknown"}`,
+    `target_session_id=${recovery.target_session_id || "unknown"}`,
+    `target_session_status=${recovery.target_session_status || "unknown"}`,
+    `age=${formatAgeSeconds(recovery.notified_age_sec)}`,
+    `next=${commandRecoveryAction(recovery)}`,
+    next?.description ? `action_detail=${next.description}` : "",
+  ].filter(Boolean);
+}
+
+function commandRecoveryAction(recovery: ObserverCommandRecoveryProjection): string {
+  const next = recovery.next_legal_action;
+  return next?.action || next?.tool || next?.followup_tool || "recover";
+}
+
+function formatAgeSeconds(value?: number | null): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  if (value < 60) return `${Math.round(value)}s`;
+  if (value < 3600) return `${Math.round(value / 60)}m`;
+  return `${Math.round(value / 3600)}h`;
 }
 
 function SummaryItem({ label, value, tone, mono = false }: { label: string; value: string; tone?: string; mono?: boolean }) {
