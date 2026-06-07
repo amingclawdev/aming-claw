@@ -45,9 +45,16 @@
       "id": "route_token_gate.task_timeline_append",
       "match": { "event_type": ["route_token_gate.task_timeline_append"] },
       "title": "Timeline append authorized",
-      "detail": "The route token gate authorized a public task timeline append.",
+      "detail": "The route token gate checked whether a protected timeline append could proceed and produced public authorization evidence.",
       "lane": "gate",
       "actor": "Route token gate",
+      "narrative": {
+        "actor": "Route token gate evaluated a protected task-timeline append.",
+        "information": "It produced gate evidence about the allowed action, event kind, status, and route identity hashes.",
+        "context": "The gate shows whether the append is tied to approved route context without displaying route tokens.",
+        "purpose": "This protects close-gate lanes from unscoped timeline evidence.",
+        "outcome": "The event records whether the timeline append was accepted, blocked, or needs more route evidence."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "phase", "path": "phase" },
@@ -70,9 +77,16 @@
       "id": "service.route.completed",
       "match": { "event_type": ["service.route.completed"] },
       "title": "Route service completed",
-      "detail": "A route-service step completed and emitted public completion evidence.",
+      "detail": "The route service completed a route decision and emitted public-safe completion evidence.",
       "lane": "observer",
       "actor": "Route service",
+      "narrative": {
+        "actor": "Route service evaluated the requested governance action.",
+        "information": "It produced route completion evidence, including action status and public route identity hashes when present.",
+        "context": "The visible context is limited to route ids, hashes, action labels, and request ids; private route context bodies are not displayed.",
+        "purpose": "This tells the observer and gates which action was authorized and why it can be traced.",
+        "outcome": "The route decision changed the task state by allowing, blocking, or recording the next governed action."
+      },
       "chip_paths": [
         { "label": "route", "path": "payload.route_id" },
         { "label": "status", "path": "status" },
@@ -92,11 +106,18 @@
     },
     {
       "id": "mf_subagent.startup",
-      "match": { "event_type": ["mf_subagent.startup"] },
+      "match": { "event_type": ["mf_subagent.startup"], "event_kind": ["mf_subagent_startup"] },
       "title": "Worker startup recorded",
-      "detail": "A bounded manual-fix worker started inside its assigned lane.",
+      "detail": "A bounded manual-fix worker started inside its assigned branch/worktree lane with public fence evidence.",
       "lane": "worker",
       "actor": "Bounded worker",
+      "narrative": {
+        "actor": "Bounded worker started the assigned manual-fix lane.",
+        "information": "It produced startup evidence for the worker identity, branch/worktree, fence, and owned files when present.",
+        "context": "The startup record identifies the bounded task lineage and target commit; raw request text and route tokens are not displayed.",
+        "purpose": "This proves implementation work is happening inside the dispatched worker boundary.",
+        "outcome": "The worker lane moved from dispatched to started, which is required before review or close can trust worker evidence."
+      },
       "chip_paths": [
         { "label": "worker", "path": "payload.worker_id" },
         { "label": "lane", "path": "payload.lane" },
@@ -118,11 +139,21 @@
     },
     {
       "id": "route.prompt_context.requested",
-      "match": { "event_type": ["route.prompt_context.requested"] },
+      "match": {
+        "event_type": ["route.prompt_context.requested", "route.prompt_context.loaded", "route.prompt_context.completed"],
+        "event_kind": ["route_context"]
+      },
       "title": "Prompt context requested",
-      "detail": "The route service requested prompt context; raw private request text is not displayed.",
+      "detail": "The route service assembled public-safe prompt context; raw request text and private context bodies are not displayed.",
       "lane": "observer",
       "actor": "Route service",
+      "narrative": {
+        "actor": "Route service requested bounded task context.",
+        "information": "It received or produced context identity evidence such as route id, route context hash, prompt contract id, and visible manifest hash.",
+        "context": "Context contains target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden.",
+        "purpose": "This gives the observer or worker enough public-safe scope to act without exposing private route bodies.",
+        "outcome": "The route context became available for a protected dispatch or action request."
+      },
       "chip_paths": [
         { "label": "route", "path": "payload.route_id" },
         { "label": "prompt contract", "path": "payload.prompt_contract_id" },
@@ -142,11 +173,21 @@
     },
     {
       "id": "route.action.requested",
-      "match": { "event_type": ["route.action.requested"] },
+      "match": {
+        "event_type": ["route.action.requested", "route.action.completed", "route.action.blocked"],
+        "event_kind": ["route_action", "route_action_precheck"]
+      },
       "title": "Route action requested",
-      "detail": "A public route action was requested after route prechecks.",
+      "detail": "A public route action was requested after route prechecks identified the allowed governance action.",
       "lane": "observer",
       "actor": "Route service",
+      "narrative": {
+        "actor": "Route service requested a scoped governance action.",
+        "information": "It produced action-precheck evidence for the action, stage, status, route hash, and backlog/task scope when present.",
+        "context": "The action request carries public route identity and allowed-action metadata; route tokens and private route bodies are not displayed.",
+        "purpose": "This explains why the next mutation or dispatch is allowed to proceed.",
+        "outcome": "The task moved toward the requested governed action, or stayed blocked if the route action was not allowed."
+      },
       "chip_paths": [
         { "label": "action", "path": "payload.action" },
         { "label": "stage", "path": "payload.stage" },
@@ -165,11 +206,18 @@
     },
     {
       "id": "mf_subagent.read_receipt",
-      "match": { "event_type": ["mf_subagent.read_receipt"] },
+      "match": { "event_type": ["mf_subagent.read_receipt"], "event_kind": ["mf_subagent_read_receipt"] },
       "title": "Worker read receipt",
-      "detail": "The bounded worker acknowledged its public task contract.",
+      "detail": "Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden.",
       "lane": "worker",
       "actor": "Bounded worker",
+      "narrative": {
+        "actor": "Bounded worker acknowledged the assigned task contract.",
+        "information": "It recorded that bounded context was received and that forbidden actions and stop state were understood.",
+        "context": "Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden.",
+        "purpose": "This proves the worker understood the implementation fence before producing evidence.",
+        "outcome": "The worker lane recorded context consumption, allowing startup, implementation, or review gates to reason about the lane."
+      },
       "chip_paths": [
         { "label": "worker", "path": "payload.worker_id" },
         { "label": "receipt", "path": "payload.receipt_id" },
@@ -191,9 +239,16 @@
       "id": "route_token_gate.backlog_close",
       "match": { "event_type": ["route_token_gate.backlog_close"] },
       "title": "Backlog close gate checked",
-      "detail": "The route token gate checked a backlog close request.",
+      "detail": "The route token gate checked whether backlog close could proceed with the recorded public evidence.",
       "lane": "gate",
       "actor": "Route token gate",
+      "narrative": {
+        "actor": "Route token gate evaluated a backlog close request.",
+        "information": "It produced close-gate evidence such as can-close status, missing event kinds, and route identity fields when present.",
+        "context": "The gate reads public timeline evidence and protected lane state; route tokens and private route bodies are not displayed.",
+        "purpose": "This explains why the backlog can close or what evidence is still missing.",
+        "outcome": "The close state changed to ready, blocked, or still waiting for required evidence."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "backlog", "path": "backlog_id" },
@@ -213,9 +268,16 @@
       "id": "route_token_gate.upsert",
       "match": { "event_type": ["route_token_gate.upsert", "route_token_gate.backlog_upsert"] },
       "title": "Backlog upsert authorized",
-      "detail": "The route token gate authorized a public backlog upsert.",
+      "detail": "The route token gate checked whether a public backlog upsert was authorized.",
       "lane": "gate",
       "actor": "Route token gate",
+      "narrative": {
+        "actor": "Route token gate evaluated a backlog upsert request.",
+        "information": "It produced upsert authorization evidence for the backlog id, route id, operation, and target files when present.",
+        "context": "The visible context is the public route/upsert envelope; route tokens and private route bodies are not displayed.",
+        "purpose": "This protects backlog mutations from unscoped updates.",
+        "outcome": "The backlog upsert was authorized, blocked, or recorded for follow-up."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "backlog", "path": "backlog_id" },
@@ -234,12 +296,50 @@
       ]
     },
     {
+      "id": "route_token_gate.generic",
+      "match": { "event_type": ["route_token_gate"], "event_kind": ["route_token_gate"], "phase": ["route_gate"] },
+      "title": "Route token gate checked",
+      "detail": "The route token gate checked a protected governance action and recorded public gate evidence.",
+      "lane": "gate",
+      "actor": "Route token gate",
+      "narrative": {
+        "actor": "Route token gate evaluated a protected action.",
+        "information": "It produced public gate status, action, route identity hash, and missing-evidence fields when present.",
+        "context": "The gate evidence explains route authorization without displaying route tokens or private route bodies.",
+        "purpose": "This keeps protected timeline, backlog, and close actions tied to approved route context.",
+        "outcome": "The protected action was accepted, blocked, or left waiting for route evidence."
+      },
+      "chip_paths": [
+        { "label": "status", "path": "status" },
+        { "label": "action", "path": "payload.action" },
+        { "label": "route", "path": "payload.route_id" },
+        { "label": "route hash", "path": "payload.route_context_hash" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "gate status", "path": "status" },
+        { "kind": "gate", "label": "missing", "path": "payload.missing_event_kinds" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "missing event kinds", "path": "payload.missing_event_kinds" },
+        { "label": "missing requirements", "path": "payload.missing_requirement_ids" }
+      ]
+    },
+    {
       "id": "mf_subagent.dispatch",
-      "match": { "event_type": ["mf_subagent.dispatch", "mf_subagent.dispatched"] },
+      "match": { "event_type": ["mf_subagent.dispatch", "mf_subagent.dispatched"], "event_kind": ["mf_subagent_dispatch", "bounded_implementation_worker_dispatch"] },
       "title": "Worker dispatch recorded",
-      "detail": "The observer dispatched a bounded worker with public file-fence evidence.",
+      "detail": "The observer dispatched a bounded worker with target files, acceptance criteria, route identity hashes, and required evidence.",
       "lane": "observer",
       "actor": "Observer",
+      "narrative": {
+        "actor": "Observer dispatched a bounded implementation worker.",
+        "information": "It produced dispatch evidence for worker identity, file fence, branch/worktree, route identity, and graph trace ids when present.",
+        "context": "Dispatch context contains target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden.",
+        "purpose": "This starts implementation while preserving the observer-owned merge, close, and reconcile boundaries.",
+        "outcome": "The task gained a bounded worker lane that can produce implementation evidence for review."
+      },
       "chip_paths": [
         { "label": "worker", "path": "payload.worker_id" },
         { "label": "lane", "path": "payload.lane" },
@@ -263,9 +363,16 @@
       "id": "implementation",
       "match": { "event_kind": ["implementation"], "phase": ["implementation"] },
       "title": "Implementation evidence",
-      "detail": "Implementation work was recorded with public code, node, or test evidence.",
+      "detail": "Implementation work was recorded with public code, node, file, or test evidence.",
       "lane": "worker",
       "actor": "Bounded worker",
+      "narrative": {
+        "actor": "Bounded worker produced implementation evidence.",
+        "information": "It recorded changed files, graph traces, node ids, tests, or commit evidence when present.",
+        "context": "The evidence describes the bounded code change without exposing private request bodies or host secrets.",
+        "purpose": "This is the worker-produced proof that the requested implementation happened inside the file fence.",
+        "outcome": "The implementation lane moved toward review, verification, or a blocked follow-up depending on status."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "phase", "path": "phase" },
@@ -293,9 +400,16 @@
       "id": "verification",
       "match": { "event_kind": ["verification"], "phase": ["verification"] },
       "title": "Verification evidence",
-      "detail": "Verification was recorded with public test or gate evidence.",
+      "detail": "Verification was recorded with public test, QA, browser, or gate evidence.",
       "lane": "verification",
       "actor": "Verification",
+      "narrative": {
+        "actor": "Verification lane checked the recorded work.",
+        "information": "It produced public test results, QA status, warnings, screenshots, or gate checks when present.",
+        "context": "The visible evidence is limited to public commands, pass/fail state, artifacts, and sanitized verification details.",
+        "purpose": "This tells the observer whether implementation evidence is trustworthy enough for review or close.",
+        "outcome": "The task state moved to passed, failed, blocked, or waiting based on verification status."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "passed", "path": "verification.passed" },
@@ -321,9 +435,16 @@
       "id": "independent_verification.completed",
       "match": { "event_type": ["independent_verification.completed"] },
       "title": "Independent verification completed",
-      "detail": "An independent verification lane completed and recorded public evidence.",
+      "detail": "An independent verification lane completed and recorded public QA evidence.",
       "lane": "verification",
       "actor": "Independent verification",
+      "narrative": {
+        "actor": "Independent verification lane reviewed the worker evidence.",
+        "information": "It produced public QA evidence, test results, graph traces, or changed-file checks when present.",
+        "context": "The verifier uses public task evidence and sanitized artifacts, not private prompt or route-token bodies.",
+        "purpose": "This separates worker output from verification so the observer can trust the handoff.",
+        "outcome": "The verification lane recorded whether the candidate is ready for merge/close review."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "verifier", "path": "payload.verifier" },
@@ -347,9 +468,16 @@
       "id": "observer.close_ready",
       "match": { "event_type": ["observer.close_ready"] },
       "title": "Observer close-ready evidence",
-      "detail": "The observer recorded public close-ready evidence for review.",
+      "detail": "The observer recorded public close-ready evidence for final review.",
       "lane": "gate",
       "actor": "Observer",
+      "narrative": {
+        "actor": "Observer recorded close-ready evidence.",
+        "information": "It produced a public review summary, commit/test evidence, and close-gate status when present.",
+        "context": "Close-ready evidence summarizes implementation, verification, and risk without exposing private request text.",
+        "purpose": "This is the explicit signal that the backlog row can enter close review.",
+        "outcome": "The close gate can pass when this evidence and all required protected lanes are present."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "backlog", "path": "backlog_id" },
@@ -376,6 +504,13 @@
       "detail": "Manual-fix close-ready evidence was recorded for the backlog row.",
       "lane": "gate",
       "actor": "Aming Claw gate",
+      "narrative": {
+        "actor": "Manual-fix gate recorded close-ready evidence.",
+        "information": "It produced public precommit, verification, risk, test, and changed-file evidence when present.",
+        "context": "The evidence is scoped to the manual-fix backlog row and sanitized before display.",
+        "purpose": "This gives the observer a compact close packet for review.",
+        "outcome": "The task moves to close-ready when manual-fix evidence satisfies the required lanes."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "backlog", "path": "backlog_id" },
@@ -402,6 +537,13 @@
       "detail": "Close-ready evidence was recorded for this task timeline.",
       "lane": "gate",
       "actor": "Aming Claw gate",
+      "narrative": {
+        "actor": "Close gate received close-ready evidence.",
+        "information": "It recorded public close status, commit, tests, changed files, and remaining missing evidence when present.",
+        "context": "Close-ready context ties implementation and verification evidence to the backlog row without exposing private request bodies.",
+        "purpose": "This is the final timeline signal needed before the close gate can pass.",
+        "outcome": "The task becomes ready to close when close-ready evidence and required verification lanes are present."
+      },
       "chip_paths": [
         { "label": "status", "path": "status" },
         { "label": "backlog", "path": "backlog_id" },

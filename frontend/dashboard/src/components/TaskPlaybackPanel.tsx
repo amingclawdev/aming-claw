@@ -44,13 +44,8 @@ export default function TaskPlaybackPanel({
       {!loading && !error && gate.blocked ? (
         <div className="task-playback-blocked">
           <strong>Blocked close gate</strong>
-          <span>
-            {gate.missing_event_kinds.length > 0
-              ? `Missing event kinds: ${gate.missing_event_kinds.join(", ")}`
-              : gate.missing_requirement_count > 0
-                ? `${gate.missing_requirement_count} evidence requirement${gate.missing_requirement_count === 1 ? "" : "s"} missing`
-                : "Close is not ready yet."}
-          </span>
+          <span>{gate.reason_sentence}</span>
+          <em>{gate.next_expected_action}</em>
         </div>
       ) : null}
 
@@ -112,12 +107,12 @@ export default function TaskPlaybackPanel({
                 <span className="mono">{selectedFrame.source_event_id}</span>
               </div>
               <p>{selectedFrame.detail}</p>
+              <ChipSection title="Actor-context narrative" values={narrativeValues(selectedFrame)} />
               {selectedFrame.semantic_chips.length > 0 ? (
                 <ChipSection title="Public event facts" values={selectedFrame.semantic_chips.map((chip) => `${chip.label}: ${chip.value}`)} />
               ) : null}
-              {selectedEvidence.length > 0 ? <ChipSection title="Evidence refs" values={selectedEvidence.map((ref) => `${ref.label}: ${ref.value}`)} /> : null}
-              {selectedArtifacts.length > 0 ? <ChipSection title="Artifacts" values={selectedArtifacts.map((ref) => `${ref.kind}: ${ref.value}`)} /> : null}
-              {selectedInspector ? <SafeEvidenceInspector inspector={selectedInspector} compact={compact} /> : null}
+              <EventQueryHook frame={selectedFrame} />
+              <AdvancedEvidenceDetails evidence={selectedEvidence} artifacts={selectedArtifacts} inspector={selectedInspector} />
             </article>
           ) : null}
         </div>
@@ -131,6 +126,16 @@ export default function TaskPlaybackPanel({
       </div>
     </section>
   );
+}
+
+function narrativeValues(frame: TaskPlaybackFrame): string[] {
+  return [
+    `Who acted: ${frame.narrative.actor}`,
+    `What changed: ${frame.narrative.information}`,
+    `Context: ${frame.narrative.context}`,
+    `Why it mattered: ${frame.narrative.purpose}`,
+    `Outcome: ${frame.narrative.outcome}`,
+  ];
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
@@ -156,16 +161,50 @@ function ChipSection({ title, values }: { title: string; values: string[] }) {
   );
 }
 
+function EventQueryHook({ frame }: { frame: TaskPlaybackFrame }) {
+  return (
+    <div className="task-playback-chip-section task-playback-event-hook">
+      <strong>Explain/query this event</strong>
+      <div>
+        <button type="button" data-event-id={frame.source_event_id} onClick={() => copyEventRefs(frame)}>
+          Copy event refs
+        </button>
+        <span className="mono">event {frame.source_event_id}</span>
+        <span className="mono">semantic {frame.semantic_entry_id}</span>
+      </div>
+    </div>
+  );
+}
+
+function AdvancedEvidenceDetails({
+  evidence,
+  artifacts,
+  inspector,
+}: {
+  evidence: TaskPlaybackFrame["evidence_refs"];
+  artifacts: TaskPlaybackFrame["artifact_refs"];
+  inspector: TaskPlaybackFrame["detail_inspector"] | null;
+}) {
+  const hasEvidence = evidence.length > 0 || artifacts.length > 0 || inspector;
+  if (!hasEvidence) return null;
+  return (
+    <details className="backlog-inspector-raw task-playback-inspector">
+      <summary>Advanced evidence / Details</summary>
+      {evidence.length > 0 ? <ChipSection title="Evidence refs" values={evidence.map((ref) => `${ref.label}: ${ref.value}`)} /> : null}
+      {artifacts.length > 0 ? <ChipSection title="Artifacts" values={artifacts.map((ref) => `${ref.kind}: ${ref.value}`)} /> : null}
+      {inspector ? <SafeEvidenceInspector inspector={inspector} /> : null}
+    </details>
+  );
+}
+
 function SafeEvidenceInspector({
   inspector,
-  compact,
 }: {
   inspector: NonNullable<TaskPlaybackFrame["detail_inspector"]>;
-  compact: boolean;
 }) {
   return (
-    <details className="backlog-inspector-raw task-playback-inspector" open={!compact}>
-      <summary>Safe evidence inspector</summary>
+    <div className="task-playback-safe-evidence">
+      <strong>Safe evidence inspector</strong>
       <div className="backlog-inspector-grid">
         {inspector.rows.slice(0, 18).map((row) => (
           <div key={`${row.kind}:${row.label}:${row.value}`}>
@@ -188,8 +227,24 @@ function SafeEvidenceInspector({
           </div>
         ))}
       </div>
-    </details>
+    </div>
   );
+}
+
+function copyEventRefs(frame: TaskPlaybackFrame): void {
+  const text = eventRefsText(frame);
+  void navigator.clipboard?.writeText(text);
+}
+
+function eventRefsText(frame: TaskPlaybackFrame): string {
+  const refs = [
+    `event_id=${frame.source_event_id}`,
+    `event_type=${frame.event_type}`,
+    `event_kind=${frame.event_kind}`,
+    `semantic_entry=${frame.semantic_entry_id}`,
+    ...frame.evidence_refs.map((ref) => `${ref.kind}:${ref.label}=${ref.value}`),
+  ];
+  return refs.join("\n");
 }
 
 function formatInspectorValue(value: unknown): string {

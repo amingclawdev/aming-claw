@@ -945,10 +945,17 @@ function verifyBacklogEvidenceContract() {
   });
   assert(semanticCatalogSource.includes("System timeline event"), "Unknown timeline events should use the clearer System timeline event fallback");
   assert(playbackPanelSource.includes("Safe evidence inspector"), "Task playback panel should expose a clickable public-safe evidence inspector");
+  assert(playbackPanelSource.includes("Actor-context narrative"), "Task playback panel should default to actor-context event narrative");
+  assert(playbackPanelSource.includes("Advanced evidence / Details"), "Task playback raw evidence should be collapsed under Advanced evidence / Details");
+  assert(playbackPanelSource.includes("Explain/query this event"), "Task playback panel should expose an event-id query affordance without model calls");
+  assert(playbackSource.includes("reason_sentence"), "Task playback close-gate summary should expose a human-readable blocked reason");
+  assert(playbackSource.includes("next_expected_action"), "Task playback close-gate summary should expose next expected evidence/action");
   assert(playbackPanelSource.includes("raw_sections"), "Task playback panel should show sanitized/redacted raw evidence sections");
   assert(viewSource.includes("redaction_count"), "Backlog evidence inspector should report redacted raw timeline fields");
   assert(playbackTestSource.includes("AC-OBSERVER-COMMAND-QUEUE-ACTIVE-CONSUMER-RECOVERY-20260607"), "Task playback fixture should cover the observer command recovery backlog");
   assert(playbackTestSource.includes("AC-DOGFOOD-OBSERVER-ONLY-COMMAND-STARTUP-GATE-20260607"), "Task playback fixture should cover the observer-only startup gate backlog");
+  assert(playbackTestSource.includes("Blocked because close-ready evidence has not been recorded"), "Task playback fixture should cover a readable blocked close-gate reason");
+  assert(playbackTestSource.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."), "Task playback fixture should cover route/context worker narrative");
   assert(playbackTestSource.includes("System timeline event"), "Task playback fixture should prove unknown events use the system fallback");
   assert(playbackSource.includes("fallback_sample"), "Task playback fixture data should be marked as fallback sample");
   assert(playbackSource.includes("host_private_paths: \"redacted\""), "Task playback privacy boundary should redact host-private paths");

@@ -7,6 +7,7 @@ import {
   timelineStatusFromEvent,
   type TaskTimelineEvidenceInspector,
   type TaskTimelineSemanticChip,
+  type TaskTimelineSemanticNarrative,
   type TaskTimelineSemanticProjection,
 } from "./taskTimelineSemantics";
 
@@ -40,6 +41,7 @@ export interface TaskPlaybackFrame {
   detail: string;
   status: TaskPlaybackFrameStatus;
   actor: string;
+  narrative: TaskTimelineSemanticNarrative;
   semantic_entry_id: string;
   semantic_chips: TaskTimelineSemanticChip[];
   detail_inspector: TaskTimelineEvidenceInspector;
@@ -62,7 +64,11 @@ export interface TaskPlaybackCloseGateSummary {
   status: TaskPlaybackFrameStatus;
   label: string;
   missing_event_kinds: string[];
+  missing_requirement_ids: string[];
   missing_requirement_count: number;
+  reason_sentence: string;
+  next_expected_action: string;
+  next_expected_evidence: string[];
   blocked: boolean;
   event_count: number;
 }
@@ -264,6 +270,7 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
     detail: semantic.detail,
     status,
     actor: semantic.actor_label,
+    narrative: semantic.narrative,
     semantic_entry_id: semantic.catalog_entry_id,
     semantic_chips: semantic.chips,
     detail_inspector: semantic.inspector,
@@ -299,25 +306,125 @@ function closeGateSummaryFrom(response?: BacklogTimelineGateResponse | null): Ta
       status: "missing",
       label: "No close gate response loaded",
       missing_event_kinds: [],
+      missing_requirement_ids: [],
       missing_requirement_count: 0,
+      reason_sentence: "Close-gate verification has not been loaded for this task yet.",
+      next_expected_action: "Next expected evidence/action: load the governed timeline and close-gate verification.",
+      next_expected_evidence: [],
       blocked: false,
       event_count: 0,
     };
   }
-  const missingEventKinds = gate.missing_event_kinds ?? [];
-  const missingRequirementCount = (gate.contract_gate?.missing_requirement_ids ?? []).length
-    + (gate.route_context_gate?.missing_requirement_ids ?? []).length;
+  const missingEventKinds = stable((gate.missing_event_kinds ?? []).map(safeText).filter(Boolean));
+  const missingRequirementIds = closeGateMissingRequirementIds(response);
+  const missingRequirementCount = missingRequirementIds.length;
   const blocked = response.applicable && (!response.can_close || gate.passed === false || missingEventKinds.length > 0 || missingRequirementCount > 0);
+  const nextExpectedEvidence = stable([...missingEventKinds, ...missingRequirementIds]).slice(0, 8);
   return {
     applicable: Boolean(response.applicable),
     can_close: Boolean(response.can_close),
     status: blocked ? "blocked" : gate.passed || response.can_close ? "passed" : "recorded",
     label: response.applicable ? (blocked ? "Close gate blocked" : "Close gate ready") : "Close gate not applicable",
-    missing_event_kinds: missingEventKinds.map(safeText).filter(Boolean),
+    missing_event_kinds: missingEventKinds,
+    missing_requirement_ids: missingRequirementIds,
     missing_requirement_count: missingRequirementCount,
+    reason_sentence: closeGateReasonSentence(response, missingEventKinds, missingRequirementIds, blocked),
+    next_expected_action: closeGateNextExpectedAction(response, missingEventKinds, missingRequirementIds, blocked),
+    next_expected_evidence: nextExpectedEvidence,
     blocked,
     event_count: response.event_count ?? gate.event_count ?? response.events?.length ?? 0,
   };
+}
+
+function closeGateMissingRequirementIds(response: BacklogTimelineGateResponse): string[] {
+  const gate = response.timeline_gate;
+  const contractGate = asRecord(gate?.contract_gate);
+  const routeGate = asRecord(gate?.route_context_gate);
+  const verification = asRecord(asRecord(response as unknown as Record<string, unknown>).verification);
+  const gateRecord = asRecord(gate as unknown as Record<string, unknown>);
+  return stable([
+    ...stringsFromUnknown(contractGate.missing_requirement_ids),
+    ...stringsFromUnknown(routeGate.missing_requirement_ids),
+    ...stringsFromUnknown(gateRecord.missing_requirement_ids),
+    ...stringsFromUnknown(gateRecord.missing_protected_lanes),
+    ...stringsFromUnknown(gateRecord.required_before_protected_evidence),
+    ...stringsFromUnknown(verification.missing_requirement_ids),
+    ...stringsFromUnknown(verification.missing_protected_lanes),
+    ...stringsFromUnknown(verification.required_before_protected_evidence),
+    ...stringsFromUnknown(verification.next_expected_event_kind),
+  ].map(safeText).filter(Boolean));
+}
+
+function closeGateReasonSentence(
+  response: BacklogTimelineGateResponse,
+  missingEventKinds: string[],
+  missingRequirementIds: string[],
+  blocked: boolean,
+): string {
+  if (response.applicable === false) return safeText(response.reason || "Close gate is not applicable to this backlog row.");
+  if (!blocked) return "Close gate can pass because required public evidence is present.";
+  if (missingEventKinds.length > 0) {
+    const label = formatEvidenceList(missingEventKinds);
+    const plural = missingEventKinds.length === 1;
+    return `Blocked because ${label} evidence has not been recorded; the close gate cannot pass until ${plural ? "that event exists" : "those events exist"}.`;
+  }
+  if (missingRequirementIds.length > 0) {
+    const label = formatEvidenceList(missingRequirementIds);
+    const plural = missingRequirementIds.length === 1;
+    return `Blocked because ${label} evidence is missing; the close gate cannot pass until ${plural ? "that requirement is satisfied" : "those requirements are satisfied"}.`;
+  }
+  const reason = safeText(response.reason || "");
+  if (reason) return `Blocked because ${lowercaseFirst(trimTrailingPunctuation(reason))}.`;
+  return "Blocked because close-gate verification has not accepted the current evidence yet.";
+}
+
+function closeGateNextExpectedAction(
+  response: BacklogTimelineGateResponse,
+  missingEventKinds: string[],
+  missingRequirementIds: string[],
+  blocked: boolean,
+): string {
+  if (response.applicable === false) return "Next expected evidence/action: no close-gate evidence is required for this row.";
+  if (!blocked) return "Next expected evidence/action: review the close-ready evidence and complete the close step.";
+  if (missingEventKinds.length > 0) {
+    return `Next expected evidence/action: record ${formatEvidenceList(missingEventKinds)} evidence, then rerun close-gate verification.`;
+  }
+  if (missingRequirementIds.length > 0) {
+    return `Next expected evidence/action: satisfy ${formatEvidenceList(missingRequirementIds)}, then rerun close-gate verification.`;
+  }
+  return "Next expected evidence/action: add the missing public verification evidence, then rerun close-gate verification.";
+}
+
+function formatEvidenceList(values: string[]): string {
+  const labels = stable(values.map(humanEvidenceName).filter(Boolean));
+  if (labels.length === 0) return "required";
+  if (labels.length === 1) return labels[0];
+  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`;
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function humanEvidenceName(value: string): string {
+  const normalized = safeText(value).trim();
+  const labels: Record<string, string> = {
+    close_ready: "close-ready",
+    implementation: "implementation",
+    verification: "verification",
+    independent_verification_lane: "independent verification lane",
+    mf_subagent_startup: "bounded worker startup",
+    mf_subagent_read_receipt: "bounded worker read receipt",
+    bounded_implementation_worker_dispatch: "bounded worker dispatch",
+    route_context: "route context",
+    route_action_precheck: "route action precheck",
+  };
+  return labels[normalized] ?? normalized.replace(/_/g, " ").replace(/\s+/g, " ");
+}
+
+function trimTrailingPunctuation(value: string): string {
+  return value.replace(/[.!?]+$/g, "").trim();
+}
+
+function lowercaseFirst(value: string): string {
+  return value ? value.charAt(0).toLowerCase() + value.slice(1) : value;
 }
 
 function summarizeFrames(

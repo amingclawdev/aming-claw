@@ -38,6 +38,14 @@ export interface TaskTimelineEvidenceInspector {
   redaction_count: number;
 }
 
+export interface TaskTimelineSemanticNarrative {
+  actor: string;
+  information: string;
+  context: string;
+  purpose: string;
+  outcome: string;
+}
+
 export interface TaskTimelineSemanticProjection {
   schema_version: "task_timeline_semantic_projection.v1";
   catalog_schema_version: string;
@@ -53,6 +61,7 @@ export interface TaskTimelineSemanticProjection {
   lane_family: TaskTimelineSemanticLane;
   actor: string;
   actor_label: string;
+  narrative: TaskTimelineSemanticNarrative;
   event_type_label: string;
   event_kind_label: string;
   phase_label: string;
@@ -75,6 +84,7 @@ interface CatalogEntry {
   detail: string;
   lane?: TaskTimelineSemanticLane;
   actor?: string;
+  narrative?: Partial<TaskTimelineSemanticNarrative>;
   chip_paths?: CatalogPath[];
   evidence_paths?: CatalogPath[];
   artifact_paths?: CatalogPath[];
@@ -144,6 +154,7 @@ export function projectTaskTimelineEvent(event: TaskTimelineEvent, index = 0): T
   const statusLabel = statusLabelFor(event, status);
   const laneId = spec.lane ?? laneIdForEvent(event);
   const actorLabel = publicLabel(spec.actor || actorForEvent(event, laneId), "Aming Claw");
+  const narrative = buildNarrative(event, spec, actorLabel, statusLabel, laneId);
   const chips = collectChips(event, spec.chip_paths ?? CATALOG.fallback.chip_paths ?? [], "fact");
   const details = collectChips(event, spec.detail_paths ?? [], "detail");
   const evidence = stableChips([
@@ -159,8 +170,8 @@ export function projectTaskTimelineEvent(event: TaskTimelineEvent, index = 0): T
     catalog_entry_id: spec.id,
     template_id: spec.id,
     fallback,
-    title: publicLabel(spec.title, CATALOG.fallback.title),
-    detail: publicLabel(spec.detail, CATALOG.fallback.detail),
+    title: catalogLabel(spec.title, CATALOG.fallback.title),
+    detail: catalogLabel(spec.detail, CATALOG.fallback.detail),
     status,
     status_label: statusLabel,
     lane_id: laneId,
@@ -168,6 +179,7 @@ export function projectTaskTimelineEvent(event: TaskTimelineEvent, index = 0): T
     lane_family: laneId,
     actor: actorLabel,
     actor_label: actorLabel,
+    narrative,
     event_type_label: publicLabel(event.event_type || "timeline_event", "timeline_event"),
     event_kind_label: publicLabel(event.event_kind || event.phase || "event", "event"),
     phase_label: publicLabel(event.phase || event.event_kind || `event ${index + 1}`, `event ${index + 1}`),
@@ -212,15 +224,57 @@ function fallbackEntry(): CatalogEntry {
 }
 
 function selectCatalogEntry(event: TaskTimelineEvent): CatalogEntry | null {
-  return CATALOG.templates.find((entry) => catalogEntryMatches(entry, event)) ?? null;
+  let best: { entry: CatalogEntry; score: number } | null = null;
+  for (const entry of CATALOG.templates) {
+    const score = catalogEntryMatchScore(entry, event);
+    if (score <= 0) continue;
+    if (!best || score > best.score) best = { entry, score };
+  }
+  return best?.entry ?? null;
 }
 
-function catalogEntryMatches(entry: CatalogEntry, event: TaskTimelineEvent): boolean {
+function catalogEntryMatchScore(entry: CatalogEntry, event: TaskTimelineEvent): number {
+  const weights: Record<"event_type" | "event_kind" | "phase" | "status", number> = {
+    event_type: 100,
+    event_kind: 30,
+    phase: 20,
+    status: 10,
+  };
   return (["event_type", "event_kind", "phase", "status"] as const).some((field) => {
     const expected = entry.match[field]?.map(normalizeMatchValue) ?? [];
     if (expected.length === 0) return false;
     return expected.includes(normalizeMatchValue(stringFrom(event[field])));
-  });
+  }) ? (["event_type", "event_kind", "phase", "status"] as const).reduce((score, field) => {
+    const expected = entry.match[field]?.map(normalizeMatchValue) ?? [];
+    if (expected.length === 0) return score;
+    return expected.includes(normalizeMatchValue(stringFrom(event[field]))) ? score + weights[field] : score;
+  }, 0) : 0;
+}
+
+function buildNarrative(
+  event: TaskTimelineEvent,
+  entry: CatalogEntry,
+  actorLabel: string,
+  statusLabel: string,
+  laneId: TaskTimelineSemanticLane,
+): TaskTimelineSemanticNarrative {
+  const eventKind = publicLabel(event.event_kind || event.event_type || "timeline event", "timeline event");
+  const lane = laneLabel(laneId);
+  const fallback: TaskTimelineSemanticNarrative = {
+    actor: `${actorLabel} acted in the ${lane} lane.`,
+    information: `${actorLabel} recorded public ${eventKind} evidence.`,
+    context: "Public-safe event fields are summarized; raw request bodies and provider context are not displayed.",
+    purpose: "This event updates the task timeline used by review and close-gate checks.",
+    outcome: `Outcome/status changed to ${statusLabel}.`,
+  };
+  const template = entry.narrative ?? {};
+  return {
+    actor: catalogLabel(template.actor, fallback.actor),
+    information: catalogLabel(template.information, fallback.information),
+    context: catalogLabel(template.context, fallback.context),
+    purpose: catalogLabel(template.purpose, fallback.purpose),
+    outcome: catalogLabel(template.outcome, fallback.outcome),
+  };
 }
 
 function normalizeMatchValue(value: string): string {
@@ -393,6 +447,19 @@ function actorForEvent(event: TaskTimelineEvent, lane: TaskTimelineSemanticLane)
 function publicLabel(value: string, fallback = ""): string {
   const safe = sanitizePublicTimelineText(value);
   return safe && safe !== "[private detail redacted]" ? safe : fallback;
+}
+
+function catalogLabel(value: string | undefined, fallback = ""): string {
+  const safe = sanitizeCatalogText(value || "");
+  return safe || fallback;
+}
+
+function sanitizeCatalogText(value: string): string {
+  return value
+    .replace(ABSOLUTE_HOST_PATH, "$1[local path redacted]")
+    .replace(TOKEN_VALUE, "[token redacted]")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function eventDisplayId(event: TaskTimelineEvent): string {

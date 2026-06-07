@@ -15,6 +15,13 @@ const historicalBacklog: BacklogBug = {
   priority: "P1",
 };
 
+const narrativeFocusBacklog: BacklogBug = {
+  bug_id: "AC-TASK-PLAYBACK-NARRATIVE-FOCUS-20260607",
+  title: "Task playback narrative focus",
+  status: "OPEN",
+  priority: "P1",
+};
+
 export const TASK_PLAYBACK_HISTORICAL_FIXTURE_EVENTS: TaskTimelineEvent[] = [
   {
     id: 101,
@@ -173,6 +180,84 @@ export const TASK_PLAYBACK_HISTORICAL_FIXTURE_EVENTS: TaskTimelineEvent[] = [
   },
 ];
 
+export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] = [
+  {
+    id: 201,
+    event_type: "route.prompt_context.requested",
+    event_kind: "route_context",
+    phase: "dispatch",
+    actor: "route service",
+    status: "accepted",
+    backlog_id: narrativeFocusBacklog.bug_id,
+    task_id: "mfsub-task-playback-narrative-focus-a",
+    payload: {
+      route_id: "route-20260607-fixture-narrative",
+      route_context_hash: "sha256:fixture-narrative-route-context",
+      prompt_contract_id: "rprompt-fixture-narrative",
+      prompt_contract_hash: "sha256:fixture-narrative-prompt-contract",
+      visible_injection_manifest_hash: "sha256:fixture-visible-manifest",
+      target_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+      acceptance_criteria: ["blocked reason visible", "actor context narrative visible"],
+      required_evidence: ["implementation", "verification", "close_ready"],
+      [PRIVATE_REQUEST_FIELD]: "[fixture private request text]",
+      route_context: "[fixture private route context body]",
+    },
+    created_at: "2026-06-07T11:00:00Z",
+  },
+  {
+    id: 202,
+    event_type: "route.action.requested",
+    event_kind: "route_action_precheck",
+    phase: "dispatch",
+    actor: "route service",
+    status: "allowed",
+    backlog_id: narrativeFocusBacklog.bug_id,
+    task_id: "mfsub-task-playback-narrative-focus-a",
+    payload: {
+      action: "observer_dispatch_bounded_worker",
+      stage: "dispatch",
+      route_context_hash: "sha256:fixture-narrative-route-context",
+      prompt_contract_id: "rprompt-fixture-narrative",
+      allowed_action: "dispatch_bounded_worker",
+    },
+    created_at: "2026-06-07T11:01:00Z",
+  },
+  {
+    id: 203,
+    event_type: "mf_subagent.read_receipt",
+    event_kind: "mf_subagent_read_receipt",
+    phase: "startup_gate",
+    actor: "mf_sub",
+    status: "accepted",
+    backlog_id: narrativeFocusBacklog.bug_id,
+    task_id: "mfsub-task-playback-narrative-focus-a",
+    payload: {
+      worker_id: "mfsub-task-playback-narrative-focus-a",
+      receipt_id: "receipt-fixture-narrative",
+      owned_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+      acknowledged_forbidden_actions: ["merge", "push", "delete_worktree"],
+      route_context_hash: "sha256:fixture-narrative-route-context",
+      prompt_contract_id: "rprompt-fixture-narrative",
+    },
+    created_at: "2026-06-07T11:02:00Z",
+  },
+  {
+    id: 204,
+    event_type: "task_timeline_append",
+    event_kind: "verification",
+    phase: "verification",
+    actor: "qa",
+    status: "passed",
+    backlog_id: narrativeFocusBacklog.bug_id,
+    task_id: "qa-fixture-narrative",
+    verification: {
+      passed: true,
+      tests_run: ["npm run test -- taskPlayback"],
+    },
+    created_at: "2026-06-07T11:03:00Z",
+  },
+];
+
 export function buildTaskPlaybackHistoricalSemanticFixture() {
   return normalizeTaskPlaybackTrace({
     projectId: "aming-claw",
@@ -189,12 +274,51 @@ export function buildTaskPlaybackHistoricalSemanticFixture() {
   });
 }
 
+export function buildTaskPlaybackNarrativeFocusFixture() {
+  return normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog: narrativeFocusBacklog,
+    taskTimeline: {
+      project_id: "aming-claw",
+      backlog_id: narrativeFocusBacklog.bug_id,
+      events: TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS,
+      count: TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS.length,
+    },
+    gateResponse: {
+      project_id: "aming-claw",
+      bug_id: narrativeFocusBacklog.bug_id,
+      applicable: true,
+      can_close: false,
+      timeline_gate: {
+        passed: false,
+        status: "blocked",
+        required_event_kinds: ["implementation", "verification", "close_ready"],
+        present_event_kinds: ["verification"],
+        missing_event_kinds: ["close_ready"],
+        event_count: TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS.length,
+        route_context_gate: {
+          passed: false,
+          status: "blocked",
+          required_requirement_ids: ["bounded_implementation_worker_dispatch", "mf_subagent_startup"],
+          present_requirement_ids: ["route_context", "route_action_precheck"],
+          missing_requirement_ids: ["mf_subagent_startup"],
+        },
+      },
+      event_count: TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS.length,
+      events: TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS,
+    },
+    source: "governed",
+    generatedAt: "2026-06-07T11:04:00Z",
+  });
+}
+
 export function taskPlaybackHistoricalSemanticFixtureAssertions(): string[] {
   const trace = buildTaskPlaybackHistoricalSemanticFixture();
   const visible = JSON.stringify({
     frames: trace.frames.map((frame) => ({
       title: frame.title,
       detail: frame.detail,
+      narrative: frame.narrative,
       chips: frame.semantic_chips,
       inspector: frame.detail_inspector,
     })),
@@ -210,7 +334,44 @@ export function taskPlaybackHistoricalSemanticFixtureAssertions(): string[] {
   return trace.frames.map((frame) => `${frame.title}: ${frame.detail}`);
 }
 
-export const taskPlaybackHistoricalSemanticFixtureSummary = taskPlaybackHistoricalSemanticFixtureAssertions();
+export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
+  const trace = buildTaskPlaybackNarrativeFocusFixture();
+  const visible = JSON.stringify({
+    close_gate_summary: trace.close_gate_summary,
+    frames: trace.frames.map((frame) => ({
+      title: frame.title,
+      detail: frame.detail,
+      narrative: frame.narrative,
+      chips: frame.semantic_chips,
+      inspector: frame.detail_inspector,
+    })),
+  });
+  assertFixture(
+    trace.close_gate_summary.reason_sentence === "Blocked because close-ready evidence has not been recorded; the close gate cannot pass until that event exists.",
+    "blocked close gate should show a human-readable reason sentence",
+  );
+  assertFixture(
+    trace.close_gate_summary.next_expected_action.includes("record close-ready evidence"),
+    "blocked close gate should show the next expected evidence/action",
+  );
+  assertFixture(
+    visible.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."),
+    "route/context worker story should be visible",
+  );
+  assertFixture(visible.includes("Route service requested bounded task context."), "route context actor story should be visible");
+  assertFixture(!visible.includes("[fixture private request text]"), "private request text should stay hidden");
+  assertFixture(!visible.includes("[fixture private route context body]"), "private route context body should stay hidden");
+  return [
+    trace.close_gate_summary.reason_sentence,
+    trace.close_gate_summary.next_expected_action,
+    ...trace.frames.map((frame) => `${frame.title}: ${frame.narrative.context}`),
+  ];
+}
+
+export const taskPlaybackHistoricalSemanticFixtureSummary = [
+  ...taskPlaybackHistoricalSemanticFixtureAssertions(),
+  ...taskPlaybackNarrativeFocusFixtureAssertions(),
+];
 
 function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
