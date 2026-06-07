@@ -170,8 +170,11 @@
         { "label": "intent", "path": "payload.intent" },
         { "label": "topology", "path": "payload.selected_topology" },
         { "label": "target file", "path": "payload.target_files" },
+        { "label": "target file", "path": "payload.prompt_contract.target_files" },
         { "label": "acceptance criterion", "path": "payload.acceptance_criteria" },
+        { "label": "acceptance criterion", "path": "payload.prompt_contract.acceptance_criteria" },
         { "label": "required evidence", "path": "payload.required_evidence" },
+        { "label": "required evidence", "path": "payload.prompt_contract.evidence_required" },
         { "label": "route", "path": "payload.route_id" },
         { "label": "prompt contract", "path": "payload.prompt_contract_id" },
         { "label": "prompt contract", "path": "payload.prompt_contract.prompt_contract_id" },
@@ -189,7 +192,9 @@
         { "label": "stage", "path": "payload.stage" },
         { "label": "route hash", "path": "payload.route_context_hash" },
         { "label": "target file", "path": "payload.target_files" },
+        { "label": "target file", "path": "payload.prompt_contract.target_files" },
         { "label": "required evidence", "path": "payload.required_evidence" },
+        { "label": "required evidence", "path": "payload.prompt_contract.evidence_required" },
         { "label": "task", "path": "task_id" }
       ]
     },

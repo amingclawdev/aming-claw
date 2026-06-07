@@ -294,6 +294,49 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
     },
     created_at: "2026-06-07T11:04:00Z",
   },
+  {
+    id: 1750,
+    event_type: "route.prompt_context.requested",
+    event_kind: "route_context",
+    phase: "dispatch",
+    actor: "fallback_observer",
+    status: "accepted",
+    backlog_id: "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604",
+    task_id: "repair-474fadf0551f130e",
+    created_at: "2026-06-07T11:05:00Z",
+    payload_json: JSON.stringify({
+      backlog_id: "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604",
+      blocker_ids: ["missing_timeline_evidence", "missing_verification", "pending_scope_timeout", "route_identity_mismatch"],
+      prompt_contract: {
+        acceptance_criteria: ["takeover works from contract state", "close gate fails on missing evidence"],
+        evidence_required: ["implementation", "verification", "close_ready"],
+        prompt_contract_id: "rprompt-repair-fixture-1750",
+        target_files: [
+          "agent/governance/task_timeline.py",
+          "agent/governance/observer_session.py",
+          "frontend/dashboard/src/views/BacklogView.tsx",
+        ],
+      },
+      reason: "pending_scope_timeout blocked route identity consumption",
+      route_context: "[fixture private route context body]",
+      route_id: "route-repair-fixture-1750",
+      selected_topology: "observer_led_parallel_lanes",
+      source_event_ids: ["repair-474fadf0551f130e:route_prompt_context"],
+      stage: "dispatch",
+    }),
+    verification_json: JSON.stringify({
+      missing_event_kinds: ["implementation", "verification"],
+      missing_requirement_ids: ["mf_subagent_startup"],
+      next_legal_action: "Record matching route context, bounded worker startup, implementation, and verification evidence before close.",
+      route_identity_mismatch: true,
+    }),
+    artifact_refs_json: JSON.stringify({
+      prompt_contract_hash: "sha256:fixture-prompt-1750",
+      prompt_contract_id: "rprompt-repair-fixture-1750",
+      route_context_hash: "sha256:fixture-route-1750",
+      source_event_id: "repair-474fadf0551f130e:route_prompt_context",
+    }),
+  } as unknown as TaskTimelineEvent,
 ];
 
 export function buildTaskPlaybackHistoricalSemanticFixture() {
@@ -375,6 +418,7 @@ export function taskPlaybackHistoricalSemanticFixtureAssertions(): string[] {
 export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   const trace = buildTaskPlaybackNarrativeFocusFixture();
   const promptContextFrame = trace.frames.find((frame) => frame.title === "Prompt context requested");
+  const rawPromptContextFrame = trace.frames.find((frame) => frame.source_event_id === "#1750");
   const routeActionFrame = trace.frames.find((frame) => frame.title === "Route action requested");
   const serviceRouteFrame = trace.frames.find((frame) => frame.title === "Route service completed");
   const visible = JSON.stringify({
@@ -382,15 +426,20 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
     frames: trace.frames.map((frame) => ({
       title: frame.title,
       detail: frame.detail,
+      summary: frame.summary,
       narrative: frame.narrative,
       chips: frame.semantic_chips,
+      specific_facts: frame.specific_facts,
+      failure_diagnosis: frame.failure_diagnosis,
+      evidence_links: frame.evidence_links,
       inspector: frame.detail_inspector,
     })),
   });
   assertFixture(Boolean(promptContextFrame), "route prompt context frame should exist in the narrative fixture");
+  assertFixture(Boolean(rawPromptContextFrame), "event #1750 route prompt context frame should hydrate payload_json into playback");
   assertFixture(Boolean(routeActionFrame), "route action frame should exist in the narrative fixture");
   assertFixture(Boolean(serviceRouteFrame), "route service frame should exist in the narrative fixture");
-  if (!promptContextFrame || !routeActionFrame || !serviceRouteFrame) throw new Error("missing route narrative fixture frames");
+  if (!promptContextFrame || !rawPromptContextFrame || !routeActionFrame || !serviceRouteFrame) throw new Error("missing route narrative fixture frames");
   assertFixture(
     trace.close_gate_summary.reason_sentence === "Blocked because implementation, verification, and close-ready evidence have not been recorded; the close gate cannot pass until those events exist.",
     "blocked close gate should show a human-readable reason sentence with missing event kinds",
@@ -416,6 +465,36 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
     "route prompt context chips should show required evidence context",
   );
   assertFixture(
+    rawPromptContextFrame.summary.includes("AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604")
+      && rawPromptContextFrame.summary.includes("route-repair-fixture-1750")
+      && rawPromptContextFrame.summary.includes("3 target files")
+      && rawPromptContextFrame.summary.includes("2 acceptance criteria")
+      && rawPromptContextFrame.summary.includes("3 required evidence items"),
+    "event #1750 summary should explain backlog, route identity, prompt contract scope, and evidence counts",
+  );
+  assertFixture(
+    rawPromptContextFrame.specific_facts.some((fact) => fact.label === "target-file count" && fact.value === "3 target files")
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "acceptance-criteria count" && fact.value === "2 acceptance criteria")
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "required evidence" && fact.value.includes("implementation")),
+    "event #1750 specific facts should promote target-file, acceptance-criteria, and required-evidence details",
+  );
+  assertFixture(
+    rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "blocker ids" && fact.value.includes("route_identity_mismatch"))
+      && rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "missing event kinds" && fact.value.includes("implementation"))
+      && rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "missing required evidence" && fact.value.includes("mf_subagent_startup"))
+      && rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "mismatched route identity" && fact.value.includes("true"))
+      && rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "stale/timeout reason" && fact.value.includes("pending_scope_timeout"))
+      && rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "next legal action" && fact.value.includes("Record matching route context")),
+    "event #1750 blocker diagnosis should promote blocker ids, missing evidence, route mismatch, timeout reason, and next legal action",
+  );
+  assertFixture(
+    rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "timeline_event" && ref.value === "#1750")
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "route_context" && ref.value === "sha256:fixture-route-1750")
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "prompt_contract" && ref.value === "rprompt-repair-fixture-1750")
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.value.includes("route_prompt_context")),
+    "event #1750 evidence links should include typed timeline, route context, prompt contract, and source-event refs",
+  );
+  assertFixture(
     routeActionFrame.detail.includes("authorized or blocked") && routeActionFrame.narrative.outcome.includes("close-ready evidence"),
     "route action narrative should explain authorization and remaining evidence",
   );
@@ -438,7 +517,7 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   return [
     trace.close_gate_summary.reason_sentence,
     trace.close_gate_summary.next_expected_action,
-    ...trace.frames.map((frame) => `${frame.title}: ${frame.narrative.context}`),
+    ...trace.frames.map((frame) => `${frame.title}: ${frame.summary}`),
   ];
 }
 

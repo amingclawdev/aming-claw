@@ -24,8 +24,7 @@ export default function TaskPlaybackPanel({
   const [advancedEvidenceOpenFrameId, setAdvancedEvidenceOpenFrameId] = useState("");
   const advancedEvidenceOpen = Boolean(selectedFrameKey && advancedEvidenceOpenFrameId === selectedFrameKey);
   const gate = trace.close_gate_summary;
-  const selectedEvidence = selectedFrame?.evidence_refs ?? [];
-  const selectedArtifacts = selectedFrame?.artifact_refs ?? [];
+  const selectedEvidenceLinks = selectedFrame?.evidence_links ?? selectedFrame?.evidence_refs ?? [];
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
 
   useEffect(() => {
@@ -116,16 +115,17 @@ export default function TaskPlaybackPanel({
                 <span className="mono">{selectedFrame.phase}</span>
                 <span className="mono">{selectedFrame.source_event_id}</span>
               </div>
-              <p>{selectedFrame.detail}</p>
-              <ChipSection title="Actor-context narrative" values={narrativeValues(selectedFrame)} />
-              {selectedFrame.semantic_chips.length > 0 ? (
-                <ChipSection title="Public event facts" values={selectedFrame.semantic_chips.map((chip) => `${chip.label}: ${chip.value}`)} />
-              ) : null}
+              <div className="task-playback-chip-section">
+                <strong>Event summary</strong>
+                <p>{selectedFrame.summary}</p>
+              </div>
+              <StructuredFactSection title="Specific facts" facts={selectedFrame.specific_facts} />
+              <StructuredFactSection title="Failure/blocker diagnosis" facts={selectedFrame.failure_diagnosis} />
+              <EvidenceLinkSection links={selectedEvidenceLinks} />
+              <ChipSection title="Auxiliary explanation / Actor-context narrative" values={narrativeValues(selectedFrame)} />
               <EventQueryHook frame={selectedFrame} />
-              <AdvancedEvidenceDetails
+              <AdvancedRawDataDetails
                 key={selectedFrame.id}
-                evidence={selectedEvidence}
-                artifacts={selectedArtifacts}
                 inspector={selectedInspector}
                 open={advancedEvidenceOpen}
                 onOpenChange={(open) => setAdvancedEvidenceOpenFrameId(open ? selectedFrameKey : "")}
@@ -147,6 +147,7 @@ export default function TaskPlaybackPanel({
 
 function narrativeValues(frame: TaskPlaybackFrame): string[] {
   return [
+    `Template detail: ${frame.detail}`,
     `Who acted: ${frame.narrative.actor}`,
     `What changed: ${frame.narrative.information}`,
     `Context: ${frame.narrative.context}`,
@@ -178,6 +179,28 @@ function ChipSection({ title, values }: { title: string; values: string[] }) {
   );
 }
 
+function StructuredFactSection({ title, facts }: { title: string; facts: TaskPlaybackFrame["specific_facts"] }) {
+  if (facts.length === 0) return null;
+  return <ChipSection title={title} values={facts.map((fact) => `${fact.label}: ${fact.value}`)} />;
+}
+
+function EvidenceLinkSection({ links }: { links: TaskPlaybackFrame["evidence_links"] }) {
+  if (links.length === 0) return null;
+  return (
+    <div className="task-playback-chip-section">
+      <strong>Evidence links</strong>
+      <div>
+        {links.slice(0, 16).map((ref) => (
+          <button type="button" key={`${ref.kind}:${ref.label}:${ref.value}`} onClick={() => copyEvidenceLink(ref)} title={`Copy ${ref.kind}`}>
+            {ref.kind}: {ref.label}: {ref.value}
+          </button>
+        ))}
+        {links.length > 16 ? <em>+{links.length - 16}</em> : null}
+      </div>
+    </div>
+  );
+}
+
 function EventQueryHook({ frame }: { frame: TaskPlaybackFrame }) {
   return (
     <div className="task-playback-chip-section task-playback-event-hook">
@@ -193,62 +216,30 @@ function EventQueryHook({ frame }: { frame: TaskPlaybackFrame }) {
   );
 }
 
-function AdvancedEvidenceDetails({
-  evidence,
-  artifacts,
+function AdvancedRawDataDetails({
   inspector,
   open,
   onOpenChange,
 }: {
-  evidence: TaskPlaybackFrame["evidence_refs"];
-  artifacts: TaskPlaybackFrame["artifact_refs"];
   inspector: TaskPlaybackFrame["detail_inspector"] | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const hasEvidence = evidence.length > 0 || artifacts.length > 0 || inspector;
-  if (!hasEvidence) return null;
+  const rawSections = inspector?.raw_sections ?? [];
+  if (rawSections.length === 0) return null;
   return (
     <details className="backlog-inspector-raw task-playback-inspector" open={open} onToggle={(event) => onOpenChange(event.currentTarget.open)}>
-      <summary>Advanced evidence / Details</summary>
-      {evidence.length > 0 ? <ChipSection title="Evidence refs" values={evidence.map((ref) => `${ref.label}: ${ref.value}`)} /> : null}
-      {artifacts.length > 0 ? <ChipSection title="Artifacts" values={artifacts.map((ref) => `${ref.kind}: ${ref.value}`)} /> : null}
-      {inspector ? <SafeEvidenceInspector inspector={inspector} /> : null}
-    </details>
-  );
-}
-
-function SafeEvidenceInspector({
-  inspector,
-}: {
-  inspector: NonNullable<TaskPlaybackFrame["detail_inspector"]>;
-}) {
-  return (
-    <div className="task-playback-safe-evidence">
-      <strong>Safe evidence inspector</strong>
-      <div className="backlog-inspector-grid">
-        {inspector.rows.slice(0, 18).map((row) => (
-          <div key={`${row.kind}:${row.label}:${row.value}`}>
-            <span>{row.label}</span>
-            <strong className="mono">{row.value}</strong>
-          </div>
-        ))}
-        {inspector.redaction_count > 0 ? (
-          <div>
-            <span>redactions</span>
-            <strong className="mono">{inspector.redaction_count}</strong>
-          </div>
-        ) : null}
-      </div>
+      <summary>Advanced raw data</summary>
+      {inspector?.redaction_count ? <ChipSection title="Raw data redactions" values={[String(inspector.redaction_count)]} /> : null}
       <div className="backlog-inspector-json">
-        {inspector.raw_sections.map((section) => (
+        {rawSections.map((section) => (
           <div key={section.label}>
             <span>{section.redacted ? `${section.label} redacted` : section.label}</span>
             <pre>{formatInspectorValue(section.value)}</pre>
           </div>
         ))}
       </div>
-    </div>
+    </details>
   );
 }
 
@@ -257,12 +248,17 @@ function copyEventRefs(frame: TaskPlaybackFrame): void {
   void navigator.clipboard?.writeText(text);
 }
 
+function copyEvidenceLink(ref: TaskPlaybackFrame["evidence_links"][number]): void {
+  void navigator.clipboard?.writeText(`${ref.kind}:${ref.label}=${ref.value}`);
+}
+
 function eventRefsText(frame: TaskPlaybackFrame): string {
   const refs = [
     `event_id=${frame.source_event_id}`,
     `event_type=${frame.event_type}`,
     `event_kind=${frame.event_kind}`,
     `semantic_entry=${frame.semantic_entry_id}`,
+    `summary=${frame.summary}`,
     ...frame.evidence_refs.map((ref) => `${ref.kind}:${ref.label}=${ref.value}`),
   ];
   return refs.join("\n");
