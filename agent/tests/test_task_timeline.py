@@ -144,6 +144,59 @@ def _route_context_qa_verification_event():
     }
 
 
+def _route_owned_source_event(identity=None, *, source_event_id="route-source-1"):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "event_type": "route.action.requested",
+        "event_kind": "route_action_source_event",
+        "phase": "pre_mutation",
+        "status": "requested",
+        "correlation_id": source_event_id,
+        "payload": {
+            "route_source_event": {
+                **route_identity,
+                "source_event_id": source_event_id,
+                "action": "dispatch_bounded_worker",
+                "raw_prompt_persisted": False,
+            }
+        },
+        "verification": {
+            **route_identity,
+            "source_event_id": source_event_id,
+        },
+    }
+
+
+def _route_owned_source_service_event(
+    identity=None,
+    *,
+    parent_event_id=0,
+    source_event_id="route-source-1",
+):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "phase": "route_service",
+        "status": "accepted",
+        "parent_event_id": parent_event_id,
+        "payload": {
+            "service_id": "route.action_precheck",
+            "decision": "allow",
+            "source_event_id": source_event_id,
+            "route_evidence": {
+                **route_identity,
+                "source_event_id": source_event_id,
+            },
+        },
+        "verification": {
+            **route_identity,
+            "source_event_id": source_event_id,
+            "decision": "allow",
+        },
+    }
+
+
 def _mf_subagent_read_receipt_event(event_id=0, contract_hash="", identity=None):
     payload = {"read_receipt_hash": "sha256:test-read-receipt"}
     if contract_hash:
@@ -712,9 +765,54 @@ class TestTaskTimeline(unittest.TestCase):
         self.conn.commit()
         return contract
 
-    def _record_route_context_consumption(self, bug_id, *, task_id=""):
+    def _record_route_owned_source_lineage(self, bug_id, *, task_id=""):
         from agent.governance import task_timeline
 
+        source_event_id = f"source-{bug_id}-{task_id or 'backlog'}"
+        source = _route_owned_source_event(source_event_id=source_event_id)
+        recorded_source = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=task_id,
+            event_type=source["event_type"],
+            phase=source["phase"],
+            event_kind=source["event_kind"],
+            status=source["status"],
+            payload=source["payload"],
+            verification=source["verification"],
+            correlation_id=source["correlation_id"],
+        )
+        service_event = _route_owned_source_service_event(
+            parent_event_id=recorded_source["id"],
+            source_event_id=source_event_id,
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=task_id,
+            event_type=service_event["event_type"],
+            phase=service_event["phase"],
+            event_kind=service_event["event_kind"],
+            status=service_event["status"],
+            parent_event_id=service_event["parent_event_id"],
+            payload=service_event["payload"],
+            verification=service_event["verification"],
+        )
+        self.conn.commit()
+
+    def _record_route_context_consumption(
+        self,
+        bug_id,
+        *,
+        task_id="",
+        include_source_lineage=True,
+    ):
+        from agent.governance import task_timeline
+
+        if include_source_lineage:
+            self._record_route_owned_source_lineage(bug_id, task_id=task_id)
         for event in [
             *_route_context_consumption_events(),
             _route_context_qa_verification_event(),
@@ -737,6 +835,7 @@ class TestTaskTimeline(unittest.TestCase):
     def _record_route_service_context(self, bug_id, *, task_id=""):
         from agent.governance import task_timeline
 
+        self._record_route_owned_source_lineage(bug_id, task_id=task_id)
         for event in _route_context_consumption_events()[:2]:
             task_timeline.record_event(
                 self.conn,
@@ -1164,6 +1263,7 @@ class TestTaskTimeline(unittest.TestCase):
         bug_id = "BUG-TL-MF-PARALLEL-WAIVER-DISPATCH-READ-STARTUP"
         worker_task_id = "worker-task-read-startup"
         contract = self._insert_router_backlog(bug_id)
+        self._record_route_owned_source_lineage(bug_id, task_id=worker_task_id)
         read_receipt = _mf_subagent_read_receipt_event(identity=ROUTE_IDENTITY)
         startup_event = _route_context_worker_startup_event()
         for event in (read_receipt, startup_event):
@@ -1415,6 +1515,7 @@ class TestTaskTimeline(unittest.TestCase):
         bug_id = "BUG-TL-MF-PARALLEL-WAIVER-DISPATCH-NO-READ"
         worker_task_id = "worker-task-no-read"
         self._insert_router_backlog(bug_id)
+        self._record_route_owned_source_lineage(bug_id, task_id=worker_task_id)
         startup_event = _route_context_worker_startup_event()
         task_timeline.record_event(
             self.conn,
@@ -1672,6 +1773,140 @@ class TestTaskTimeline(unittest.TestCase):
         ).fetchone()["c"]
         self.assertEqual(count, 2)
 
+    def test_mf_parallel_timeline_accepts_route_token_for_bounded_dispatch_lane(self):
+        from agent.governance import server
+
+        bug_id = "BUG-TL-MF-PARALLEL-TOKEN-DISPATCH"
+        worker_task_id = "worker-token-dispatch"
+        self._insert_router_backlog(bug_id)
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    **_runtime_contract_bounded_dispatch_event(
+                        task_id=worker_task_id,
+                        parent_task_id=bug_id,
+                    ),
+                    "route_token": _route_token(
+                        "task_timeline_append",
+                        bug_id,
+                        task_id=worker_task_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(result["route_token_gate"]["decision"], "route_token")
+        self.assertEqual(
+            result["event_kind"],
+            "bounded_implementation_worker_dispatch",
+        )
+        self.assertNotIn("route_token", result["payload"])
+        self.assertIn("route_token_gate", result["payload"])
+
+    def test_mf_parallel_timeline_accepts_source_event_for_bounded_dispatch_lane_without_token(self):
+        from agent.governance import server
+
+        bug_id = "BUG-TL-MF-PARALLEL-SOURCE-DISPATCH"
+        worker_task_id = "worker-source-dispatch"
+        self._insert_router_backlog(bug_id)
+        self._record_route_owned_source_lineage(bug_id, task_id=worker_task_id)
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    **_runtime_contract_bounded_dispatch_event(
+                        task_id=worker_task_id,
+                        parent_task_id=bug_id,
+                    ),
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(
+            result["route_token_gate"]["decision"],
+            "route_owned_source_event",
+        )
+        self.assertEqual(
+            result["route_token_gate"]["protected_lane"],
+            "bounded_implementation_worker_dispatch",
+        )
+        self.assertTrue(result["route_token_gate"]["source_event_refs"])
+
+    def test_mf_parallel_timeline_accepts_source_event_for_independent_verification_without_token(self):
+        from agent.governance import server
+
+        bug_id = "BUG-TL-MF-PARALLEL-SOURCE-QA"
+        self._insert_router_backlog(bug_id)
+        self._record_route_owned_source_lineage(bug_id)
+        qa_event = _route_context_qa_verification_event()
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "event_type": "independent_verification.completed",
+                    "event_kind": qa_event["event_kind"],
+                    "phase": qa_event["phase"],
+                    "status": qa_event["status"],
+                    "verification": qa_event["verification"],
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(
+            result["route_token_gate"]["decision"],
+            "route_owned_source_event",
+        )
+        self.assertEqual(
+            result["route_token_gate"]["protected_lane"],
+            "independent_verification_lane",
+        )
+
+    def test_mf_parallel_timeline_rejects_generic_waiver_without_source_event_lineage(self):
+        from agent.governance import server
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-TL-MF-PARALLEL-WAIVER-NO-SOURCE-LINEAGE"
+        self._insert_router_backlog(bug_id)
+        self._record_route_context_consumption(
+            bug_id,
+            include_source_lineage=False,
+        )
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": bug_id,
+                        "event_type": "mf.implementation",
+                        "event_kind": "implementation",
+                        "status": "accepted",
+                        "route_waiver": self._route_waiver_for_existing_identity(bug_id),
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        self.assertTrue(raised.exception.details["source_event_lineage_required"])
+        self.assertEqual(
+            raised.exception.details["legal_next_action"],
+            "record_or_reuse_an_accepted_route_owned_source_event_for_the_claimed_route_identity",
+        )
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ? AND event_kind = 'implementation'",
+            (bug_id,),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
     def test_mf_parallel_timeline_accepts_matching_waiver_after_bounded_evidence(self):
         from agent.governance import server
 
@@ -1770,6 +2005,7 @@ class TestTaskTimeline(unittest.TestCase):
 
         bug_id = "BUG-TL-MF-PARALLEL-WAIVER-QA-CYCLE"
         self._insert_router_backlog(bug_id)
+        self._record_route_owned_source_lineage(bug_id)
         for event in _route_context_consumption_events():
             task_timeline.record_event(
                 self.conn,
@@ -2030,7 +2266,7 @@ class TestTaskTimeline(unittest.TestCase):
             {"route_context_token_required"},
         )
 
-    def test_timeline_append_preserves_top_level_route_token_for_service_router(self):
+    def test_timeline_append_redacts_top_level_route_token_payload(self):
         from agent.governance import server, task_timeline
 
         bug_id = "BUG-SERVICE-ROUTER-TOKEN"
@@ -2063,24 +2299,57 @@ class TestTaskTimeline(unittest.TestCase):
             task_id=task_id,
             backlog_id=bug_id,
         )[0]
-        routed = task_timeline.list_events(
-            self.conn,
-            "proj",
-            parent_event_id=result["id"],
-            event_kind="service_route",
-        )
 
-        self.assertIn("route_token", source["payload"])
-        self.assertGreaterEqual(len(routed), 2)
-        self.assertEqual({event["event_type"] for event in routed}, {"service.route.completed"})
-        self.assertEqual({event["payload"]["decision"] for event in routed}, {"allow"})
-        self.assertTrue(
-            all(
-                event["payload"]["route_evidence"]["route_context_hash"]
-                == "sha256:test-route-context-service_route"
-                for event in routed
-            )
+        self.assertNotIn("route_token", source["payload"])
+        self.assertIn("route_token_gate", source["payload"])
+        gate = source["payload"]["route_token_gate"]
+        self.assertEqual(gate["decision"], "route_token_input_redacted")
+        self.assertEqual(
+            gate["route_context_hash"],
+            "sha256:test-route-context-service_route",
         )
+        self.assertTrue(gate["route_token_hash"].startswith("sha256:"))
+        self.assertNotIn("expires_at", source["payload"].get("route_token_gate", {}))
+
+    def test_project_bootstrap_without_prior_route_token_returns_public_safe_handoff(self):
+        from agent.governance import server
+
+        workspace_path = os.path.join(self.tmp.name, "bootstrap-project")
+        os.makedirs(workspace_path, exist_ok=True)
+        route_identity = {
+            **ROUTE_IDENTITY,
+            "route_id": "route-bootstrap-test",
+            "visible_injection_manifest_hash": "sha256:bootstrap-visible",
+            "raw_prompt": "do-not-persist",
+        }
+
+        with mock.patch.object(
+            server.project_service,
+            "bootstrap_project",
+            return_value={"project_id": "bootstrap-project", "graph_stats": {}},
+        ):
+            code, result = server.handle_project_bootstrap(
+                _ctx(
+                    method="POST",
+                    body={
+                        "workspace_path": workspace_path,
+                        "project_id": "bootstrap-project",
+                        "route_identity": route_identity,
+                    },
+                )
+            )
+
+        self.assertEqual(code, 200)
+        self.assertIsNone(result["route_token_gate"])
+        handoff = result["route_bootstrap_handoff"]
+        self.assertFalse(handoff["route_token_required_before_bootstrap"])
+        self.assertEqual(
+            handoff["route_identity"]["route_id"],
+            "route-bootstrap-test",
+        )
+        handoff_json = json.dumps(handoff, sort_keys=True)
+        self.assertNotIn("do-not-persist", handoff_json)
+        self.assertNotIn("raw_prompt", handoff["route_identity"])
 
     def test_observer_repair_route_evidence_records_service_route_gate_inputs(self):
         from agent.governance import server, task_timeline

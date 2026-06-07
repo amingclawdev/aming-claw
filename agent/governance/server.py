@@ -996,8 +996,13 @@ def handle_project_bootstrap(ctx: RequestContext):
     if not workspace_path:
         return 400, {"error": "workspace_path is required"}
     project_id = _bootstrap_route_gate_project_id(ctx.body, workspace_path)
-    route_gate = _require_route_token_mutation_gate(
+    route_gate = _optional_route_token_mutation_gate(
         ctx,
+        action="project_bootstrap",
+        project_id=project_id,
+    )
+    route_handoff = _route_bootstrap_handoff(
+        ctx.body or {},
         action="project_bootstrap",
         project_id=project_id,
     )
@@ -1014,14 +1019,16 @@ def handle_project_bootstrap(ctx: RequestContext):
         if pid:
             conn = get_connection(pid)
             try:
-                _record_route_token_gate_event(conn, pid, route_gate)
-                conn.commit()
+                if route_gate:
+                    _record_route_token_gate_event(conn, pid, route_gate)
+                    conn.commit()
             finally:
                 conn.close()
-        result["route_token_gate"] = route_gate
+        result["route_token_gate"] = route_gate or None
+        result["route_bootstrap_handoff"] = route_handoff
         return 200, result
     except Exception as e:
-        return 400, {"error": str(e)}
+        return 400, {"error": str(e), "route_bootstrap_handoff": route_handoff}
 
 
 @route("POST", "/api/local/choose-directory")
@@ -18181,13 +18188,104 @@ def _body_with_metadata_route_gate(body: dict, metadata: dict | None = None) -> 
     return payload
 
 
-def _timeline_payload_with_route_gate(body: dict) -> dict:
+def _stable_public_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _route_gate_public_summary(gate: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(gate, Mapping) or not gate:
+        return {}
+    allowed = {
+        "schema_version",
+        "allowed",
+        "status",
+        "action",
+        "decision",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "caller_role",
+        "route_token_hash",
+        "waiver_hash",
+        "source_event_gate_hash",
+        "expires_at",
+        "evidence_refs",
+        "timeline_evidence",
+        "source_event_refs",
+        "scope",
+        "required_fields",
+        "protected_lane",
+        "legal_next_action",
+        "next_legal_action",
+    }
+    summary = {key: gate.get(key) for key in allowed if gate.get(key) not in (None, "", [], {})}
+    route_identity = gate.get("route_identity")
+    if isinstance(route_identity, Mapping):
+        summary["route_identity"] = _route_identity_public_summary(route_identity)
+    return summary
+
+
+def _route_token_input_redaction_summary(body: Mapping[str, Any]) -> dict[str, Any]:
+    token = body.get("route_token") if isinstance(body, Mapping) else None
+    if isinstance(token, str):
+        try:
+            token = json.loads(token)
+        except Exception:
+            token = {"unparseable": True}
+    if not isinstance(token, Mapping) or not token:
+        return {}
+    scope = token.get("scope") if isinstance(token.get("scope"), Mapping) else {}
+    return {
+        "schema_version": "route_token_input_redaction.v1",
+        "decision": "route_token_input_redacted",
+        "route_token_hash": _stable_public_hash(token),
+        "route_context_hash": str(token.get("route_context_hash") or ""),
+        "prompt_contract_id": str(token.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(token.get("prompt_contract_hash") or ""),
+        "caller_role": str(token.get("caller_role") or token.get("role") or ""),
+        "evidence_refs": [
+            str(item)
+            for item in (
+                token.get("evidence_refs")
+                if isinstance(token.get("evidence_refs"), list)
+                else []
+            )
+            if str(item)
+        ],
+        "scope": {
+            "project_id": str(token.get("project_id") or scope.get("project_id") or ""),
+            "backlog_id": str(
+                token.get("backlog_id")
+                or token.get("bug_id")
+                or scope.get("backlog_id")
+                or scope.get("bug_id")
+                or ""
+            ),
+            "task_id": str(token.get("task_id") or scope.get("task_id") or ""),
+        },
+    }
+
+
+def _timeline_payload_with_route_gate(
+    body: dict,
+    route_gate: Mapping[str, Any] | None = None,
+) -> dict:
     payload_value = body.get("payload") if isinstance(body, dict) else {}
     payload = dict(payload_value) if isinstance(payload_value, dict) else {}
     event_type = str(body.get("event_type", "") if isinstance(body, dict) else "")
     if event_type.startswith("service.route.") or payload.get("service_router_suppress") is True:
         return payload
     for key in _ROUTE_GATE_PAYLOAD_KEYS:
+        if key == "route_token" and body.get(key):
+            if not payload.get("route_token_gate"):
+                payload["route_token_gate"] = (
+                    _route_gate_public_summary(route_gate)
+                    or _route_token_input_redaction_summary(body)
+                )
+            continue
         if not payload.get(key) and body.get(key):
             payload[key] = body.get(key)
     return payload
@@ -18225,6 +18323,75 @@ def _require_route_token_mutation_gate(
         ) from exc
 
 
+def _optional_route_token_mutation_gate(
+    ctx: RequestContext,
+    *,
+    action: str,
+    project_id: str | None = None,
+    backlog_id: str = "",
+    task_id: str = "",
+    metadata: dict | None = None,
+) -> dict:
+    body = _body_with_metadata_route_gate(ctx.body or {}, metadata)
+    if not _body_has_route_token_input(body) and not _body_has_route_waiver(body):
+        return {}
+    return _require_route_token_mutation_gate(
+        ctx,
+        action=action,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        metadata=metadata,
+    )
+
+
+def _route_bootstrap_handoff(
+    body: Mapping[str, Any],
+    *,
+    action: str,
+    project_id: str,
+) -> dict[str, Any]:
+    payload = body if isinstance(body, Mapping) else {}
+    route_identity = (
+        payload.get("route_identity")
+        or payload.get("claimed_route_identity")
+        or payload.get("command_route_identity")
+        or payload.get("observer_command_route_identity")
+        or payload.get("route_context")
+        or {}
+    )
+    if not isinstance(route_identity, Mapping):
+        route_identity = {}
+    identity = _route_identity_public_summary(
+        {
+            **{
+                key: payload.get(key)
+                for key in (
+                    "route_id",
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                )
+                if payload.get(key)
+            },
+            **dict(route_identity),
+        }
+    )
+    return {
+        "schema_version": "route_bootstrap_handoff.v1",
+        "action": action,
+        "project_id": project_id,
+        "route_identity": identity,
+        "route_token_required_before_bootstrap": False,
+        "raw_prompt_persisted": False,
+        "raw_route_token_persisted": False,
+        "next_legal_action": (
+            "run_route_action_precheck_after_bootstrap_or_reuse_recorded_public_route_identity"
+        ),
+    }
+
+
 def _body_has_route_waiver(body: dict | None) -> bool:
     payload = body or {}
     return any(payload.get(key) for key in (
@@ -18244,6 +18411,10 @@ def _body_has_usable_route_token(body: dict | None) -> bool:
     if not isinstance(token, Mapping):
         return False
     return bool(token.get("route_context_hash") and token.get("prompt_contract_id"))
+
+
+def _body_has_route_token_input(body: dict | None) -> bool:
+    return bool((body or {}).get("route_token"))
 
 
 def _route_waiver_payload(body: dict | None) -> dict:
@@ -18534,6 +18705,339 @@ def _route_identity_mismatch_fields(
     return mismatched
 
 
+def _timeline_event_summary(body: dict, event: dict) -> dict[str, Any]:
+    from . import task_timeline
+
+    candidate = _timeline_event_route_consumption_candidate(body, event)
+    return task_timeline.route_context_consumption_event_summary(candidate)
+
+
+def _timeline_claimed_route_identity(
+    body: dict,
+    event: dict,
+    route_context_gate: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    payload = body.get("payload") if isinstance(body, Mapping) else {}
+    payload = payload if isinstance(payload, Mapping) else {}
+    summary = _timeline_event_summary(body, event)
+    candidates: list[Mapping[str, Any]] = []
+    for value in (
+        body.get("route_identity"),
+        body.get("claimed_route_identity"),
+        body.get("command_route_identity"),
+        body.get("observer_command_route_identity"),
+        payload.get("route_identity"),
+        summary.get("route_identity"),
+        _route_waiver_payload(body),
+        (route_context_gate or {}).get("route_identity")
+        if isinstance(route_context_gate, Mapping)
+        else {},
+    ):
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    merged: dict[str, str] = {}
+    for candidate in candidates:
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        ):
+            token = str(candidate.get(field) or "").strip()
+            if token and not merged.get(field):
+                merged[field] = token
+    return merged
+
+
+def _timeline_supplied_route_categories(body: dict, event: dict) -> set[str]:
+    summary = _timeline_event_summary(body, event)
+    return {str(item) for item in summary.get("categories", []) if str(item)}
+
+
+def _timeline_missing_protected_lanes(
+    route_context_gate: Mapping[str, Any],
+) -> list[str]:
+    missing = {
+        str(item)
+        for item in route_context_gate.get("missing_requirement_ids", [])
+        if str(item)
+    }
+    ordered = [
+        "route_context",
+        "route_action_precheck",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "independent_verification_lane",
+    ]
+    return [item for item in ordered if item in missing]
+
+
+def _timeline_claimed_protected_lane(
+    body: dict,
+    event: dict,
+    route_context_gate: Mapping[str, Any],
+) -> str:
+    categories = _timeline_supplied_route_categories(body, event)
+    for lane in (
+        "bounded_implementation_worker_dispatch",
+        "independent_verification_lane",
+        "mf_subagent_startup",
+    ):
+        if lane in categories:
+            return lane
+    missing_lanes = _timeline_missing_protected_lanes(route_context_gate)
+    return missing_lanes[0] if missing_lanes else ""
+
+
+def _timeline_source_event_directly_authorizes_lane(body: dict, event: dict) -> bool:
+    if _timeline_event_requires_ordered_dispatch_lineage(event):
+        return True
+    marker = _route_gate_marker(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_type", "event_kind", "phase")
+        )
+    )
+    return any(
+        token in marker
+        for token in (
+            "independent_verification",
+            "independent_verification_lane",
+            "qa_verification",
+            "independent_qa",
+        )
+    )
+
+
+def _timeline_source_event_waiver_lane_allowed(
+    events: list[dict[str, Any]],
+    body: dict,
+    event: dict,
+    route_context_gate: dict,
+    missing_requirement_ids: list[str],
+) -> bool:
+    marker = _route_gate_marker(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_type", "event_kind", "phase")
+        )
+    )
+    if any(
+        token in marker
+        for token in (
+            "independent_verification",
+            "independent_verification_lane",
+            "qa_verification",
+            "independent_qa",
+        )
+    ):
+        return True
+    if not _timeline_event_requires_ordered_dispatch_lineage(event):
+        return False
+    present = _route_gate_present_requirement_ids(route_context_gate)
+    if "mf_subagent_startup" not in present:
+        return True
+    return _timeline_route_waiver_ordered_worker_lineage_allowed(
+        events,
+        body,
+        event,
+        route_context_gate,
+        missing_requirement_ids,
+    )
+
+
+def _timeline_source_event_route_gate(
+    events: list[dict[str, Any]],
+    body: dict,
+    event: dict,
+    route_context_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import task_timeline
+    from .mf_subagent_contract import ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION
+
+    route_identity = _timeline_claimed_route_identity(body, event, route_context_gate)
+    protected_lane = _timeline_claimed_protected_lane(body, event, route_context_gate)
+    if not route_identity.get("route_context_hash") or not route_identity.get(
+        "prompt_contract_id"
+    ):
+        return {}
+    source_gate = task_timeline.route_owned_source_event_gate_verification(
+        events,
+        route_identity=route_identity,
+        protected_lane=protected_lane,
+    )
+    if not source_gate.get("passed"):
+        return {}
+    return {
+        "schema_version": ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
+        "allowed": True,
+        "status": "accepted",
+        "action": "task_timeline_append",
+        "decision": "route_owned_source_event",
+        "caller_role": "route_source_event",
+        "route_id": route_identity.get("route_id", ""),
+        "route_context_hash": route_identity.get("route_context_hash", ""),
+        "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
+        "prompt_contract_hash": route_identity.get("prompt_contract_hash", ""),
+        "visible_injection_manifest_hash": route_identity.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "protected_lane": protected_lane,
+        "source_event_refs": source_gate.get("source_event_refs", []),
+        "source_event_gate_hash": _stable_public_hash(source_gate),
+        "route_identity": source_gate.get("route_identity", route_identity),
+        "legal_next_action": source_gate.get("next_legal_action", ""),
+        "source_event_gate": source_gate,
+    }
+
+
+def _timeline_route_context_state(
+    conn,
+    project_id: str,
+    body: dict,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    from . import task_timeline
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    row = conn.execute(
+        "SELECT * FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    if row:
+        contract = backlog_runtime.parse_json_object(
+            _row_get(row, "chain_trigger_json", "{}")
+        )
+        contract = _mf_close_contract_with_route_context(contract, row, body)
+    else:
+        contract = {
+            "close_context": {
+                key: body.get(key)
+                for key in (
+                    "priority",
+                    "target_files",
+                    "changed_files",
+                    "owned_files",
+                    "caller_role",
+                    "task_summary",
+                    "summary",
+                )
+                if body.get(key) not in (None, "", [], {})
+            }
+        }
+
+    scoped_task_id = str(body.get("task_id") or "").strip()
+    scoped_events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=scoped_task_id,
+        limit=1000,
+    )
+    route_context_gate = task_timeline.mf_route_context_gate_verification(
+        scoped_events,
+        contract=contract,
+    )
+    selected_events = scoped_events
+    if (
+        scoped_task_id
+        and route_context_gate.get("required")
+        and not route_context_gate.get("passed")
+    ):
+        backlog_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+        backlog_route_context_gate = task_timeline.mf_route_context_gate_verification(
+            backlog_events,
+            contract=contract,
+        )
+        if backlog_route_context_gate.get("required"):
+            route_context_gate = _select_timeline_route_context_gate(
+                route_context_gate,
+                backlog_route_context_gate,
+            )
+            if route_context_gate is backlog_route_context_gate:
+                selected_events = backlog_events
+    return contract, selected_events, route_context_gate
+
+
+def _timeline_no_token_source_event_gate_or_block(
+    conn,
+    project_id: str,
+    body: dict,
+    event: dict,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from .mf_subagent_contract import route_token_required_failure_details
+
+    if _body_has_route_token_input(body) or _body_has_route_waiver(body):
+        return {}, {}
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    if not backlog_id:
+        return {}, {}
+    _, selected_events, route_context_gate = _timeline_route_context_state(
+        conn,
+        project_id,
+        body,
+    )
+    if not route_context_gate.get("required"):
+        return {}, {}
+    source_gate = _timeline_source_event_route_gate(
+        selected_events,
+        body,
+        event,
+        route_context_gate,
+    )
+    if source_gate and _timeline_source_event_directly_authorizes_lane(body, event):
+        return source_gate, {}
+    missing_protected_lanes = _timeline_missing_protected_lanes(route_context_gate)
+    source_event_gate = (
+        source_gate.get("source_event_gate", {})
+        if source_gate
+        else {}
+    )
+    reason = (
+        "route_token or accepted route-owned source-event lineage is required "
+        "before appending protected mf_parallel evidence"
+    )
+    return {}, route_token_required_failure_details(
+        action="task_timeline_append",
+        reason=reason,
+        extra={
+            "protected_event": {
+                "event_type": event.get("event_type", ""),
+                "event_kind": event.get("event_kind", ""),
+                "phase": event.get("phase", ""),
+            },
+            "source_event_lineage_required": True,
+            "route_owned_source_event_gate": source_event_gate,
+            "missing_requirement_ids": route_context_gate.get(
+                "missing_requirement_ids",
+                [],
+            ),
+            "missing_protected_lanes": missing_protected_lanes,
+            "missing_protected_lane": (
+                _timeline_claimed_protected_lane(body, event, route_context_gate)
+                or (missing_protected_lanes[0] if missing_protected_lanes else "")
+            ),
+            "legal_next_action": (
+                "pass_a_valid_route_token_or_record_an_accepted_route_owned_source_event_for_the_claimed_route_identity"
+            ),
+            "required_before_protected_evidence": [
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+                "independent_verification_lane",
+            ],
+            "present_requirement_ids": route_context_gate.get(
+                "present_requirement_ids",
+                [],
+            ),
+        },
+    )
+
+
 def _timeline_route_waiver_consumption_bootstrap_allowed(
     body: dict,
     event: dict,
@@ -18546,10 +19050,7 @@ def _timeline_route_waiver_consumption_bootstrap_allowed(
     if _timeline_event_blocked_evidence_markers(event):
         return False
 
-    from . import task_timeline
-
-    candidate = _timeline_event_route_consumption_candidate(body, event)
-    summary = task_timeline.route_context_consumption_event_summary(candidate)
+    summary = _timeline_event_summary(body, event)
     if not summary.get("passed"):
         return False
     supplied_categories = {
@@ -18610,8 +19111,7 @@ def _timeline_route_waiver_ordered_worker_lineage_allowed(
 
     from . import task_timeline
 
-    candidate = _timeline_event_route_consumption_candidate(body, event)
-    summary = task_timeline.route_context_consumption_event_summary(candidate)
+    summary = _timeline_event_summary(body, event)
     if not summary.get("passed"):
         return False
     supplied_categories = {
@@ -18720,76 +19220,30 @@ def _timeline_route_waiver_block_for_high_risk(
     if not backlog_id:
         return {}
 
-    from . import task_timeline
     from .mf_subagent_contract import route_token_required_failure_details
 
-    row = conn.execute(
-        "SELECT * FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
-    ).fetchone()
-    if row:
-        contract = backlog_runtime.parse_json_object(
-            _row_get(row, "chain_trigger_json", "{}")
-        )
-        contract = _mf_close_contract_with_route_context(contract, row, body)
-    else:
-        contract = {
-            "close_context": {
-                key: body.get(key)
-                for key in (
-                    "priority",
-                    "target_files",
-                    "changed_files",
-                    "owned_files",
-                    "caller_role",
-                    "task_summary",
-                    "summary",
-                )
-                if body.get(key) not in (None, "", [], {})
-            }
-        }
-
-    scoped_task_id = str(body.get("task_id") or "").strip()
-    scoped_events = task_timeline.list_events(
+    _, selected_events, route_context_gate = _timeline_route_context_state(
         conn,
         project_id,
-        backlog_id=backlog_id,
-        task_id=scoped_task_id,
-        limit=1000,
+        body,
     )
-    route_context_gate = task_timeline.mf_route_context_gate_verification(
-        scoped_events,
-        contract=contract,
-    )
-    selected_events = scoped_events
-    if (
-        scoped_task_id
-        and route_context_gate.get("required")
-        and not route_context_gate.get("passed")
-    ):
-        backlog_events = task_timeline.list_events(
-            conn,
-            project_id,
-            backlog_id=backlog_id,
-            limit=1000,
-        )
-        backlog_route_context_gate = task_timeline.mf_route_context_gate_verification(
-            backlog_events,
-            contract=contract,
-        )
-        if backlog_route_context_gate.get("required"):
-            route_context_gate = _select_timeline_route_context_gate(
-                route_context_gate,
-                backlog_route_context_gate,
-            )
-            if route_context_gate is backlog_route_context_gate:
-                selected_events = backlog_events
     if not route_context_gate.get("required"):
         return {}
     identity_mismatch = _route_waiver_identity_mismatch(
         route_context_gate,
         _route_waiver_payload(body),
     )
-    if route_context_gate.get("passed") and not identity_mismatch:
+    source_gate = (
+        {}
+        if identity_mismatch
+        else _timeline_source_event_route_gate(
+            selected_events,
+            body,
+            event,
+            route_context_gate,
+        )
+    )
+    if route_context_gate.get("passed") and not identity_mismatch and source_gate:
         return {}
     missing_requirement_ids = [
         str(item)
@@ -18798,7 +19252,16 @@ def _timeline_route_waiver_block_for_high_risk(
     ]
     if (
         not identity_mismatch
+        and source_gate
         and (
+            _timeline_source_event_waiver_lane_allowed(
+                selected_events,
+                body,
+                event,
+                route_context_gate,
+                missing_requirement_ids,
+            )
+            or
             _timeline_route_waiver_consumption_bootstrap_allowed(
                 body,
                 event,
@@ -18820,17 +19283,25 @@ def _timeline_route_waiver_block_for_high_risk(
     has_startup = "mf_subagent_startup" in {
         str(item) for item in present_requirement_ids if str(item)
     }
+    missing_protected_lanes = _timeline_missing_protected_lanes(route_context_gate)
+    source_lineage_required = not bool(source_gate)
     reason = (
         "route_waiver route identity does not match existing bounded worker "
         "route-context evidence"
         if identity_mismatch
         else (
             "generic route_waiver cannot append protected mf_parallel evidence "
+            "without accepted route-owned source-event lineage for the claimed "
+            "route identity"
+            if source_lineage_required
+            else (
+            "generic route_waiver cannot append protected mf_parallel evidence "
             "before an accepted route token issuer or ordered read-receipt/startup "
             "lineage exists"
             if has_startup
             else "generic route_waiver cannot append protected mf_parallel evidence "
             "before bounded worker route-context consumption exists"
+            )
         )
     )
     return route_token_required_failure_details(
@@ -18859,6 +19330,10 @@ def _timeline_route_waiver_block_for_high_risk(
             },
             "route_waiver_recording_allowed": True,
             "waiver_evidence_only": True,
+            "source_event_lineage_required": source_lineage_required,
+            "route_owned_source_event_gate": (
+                source_gate.get("source_event_gate", {}) if source_gate else {}
+            ),
             "blocked_evidence_kinds": [
                 "implementation",
                 "verification",
@@ -18874,6 +19349,16 @@ def _timeline_route_waiver_block_for_high_risk(
             "topology_policy": route_context_gate.get("topology_policy", {}),
             "missing_requirement_ids": route_context_gate.get(
                 "missing_requirement_ids", []
+            ),
+            "missing_protected_lanes": missing_protected_lanes,
+            "missing_protected_lane": (
+                _timeline_claimed_protected_lane(body, event, route_context_gate)
+                or (missing_protected_lanes[0] if missing_protected_lanes else "")
+            ),
+            "legal_next_action": (
+                "record_or_reuse_an_accepted_route_owned_source_event_for_the_claimed_route_identity"
+                if source_lineage_required
+                else "append_the_exact_missing_protected_lane_before_retrying_close_evidence"
             ),
             "present_requirement_ids": present_requirement_ids,
         },
@@ -19553,22 +20038,36 @@ def handle_task_timeline_append(ctx: RequestContext):
 
     with DBContext(project_id) as conn:
         if task_timeline.is_protected_close_evidence(event):
-            waiver_block = _timeline_route_waiver_block_for_high_risk(
-                conn, project_id, ctx.body or {}, event
+            route_gate, source_block = _timeline_no_token_source_event_gate_or_block(
+                conn,
+                project_id,
+                ctx.body or {},
+                event,
             )
-            if waiver_block:
+            if source_block:
                 raise GovernanceError(
                     "route_token_required",
-                    str(waiver_block.get("reason") or "route_token required"),
+                    str(source_block.get("reason") or "route_token required"),
                     422,
-                    waiver_block,
+                    source_block,
                 )
-            route_gate = _require_route_token_mutation_gate(
-                ctx,
-                action="task_timeline_append",
-                backlog_id=ctx.body.get("backlog_id", ""),
-                task_id=ctx.body.get("task_id", ""),
-            )
+            if not route_gate:
+                waiver_block = _timeline_route_waiver_block_for_high_risk(
+                    conn, project_id, ctx.body or {}, event
+                )
+                if waiver_block:
+                    raise GovernanceError(
+                        "route_token_required",
+                        str(waiver_block.get("reason") or "route_token required"),
+                        422,
+                        waiver_block,
+                    )
+                route_gate = _require_route_token_mutation_gate(
+                    ctx,
+                    action="task_timeline_append",
+                    backlog_id=ctx.body.get("backlog_id", ""),
+                    task_id=ctx.body.get("task_id", ""),
+                )
         if route_gate:
             _record_route_token_gate_event(
                 conn,
@@ -19596,7 +20095,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             schema_version=_query_int(ctx.body, "schema_version", 2),
             actor=ctx.body.get("actor", ""),
             status=ctx.body.get("status", ""),
-            payload=_timeline_payload_with_route_gate(ctx.body),
+            payload=_timeline_payload_with_route_gate(ctx.body, route_gate),
             verification=ctx.body.get("verification") or {},
             artifact_refs=ctx.body.get("artifact_refs") or {},
             trace_id=ctx.body.get("trace_id", ""),

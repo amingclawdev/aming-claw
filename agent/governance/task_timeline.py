@@ -115,6 +115,7 @@ MF_BOUNDED_SUBAGENT_DISPATCH_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.dispatch"
 MF_BOUNDED_SUBAGENT_REVIEW_READY_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.review_ready"
 
 MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION = "mf_route_context_consumption_gate.v1"
+MF_ROUTE_OWNED_SOURCE_EVENT_GATE_SCHEMA_VERSION = "mf_route_owned_source_event_gate.v1"
 MF_CLOSE_MISSING_GROUPS_SCHEMA_VERSION = "mf_close_missing_evidence_groups.v1"
 MF_ROUTE_CONTEXT_REMINDER_SCHEMA_VERSION = "mf_route_context_reminder.v1"
 MF_ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1"
@@ -198,6 +199,13 @@ MF_ROUTE_IDENTITY_CLEANUP_MARKERS = {
     "route_identity_recovery",
     "route_identity_supersede",
     "route_identity_superseded",
+}
+MF_ROUTE_SOURCE_PASS_STATUSES = {
+    *MF_ROUTE_CONTEXT_PASS_STATUSES,
+    "complete",
+    "completed",
+    "succeeded",
+    "success",
 }
 
 
@@ -2267,6 +2275,165 @@ def route_context_consumption_event_summary(
         "attempt_lineage": _route_attempt_lineage(row),
         "runtime_dispatch_evidence": _runtime_dispatch_evidence(row),
         "passed": _route_event_passed(row),
+    }
+
+
+def _route_owned_event_ref(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": event.get("id") or event.get("event_id"),
+        "event_type": event.get("event_type"),
+        "event_kind": event.get("event_kind"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+        "correlation_id": event.get("correlation_id"),
+    }
+
+
+def _route_owned_event_matches_identity(
+    event: dict[str, Any],
+    route_identity: Mapping[str, Any],
+) -> bool:
+    if not route_identity:
+        return True
+    identity = _route_identity(event)
+    if not identity:
+        return False
+    expected = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+        if str(route_identity.get(field) or "").strip()
+    }
+    return _route_identity_matches_filter(identity, expected)
+
+
+def _is_route_owned_source_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "").strip().lower()
+    event_kind = _route_marker(event.get("event_kind"))
+    return event_type.startswith("route.") or event_kind in {
+        "route_source_event",
+        "route_action_source_event",
+        "route_context_source_event",
+    }
+
+
+def _is_route_service_completion_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "").strip().lower()
+    event_kind = _route_marker(event.get("event_kind"))
+    if event_type.startswith("service.route."):
+        return True
+    return event_kind == "service_route"
+
+
+def _route_source_event_accepted(event: dict[str, Any]) -> bool:
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    if status in MF_ROUTE_SOURCE_PASS_STATUSES:
+        return True
+    payload = _mapping(event.get("payload"))
+    decision = str(
+        payload.get("decision")
+        or payload.get("status")
+        or _mapping(payload.get("route_evidence")).get("decision")
+        or ""
+    ).strip().lower()
+    return decision in MF_ROUTE_SOURCE_PASS_STATUSES or decision == "allow"
+
+
+def route_owned_source_event_gate_verification(
+    events: list[dict[str, Any]] | None,
+    *,
+    route_identity: Mapping[str, Any] | None = None,
+    protected_lane: str = "",
+) -> dict[str, Any]:
+    """Verify an accepted route-owned source event exists for a route identity."""
+
+    rows = [_mapping(event) for event in (events or []) if _mapping(event)]
+    identity_filter = _mapping(route_identity)
+    source_events: dict[str, dict[str, Any]] = {}
+    source_refs: set[str] = set()
+    accepted_direct: list[dict[str, Any]] = []
+    accepted_lineage: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+
+    for event in rows:
+        if not _is_route_owned_source_event(event):
+            continue
+        if not _route_owned_event_matches_identity(event, identity_filter):
+            ignored.append({
+                **_route_owned_event_ref(event),
+                "reason": "route_identity_mismatch",
+            })
+            continue
+        ref = str(event.get("id") or event.get("event_id") or "").strip()
+        correlation_id = str(event.get("correlation_id") or "").strip()
+        source_event_id = str(_first_deep_text(event, "source_event_id") or "").strip()
+        for key in (ref, correlation_id, source_event_id):
+            if key:
+                source_events[key] = event
+                source_refs.add(key)
+        if _route_source_event_accepted(event):
+            accepted_direct.append(_route_owned_event_ref(event))
+
+    for event in rows:
+        if not _is_route_service_completion_event(event):
+            continue
+        if not _route_owned_event_matches_identity(event, identity_filter):
+            ignored.append({
+                **_route_owned_event_ref(event),
+                "reason": "route_identity_mismatch",
+            })
+            continue
+        parent_ref = str(event.get("parent_event_id") or "").strip()
+        correlation_id = str(event.get("correlation_id") or "").strip()
+        source_event_id = str(_first_deep_text(event, "source_event_id") or "").strip()
+        lineage_refs = [ref for ref in (parent_ref, correlation_id, source_event_id) if ref]
+        source_event = next(
+            (source_events.get(ref) for ref in lineage_refs if source_events.get(ref)),
+            None,
+        )
+        if not source_event:
+            ignored.append({
+                **_route_owned_event_ref(event),
+                "reason": "missing_route_source_parent",
+            })
+            continue
+        if not _route_source_event_accepted(event):
+            ignored.append({
+                **_route_owned_event_ref(event),
+                "reason": "non_passing_route_service_result",
+            })
+            continue
+        accepted_lineage.append({
+            "source_event": _route_owned_event_ref(source_event),
+            "service_event": _route_owned_event_ref(event),
+        })
+
+    passed = bool(accepted_direct or accepted_lineage)
+    route_identity_summary = {
+        field: str(identity_filter.get(field) or "").strip()
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if str(identity_filter.get(field) or "").strip()
+    }
+    return {
+        "schema_version": MF_ROUTE_OWNED_SOURCE_EVENT_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "protected_lane": str(protected_lane or ""),
+        "route_identity": route_identity_summary,
+        "source_event_refs": sorted(source_refs),
+        "accepted_direct_source_events": accepted_direct,
+        "accepted_source_lineage": accepted_lineage,
+        "ignored_source_events": ignored,
+        "next_legal_action": (
+            "append_the_protected_timeline_evidence_with_this_route_owned_source_event_gate"
+            if passed
+            else "record_or_reuse_an_accepted_route_owned_source_event_for_the_claimed_route_identity"
+        ),
     }
 
 
