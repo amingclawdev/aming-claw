@@ -445,6 +445,192 @@ def test_execute_backlog_row_complete_without_startup_fails_truthfully():
     assert "runtime-text startup intent" in blocker["reason"]
 
 
+def test_execute_backlog_row_observer_only_monitor_complete_without_startup():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="dashboard",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "observer_only_monitor_evidence": {
+                "schema_version": (
+                    observer_session
+                    .OBSERVER_COMMAND_OBSERVER_ONLY_MONITOR_EVIDENCE_SCHEMA_VERSION
+                ),
+                "status": "passed",
+                "observer_only": True,
+                "no_implementation_worker_required": True,
+                "command_kind": "dashboard_monitor",
+                "observer_command_id": command["command_id"],
+                "backlog_id": payload["backlog_id"],
+                "route_id": payload["route_id"],
+                "route_context_hash": payload["route_context_hash"],
+                "prompt_contract_id": payload["prompt_contract_id"],
+                "visible_injection_manifest_hash": payload[
+                    "visible_injection_manifest_hash"
+                ],
+                "timeline_event_ref": "timeline:2701",
+                "data_sources": ["observer_command_queue", "task_timeline"],
+            },
+        },
+        now="2026-06-03T00:00:03Z",
+    )
+
+    command_after = completed["command"]
+    projection = command_after["result"]["terminal_contract_projection"]
+    assert completed["ok"] is True
+    assert command_after["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert command_after["error"] == ""
+    assert command_after["result"]["ok"] is True
+    assert command_after["result"]["status"] == "completed"
+    assert "startup_surface_blocker" not in command_after["result"]
+    assert projection["source_of_truth"] == "observer_command_queue/task_timeline"
+    assert projection["command_projection_status"] == "completed"
+    assert projection["canonical_contract_state"] == "completed"
+    assert projection["observer_only_monitor"]["no_implementation_worker_required"] is True
+    assert command_after["command_projection_status"] == "completed"
+    assert command_after["canonical_route_identity"]["route_id"] == payload["route_id"]
+
+
+def test_execute_backlog_row_observer_only_monitor_requires_no_worker_evidence():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="dashboard",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "observer_only_monitor_evidence": {
+                "observer_only": True,
+                "command_kind": "dashboard_monitor",
+                "observer_command_id": command["command_id"],
+                "backlog_id": payload["backlog_id"],
+                "route_id": payload["route_id"],
+                "route_context_hash": payload["route_context_hash"],
+                "prompt_contract_id": payload["prompt_contract_id"],
+                "visible_injection_manifest_hash": payload[
+                    "visible_injection_manifest_hash"
+                ],
+            },
+        },
+        now="2026-06-03T00:00:03Z",
+    )
+
+    command_after = completed["command"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert command_after["result"]["ok"] is False
+    assert "terminal_contract_projection" not in command_after["result"]
+    assert command_after["result"]["startup_surface_blocker"]["status"] == "blocked"
+
+
+def test_execute_backlog_row_terminal_dispatch_blocker_overrides_monitor_completion():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="dashboard",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "observer_only_monitor_evidence": {
+                "observer_only": True,
+                "no_implementation_worker_required": True,
+                "command_kind": "dashboard_monitor",
+                "observer_command_id": command["command_id"],
+                "backlog_id": payload["backlog_id"],
+                "route_id": payload["route_id"],
+                "route_context_hash": payload["route_context_hash"],
+                "prompt_contract_id": payload["prompt_contract_id"],
+                "visible_injection_manifest_hash": payload[
+                    "visible_injection_manifest_hash"
+                ],
+            },
+            "terminal_dispatch_blocker": {
+                "status": "blocked",
+                "blocker_id": "dispatch_gate_blocked_by_contract",
+            },
+            "terminal_contract_projection": {
+                "canonical_contract_state": "blocked",
+                "command_projection_status": "blocked",
+                "divergence_reason": "dispatch_gate_blocked_by_contract",
+            },
+        },
+        now="2026-06-03T00:00:03Z",
+    )
+
+    command_after = completed["command"]
+    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert command_after["error"] == "dispatch_gate_blocked_by_contract"
+    assert command_after["result"]["ok"] is False
+    assert command_after["result"]["command_projection_status"] == "blocked"
+    assert command_after["result"]["canonical_contract_state"] == "blocked"
+    assert "startup_surface_blocker" not in command_after["result"]
+
+
 def test_execute_backlog_row_complete_resolves_persisted_mf_sub_evidence_refs():
     conn = _conn()
     task_timeline.ensure_schema(conn)
