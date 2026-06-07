@@ -854,6 +854,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("host_private_paths: \"redacted\""), "Task playback privacy boundary should redact host-private paths");
   assert(playbackSource.includes("PRIVATE_EVIDENCE_KEY"), "Task playback normalizer should filter private evidence keys");
   assert(playbackSource.includes("judgment[-_\\s]?brain") && playbackSource.includes("judge[-_\\s]?(private|route"), "Task playback normalizer should filter private judge labels");
+  assert(playbackSource.includes("judge[-_\\s]?mode") && playbackSource.includes("ac[-_]judge"), "Task playback normalizer should filter judge-mode backlog labels");
   assert(playbackSource.includes("isPrivatePlaybackText"), "Task playback privacy classifier should be exported for selector filtering");
   assert(playbackViewSource.includes("api.taskTimelineFor"), "Playback selection should fetch governed task timeline data");
   assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");

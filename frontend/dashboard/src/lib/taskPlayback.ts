@@ -94,7 +94,7 @@ export interface NormalizeTaskPlaybackInput {
 }
 
 const FRAME_STATUS_ORDER: TaskPlaybackFrameStatus[] = ["blocked", "failed", "missing", "running", "waiting", "passed", "recorded", "unknown"];
-const PRIVATE_EVIDENCE_KEY = /(prompt|raw_prompt|hidden|private|secret|token|route_context|route_identity|precheck|provider|filesystem|cwd|worktree_path|host|judgment[-_\s]?brain|\bjb[-_][a-z0-9][a-z0-9_-]*|private[-_\s]?judge|judge[-_\s]?(private|route|routing|precheck|provider|prompt|context|memory|brain|lineage|contract))/i;
+const PRIVATE_EVIDENCE_KEY = /(prompt|raw_prompt|hidden|private|secret|token|route_context|route_identity|precheck|provider|filesystem|cwd|worktree_path|host|judgment[-_\s]?brain|\bjb[-_][a-z0-9][a-z0-9_-]*|\bac[-_]judge[-_][a-z0-9][a-z0-9_-]*|private[-_\s]?judge|judge[-_\s]?mode|judge[-_\s]?(private|route|routing|precheck|provider|prompt|context|memory|brain|lineage|contract))/i;
 const ABSOLUTE_HOST_PATH = /(^|\s)(\/Users\/[^\s,;:]+|\/home\/[^\s,;:]+|\/var\/folders\/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)/g;
 
 export function isPrivatePlaybackText(value?: string | null): boolean {
