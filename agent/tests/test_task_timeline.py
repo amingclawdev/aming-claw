@@ -48,6 +48,20 @@ ROUTE_IDENTITY = {
     "prompt_contract_hash": "sha256:e96ff2d045d64d1578145c9ec1457ff0a3b220b6dfdfe35c331dff620a3e0e3a",
 }
 
+STRICT_GOVERNANCE_POLICY = {
+    "schema_version": "governance_policy.v1",
+    "profile": "aming-claw",
+    "source": "pytest",
+    "public_safe": True,
+    "requirements": {
+        "graph_first_evidence": True,
+        "worker_graph_trace": True,
+        "independent_qa": True,
+        "single_active_task": True,
+        "close_timeline": True,
+    },
+}
+
 
 def _route_context_consumption_events():
     return [
@@ -743,6 +757,84 @@ class TestTaskTimeline(unittest.TestCase):
         waiver = _route_waiver("task_timeline_append", bug_id, task_id=task_id)
         waiver.update(ROUTE_IDENTITY)
         return waiver
+
+    def test_record_event_publishes_timeline_and_current_task_events(self):
+        from agent.governance import event_bus, task_timeline
+
+        bus = event_bus.get_event_bus()
+        published = []
+
+        def on_event(name, payload):
+            if name in {"task_timeline.appended", "current_task.changed"}:
+                published.append((name, payload))
+
+        bus.subscribe_all(on_event)
+        try:
+            inserted = task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-SSE",
+                task_id="task-sse",
+                event_type="mf.subagent.startup",
+                phase="startup",
+                event_kind="mf_subagent.startup",
+                actor="mf-sub",
+                status="running",
+            )
+        finally:
+            bus.unsubscribe_all(on_event)
+
+        timeline = next(
+            payload for name, payload in published if name == "task_timeline.appended"
+        )
+        current = next(
+            payload for name, payload in published if name == "current_task.changed"
+        )
+        self.assertEqual(timeline["project_id"], "proj")
+        self.assertEqual(timeline["backlog_id"], "BUG-SSE")
+        self.assertEqual(timeline["task_id"], "task-sse")
+        self.assertEqual(timeline["event_id"], inserted["id"])
+        self.assertEqual(timeline["status"], "running")
+        self.assertEqual(current["source"], "task_timeline.record_event")
+        self.assertEqual(current["runtime_state"], "running")
+
+    def test_queued_event_publishes_timeline_and_current_task_events(self):
+        from agent.governance import event_bus, task_timeline
+
+        bus = event_bus.get_event_bus()
+        published = []
+
+        def on_event(name, payload):
+            if name in {"task_timeline.appended", "current_task.changed"}:
+                published.append((name, payload))
+
+        bus.subscribe_all(on_event)
+        try:
+            inserted = task_timeline.enqueue_event(
+                "proj",
+                backlog_id="BUG-SSE-QUEUE",
+                task_id="task-sse-queue",
+                event_type="mf.subagent.progress",
+                phase="implementation",
+                event_kind="implementation",
+                actor="mf-sub",
+                status="running",
+                wait=True,
+            )
+        finally:
+            bus.unsubscribe_all(on_event)
+
+        timeline = next(
+            payload for name, payload in published if name == "task_timeline.appended"
+        )
+        current = next(
+            payload for name, payload in published if name == "current_task.changed"
+        )
+        self.assertEqual(timeline["backlog_id"], "BUG-SSE-QUEUE")
+        self.assertEqual(timeline["task_id"], "task-sse-queue")
+        self.assertEqual(timeline["event_id"], inserted["id"])
+        self.assertEqual(current["source"], "task_timeline.record_event")
+        self.assertEqual(current["runtime_state"], "running")
 
     def test_concurrent_timeline_writes_use_serialized_queue(self):
         from agent.governance import task_timeline
@@ -2686,6 +2778,81 @@ class TestTaskTimeline(unittest.TestCase):
             ready["present_event_kinds"],
             ["close_ready", "implementation", "verification"],
         )
+
+    def test_strict_governance_policy_requires_graph_trace_and_independent_qa(self):
+        from agent.governance import task_timeline
+
+        contract = {"governance_policy": STRICT_GOVERNANCE_POLICY}
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["governance_policy"]["profile"], "aming-claw")
+        self.assertTrue(blocked["worker_graph_trace_gate"]["required"])
+        self.assertTrue(blocked["independent_qa_gate"]["required"])
+        self.assertEqual(
+            blocked["worker_graph_trace_gate"]["missing_requirement_ids"],
+            ["worker_graph_trace"],
+        )
+        self.assertEqual(
+            blocked["independent_qa_gate"]["missing_requirement_ids"],
+            ["independent_qa"],
+        )
+        self.assertIn(
+            "worker_graph_trace",
+            blocked["missing_evidence_groups"]["groups"],
+        )
+        self.assertIn("independent_qa", blocked["missing_evidence_groups"]["groups"])
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                {
+                    "event_kind": "qa_verification",
+                    "phase": "verification",
+                    "actor": "qa",
+                    "status": "passed",
+                    "verification": {"graph_trace_ids": ["gqt-policy-close"]},
+                },
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["worker_graph_trace_gate"]["trace_ids"], ["gqt-policy-close"])
+        self.assertTrue(ready["independent_qa_gate"]["passed"])
+
+    def test_close_timeline_policy_can_disable_required_close_event_kinds(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "governance_policy": {
+                **STRICT_GOVERNANCE_POLICY,
+                "profile": "third-party-public",
+                "requirements": {
+                    **STRICT_GOVERNANCE_POLICY["requirements"],
+                    "worker_graph_trace": False,
+                    "independent_qa": False,
+                    "single_active_task": False,
+                    "close_timeline": False,
+                },
+            },
+        }
+
+        result = task_timeline.mf_close_gate_verification([], contract=contract)
+
+        self.assertTrue(result["passed"], result)
+        self.assertFalse(result["close_timeline_required"])
+        self.assertEqual(result["required_event_kinds"], [])
+        self.assertEqual(result["missing_event_kinds"], [])
+        self.assertFalse(result["checks"]["has_implementation"])
+        self.assertFalse(result["checks"]["has_verification"])
+        self.assertFalse(result["checks"]["has_close_ready"])
 
     def test_contract_projection_reports_read_receipt_before_counted_evidence(self):
         from agent.governance import task_timeline
@@ -4953,6 +5120,84 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(filtered["decision"], "approved")
         self.assertEqual(filtered["count"], 1)
         self.assertEqual(filtered["events"][0]["task_id"], "task-b")
+
+    def test_backlog_current_task_endpoint_uses_timeline_fallback(self):
+        from agent.governance import server, task_timeline
+
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, runtime_state, current_task_id,
+                chain_trigger_json, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P1', '', '', ?, '2026-06-07T00:00:00Z',
+                       '2026-06-07T00:00:00Z')""",
+            ("BUG-CURRENT", "Current task from timeline", "{}"),
+        )
+        event = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-CURRENT",
+            task_id="task-current",
+            event_type="mf.subagent.startup",
+            phase="startup",
+            event_kind="mf_subagent.startup",
+            actor="mf-sub",
+            status="running",
+        )
+        self.conn.commit()
+
+        result = server.handle_backlog_current_task(_ctx({"limit": "10"}))
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["active"])
+        self.assertEqual(result["source"], "task_timeline")
+        self.assertEqual(result["backlog_id"], "BUG-CURRENT")
+        self.assertEqual(result["task_id"], "task-current")
+        self.assertEqual(result["latest_event"]["id"], event["id"])
+        self.assertEqual(result["latest_event"]["status"], "running")
+        self.assertEqual(result["active_count"], 1)
+        self.assertEqual(result["single_active_task"]["active_count"], 1)
+
+    def test_backlog_current_task_endpoint_prefers_newer_timeline_over_stale_runtime(self):
+        from agent.governance import server, task_timeline
+
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, runtime_state, current_task_id,
+                chain_trigger_json, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P1', 'manual_fix_in_progress', 'task-stale',
+                       ?, '2026-06-07T00:00:00Z', '2026-06-07T00:00:00Z')""",
+            ("BUG-STALE", "Stale runtime task", "{}"),
+        )
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, runtime_state, current_task_id,
+                chain_trigger_json, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P0', '', '',
+                       ?, '2026-06-07T00:00:00Z', '2026-06-07T00:00:00Z')""",
+            ("BUG-LIVE", "Live timeline task", "{}"),
+        )
+        event = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-LIVE",
+            task_id="task-live",
+            event_type="mf.subagent.startup",
+            phase="startup",
+            event_kind="mf_subagent.startup",
+            actor="mf-sub",
+            status="running",
+        )
+        self.conn.commit()
+
+        result = server.handle_backlog_current_task(_ctx({"limit": "10"}))
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["source"], "task_timeline")
+        self.assertEqual(result["backlog_id"], "BUG-LIVE")
+        self.assertEqual(result["task_id"], "task-live")
+        self.assertEqual(result["latest_event"]["id"], event["id"])
+        self.assertEqual(result["active_count"], 2)
+        self.assertEqual(result["active_backlog"][0]["bug_id"], "BUG-LIVE")
 
     def test_backlog_timeline_gate_precheck_matches_close_gate_evidence(self):
         from agent.governance import server, task_timeline

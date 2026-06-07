@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { useEventStream } from "../lib/sse";
 import {
   emptyTaskPlaybackTrace,
   normalizeTaskPlaybackTrace,
@@ -34,6 +35,8 @@ const BACKLOG_URL_PARAM = "backlog";
 const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_REFRESH_MS = 5000;
+const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 const CONTENT_SYS_DEMO_VISUALIZATION_SCHEMA = "content_sys.demo_visualization_evidence.v1";
 const ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1";
 const ROUTE_GUIDANCE_ALLOWED_STAGES = ["dispatch", "startup_gate", "implementation_wait", "handoff_gate"];
@@ -178,6 +181,51 @@ interface CurrentTaskTimelineState {
   refreshedAt?: string;
 }
 
+interface CurrentTaskHint {
+  ok?: boolean;
+  active: boolean;
+  source: string;
+  project_id: string;
+  backlog_id: string;
+  task_id?: string;
+  bug?: BacklogBug | null;
+  active_backlog?: BacklogBug[];
+  active_count?: number;
+  latest_event?: Record<string, unknown>;
+  governance_policy?: Record<string, unknown>;
+  single_active_task?: Record<string, unknown>;
+}
+
+function dashboardApiBase(): string {
+  return DIRECT_API ? BACKEND_URL : "";
+}
+
+async function currentTaskHintFor(projectId: string, signal?: AbortSignal): Promise<CurrentTaskHint> {
+  const path = `/api/backlog/${encodeURIComponent(projectId)}/current-task?limit=10`;
+  const res = await fetch(`${dashboardApiBase()}${path}`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new ApiError(res.status, `GET ${path} -> ${res.status}`, text);
+  }
+  return (await res.json()) as CurrentTaskHint;
+}
+
+function isCurrentTaskLiveEvent(name: string): boolean {
+  return [
+    "task_timeline.appended",
+    "current_task.changed",
+    "task.created",
+    "task.completed",
+    "task.failed",
+    "task.retry",
+    "dashboard.changed",
+  ].includes(name);
+}
+
 export default function BacklogView({ backlog, projectId }: Props) {
   const bugs = backlog.bugs ?? [];
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("OPEN");
@@ -191,6 +239,8 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const [detailErrorByBug, setDetailErrorByBug] = useState<Record<string, string>>({});
   const [modalTrail, setModalTrail] = useState<string[]>([]);
   const [currentTimelineByBug, setCurrentTimelineByBug] = useState<Record<string, CurrentTaskTimelineState>>({});
+  const [currentTaskHint, setCurrentTaskHint] = useState<CurrentTaskHint | null>(null);
+  const [currentTaskRefreshSeq, setCurrentTaskRefreshSeq] = useState(0);
   const [selectedCurrentFrameId, setSelectedCurrentFrameId] = useState("");
   const timelineByBugRef = useRef<Record<string, TimelineState>>({});
   const currentTimelineByBugRef = useRef<Record<string, CurrentTaskTimelineState>>({});
@@ -255,12 +305,18 @@ export default function BacklogView({ backlog, projectId }: Props) {
       .sort(compareBugs);
   }, [bugs, priorityFilter, query, statusFilter]);
 
+  const hintedCurrentBug = currentTaskHint?.active && currentTaskHint.bug ? currentTaskHint.bug : null;
+
   const activeTaskCandidates = useMemo(() => {
-    return bugs
+    const candidates = bugs
       .map((bug) => ({ bug, score: activeTaskScore(bug) }))
       .filter((item) => item.score > 0)
       .sort(compareActiveTaskCandidates);
-  }, [bugs]);
+    if (hintedCurrentBug && !candidates.some((item) => item.bug.bug_id === hintedCurrentBug.bug_id)) {
+      return [{ bug: hintedCurrentBug, score: 10_000 }, ...candidates];
+    }
+    return candidates;
+  }, [bugs, hintedCurrentBug]);
 
   const selectedCurrentBug = selectedBugId
     ? detailByBug[selectedBugId] ??
@@ -268,7 +324,9 @@ export default function BacklogView({ backlog, projectId }: Props) {
       bugs.find((bug) => bug.bug_id === selectedBugId) ??
       backlogIdPlaceholder(selectedBugId)
     : null;
-  const primaryCurrentBug = selectedBugId ? selectedCurrentBug : activeTaskCandidates[0]?.bug ?? null;
+  const primaryCurrentBug = selectedBugId
+    ? selectedCurrentBug
+    : hintedCurrentBug ?? activeTaskCandidates[0]?.bug ?? null;
   const secondaryActiveBugs = primaryCurrentBug
     ? activeTaskCandidates.map((item) => item.bug).filter((bug) => bug.bug_id !== primaryCurrentBug.bug_id)
     : activeTaskCandidates.map((item) => item.bug);
@@ -285,6 +343,8 @@ export default function BacklogView({ backlog, projectId }: Props) {
   useEffect(() => {
     setTimelineByBug({});
     setCurrentTimelineByBug({});
+    setCurrentTaskHint(null);
+    setCurrentTaskRefreshSeq(0);
     setDetailByBug({});
     setDetailLoadingByBug({});
     setDetailErrorByBug({});
@@ -435,6 +495,53 @@ export default function BacklogView({ backlog, projectId }: Props) {
     });
   }, [projectId]);
 
+  const refreshCurrentTaskHint = useCallback((signal: AbortSignal) => {
+    return currentTaskHintFor(projectId, signal)
+      .then((hint) => {
+        if (signal.aborted || !currentTimelineMountedRef.current) return;
+        setCurrentTaskHint(hint);
+        if (hint.active && hint.bug?.bug_id) {
+          setCurrentTimelineByBug((states) => {
+            const bugId = hint.bug!.bug_id;
+            const existing = states[bugId];
+            return {
+              ...states,
+              [bugId]: {
+                loading: existing?.loading ?? false,
+                loaded: existing?.loaded ?? false,
+                error: existing?.error ?? "",
+                trace: existing?.trace ?? emptyTaskPlaybackTrace(projectId, hint.bug!),
+                bug: existing?.bug ?? hint.bug!,
+                taskTimeline: existing?.taskTimeline,
+                gate: existing?.gate,
+                refreshedAt: existing?.refreshedAt,
+              },
+            };
+          });
+        }
+      })
+      .catch(() => {
+        if (!signal.aborted && currentTimelineMountedRef.current) {
+          setCurrentTaskHint(null);
+        }
+      });
+  }, [projectId]);
+
+  useEventStream(projectId, {
+    enabled: Boolean(projectId),
+    onEvent: ({ name }) => {
+      if (isCurrentTaskLiveEvent(name)) {
+        setCurrentTaskRefreshSeq((seq) => seq + 1);
+      }
+    },
+  });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    refreshCurrentTaskHint(controller.signal);
+    return () => controller.abort();
+  }, [currentTaskRefreshSeq, refreshCurrentTaskHint]);
+
   useEffect(() => {
     if (!primaryCurrentBug) return undefined;
     const bug = primaryCurrentBug;
@@ -472,7 +579,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
       window.clearInterval(timer);
       controller.abort();
     };
-  }, [primaryCurrentBug?.bug_id, projectId, refreshCurrentTaskTimeline]);
+  }, [currentTaskRefreshSeq, primaryCurrentBug?.bug_id, projectId, refreshCurrentTaskTimeline]);
 
   useEffect(() => {
     if (!selectedBugId) return;

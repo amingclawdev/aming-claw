@@ -31,6 +31,165 @@ logger = logging.getLogger(__name__)
 # Dataclasses
 # ---------------------------------------------------------------------------
 
+GOVERNANCE_POLICY_SCHEMA_VERSION = "governance_policy.v1"
+DEFAULT_GOVERNANCE_POLICY_PROFILE = "third-party-public"
+AMING_CLAW_GOVERNANCE_POLICY_PROFILE = "aming-claw"
+
+_GOVERNANCE_POLICY_PROFILE_ALIASES = {
+    "default": DEFAULT_GOVERNANCE_POLICY_PROFILE,
+    "public": DEFAULT_GOVERNANCE_POLICY_PROFILE,
+    "third-party": DEFAULT_GOVERNANCE_POLICY_PROFILE,
+    "third_party": DEFAULT_GOVERNANCE_POLICY_PROFILE,
+    "third_party_public": DEFAULT_GOVERNANCE_POLICY_PROFILE,
+    "third-party-public": DEFAULT_GOVERNANCE_POLICY_PROFILE,
+    "aming_claw": AMING_CLAW_GOVERNANCE_POLICY_PROFILE,
+    "aming-claw": AMING_CLAW_GOVERNANCE_POLICY_PROFILE,
+}
+
+_GOVERNANCE_POLICY_REQUIREMENTS = {
+    DEFAULT_GOVERNANCE_POLICY_PROFILE: {
+        "graph_first_evidence": True,
+        "worker_graph_trace": False,
+        "independent_qa": False,
+        "single_active_task": False,
+        "close_timeline": True,
+    },
+    AMING_CLAW_GOVERNANCE_POLICY_PROFILE: {
+        "graph_first_evidence": True,
+        "worker_graph_trace": True,
+        "independent_qa": True,
+        "single_active_task": True,
+        "close_timeline": True,
+    },
+}
+
+
+def _policy_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "required", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "optional", "disabled"}:
+            return False
+    return default
+
+
+def _normalize_governance_policy_profile(profile: str) -> str:
+    key = str(profile or "").strip().lower().replace("_", "-")
+    return _GOVERNANCE_POLICY_PROFILE_ALIASES.get(key, key or DEFAULT_GOVERNANCE_POLICY_PROFILE)
+
+
+@dataclass
+class GovernancePolicyConfig:
+    profile: str = DEFAULT_GOVERNANCE_POLICY_PROFILE
+    source: str = "project_default"
+    graph_first_evidence_required: bool = True
+    worker_graph_trace_required: bool = False
+    independent_qa_required: bool = False
+    single_active_task_required: bool = False
+    close_timeline_required: bool = True
+    public_safe: bool = True
+
+
+def governance_policy_to_dict(policy: GovernancePolicyConfig | dict | None) -> dict:
+    if isinstance(policy, dict):
+        profile = _normalize_governance_policy_profile(policy.get("profile", ""))
+        requirements = policy.get("requirements") if isinstance(policy.get("requirements"), dict) else {}
+        return {
+            "schema_version": GOVERNANCE_POLICY_SCHEMA_VERSION,
+            "profile": profile,
+            "source": str(policy.get("source") or "project_default"),
+            "public_safe": bool(policy.get("public_safe", True)),
+            "requirements": {
+                "graph_first_evidence": _policy_bool(
+                    requirements.get("graph_first_evidence"),
+                    bool(policy.get("graph_first_evidence_required", True)),
+                ),
+                "worker_graph_trace": _policy_bool(
+                    requirements.get("worker_graph_trace"),
+                    bool(policy.get("worker_graph_trace_required", False)),
+                ),
+                "independent_qa": _policy_bool(
+                    requirements.get("independent_qa"),
+                    bool(policy.get("independent_qa_required", False)),
+                ),
+                "single_active_task": _policy_bool(
+                    requirements.get("single_active_task"),
+                    bool(policy.get("single_active_task_required", False)),
+                ),
+                "close_timeline": _policy_bool(
+                    requirements.get("close_timeline"),
+                    bool(policy.get("close_timeline_required", True)),
+                ),
+            },
+        }
+    policy = policy or GovernancePolicyConfig()
+    return {
+        "schema_version": GOVERNANCE_POLICY_SCHEMA_VERSION,
+        "profile": policy.profile,
+        "source": policy.source,
+        "public_safe": policy.public_safe,
+        "requirements": {
+            "graph_first_evidence": policy.graph_first_evidence_required,
+            "worker_graph_trace": policy.worker_graph_trace_required,
+            "independent_qa": policy.independent_qa_required,
+            "single_active_task": policy.single_active_task_required,
+            "close_timeline": policy.close_timeline_required,
+        },
+    }
+
+
+def resolve_governance_policy(
+    project_id: str = "",
+    raw: Optional[dict] = None,
+) -> GovernancePolicyConfig:
+    """Resolve the public-safe governance policy for a project config."""
+    raw = raw if isinstance(raw, dict) else {}
+    policy_raw = raw.get("policy") if isinstance(raw.get("policy"), dict) else {}
+    explicit_profile = (
+        policy_raw.get("profile")
+        or raw.get("policy_profile")
+        or raw.get("profile")
+        or ""
+    )
+    default_profile = (
+        AMING_CLAW_GOVERNANCE_POLICY_PROFILE
+        if str(project_id or "").strip() == "aming-claw"
+        else DEFAULT_GOVERNANCE_POLICY_PROFILE
+    )
+    profile = _normalize_governance_policy_profile(explicit_profile or default_profile)
+    if profile not in _GOVERNANCE_POLICY_REQUIREMENTS:
+        profile = DEFAULT_GOVERNANCE_POLICY_PROFILE
+    source = "project_config" if explicit_profile else "project_default"
+    requirements = dict(_GOVERNANCE_POLICY_REQUIREMENTS[profile])
+    overrides = policy_raw.get("requirements") if isinstance(policy_raw.get("requirements"), dict) else {}
+    for key in tuple(requirements):
+        direct_key = f"{key}_required"
+        if key in overrides:
+            requirements[key] = _policy_bool(overrides[key], requirements[key])
+        elif direct_key in overrides:
+            requirements[key] = _policy_bool(overrides[direct_key], requirements[key])
+        elif key in policy_raw:
+            requirements[key] = _policy_bool(policy_raw[key], requirements[key])
+        elif direct_key in policy_raw:
+            requirements[key] = _policy_bool(policy_raw[direct_key], requirements[key])
+        elif direct_key in raw:
+            requirements[key] = _policy_bool(raw[direct_key], requirements[key])
+    return GovernancePolicyConfig(
+        profile=profile,
+        source=source,
+        graph_first_evidence_required=requirements["graph_first_evidence"],
+        worker_graph_trace_required=requirements["worker_graph_trace"],
+        independent_qa_required=requirements["independent_qa"],
+        single_active_task_required=requirements["single_active_task"],
+        close_timeline_required=requirements["close_timeline"],
+        public_safe=True,
+    )
+
 
 @dataclass
 class E2ETriggerConfig:
@@ -113,6 +272,8 @@ class GovernanceConfig:
     test_tool_label: str = "pytest"
     exclude_roots: List[str] = field(default_factory=list)
     """Workspace-relative directories/path prefixes excluded from governance scans."""
+    policy_profile: str = DEFAULT_GOVERNANCE_POLICY_PROFILE
+    policy: GovernancePolicyConfig = field(default_factory=resolve_governance_policy)
 
 
 @dataclass
@@ -205,6 +366,8 @@ DEFAULT_CONFIG = ProjectConfig(
         enabled=True,
         test_tool_label="pytest",
         exclude_roots=[],
+        policy_profile=AMING_CLAW_GOVERNANCE_POLICY_PROFILE,
+        policy=resolve_governance_policy("aming-claw"),
     ),
     graph=GraphConfig(
         exclude_paths=["examples", "docs/dev", ".worktrees", ".claude/worktrees"],
@@ -371,6 +534,7 @@ def _write_json(path: Path, raw: dict) -> None:
 
 def _parse_raw(raw: dict) -> ProjectConfig:
     """Convert a validated raw dict to a ProjectConfig, merging with defaults."""
+    project_id = str(raw.get("project_id", "") or "")
 
     # ---- testing ----
     t_raw = raw.get("testing", {})
@@ -417,10 +581,18 @@ def _parse_raw(raw: dict) -> ProjectConfig:
 
     # ---- governance ----
     g_raw = raw.get("governance", {})
+    if not isinstance(g_raw, dict):
+        g_raw = {}
+    governance_policy = resolve_governance_policy(
+        project_id,
+        g_raw,
+    )
     governance = GovernanceConfig(
         enabled=g_raw.get("enabled", False),
         test_tool_label=g_raw.get("test_tool_label", "pytest"),
         exclude_roots=_string_list(g_raw.get("exclude_roots", [])),
+        policy_profile=governance_policy.profile,
+        policy=governance_policy,
     )
 
     # ---- graph ----
@@ -442,7 +614,7 @@ def _parse_raw(raw: dict) -> ProjectConfig:
     )
 
     return ProjectConfig(
-        project_id=raw.get("project_id", ""),
+        project_id=project_id,
         language=raw.get("language", "python"),
         testing=testing,
         build=build,
@@ -879,7 +1051,12 @@ def generate_default_config(workspace_path: str, project_name: str = "") -> Proj
         ),
         build=BuildConfig(command="", release_checks=[]),
         deploy=DeployConfig(strategy=strategy),
-        governance=GovernanceConfig(enabled=True, test_tool_label=language),
+        governance=GovernanceConfig(
+            enabled=True,
+            test_tool_label=language,
+            policy_profile=resolve_governance_policy(project_id).profile,
+            policy=resolve_governance_policy(project_id),
+        ),
     )
 
 
@@ -963,6 +1140,8 @@ def explain_config(
         "governance": {
             "enabled": config.governance.enabled,
             "test_tool_label": config.governance.test_tool_label,
+            "policy_profile": config.governance.policy_profile,
+            "policy": governance_policy_to_dict(config.governance.policy),
         },
         "affected_services": affected_services,
     }
