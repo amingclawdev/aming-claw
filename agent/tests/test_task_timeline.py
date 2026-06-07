@@ -2306,6 +2306,69 @@ class TestTaskTimeline(unittest.TestCase):
             },
         )
 
+    def test_observer_repair_route_evidence_consumes_command_identity_from_seed(self):
+        from agent.governance import server
+
+        bug_id = "BUG-OBSERVER-COMMAND-ROUTE-CONSUMPTION"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": bug_id,
+        }
+        identity = {
+            **ROUTE_IDENTITY,
+            "route_id": "route-command-seed-consumed",
+            "visible_injection_manifest_hash": "sha256:command-visible-manifest",
+        }
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, target_files, test_files,
+                acceptance_criteria, chain_trigger_json, mf_type, bypass_policy_json,
+                created_at, updated_at)
+               VALUES (?, ?, 'MF_IN_PROGRESS', 'P0', ?, ?, ?, ?, 'chain_rescue', ?,
+                       '2026-06-03T00:00:00Z', '2026-06-03T00:00:00Z')""",
+            (
+                bug_id,
+                "Observer command route consumption",
+                json.dumps(["agent/governance/observer_repair_run.py"]),
+                json.dumps(["agent/tests/test_observer_repair_run.py"]),
+                json.dumps(["consume command route identity from seed"]),
+                json.dumps(contract),
+                json.dumps({"mf_type": "chain_rescue"}),
+            ),
+        )
+        self.conn.commit()
+
+        dry_run = server.handle_observer_repair_run_route_evidence(
+            _ctx(
+                method="POST",
+                body={
+                    "root_backlog_ids": [bug_id],
+                    "actor": "observer-test",
+                    "route_context_seed": {
+                        "route_identity": identity,
+                        "action_precheck": {
+                            **identity,
+                            "caller_role": "observer",
+                            "action": "dispatch_bounded_worker",
+                            "allowed": True,
+                        },
+                    },
+                    "version_check": {"ok": True, "dirty": False, "dirty_files": []},
+                },
+            )
+        )
+
+        self.assertFalse(dry_run["record"])
+        self.assertTrue(dry_run["recordable"], dry_run)
+        self.assertEqual(
+            dry_run["route_identity_consumption"]["consumed_route_identity"],
+            identity,
+        )
+        self.assertTrue(dry_run["route_identity_consumption"]["consumed"])
+        self.assertFalse(dry_run["route_identity_consumption"]["superseded"])
+        self.assertEqual(dry_run["route_action_precheck"]["route_identity"], identity)
+        self.assertNotIn("route_identity_supersession", dry_run)
+
     def test_ai_validated_timeline_route_persists_contract_evidence(self):
         from agent.governance import task_timeline
 

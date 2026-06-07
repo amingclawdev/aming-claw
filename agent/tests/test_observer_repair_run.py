@@ -82,6 +82,13 @@ def _external_route_identity():
     }
 
 
+def _command_route_identity():
+    return {
+        **_external_route_identity(),
+        "route_id": "route-command-consumption-test",
+    }
+
+
 def test_repair_run_plan_is_deterministic_and_judge_independent():
     kwargs = {
         "project_id": "aming-claw",
@@ -417,6 +424,90 @@ def test_external_route_action_precheck_materializes_public_source_event():
     assert "do-not-leak-provider-body" not in materialized_json
     assert "do-not-leak-raw-prompt" not in materialized_json
     assert "do-not-leak-hidden-context" not in materialized_json
+
+
+def test_command_route_identity_consumption_reports_supplied_identity():
+    row = _single_route_row()
+    identity = _command_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        action_precheck_id="external-dispatch-precheck",
+        external_route_identity=identity,
+        action_precheck={
+            **identity,
+            "caller_role": "observer",
+            "action": "dispatch_bounded_worker",
+            "allowed": True,
+        },
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+        actor="observer-test",
+    )
+
+    consumption = materialization["route_identity_consumption"]
+    assert materialization["ok"] is True
+    assert materialization["recordable"] is True
+    assert consumption["consumed"] is True
+    assert consumption["superseded"] is False
+    assert consumption["consumed_route_identity"] == identity
+    assert materialization["route_action_precheck"]["route_identity"] == identity
+    assert "route_identity_supersession" not in materialization
+    assert [event["event_kind"] for event in materialization["source_events"]] == [
+        "route_action_precheck"
+    ]
+
+
+def test_command_route_identity_without_precheck_returns_supersession_lineage():
+    row = _single_route_row()
+    identity = _command_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        external_route_identity=identity,
+        action_precheck={},
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+        actor="observer-test",
+    )
+
+    consumption = materialization["route_identity_consumption"]
+    supersession = materialization["route_identity_supersession"]
+    generated_identity = materialization["service_generated_route_identity"]
+
+    assert materialization["ok"] is True
+    assert materialization["recordable"] is True
+    assert consumption["consumed"] is False
+    assert consumption["superseded"] is True
+    assert consumption["supplied_route_identity"] == identity
+    assert consumption["generated_route_identity"] == generated_identity
+    assert supersession["status"] == "superseded"
+    assert supersession["superseded_route_identity"] == identity
+    assert supersession["canonical_route_identity"] == generated_identity
+    assert supersession["source_event"]["event_kind"] == "route_identity_supersede"
+    assert supersession["source_event"]["status"] == "accepted"
+    assert supersession["source_event"]["payload"]["service_router_suppress"] is True
+    assert [event["event_kind"] for event in materialization["source_events"]] == [
+        "route_context",
+        "route_identity_supersede",
+        "route_action_precheck",
+    ]
+    assert supersession["raw_prompt_excluded"] is True
+    assert supersession["hidden_context_excluded"] is True
 
 
 def test_external_route_action_precheck_rejects_mismatched_identity():

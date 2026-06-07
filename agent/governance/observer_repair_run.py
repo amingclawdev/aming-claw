@@ -18,6 +18,10 @@ ROUTE_CONTEXT_SCHEMA_VERSION = "observer_repair_route_context.v1"
 ROUTE_SERVICE_PREVIEW_SCHEMA_VERSION = "observer_repair_route_service_preview.v1"
 ROUTE_SERVICE_MATERIALIZATION_SCHEMA_VERSION = "observer_repair_route_service_materialization.v1"
 ROUTE_SERVICE_SOURCE_EVENT_SCHEMA_VERSION = "observer_repair_route_service_source_event.v1"
+ROUTE_IDENTITY_CONSUMPTION_SCHEMA_VERSION = "observer_repair_route_identity_consumption.v1"
+ROUTE_IDENTITY_SUPERSESSION_SCHEMA_VERSION = "observer_repair_route_identity_supersession.v1"
+ROUTE_IDENTITY_SUPERSESSION_EVENT_TYPE = "route.identity.superseded"
+ROUTE_IDENTITY_SUPERSESSION_EVENT_KIND = "route_identity_supersede"
 OBSERVER_STEP_MONITOR_SCHEMA_VERSION = "observer_step_monitor.v1"
 OBSERVER_DIRECT_MUTATION_POLICY_SCHEMA_VERSION = "observer_direct_mutation_policy.v1"
 ROUTE_WORKFLOW_TEMPLATE_ID = "mf_workflow_runtime.v1"
@@ -556,6 +560,11 @@ def _service_route_identity(route: Mapping[str, Any], bundle: Mapping[str, Any])
     evidence = _object(route.get("evidence"))
     prompt_contract = _object(bundle.get("prompt_contract"))
     return {
+        "route_id": _string(
+            route.get("route_id")
+            or evidence.get("route_id")
+            or bundle.get("route_id")
+        ),
         "route_context_hash": _string(
             bundle.get("route_context_hash") or evidence.get("route_context_hash")
         ),
@@ -608,10 +617,14 @@ def _route_identity_from_public(value: Any) -> dict[str, str]:
             or prompt_contract.get("prompt_contract_hash")
         ),
         "visible_injection_manifest_hash": visible_manifest_hash,
+        "route_id": _string(
+            payload.get("route_id")
+            or route_identity.get("route_id")
+            or route_context.get("route_id")
+            or route.get("route_id")
+        ),
     }
-    if visible_manifest_hash:
-        return {key: value for key, value in identity.items() if value}
-    if isinstance(visible_manifest, Mapping) and visible_manifest:
+    if not visible_manifest_hash and isinstance(visible_manifest, Mapping) and visible_manifest:
         identity["visible_injection_manifest"] = "present"
     return {key: value for key, value in identity.items() if value}
 
@@ -622,6 +635,7 @@ def _route_identity_mismatch_fields(
 ) -> list[str]:
     mismatched: list[str] = []
     for field in (
+        "route_id",
         "route_context_hash",
         "prompt_contract_id",
         "prompt_contract_hash",
@@ -765,6 +779,7 @@ def _external_route_action_precheck(
         "caller_role": caller_role,
         "action": action,
         "allowed_actions": allowed_actions,
+        "route_id": identity.get("route_id", ""),
         "route_context_hash": identity["route_context_hash"],
         "prompt_contract_id": identity["prompt_contract_id"],
         "visible_injection_manifest_hash": identity["visible_injection_manifest_hash"],
@@ -1001,6 +1016,7 @@ def _route_service_source_event(
         "verification": {
             "schema_version": ROUTE_SERVICE_SOURCE_EVENT_SCHEMA_VERSION,
             "route_service": service_id,
+            "route_id": _string(route_identity.get("route_id")),
             "route_context_hash": _string(route_identity.get("route_context_hash")),
             "prompt_contract_id": _string(route_identity.get("prompt_contract_id")),
             "prompt_contract_hash": _string(route_identity.get("prompt_contract_hash")),
@@ -1015,6 +1031,7 @@ def _route_service_source_event(
             "source_event_id": source_event_id,
             "service_id": service_id,
             "precheck_id": precheck_id,
+            "route_id": _string(route_identity.get("route_id")),
             "route_context_hash": _string(route_identity.get("route_context_hash")),
             "prompt_contract_id": _string(route_identity.get("prompt_contract_id")),
             "prompt_contract_hash": _string(route_identity.get("prompt_contract_hash")),
@@ -1217,6 +1234,166 @@ def _route_action_precheck_present(route_service_preview: Mapping[str, Any]) -> 
         if _object(precheck.get("source_event")):
             return True
     return False
+
+
+def _generated_route_action_precheck(
+    *,
+    preview: Mapping[str, Any],
+    precheck: Mapping[str, Any],
+    selected_action: str,
+) -> dict[str, Any]:
+    route_action_gate = _object(precheck.get("route_action_gate"))
+    action_name = _string(precheck.get("action"))
+    return {
+        "present": bool(_object(precheck.get("source_event"))),
+        "valid": bool(route_action_gate.get("allowed")),
+        "precheck_id": selected_action,
+        "source": "generated",
+        "route_identity": _object(preview.get("service_generated_route_identity")),
+        "route_action_gate": route_action_gate,
+        "authorizes_protected_worker_dispatch_evidence": bool(
+            route_action_gate.get("allowed")
+        )
+        and action_name in WORKER_DISPATCH_ROUTE_ACTIONS,
+    }
+
+
+def _identity_consumption_result(
+    *,
+    supplied_route_identity: Mapping[str, Any],
+    consumed_route_identity: Mapping[str, Any] | None = None,
+    generated_route_identity: Mapping[str, Any] | None = None,
+    consumed: bool,
+    superseded: bool = False,
+    source: str = "",
+    reason: str = "",
+    next_legal_actions: Sequence[str] = (),
+) -> dict[str, Any]:
+    supplied = _route_identity_from_public(supplied_route_identity)
+    consumed_identity = _route_identity_from_public(consumed_route_identity or {})
+    generated_identity = _route_identity_from_public(generated_route_identity or {})
+    comparison_identity = consumed_identity or generated_identity
+    return {
+        "schema_version": ROUTE_IDENTITY_CONSUMPTION_SCHEMA_VERSION,
+        "supplied": bool(supplied),
+        "consumed": consumed,
+        "superseded": superseded,
+        "source": source,
+        "reason": reason,
+        "supplied_route_identity": supplied,
+        "consumed_route_identity": consumed_identity,
+        "generated_route_identity": generated_identity,
+        "route_identity_mismatch_fields": (
+            _route_identity_mismatch_fields(comparison_identity, supplied)
+            if comparison_identity and supplied
+            else []
+        ),
+        "next_legal_actions": [
+            str(item) for item in next_legal_actions if str(item).strip()
+        ],
+        "public_safe": True,
+        "raw_prompt_excluded": True,
+        "hidden_context_excluded": True,
+        "private_provider_body_excluded": True,
+    }
+
+
+def _external_route_supersession_allowed(route_action_precheck: Mapping[str, Any]) -> bool:
+    reason = _string(route_action_precheck.get("reason")).lower()
+    if not reason:
+        return False
+    return any(
+        marker in reason
+        for marker in (
+            "external action precheck packet or source marker is required",
+            "external route action precheck identity mismatch",
+            "external route identity missing required fields",
+        )
+    )
+
+
+def _route_identity_supersession(
+    *,
+    plan: Mapping[str, Any],
+    selected_action: str,
+    supplied_route_identity: Mapping[str, Any],
+    generated_route_identity: Mapping[str, Any],
+    reason: str,
+    actor: str,
+) -> dict[str, Any]:
+    supplied = _route_identity_from_public(supplied_route_identity)
+    generated = _route_identity_from_public(generated_route_identity)
+    root_backlog_ids = [
+        str(item) for item in _list(plan.get("root_backlog_ids")) if str(item)
+    ]
+    backlog_id = root_backlog_ids[0] if len(root_backlog_ids) == 1 else ""
+    relation = {
+        "schema_version": ROUTE_IDENTITY_SUPERSESSION_SCHEMA_VERSION,
+        "status": "superseded",
+        "accepted": True,
+        "project_id": _string(plan.get("project_id")),
+        "repair_run_id": _string(plan.get("repair_run_id")),
+        "action_precheck_id": selected_action,
+        "superseded_route_identity": supplied,
+        "canonical_route_identity": generated,
+        "generated_route_identity": generated,
+        "route_identity_mismatch_fields": (
+            _route_identity_mismatch_fields(generated, supplied)
+            if generated and supplied
+            else []
+        ),
+        "reason": reason
+        or "supplied command route identity was superseded by service-generated route identity",
+        "next_legal_actions": [
+            "record_route_identity_supersede_before_worker_dispatch",
+            "dispatch_only_with_generated_route_identity_after_supersession_evidence",
+            "do_not_reuse_superseded_command_route_identity_for_protected_worker_dispatch",
+        ],
+        "public_safe": True,
+        "raw_prompt_excluded": True,
+        "hidden_context_excluded": True,
+        "private_provider_body_excluded": True,
+    }
+    source_event_id = (
+        f"{_string(plan.get('repair_run_id'))}:route_identity_supersede:"
+        f"{_stable_hash({'supplied': supplied, 'generated': generated}, length=12)}"
+    )
+    payload = {
+        **relation,
+        "template_id": ROUTE_WORKFLOW_TEMPLATE_ID,
+        "stage": ROUTE_SERVICE_STAGE,
+        "route_identity_cleanup": generated,
+        "route_identity_supersession": relation,
+        "service_router_suppress": True,
+    }
+    source_event = _route_service_source_event(
+        source_event_id=source_event_id,
+        event_type=ROUTE_IDENTITY_SUPERSESSION_EVENT_TYPE,
+        event_kind=ROUTE_IDENTITY_SUPERSESSION_EVENT_KIND,
+        project_id=_string(plan.get("project_id")),
+        backlog_id=backlog_id,
+        actor=actor,
+        payload=payload,
+        route_identity=generated,
+        repair_run_id=_string(plan.get("repair_run_id")),
+        service_id="route.identity_supersession",
+        precheck_id=selected_action,
+    )
+    source_event["status"] = "accepted"
+    source_event["verification"] = {
+        **_object(source_event.get("verification")),
+        "status": "accepted",
+        "route_identity_supersession": relation,
+        "public_safe": True,
+    }
+    source_event["artifact_refs"] = {
+        **_object(source_event.get("artifact_refs")),
+        "superseded_route_id": supplied.get("route_id", ""),
+        "canonical_route_id": generated.get("route_id", ""),
+        "supersession_hash": f"sha256:{_stable_hash(relation, length=64)}",
+        "public_safe": True,
+    }
+    return {**relation, "source_event": source_event}
 
 
 def _graph_query_trace_ids(seed: Mapping[str, Any]) -> list[str]:
@@ -1654,6 +1831,9 @@ def build_route_service_materialization(
     external_requested = bool(external_identity)
     source_events: list[dict[str, Any]] = []
     missing: list[str] = []
+    generated_identity = _object(preview.get("service_generated_route_identity"))
+    route_identity_consumption: dict[str, Any] = {}
+    route_identity_supersession: dict[str, Any] = {}
 
     if not external_requested:
         prompt_event = _object(
@@ -1671,7 +1851,7 @@ def build_route_service_materialization(
     )
     route_action_precheck: dict[str, Any]
     if external_requested:
-        route_action_precheck = _external_route_action_precheck(
+        external_route_action_precheck = _external_route_action_precheck(
             plan=plan,
             action_precheck_id=selected_action,
             route_identity=external_identity,
@@ -1680,34 +1860,125 @@ def build_route_service_materialization(
             graph_status=graph_status or {},
             version_check=version_check or {},
         )
-        action_source_event = _object(route_action_precheck.get("source_event"))
-        if action_source_event:
+        action_source_event = _object(external_route_action_precheck.get("source_event"))
+        if (
+            external_route_action_precheck.get("present")
+            and external_route_action_precheck.get("valid")
+            and action_source_event
+        ):
+            route_action_precheck = external_route_action_precheck
             source_events.append(_materialization_event(action_source_event, actor=actor))
+            route_identity_consumption = _identity_consumption_result(
+                supplied_route_identity=external_identity,
+                consumed_route_identity=route_action_precheck.get("route_identity"),
+                generated_route_identity=generated_identity,
+                consumed=True,
+                source="external",
+                reason="supplied command route identity consumed by external route action precheck",
+                next_legal_actions=[
+                    "dispatch_bounded_worker_with_consumed_command_route_identity",
+                ],
+            )
         else:
-            missing.append(f"route.action_precheck:{selected_action}")
+            generated_action_source_event = _object(precheck.get("source_event"))
+            generated_route_action_precheck = _generated_route_action_precheck(
+                preview=preview,
+                precheck=precheck,
+                selected_action=selected_action,
+            )
+            if (
+                _external_route_supersession_allowed(external_route_action_precheck)
+                and external_identity.get("route_id")
+                and generated_identity
+                and generated_action_source_event
+                and generated_route_action_precheck.get("valid")
+            ):
+                prompt_event = _object(
+                    _object(preview.get("prompt_context_event")).get("source_event")
+                )
+                if prompt_event:
+                    source_events.append(_materialization_event(prompt_event, actor=actor))
+                else:
+                    missing.append("route.prompt_alert_bundle")
+                route_identity_supersession = _route_identity_supersession(
+                    plan=plan,
+                    selected_action=selected_action,
+                    supplied_route_identity=external_identity,
+                    generated_route_identity=generated_identity,
+                    reason=_string(external_route_action_precheck.get("reason")),
+                    actor=actor,
+                )
+                supersession_source_event = _object(
+                    route_identity_supersession.get("source_event")
+                )
+                if supersession_source_event:
+                    source_events.append(
+                        _materialization_event(supersession_source_event, actor=actor)
+                    )
+                else:
+                    missing.append("route.identity_supersession")
+                source_events.append(
+                    _materialization_event(generated_action_source_event, actor=actor)
+                )
+                route_action_precheck = {
+                    **generated_route_action_precheck,
+                    "source": "generated_after_supersession",
+                    "superseded_route_action_precheck": {
+                        key: value
+                        for key, value in external_route_action_precheck.items()
+                        if key in {
+                            "present",
+                            "valid",
+                            "precheck_id",
+                            "source",
+                            "reason",
+                            "route_identity",
+                            "supplied_route_identity",
+                            "route_identity_mismatch_fields",
+                        }
+                    },
+                }
+                route_identity_consumption = _identity_consumption_result(
+                    supplied_route_identity=external_identity,
+                    generated_route_identity=generated_identity,
+                    consumed=False,
+                    superseded=True,
+                    source="generated_after_supersession",
+                    reason=_string(external_route_action_precheck.get("reason")),
+                    next_legal_actions=[
+                        "record_route_identity_supersede_before_worker_dispatch",
+                        "dispatch_only_with_generated_route_identity_after_supersession_evidence",
+                    ],
+                )
+            else:
+                route_action_precheck = external_route_action_precheck
+                missing.append(f"route.action_precheck:{selected_action}")
+                route_identity_consumption = _identity_consumption_result(
+                    supplied_route_identity=external_identity,
+                    generated_route_identity=generated_identity,
+                    consumed=False,
+                    source="external",
+                    reason=_string(external_route_action_precheck.get("reason"))
+                    or "supplied command route identity was not consumed",
+                    next_legal_actions=[
+                        "rerun_route_action_precheck_with_matching_route_identity",
+                        "do_not_dispatch_worker_until_command_route_identity_is_consumed_or_superseded",
+                    ],
+                )
     else:
         action_source_event = _object(precheck.get("source_event"))
-        route_action_gate = _object(precheck.get("route_action_gate"))
-        action_name = _string(precheck.get("action"))
-        route_action_precheck = {
-            "present": bool(action_source_event),
-            "valid": bool(route_action_gate.get("allowed")),
-            "precheck_id": selected_action,
-            "source": "generated",
-            "route_identity": _object(preview.get("service_generated_route_identity")),
-            "route_action_gate": route_action_gate,
-            "authorizes_protected_worker_dispatch_evidence": bool(
-                route_action_gate.get("allowed")
-            )
-            and action_name in WORKER_DISPATCH_ROUTE_ACTIONS,
-        }
+        route_action_precheck = _generated_route_action_precheck(
+            preview=preview,
+            precheck=precheck,
+            selected_action=selected_action,
+        )
         if action_source_event:
             source_events.append(_materialization_event(action_source_event, actor=actor))
         else:
             missing.append(f"route.action_precheck:{selected_action}")
 
     recordable = bool(preview.get("available")) and len(root_backlog_ids) == 1 and not missing
-    return {
+    materialization = {
         "ok": bool(preview.get("available"))
         and not missing
         and bool(route_action_precheck.get("valid")),
@@ -1725,12 +1996,15 @@ def build_route_service_materialization(
         "source_events": source_events,
         "missing_source_events": missing,
         "route_service_preview_available": bool(preview.get("available")),
-        "service_generated_route_identity": _object(
-            preview.get("service_generated_route_identity")
-        ),
+        "service_generated_route_identity": generated_identity,
         "counts_as_close_evidence": False,
         "authorizes_protected_write": False,
     }
+    if route_identity_consumption:
+        materialization["route_identity_consumption"] = route_identity_consumption
+    if route_identity_supersession:
+        materialization["route_identity_supersession"] = route_identity_supersession
+    return materialization
 
 
 def _materialization_event(

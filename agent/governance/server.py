@@ -1524,29 +1524,48 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
         from . import observer_repair_run, task_timeline
 
         plan = _build_observer_repair_run_plan_from_body(conn, project_id, body)
+        route_context_seed = (
+            body.get("route_context_seed")
+            if isinstance(body.get("route_context_seed"), Mapping)
+            else {}
+        )
         action_precheck = (
             body.get("action_precheck")
             or body.get("external_action_precheck")
             or body.get("action_precheck_packet")
+            or route_context_seed.get("action_precheck")
+            or route_context_seed.get("external_action_precheck")
+            or route_context_seed.get("action_precheck_packet")
+            or route_context_seed.get("route_action_precheck")
         )
         if not isinstance(action_precheck, Mapping):
             action_precheck = {}
         external_route_identity = (
             body.get("route_identity")
             or body.get("external_route_identity")
+            or body.get("claimed_route_identity")
+            or body.get("command_route_identity")
+            or body.get("observer_command_route_identity")
             or body.get("route_context")
+            or route_context_seed.get("route_identity")
+            or route_context_seed.get("external_route_identity")
+            or route_context_seed.get("claimed_route_identity")
+            or route_context_seed.get("command_route_identity")
+            or route_context_seed.get("observer_command_route_identity")
+            or route_context_seed.get("route_context")
         )
         if not isinstance(external_route_identity, Mapping):
             external_route_identity = {
-                key: body.get(key)
+                key: body.get(key) or route_context_seed.get(key)
                 for key in (
+                    "route_id",
                     "route_context_hash",
                     "prompt_contract_id",
                     "prompt_contract_hash",
                     "visible_injection_manifest_hash",
                     "visible_injection_manifest",
                 )
-                if body.get(key)
+                if body.get(key) or route_context_seed.get(key)
             }
         if not external_route_identity and action_precheck:
             external_route_identity = dict(action_precheck)

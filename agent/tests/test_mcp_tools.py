@@ -147,6 +147,21 @@ def test_mcp_observer_command_list_advertises_consumer_recovery_diagnostics():
     assert "observer-consumer recovery diagnostics" in tool["description"]
 
 
+def test_mcp_observer_repair_route_evidence_exposes_command_identity_inputs():
+    props = _tool_properties("observer_repair_run_route_evidence")
+
+    assert {
+        "route_identity",
+        "external_route_identity",
+        "claimed_route_identity",
+        "command_route_identity",
+        "observer_command_route_identity",
+        "action_precheck",
+        "external_action_precheck",
+        "action_precheck_packet",
+    }.issubset(props)
+
+
 def test_mcp_observer_repair_run_route_evidence_routes_to_governance_api():
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)

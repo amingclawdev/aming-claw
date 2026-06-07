@@ -683,7 +683,39 @@ TOOLS: list[dict] = [
                 },
                 "route_context_seed": {
                     "type": "object",
-                    "description": "Public-safe seed material for deterministic route context identity.",
+                    "description": "Public-safe seed material for deterministic route context identity. May include route_identity/action_precheck fields.",
+                },
+                "route_identity": {
+                    "type": "object",
+                    "description": "Claimed public-safe command route identity to consume: route_id, route_context_hash, prompt_contract_id, prompt_contract_hash, and visible_injection_manifest_hash.",
+                },
+                "external_route_identity": {
+                    "type": "object",
+                    "description": "Alias for route_identity.",
+                },
+                "claimed_route_identity": {
+                    "type": "object",
+                    "description": "Alias for route_identity when replaying observer command evidence.",
+                },
+                "command_route_identity": {
+                    "type": "object",
+                    "description": "Alias for route_identity from an observer command.",
+                },
+                "observer_command_route_identity": {
+                    "type": "object",
+                    "description": "Alias for route_identity from an observer command.",
+                },
+                "action_precheck": {
+                    "type": "object",
+                    "description": "Public-safe route action precheck packet for the supplied route identity.",
+                },
+                "external_action_precheck": {
+                    "type": "object",
+                    "description": "Alias for action_precheck.",
+                },
+                "action_precheck_packet": {
+                    "type": "object",
+                    "description": "Alias for action_precheck.",
                 },
                 "version_check": {
                     "type": "object",
