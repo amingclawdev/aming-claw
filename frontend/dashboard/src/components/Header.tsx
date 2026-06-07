@@ -7,6 +7,7 @@ import type {
 } from "../types";
 import type { LiveStatus } from "../lib/sse";
 import type { AiConfigResponse, ProjectListItem } from "../lib/api";
+import { isPrivatePlaybackText } from "../lib/taskPlayback";
 
 interface Props {
   loading: boolean;
@@ -34,6 +35,23 @@ interface Props {
   onToggleMultiSelect?(): void;
   onBatchEnrich?(): void;
   onClearMultiSelect?(): void;
+}
+
+const PRIVATE_HEADER_PROJECT_TEXT = /\bjb[-_\s]+route\b/i;
+
+function isPrivateHeaderProjectText(value?: string | null): boolean {
+  const text = value?.trim();
+  return Boolean(text && (isPrivatePlaybackText(text) || PRIVATE_HEADER_PROJECT_TEXT.test(text)));
+}
+
+function isPublicHeaderProject(project: Pick<ProjectListItem, "project_id" | "name">): boolean {
+  return !isPrivateHeaderProjectText(project.project_id) && !isPrivateHeaderProjectText(project.name);
+}
+
+function projectOptionLabel(project: Pick<ProjectListItem, "project_id" | "name">): string {
+  return project.name?.trim() && project.name.trim() !== project.project_id
+    ? `${project.name.trim()} · ${project.project_id}`
+    : project.project_id;
 }
 
 export default function Header({
@@ -76,8 +94,23 @@ export default function Header({
   const edgeEligible = sem?.edge_semantic_eligible_count ?? 0;
   const edgeCurrent = sem?.edge_semantic_current_count ?? 0;
   const edgeMissing = sem?.edge_semantic_missing_count ?? 0;
-  const activeProject = projects.find((project) => project.project_id === projectId);
-  const activeProjectLabel = activeProject?.name?.trim() || projectId;
+  const activeRegistryProject = projects.find((project) => project.project_id === projectId);
+  const publicProjects = projects.filter(isPublicHeaderProject);
+  const activeProjectIsPublic =
+    !isPrivateHeaderProjectText(projectId) &&
+    (!activeRegistryProject || isPublicHeaderProject(activeRegistryProject));
+  const activeProjectOption =
+    activeProjectIsPublic && !publicProjects.some((project) => project.project_id === projectId)
+      ? { project_id: projectId, name: activeRegistryProject?.name }
+      : null;
+  const headerProjects = activeProjectOption ? [activeProjectOption, ...publicProjects] : publicProjects;
+  const activeProject = headerProjects.find((project) => project.project_id === projectId);
+  const fallbackProjectId = activeProjectIsPublic ? projectId : "aming-claw";
+  const projectSelectValue = activeProject
+    ? projectId
+    : headerProjects[0]?.project_id ?? fallbackProjectId;
+  const activeProjectLabel = activeProject?.name?.trim() || fallbackProjectId;
+  const activeProjectTitle = activeProject ? projectId : activeProjectLabel;
 
   return (
     <header className="header">
@@ -85,7 +118,7 @@ export default function Header({
         <div className="header-logo">a</div>
         <div>
           <div className="header-title-row">
-            <div className="header-title" title={projectId}>{activeProjectLabel}</div>
+            <div className="header-title" title={activeProjectTitle}>{activeProjectLabel}</div>
             <span className="pill pill-active">
               <span className="pill-dot" />
               {summary?.snapshot_status ?? "—"}
@@ -101,20 +134,18 @@ export default function Header({
           <div className="header-meta">
             <select
               className="project-select"
-              value={projectId}
+              value={projectSelectValue}
               onChange={(event) => onProjectChange(event.target.value)}
               title="Switch registered project"
             >
-              {projects.length ? (
-                projects.map((project) => (
+              {headerProjects.length ? (
+                headerProjects.map((project) => (
                   <option key={project.project_id} value={project.project_id}>
-                    {project.name?.trim() && project.name.trim() !== project.project_id
-                      ? `${project.name.trim()} · ${project.project_id}`
-                      : project.project_id}
+                    {projectOptionLabel(project)}
                   </option>
                 ))
               ) : (
-                <option value={projectId}>{projectId}</option>
+                <option value={fallbackProjectId}>{fallbackProjectId}</option>
               )}
             </select>
             <span>·</span>

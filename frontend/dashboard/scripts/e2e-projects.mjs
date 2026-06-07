@@ -579,6 +579,11 @@ function verifyHeaderV1Contract() {
   assert(!appSource.includes("onOpenReview={() => setActionPanelOpen(true)}"), "Header should not expose global Action launcher in v1");
   assert(!headerSource.includes(">Action<"), "Header component should not render the global Action launcher in v1");
   assert(!headerSource.includes("onOpenReview"), "Header component should not accept the global Action launcher prop in v1");
+  assert(headerSource.includes("isPrivatePlaybackText"), "Header project selector should reuse the shared private-label classifier");
+  assert(headerSource.includes("isPublicHeaderProject") && headerSource.includes("project.project_id") && headerSource.includes("project.name"), "Header project selector should filter private project ids and names");
+  assert(headerSource.includes("PRIVATE_HEADER_PROJECT_TEXT") && headerSource.includes("jb[-_\\s]+route"), "Header project selector should filter private JB Route fixture labels");
+  assert(headerSource.includes("publicProjects = projects.filter(isPublicHeaderProject)"), "Header project selector should derive a public project option list");
+  assert(headerSource.includes("headerProjects.map((project)") && !headerSource.includes("projects.map((project) => ("), "Header project selector should render filtered options, not raw registry rows");
   ok("global Action launcher is hidden for v1");
 }
 
