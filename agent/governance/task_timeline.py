@@ -529,8 +529,10 @@ class _TimelineWriteQueue:
 
                 conn = get_connection(event["project_id"])
                 try:
-                    item["result"] = _insert_event(conn, event)
+                    inserted = _insert_event(conn, event)
                     conn.commit()
+                    _publish_timeline_event(inserted)
+                    item["result"] = inserted
                 finally:
                     conn.close()
             except Exception as exc:
@@ -3378,6 +3380,11 @@ def mf_close_gate_verification(
     """Validate the minimum observer/MF timeline evidence before backlog close."""
 
     rows = events if isinstance(events, list) else []
+    governance_policy = _governance_policy(contract)
+    close_timeline_required = _policy_requires(governance_policy, "close_timeline")
+    required_event_kinds = (
+        set(MF_CLOSE_REQUIRED_EVENT_KINDS) if close_timeline_required else set()
+    )
     present: set[str] = set()
     ignored: list[dict[str, Any]] = []
     for event in rows:
@@ -3393,17 +3400,16 @@ def mf_close_gate_verification(
             and kind in {"qa_verification", "independent_verification"}
         ):
             key = "verification"
-        if key in MF_CLOSE_REQUIRED_EVENT_KINDS and status in MF_CLOSE_PASS_STATUSES:
+        if key in required_event_kinds and status in MF_CLOSE_PASS_STATUSES:
             present.add(key)
-        elif key in MF_CLOSE_REQUIRED_EVENT_KINDS:
+        elif key in required_event_kinds:
             ignored.append({
                 "event_kind": kind,
                 "phase": phase,
                 "status": status,
                 "id": event.get("id"),
             })
-    missing = sorted(MF_CLOSE_REQUIRED_EVENT_KINDS - present)
-    governance_policy = _governance_policy(contract)
+    missing = sorted(required_event_kinds - present)
     contract_gate = mf_contract_gate_verification(rows, contract)
     route_context_gate = mf_route_context_gate_verification(rows, contract)
     lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
@@ -3473,7 +3479,8 @@ def mf_close_gate_verification(
         "schema_version": "mf_close_timeline_gate.v1",
         "passed": passed,
         "status": "passed" if passed else "failed",
-        "required_event_kinds": sorted(MF_CLOSE_REQUIRED_EVENT_KINDS),
+        "required_event_kinds": sorted(required_event_kinds),
+        "close_timeline_required": close_timeline_required,
         "present_event_kinds": sorted(present),
         "missing_event_kinds": missing,
         "event_count": len(rows),

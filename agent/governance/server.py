@@ -21788,7 +21788,7 @@ def _single_active_task_summary(policy: Mapping[str, Any], active_count: int) ->
 def _current_task_runtime_rows(conn, limit: int) -> list[sqlite3.Row]:
     placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
     return conn.execute(
-        f"""SELECT * FROM backlog_bugs
+        f"""SELECT rowid AS _rowid, * FROM backlog_bugs
             WHERE UPPER(status) NOT IN ({placeholders})
               AND (
                 COALESCE(runtime_state, '') != ''
@@ -21801,11 +21801,11 @@ def _current_task_runtime_rows(conn, limit: int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _current_task_timeline_fallback(
+def _current_task_timeline_candidate(
     conn,
     project_id: str,
     limit: int,
-) -> tuple[sqlite3.Row | None, dict]:
+) -> dict:
     from . import task_timeline
 
     task_timeline.ensure_schema(conn)
@@ -21826,56 +21826,98 @@ def _current_task_timeline_fallback(
         if not backlog_id:
             continue
         bug = conn.execute(
-            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+            "SELECT rowid AS _rowid, * FROM backlog_bugs WHERE bug_id = ?",
             (backlog_id,),
         ).fetchone()
         if bug:
-            return bug, event
-    return None, {}
+            return {
+                "source": "task_timeline",
+                "bug": bug,
+                "task_id": str(event.get("task_id") or ""),
+                "latest_event": event,
+                "evidence_at": str(event.get("created_at") or ""),
+                "event_id": int(event.get("id") or 0),
+                "rowid": int(_row_get(bug, "_rowid", 0) or 0),
+            }
+    return {}
+
+
+def _current_task_runtime_candidates(rows: list[sqlite3.Row]) -> list[dict]:
+    candidates: list[dict] = []
+    for row in rows:
+        candidates.append({
+            "source": "backlog_runtime_state",
+            "bug": row,
+            "task_id": _row_get(row, "current_task_id", ""),
+            "latest_event": {},
+            "evidence_at": str(
+                _row_get(row, "updated_at", "")
+                or _row_get(row, "created_at", "")
+                or ""
+            ),
+            "event_id": 0,
+            "rowid": int(_row_get(row, "_rowid", 0) or 0),
+        })
+    return candidates
+
+
+def _current_task_candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[str, int, int]:
+    return (
+        str(candidate.get("evidence_at") or ""),
+        int(candidate.get("event_id") or 0),
+        int(candidate.get("rowid") or 0),
+    )
+
+
+def _current_task_active_backlog(candidates: list[dict], primary: Mapping[str, Any]) -> list[dict]:
+    ordered = [
+        dict(primary),
+        *sorted(candidates, key=_current_task_candidate_sort_key, reverse=True),
+    ]
+    seen: set[str] = set()
+    active: list[dict] = []
+    for candidate in ordered:
+        bug = candidate.get("bug")
+        if bug is None:
+            continue
+        bug_id = str(_row_get(bug, "bug_id", "") or "")
+        if not bug_id or bug_id in seen:
+            continue
+        seen.add(bug_id)
+        active.append(_backlog_compact_bug(bug))
+    return active
 
 
 @route("GET", "/api/backlog/{project_id}/current-task")
 def handle_backlog_current_task(ctx: RequestContext):
-    """Return the current backlog task, with task-timeline fallback."""
+    """Return the current backlog task from the newest active evidence."""
     pid = ctx.path_params["project_id"]
     limit = max(1, min(_query_int(ctx.query, "limit", 10), 50))
     conn = get_connection(pid)
     try:
         policy = _current_task_policy_payload(pid)
         runtime_rows = _current_task_runtime_rows(conn, limit)
-        active_rows = [_backlog_compact_bug(row) for row in runtime_rows]
-        if runtime_rows:
-            primary = runtime_rows[0]
+        candidates = _current_task_runtime_candidates(runtime_rows)
+        timeline_candidate = _current_task_timeline_candidate(conn, pid, limit)
+        if timeline_candidate:
+            candidates.append(timeline_candidate)
+        if candidates:
+            primary = max(candidates, key=_current_task_candidate_sort_key)
+            primary_bug = primary["bug"]
+            active_rows = _current_task_active_backlog(candidates, primary)
             return {
                 "ok": True,
                 "project_id": pid,
                 "active": True,
-                "source": "backlog_runtime_state",
-                "backlog_id": primary["bug_id"],
-                "task_id": _row_get(primary, "current_task_id", ""),
-                "bug": _backlog_compact_bug(primary),
+                "source": primary["source"],
+                "backlog_id": _row_get(primary_bug, "bug_id", ""),
+                "task_id": str(primary.get("task_id") or ""),
+                "bug": _backlog_compact_bug(primary_bug),
                 "active_backlog": active_rows,
                 "active_count": len(active_rows),
-                "latest_event": {},
+                "latest_event": _current_task_event_summary(primary.get("latest_event")),
                 "governance_policy": policy,
                 "single_active_task": _single_active_task_summary(policy, len(active_rows)),
-            }
-
-        bug, event = _current_task_timeline_fallback(conn, pid, limit)
-        if bug:
-            return {
-                "ok": True,
-                "project_id": pid,
-                "active": True,
-                "source": "task_timeline",
-                "backlog_id": bug["bug_id"],
-                "task_id": str(event.get("task_id") or ""),
-                "bug": _backlog_compact_bug(bug),
-                "active_backlog": [_backlog_compact_bug(bug)],
-                "active_count": 1,
-                "latest_event": _current_task_event_summary(event),
-                "governance_policy": policy,
-                "single_active_task": _single_active_task_summary(policy, 1),
             }
         return {
             "ok": True,
