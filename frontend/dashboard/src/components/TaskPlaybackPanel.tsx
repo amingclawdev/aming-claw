@@ -44,6 +44,7 @@ export default function TaskPlaybackPanel({
       {!loading && !error && gate.blocked ? (
         <div className="task-playback-blocked">
           <strong>Blocked close gate</strong>
+          {gate.missing_event_kinds.length > 0 ? <span>Missing event kinds: {gate.missing_event_kinds.join(", ")}</span> : null}
           <span>{gate.reason_sentence}</span>
           <em>{gate.next_expected_action}</em>
         </div>
@@ -112,7 +113,12 @@ export default function TaskPlaybackPanel({
                 <ChipSection title="Public event facts" values={selectedFrame.semantic_chips.map((chip) => `${chip.label}: ${chip.value}`)} />
               ) : null}
               <EventQueryHook frame={selectedFrame} />
-              <AdvancedEvidenceDetails evidence={selectedEvidence} artifacts={selectedArtifacts} inspector={selectedInspector} />
+              <AdvancedEvidenceDetails
+                key={selectedFrame.id}
+                evidence={selectedEvidence}
+                artifacts={selectedArtifacts}
+                inspector={selectedInspector}
+              />
             </article>
           ) : null}
         </div>

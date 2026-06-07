@@ -365,13 +365,13 @@ function closeGateReasonSentence(
   if (!blocked) return "Close gate can pass because required public evidence is present.";
   if (missingEventKinds.length > 0) {
     const label = formatEvidenceList(missingEventKinds);
-    const plural = missingEventKinds.length === 1;
-    return `Blocked because ${label} evidence has not been recorded; the close gate cannot pass until ${plural ? "that event exists" : "those events exist"}.`;
+    const single = missingEventKinds.length === 1;
+    return `Blocked because ${label} evidence ${single ? "has" : "have"} not been recorded; the close gate cannot pass until ${single ? "that event exists" : "those events exist"}.`;
   }
   if (missingRequirementIds.length > 0) {
     const label = formatEvidenceList(missingRequirementIds);
-    const plural = missingRequirementIds.length === 1;
-    return `Blocked because ${label} evidence is missing; the close gate cannot pass until ${plural ? "that requirement is satisfied" : "those requirements are satisfied"}.`;
+    const single = missingRequirementIds.length === 1;
+    return `Blocked because ${label} evidence ${single ? "is" : "are"} missing; the close gate cannot pass until ${single ? "that requirement is satisfied" : "those requirements are satisfied"}.`;
   }
   const reason = safeText(response.reason || "");
   if (reason) return `Blocked because ${lowercaseFirst(trimTrailingPunctuation(reason))}.`;
@@ -387,7 +387,7 @@ function closeGateNextExpectedAction(
   if (response.applicable === false) return "Next expected evidence/action: no close-gate evidence is required for this row.";
   if (!blocked) return "Next expected evidence/action: review the close-ready evidence and complete the close step.";
   if (missingEventKinds.length > 0) {
-    return `Next expected evidence/action: record ${formatEvidenceList(missingEventKinds)} evidence, then rerun close-gate verification.`;
+    return `Next expected evidence/action: add ${formatEvidenceList(missingEventKinds)} evidence, then rerun close-gate verification.`;
   }
   if (missingRequirementIds.length > 0) {
     return `Next expected evidence/action: satisfy ${formatEvidenceList(missingRequirementIds)}, then rerun close-gate verification.`;

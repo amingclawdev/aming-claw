@@ -224,6 +224,33 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
   },
   {
     id: 203,
+    event_type: "service.route.completed",
+    event_kind: "route_context",
+    phase: "route_service",
+    actor: "service-router",
+    status: "allowed",
+    backlog_id: narrativeFocusBacklog.bug_id,
+    task_id: "mfsub-task-playback-narrative-focus-a",
+    payload: {
+      service_id: "route.prompt_alert_bundle",
+      decision: "allow",
+      route_id: "event.route_prompt_context.preview",
+      route_context_hash: "sha256:fixture-narrative-route-context",
+      prompt_contract_id: "rprompt-fixture-narrative",
+      visible_injection_manifest_hash: "sha256:fixture-visible-manifest",
+      source_event_type: "route.prompt_context.requested",
+      result: {
+        status: "allowed",
+        route_action_gate: {
+          action: "dispatch_bounded_worker",
+          allowed: true,
+        },
+      },
+    },
+    created_at: "2026-06-07T11:02:00Z",
+  },
+  {
+    id: 204,
     event_type: "mf_subagent.read_receipt",
     event_kind: "mf_subagent_read_receipt",
     phase: "startup_gate",
@@ -239,22 +266,33 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
       route_context_hash: "sha256:fixture-narrative-route-context",
       prompt_contract_id: "rprompt-fixture-narrative",
     },
-    created_at: "2026-06-07T11:02:00Z",
+    created_at: "2026-06-07T11:03:00Z",
   },
   {
-    id: 204,
-    event_type: "task_timeline_append",
-    event_kind: "verification",
-    phase: "verification",
-    actor: "qa",
-    status: "passed",
+    id: 205,
+    event_type: "route_gate_blocker_observed",
+    event_kind: "route_waiver",
+    phase: "route_gate",
+    actor: "fallback_observer",
+    status: "blocked",
     backlog_id: narrativeFocusBacklog.bug_id,
-    task_id: "qa-fixture-narrative",
-    verification: {
-      passed: true,
-      tests_run: ["npm run test -- taskPlayback"],
+    task_id: "mfsub-task-playback-narrative-focus-a",
+    payload: {
+      blocked_event_kinds: ["bounded_implementation_worker_dispatch", "mf_subagent_startup"],
+      failed_request_ids: ["req-fixture-route-blocker"],
+      prompt_contract_id: "rprompt-fixture-narrative",
+      reason: "Protected evidence requires route token or prior bounded worker route-context consumption.",
+      next_action: "Add bounded worker startup and dispatch route-context evidence before close.",
+      route_context_hash: "sha256:fixture-narrative-route-context",
+      route_id: "route-20260607-fixture-narrative",
+      worker_id: "mfsub-task-playback-narrative-focus-a",
+      worktree_path: "[fixture private path]",
     },
-    created_at: "2026-06-07T11:03:00Z",
+    verification: {
+      counts_as_close_evidence: false,
+      waiver_evidence_only: true,
+    },
+    created_at: "2026-06-07T11:04:00Z",
   },
 ];
 
@@ -293,8 +331,8 @@ export function buildTaskPlaybackNarrativeFocusFixture() {
         passed: false,
         status: "blocked",
         required_event_kinds: ["implementation", "verification", "close_ready"],
-        present_event_kinds: ["verification"],
-        missing_event_kinds: ["close_ready"],
+        present_event_kinds: ["route_context", "route_action_precheck"],
+        missing_event_kinds: ["implementation", "verification", "close_ready"],
         event_count: TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS.length,
         route_context_gate: {
           passed: false,
@@ -347,20 +385,25 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
     })),
   });
   assertFixture(
-    trace.close_gate_summary.reason_sentence === "Blocked because close-ready evidence has not been recorded; the close gate cannot pass until that event exists.",
-    "blocked close gate should show a human-readable reason sentence",
+    trace.close_gate_summary.reason_sentence === "Blocked because implementation, verification, and close-ready evidence have not been recorded; the close gate cannot pass until those events exist.",
+    "blocked close gate should show a human-readable reason sentence with missing event kinds",
   );
   assertFixture(
-    trace.close_gate_summary.next_expected_action.includes("record close-ready evidence"),
+    trace.close_gate_summary.next_expected_action.includes("add implementation, verification, and close-ready evidence"),
     "blocked close gate should show the next expected evidence/action",
   );
   assertFixture(
     visible.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."),
     "route/context worker story should be visible",
   );
-  assertFixture(visible.includes("Route service requested bounded task context."), "route context actor story should be visible");
+  assertFixture(visible.includes("Route service requested or delivered bounded task context."), "route context actor story should be visible");
+  assertFixture(visible.includes("Route service completed"), "route service completion should be readable");
+  assertFixture(visible.includes("Route evidence blocked"), "route waiver/blocker rows should be readable");
+  assertFixture(visible.includes("waiver-only evidence"), "route waiver narrative should explain the evidence implication");
+  assertFixture(!visible.includes("A governance timeline event was recorded."), "route/prompt events should not use the old generic fallback detail");
   assertFixture(!visible.includes("[fixture private request text]"), "private request text should stay hidden");
   assertFixture(!visible.includes("[fixture private route context body]"), "private route context body should stay hidden");
+  assertFixture(!visible.includes("[fixture private path]"), "private worktree paths should stay hidden");
   return [
     trace.close_gate_summary.reason_sentence,
     trace.close_gate_summary.next_expected_action,
