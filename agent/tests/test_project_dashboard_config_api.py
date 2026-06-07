@@ -101,6 +101,14 @@ def test_project_config_endpoint_exposes_governance_exclude_roots(tmp_path, monk
     assert payload["project_id"] == "dashboard-demo"
     assert payload["language"] == "typescript"
     assert payload["governance"]["exclude_roots"] == ["examples"]
+    assert payload["governance"]["policy_profile"] == "third-party-public"
+    policy = payload["governance"]["policy"]
+    assert policy["schema_version"] == "governance_policy.v1"
+    assert policy["profile"] == "third-party-public"
+    assert policy["public_safe"] is True
+    assert policy["requirements"]["graph_first_evidence"] is True
+    assert policy["requirements"]["worker_graph_trace"] is False
+    assert policy["requirements"]["independent_qa"] is False
     assert payload["testing"]["e2e"]["suites"]["dashboard.semantic.safe"]["command"].startswith("node scripts/")
     assert payload["graph"]["exclude_paths"] == ["docs/dev"]
     assert payload["graph"]["effective_exclude_roots"] == [
@@ -129,6 +137,14 @@ def test_project_config_endpoint_falls_back_to_repo_root_for_aming_claw(monkeypa
 
     assert payload["project_id"] == "aming-claw"
     assert "examples" in payload["governance"]["exclude_roots"]
+    assert payload["governance"]["policy_profile"] == "aming-claw"
+    policy = payload["governance"]["policy"]
+    assert policy["schema_version"] == "governance_policy.v1"
+    assert policy["profile"] == "aming-claw"
+    assert policy["public_safe"] is True
+    assert policy["requirements"]["worker_graph_trace"] is True
+    assert policy["requirements"]["independent_qa"] is True
+    assert policy["requirements"]["single_active_task"] is True
 
 
 def test_project_e2e_config_endpoint_exposes_suite_registry(tmp_path, monkeypatch):
@@ -159,6 +175,11 @@ def test_project_ai_config_endpoint_returns_writable_dashboard_contract(tmp_path
             "status": "active",
         }],
     )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
 
     payload = server.handle_project_ai_config(_ctx("dashboard-demo"))
 
@@ -186,6 +207,11 @@ def test_project_ai_config_live_check_marks_claude_auth_error(tmp_path, monkeypa
             "workspace_path": str(tmp_path),
             "status": "active",
         }],
+    )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
     )
     monkeypatch.setattr(server.shutil, "which", lambda candidate: f"/bin/{candidate}")
 
@@ -373,6 +399,8 @@ def test_project_config_endpoint_uses_registry_fallback_without_local_file(tmp_p
     assert payload["config_source"] == "aming_claw_registry"
     assert payload["language"] == "typescript"
     assert payload["ai"]["routing"]["semantic"]["model"] == "claude-opus-4-7"
+    assert payload["governance"]["policy_profile"] == "third-party-public"
+    assert payload["governance"]["policy"]["requirements"]["worker_graph_trace"] is False
 
 
 def test_project_config_endpoint_generates_non_invasive_default_for_no_config(tmp_path, monkeypatch):

@@ -2056,6 +2056,8 @@ def _normalize_project_config_payload(
     out.setdefault("build", {})
     out.setdefault("deploy", {})
     out.setdefault("governance", {})
+    if not isinstance(out["governance"], dict):
+        out["governance"] = {}
     out.setdefault("graph", {})
     out.setdefault("ai", {})
     if not isinstance(out["ai"], dict):
@@ -2063,9 +2065,43 @@ def _normalize_project_config_payload(
     out["ai"].setdefault("routing", {})
     out["config_source"] = source
     out["write_target"] = write_target
+    out["governance"] = _project_config_governance_with_policy(
+        project_id,
+        out.get("governance"),
+    )
     if local_config_error:
         out["local_config_error"] = local_config_error
     return out
+
+
+def _project_config_governance_with_policy(project_id: str, governance: Any) -> dict:
+    payload = dict(governance) if isinstance(governance, Mapping) else {}
+    try:
+        from project_config import governance_policy_to_dict, resolve_governance_policy
+
+        policy_payload = payload.get("policy") if isinstance(payload.get("policy"), dict) else None
+        if policy_payload:
+            resolved = governance_policy_to_dict(policy_payload)
+        else:
+            resolved = governance_policy_to_dict(resolve_governance_policy(project_id, payload))
+    except Exception:
+        profile = str(payload.get("policy_profile") or "").strip()
+        resolved = {
+            "schema_version": "governance_policy.v1",
+            "profile": profile or ("aming-claw" if project_id == "aming-claw" else "third-party-public"),
+            "source": "project_default",
+            "public_safe": True,
+            "requirements": {
+                "graph_first_evidence": True,
+                "worker_graph_trace": project_id == "aming-claw",
+                "independent_qa": project_id == "aming-claw",
+                "single_active_task": project_id == "aming-claw",
+                "close_timeline": True,
+            },
+        }
+    payload["policy_profile"] = str(resolved.get("profile") or "")
+    payload["policy"] = resolved
+    return payload
 
 
 def _registry_project_config(project_id: str) -> tuple[dict, str]:
@@ -18085,6 +18121,26 @@ def _publish_event(event_name, payload):
         pass
 
 
+def _publish_current_task_changed(
+    project_id: str,
+    *,
+    backlog_id: str = "",
+    task_id: str = "",
+    source: str = "",
+    runtime_state: str = "",
+    event_id: Any = "",
+) -> None:
+    _publish_event("current_task.changed", {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "source": source,
+        "runtime_state": runtime_state,
+        "event_id": event_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 _ROUTE_TOKEN_TASK_CREATE_TYPES = {"dev", "test", "qa", "gatekeeper", "merge", "deploy"}
 _ROUTE_GATE_PAYLOAD_KEYS = (
     "route_token",
@@ -19193,6 +19249,13 @@ def handle_task_create(ctx: RequestContext):
                 metadata=metadata,
                 runtime_state=result.get("status", "queued"),
             )
+            _publish_current_task_changed(
+                project_id,
+                backlog_id=_created_bug_id,
+                task_id=result.get("task_id", ""),
+                source="task.created",
+                runtime_state=result.get("status", "queued"),
+            )
         if metadata.get("route_token_gate"):
             _record_route_token_gate_event(
                 conn,
@@ -19260,6 +19323,13 @@ def handle_task_claim(ctx: RequestContext):
                 task_id=task.get("task_id", ""),
                 task_type=task.get("type", "task"),
                 metadata=metadata,
+                runtime_state="claimed",
+            )
+            _publish_current_task_changed(
+                project_id,
+                backlog_id=bug_id,
+                task_id=task.get("task_id", ""),
+                source="task.claimed",
                 runtime_state="claimed",
             )
         return {"task": task, "fence_token": fence_token}
@@ -21677,6 +21747,154 @@ def handle_backlog_portable_import(ctx: RequestContext):
         conn.close()
 
 
+def _current_task_event_summary(event: Mapping[str, Any] | None) -> dict:
+    if not event:
+        return {}
+    return {
+        "id": event.get("id"),
+        "event_type": event.get("event_type", ""),
+        "event_kind": event.get("event_kind", ""),
+        "phase": event.get("phase", ""),
+        "status": event.get("status", ""),
+        "task_id": event.get("task_id", ""),
+        "backlog_id": event.get("backlog_id", ""),
+        "actor": event.get("actor", ""),
+        "created_at": event.get("created_at", ""),
+    }
+
+
+def _current_task_policy_payload(project_id: str) -> dict:
+    try:
+        root = _project_workspace_for_config(project_id)
+        config = _resolved_project_config_payload(project_id, root)
+        governance = config.get("governance") if isinstance(config.get("governance"), dict) else {}
+        policy = governance.get("policy") if isinstance(governance.get("policy"), dict) else {}
+        return dict(policy)
+    except Exception:
+        return _project_config_governance_with_policy(project_id, {}).get("policy", {})
+
+
+def _single_active_task_summary(policy: Mapping[str, Any], active_count: int) -> dict:
+    requirements = policy.get("requirements") if isinstance(policy.get("requirements"), Mapping) else {}
+    required = bool(requirements.get("single_active_task"))
+    return {
+        "schema_version": "single_active_task_policy_evidence.v1",
+        "required": required,
+        "active_count": active_count,
+        "passed": (active_count <= 1) if required else True,
+    }
+
+
+def _current_task_runtime_rows(conn, limit: int) -> list[sqlite3.Row]:
+    placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+    return conn.execute(
+        f"""SELECT * FROM backlog_bugs
+            WHERE UPPER(status) NOT IN ({placeholders})
+              AND (
+                COALESCE(runtime_state, '') != ''
+                OR COALESCE(current_task_id, '') != ''
+                OR COALESCE(chain_stage, '') != ''
+              )
+            ORDER BY updated_at DESC, rowid DESC
+            LIMIT ?""",
+        [*_BACKLOG_CLOSED_STATUSES, max(1, min(limit, 20))],
+    ).fetchall()
+
+
+def _current_task_timeline_fallback(
+    conn,
+    project_id: str,
+    limit: int,
+) -> tuple[sqlite3.Row | None, dict]:
+    from . import task_timeline
+
+    task_timeline.ensure_schema(conn)
+    placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+    events = conn.execute(
+        f"""SELECT e.* FROM task_timeline_events e
+            JOIN backlog_bugs b ON b.bug_id = e.backlog_id
+            WHERE e.project_id = ?
+              AND COALESCE(e.backlog_id, '') != ''
+              AND UPPER(b.status) NOT IN ({placeholders})
+            ORDER BY e.id DESC
+            LIMIT ?""",
+        [project_id, *_BACKLOG_CLOSED_STATUSES, max(1, min(limit, 50))],
+    ).fetchall()
+    for event_row in events:
+        event = task_timeline._row_to_dict(event_row)
+        backlog_id = str(event.get("backlog_id") or "")
+        if not backlog_id:
+            continue
+        bug = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+        if bug:
+            return bug, event
+    return None, {}
+
+
+@route("GET", "/api/backlog/{project_id}/current-task")
+def handle_backlog_current_task(ctx: RequestContext):
+    """Return the current backlog task, with task-timeline fallback."""
+    pid = ctx.path_params["project_id"]
+    limit = max(1, min(_query_int(ctx.query, "limit", 10), 50))
+    conn = get_connection(pid)
+    try:
+        policy = _current_task_policy_payload(pid)
+        runtime_rows = _current_task_runtime_rows(conn, limit)
+        active_rows = [_backlog_compact_bug(row) for row in runtime_rows]
+        if runtime_rows:
+            primary = runtime_rows[0]
+            return {
+                "ok": True,
+                "project_id": pid,
+                "active": True,
+                "source": "backlog_runtime_state",
+                "backlog_id": primary["bug_id"],
+                "task_id": _row_get(primary, "current_task_id", ""),
+                "bug": _backlog_compact_bug(primary),
+                "active_backlog": active_rows,
+                "active_count": len(active_rows),
+                "latest_event": {},
+                "governance_policy": policy,
+                "single_active_task": _single_active_task_summary(policy, len(active_rows)),
+            }
+
+        bug, event = _current_task_timeline_fallback(conn, pid, limit)
+        if bug:
+            return {
+                "ok": True,
+                "project_id": pid,
+                "active": True,
+                "source": "task_timeline",
+                "backlog_id": bug["bug_id"],
+                "task_id": str(event.get("task_id") or ""),
+                "bug": _backlog_compact_bug(bug),
+                "active_backlog": [_backlog_compact_bug(bug)],
+                "active_count": 1,
+                "latest_event": _current_task_event_summary(event),
+                "governance_policy": policy,
+                "single_active_task": _single_active_task_summary(policy, 1),
+            }
+        return {
+            "ok": True,
+            "project_id": pid,
+            "active": False,
+            "source": "none",
+            "backlog_id": "",
+            "task_id": "",
+            "bug": None,
+            "active_backlog": [],
+            "active_count": 0,
+            "latest_event": {},
+            "governance_policy": policy,
+            "single_active_task": _single_active_task_summary(policy, 0),
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/backlog/{project_id}/{bug_id}")
 def handle_backlog_get(ctx: RequestContext):
     """Get a single backlog bug by ID. Returns 404 if missing."""
@@ -22199,6 +22417,13 @@ def handle_backlog_predeclare_mf(ctx: RequestContext):
             bypass_policy=predeclare_policy,
             mf_type=mf_type,
         )
+        _publish_current_task_changed(
+            pid,
+            backlog_id=bug_id,
+            task_id=str(row["current_task_id"] or ""),
+            source="backlog.predeclare_mf",
+            runtime_state="manual_fix_planned",
+        )
         conn.commit()
 
         # Audit: best-effort
@@ -22299,6 +22524,13 @@ def handle_backlog_start_mf(ctx: RequestContext):
             bypass_policy=start_policy,
             mf_type=mf_type,
             takeover=takeover,
+        )
+        _publish_current_task_changed(
+            pid,
+            backlog_id=bug_id,
+            task_id=str(takeover.get("taken_over_task_id") or ""),
+            source="backlog.start_mf",
+            runtime_state="manual_fix_in_progress",
         )
         conn.commit()
 
@@ -22439,6 +22671,13 @@ def handle_backlog_close(ctx: RequestContext):
             "manual_fix" if prior_status == "MF_IN_PROGRESS" else "fixed",
             project_id=pid,
             result={"commit": body.get("commit", ""), "route_token_gate": route_gate},
+            runtime_state="fixed",
+        )
+        _publish_current_task_changed(
+            pid,
+            backlog_id=bug_id,
+            task_id=str(_row_get(row, "current_task_id", "")),
+            source="backlog.close",
             runtime_state="fixed",
         )
         conn.commit()

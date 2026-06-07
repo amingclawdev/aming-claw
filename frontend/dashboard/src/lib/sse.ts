@@ -114,6 +114,8 @@ export function useEventStream(
         "task.completed",
         "task.failed",
         "task.retry",
+        "task_timeline.appended",
+        "current_task.changed",
         "gate.blocked",
         "gate.satisfied",
         "backfill.promoted",

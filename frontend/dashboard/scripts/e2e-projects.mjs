@@ -784,6 +784,7 @@ function verifyBacklogEvidenceContract() {
   phase("backlog evidence contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  const sseSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/sse.ts"), "utf8");
   const playbackSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.ts"), "utf8");
   const playbackPanelSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TaskPlaybackPanel.tsx"), "utf8");
   const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
@@ -859,13 +860,25 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("api.backlogTimelineGateFor"), "Backlog current panel should fetch governed close-gate data");
   assert(viewSource.includes("activeTaskScore"), "Backlog current panel should score real active backlog tasks");
   assert(viewSource.includes("secondaryActiveBugs"), "Backlog current panel should expose secondary active task options");
+  assert(viewSource.includes("currentTaskHintFor"), "Backlog current panel should fetch the backend current-task hint");
+  assert(viewSource.includes("/current-task?limit=10"), "Backlog current panel should use the current-task API fallback");
+  assert(viewSource.includes("useEventStream(projectId"), "Backlog current panel should reuse the dashboard SSE stream");
+  assert(viewSource.includes("isCurrentTaskLiveEvent"), "Backlog current panel should refresh on live current-task events");
+  assert(viewSource.includes("currentTaskRefreshSeq"), "Backlog current panel should bridge SSE events into immediate refreshes");
+  assert(viewSource.includes("task_timeline.appended"), "Backlog current panel should refresh on task timeline append events");
+  assert(viewSource.includes("current_task.changed"), "Backlog current panel should refresh on current-task changed events");
   assert(viewSource.includes("CURRENT_TASK_REFRESH_MS"), "Backlog current panel should define a bounded live refresh interval");
   assert(viewSource.includes("window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS)"), "Backlog current panel should poll the primary task without page reloads");
   assert(viewSource.includes("refreshCurrentTaskTimeline"), "Backlog current panel should refresh task detail, timeline, and gate together");
   assert(viewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Backlog current panel should refresh backlog row detail during live polling");
   assert(viewSource.includes("currentTimelineMountedRef"), "Backlog current panel should guard async refreshes after unmount");
   assert(viewSource.includes("backlogIdPlaceholder(selectedBugId)"), "URL-selected backlog ids outside the compact list should still own current timeline selection");
-  assert(viewSource.includes("const primaryCurrentBug = selectedBugId ? selectedCurrentBug"), "URL-selected backlog rows should not be overridden by auto primary active tasks");
+  assert(
+    viewSource.includes("const primaryCurrentBug = selectedBugId")
+      && viewSource.includes("? selectedCurrentBug")
+      && viewSource.includes(": hintedCurrentBug ?? activeTaskCandidates"),
+    "URL-selected backlog rows should not be overridden by auto primary active tasks",
+  );
   assert(viewSource.includes("setSelectedCurrentFrameId(\"\")"), "Backlog current panel should reset stale selected playback frames on task switch");
   assert(!viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view must not render default fixture stream replay frames");
   assert(!viewSource.includes("FixtureStreamReplay"), "Backlog view must not render the default fixture stream replay panel");
@@ -898,6 +911,8 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("TaskPlaybackPanel"), "Backlog row expansion should reuse the public task playback panel");
   assert(viewSource.includes("view=playback"), "Backlog view should expose a visible playback entry point");
   assert(playbackPanelSource.includes("Private refs redacted"), "Task playback panel should use public-safe private ref redaction copy");
+  assert(sseSource.includes('"task_timeline.appended"'), "Dashboard SSE client should listen for task timeline append events");
+  assert(sseSource.includes('"current_task.changed"'), "Dashboard SSE client should listen for current-task changed events");
   assert(!playbackPanelSource.includes("Host paths redacted"), "Task playback panel must not render private host-path wording");
   assert(playbackSource.includes("task_playback_trace.v1"), "Task playback should normalize to task_playback_trace.v1");
   assert(playbackSource.includes("normalizeTaskPlaybackTrace"), "Task playback normalizer should be exported");
@@ -943,6 +958,8 @@ async function main() {
         ONLY === "simple-first-entry-engineer-escape-desktop"
       ) {
         verifyOrdinaryUserEntryContract();
+      } else if (ONLY === "backlog-evidence") {
+        verifyBacklogEvidenceContract();
       } else {
         throw new Error(`unknown --only target: ${ONLY}`);
       }

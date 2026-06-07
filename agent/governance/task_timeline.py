@@ -16,7 +16,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 log = logging.getLogger(__name__)
 
@@ -403,6 +403,30 @@ def _run_service_router_hook(conn: sqlite3.Connection, inserted_event: dict[str,
         log.debug("service router timeline hook failed", exc_info=True)
 
 
+def _publish_timeline_event(inserted_event: dict[str, Any]) -> None:
+    try:
+        from agent.governance import event_bus
+
+        payload = {
+            "project_id": _text(inserted_event.get("project_id")),
+            "backlog_id": _text(inserted_event.get("backlog_id")),
+            "task_id": _text(inserted_event.get("task_id")),
+            "event_id": inserted_event.get("id", ""),
+            "event_type": _text(inserted_event.get("event_type")),
+            "event_kind": _text(inserted_event.get("event_kind")),
+            "phase": _text(inserted_event.get("phase")),
+            "status": _text(inserted_event.get("status")),
+        }
+        event_bus._bus.publish("task_timeline.appended", payload)
+        event_bus._bus.publish("current_task.changed", {
+            **payload,
+            "source": "task_timeline.record_event",
+            "runtime_state": payload["status"],
+        })
+    except Exception:
+        log.debug("task timeline event publish failed", exc_info=True)
+
+
 def record_event(
     conn: sqlite3.Connection,
     *,
@@ -432,7 +456,7 @@ def record_event(
 
     if not project_id or not event_type:
         raise ValueError("project_id and event_type are required")
-    return _insert_event(
+    inserted = _insert_event(
         conn,
         {
             "project_id": project_id,
@@ -458,6 +482,8 @@ def record_event(
             "commit_sha": commit_sha,
         },
     )
+    _publish_timeline_event(inserted)
+    return inserted
 
 
 class _TimelineWriteQueue:
@@ -751,6 +777,150 @@ def _contract_root(contract: dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(nested, dict):
             return nested
     return data
+
+
+def _policy_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "required", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "optional", "disabled"}:
+            return False
+    return default
+
+
+def _governance_policy(contract: dict[str, Any] | None = None) -> dict[str, Any]:
+    root = _contract_root(contract)
+    policy = _mapping(root.get("governance_policy"))
+    profile = _text(policy.get("profile")) or _text(root.get("governance_policy_profile"))
+    if not profile:
+        project_id = _text(root.get("project_id") or root.get("target_project_id"))
+        profile = "aming-claw" if project_id == "aming-claw" else "third-party-public"
+    requirements = _mapping(policy.get("requirements"))
+    strict = profile == "aming-claw"
+    return {
+        "schema_version": "governance_policy.v1",
+        "profile": profile,
+        "source": _text(policy.get("source")) or "project_default",
+        "public_safe": bool(policy.get("public_safe", True)) if policy else True,
+        "requirements": {
+            "graph_first_evidence": _policy_bool(
+                requirements.get("graph_first_evidence"),
+                True,
+            ),
+            "worker_graph_trace": _policy_bool(
+                requirements.get("worker_graph_trace"),
+                strict,
+            ),
+            "independent_qa": _policy_bool(
+                requirements.get("independent_qa"),
+                strict,
+            ),
+            "single_active_task": _policy_bool(
+                requirements.get("single_active_task"),
+                strict,
+            ),
+            "close_timeline": _policy_bool(
+                requirements.get("close_timeline"),
+                True,
+            ),
+        },
+    }
+
+
+def _policy_requires(policy: Mapping[str, Any], key: str) -> bool:
+    return bool(_mapping(policy.get("requirements")).get(key))
+
+
+def _event_graph_trace_ids(event: Mapping[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for key in ("trace_id", "graph_trace_id"):
+        text = _text(event.get(key)).strip()
+        if text:
+            ids.add(text)
+    for key in ("graph_trace_ids", "graph_query_trace_ids"):
+        ids.update(_string_list(event.get(key)))
+    for key in ("payload", "verification", "artifact_refs"):
+        nested = _mapping(event.get(key))
+        for trace_key in ("trace_id", "graph_trace_id"):
+            text = _text(nested.get(trace_key)).strip()
+            if text:
+                ids.add(text)
+        for trace_key in ("graph_trace_ids", "graph_query_trace_ids"):
+            ids.update(_string_list(nested.get(trace_key)))
+    return ids
+
+
+def _worker_graph_trace_gate(
+    rows: list[dict[str, Any]],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = _policy_requires(policy, "worker_graph_trace")
+    evidence_events: list[dict[str, Any]] = []
+    trace_ids: set[str] = set()
+    for event in rows:
+        ids = _event_graph_trace_ids(_mapping(event))
+        if not ids:
+            continue
+        trace_ids.update(ids)
+        evidence_events.append({
+            "id": event.get("id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "status": event.get("status"),
+            "graph_trace_ids": sorted(ids),
+        })
+    passed = bool(trace_ids) or not required
+    return {
+        "schema_version": "worker_graph_trace_gate.v1",
+        "required": required,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "trace_ids": sorted(trace_ids),
+        "missing_requirement_ids": [] if passed else ["worker_graph_trace"],
+        "evidence_events": evidence_events,
+    }
+
+
+def _independent_qa_gate(
+    rows: list[dict[str, Any]],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = _policy_requires(policy, "independent_qa")
+    evidence_events: list[dict[str, Any]] = []
+    for event in rows:
+        event = _mapping(event)
+        status = _text(event.get("status") or event.get("decision")).lower()
+        marker = " ".join([
+            _text(event.get("event_kind")),
+            _text(event.get("event_type")),
+            _text(event.get("phase")),
+            _text(event.get("actor")),
+        ]).lower()
+        if status not in MF_CLOSE_PASS_STATUSES:
+            continue
+        if "qa" not in marker and "independent_verification" not in marker:
+            continue
+        evidence_events.append({
+            "id": event.get("id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "actor": event.get("actor"),
+            "status": event.get("status"),
+        })
+    passed = bool(evidence_events) or not required
+    return {
+        "schema_version": "independent_qa_gate.v1",
+        "required": required,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "missing_requirement_ids": [] if passed else ["independent_qa"],
+        "evidence_events": evidence_events,
+    }
 
 
 def _canonical_contract_hash(value: Any) -> str:
@@ -3233,9 +3403,12 @@ def mf_close_gate_verification(
                 "id": event.get("id"),
             })
     missing = sorted(MF_CLOSE_REQUIRED_EVENT_KINDS - present)
+    governance_policy = _governance_policy(contract)
     contract_gate = mf_contract_gate_verification(rows, contract)
     route_context_gate = mf_route_context_gate_verification(rows, contract)
     lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
+    worker_graph_trace_gate = _worker_graph_trace_gate(rows, governance_policy)
+    independent_qa_gate = _independent_qa_gate(rows, governance_policy)
     contract_projection = mf_contract_projection(
         rows,
         contract,
@@ -3269,6 +3442,19 @@ def mf_close_gate_verification(
             "missing": post_verification_actions_gate.get("missing_actions", []),
             "next_action": "record observer-owned post-verification action or follow-up evidence",
         }
+    if worker_graph_trace_gate.get("required") and not worker_graph_trace_gate.get("passed"):
+        groups["worker_graph_trace"] = {
+            "label": "worker graph trace",
+            "missing": worker_graph_trace_gate.get("missing_requirement_ids", []),
+            "next_action": "record audited graph_query trace ids from the worker lane",
+        }
+    if independent_qa_gate.get("required") and not independent_qa_gate.get("passed"):
+        groups["independent_qa"] = {
+            "label": "independent QA",
+            "missing": independent_qa_gate.get("missing_requirement_ids", []),
+            "next_action": "record a passing independent QA verification timeline event",
+        }
+    missing_evidence_groups["groups"] = groups
     route_context_reminder = mf_route_context_reminder(
         route_context_gate,
         missing_evidence_groups,
@@ -3278,6 +3464,8 @@ def mf_close_gate_verification(
         and bool(contract_gate.get("passed"))
         and bool(route_context_gate.get("passed"))
         and bool(lane_ownership_gate.get("passed"))
+        and bool(worker_graph_trace_gate.get("passed"))
+        and bool(independent_qa_gate.get("passed"))
         and bool(contract_projection_gate.get("passed"))
         and bool(post_verification_actions_gate.get("passed"))
     )
@@ -3290,9 +3478,12 @@ def mf_close_gate_verification(
         "missing_event_kinds": missing,
         "event_count": len(rows),
         "ignored_required_events": ignored,
+        "governance_policy": governance_policy,
         "contract_gate": contract_gate,
         "route_context_gate": route_context_gate,
         "lane_ownership_gate": lane_ownership_gate,
+        "worker_graph_trace_gate": worker_graph_trace_gate,
+        "independent_qa_gate": independent_qa_gate,
         "contract_projection": contract_projection,
         "contract_projection_gate": contract_projection_gate,
         "post_verification_actions_gate": post_verification_actions_gate,
@@ -3305,6 +3496,8 @@ def mf_close_gate_verification(
             "has_contract_evidence": bool(contract_gate.get("passed")),
             "has_route_context_consumption": bool(route_context_gate.get("passed")),
             "has_lane_ownership": bool(lane_ownership_gate.get("passed")),
+            "has_worker_graph_trace": bool(worker_graph_trace_gate.get("passed")),
+            "has_independent_qa": bool(independent_qa_gate.get("passed")),
             "has_contract_projection": bool(contract_projection.get("schema_version")),
             "has_current_contract_projection": bool(
                 contract_projection_gate.get("passed")

@@ -566,10 +566,17 @@ def _copy_json_dict(raw: object) -> dict:
 def project_config_to_metadata(config) -> dict:
     """Serialize a ProjectConfig-like object for central registry storage."""
     try:
-        from project_config import e2e_config_to_dict, effective_graph_exclude_roots
+        from project_config import (
+            e2e_config_to_dict,
+            effective_graph_exclude_roots,
+            governance_policy_to_dict,
+            resolve_governance_policy,
+        )
     except Exception:
         e2e_config_to_dict = None
         effective_graph_exclude_roots = None
+        governance_policy_to_dict = None
+        resolve_governance_policy = None
 
     testing = getattr(config, "testing", None)
     build = getattr(config, "build", None)
@@ -583,8 +590,21 @@ def project_config_to_metadata(config) -> dict:
     effective_excludes = (
         effective_graph_exclude_roots(config) if effective_graph_exclude_roots else []
     )
+    project_id = str(getattr(config, "project_id", "") or "").strip()
+    governance_policy = getattr(governance, "policy", None)
+    if governance_policy_to_dict:
+        policy_payload = governance_policy_to_dict(
+            governance_policy
+            or (
+                resolve_governance_policy(project_id)
+                if resolve_governance_policy
+                else None
+            )
+        )
+    else:
+        policy_payload = {"profile": str(getattr(governance, "policy_profile", "") or "")}
     return {
-        "project_id": str(getattr(config, "project_id", "") or "").strip(),
+        "project_id": project_id,
         "language": str(getattr(config, "language", "") or "python").strip(),
         "testing": {
             "unit_command": str(getattr(testing, "unit_command", "") or ""),
@@ -603,6 +623,11 @@ def project_config_to_metadata(config) -> dict:
             "enabled": bool(getattr(governance, "enabled", False)),
             "test_tool_label": str(getattr(governance, "test_tool_label", "") or ""),
             "exclude_roots": list(getattr(governance, "exclude_roots", []) or []),
+            "policy_profile": str(
+                getattr(governance, "policy_profile", "")
+                or policy_payload.get("profile", "")
+            ),
+            "policy": policy_payload,
         },
         "graph": {
             "exclude_paths": list(getattr(graph, "exclude_paths", []) or []),

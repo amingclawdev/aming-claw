@@ -267,6 +267,142 @@ def _runtime_context_gate_requirements(subject: Mapping[str, Any], gate: str) ->
     }
 
 
+def _governance_policy(subject: Mapping[str, Any]) -> dict[str, Any]:
+    policy = _mapping(subject.get("governance_policy"))
+    if not policy:
+        config = _mapping(subject.get("project_config"))
+        governance = _mapping(config.get("governance"))
+        policy = _mapping(governance.get("policy"))
+    if not policy:
+        contract = _mapping(subject.get("contract"))
+        policy = _mapping(contract.get("governance_policy"))
+    project_id = _first_text(subject, "project_id", "target_project_id")
+    profile = _text(policy.get("profile")) if policy else ""
+    if not profile:
+        profile = "aming-claw" if project_id == "aming-claw" else "third-party-public"
+    requirements = _mapping(policy.get("requirements")) if policy else {}
+    strict = profile == "aming-claw"
+    return {
+        "schema_version": "governance_policy.v1",
+        "profile": profile,
+        "source": _text(policy.get("source")) or "project_default",
+        "public_safe": bool(policy.get("public_safe", True)) if policy else True,
+        "requirements": {
+            "graph_first_evidence": _policy_bool(
+                requirements.get("graph_first_evidence"),
+                True,
+            ),
+            "worker_graph_trace": _policy_bool(
+                requirements.get("worker_graph_trace"),
+                strict,
+            ),
+            "independent_qa": _policy_bool(
+                requirements.get("independent_qa"),
+                strict,
+            ),
+            "single_active_task": _policy_bool(
+                requirements.get("single_active_task"),
+                strict,
+            ),
+            "close_timeline": _policy_bool(
+                requirements.get("close_timeline"),
+                True,
+            ),
+        },
+    }
+
+
+def _policy_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "required", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "optional", "disabled"}:
+            return False
+    return default
+
+
+def _policy_requires(policy: Mapping[str, Any], key: str) -> bool:
+    return bool(_mapping(policy.get("requirements")).get(key))
+
+
+def _graph_trace_ids_from(value: Any) -> set[str]:
+    ids: set[str] = set()
+    if isinstance(value, str):
+        if value.strip():
+            ids.add(value.strip())
+        return ids
+    if isinstance(value, Mapping):
+        for key in ("trace_id", "graph_trace_id"):
+            text = _text(value.get(key))
+            if text:
+                ids.add(text)
+        for key in ("graph_trace_ids", "graph_query_trace_ids"):
+            ids.update(_string_list(value.get(key)))
+        for key in ("payload", "verification", "artifact_refs", "graph_query_identity"):
+            ids.update(_graph_trace_ids_from(value.get(key)))
+        return ids
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            ids.update(_graph_trace_ids_from(item))
+    return ids
+
+
+def _has_graph_trace_evidence(subject: Mapping[str, Any]) -> bool:
+    for key in (
+        "graph_query_identity",
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+        "graph_trace_evidence",
+        "timeline_evidence",
+        "contract_evidence",
+    ):
+        if _graph_trace_ids_from(subject.get(key)):
+            return True
+    return False
+
+
+def _single_active_task_status(subject: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = _mapping(
+        subject.get("single_active_task_evidence")
+        or subject.get("current_task_evidence")
+    )
+    if evidence:
+        count = int(evidence.get("active_task_count") or evidence.get("active_count") or 0)
+        others = _string_list(
+            evidence.get("other_active_task_ids") or evidence.get("active_task_ids")
+        )
+        passed = bool(evidence.get("passed", count <= 1 and len(others) <= 1))
+        return {
+            "schema_version": "single_active_task_policy_evidence.v1",
+            "provided": True,
+            "passed": passed,
+            "active_task_count": count,
+            "active_task_ids": others,
+        }
+    if "active_task_count" in subject:
+        count = int(subject.get("active_task_count") or 0)
+        ids = _string_list(subject.get("active_task_ids"))
+        return {
+            "schema_version": "single_active_task_policy_evidence.v1",
+            "provided": True,
+            "passed": count <= 1,
+            "active_task_count": count,
+            "active_task_ids": ids,
+        }
+    return {
+        "schema_version": "single_active_task_policy_evidence.v1",
+        "provided": False,
+        "passed": False,
+        "active_task_count": 0,
+        "active_task_ids": [],
+    }
+
+
 def _dispatch_gate(
     contract_id: str,
     stage: str,
@@ -275,6 +411,7 @@ def _dispatch_gate(
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    governance_policy = _governance_policy(subject)
     errors.extend(_contract_errors(subject, contract_id, stage, "mf_subagent.dispatch"))
     projection_requirements = _runtime_context_gate_requirements(
         subject,
@@ -337,6 +474,14 @@ def _dispatch_gate(
         subject.get("branch_adoption_evidence")
     ):
         errors.append("missing_existing_branch_adoption_evidence")
+    if _policy_requires(governance_policy, "graph_first_evidence") and not graph_snapshot_commit:
+        errors.append("missing_graph_first_evidence")
+    single_active_task = _single_active_task_status(subject)
+    if _policy_requires(governance_policy, "single_active_task"):
+        if not single_active_task["provided"]:
+            errors.append("missing_single_active_task_evidence")
+        elif not single_active_task["passed"]:
+            errors.append("single_active_task_policy_violation")
     if projection_requirements["explicit_projection"]:
         for field_name in projection_requirements["missing_fields"]:
             errors.append(f"missing_runtime_context_projection:{field_name}")
@@ -367,6 +512,8 @@ def _dispatch_gate(
                 and graph_snapshot_commit != target_head_commit
             )
         ),
+        "governance_policy": governance_policy,
+        "single_active_task": single_active_task,
         "branch_adoption_mode": adoption_mode,
         "fence_token_present": bool(_text(subject.get("fence_token"))),
         "runtime_context_projection_requirements": projection_requirements,
@@ -381,6 +528,7 @@ def _startup_gate(
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    governance_policy = _governance_policy(subject)
     errors.extend(_contract_errors(subject, contract_id, stage, "mf_subagent.startup"))
     projection_requirements = _runtime_context_gate_requirements(
         subject,
@@ -467,7 +615,6 @@ def _startup_gate(
     if projection_requirements["explicit_projection"]:
         for field_name in projection_requirements["missing_fields"]:
             errors.append(f"missing_runtime_context_projection:{field_name}")
-
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
         "actor": actor,
@@ -492,6 +639,8 @@ def _startup_gate(
         "fence_token_present": bool(fence_token),
         "actual_fence_token_present": bool(actual_fence_token),
         "fence_token_matches": bool(fence_token and actual_fence_token == fence_token),
+        "governance_policy": governance_policy,
+        "worker_graph_trace_evidence_present": _has_graph_trace_evidence(subject),
         "runtime_context_projection_requirements": projection_requirements,
     }
 
@@ -504,6 +653,7 @@ def _handoff_gate(
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    governance_policy = _governance_policy(subject)
     errors.extend(_contract_errors(subject, contract_id, stage, "mf_subagent.handoff"))
 
     worktree_path = _path(subject, "worker_worktree", "source_worktree", "worktree")
@@ -527,6 +677,8 @@ def _handoff_gate(
         errors.append("missing_tests_evidence")
     if not _has_timeline_kind(subject.get("timeline_evidence"), {"implementation", "verification"}):
         errors.append("missing_timeline_evidence")
+    if _policy_requires(governance_policy, "worker_graph_trace") and not _has_graph_trace_evidence(subject):
+        errors.append("missing_worker_graph_trace_evidence")
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -545,6 +697,8 @@ def _handoff_gate(
             subject.get("timeline_evidence"),
             {"implementation", "verification"},
         ),
+        "governance_policy": governance_policy,
+        "worker_graph_trace_evidence_present": _has_graph_trace_evidence(subject),
     }
 
 
@@ -566,7 +720,11 @@ def _merge_gate(
     errors.extend(_token_errors(subject, current_commit=source_commit))
     missing_evidence = _missing_required_evidence(subject, include_close_ready=False)
     topology_policy = _topology_policy(subject)
-    independent_verification_required = _independent_verification_required(topology_policy)
+    governance_policy = _governance_policy(subject)
+    independent_verification_required = _independent_verification_required(
+        topology_policy,
+        governance_policy,
+    )
     independent_verification_present = _independent_verification_present(subject)
 
     if main_git["error"]:
@@ -591,6 +749,8 @@ def _merge_gate(
         errors.append("missing_implementation_or_verification_timeline")
     if independent_verification_required and not independent_verification_present:
         errors.append("missing_independent_verification_lane_evidence")
+    if _policy_requires(governance_policy, "worker_graph_trace") and not _has_graph_trace_evidence(subject):
+        errors.append("missing_worker_graph_trace_evidence")
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -606,8 +766,10 @@ def _merge_gate(
         "observed_source_head": observed_source_head,
         "missing_required_evidence": missing_evidence,
         "topology_policy": topology_policy,
+        "governance_policy": governance_policy,
         "independent_verification_required": independent_verification_required,
         "independent_verification_evidence_present": independent_verification_present,
+        "worker_graph_trace_evidence_present": _has_graph_trace_evidence(subject),
         "timeline_evidence_present": _has_timeline_kind(
             subject.get("timeline_evidence"),
             {"implementation", "verification"},
@@ -951,7 +1113,11 @@ def _close_gate(
     errors.extend(_token_errors(subject, current_commit=current_commit))
     missing_evidence = _missing_required_evidence(subject, include_close_ready=True)
     topology_policy = _topology_policy(subject)
-    independent_verification_required = _independent_verification_required(topology_policy)
+    governance_policy = _governance_policy(subject)
+    independent_verification_required = _independent_verification_required(
+        topology_policy,
+        governance_policy,
+    )
     independent_verification_present = _independent_verification_present(subject)
     route_context_gate = _route_context_consumption_gate(subject)
     close_missing_event_kinds = [
@@ -981,6 +1147,8 @@ def _close_gate(
         errors.append("required_evidence_ids_missing")
     if independent_verification_required and not independent_verification_present:
         errors.append("missing_independent_verification_lane_evidence")
+    if _policy_requires(governance_policy, "worker_graph_trace") and not _has_graph_trace_evidence(subject):
+        errors.append("missing_worker_graph_trace_evidence")
     if route_context_gate.get("required") and not route_context_gate.get("passed"):
         for missing in route_context_gate.get("missing_requirement_ids") or []:
             errors.append(_route_context_missing_error(str(missing)))
@@ -999,11 +1167,13 @@ def _close_gate(
         "missing_required_evidence": missing_evidence,
         "missing_evidence_groups": missing_evidence_groups,
         "topology_policy": topology_policy,
+        "governance_policy": governance_policy,
         "route_context_gate": route_context_gate,
         "route_context_reminder": route_context_reminder,
         "route_context_consumption_required": bool(route_context_gate.get("required")),
         "independent_verification_required": independent_verification_required,
         "independent_verification_evidence_present": independent_verification_present,
+        "worker_graph_trace_evidence_present": _has_graph_trace_evidence(subject),
         "runtime_context_projection_requirements": projection_requirements,
         "close_ready_present": _has_timeline_kind(subject.get("timeline_evidence"), {"close_ready"}),
         "mf_timeline_precheck_compatible": _has_timeline_kind(
@@ -1298,10 +1468,14 @@ def _topology_policy(subject: Mapping[str, Any]) -> dict[str, Any]:
     return classify_route_topology(payload)
 
 
-def _independent_verification_required(topology_policy: Mapping[str, Any]) -> bool:
+def _independent_verification_required(
+    topology_policy: Mapping[str, Any],
+    governance_policy: Mapping[str, Any] | None = None,
+) -> bool:
     return (
         bool(topology_policy.get("independent_verification_required"))
         or _text(topology_policy.get("selected_topology")) == OBSERVER_LED_PARALLEL_TOPOLOGY
+        or _policy_requires(_mapping(governance_policy), "independent_qa")
     )
 
 

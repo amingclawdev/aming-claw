@@ -34,6 +34,20 @@ ROUTE_IDENTITY = {
     "prompt_contract_hash": "sha256:test-prompt-contract",
 }
 
+STRICT_GOVERNANCE_POLICY = {
+    "schema_version": "governance_policy.v1",
+    "profile": "aming-claw",
+    "source": "pytest",
+    "public_safe": True,
+    "requirements": {
+        "graph_first_evidence": True,
+        "worker_graph_trace": True,
+        "independent_qa": True,
+        "single_active_task": True,
+        "close_timeline": True,
+    },
+}
+
 
 def route_context_consumption_events() -> list[dict[str, object]]:
     return [
@@ -518,6 +532,32 @@ def test_scn_mf_wf_010_startup_identity_allows_assigned_worker_worktree(
     assert result["evidence"]["fence_token_matches"] is True
 
 
+def test_policy_worker_graph_trace_does_not_block_startup_boundary(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    subject = fixture.startup_subject(contract)
+    subject["governance_policy"] = STRICT_GOVERNANCE_POLICY
+
+    result = run_precheck(
+        "mf_subagent.startup",
+        CONTRACT_ID,
+        "startup_gate",
+        subject,
+        "pytest",
+    )
+
+    assert result["decision"] == "allow"
+    assert result["evidence"]["governance_policy"]["profile"] == "aming-claw"
+    assert (
+        result["evidence"]["governance_policy"]["requirements"]["worker_graph_trace"]
+        is True
+    )
+    assert result["evidence"]["worker_graph_trace_evidence_present"] is False
+    assert "missing_worker_graph_trace_evidence" not in result["evidence"]["errors"]
+
+
 def test_scn_mf_wf_010_startup_blocks_wrong_main_worktree_and_dirty_owned_overlap(
     tmp_path: Path,
 ) -> None:
@@ -599,6 +639,39 @@ def test_scn_mf_wf_003_handoff_allows_owned_dirty_scope_and_counts_files(
     )
     assert missing_result["decision"] == "block"
     assert "missing_tests_evidence" in missing_result["evidence"]["errors"]
+
+
+def test_policy_worker_graph_trace_blocks_handoff_after_startup_boundary(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    subject = fixture.handoff_subject(contract)
+    subject["governance_policy"] = STRICT_GOVERNANCE_POLICY
+
+    blocked = run_precheck(
+        "mf_subagent.handoff",
+        CONTRACT_ID,
+        "handoff_gate",
+        subject,
+        "pytest",
+    )
+
+    assert blocked["decision"] == "block"
+    assert "missing_worker_graph_trace_evidence" in blocked["evidence"]["errors"]
+    assert blocked["evidence"]["worker_graph_trace_evidence_present"] is False
+
+    subject["graph_trace_ids"] = ["gqt-policy-handoff"]
+    allowed = run_precheck(
+        "mf_subagent.handoff",
+        CONTRACT_ID,
+        "handoff_gate",
+        subject,
+        "pytest",
+    )
+
+    assert allowed["decision"] == "allow"
+    assert allowed["evidence"]["worker_graph_trace_evidence_present"] is True
 
 
 def test_scn_mf_wf_008_handoff_compacts_large_ignored_file_evidence(
