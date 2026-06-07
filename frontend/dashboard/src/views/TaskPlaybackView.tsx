@@ -3,6 +3,7 @@ import { api, ApiError } from "../lib/api";
 import {
   emptyTaskPlaybackTrace,
   fallbackTaskPlaybackSampleTrace,
+  isPrivatePlaybackText,
   normalizeTaskPlaybackTrace,
   type TaskPlaybackTrace,
 } from "../lib/taskPlayback";
@@ -32,6 +33,7 @@ interface PlaybackLoadState {
 
 export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const bugs = backlog.bugs ?? [];
+  const publicBugs = useMemo(() => bugs.filter((bug) => !isPrivatePlaybackBacklog(bug)), [bugs]);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("open");
   const [gateFilter, setGateFilter] = useState<GateFilter>("all");
@@ -75,8 +77,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
 
   const selectedBug = useMemo(() => {
     if (!selectedBugId) return null;
-    return bugs.find((bug) => bug.bug_id === selectedBugId) ?? null;
-  }, [bugs, selectedBugId]);
+    return publicBugs.find((bug) => bug.bug_id === selectedBugId) ?? null;
+  }, [publicBugs, selectedBugId]);
 
   useEffect(() => {
     selectedBugRef.current = selectedBug;
@@ -90,7 +92,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return bugs
+    return publicBugs
       .filter((bug) => {
         if (statusFilter === "open" && !isOpenBug(bug)) return false;
         if (statusFilter === "fixed" && isOpenBug(bug)) return false;
@@ -111,7 +113,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       })
       .slice()
       .sort(compareBacklogRows);
-  }, [bugs, gateFilter, playbackByBug, query, statusFilter]);
+  }, [publicBugs, gateFilter, playbackByBug, query, statusFilter]);
 
   useEffect(() => {
     const bug = selectedBugRef.current;
@@ -237,7 +239,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         <aside className="task-playback-selector" aria-label="Backlog playback selector">
           <div className="task-playback-selector-head">
             <strong>Backlog selector</strong>
-            <span className="mono">{rows.length} / {bugs.length}</span>
+            <span className="mono">{rows.length} / {publicBugs.length}</span>
           </div>
           <input
             className="backlog-search"
@@ -360,6 +362,18 @@ function matchesGateFilter(filter: GateFilter, bug: BacklogBug, state?: Playback
   if (filter === "blocked_gate") return Boolean(state?.trace.close_gate_summary.blocked);
   if (filter === "no_timeline") return Boolean(state?.loaded && state.trace.frames.length === 0);
   return true;
+}
+
+function isPrivatePlaybackBacklog(bug: BacklogBug): boolean {
+  const fields = [
+    bug.bug_id,
+    bug.title,
+    bug.runtime_state,
+    bug.chain_stage,
+    bug.mf_type,
+    bug.contract_summary?.template_id,
+  ];
+  return fields.some((field) => isPrivatePlaybackText(String(field || "")));
 }
 
 function playbackRowMeta(bug: BacklogBug, state?: PlaybackLoadState): string {

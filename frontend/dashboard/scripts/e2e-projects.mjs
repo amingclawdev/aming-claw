@@ -854,8 +854,11 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("host_private_paths: \"redacted\""), "Task playback privacy boundary should redact host-private paths");
   assert(playbackSource.includes("PRIVATE_EVIDENCE_KEY"), "Task playback normalizer should filter private evidence keys");
   assert(playbackSource.includes("judgment[-_\\s]?brain") && playbackSource.includes("judge[-_\\s]?(private|route"), "Task playback normalizer should filter private judge labels");
+  assert(playbackSource.includes("isPrivatePlaybackText"), "Task playback privacy classifier should be exported for selector filtering");
   assert(playbackViewSource.includes("api.taskTimelineFor"), "Playback selection should fetch governed task timeline data");
   assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");
+  assert(playbackViewSource.includes("isPrivatePlaybackBacklog") && playbackViewSource.includes("!isPrivatePlaybackBacklog(bug)"), "Playback selector should filter private backlog rows");
+  assert(playbackViewSource.includes("publicBugs.find"), "URL-selected playback rows should resolve only through public backlog rows");
   assert(playbackViewSource.includes("inFlightPlaybackKeysRef"), "Playback loading should track in-flight governed requests outside render state");
   assert(!playbackViewSource.includes("[playbackByBug, projectId, selectedBug]"), "Playback loading effect must not depend on full playback state");
   assert(playbackViewSource.includes("selectedLoadBugId = selectedBug?.bug_id"), "Playback loading should wait for URL-selected backlog data to become available");
