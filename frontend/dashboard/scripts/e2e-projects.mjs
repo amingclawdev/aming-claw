@@ -873,7 +873,10 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("refreshActivityTimeline"), "Activity view should refresh task detail, timeline, and gate together");
   assert(playbackViewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Activity view should refresh backlog row detail during live polling");
   assert(playbackViewSource.includes("activityMountedRef"), "Activity view should guard async refreshes after unmount");
-  assert(playbackViewSource.includes("const activityBug = selectedBug") && playbackViewSource.includes("hintedCurrentBug ?? activeTaskCandidates"), "URL-selected backlog rows should not be overridden by auto primary active tasks");
+  assert(playbackViewSource.includes("const activityBug = hintedCurrentBug"), "Current activity should be driven only by the active current-task hint");
+  assert(!playbackViewSource.includes("activeTaskCandidates") && !playbackViewSource.includes("secondaryActivityBugs"), "Current activity must not render a backlog/history candidate list");
+  assert(playbackViewSource.includes("ActivityStreamSummary"), "Current activity should summarize worker, QA, close-gate, latest event, next evidence, and blocker state");
+  assert(playbackViewSource.includes("No actively running observer task or command is recorded"), "Current activity should expose a clear empty state");
   assert(playbackViewSource.includes("setSelectedActivityFrameId(\"\")"), "Activity view should reset stale selected playback frames on project switch");
   assert(viewSource.includes("activityHref") && viewSource.includes("playbackDetailHref"), "Backlog rows should build Activity and playback deep links");
   assert(viewSource.includes("Open activity") && viewSource.includes("Open playback"), "Backlog rows should expose Activity and playback deep links");
@@ -884,9 +887,9 @@ function verifyBacklogEvidenceContract() {
   assert(!viewSource.includes("refreshCurrentTaskTimeline"), "Backlog view should not carry the full current event refresh loop");
   assert(!viewSource.includes("TaskPlaybackPanel"), "Backlog view should not render the full task playback panel inline");
   assert(
-    playbackViewSource.includes("const activityBug = selectedBug")
-      && playbackViewSource.includes("hintedCurrentBug ?? activeTaskCandidates"),
-    "Activity view should honor URL-selected backlog rows before auto primary active tasks",
+    playbackViewSource.includes("const activityBug = hintedCurrentBug")
+      && !playbackViewSource.includes("selectedBug ?? hintedCurrentBug"),
+    "Activity view should not treat a historical URL-selected backlog row as the current stream",
   );
   assert(!viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view must not render default fixture stream replay frames");
   assert(!viewSource.includes("FixtureStreamReplay"), "Backlog view must not render the default fixture stream replay panel");
@@ -961,9 +964,11 @@ function verifyBacklogEvidenceContract() {
       && playbackPanelSource.includes("Blocked/failed")
       && playbackPanelSource.includes("Filter playback by lane")
       && playbackPanelSource.includes("Filter playback by event kind")
+      && playbackPanelSource.includes("Filter playback by date")
       && playbackPanelSource.includes("Filter playback by event id"),
-    "Task playback should expose latest/current, blocked/failed, lane, kind, and event-id controls",
+    "Task playback should expose latest/current, blocked/failed, lane, kind, date, and event-id controls",
   );
+  assert(playbackPanelSource.includes("task-playback-event-column"), "Task playback filters should align above the event list instead of the detail column");
   assert(playbackPanelSource.includes("Evidence links"), "Task playback panel should expose typed primary evidence links");
   assert(playbackPanelSource.includes("EvidenceInspectorModal"), "Task playback evidence links should open a structured inspector modal");
   assert(playbackPanelSource.includes('aria-haspopup="dialog"'), "Task playback evidence chips should advertise dialog inspection");
@@ -976,12 +981,16 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("Copy evidence ref"), "Task playback evidence inspector should preserve copy-ref behavior");
   assert(playbackPanelSource.includes("Advanced raw data stays collapsed"), "Task playback evidence inspector should keep raw JSON in the collapsed advanced panel");
   assert(playbackPanelSource.includes("rawPathsForEvidenceKind"), "Task playback evidence inspector should extract typed public fields from sanitized raw sections");
-  assert(playbackPanelSource.includes("route_context") && playbackPanelSource.includes("prompt_contract"), "Task playback evidence inspector should handle route context and prompt contract refs");
+  assert(playbackPanelSource.includes("route_context") && playbackPanelSource.includes("read_receipt") && playbackPanelSource.includes("prompt_contract"), "Task playback evidence inspector should handle route context, read receipt, and prompt contract refs");
   assert(playbackPanelSource.includes("public-safe context not persisted on this event"), "Task playback evidence inspector should state when public route/prompt/source context was not persisted");
   assert(playbackPanelSource.includes("identity verified; showing best canonical/visible route bundle and read receipt evidence"), "Task playback evidence inspector should say identity verified when route/prompt identity fields are present");
   assert(playbackPanelSource.includes("routeContextBoundaryRows"), "Task playback evidence inspector should add route/read-receipt public boundary rows");
   assert(playbackPanelSource.includes("raw private prompt text") && playbackPanelSource.includes("hidden and not exposed"), "Task playback read-receipt inspector should explicitly hide private prompt text");
   assert(playbackPanelSource.includes("body persisted status"), "Task playback read-receipt inspector should expose body persistence status");
+  assert(playbackPanelSource.includes("no mf_subagent_read_receipt exists"), "Task playback legacy route rows should state when no read receipt exists");
+  assert(playbackPanelSource.includes("actual persisted public-safe body fields"), "Task playback route/read-receipt inspector should identify persisted public-safe bodies when present");
+  assert(playbackPanelSource.includes("Persisted graph trace"), "Task playback graph trace inspector should expose persisted trace summaries above raw JSON");
+  assert(playbackPanelSource.includes("query args not persisted") && playbackPanelSource.includes("resolved graph nodes/files not persisted"), "Task playback graph trace inspector should name unavailable trace args and resolved graph fields");
   assert(
     playbackPanelSource.includes("route_alerts")
       && playbackPanelSource.includes("allowed_actions")

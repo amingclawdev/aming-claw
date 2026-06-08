@@ -49,6 +49,8 @@ interface CurrentTaskHint {
   active_backlog?: BacklogBug[];
   active_count?: number;
   latest_event?: Record<string, unknown>;
+  single_active_task?: Record<string, unknown>;
+  governance_policy?: Record<string, unknown>;
 }
 
 interface ActivityLoadState extends PlaybackLoadState {
@@ -150,23 +152,10 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const hintedCurrentBug = currentTaskHint?.active && currentTaskHint.bug && !isPrivatePlaybackBacklog(currentTaskHint.bug)
     ? currentTaskHint.bug
     : null;
-  const activeTaskCandidates = useMemo(() => {
-    const candidates = publicBugs
-      .map((bug) => ({ bug, score: activeTaskScore(bug) }))
-      .filter((item) => item.score > 0)
-      .sort(compareActiveTaskCandidates);
-    if (hintedCurrentBug && !candidates.some((item) => item.bug.bug_id === hintedCurrentBug.bug_id)) {
-      return [{ bug: hintedCurrentBug, score: 10_000 }, ...candidates];
-    }
-    return candidates;
-  }, [hintedCurrentBug, publicBugs]);
-  const activityBug = selectedBug ?? hintedCurrentBug ?? activeTaskCandidates[0]?.bug ?? null;
+  const activityBug = hintedCurrentBug;
   const activityState = activityBug ? activityByBug[activityBug.bug_id] : undefined;
   const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
   const activityFrameId = selectedActivityFrameId || activityTrace.frames[0]?.id || "";
-  const secondaryActivityBugs = activityBug
-    ? activeTaskCandidates.map((item) => item.bug).filter((bug) => bug.bug_id !== activityBug.bug_id)
-    : activeTaskCandidates.map((item) => item.bug);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -443,7 +432,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         <div className="view-header-actions">
           <span className="mono">{projectId}</span>
           <span className={`status-badge ${activityTrace.statuses.has_governed_data ? "status-complete" : "status-unknown"}`}>
-            {!activityBug ? "no current activity" : activityTrace.source === "fallback_sample" ? "sample fallback" : "governed data"}
+            {!activityBug ? "no current activity" : activityTrace.source === "fallback_sample" ? "sample fallback" : "governed current stream"}
           </span>
         </div>
       </div>
@@ -465,7 +454,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               <span className="mono">{activityBug?.bug_id || "no task"}</span>
             </div>
             {activityBug ? (
-              <button type="button" className="active" onClick={() => selectBug(activityBug.bug_id)}>
+              <button type="button" className="active" onClick={() => setActivityRefreshSeq((seq) => seq + 1)}>
                 <div>
                   <strong>{activityBug.title || activityBug.bug_id}</strong>
                   <span className="mono">{activityBug.bug_id}</span>
@@ -474,22 +463,9 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 <em>{activityState?.loading ? "loading events" : `${activityTrace.frames.length} event${activityTrace.frames.length === 1 ? "" : "s"}`}</em>
               </button>
             ) : (
-              <div className="timeline-empty">No current task/runtime event stream is active for this project.</div>
+              <div className="timeline-empty">No actively running observer task or command is recorded for this project.</div>
             )}
-            {secondaryActivityBugs.length > 0 ? (
-              <div className="task-playback-row-list">
-                {secondaryActivityBugs.slice(0, 8).map((bug) => (
-                  <button type="button" key={bug.bug_id} onClick={() => selectBug(bug.bug_id)}>
-                    <div>
-                      <strong>{bug.title || bug.bug_id}</strong>
-                      <span className="mono">{bug.bug_id}</span>
-                    </div>
-                    <span className={`status-badge ${statusClass(bug.status)}`}>{normalizeStatus(bug.status)}</span>
-                    <em>{bug.runtime_state || bug.chain_stage || bug.mf_type || "active candidate"}</em>
-                  </button>
-                ))}
-              </div>
-            ) : null}
+            <ActivityStreamSummary hint={currentTaskHint} trace={activityTrace} />
             <div className="task-playback-controls">
               <button type="button" className="action-btn" onClick={() => setActivityRefreshSeq((seq) => seq + 1)}>
                 Refresh
@@ -629,6 +605,93 @@ function SegmentedButton<T extends string>({
   );
 }
 
+function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; trace: TaskPlaybackTrace }) {
+  const latestFrame = trace.frames[trace.frames.length - 1] ?? null;
+  const latestEvent = hint?.latest_event ?? {};
+  const latestEventText = compactJoin([
+    hintText(latestEvent, "event_kind") || latestFrame?.event_kind || "",
+    hintText(latestEvent, "event_type") || latestFrame?.event_type || "",
+    hintText(latestEvent, "status") || latestFrame?.status || "",
+    hintText(latestEvent, "created_at") || latestFrame?.at || "",
+  ]);
+  const laneState = compactJoin([
+    laneStatusSummary(trace, "worker", "worker"),
+    laneStatusSummary(trace, "verification", "QA"),
+    laneStatusSummary(trace, "gate", "close gate"),
+  ]);
+  const nextExpected = trace.close_gate_summary.next_expected_evidence.length > 0
+    ? trace.close_gate_summary.next_expected_evidence.join(", ")
+    : firstHintValue(latestEvent, ["next_expected_evidence", "missing_event_kinds", "missing_requirement_ids"]) || "none recorded";
+  const nextAction = trace.close_gate_summary.next_expected_action
+    || firstHintValue(latestEvent, ["next_legal_action", "next_expected_action", "next_action"])
+    || "none recorded";
+  const blocker = latestFrame?.failure_diagnosis[0]
+    ? `${latestFrame.failure_diagnosis[0].label}: ${latestFrame.failure_diagnosis[0].value}`
+    : firstHintValue(latestEvent, ["blocker_ids", "blockers", "missing_event_kinds", "missing_requirement_ids"])
+      || (trace.close_gate_summary.blocked ? trace.close_gate_summary.reason_sentence : "none recorded");
+  const activeCount = hint?.active_count != null ? `${hint.active_count} active` : "";
+  const singleActive = hint?.single_active_task ? singleActiveSummary(hint.single_active_task) : "";
+  return (
+    <div className="task-playback-chip-section" aria-label="Current stream state">
+      <strong>Current stream state</strong>
+      <div>
+        {activeCount ? <span>{activeCount}</span> : null}
+        {singleActive ? <span>{singleActive}</span> : null}
+        <span>Latest event: {latestEventText || "none recorded"}</span>
+        <span>Worker/QA/close gate: {laneState || "none recorded"}</span>
+        <span>Next expected evidence: {nextExpected}</span>
+        <span>Blocker/next legal action: {blocker}; {nextAction}</span>
+      </div>
+    </div>
+  );
+}
+
+function laneStatusSummary(trace: TaskPlaybackTrace, laneId: string, label: string): string {
+  const lane = trace.lanes.find((item) => item.id === laneId);
+  if (!lane) return "";
+  return `${label} ${lane.status} (${lane.frame_count})`;
+}
+
+function firstHintValue(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = compactUnknown(record[key]);
+    if (value) return value;
+  }
+  return "";
+}
+
+function hintText(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function compactUnknown(value: unknown): string {
+  if (value == null || value === "") return "";
+  if (Array.isArray(value)) return value.map(compactUnknown).filter(Boolean).slice(0, 6).join(", ");
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => {
+        const text = compactUnknown(item);
+        return text ? `${key}: ${text}` : "";
+      })
+      .filter(Boolean);
+    return entries.slice(0, 4).join("; ");
+  }
+  return String(value).trim();
+}
+
+function compactJoin(values: string[]): string {
+  return values.map((value) => value.trim()).filter(Boolean).join(" / ");
+}
+
+function singleActiveSummary(value: Record<string, unknown>): string {
+  const required = value.required === true ? "single-active required" : "single-active optional";
+  const passed = value.passed === false ? "policy blocked" : "policy ok";
+  return `${required}; ${passed}`;
+}
+
 function dashboardApiBase(): string {
   return DIRECT_API ? BACKEND_URL : "";
 }
@@ -732,37 +795,6 @@ function compareBacklogRows(a: BacklogBug, b: BacklogBug): number {
   const priority = priorityWeight(a.priority) - priorityWeight(b.priority);
   if (priority !== 0) return priority;
   return Date.parse(b.updated_at || b.created_at || "") - Date.parse(a.updated_at || a.created_at || "");
-}
-
-function compareActiveTaskCandidates(
-  a: { bug: BacklogBug; score: number },
-  b: { bug: BacklogBug; score: number },
-): number {
-  if (a.score !== b.score) return b.score - a.score;
-  const priority = priorityWeight(a.bug.priority) - priorityWeight(b.bug.priority);
-  if (priority !== 0) return priority;
-  return Date.parse(b.bug.updated_at || b.bug.created_at || "") - Date.parse(a.bug.updated_at || a.bug.created_at || "");
-}
-
-function activeTaskScore(bug: BacklogBug): number {
-  if (!isOpenBug(bug)) return 0;
-  const status = normalizeStatus(bug.status);
-  const runtimeText = [
-    bug.runtime_state,
-    bug.chain_stage,
-    bug.mf_type,
-    bug.current_task_id ? "current_task_id" : "",
-  ].join(" ").toUpperCase();
-  let score = 0;
-  if (status === "MF_IN_PROGRESS") score += 120;
-  if (["CLAIMED", "RUNNING", "IN_PROGRESS", "QUEUED"].includes(status)) score += 100;
-  if (status === "OPEN" && bug.current_task_id) score += 80;
-  if (/\b(MF_IN_PROGRESS|CLAIMED|RUNNING|IN_PROGRESS|IMPLEMENTATION|DISPATCH|HANDOFF|MERGE_GATE|WORKER|TASK)\b/.test(runtimeText)) {
-    score += 70;
-  }
-  if (/\bQUEUED\b/.test(runtimeText)) score += 50;
-  if (bug.contract_summary?.has_contract) score += 15;
-  return score;
 }
 
 function statusClass(status: string): string {

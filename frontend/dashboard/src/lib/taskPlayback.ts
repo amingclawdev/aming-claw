@@ -19,6 +19,7 @@ export interface TaskPlaybackEvidenceRef {
   kind:
     | "timeline_event"
     | "route_context"
+    | "read_receipt"
     | "prompt_contract"
     | "graph_trace"
     | "precheck"
@@ -462,6 +463,14 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "verification.route_identity.visible_injection_manifest_hash",
     "artifact_refs.visible_injection_manifest_hash",
   ]);
+  pushFirstFact(facts, event, "launch_text_hash", "launch text hash", [
+    "payload.launch_text_hash",
+    "payload.route_identity.launch_text_hash",
+    "payload.revision_receipt.launch_text_hash",
+    "verification.launch_text_hash",
+    "verification.route_identity.launch_text_hash",
+    "artifact_refs.launch_text_hash",
+  ]);
   pushFirstFact(facts, event, "stage", "stage", [
     "payload.stage",
     "payload.lifecycle_state",
@@ -500,6 +509,51 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
   ]);
   if (requiredEvidence.length > 0) {
     pushFact(facts, "required_evidence", "required evidence", formatCompactList(requiredEvidence), sourceForPath(requiredEvidence[0].path));
+  }
+  const requiredLaneEvidence = publicValuesAtPaths(event, [
+    "payload.required_lanes_evidence",
+    "payload.required_lanes",
+    "payload.route_context.required_lanes_evidence",
+    "payload.route_context.visible_bundle.required_lanes_evidence",
+    "payload.visible_bundle.required_lanes_evidence",
+    "verification.required_lanes_evidence",
+    "artifact_refs.required_lanes_evidence",
+  ]);
+  if (requiredLaneEvidence.length > 0) {
+    pushFact(facts, "required_lanes_evidence", "required lanes/evidence", formatCompactList(requiredLaneEvidence), sourceForPath(requiredLaneEvidence[0].path));
+  }
+  const routeAlerts = publicValuesAtPaths(event, [
+    "payload.route_alerts",
+    "payload.alerts",
+    "payload.route_context.alerts",
+    "payload.route_context.route_alerts",
+    "verification.route_alerts",
+    "artifact_refs.route_alerts",
+  ]);
+  if (routeAlerts.length > 0) {
+    pushFact(facts, "route_alerts", "route alerts", formatCompactList(routeAlerts), sourceForPath(routeAlerts[0].path));
+  }
+  const allowedActions = publicValuesAtPaths(event, [
+    "payload.allowed_actions",
+    "payload.route_context.allowed_actions",
+    "payload.route_context.visible_bundle.allowed_actions",
+    "payload.visible_bundle.allowed_actions",
+    "verification.allowed_actions",
+  ]);
+  if (allowedActions.length > 0) {
+    pushFact(facts, "allowed_actions", "allowed actions", formatCompactList(allowedActions), sourceForPath(allowedActions[0].path));
+  }
+  const blockedActions = publicValuesAtPaths(event, [
+    "payload.blocked_actions",
+    "payload.acknowledged_forbidden_actions",
+    "payload.forbidden_actions",
+    "payload.route_context.blocked_actions",
+    "payload.route_context.visible_bundle.blocked_actions",
+    "payload.visible_bundle.blocked_actions",
+    "verification.blocked_actions",
+  ]);
+  if (blockedActions.length > 0) {
+    pushFact(facts, "blocked_actions", "blocked actions", formatCompactList(blockedActions), sourceForPath(blockedActions[0].path));
   }
   pushOutcomeFact(facts, event, "decision", "decision", [
     "payload.decision",
@@ -820,7 +874,7 @@ function evidenceLinksFromEvent(
     "artifact_refs.source_event_id",
     "artifact_refs.source_event_refs",
   ]);
-  pushEvidenceValues(links, "source_event", "read receipt", event, [
+  pushEvidenceValues(links, "read_receipt", "read receipt", event, [
     "payload.read_receipt_event_id",
     "payload.read_receipt_event_ids",
     "payload.read_receipt_event_ref",

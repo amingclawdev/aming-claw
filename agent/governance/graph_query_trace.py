@@ -612,10 +612,36 @@ def get_trace(conn: sqlite3.Connection, project_id: str, trace_id: str) -> dict[
         """,
         (trace_id,),
     ).fetchall()
-    trace["events"] = [dict(event) for event in events]
+    trace["events"] = [_trace_event_payload(dict(event)) for event in events]
     trace["event_count"] = len(trace["events"])
     trace["graph_query_identity"] = graph_query_identity(trace)
     return {"ok": True, "trace": trace}
+
+
+def _trace_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    """Expose persisted graph-query event summaries without implying raw args/results exist."""
+
+    args_hash = str(event.get("args_hash") or "")
+    result_hash = str(event.get("result_hash") or "")
+    payload = dict(event)
+    payload["args"] = {
+        "persisted": False,
+        "args_hash": args_hash,
+        "message": "query args are not persisted on graph_query_events; only the args hash is available",
+    }
+    payload["result_summary"] = {
+        "persisted": True,
+        "result_count": int(event.get("result_count") or 0),
+        "result_hash": result_hash,
+        "duration_ms": int(event.get("duration_ms") or 0),
+    }
+    payload["resolved_graph"] = {
+        "persisted": False,
+        "nodes": [],
+        "files": [],
+        "message": "resolved graph nodes/files are not persisted on graph_query_events",
+    }
+    return payload
 
 
 def finish_trace(

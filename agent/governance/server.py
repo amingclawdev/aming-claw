@@ -18627,7 +18627,6 @@ _TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS = (
 )
 _TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS = (
     "route_id",
-    "route_token_ref",
     "prompt_contract_hash",
     "visible_injection_manifest_hash",
     "worktree_path",
@@ -18917,8 +18916,6 @@ def _timeline_source_event_route_gate(
     if not route_identity.get("route_context_hash") or not route_identity.get(
         "prompt_contract_id"
     ):
-        return {}
-    if not route_identity.get("route_token_ref"):
         return {}
     source_gate = task_timeline.route_owned_source_event_gate_verification(
         events,
@@ -22419,6 +22416,55 @@ def handle_backlog_portable_import(ctx: RequestContext):
         conn.close()
 
 
+_CURRENT_TASK_ACTIVE_BACKLOG_STATUSES = {
+    "CLAIMED",
+    "IN_PROGRESS",
+    "MF_IN_PROGRESS",
+    "QUEUED",
+    "RUNNING",
+    "WAITING",
+    "WAITING_MERGE",
+    "REVIEW_READY",
+    "BLOCKED",
+}
+_CURRENT_TASK_ACTIVE_EVENT_STATUSES = {
+    "blocked",
+    "claimed",
+    "in_progress",
+    "queued",
+    "running",
+    "waiting",
+    "waiting_merge",
+}
+_CURRENT_TASK_TERMINAL_EVENT_STATUSES = {
+    "accepted",
+    "allow",
+    "allowed",
+    "approved",
+    "cancelled",
+    "closed",
+    "complete",
+    "completed",
+    "done",
+    "fixed",
+    "merged",
+    "ok",
+    "passed",
+    "recorded",
+    "resolved",
+    "skipped",
+    "succeeded",
+    "superseded",
+}
+_CURRENT_TASK_ACTIVE_RUNTIME_RE = re.compile(
+    r"(manual[_ -]?fix[_ -]?in[_ -]?progress|mf[_ -]?in[_ -]?progress|"
+    r"\bclaimed\b|\brunning\b|\bin[_ -]?progress\b|\bqueued\b|\bwaiting\b|"
+    r"startup[_ -]?gate|dispatch|implementation[_ -]?wait|implementation|"
+    r"handoff[_ -]?gate|merge[_ -]?gate|close[_ -]?gate|review[_ -]?ready|waiting[_ -]?merge|blocked)",
+    re.IGNORECASE,
+)
+
+
 def _current_task_event_summary(event: Mapping[str, Any] | None) -> dict:
     if not event:
         return {}
@@ -22432,6 +22478,20 @@ def _current_task_event_summary(event: Mapping[str, Any] | None) -> dict:
         "backlog_id": event.get("backlog_id", ""),
         "actor": event.get("actor", ""),
         "created_at": event.get("created_at", ""),
+        "blocker_ids": _current_task_public_values(event, ("blocker_ids", "blockers", "failed_request_ids")),
+        "missing_event_kinds": _current_task_public_values(event, ("missing_event_kinds", "blocked_event_kinds")),
+        "missing_requirement_ids": _current_task_public_values(
+            event,
+            ("missing_requirement_ids", "missing_required_evidence", "required_before_protected_evidence"),
+        ),
+        "next_legal_action": _current_task_first_public_value(
+            event,
+            ("next_legal_action", "next_expected_action", "next_action", "legal_next_action", "recovery_action"),
+        ),
+        "next_expected_evidence": _current_task_public_values(
+            event,
+            ("next_expected_evidence", "required_evidence", "required_event_kinds", "required_lanes_evidence"),
+        ),
     }
 
 
@@ -22473,6 +22533,83 @@ def _current_task_runtime_rows(conn, limit: int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _current_task_public_containers(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = [event]
+    for key in ("payload", "verification", "artifact_refs"):
+        value = event.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    return containers
+
+
+def _current_task_public_values(event: Mapping[str, Any], keys: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for container in _current_task_public_containers(event):
+        for key in keys:
+            values.extend(_current_task_strings(container.get(key)))
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result[:8]
+
+
+def _current_task_first_public_value(event: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    values = _current_task_public_values(event, keys)
+    return values[0] if values else ""
+
+
+def _current_task_strings(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (str, int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            out.extend(_current_task_strings(item))
+        return out
+    if isinstance(value, Mapping):
+        out: list[str] = []
+        for key in ("id", "event_id", "kind", "label", "status", "reason", "action", "description"):
+            if key in value:
+                out.extend(_current_task_strings(value.get(key)))
+        return out or [", ".join(str(key) for key in list(value.keys())[:4])]
+    return [str(value)]
+
+
+def _current_task_row_is_active(row: sqlite3.Row) -> bool:
+    status = str(_row_get(row, "status", "") or "").strip().upper()
+    if status in _BACKLOG_CLOSED_STATUSES:
+        return False
+    if status in _CURRENT_TASK_ACTIVE_BACKLOG_STATUSES:
+        return True
+    marker = " ".join(
+        str(_row_get(row, key, "") or "")
+        for key in ("runtime_state", "chain_stage", "mf_type", "current_task_id")
+    )
+    return bool(marker.strip() and _CURRENT_TASK_ACTIVE_RUNTIME_RE.search(marker))
+
+
+def _current_task_event_is_active(event: Mapping[str, Any]) -> bool:
+    status = str(event.get("status") or "").strip().lower().replace("-", "_")
+    if status in _CURRENT_TASK_ACTIVE_EVENT_STATUSES:
+        return True
+    if status in _CURRENT_TASK_TERMINAL_EVENT_STATUSES:
+        return False
+    if not status:
+        return False
+    marker = " ".join(
+        str(event.get(key) or "")
+        for key in ("event_type", "event_kind", "phase", "task_id")
+    )
+    return bool(str(event.get("task_id") or "").strip() and _CURRENT_TASK_ACTIVE_RUNTIME_RE.search(marker))
+
+
 def _current_task_timeline_candidate(
     conn,
     project_id: str,
@@ -22494,6 +22631,8 @@ def _current_task_timeline_candidate(
     ).fetchall()
     for event_row in events:
         event = task_timeline._row_to_dict(event_row)
+        if not _current_task_event_is_active(event):
+            continue
         backlog_id = str(event.get("backlog_id") or "")
         if not backlog_id:
             continue
@@ -22517,6 +22656,8 @@ def _current_task_timeline_candidate(
 def _current_task_runtime_candidates(rows: list[sqlite3.Row]) -> list[dict]:
     candidates: list[dict] = []
     for row in rows:
+        if not _current_task_row_is_active(row):
+            continue
         candidates.append({
             "source": "backlog_runtime_state",
             "bug": row,

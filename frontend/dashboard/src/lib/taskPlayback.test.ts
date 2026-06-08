@@ -393,6 +393,65 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
       source_event_id: "329",
     }),
   } as unknown as TaskTimelineEvent,
+  {
+    id: 1760,
+    event_type: "task_timeline_append",
+    event_kind: "implementation",
+    phase: "implementation",
+    actor: "mf_sub",
+    status: "passed",
+    backlog_id: narrativeFocusBacklog.bug_id,
+    task_id: "mfsub-task-playback-narrative-focus-a",
+    created_at: "2026-06-07T11:07:00Z",
+    payload_json: JSON.stringify({
+      graph_query_trace_ids: ["gqt-fixture-current"],
+      graph_query_trace: {
+        trace_id: "gqt-fixture-current",
+        query_source: "mf_subagent",
+        query_purpose: "subagent_context_build",
+        tool: "find_node_by_path",
+        args: { path: "frontend/dashboard/src/lib/taskPlayback.ts" },
+        result_summary: { result_count: 2, result_hash: "sha256:fixture-graph-result" },
+        resolved_nodes: ["L7.fixture.task-playback"],
+        resolved_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+      },
+      changed_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+    }),
+    artifact_refs_json: JSON.stringify({
+      graph_query_trace_ids: ["gqt-fixture-current"],
+      source_event_id: "1760",
+    }),
+  } as unknown as TaskTimelineEvent,
+  {
+    id: 1761,
+    event_type: "route.prompt_context.requested",
+    event_kind: "route_context",
+    phase: "dispatch",
+    actor: "fallback_observer",
+    status: "accepted",
+    backlog_id: "AC-MF-SUB-STARTUP-COMMAND-ID-FLOW-20260606",
+    task_id: "legacy-startup-command-id-flow",
+    created_at: "2026-06-07T11:08:00Z",
+    payload_json: JSON.stringify({
+      backlog_id: "AC-MF-SUB-STARTUP-COMMAND-ID-FLOW-20260606",
+      route_id: "route-legacy-startup-flow",
+      route_context_hash: "sha256:legacy-route-context",
+      prompt_contract_id: "rprompt-legacy-startup-flow",
+      prompt_contract_hash: "sha256:legacy-prompt-contract",
+      visible_injection_manifest_hash: "sha256:legacy-visible-manifest",
+      launch_text_hash: "sha256:legacy-launch-text",
+      body_persisted_status: "route context body unavailable in legacy timeline row",
+      source_event_ids: ["timeline_event:2980", "service_event:2981"],
+      target_files: ["agent/governance/task_timeline.py"],
+      acceptance_criteria: ["startup command id stays visible"],
+    }),
+    artifact_refs_json: JSON.stringify({
+      route_context_hash: "sha256:legacy-route-context",
+      prompt_contract_id: "rprompt-legacy-startup-flow",
+      prompt_contract_hash: "sha256:legacy-prompt-contract",
+      source_event_ids: ["timeline_event:2980", "service_event:2981"],
+    }),
+  } as unknown as TaskTimelineEvent,
 ];
 
 export function buildTaskPlaybackHistoricalSemanticFixture() {
@@ -479,6 +538,8 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   const routeActionFrame = trace.frames.find((frame) => frame.title === "Route action requested");
   const serviceRouteFrame = trace.frames.find((frame) => frame.title === "Route service completed");
   const readReceiptFrame = trace.frames.find((frame) => frame.source_event_id === "#204");
+  const graphTraceFrame = trace.frames.find((frame) => frame.source_event_id === "#1760");
+  const legacyRouteFrame = trace.frames.find((frame) => frame.source_event_id === "#1761");
   const visible = JSON.stringify({
     close_gate_summary: trace.close_gate_summary,
     frames: trace.frames.map((frame) => ({
@@ -499,7 +560,9 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   assertFixture(Boolean(routeActionFrame), "route action frame should exist in the narrative fixture");
   assertFixture(Boolean(serviceRouteFrame), "route service frame should exist in the narrative fixture");
   assertFixture(Boolean(readReceiptFrame), "read receipt frame should exist in the narrative fixture");
-  if (!promptContextFrame || !rawPromptContextFrame || !auditRemainingScopeFrame || !routeActionFrame || !serviceRouteFrame || !readReceiptFrame) throw new Error("missing route narrative fixture frames");
+  assertFixture(Boolean(graphTraceFrame), "graph trace frame should exist in the narrative fixture");
+  assertFixture(Boolean(legacyRouteFrame), "legacy route frame should exist in the narrative fixture");
+  if (!promptContextFrame || !rawPromptContextFrame || !auditRemainingScopeFrame || !routeActionFrame || !serviceRouteFrame || !readReceiptFrame || !graphTraceFrame || !legacyRouteFrame) throw new Error("missing route narrative fixture frames");
   assertFixture(
     trace.close_gate_summary.reason_sentence === "Blocked because implementation, verification, and close-ready evidence have not been recorded; the close gate cannot pass until those events exist.",
     "blocked close gate should show a human-readable reason sentence with missing event kinds",
@@ -566,7 +629,7 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "route_context" && ref.value === "sha256:fixture-route-1750")
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "prompt_contract" && ref.value === "rprompt-repair-fixture-1750")
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.value.includes("route_prompt_context"))
-      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.label === "read receipt" && ref.value.includes("2893"))
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "read_receipt" && ref.label === "read receipt" && ref.value.includes("2893"))
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.label === "startup" && ref.value.includes("2894")),
     "event #1750 evidence links should include typed timeline, route context, prompt contract, source-event, read-receipt, and startup refs",
   );
@@ -598,6 +661,20 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       && readReceiptPayloadVisible.includes("canonical_visible_contract_text_hash")
       && !readReceiptPayloadVisible.includes("[fixture private request text]"),
     "read receipt raw payload should expose canonical visible contract fields and route action bounds while redacting private prompt material",
+  );
+  assertFixture(
+    graphTraceFrame.evidence_links.some((ref) => ref.kind === "graph_trace" && ref.value === "gqt-fixture-current")
+      && JSON.stringify(graphTraceFrame.detail_inspector.raw_sections.map((section) => section.value)).includes("find_node_by_path")
+      && JSON.stringify(graphTraceFrame.detail_inspector.raw_sections.map((section) => section.value)).includes("L7.fixture.task-playback")
+      && JSON.stringify(graphTraceFrame.detail_inspector.raw_sections.map((section) => section.value)).includes("frontend/dashboard/src/lib/taskPlayback.ts"),
+    "graph trace fixture should expose trace id, tool, result summary, resolved node, and resolved file fields above raw JSON",
+  );
+  assertFixture(
+    legacyRouteFrame.evidence_links.some((ref) => ref.kind === "route_context" && ref.value === "sha256:legacy-route-context")
+      && !legacyRouteFrame.evidence_links.some((ref) => ref.kind === "read_receipt")
+      && legacyRouteFrame.specific_facts.some((fact) => fact.label === "launch text hash" && fact.value.includes("sha256:legacy-launch-text"))
+      && legacyRouteFrame.specific_facts.some((fact) => fact.label === "source event refs" && fact.value.includes("timeline_event:2980")),
+    "legacy startup command route fixture should list only verifiable hashes/source events and no read receipt evidence",
   );
   assertFixture(
     auditRemainingScopeFrame.summary.includes("decision do not close P0 umbrella yet")

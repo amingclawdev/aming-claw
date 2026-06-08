@@ -5,6 +5,12 @@ import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
 type EvidenceRef = TaskPlaybackFrame["evidence_links"][number];
 type EvidenceInspectorRow = { label: string; value: string; source?: string };
 type FrameStatusFilter = "all" | "blocked_failed";
+type FrameDateFilter = "all" | string;
+type GraphTraceLookupState = {
+  loading: boolean;
+  rows: EvidenceInspectorRow[];
+  error: string;
+};
 
 interface Props {
   trace: TaskPlaybackTrace;
@@ -28,10 +34,12 @@ export default function TaskPlaybackPanel({
   const [laneFilter, setLaneFilter] = useState("all");
   const [eventKindFilter, setEventKindFilter] = useState("all");
   const [eventIdFilter, setEventIdFilter] = useState("");
+  const [dateFilter, setDateFilter] = useState<FrameDateFilter>("all");
   const allFrames = trace.frames;
   const laneOptions = stableStrings(allFrames.map((frame) => frame.lane_id || "unknown"));
   const eventKindOptions = stableStrings(allFrames.map((frame) => frame.event_kind || frame.event_type || "event"));
-  const filteredFrames = filterPlaybackFrames(allFrames, statusFilter, laneFilter, eventKindFilter, eventIdFilter);
+  const dateOptions = frameDateOptions(allFrames);
+  const filteredFrames = filterPlaybackFrames(allFrames, statusFilter, laneFilter, eventKindFilter, eventIdFilter, dateFilter);
   const effectiveSelectedFrameId = selectedFrameId || internalSelectedFrameId;
   const selectedFrame =
     allFrames.find((frame) => frame.id === effectiveSelectedFrameId) ??
@@ -59,6 +67,7 @@ export default function TaskPlaybackPanel({
     setLaneFilter("all");
     setEventKindFilter("all");
     setEventIdFilter("");
+    setDateFilter("all");
   }, [trace.backlog_id]);
 
   useEffect(() => {
@@ -125,70 +134,78 @@ export default function TaskPlaybackPanel({
 
       {trace.frames.length > 0 ? (
         <div className="task-playback-body">
-          <div className="task-playback-controls" aria-label="Playback event controls">
-            <button type="button" className="action-btn" onClick={() => selectFrame(filteredFrames[filteredFrames.length - 1]?.id || allFrames[allFrames.length - 1]?.id || "")}>
-              Latest
-            </button>
-            <button type="button" className="action-btn" onClick={() => selectFrame(selectedFrame?.id || filteredFrames[0]?.id || "")}>
-              Current
-            </button>
-            <button
-              type="button"
-              className={`action-btn ${statusFilter === "blocked_failed" ? "active" : ""}`}
-              onClick={() => setStatusFilter((value) => value === "blocked_failed" ? "all" : "blocked_failed")}
-            >
-              Blocked/failed
-            </button>
-            <select value={laneFilter} onChange={(event) => setLaneFilter(event.target.value)} aria-label="Filter playback by lane">
-              <option value="all">All lanes</option>
-              {laneOptions.map((lane) => (
-                <option value={lane} key={lane}>{laneLabel(lane)}</option>
-              ))}
-            </select>
-            <select value={eventKindFilter} onChange={(event) => setEventKindFilter(event.target.value)} aria-label="Filter playback by event kind">
-              <option value="all">All event kinds</option>
-              {eventKindOptions.map((kind) => (
-                <option value={kind} key={kind}>{kind}</option>
-              ))}
-            </select>
-            <input
-              className="backlog-search"
-              value={eventIdFilter}
-              onChange={(event) => setEventIdFilter(event.target.value)}
-              placeholder="Event id"
-              aria-label="Filter playback by event id"
-            />
-          </div>
-          <ol className="task-playback-frame-list">
-            {groupedFrames.map((group) => (
-              <Fragment key={group.day}>
-                <li className="task-playback-day" aria-label={`Timeline events for ${group.day}`}>
-                  <span className="mono">{group.day}</span>
-                </li>
-                {group.frames.map((frame) => (
-                  <li key={frame.id}>
-                    <button
-                      type="button"
-                      className={frame.id === selectedFrame?.id ? "active" : ""}
-                      onClick={() => selectFrame(frame.id)}
-                    >
-                      <span className={`task-playback-dot status-${frame.status}`} />
-                      <div>
-                        <strong>{frame.title}</strong>
-                        <span>{frame.event_kind}</span>
-                      </div>
-                      <em>{formatFrameDateTime(frame)}</em>
-                    </button>
-                  </li>
+          <div className="task-playback-event-column task-playback-main">
+            <div className="task-playback-controls" aria-label="Playback event controls">
+              <button type="button" className="action-btn" onClick={() => selectFrame(filteredFrames[filteredFrames.length - 1]?.id || allFrames[allFrames.length - 1]?.id || "")}>
+                Latest
+              </button>
+              <button type="button" className="action-btn" onClick={() => selectFrame(selectedFrame?.id || filteredFrames[0]?.id || "")}>
+                Current
+              </button>
+              <button
+                type="button"
+                className={`action-btn ${statusFilter === "blocked_failed" ? "active" : ""}`}
+                onClick={() => setStatusFilter((value) => value === "blocked_failed" ? "all" : "blocked_failed")}
+              >
+                Blocked/failed
+              </button>
+              <select value={laneFilter} onChange={(event) => setLaneFilter(event.target.value)} aria-label="Filter playback by lane">
+                <option value="all">All lanes</option>
+                {laneOptions.map((lane) => (
+                  <option value={lane} key={lane}>{laneLabel(lane)}</option>
                 ))}
-              </Fragment>
-            ))}
-            {filteredFrames.length === 0 ? (
-              <li>
-                <div className="timeline-empty">No playback events match these controls.</div>
-              </li>
-            ) : null}
-          </ol>
+              </select>
+              <select value={eventKindFilter} onChange={(event) => setEventKindFilter(event.target.value)} aria-label="Filter playback by event kind">
+                <option value="all">All event kinds</option>
+                {eventKindOptions.map((kind) => (
+                  <option value={kind} key={kind}>{kind}</option>
+                ))}
+              </select>
+              <select value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} aria-label="Filter playback by date">
+                <option value="all">All dates</option>
+                {dateOptions.map((option) => (
+                  <option value={option.key} key={option.key}>{option.label}</option>
+                ))}
+              </select>
+              <input
+                className="backlog-search"
+                value={eventIdFilter}
+                onChange={(event) => setEventIdFilter(event.target.value)}
+                placeholder="Event id"
+                aria-label="Filter playback by event id"
+              />
+            </div>
+            <ol className="task-playback-frame-list">
+              {groupedFrames.map((group) => (
+                <Fragment key={group.day}>
+                  <li className="task-playback-day" aria-label={`Timeline events for ${group.day}`}>
+                    <span className="mono">{group.day}</span>
+                  </li>
+                  {group.frames.map((frame) => (
+                    <li key={frame.id}>
+                      <button
+                        type="button"
+                        className={frame.id === selectedFrame?.id ? "active" : ""}
+                        onClick={() => selectFrame(frame.id)}
+                      >
+                        <span className={`task-playback-dot status-${frame.status}`} />
+                        <div>
+                          <strong>{frame.title}</strong>
+                          <span>{frame.event_kind}</span>
+                        </div>
+                        <em>{formatFrameDateTime(frame)}</em>
+                      </button>
+                    </li>
+                  ))}
+                </Fragment>
+              ))}
+              {filteredFrames.length === 0 ? (
+                <li>
+                  <div className="timeline-empty">No playback events match these controls.</div>
+                </li>
+              ) : null}
+            </ol>
+          </div>
 
           {selectedFrame ? (
             <article className={`task-playback-current status-${selectedFrame.status}`}>
@@ -222,7 +239,7 @@ export default function TaskPlaybackPanel({
                 onOpenChange={(open) => setAdvancedEvidenceOpenFrameId(open ? selectedFrameKey : "")}
               />
               {selectedEvidenceRef ? (
-                <EvidenceInspectorModal frame={selectedFrame} evidenceRef={selectedEvidenceRef} onClose={() => setSelectedEvidenceRef(null)} />
+                <EvidenceInspectorModal projectId={trace.project_id} frame={selectedFrame} evidenceRef={selectedEvidenceRef} onClose={() => setSelectedEvidenceRef(null)} />
               ) : null}
             </article>
           ) : null}
@@ -256,12 +273,14 @@ function filterPlaybackFrames(
   laneFilter: string,
   eventKindFilter: string,
   eventIdFilter: string,
+  dateFilter: FrameDateFilter,
 ): TaskPlaybackFrame[] {
   const eventIdQuery = eventIdFilter.trim().toLowerCase();
   return frames.filter((frame) => {
     if (statusFilter === "blocked_failed" && !["blocked", "failed", "missing"].includes(frame.status)) return false;
     if (laneFilter !== "all" && frame.lane_id !== laneFilter) return false;
     if (eventKindFilter !== "all" && frame.event_kind !== eventKindFilter && frame.event_type !== eventKindFilter) return false;
+    if (dateFilter !== "all" && frameDateKey(frame) !== dateFilter) return false;
     if (eventIdQuery) {
       const haystack = [frame.id, frame.source_event_id, frame.event_type, frame.event_kind, frame.semantic_entry_id].join(" ").toLowerCase();
       if (!haystack.includes(eventIdQuery)) return false;
@@ -279,6 +298,25 @@ function groupFramesByDay(frames: TaskPlaybackFrame[]): Array<{ day: string; fra
     else groups.push({ day, frames: [frame] });
   }
   return groups;
+}
+
+function frameDateOptions(frames: TaskPlaybackFrame[]): Array<{ key: string; label: string }> {
+  const seen = new Set<string>();
+  const options: Array<{ key: string; label: string }> = [];
+  for (const frame of frames) {
+    const key = frameDateKey(frame);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    options.push({ key, label: formatFrameDay(frame) });
+  }
+  return options;
+}
+
+function frameDateKey(frame: TaskPlaybackFrame): string {
+  if (!frame.at) return "";
+  const date = new Date(frame.at);
+  if (Number.isNaN(date.getTime())) return frame.at;
+  return date.toISOString().slice(0, 10);
 }
 
 function formatFrameDay(frame: TaskPlaybackFrame): string {
@@ -359,11 +397,22 @@ function EvidenceLinkSection({ links, onInspect }: { links: TaskPlaybackFrame["e
   );
 }
 
-function EvidenceInspectorModal({ frame, evidenceRef, onClose }: { frame: TaskPlaybackFrame; evidenceRef: EvidenceRef; onClose: () => void }) {
+function EvidenceInspectorModal({
+  projectId,
+  frame,
+  evidenceRef,
+  onClose,
+}: {
+  projectId: string;
+  frame: TaskPlaybackFrame;
+  evidenceRef: EvidenceRef;
+  onClose: () => void;
+}) {
   const contextRows = evidenceContextRows(frame, evidenceRef);
   const diagnosisRows = frame.failure_diagnosis.map((fact) => ({ label: fact.label, value: fact.value, source: fact.source }));
   const detailRows = evidenceDetailRows(frame, evidenceRef);
   const rawSections = evidenceRawSections(frame, evidenceRef);
+  const graphTraceLookup = useGraphTraceLookup(projectId, frame, evidenceRef);
   return (
     <div className="task-playback-evidence-modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
@@ -389,6 +438,7 @@ function EvidenceInspectorModal({ frame, evidenceRef, onClose }: { frame: TaskPl
         </div>
         <p className="task-playback-evidence-summary">{evidenceSummary(evidenceRef, frame)}</p>
         <EvidenceRowSection title="Structured context" rows={contextRows} />
+        {evidenceRef.kind === "graph_trace" ? <EvidenceRowSection title="Persisted graph trace" rows={graphTraceLookup.rows} /> : null}
         <EvidenceRowSection title="Failure/blocker diagnosis" rows={diagnosisRows} />
         <EvidenceRowSection title="Sanitized detail rows" rows={detailRows} />
         <EvidenceRawSection sections={rawSections} />
@@ -401,6 +451,80 @@ function EvidenceInspectorModal({ frame, evidenceRef, onClose }: { frame: TaskPl
       </section>
     </div>
   );
+}
+
+function useGraphTraceLookup(projectId: string, frame: TaskPlaybackFrame, evidenceRef: EvidenceRef): GraphTraceLookupState {
+  const [state, setState] = useState<GraphTraceLookupState>({ loading: false, rows: [], error: "" });
+
+  useEffect(() => {
+    if (evidenceRef.kind !== "graph_trace") {
+      setState({ loading: false, rows: [], error: "" });
+      return undefined;
+    }
+    const traceId = evidenceRef.value.trim();
+    const sourceRows = graphTraceSourceRows(frame, evidenceRef);
+    if (!traceId || !projectId) {
+      setState({
+        loading: false,
+        error: "missing trace id",
+        rows: [
+          ...sourceRows,
+          { label: "graph trace unavailable", value: "trace id or project id missing; source event refs are the only verifiable evidence", source: "graph_trace" },
+        ],
+      });
+      return undefined;
+    }
+
+    let cancelled = false;
+    setState({
+      loading: true,
+      error: "",
+      rows: [
+        ...sourceRows,
+        { label: "Graph trace persisted lookup", value: `loading ${traceId}`, source: "graph_trace" },
+      ],
+    });
+
+    fetch(`/api/graph-governance/${encodeURIComponent(projectId)}/query-traces/${encodeURIComponent(traceId)}`, {
+      headers: { Accept: "application/json" },
+    })
+      .then(async (response) => {
+        const text = await response.text();
+        let payload: unknown = {};
+        try {
+          payload = text ? JSON.parse(text) : {};
+        } catch {
+          payload = {};
+        }
+        if (!response.ok) {
+          throw new Error(`GET query trace ${traceId} -> ${response.status}${text ? ` ${text.slice(0, 180)}` : ""}`);
+        }
+        return payload;
+      })
+      .then((payload) => {
+        if (cancelled) return;
+        setState({ loading: false, error: "", rows: graphTraceRowsFromPayload(payload, frame, evidenceRef) });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setState({
+          loading: false,
+          error: String(error),
+          rows: [
+            ...sourceRows,
+            { label: "graph trace unavailable", value: String(error), source: "graph_trace" },
+            { label: "query args", value: "not persisted/unavailable from the trace API response in this view", source: "graph_trace" },
+            { label: "resolved graph nodes/files", value: "not persisted/unavailable; inspect the source trace or event refs listed above", source: "graph_trace" },
+          ],
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, evidenceRef.kind, evidenceRef.value, frame.source_event_id]);
+
+  return state;
 }
 
 function EvidenceRowSection({ title, rows }: { title: string; rows: EvidenceInspectorRow[] }) {
@@ -491,9 +615,92 @@ function copyEvidenceLink(ref: TaskPlaybackFrame["evidence_links"][number]): voi
   void navigator.clipboard?.writeText(`${ref.kind}:${ref.label}=${ref.value}`);
 }
 
+function graphTraceRowsFromPayload(payload: unknown, frame: TaskPlaybackFrame, evidenceRef: EvidenceRef): EvidenceInspectorRow[] {
+  const trace = recordFromUnknown(recordFromUnknown(payload).trace);
+  const events = arrayFromUnknown(trace.events).map(recordFromUnknown);
+  const rows: EvidenceInspectorRow[] = [
+    ...graphTraceSourceRows(frame, evidenceRef),
+    { label: "trace id", value: publicEvidenceText(trace.trace_id) || evidenceRef.value, source: "graph_query_traces" },
+    { label: "query source", value: publicEvidenceText(trace.query_source) || "not persisted/unavailable", source: "graph_query_traces" },
+    { label: "query purpose", value: publicEvidenceText(trace.query_purpose) || "not persisted/unavailable", source: "graph_query_traces" },
+    { label: "trace status", value: publicEvidenceText(trace.status) || "not persisted/unavailable", source: "graph_query_traces" },
+    { label: "snapshot", value: publicEvidenceText(trace.snapshot_id) || "not persisted/unavailable", source: "graph_query_traces" },
+  ];
+
+  if (events.length === 0) {
+    rows.push(
+      { label: "tool", value: "not persisted/unavailable; no graph_query_events rows were returned", source: "graph_query_events" },
+      { label: "query args", value: "not persisted/unavailable; source trace/event refs are the only verifiable evidence", source: "graph_query_events" },
+      { label: "result summary", value: "not persisted/unavailable; source trace/event refs are the only verifiable evidence", source: "graph_query_events" },
+      { label: "resolved graph nodes/files", value: "not persisted/unavailable; source trace/event refs are the only verifiable evidence", source: "graph_query_events" },
+    );
+    return rows;
+  }
+
+  for (const event of events.slice(0, 8)) {
+    const suffix = publicEvidenceText(event.seq) || String(rows.length);
+    rows.push(
+      { label: `tool #${suffix}`, value: publicEvidenceText(event.tool) || "not persisted/unavailable", source: "graph_query_events" },
+      { label: `query args #${suffix}`, value: graphTraceArgsText(event), source: "graph_query_events" },
+      { label: `result summary #${suffix}`, value: graphTraceResultSummaryText(event), source: "graph_query_events" },
+      { label: `resolved graph nodes/files #${suffix}`, value: graphTraceResolvedText(event), source: "graph_query_events" },
+    );
+  }
+  return rows;
+}
+
+function graphTraceSourceRows(frame: TaskPlaybackFrame, evidenceRef: EvidenceRef): EvidenceInspectorRow[] {
+  const refs = stableStrings([
+    evidenceRef.value,
+    frame.source_event_id,
+    ...frame.evidence_refs
+      .filter((ref) => ref.kind === "graph_trace" || ref.kind === "timeline_event" || ref.kind === "source_event")
+      .map((ref) => `${ref.kind}:${ref.label}:${ref.value}`),
+  ]);
+  return [
+    { label: "source trace/event refs", value: refs.join(", ") || "none", source: "timeline_event" },
+  ];
+}
+
+function graphTraceArgsText(event: Record<string, unknown>): string {
+  const args = recordFromUnknown(event.args);
+  const argsHash = publicEvidenceText(event.args_hash);
+  if (Object.keys(args).length > 0) {
+    const persisted = args.persisted !== false && args.available !== false;
+    if (!persisted) return `query args not persisted; args hash ${argsHash || publicEvidenceText(args.args_hash) || "unavailable"}`;
+    return publicEvidenceText(args) || `query args not persisted; args hash ${argsHash || "unavailable"}`;
+  }
+  return argsHash ? `query args not persisted; args hash ${argsHash}` : "query args not persisted/unavailable";
+}
+
+function graphTraceResultSummaryText(event: Record<string, unknown>): string {
+  const summary = recordFromUnknown(event.result_summary);
+  const count = publicEvidenceText(summary.result_count ?? event.result_count);
+  const hash = publicEvidenceText(summary.result_hash ?? event.result_hash);
+  const duration = publicEvidenceText(summary.duration_ms ?? event.duration_ms);
+  const parts = [
+    count ? `result_count ${count}` : "",
+    hash ? `result_hash ${hash}` : "",
+    duration ? `duration_ms ${duration}` : "",
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join("; ") : "result summary not persisted/unavailable";
+}
+
+function graphTraceResolvedText(event: Record<string, unknown>): string {
+  const resolved = recordFromUnknown(event.resolved_graph);
+  const nodes = publicEvidenceText(resolved.nodes ?? resolved.node_ids ?? event.resolved_nodes ?? event.nodes);
+  const files = publicEvidenceText(resolved.files ?? resolved.file_paths ?? event.resolved_files ?? event.files);
+  const persisted = resolved.persisted !== false && Boolean(nodes || files);
+  if (persisted) return [nodes ? `nodes ${nodes}` : "", files ? `files ${files}` : ""].filter(Boolean).join("; ");
+  return "resolved graph nodes/files not persisted by graph_query_events; inspect the source trace or event refs listed above";
+}
+
 function evidenceSummary(evidenceRef: EvidenceRef, frame: TaskPlaybackFrame): string {
   if (isRouteContextOrReadReceiptRef(evidenceRef)) {
     return `This route-context/read-receipt ref is tied to ${frame.title} ${frame.source_event_id}; it shows only the public-safe route or canonical visible contract fields the worker acknowledged, plus explicit body persistence status.`;
+  }
+  if (evidenceRef.kind === "graph_trace") {
+    return `This graph trace ref is tied to ${frame.title} ${frame.source_event_id}; persisted trace identity, tools, result summaries, and resolved node/file details are shown when available, otherwise the unavailable fields are named explicitly.`;
   }
   if (evidenceRef.kind === "prompt_contract") {
     return `This prompt-contract ref is tied to ${frame.title} ${frame.source_event_id}; target scope, acceptance criteria, required evidence, and route identity appear when they were recorded as public facts.`;
@@ -525,10 +732,11 @@ function evidenceContextRows(frame: TaskPlaybackFrame, evidenceRef: EvidenceRef)
 
 function evidenceContextPersistenceRows(evidenceRef: EvidenceRef, rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {
   const kind = evidenceRef.kind;
-  if (!["route_context", "prompt_contract", "source_event"].includes(kind)) return rows;
+  if (!["route_context", "read_receipt", "prompt_contract", "source_event"].includes(kind)) return rows;
   const baseLabels = new Set(["event", "status", "event type", "phase", "summary"]);
   const hasPersistedContext = rows.some((row) => !baseLabels.has(row.label) && publicEvidenceText(row.value));
   const identityVerified = routeIdentityVerified(rows);
+  const readReceiptPresent = readReceiptEvidencePresent(rows);
   const next = [
     ...(isRouteContextOrReadReceiptRef(evidenceRef) ? routeContextBoundaryRows(rows) : []),
     ...rows,
@@ -549,6 +757,13 @@ function evidenceContextPersistenceRows(evidenceRef: EvidenceRef, rows: Evidence
     next.push({
       label: "body persisted status",
       value: "context body unavailable; only public ids, hashes, event refs, and canonical visible contract fields are shown",
+      source: "route boundary",
+    });
+  }
+  if (isRouteContextOrReadReceiptRef(evidenceRef) && !readReceiptPresent) {
+    next.push({
+      label: "read receipt status",
+      value: "no mf_subagent_read_receipt exists for this event; only verifiable ids, hashes, and source events are shown",
       source: "route boundary",
     });
   }
@@ -577,7 +792,7 @@ function routeContextBoundaryRows(rows: EvidenceInspectorRow[]): EvidenceInspect
     {
       label: "public-safe context source",
       value: hasCanonicalContract
-        ? "canonical visible contract or route/prompt bundle persisted on this event"
+        ? "actual persisted public-safe body fields from the canonical visible contract or route/prompt bundle are shown below"
         : "specific context body unavailable; showing persisted public refs and hashes",
       source: "route boundary",
     },
@@ -585,7 +800,11 @@ function routeContextBoundaryRows(rows: EvidenceInspectorRow[]): EvidenceInspect
 }
 
 function isRouteContextOrReadReceiptRef(ref: EvidenceRef): boolean {
-  return ref.kind === "route_context" || (ref.kind === "source_event" && /read[-_\s]?receipt/i.test(`${ref.label} ${ref.value}`));
+  return ref.kind === "route_context" || ref.kind === "read_receipt" || (ref.kind === "source_event" && /read[-_\s]?receipt/i.test(`${ref.label} ${ref.value}`));
+}
+
+function readReceiptEvidencePresent(rows: EvidenceInspectorRow[]): boolean {
+  return rows.some((row) => /read[-_\s]?receipt|mf_subagent_read_receipt/i.test(`${row.label} ${row.value}`));
 }
 
 function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
@@ -596,15 +815,20 @@ function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
     "prompt_contract_id",
     "prompt_contract_hash",
     "visible_injection_manifest_hash",
+    "launch_text_hash",
     "topology",
     "target_file_count",
     "acceptance_criteria_count",
     "required_evidence",
+    "required_lanes_evidence",
+    "route_alerts",
+    "allowed_actions",
+    "blocked_actions",
     "source_event_refs",
     "read_receipt_refs",
     "startup_refs",
   ];
-  if (kind === "route_context" || kind === "prompt_contract") return new Set([...shared, ...routeScope]);
+  if (kind === "route_context" || kind === "read_receipt" || kind === "prompt_contract") return new Set([...shared, ...routeScope]);
   if (kind === "timeline_event" || kind === "source_event" || kind === "gate") return new Set([...shared, ...routeScope, "decision"]);
   if (kind === "commit" || kind === "artifact" || kind === "file" || kind === "test") return new Set([...shared, "decision", "closed_rows", "implemented_and_merged"]);
   return new Set([...shared, ...routeScope, "decision"]);
@@ -639,15 +863,23 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
   const identity = [
     "route_id",
     "route_context_hash",
+    "route_context.route_id",
+    "route_context.route_context_hash",
     "route_identity.route_id",
     "route_identity.route_context_hash",
     "prompt_contract_id",
     "prompt_contract_hash",
+    "prompt_contract.prompt_contract_id",
+    "prompt_contract.prompt_contract_hash",
     "route_identity.prompt_contract_id",
     "route_identity.prompt_contract_hash",
     "visible_injection_manifest_hash",
+    "visible_injection_manifest.hash",
+    "route_context.visible_injection_manifest_hash",
+    "route_context.visible_bundle.visible_injection_manifest_hash",
     "route_identity.visible_injection_manifest_hash",
     "launch_text_hash",
+    "route_context.launch_text_hash",
     "canonical_visible_contract_text_hash",
     "revision_receipt.canonical_visible_contract_text_hash",
     "runtime_context_id",
@@ -673,29 +905,82 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
   ];
   const scope = [
     "body_persisted_status",
+    "route_context.body_persisted_status",
+    "read_receipt.body_persisted_status",
     "raw_launch_text_persisted",
-    "raw_private_prompt_text",
     "route_alerts",
     "route_alert_codes",
+    "alerts",
+    "route_context.route_alerts",
+    "route_context.alerts",
     "stage",
     "selected_topology",
     "recommended_topology",
     "topology",
     "target_files",
     "owned_files",
+    "prompt_contract.target_files",
+    "route_context.target_files",
     "acceptance_criteria",
+    "prompt_contract.acceptance_criteria",
+    "route_context.acceptance_criteria",
     "allowed_actions",
+    "acknowledged_allowed_actions",
+    "route_context.allowed_actions",
+    "route_context.visible_bundle.allowed_actions",
+    "visible_bundle.allowed_actions",
     "blocked_actions",
+    "acknowledged_forbidden_actions",
+    "forbidden_actions",
+    "route_context.blocked_actions",
+    "route_context.visible_bundle.blocked_actions",
+    "visible_bundle.blocked_actions",
     "required_evidence",
     "required_lanes_evidence",
+    "route_context.required_lanes_evidence",
+    "route_context.visible_bundle.required_lanes_evidence",
+    "visible_bundle.required_lanes_evidence",
     "evidence_required",
     "required_output",
     "visible_injection_manifest.refs",
     "visible_injection_manifest.allowed_injections",
     "visible_injection_manifest.source_ref_hashes",
+    "route_context.visible_injection_manifest.refs",
+    "route_context.visible_injection_manifest.allowed_injections",
+    "route_context.visible_injection_manifest.source_ref_hashes",
+    "route_context.route_docs",
+    "route_context.source_label",
+    "route_docs",
+    "source_label",
     "visible_injection_refs",
     "visible_injection_manifest_hash",
     ...sourceRefs,
+  ];
+  const graphTrace = [
+    "trace_id",
+    "graph_trace_id",
+    "graph_query_trace_id",
+    "graph_trace_ids",
+    "graph_query_trace_ids",
+    "graph_query_trace.trace_id",
+    "graph_query_trace.query_source",
+    "graph_query_trace.query_purpose",
+    "graph_query_trace.tool",
+    "graph_query_trace.args",
+    "graph_query_trace.result_summary",
+    "graph_query_trace.resolved_nodes",
+    "graph_query_trace.resolved_files",
+    "graph_query_audit.trace_id",
+    "graph_query_audit.query_source",
+    "graph_query_audit.query_purpose",
+    "graph_query_audit.tool",
+    "graph_query_audit.args",
+    "graph_query_audit.result_summary",
+    "graph_query_context.resolved_nodes",
+    "graph_query_context.resolved_files",
+    "graph_query_context.path_bindings",
+    "graph_query_context.nodes",
+    "graph_query_context.files",
   ];
   const blockers = [
     "blocker_ids",
@@ -716,7 +1001,8 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "next_action",
     "next_expected_action",
   ];
-  if (kind === "route_context" || kind === "prompt_contract") return [...identity, ...scope, ...blockers];
+  if (kind === "route_context" || kind === "read_receipt" || kind === "prompt_contract") return [...identity, ...scope, ...blockers];
+  if (kind === "graph_trace") return [...graphTrace, ...identity, ...sourceRefs];
   if (kind === "timeline_event" || kind === "source_event" || kind === "gate" || kind === "precheck") return ["event_id", ...sourceRefs, ...identity, ...blockers];
   if (kind === "commit") return ["commit", "commit_hash", "target_commit", "head_commit", "source_commit", "artifact_refs", ...identity];
   if (kind === "artifact" || kind === "file" || kind === "test") return ["artifact_refs", "artifacts", "files", "changed_files", "tests_run", "test_commands", ...identity];
@@ -736,7 +1022,9 @@ function evidenceDetailRows(frame: TaskPlaybackFrame, evidenceRef: EvidenceRef):
 
 function detailTermsForEvidence(kind: EvidenceRef["kind"]): string[] {
   if (kind === "route_context") return ["route", "topology", "stage", "target", "acceptance", "evidence", "blocker", "missing", "next"];
+  if (kind === "read_receipt") return ["read", "receipt", "route", "target", "acceptance", "allowed", "blocked", "evidence", "hash"];
   if (kind === "prompt_contract") return ["prompt", "contract", "target", "acceptance", "evidence", "stage"];
+  if (kind === "graph_trace") return ["graph", "trace", "query", "tool", "args", "result", "node", "file"];
   if (kind === "timeline_event" || kind === "source_event" || kind === "gate") return ["event", "status", "gate", "blocker", "missing", "next"];
   if (kind === "commit") return ["commit", "artifact", "source"];
   return [kind.replace(/_/g, " "), kind, "evidence", "artifact", "status"];
@@ -747,6 +1035,14 @@ function valueAtPath(record: Record<string, unknown>, path: string): unknown {
     if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
     return (current as Record<string, unknown>)[part];
   }, record);
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function arrayFromUnknown(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function publicEvidenceText(value: unknown, path = ""): string {
