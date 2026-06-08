@@ -174,9 +174,11 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
         "route_context_hash": "sha256:route-startup",
         "prompt_contract_id": "rprompt-startup",
         "prompt_contract_hash": "sha256:prompt-startup",
+        "route_token_ref": "rtok-startup",
         "visible_injection_manifest_hash": "sha256:visible-startup",
         "observer_command_id": "cmd-startup",
         "read_receipt_hash": "sha256:read-startup",
+        "read_receipt_event_id": "2873",
     }
     payload.update(overrides)
     return payload
@@ -277,6 +279,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "route_context_hash": "sha256:route-runtime-context",
             "prompt_contract_id": "rprompt-runtime-context",
             "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
             "visible_injection_manifest_hash": "sha256:visible-runtime-context",
             "raw_private_context": private_secret,
         },
@@ -355,6 +358,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
                 "route_context_hash": "sha256:route-runtime-context",
                 "prompt_contract_id": "rprompt-runtime-context",
                 "prompt_contract_hash": "sha256:prompt-runtime-context",
+                "route_token_ref": "rtok-runtime-context",
                 "visible_injection_manifest_hash": "sha256:visible-runtime-context",
             },
             fence_token="stale-fence",
@@ -394,6 +398,7 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
             "route_context_hash": "sha256:route-startup",
             "prompt_contract_id": "rprompt-startup",
             "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
             "visible_injection_manifest_hash": "sha256:visible-startup",
         },
         now_iso=NOW,
@@ -475,6 +480,7 @@ def test_mf_sub_startup_blocks_route_identity_mismatch_with_contract_revision(tm
             "route_context_hash": "sha256:route-startup",
             "prompt_contract_id": "rprompt-startup",
             "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
             "visible_injection_manifest_hash": "sha256:visible-startup",
         },
         now_iso=NOW,

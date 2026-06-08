@@ -949,6 +949,18 @@ TOOLS: list[dict] = [
                 "route_context_hash": {"type": "string"},
                 "prompt_contract_id": {"type": "string"},
                 "prompt_contract_hash": {"type": "string"},
+                "route_token_ref": {
+                    "type": "string",
+                    "description": "Route token/source evidence consumed by the startup read-receipt gate.",
+                },
+                "read_receipt_hash": {
+                    "type": "string",
+                    "description": "Hash of the mf_subagent_read_receipt recorded before startup.",
+                },
+                "read_receipt_event_id": {
+                    "type": "string",
+                    "description": "Timeline event id for the mf_subagent_read_receipt recorded before startup.",
+                },
                 "visible_injection_manifest_hash": {"type": "string"},
                 "launch_text_hash": {"type": "string"},
                 "startup_source": {"type": "string"},

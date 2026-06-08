@@ -114,6 +114,20 @@ def test_mcp_stdio_protected_write_schemas_expose_route_gate_fields():
         assert "route_token_waiver" in properties
 
 
+def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fields():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    properties = tools["parallel_branch_startup"]["inputSchema"]["properties"]
+    assert "route_token_ref" in properties
+    assert "read_receipt_hash" in properties
+    assert "read_receipt_event_id" in properties
+
+
 def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
@@ -357,6 +371,46 @@ def test_mcp_protected_write_dispatch_preserves_structured_gate_failure():
     assert result["details"]["fault_domain"] == "caller_missing_route_evidence"
     assert result["details"]["expected_behavior"] is True
     assert result["details"]["is_system_bug"] is False
+
+
+def test_mcp_parallel_branch_startup_forwards_read_receipt_bridge_fields():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "status": "startup_recorded"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "parallel_branch_startup",
+        {
+            "project_id": "aming-claw",
+            "task_id": "AC-STARTUP",
+            "route_token_ref": "timeline_event:2966;service_event:2967",
+            "read_receipt_hash": "sha256:read-receipt",
+            "read_receipt_event_id": "2963",
+        },
+    )
+
+    assert result == {"ok": True, "status": "startup_recorded"}
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/startup",
+            {
+                "task_id": "AC-STARTUP",
+                "route_token_ref": "timeline_event:2966;service_event:2967",
+                "read_receipt_hash": "sha256:read-receipt",
+                "read_receipt_event_id": "2963",
+            },
+        )
+    ]
 
 
 def test_mcp_observer_repair_run_plan_dispatches_to_read_only_endpoint():
