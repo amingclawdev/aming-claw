@@ -152,7 +152,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const hintedCurrentBug = currentTaskHint?.active && currentTaskHint.bug && !isPrivatePlaybackBacklog(currentTaskHint.bug)
     ? currentTaskHint.bug
     : null;
-  const activityBug = hintedCurrentBug;
+  const activityBug = selectedBug ?? hintedCurrentBug;
   const activityState = activityBug ? activityByBug[activityBug.bug_id] : undefined;
   const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
   const activityFrameId = selectedActivityFrameId || activityTrace.frames[0]?.id || "";
@@ -609,10 +609,10 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
   const latestFrame = trace.frames[trace.frames.length - 1] ?? null;
   const latestEvent = hint?.latest_event ?? {};
   const latestEventText = compactJoin([
-    hintText(latestEvent, "event_kind") || latestFrame?.event_kind || "",
-    hintText(latestEvent, "event_type") || latestFrame?.event_type || "",
-    hintText(latestEvent, "status") || latestFrame?.status || "",
-    hintText(latestEvent, "created_at") || latestFrame?.at || "",
+    latestFrame?.event_kind || hintText(latestEvent, "event_kind") || "",
+    latestFrame?.event_type || hintText(latestEvent, "event_type") || "",
+    latestFrame?.status || hintText(latestEvent, "status") || "",
+    latestFrame?.at || hintText(latestEvent, "created_at") || "",
   ]);
   const laneState = compactJoin([
     laneStatusSummary(trace, "worker", "worker"),
