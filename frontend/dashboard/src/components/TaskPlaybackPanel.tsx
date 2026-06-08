@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 
 import { isPrivatePlaybackText } from "../lib/taskPlayback";
 import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
 
 type EvidenceRef = TaskPlaybackFrame["evidence_links"][number];
 type EvidenceInspectorRow = { label: string; value: string; source?: string };
+type FrameStatusFilter = "all" | "blocked_failed";
 
 interface Props {
   trace: TaskPlaybackTrace;
@@ -23,7 +24,21 @@ export default function TaskPlaybackPanel({
   onSelectFrame,
   compact = false,
 }: Props) {
-  const selectedFrame = trace.frames.find((frame) => frame.id === selectedFrameId) ?? trace.frames[0] ?? null;
+  const [internalSelectedFrameId, setInternalSelectedFrameId] = useState("");
+  const [statusFilter, setStatusFilter] = useState<FrameStatusFilter>("all");
+  const [laneFilter, setLaneFilter] = useState("all");
+  const [eventKindFilter, setEventKindFilter] = useState("all");
+  const [eventIdFilter, setEventIdFilter] = useState("");
+  const allFrames = trace.frames;
+  const laneOptions = stableStrings(allFrames.map((frame) => frame.lane_id || "unknown"));
+  const eventKindOptions = stableStrings(allFrames.map((frame) => frame.event_kind || frame.event_type || "event"));
+  const filteredFrames = filterPlaybackFrames(allFrames, statusFilter, laneFilter, eventKindFilter, eventIdFilter);
+  const effectiveSelectedFrameId = selectedFrameId || internalSelectedFrameId;
+  const selectedFrame =
+    allFrames.find((frame) => frame.id === effectiveSelectedFrameId) ??
+    filteredFrames[0] ??
+    allFrames[0] ??
+    null;
   const selectedFrameKey = selectedFrame?.id ?? "";
   const [advancedEvidenceOpenFrameId, setAdvancedEvidenceOpenFrameId] = useState("");
   const [selectedEvidenceRef, setSelectedEvidenceRef] = useState<EvidenceRef | null>(null);
@@ -31,6 +46,21 @@ export default function TaskPlaybackPanel({
   const gate = trace.close_gate_summary;
   const selectedEvidenceLinks = selectedFrame?.evidence_links ?? selectedFrame?.evidence_refs ?? [];
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
+  const groupedFrames = groupFramesByDay(filteredFrames);
+
+  const selectFrame = (frameId: string) => {
+    if (!frameId) return;
+    onSelectFrame?.(frameId);
+    if (!onSelectFrame) setInternalSelectedFrameId(frameId);
+  };
+
+  useEffect(() => {
+    setInternalSelectedFrameId("");
+    setStatusFilter("all");
+    setLaneFilter("all");
+    setEventKindFilter("all");
+    setEventIdFilter("");
+  }, [trace.backlog_id]);
 
   useEffect(() => {
     setAdvancedEvidenceOpenFrameId("");
@@ -96,23 +126,69 @@ export default function TaskPlaybackPanel({
 
       {trace.frames.length > 0 ? (
         <div className="task-playback-body">
+          <div className="task-playback-controls" aria-label="Playback event controls">
+            <button type="button" className="action-btn" onClick={() => selectFrame(filteredFrames[filteredFrames.length - 1]?.id || allFrames[allFrames.length - 1]?.id || "")}>
+              Latest
+            </button>
+            <button type="button" className="action-btn" onClick={() => selectFrame(selectedFrame?.id || filteredFrames[0]?.id || "")}>
+              Current
+            </button>
+            <button
+              type="button"
+              className={`action-btn ${statusFilter === "blocked_failed" ? "active" : ""}`}
+              onClick={() => setStatusFilter((value) => value === "blocked_failed" ? "all" : "blocked_failed")}
+            >
+              Blocked/failed
+            </button>
+            <select value={laneFilter} onChange={(event) => setLaneFilter(event.target.value)} aria-label="Filter playback by lane">
+              <option value="all">All lanes</option>
+              {laneOptions.map((lane) => (
+                <option value={lane} key={lane}>{laneLabel(lane)}</option>
+              ))}
+            </select>
+            <select value={eventKindFilter} onChange={(event) => setEventKindFilter(event.target.value)} aria-label="Filter playback by event kind">
+              <option value="all">All event kinds</option>
+              {eventKindOptions.map((kind) => (
+                <option value={kind} key={kind}>{kind}</option>
+              ))}
+            </select>
+            <input
+              className="backlog-search"
+              value={eventIdFilter}
+              onChange={(event) => setEventIdFilter(event.target.value)}
+              placeholder="Event id"
+              aria-label="Filter playback by event id"
+            />
+          </div>
           <ol className="task-playback-frame-list">
-            {trace.frames.map((frame) => (
-              <li key={frame.id}>
-                <button
-                  type="button"
-                  className={frame.id === selectedFrame?.id ? "active" : ""}
-                  onClick={() => onSelectFrame?.(frame.id)}
-                >
-                  <span className={`task-playback-dot status-${frame.status}`} />
-                  <div>
-                    <strong>{frame.title}</strong>
-                    <span>{frame.event_kind}</span>
-                  </div>
-                  <em>{formatFrameTime(frame)}</em>
-                </button>
-              </li>
+            {groupedFrames.map((group) => (
+              <Fragment key={group.day}>
+                <li className="task-playback-day" aria-label={`Timeline events for ${group.day}`}>
+                  <span className="mono">{group.day}</span>
+                </li>
+                {group.frames.map((frame) => (
+                  <li key={frame.id}>
+                    <button
+                      type="button"
+                      className={frame.id === selectedFrame?.id ? "active" : ""}
+                      onClick={() => selectFrame(frame.id)}
+                    >
+                      <span className={`task-playback-dot status-${frame.status}`} />
+                      <div>
+                        <strong>{frame.title}</strong>
+                        <span>{frame.event_kind}</span>
+                      </div>
+                      <em>{formatFrameDateTime(frame)}</em>
+                    </button>
+                  </li>
+                ))}
+              </Fragment>
             ))}
+            {filteredFrames.length === 0 ? (
+              <li>
+                <div className="timeline-empty">No playback events match these controls.</div>
+              </li>
+            ) : null}
           </ol>
 
           {selectedFrame ? (
@@ -129,6 +205,7 @@ export default function TaskPlaybackPanel({
                 <span className="mono">{selectedFrame.event_type}</span>
                 <span className="mono">{selectedFrame.phase}</span>
                 <span className="mono">{selectedFrame.source_event_id}</span>
+                <span className="mono">{formatFrameDateTime(selectedFrame)}</span>
               </div>
               <div className="task-playback-chip-section">
                 <strong>Event summary</strong>
@@ -172,6 +249,64 @@ function narrativeValues(frame: TaskPlaybackFrame): string[] {
     `Why it mattered: ${frame.narrative.purpose}`,
     `Outcome: ${frame.narrative.outcome}`,
   ];
+}
+
+function filterPlaybackFrames(
+  frames: TaskPlaybackFrame[],
+  statusFilter: FrameStatusFilter,
+  laneFilter: string,
+  eventKindFilter: string,
+  eventIdFilter: string,
+): TaskPlaybackFrame[] {
+  const eventIdQuery = eventIdFilter.trim().toLowerCase();
+  return frames.filter((frame) => {
+    if (statusFilter === "blocked_failed" && !["blocked", "failed", "missing"].includes(frame.status)) return false;
+    if (laneFilter !== "all" && frame.lane_id !== laneFilter) return false;
+    if (eventKindFilter !== "all" && frame.event_kind !== eventKindFilter && frame.event_type !== eventKindFilter) return false;
+    if (eventIdQuery) {
+      const haystack = [frame.id, frame.source_event_id, frame.event_type, frame.event_kind, frame.semantic_entry_id].join(" ").toLowerCase();
+      if (!haystack.includes(eventIdQuery)) return false;
+    }
+    return true;
+  });
+}
+
+function groupFramesByDay(frames: TaskPlaybackFrame[]): Array<{ day: string; frames: TaskPlaybackFrame[] }> {
+  const groups: Array<{ day: string; frames: TaskPlaybackFrame[] }> = [];
+  for (const frame of frames) {
+    const day = formatFrameDay(frame);
+    const current = groups[groups.length - 1];
+    if (current?.day === day) current.frames.push(frame);
+    else groups.push({ day, frames: [frame] });
+  }
+  return groups;
+}
+
+function formatFrameDay(frame: TaskPlaybackFrame): string {
+  if (!frame.at) return "Recorded date unavailable";
+  const date = new Date(frame.at);
+  if (Number.isNaN(date.getTime())) return frame.at;
+  return date.toLocaleDateString([], { weekday: "short", year: "numeric", month: "long", day: "numeric" });
+}
+
+function stableStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values.map((item) => item.trim()).filter(Boolean)) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function laneLabel(id: string): string {
+  if (id === "content_sys") return "content-sys";
+  if (id === "gate") return "Close gate";
+  if (id === "verification") return "Verification";
+  if (id === "worker") return "Bounded worker";
+  if (id === "observer") return "Observer";
+  return id.replace(/[_-]+/g, " ");
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
@@ -273,7 +408,7 @@ function EvidenceRowSection({ title, rows }: { title: string; rows: EvidenceInsp
     <div className="task-playback-evidence-section">
       <strong>{title}</strong>
       <dl>
-        {stableEvidenceRows(rows).slice(0, 18).map((row) => (
+        {stableEvidenceRows(rows).slice(0, 32).map((row) => (
           <div key={`${row.label}:${row.value}:${row.source ?? ""}`}>
             <dt>{row.label}</dt>
             <dd>
@@ -339,8 +474,8 @@ function copyEvidenceLink(ref: TaskPlaybackFrame["evidence_links"][number]): voi
 }
 
 function evidenceSummary(evidenceRef: EvidenceRef, frame: TaskPlaybackFrame): string {
-  if (evidenceRef.kind === "route_context") {
-    return `This route-context ref is tied to ${frame.title} ${frame.source_event_id}; the visible context below is assembled from the event summary, structured facts, blocker diagnosis, and sanitized inspector rows.`;
+  if (isRouteContextOrReadReceiptRef(evidenceRef)) {
+    return `This route-context/read-receipt ref is tied to ${frame.title} ${frame.source_event_id}; it shows only the public-safe route or canonical visible contract fields the worker acknowledged, plus explicit body persistence status.`;
   }
   if (evidenceRef.kind === "prompt_contract") {
     return `This prompt-contract ref is tied to ${frame.title} ${frame.source_event_id}; target scope, acceptance criteria, required evidence, and route identity appear when they were recorded as public facts.`;
@@ -367,14 +502,16 @@ function evidenceContextRows(frame: TaskPlaybackFrame, evidenceRef: EvidenceRef)
     if (preferredFacts.has(fact.kind) || preferredFacts.has(fact.label)) rows.push({ label: fact.label, value: fact.value, source: fact.source });
   }
   rows.push(...rawPathRowsForEvidence(frame, evidenceRef));
-  return evidenceContextPersistenceRows(evidenceRef.kind, rows).filter((row) => publicEvidenceText(row.value));
+  return evidenceContextPersistenceRows(evidenceRef, rows).filter((row) => publicEvidenceText(row.value));
 }
 
-function evidenceContextPersistenceRows(kind: EvidenceRef["kind"], rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {
+function evidenceContextPersistenceRows(evidenceRef: EvidenceRef, rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {
+  const kind = evidenceRef.kind;
   if (!["route_context", "prompt_contract", "source_event"].includes(kind)) return rows;
   const baseLabels = new Set(["event", "status", "event type", "phase", "summary"]);
   const hasPersistedContext = rows.some((row) => !baseLabels.has(row.label) && publicEvidenceText(row.value));
-  return [
+  const next = [
+    ...(isRouteContextOrReadReceiptRef(evidenceRef) ? routeContextBoundaryRows(rows) : []),
     ...rows,
     {
       label: "context persistence",
@@ -382,6 +519,36 @@ function evidenceContextPersistenceRows(kind: EvidenceRef["kind"], rows: Evidenc
       source: kind,
     },
   ];
+  if (isRouteContextOrReadReceiptRef(evidenceRef) && !rows.some((row) => row.label === "body persisted status")) {
+    next.push({
+      label: "body persisted status",
+      value: "context body unavailable; only public ids, hashes, event refs, and canonical visible contract fields are shown",
+      source: "route boundary",
+    });
+  }
+  return next;
+}
+
+function routeContextBoundaryRows(rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {
+  const hasCanonicalContract = rows.some((row) => /canonical visible contract|target files|acceptance criteria|allowed actions|blocked actions|required/i.test(row.label));
+  return [
+    {
+      label: "raw private prompt text",
+      value: "hidden and not exposed",
+      source: "route boundary",
+    },
+    {
+      label: "public-safe context source",
+      value: hasCanonicalContract
+        ? "canonical visible contract or route/prompt bundle persisted on this event"
+        : "specific context body unavailable; showing persisted public refs and hashes",
+      source: "route boundary",
+    },
+  ];
+}
+
+function isRouteContextOrReadReceiptRef(ref: EvidenceRef): boolean {
+  return ref.kind === "route_context" || (ref.kind === "source_event" && /read[-_\s]?receipt/i.test(`${ref.label} ${ref.value}`));
 }
 
 function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
@@ -434,6 +601,14 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "route_identity.prompt_contract_hash",
     "visible_injection_manifest_hash",
     "route_identity.visible_injection_manifest_hash",
+    "launch_text_hash",
+    "canonical_visible_contract_text_hash",
+    "revision_receipt.canonical_visible_contract_text_hash",
+    "runtime_context_id",
+    "contract_revision_id",
+    "runtime_contract_revision_id",
+    "observer_command_id",
+    "fence_token",
   ];
   const sourceRefs = [
     "source_event_id",
@@ -451,6 +626,11 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "startup_intent_event_id",
   ];
   const scope = [
+    "body_persisted_status",
+    "raw_launch_text_persisted",
+    "raw_private_prompt_text",
+    "route_alerts",
+    "route_alert_codes",
     "stage",
     "selected_topology",
     "recommended_topology",
@@ -458,8 +638,17 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "target_files",
     "owned_files",
     "acceptance_criteria",
+    "allowed_actions",
+    "blocked_actions",
     "required_evidence",
+    "required_lanes_evidence",
     "evidence_required",
+    "required_output",
+    "visible_injection_manifest.refs",
+    "visible_injection_manifest.allowed_injections",
+    "visible_injection_manifest.source_ref_hashes",
+    "visible_injection_refs",
+    "visible_injection_manifest_hash",
     ...sourceRefs,
   ];
   const blockers = [
@@ -582,11 +771,20 @@ function formatInspectorValue(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value ?? {}, null, 2);
 }
 
-function formatFrameTime(frame: TaskPlaybackFrame): string {
+function formatFrameDateTime(frame: TaskPlaybackFrame): string {
   if (!frame.at) return "recorded";
   const date = new Date(frame.at);
   if (Number.isNaN(date.getTime())) return frame.at;
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleString([], {
+    weekday: "short",
+    year: "numeric",
+    month: "long",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  });
 }
 
 function statusClass(status: string): string {

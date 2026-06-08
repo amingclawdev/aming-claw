@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { useEventStream } from "../lib/sse";
 import {
   emptyTaskPlaybackTrace,
   fallbackTaskPlaybackSampleTrace,
@@ -17,9 +18,15 @@ interface Props {
 
 type StatusFilter = "open" | "fixed" | "all";
 type GateFilter = "all" | "gate_candidate" | "timeline_loaded" | "blocked_gate" | "no_timeline";
+type ActivityMode = "activity" | "history";
 
 const PLAYBACK_BACKLOG_PARAM = "playback_backlog";
+const ACTIVITY_TAB_PARAM = "activity_tab";
 const PLAYBACK_TIMELINE_LIMIT = 250;
+const ACTIVITY_TIMELINE_LIMIT = 250;
+const CURRENT_TASK_REFRESH_MS = 5000;
+const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "MERGED", "SUPERSEDED"]);
 
 interface PlaybackLoadState {
@@ -31,19 +38,44 @@ interface PlaybackLoadState {
   gate?: BacklogTimelineGateResponse | null;
 }
 
+interface CurrentTaskHint {
+  ok?: boolean;
+  active: boolean;
+  source: string;
+  project_id: string;
+  backlog_id: string;
+  task_id?: string;
+  bug?: BacklogBug | null;
+  active_backlog?: BacklogBug[];
+  active_count?: number;
+  latest_event?: Record<string, unknown>;
+}
+
+interface ActivityLoadState extends PlaybackLoadState {
+  bug?: BacklogBug;
+  refreshedAt?: string;
+}
+
 export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const bugs = backlog.bugs ?? [];
   const publicBugs = useMemo(() => bugs.filter((bug) => !isPrivatePlaybackBacklog(bug)), [bugs]);
+  const [mode, setMode] = useState<ActivityMode>(() => readActivityMode());
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("open");
   const [gateFilter, setGateFilter] = useState<GateFilter>("all");
   const [selectedBugId, setSelectedBugId] = useState(() => readSelectedBacklogId());
   const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>({});
+  const [activityByBug, setActivityByBug] = useState<Record<string, ActivityLoadState>>({});
+  const [currentTaskHint, setCurrentTaskHint] = useState<CurrentTaskHint | null>(null);
+  const [activityRefreshSeq, setActivityRefreshSeq] = useState(0);
   const [selectedFrameId, setSelectedFrameId] = useState<string>("");
+  const [selectedActivityFrameId, setSelectedActivityFrameId] = useState<string>("");
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const playbackByBugRef = useRef<Record<string, PlaybackLoadState>>({});
+  const activityByBugRef = useRef<Record<string, ActivityLoadState>>({});
   const selectedBugRef = useRef<BacklogBug | null>(null);
+  const activityMountedRef = useRef(true);
   const mountedRef = useRef(true);
   const activeProjectIdRef = useRef(projectId);
   const inFlightPlaybackKeysRef = useRef<Set<string>>(new Set());
@@ -54,21 +86,32 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   }, [playbackByBug]);
 
   useEffect(() => {
+    activityByBugRef.current = activityByBug;
+  }, [activityByBug]);
+
+  useEffect(() => {
     activeProjectIdRef.current = projectId;
     playbackControllersRef.current.forEach((controller) => controller.abort());
     playbackControllersRef.current.clear();
     inFlightPlaybackKeysRef.current.clear();
     playbackByBugRef.current = {};
+    activityByBugRef.current = {};
     setPlaybackByBug({});
+    setActivityByBug({});
+    setCurrentTaskHint(null);
+    setActivityRefreshSeq(0);
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
+    setSelectedActivityFrameId("");
     setPlaying(false);
   }, [projectId]);
 
   useEffect(() => {
     mountedRef.current = true;
+    activityMountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      activityMountedRef.current = false;
       playbackControllersRef.current.forEach((controller) => controller.abort());
       playbackControllersRef.current.clear();
       inFlightPlaybackKeysRef.current.clear();
@@ -84,11 +127,46 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     selectedBugRef.current = selectedBug;
   }, [selectedBug]);
 
+  useEffect(() => {
+    const handlePopState = () => {
+      setSelectedBugId(readSelectedBacklogId());
+      setMode(readActivityMode());
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
   const fallbackTrace = useMemo(() => fallbackTaskPlaybackSampleTrace(projectId), [projectId]);
+  const activityPlaceholderBug = useMemo<BacklogBug>(() => ({
+    bug_id: "current-activity",
+    title: "Current activity",
+    status: "UNKNOWN",
+    priority: "P3",
+  }), []);
   const selectedState = selectedBugId ? playbackByBug[selectedBugId] : undefined;
   const activeTrace = selectedState?.trace ?? (selectedBug ? emptyTaskPlaybackTrace(projectId, selectedBug) : fallbackTrace);
   const activeFrameId = selectedFrameId || activeTrace.frames[0]?.id || "";
   const selectedLoadBugId = selectedBug?.bug_id || "";
+  const hintedCurrentBug = currentTaskHint?.active && currentTaskHint.bug && !isPrivatePlaybackBacklog(currentTaskHint.bug)
+    ? currentTaskHint.bug
+    : null;
+  const activeTaskCandidates = useMemo(() => {
+    const candidates = publicBugs
+      .map((bug) => ({ bug, score: activeTaskScore(bug) }))
+      .filter((item) => item.score > 0)
+      .sort(compareActiveTaskCandidates);
+    if (hintedCurrentBug && !candidates.some((item) => item.bug.bug_id === hintedCurrentBug.bug_id)) {
+      return [{ bug: hintedCurrentBug, score: 10_000 }, ...candidates];
+    }
+    return candidates;
+  }, [hintedCurrentBug, publicBugs]);
+  const activityBug = selectedBug ?? hintedCurrentBug ?? activeTaskCandidates[0]?.bug ?? null;
+  const activityState = activityBug ? activityByBug[activityBug.bug_id] : undefined;
+  const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
+  const activityFrameId = selectedActivityFrameId || activityTrace.frames[0]?.id || "";
+  const secondaryActivityBugs = activityBug
+    ? activeTaskCandidates.map((item) => item.bug).filter((bug) => bug.bug_id !== activityBug.bug_id)
+    : activeTaskCandidates.map((item) => item.bug);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -114,6 +192,136 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       .slice()
       .sort(compareBacklogRows);
   }, [publicBugs, gateFilter, playbackByBug, query, statusFilter]);
+
+  const refreshCurrentTaskHint = useCallback((signal: AbortSignal) => {
+    return currentTaskHintFor(projectId, signal)
+      .then((hint) => {
+        if (signal.aborted || !activityMountedRef.current || activeProjectIdRef.current !== projectId) return;
+        setCurrentTaskHint(hint);
+      })
+      .catch(() => {
+        if (!signal.aborted && activityMountedRef.current && activeProjectIdRef.current === projectId) {
+          setCurrentTaskHint(null);
+        }
+      });
+  }, [projectId]);
+
+  const refreshActivityTimeline = useCallback((bug: BacklogBug, showLoading: boolean, signal: AbortSignal) => {
+    const bugId = bug.bug_id;
+    if (showLoading) {
+      setActivityByBug((states) => ({
+        ...states,
+        [bugId]: {
+          loading: true,
+          loaded: states[bugId]?.loaded ?? false,
+          error: "",
+          trace: states[bugId]?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
+          bug: states[bugId]?.bug ?? bug,
+          taskTimeline: states[bugId]?.taskTimeline,
+          gate: states[bugId]?.gate,
+          refreshedAt: states[bugId]?.refreshedAt,
+        },
+      }));
+    }
+
+    return Promise.allSettled([
+      api.backlogBugFor(projectId, bugId, signal),
+      api.taskTimelineFor(projectId, bugId, ACTIVITY_TIMELINE_LIMIT, signal),
+      api.backlogTimelineGateFor(projectId, bugId, ACTIVITY_TIMELINE_LIMIT, signal),
+    ]).then(([detailResult, timelineResult, gateResult]) => {
+      if (signal.aborted || !activityMountedRef.current || activeProjectIdRef.current !== projectId) return;
+      const detailBug = detailResult.status === "fulfilled" ? detailResult.value : bug;
+      const taskTimeline = timelineResult.status === "fulfilled" ? timelineResult.value : null;
+      const gate = gateResult.status === "fulfilled" ? gateResult.value : null;
+      const errors = [
+        detailResult.status === "rejected" ? errorMessage(detailResult.reason) : "",
+        timelineResult.status === "rejected" ? errorMessage(timelineResult.reason) : "",
+        gateResult.status === "rejected" ? errorMessage(gateResult.reason) : "",
+      ].filter(Boolean);
+      const trace = normalizeTaskPlaybackTrace({
+        projectId,
+        backlog: detailBug,
+        taskTimeline,
+        gateResponse: gate,
+        source: taskTimeline && gate ? "governed" : "governed_partial",
+      });
+      setActivityByBug((states) => ({
+        ...states,
+        [bugId]: {
+          loading: false,
+          loaded: true,
+          error: errors.join(" | "),
+          trace,
+          bug: detailBug,
+          taskTimeline,
+          gate,
+          refreshedAt: new Date().toISOString(),
+        },
+      }));
+      setSelectedActivityFrameId((current) => current || trace.frames[0]?.id || "");
+    });
+  }, [projectId]);
+
+  useEventStream(projectId, {
+    enabled: Boolean(projectId),
+    onEvent: ({ name }) => {
+      if (isActivityLiveEvent(name)) setActivityRefreshSeq((seq) => seq + 1);
+    },
+  });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    refreshCurrentTaskHint(controller.signal);
+    return () => controller.abort();
+  }, [activityRefreshSeq, refreshCurrentTaskHint]);
+
+  useEffect(() => {
+    if (!activityBug) return undefined;
+    const bug = activityBug;
+    const controller = new AbortController();
+    let refreshing = false;
+    const refresh = (showLoading = false) => {
+      if (refreshing || controller.signal.aborted) return;
+      refreshing = true;
+      refreshActivityTimeline(bug, showLoading, controller.signal)
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || !activityMountedRef.current || activeProjectIdRef.current !== projectId) return;
+          const bugId = bug.bug_id;
+          setActivityByBug((states) => ({
+            ...states,
+            [bugId]: {
+              loading: false,
+              loaded: true,
+              error: errorMessage(error),
+              trace: states[bugId]?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
+              bug: states[bugId]?.bug ?? bug,
+              taskTimeline: states[bugId]?.taskTimeline ?? null,
+              gate: states[bugId]?.gate ?? null,
+              refreshedAt: states[bugId]?.refreshedAt,
+            },
+          }));
+        })
+        .finally(() => {
+          refreshing = false;
+        });
+    };
+
+    refresh(!activityByBugRef.current[bug.bug_id]?.loaded);
+    const timer = window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
+  }, [activityBug?.bug_id, activityRefreshSeq, projectId, refreshActivityTimeline]);
+
+  useEffect(() => {
+    if (!activityBug) return;
+    const state = activityByBug[activityBug.bug_id];
+    if (!state?.loaded || state.loading) return;
+    const currentFrameExists = Boolean(selectedActivityFrameId && state.trace.frames.some((frame) => frame.id === selectedActivityFrameId));
+    if (!selectedActivityFrameId || currentFrameExists) return;
+    setSelectedActivityFrameId(state.trace.frames[0]?.id || "");
+  }, [activityBug, activityByBug, selectedActivityFrameId]);
 
   useEffect(() => {
     const bug = selectedBugRef.current;
@@ -220,114 +428,183 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedFrameId(activeTrace.frames[0]?.id || "");
   };
 
+  const changeMode = (next: ActivityMode) => {
+    setMode(next);
+    writeActivityMode(next);
+  };
+
   return (
     <div className="view task-playback-view">
       <div className="view-header">
         <div>
-          <h2>Task Playback</h2>
-          <p>Replay governed Aming Claw/content-sys task status, timeline lanes, evidence refs, and close-gate state.</p>
+          <h2>Activity</h2>
+          <p>Current task/runtime event stream with task playback history as a reachable detail.</p>
         </div>
         <div className="view-header-actions">
           <span className="mono">{projectId}</span>
-          <span className={`status-badge ${activeTrace.statuses.has_governed_data ? "status-complete" : "status-unknown"}`}>
-            {activeTrace.source === "fallback_sample" ? "sample fallback" : "governed data"}
+          <span className={`status-badge ${activityTrace.statuses.has_governed_data ? "status-complete" : "status-unknown"}`}>
+            {!activityBug ? "no current activity" : activityTrace.source === "fallback_sample" ? "sample fallback" : "governed data"}
           </span>
         </div>
       </div>
 
-      <div className="task-playback-layout">
-        <aside className="task-playback-selector" aria-label="Backlog playback selector">
-          <div className="task-playback-selector-head">
-            <strong>Backlog selector</strong>
-            <span className="mono">{rows.length} / {publicBugs.length}</span>
-          </div>
-          <input
-            className="backlog-search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search backlog, status, files..."
-          />
-          <div className="task-playback-filters">
-            <SegmentedButton<StatusFilter>
-              value={statusFilter}
-              options={[
-                ["open", "Open"],
-                ["fixed", "Fixed"],
-                ["all", "All"],
-              ]}
-              onChange={setStatusFilter}
-            />
-            <select value={gateFilter} onChange={(event) => setGateFilter(event.target.value as GateFilter)} aria-label="Timeline and gate filter">
-              <option value="all">All timeline states</option>
-              <option value="gate_candidate">Gate candidates</option>
-              <option value="timeline_loaded">Timeline loaded</option>
-              <option value="blocked_gate">Blocked gate</option>
-              <option value="no_timeline">No timeline loaded</option>
-            </select>
-          </div>
-          {rows.length === 0 ? (
-            <div className="timeline-empty">No backlog rows match these playback filters.</div>
-          ) : (
-            <div className="task-playback-row-list">
-              {rows.map((bug) => {
-                const state = playbackByBug[bug.bug_id];
-                return (
-                  <button
-                    type="button"
-                    key={bug.bug_id}
-                    className={bug.bug_id === selectedBugId ? "active" : ""}
-                    onClick={() => selectBug(bug.bug_id)}
-                  >
+      <SegmentedButton<ActivityMode>
+        value={mode}
+        options={[
+          ["activity", "Current activity"],
+          ["history", "Playback history"],
+        ]}
+        onChange={changeMode}
+      />
+
+      {mode === "activity" ? (
+        <div className="task-playback-layout">
+          <aside className="task-playback-selector" aria-label="Current activity task selector">
+            <div className="task-playback-selector-head">
+              <strong>Current/runtime stream</strong>
+              <span className="mono">{activityBug?.bug_id || "no task"}</span>
+            </div>
+            {activityBug ? (
+              <button type="button" className="active" onClick={() => selectBug(activityBug.bug_id)}>
+                <div>
+                  <strong>{activityBug.title || activityBug.bug_id}</strong>
+                  <span className="mono">{activityBug.bug_id}</span>
+                </div>
+                <span className={`status-badge ${statusClass(activityBug.status)}`}>{normalizeStatus(activityBug.status)}</span>
+                <em>{activityState?.loading ? "loading events" : `${activityTrace.frames.length} event${activityTrace.frames.length === 1 ? "" : "s"}`}</em>
+              </button>
+            ) : (
+              <div className="timeline-empty">No current task/runtime event stream is active for this project.</div>
+            )}
+            {secondaryActivityBugs.length > 0 ? (
+              <div className="task-playback-row-list">
+                {secondaryActivityBugs.slice(0, 8).map((bug) => (
+                  <button type="button" key={bug.bug_id} onClick={() => selectBug(bug.bug_id)}>
                     <div>
                       <strong>{bug.title || bug.bug_id}</strong>
                       <span className="mono">{bug.bug_id}</span>
                     </div>
                     <span className={`status-badge ${statusClass(bug.status)}`}>{normalizeStatus(bug.status)}</span>
-                    <em>{playbackRowMeta(bug, state)}</em>
+                    <em>{bug.runtime_state || bug.chain_stage || bug.mf_type || "active candidate"}</em>
                   </button>
-                );
-              })}
+                ))}
+              </div>
+            ) : null}
+            <div className="task-playback-controls">
+              <button type="button" className="action-btn" onClick={() => setActivityRefreshSeq((seq) => seq + 1)}>
+                Refresh
+              </button>
+              <button type="button" className="action-btn" onClick={() => changeMode("history")}>
+                Open playback history
+              </button>
             </div>
-          )}
-        </aside>
+          </aside>
 
-        <div className="task-playback-main">
-          <div className="task-playback-controls">
-            <button type="button" className="action-btn" onClick={() => setPlaying((value) => !value)} disabled={activeTrace.frames.length <= 1}>
-              {playing ? "Pause" : "Play"}
-            </button>
-            <button type="button" className="action-btn" onClick={resetPlayback} disabled={activeTrace.frames.length === 0}>
-              Reset
-            </button>
-            <label>
-              Speed
-              <input
-                type="range"
-                min="1"
-                max="4"
-                step="1"
-                value={speed}
-                onChange={(event) => setSpeed(Number(event.target.value))}
-              />
-            </label>
-            {selectedBug ? (
-              <span className="mono">{selectedBug.bug_id}</span>
-            ) : (
-              <span className="mono">Select a backlog row to fetch governed timeline APIs</span>
-            )}
+          <div className="task-playback-main">
+            <TaskPlaybackPanel
+              trace={activityTrace}
+              selectedFrameId={activityFrameId}
+              loading={activityState?.loading ?? false}
+              error={activityState?.error ?? ""}
+              onSelectFrame={setSelectedActivityFrameId}
+            />
           </div>
-          <TaskPlaybackPanel
-            trace={activeTrace}
-            selectedFrameId={activeFrameId}
-            loading={selectedState?.loading ?? false}
-            error={selectedState?.error ?? ""}
-            onSelectFrame={(frameId) => {
-              setSelectedFrameId(frameId);
-              setPlaying(false);
-            }}
-          />
         </div>
-      </div>
+      ) : (
+        <div className="task-playback-layout">
+          <aside className="task-playback-selector" aria-label="Backlog playback selector">
+            <div className="task-playback-selector-head">
+              <strong>Backlog selector</strong>
+              <span className="mono">{rows.length} / {publicBugs.length}</span>
+            </div>
+            <input
+              className="backlog-search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search backlog, status, files..."
+            />
+            <div className="task-playback-filters">
+              <SegmentedButton<StatusFilter>
+                value={statusFilter}
+                options={[
+                  ["open", "Open"],
+                  ["fixed", "Fixed"],
+                  ["all", "All"],
+                ]}
+                onChange={setStatusFilter}
+              />
+              <select value={gateFilter} onChange={(event) => setGateFilter(event.target.value as GateFilter)} aria-label="Timeline and gate filter">
+                <option value="all">All timeline states</option>
+                <option value="gate_candidate">Gate candidates</option>
+                <option value="timeline_loaded">Timeline loaded</option>
+                <option value="blocked_gate">Blocked gate</option>
+                <option value="no_timeline">No timeline loaded</option>
+              </select>
+            </div>
+            {rows.length === 0 ? (
+              <div className="timeline-empty">No backlog rows match these playback filters.</div>
+            ) : (
+              <div className="task-playback-row-list">
+                {rows.map((bug) => {
+                  const state = playbackByBug[bug.bug_id];
+                  return (
+                    <button
+                      type="button"
+                      key={bug.bug_id}
+                      className={bug.bug_id === selectedBugId ? "active" : ""}
+                      onClick={() => selectBug(bug.bug_id)}
+                    >
+                      <div>
+                        <strong>{bug.title || bug.bug_id}</strong>
+                        <span className="mono">{bug.bug_id}</span>
+                      </div>
+                      <span className={`status-badge ${statusClass(bug.status)}`}>{normalizeStatus(bug.status)}</span>
+                      <em>{playbackRowMeta(bug, state)}</em>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </aside>
+
+          <div className="task-playback-main">
+            <div className="task-playback-controls">
+              <button type="button" className="action-btn" onClick={() => setPlaying((value) => !value)} disabled={activeTrace.frames.length <= 1}>
+                {playing ? "Pause" : "Play"}
+              </button>
+              <button type="button" className="action-btn" onClick={resetPlayback} disabled={activeTrace.frames.length === 0}>
+                Reset
+              </button>
+              <label>
+                Speed
+                <input
+                  type="range"
+                  min="1"
+                  max="4"
+                  step="1"
+                  value={speed}
+                  onChange={(event) => setSpeed(Number(event.target.value))}
+                />
+              </label>
+              {selectedBug ? (
+                <span className="mono">{selectedBug.bug_id}</span>
+              ) : (
+                <span className="mono">Select a backlog row to fetch governed timeline APIs</span>
+              )}
+            </div>
+            <TaskPlaybackPanel
+              trace={activeTrace}
+              selectedFrameId={activeFrameId}
+              loading={selectedState?.loading ?? false}
+              error={selectedState?.error ?? ""}
+              onSelectFrame={(frameId) => {
+                setSelectedFrameId(frameId);
+                setPlaying(false);
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -350,6 +627,36 @@ function SegmentedButton<T extends string>({
       ))}
     </div>
   );
+}
+
+function dashboardApiBase(): string {
+  return DIRECT_API ? BACKEND_URL : "";
+}
+
+async function currentTaskHintFor(projectId: string, signal?: AbortSignal): Promise<CurrentTaskHint> {
+  const path = `/api/backlog/${encodeURIComponent(projectId)}/current-task?limit=10`;
+  const res = await fetch(`${dashboardApiBase()}${path}`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new ApiError(res.status, `GET ${path} -> ${res.status}`, text);
+  }
+  return (await res.json()) as CurrentTaskHint;
+}
+
+function isActivityLiveEvent(name: string): boolean {
+  return [
+    "task_timeline.appended",
+    "current_task.changed",
+    "task.created",
+    "task.completed",
+    "task.failed",
+    "task.retry",
+    "dashboard.changed",
+  ].includes(name);
 }
 
 function matchesGateFilter(filter: GateFilter, bug: BacklogBug, state?: PlaybackLoadState): boolean {
@@ -389,11 +696,24 @@ function readSelectedBacklogId(): string {
   return new URLSearchParams(window.location.search).get(PLAYBACK_BACKLOG_PARAM)?.trim() || "";
 }
 
+function readActivityMode(): ActivityMode {
+  if (typeof window === "undefined") return "activity";
+  const value = new URLSearchParams(window.location.search).get(ACTIVITY_TAB_PARAM)?.trim();
+  return value === "history" ? "history" : "activity";
+}
+
 function writeSelectedBacklogId(backlogId: string): void {
   if (typeof window === "undefined") return;
   const url = new URL(window.location.href);
   url.searchParams.set(PLAYBACK_BACKLOG_PARAM, backlogId);
   window.history.replaceState({ playback_backlog: backlogId }, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function writeActivityMode(mode: ActivityMode): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  url.searchParams.set(ACTIVITY_TAB_PARAM, mode);
+  window.history.replaceState({ activity_tab: mode }, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
 function isOpenBug(bug: BacklogBug): boolean {
@@ -412,6 +732,37 @@ function compareBacklogRows(a: BacklogBug, b: BacklogBug): number {
   const priority = priorityWeight(a.priority) - priorityWeight(b.priority);
   if (priority !== 0) return priority;
   return Date.parse(b.updated_at || b.created_at || "") - Date.parse(a.updated_at || a.created_at || "");
+}
+
+function compareActiveTaskCandidates(
+  a: { bug: BacklogBug; score: number },
+  b: { bug: BacklogBug; score: number },
+): number {
+  if (a.score !== b.score) return b.score - a.score;
+  const priority = priorityWeight(a.bug.priority) - priorityWeight(b.bug.priority);
+  if (priority !== 0) return priority;
+  return Date.parse(b.bug.updated_at || b.bug.created_at || "") - Date.parse(a.bug.updated_at || a.bug.created_at || "");
+}
+
+function activeTaskScore(bug: BacklogBug): number {
+  if (!isOpenBug(bug)) return 0;
+  const status = normalizeStatus(bug.status);
+  const runtimeText = [
+    bug.runtime_state,
+    bug.chain_stage,
+    bug.mf_type,
+    bug.current_task_id ? "current_task_id" : "",
+  ].join(" ").toUpperCase();
+  let score = 0;
+  if (status === "MF_IN_PROGRESS") score += 120;
+  if (["CLAIMED", "RUNNING", "IN_PROGRESS", "QUEUED"].includes(status)) score += 100;
+  if (status === "OPEN" && bug.current_task_id) score += 80;
+  if (/\b(MF_IN_PROGRESS|CLAIMED|RUNNING|IN_PROGRESS|IMPLEMENTATION|DISPATCH|HANDOFF|MERGE_GATE|WORKER|TASK)\b/.test(runtimeText)) {
+    score += 70;
+  }
+  if (/\bQUEUED\b/.test(runtimeText)) score += 50;
+  if (bug.contract_summary?.has_contract) score += 15;
+  return score;
 }
 
 function statusClass(status: string): string {

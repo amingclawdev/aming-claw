@@ -791,6 +791,7 @@ function verifyBacklogEvidenceContract() {
   const playbackTestSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.test.ts"), "utf8");
   const playbackPanelSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TaskPlaybackPanel.tsx"), "utf8");
   const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
+  const treeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TreePanel.tsx"), "utf8");
   const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.tsx"), "utf8");
   const typeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/types.ts"), "utf8");
   const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
@@ -799,8 +800,6 @@ function verifyBacklogEvidenceContract() {
   assert(apiSource.includes("/timeline-gate?"), "Backlog API client should call the timeline-gate endpoint");
   assert(viewSource.includes("ContractGatePanel"), "Backlog detail should render a dedicated Contract & Gate tab panel");
   assert(viewSource.includes("NoGateNotice"), "Backlog gate UI should render explicit no-gate/not-applicable state");
-  assert(viewSource.includes("buildTimelineLanes"), "Backlog row expansion should group execution events into one-hop lanes");
-  assert(viewSource.includes("One-hop agent lanes"), "Backlog lane grid should be accessible as one-hop agent lanes");
   assert(viewSource.includes("BacklogDetailModal"), "Backlog rows should open a detail modal");
   assert(viewSource.includes("BACKLOG_URL_PARAM"), "Backlog detail modal should be URL addressable");
   assert(viewSource.includes("buildTimelineDag"), "Backlog detail should derive a timeline DAG");
@@ -808,7 +807,7 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("Subagents / Workers ·"), "Parallel worker DAG sublanes should stay under the Subagents / Workers family");
   assert(viewSource.includes("workers parallel"), "Backlog timeline should make parallel worker execution visible");
   assert(viewSource.includes("rawLaneKeyForEvent"), "Backlog timeline should keep raw lane ids inspectable without using them as labels");
-  assert(viewSource.includes("ImplementationStepGrid"), "Timeline tab should group implementation evidence into audit steps");
+  assert(viewSource.includes("Timeline DAG"), "Backlog detail should keep timeline evidence in the compact detail modal");
   assert(viewSource.includes("ArtifactPills"), "Timeline and inspector should surface concrete artifacts");
   assert(viewSource.includes("EvidenceInspector"), "Backlog DAG nodes should open an evidence inspector");
   assert(viewSource.includes("RouteEvidenceCards"), "Evidence inspector should render route-context evidence cards");
@@ -857,32 +856,38 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("Inspect public timeline details"), "Timeline payload details should remain inspectable through the public-safe evidence surface");
   assert(viewSource.includes("relatedIdsFromBug"), "Backlog detail should discover related backlog ids");
   assert(viewSource.includes("BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS"), "Backlog detail should include a deterministic parallel-lane fixture");
-  assert(viewSource.includes("CurrentTaskTimelinePanel"), "Backlog view should render a current task timeline panel");
-  assert(viewSource.includes("Current task timeline"), "Backlog current panel should use the Current task timeline label");
-  assert(viewSource.includes("api.taskTimelineFor"), "Backlog current panel should fetch governed task timeline data");
-  assert(viewSource.includes("api.backlogTimelineGateFor"), "Backlog current panel should fetch governed close-gate data");
-  assert(viewSource.includes("activeTaskScore"), "Backlog current panel should score real active backlog tasks");
-  assert(viewSource.includes("secondaryActiveBugs"), "Backlog current panel should expose secondary active task options");
-  assert(viewSource.includes("currentTaskHintFor"), "Backlog current panel should fetch the backend current-task hint");
-  assert(viewSource.includes("/current-task?limit=10"), "Backlog current panel should use the current-task API fallback");
-  assert(viewSource.includes("useEventStream(projectId"), "Backlog current panel should reuse the dashboard SSE stream");
-  assert(viewSource.includes("isCurrentTaskLiveEvent"), "Backlog current panel should refresh on live current-task events");
-  assert(viewSource.includes("currentTaskRefreshSeq"), "Backlog current panel should bridge SSE events into immediate refreshes");
-  assert(viewSource.includes("task_timeline.appended"), "Backlog current panel should refresh on task timeline append events");
-  assert(viewSource.includes("current_task.changed"), "Backlog current panel should refresh on current-task changed events");
-  assert(viewSource.includes("CURRENT_TASK_REFRESH_MS"), "Backlog current panel should define a bounded live refresh interval");
-  assert(viewSource.includes("window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS)"), "Backlog current panel should poll the primary task without page reloads");
-  assert(viewSource.includes("refreshCurrentTaskTimeline"), "Backlog current panel should refresh task detail, timeline, and gate together");
-  assert(viewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Backlog current panel should refresh backlog row detail during live polling");
-  assert(viewSource.includes("currentTimelineMountedRef"), "Backlog current panel should guard async refreshes after unmount");
-  assert(viewSource.includes("backlogIdPlaceholder(selectedBugId)"), "URL-selected backlog ids outside the compact list should still own current timeline selection");
+  assert(treeSource.includes('label="Activity"'), "Left navigation should expose Activity as the primary event destination");
+  assert(!treeSource.includes('label="Runtime event"') && !treeSource.includes('label="Runtime events"'), "Left navigation should not expose singular Runtime event copy");
+  assert(playbackViewSource.includes("<h2>Activity</h2>"), "Activity view should own the task/runtime stream heading");
+  assert(playbackViewSource.includes("Current task/runtime event stream with task playback history as a reachable detail."), "Activity view should describe current events as the primary surface");
+  assert(playbackViewSource.includes("Current activity") && playbackViewSource.includes("Playback history"), "Activity view should expose current stream and playback history tabs");
+  assert(playbackViewSource.includes("currentTaskHintFor"), "Activity view should fetch the backend current-task hint");
+  assert(playbackViewSource.includes("/current-task?limit=10"), "Activity view should use the current-task API fallback");
+  assert(playbackViewSource.includes("useEventStream(projectId"), "Activity view should reuse the dashboard SSE stream");
+  assert(playbackViewSource.includes("isActivityLiveEvent"), "Activity view should refresh on live activity events");
+  assert(playbackViewSource.includes("activityRefreshSeq"), "Activity view should bridge SSE events into immediate refreshes");
+  assert(playbackViewSource.includes("task_timeline.appended"), "Activity view should refresh on task timeline append events");
+  assert(playbackViewSource.includes("current_task.changed"), "Activity view should refresh on current-task changed events");
+  assert(playbackViewSource.includes("CURRENT_TASK_REFRESH_MS"), "Activity view should define a bounded live refresh interval");
+  assert(playbackViewSource.includes("window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS)"), "Activity view should poll the primary task without page reloads");
+  assert(playbackViewSource.includes("refreshActivityTimeline"), "Activity view should refresh task detail, timeline, and gate together");
+  assert(playbackViewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Activity view should refresh backlog row detail during live polling");
+  assert(playbackViewSource.includes("activityMountedRef"), "Activity view should guard async refreshes after unmount");
+  assert(playbackViewSource.includes("const activityBug = selectedBug") && playbackViewSource.includes("hintedCurrentBug ?? activeTaskCandidates"), "URL-selected backlog rows should not be overridden by auto primary active tasks");
+  assert(playbackViewSource.includes("setSelectedActivityFrameId(\"\")"), "Activity view should reset stale selected playback frames on project switch");
+  assert(viewSource.includes("activityHref") && viewSource.includes("playbackDetailHref"), "Backlog rows should build Activity and playback deep links");
+  assert(viewSource.includes("Open activity") && viewSource.includes("Open playback"), "Backlog rows should expose Activity and playback deep links");
+  assert(viewSource.includes("Timeline status") && viewSource.includes("Check timeline") && viewSource.includes("timeline-toggle-count"), "Backlog rows should expose compact timeline status instead of full current events");
+  assert(!viewSource.includes("CurrentTaskTimelinePanel"), "Backlog view should not render a full current task timeline panel");
+  assert(!viewSource.includes("currentTaskHintFor"), "Backlog view should not own the current-task hint fetch");
+  assert(!viewSource.includes("useEventStream(projectId"), "Backlog view should not own live current-task SSE refresh");
+  assert(!viewSource.includes("refreshCurrentTaskTimeline"), "Backlog view should not carry the full current event refresh loop");
+  assert(!viewSource.includes("TaskPlaybackPanel"), "Backlog view should not render the full task playback panel inline");
   assert(
-    viewSource.includes("const primaryCurrentBug = selectedBugId")
-      && viewSource.includes("? selectedCurrentBug")
-      && viewSource.includes(": hintedCurrentBug ?? activeTaskCandidates"),
-    "URL-selected backlog rows should not be overridden by auto primary active tasks",
+    playbackViewSource.includes("const activityBug = selectedBug")
+      && playbackViewSource.includes("hintedCurrentBug ?? activeTaskCandidates"),
+    "Activity view should honor URL-selected backlog rows before auto primary active tasks",
   );
-  assert(viewSource.includes("setSelectedCurrentFrameId(\"\")"), "Backlog current panel should reset stale selected playback frames on task switch");
   assert(!viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view must not render default fixture stream replay frames");
   assert(!viewSource.includes("FixtureStreamReplay"), "Backlog view must not render the default fixture stream replay panel");
   assert(!viewSource.includes("fixture-stream-demo"), "Backlog view must not expose the default fixture project id");
@@ -905,14 +910,12 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".backlog-evidence-inspector"), "Backlog evidence inspector should have stable layout CSS");
   assert(cssSource.includes(".backlog-route-evidence-cards"), "Route-context evidence cards should have stable layout CSS");
   assert(cssSource.includes(".backlog-inspector-raw"), "Raw inspector payloads should have stable disclosure CSS");
-  assert(cssSource.includes(".current-task-timeline"), "Current task timeline should have stable layout CSS");
-  assert(cssSource.includes(".current-task-secondary"), "Current task timeline should expose secondary active task options");
   assert(!cssSource.includes(".fixture-stream-replay"), "Backlog CSS must not include the default fixture stream replay layout");
   assert(!cssSource.includes(".fixture-stream-progress"), "Backlog CSS must not include fixture replay progress styling");
   assert(appSource.includes('"playback"'), "Dashboard should register a fixed Task Playback view route");
   assert(appSource.includes("TaskPlaybackView"), "App should render TaskPlaybackView for the playback route");
-  assert(viewSource.includes("TaskPlaybackPanel"), "Backlog row expansion should reuse the public task playback panel");
   assert(viewSource.includes("view=playback"), "Backlog view should expose a visible playback entry point");
+  assert(playbackViewSource.includes("TaskPlaybackPanel"), "Activity view should reuse the public task playback panel");
   assert(playbackPanelSource.includes("Private refs redacted"), "Task playback panel should use public-safe private ref redaction copy");
   assert(sseSource.includes('"task_timeline.appended"'), "Dashboard SSE client should listen for task timeline append events");
   assert(sseSource.includes('"current_task.changed"'), "Dashboard SSE client should listen for current-task changed events");
@@ -949,6 +952,17 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("Event summary"), "Task playback panel should lead selected events with a concrete event summary");
   assert(playbackPanelSource.includes("Specific facts"), "Task playback panel should promote structured facts above auxiliary narrative");
   assert(playbackPanelSource.includes("Failure/blocker diagnosis"), "Task playback panel should promote blocker diagnosis above raw JSON");
+  assert(playbackPanelSource.includes("formatFrameDateTime"), "Task playback rows and headers should use full absolute date plus time");
+  assert(playbackPanelSource.includes("groupFramesByDay") && playbackPanelSource.includes("task-playback-day"), "Task playback should group long event lists by day");
+  assert(
+    playbackPanelSource.includes("Latest")
+      && playbackPanelSource.includes("Current")
+      && playbackPanelSource.includes("Blocked/failed")
+      && playbackPanelSource.includes("Filter playback by lane")
+      && playbackPanelSource.includes("Filter playback by event kind")
+      && playbackPanelSource.includes("Filter playback by event id"),
+    "Task playback should expose latest/current, blocked/failed, lane, kind, and event-id controls",
+  );
   assert(playbackPanelSource.includes("Evidence links"), "Task playback panel should expose typed primary evidence links");
   assert(playbackPanelSource.includes("EvidenceInspectorModal"), "Task playback evidence links should open a structured inspector modal");
   assert(playbackPanelSource.includes('aria-haspopup="dialog"'), "Task playback evidence chips should advertise dialog inspection");
@@ -961,6 +975,17 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("rawPathsForEvidenceKind"), "Task playback evidence inspector should extract typed public fields from sanitized raw sections");
   assert(playbackPanelSource.includes("route_context") && playbackPanelSource.includes("prompt_contract"), "Task playback evidence inspector should handle route context and prompt contract refs");
   assert(playbackPanelSource.includes("public-safe context not persisted on this event"), "Task playback evidence inspector should state when public route/prompt/source context was not persisted");
+  assert(playbackPanelSource.includes("routeContextBoundaryRows"), "Task playback evidence inspector should add route/read-receipt public boundary rows");
+  assert(playbackPanelSource.includes("raw private prompt text") && playbackPanelSource.includes("hidden and not exposed"), "Task playback read-receipt inspector should explicitly hide private prompt text");
+  assert(playbackPanelSource.includes("body persisted status"), "Task playback read-receipt inspector should expose body persistence status");
+  assert(
+    playbackPanelSource.includes("route_alerts")
+      && playbackPanelSource.includes("allowed_actions")
+      && playbackPanelSource.includes("blocked_actions")
+      && playbackPanelSource.includes("required_lanes_evidence")
+      && playbackPanelSource.includes("visible_injection_manifest_hash"),
+    "Task playback read-receipt inspector should extract route alerts, action bounds, required evidence, and visible injection refs",
+  );
   assert(playbackPanelSource.includes("Auxiliary explanation / Actor-context narrative"), "Task playback panel should make actor-context narrative auxiliary copy");
   assert(playbackPanelSource.includes("Advanced raw data"), "Task playback raw evidence should be collapsed under Advanced raw data");
   assert(playbackPanelSource.includes("key={selectedFrame.id}"), "Task playback raw evidence details should remount closed when selecting a new event");
@@ -993,6 +1018,8 @@ function verifyBacklogEvidenceContract() {
   assert(playbackTestSource.includes("event #329 inspector context should expose audit decision, implemented scope, remaining acceptance, and remaining open facts"), "Task playback fixture should cover audit inspector facts");
   assert(playbackTestSource.includes("route service completion narrative should explain action outcome and missing evidence"), "Task playback fixture should cover service route completion narrative");
   assert(playbackTestSource.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."), "Task playback fixture should cover route/context worker narrative");
+  assert(playbackTestSource.includes("body_persisted_status") && playbackTestSource.includes("raw launch text not persisted"), "Task playback fixture should cover read-receipt body persistence status");
+  assert(playbackTestSource.includes("route_alerts") && playbackTestSource.includes("allowed_actions") && playbackTestSource.includes("blocked_actions"), "Task playback fixture should cover route alerts and action bounds");
   assert(playbackTestSource.includes("Route evidence blocked"), "Task playback fixture should cover route waiver/blocker narrative");
   assert(playbackTestSource.includes("A governance timeline event was recorded.") && playbackTestSource.includes("should not use the old generic fallback detail"), "Task playback fixture should guard against old generic route detail text");
   assert(playbackTestSource.includes("System timeline event"), "Task playback fixture should prove unknown events use the system fallback");
@@ -1021,6 +1048,7 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".task-playback-panel"), "Task playback panel should have stable CSS");
   assert(cssSource.includes(".task-playback-evidence-modal") && cssSource.includes(".task-playback-evidence-section"), "Task playback evidence modal should have stable CSS");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
+  ok("Activity owns current events; Backlog rows expose compact status plus Activity/playback deep links");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }
 

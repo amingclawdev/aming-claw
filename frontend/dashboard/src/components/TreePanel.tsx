@@ -268,6 +268,14 @@ export default function TreePanel(props: Props) {
           collapsed={collapsed}
           onClick={() => props.onSelectView("backlog")}
         />
+        <NavRow
+          icon="◷"
+          label="Activity"
+          meta={loading ? "…" : String(backlogCount)}
+          active={activeView === "playback"}
+          collapsed={collapsed}
+          onClick={() => props.onSelectView("playback")}
+        />
       </div>
 
       {collapsed ? null : (
