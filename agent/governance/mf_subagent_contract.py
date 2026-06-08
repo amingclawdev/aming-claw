@@ -137,9 +137,14 @@ _DISPATCH_REQUIRED_FIELDS = (
     "target_head_commit",
     "merge_queue_id",
     "fence_token",
+    "route_token_ref",
     "route_context_hash",
     "prompt_contract_id",
 )
+_MF_SUBAGENT_ALLOWED_QUERY_PURPOSES = {
+    "subagent_context_build",
+    "subagent_gate_validation",
+}
 _PARENT_ROUTE_LINEAGE_REQUIRED_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -1313,6 +1318,39 @@ def _route_context_hash(payload: Mapping[str, Any]) -> str:
     )
 
 
+def _route_identity_value(payload: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        token = _string(payload.get(name))
+        if token:
+            return token
+    for container in _route_identity_containers(payload):
+        for name in names:
+            token = _string(container.get(name))
+            if token:
+                return token
+        hashes = _nested_mapping(container, "hashes")
+        for name in names:
+            token = _string(hashes.get(name))
+            if token:
+                return token
+    return ""
+
+
+def _route_id(payload: Mapping[str, Any]) -> str:
+    return _route_identity_value(payload, "route_id", "id")
+
+
+def _route_token_ref(payload: Mapping[str, Any]) -> str:
+    return _route_identity_value(payload, "route_token_ref", "route_token_reference")
+
+
+def _route_visible_injection_manifest_hash(payload: Mapping[str, Any]) -> str:
+    return _route_identity_value(
+        payload,
+        "visible_injection_manifest_hash",
+    )
+
+
 def _route_prompt_contract_hash(payload: Mapping[str, Any]) -> str:
     prompt_contract = _nested_mapping(payload, "prompt_contract")
     route_prompt_contract = _nested_mapping(payload, "route_prompt_contract")
@@ -1850,6 +1888,7 @@ def _normalize_graph_trace_evidence(
         for trace_id in _trace_id_strings(item)
     )
     query_source = _first_deep_string(source, {"query_source"})
+    query_purpose = _first_deep_string(source, {"query_purpose"})
     if query_source and query_source != "mf_subagent":
         raise MfSubagentContractError(
             "graph trace evidence must use query_source=mf_subagent"
@@ -1857,6 +1896,11 @@ def _normalize_graph_trace_evidence(
     if required and not query_source:
         raise MfSubagentContractError(
             "graph trace evidence requires explicit query_source=mf_subagent"
+        )
+    if query_purpose and query_purpose not in _MF_SUBAGENT_ALLOWED_QUERY_PURPOSES:
+        raise MfSubagentContractError(
+            "graph trace evidence uses unsupported query_purpose="
+            f"{query_purpose}; use subagent_context_build or subagent_gate_validation"
         )
 
     embedded_task_id = _first_deep_string(source, {"task_id"})
@@ -1927,6 +1971,7 @@ def _normalize_graph_trace_evidence(
         "required": required,
         "present": bool(trace_ids),
         "query_source": query_source,
+        "query_purpose": query_purpose,
         "trace_ids": trace_ids,
         "task_id": observed["task_id"],
         "parent_task_id": observed["parent_task_id"],
@@ -1984,6 +2029,11 @@ def _normalize_dispatch_graph_obligation(
     if required and not query_source:
         raise MfSubagentContractError(
             "dispatch graph obligation requires query_source=mf_subagent"
+        )
+    if query_purpose and query_purpose not in _MF_SUBAGENT_ALLOWED_QUERY_PURPOSES:
+        raise MfSubagentContractError(
+            "dispatch graph obligation uses unsupported query_purpose="
+            f"{query_purpose}; use subagent_context_build or subagent_gate_validation"
         )
     if embedded_worker_role and embedded_worker_role != MF_SUB_ROLE:
         raise MfSubagentContractError(
@@ -2267,15 +2317,27 @@ def _normalize_service_dispatch_evidence(
 
 def _child_route_prompt_contract(
     *,
+    route_id: str = "",
     route_context_hash: str = "",
     prompt_contract_id: str = "",
     prompt_contract_hash: str = "",
+    route_token_ref: str = "",
+    visible_injection_manifest_hash: str = "",
 ) -> dict[str, str]:
-    return {
+    contract = {
         "route_context_hash": _string(route_context_hash),
         "prompt_contract_id": _string(prompt_contract_id),
         "prompt_contract_hash": _string(prompt_contract_hash),
     }
+    for key, value in (
+        ("route_id", route_id),
+        ("route_token_ref", route_token_ref),
+        ("visible_injection_manifest_hash", visible_injection_manifest_hash),
+    ):
+        token = _string(value)
+        if token:
+            contract[key] = token
+    return contract
 
 
 def _child_route_prompt_contract_from_payload(
@@ -2288,12 +2350,17 @@ def _child_route_prompt_contract_from_payload(
     if not child_route:
         child_route = _nested_mapping(route_lineage, "route_prompt_contract")
     return _child_route_prompt_contract(
+        route_id=_route_id(payload) or _string(child_route.get("route_id")),
         route_context_hash=_route_context_hash(payload)
         or _string(child_route.get("route_context_hash")),
         prompt_contract_id=_route_prompt_contract_id(payload)
         or _string(child_route.get("prompt_contract_id") or child_route.get("id")),
         prompt_contract_hash=_route_prompt_contract_hash(payload)
         or _string(child_route.get("prompt_contract_hash")),
+        route_token_ref=_route_token_ref(payload)
+        or _string(child_route.get("route_token_ref")),
+        visible_injection_manifest_hash=_route_visible_injection_manifest_hash(payload)
+        or _string(child_route.get("visible_injection_manifest_hash")),
     )
 
 
@@ -2571,6 +2638,7 @@ def _accepted_waiver_matches(
     route_context_hash: str,
     prompt_contract_id: str,
     prompt_contract_hash: str,
+    route_token_ref: str,
 ) -> bool:
     status = _string(waiver.get("status") or waiver.get("decision")).lower()
     accepted = _bool(waiver.get("accepted")) or status in {
@@ -2583,6 +2651,7 @@ def _accepted_waiver_matches(
     if not accepted:
         return False
     waiver_prompt_hash = _string(waiver.get("prompt_contract_hash"))
+    waiver_route_token_ref = _string(waiver.get("route_token_ref"))
     return (
         _string(waiver.get("route_context_hash")) == route_context_hash
         and _string(waiver.get("prompt_contract_id")) == prompt_contract_id
@@ -2590,6 +2659,10 @@ def _accepted_waiver_matches(
             not waiver_prompt_hash
             or not prompt_contract_hash
             or waiver_prompt_hash == prompt_contract_hash
+        )
+        and (
+            not route_token_ref
+            or waiver_route_token_ref == route_token_ref
         )
     )
 
@@ -2600,6 +2673,7 @@ def _dispatch_evidence_matches(
     route_context_hash: str,
     prompt_contract_id: str,
     prompt_contract_hash: str,
+    route_token_ref: str,
 ) -> bool:
     status = _string(evidence.get("status") or evidence.get("decision")).lower()
     if (
@@ -2620,6 +2694,7 @@ def _dispatch_evidence_matches(
     ).lower()
     worker_role_ok = not role or role in _WORKER_ROLES or role == MF_SUB_ROLE
     evidence_prompt_hash = _string(evidence.get("prompt_contract_hash"))
+    evidence_route_token_ref = _string(evidence.get("route_token_ref"))
     return (
         allowed
         and worker_role_ok
@@ -2629,6 +2704,10 @@ def _dispatch_evidence_matches(
             not evidence_prompt_hash
             or not prompt_contract_hash
             or evidence_prompt_hash == prompt_contract_hash
+        )
+        and (
+            not route_token_ref
+            or evidence_route_token_ref == route_token_ref
         )
     )
 
@@ -2750,6 +2829,7 @@ def _startup_evidence_matches(
     route_context_hash: str,
     prompt_contract_id: str,
     prompt_contract_hash: str,
+    route_token_ref: str,
 ) -> bool:
     if _startup_intent_only(evidence) or not _actual_startup_identity_present(evidence):
         return False
@@ -2776,6 +2856,7 @@ def _startup_evidence_matches(
     ).lower()
     worker_role_ok = not role or role in _WORKER_ROLES or role == MF_SUB_ROLE
     evidence_prompt_hash = _string(evidence.get("prompt_contract_hash"))
+    evidence_route_token_ref = _string(evidence.get("route_token_ref"))
     return (
         allowed
         and worker_role_ok
@@ -2785,6 +2866,10 @@ def _startup_evidence_matches(
             not evidence_prompt_hash
             or not prompt_contract_hash
             or evidence_prompt_hash == prompt_contract_hash
+        )
+        and (
+            not route_token_ref
+            or evidence_route_token_ref == route_token_ref
         )
     )
 
@@ -2827,18 +2912,21 @@ def _bounded_worker_evidence_matches(
     route_context_hash: str,
     prompt_contract_id: str,
     prompt_contract_hash: str,
+    route_token_ref: str,
 ) -> dict[str, Any]:
     dispatch_matches = _dispatch_evidence_matches(
         dispatch_evidence,
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+        route_token_ref=route_token_ref,
     )
     startup_matches = _startup_evidence_matches(
         startup_evidence,
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+        route_token_ref=route_token_ref,
     )
     dispatch_fence = _fence_evidence_present(dispatch_evidence)
     startup_fence = _fence_evidence_present(startup_evidence)
@@ -2969,6 +3057,7 @@ def validate_route_action_gate(
     route_context_hash = _route_context_hash(payload)
     prompt_contract_id = _route_prompt_contract_id(payload)
     prompt_contract_hash = _route_prompt_contract_hash(payload)
+    route_token_ref = _route_token_ref(payload)
     route_alert_codes = _route_alert_codes(payload)
     implementation_action = action_name in _IMPLEMENTATION_ACTIONS
     high_risk_policy = _route_action_high_risk_policy(payload)
@@ -2987,6 +3076,7 @@ def validate_route_action_gate(
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+        route_token_ref=route_token_ref,
     )
 
     if implementation_action and provider_unavailable_reason:
@@ -2997,6 +3087,10 @@ def validate_route_action_gate(
     if implementation_action and (not route_context_hash or not prompt_contract_id):
         raise MfSubagentContractError(
             "implementation action requires route_context_hash and prompt_contract_id"
+        )
+    if implementation_action and not route_token_ref:
+        raise MfSubagentContractError(
+            "implementation action requires route_token_ref"
         )
     if (
         caller_role in _OBSERVER_JUDGER_ROLES
@@ -3068,6 +3162,7 @@ def validate_route_action_gate(
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+        route_token_ref=route_token_ref,
     )
     dispatch_matches = bool(bounded_worker_evidence["dispatch_present"])
     startup_matches = bool(bounded_worker_evidence["startup_present"])
@@ -3108,6 +3203,7 @@ def validate_route_action_gate(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "route_token_ref": route_token_ref,
         "machine_context_required": bool(high_risk_policy["required"]),
         "machine_context_policy": high_risk_policy,
         "route_machine_context": machine_context,
@@ -3869,6 +3965,34 @@ def validate_mf_subagent_dispatch_gate(
             ("route_prompt_contract", ("prompt_contract_hash",)),
         ),
     )
+    route_id = _dispatch_string(
+        payload,
+        names=("route_id",),
+        nested_keys=(
+            ("route_context", ("route_id", "id")),
+            ("prompt_contract", ("route_id",)),
+            ("route_prompt_contract", ("route_id",)),
+        ),
+    )
+    route_token_ref = _dispatch_string(
+        payload,
+        names=("route_token_ref",),
+        nested_keys=(
+            ("route_context", ("route_token_ref",)),
+            ("prompt_contract", ("route_token_ref",)),
+            ("route_prompt_contract", ("route_token_ref",)),
+            ("graph_identity", ("route_token_ref",)),
+        ),
+    )
+    visible_injection_manifest_hash = _dispatch_string(
+        payload,
+        names=("visible_injection_manifest_hash",),
+        nested_keys=(
+            ("route_context", ("visible_injection_manifest_hash",)),
+            ("prompt_contract", ("visible_injection_manifest_hash",)),
+            ("route_prompt_contract", ("visible_injection_manifest_hash",)),
+        ),
+    )
     project_id = _dispatch_string(
         payload,
         names=("project_id",),
@@ -3970,6 +4094,7 @@ def validate_mf_subagent_dispatch_gate(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "route_token_ref": route_token_ref,
     }
     missing = [field for field in _DISPATCH_REQUIRED_FIELDS if not values[field]]
     if missing:
@@ -3990,9 +4115,12 @@ def validate_mf_subagent_dispatch_gate(
         backlog_id=backlog_id,
     )
     child_route_prompt_contract = _child_route_prompt_contract(
+        route_id=route_id,
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+        route_token_ref=route_token_ref,
+        visible_injection_manifest_hash=visible_injection_manifest_hash,
     )
     governed_evidence_required = _governed_nontrivial_graph_required(
         payload,
@@ -4115,6 +4243,9 @@ def validate_mf_subagent_dispatch_gate(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "route_id": route_id,
+        "route_token_ref": route_token_ref,
+        "visible_injection_manifest_hash": visible_injection_manifest_hash,
         "route_prompt_contract": child_route_prompt_contract,
         "parent_route_lineage": parent_route_lineage,
         "route_lineage": _mf_subagent_route_lineage(
@@ -4158,6 +4289,9 @@ def build_mf_subagent_input(
     route_context_hash: str = "",
     prompt_contract_id: str = "",
     prompt_contract_hash: str = "",
+    route_id: str = "",
+    route_token_ref: str = "",
+    visible_injection_manifest_hash: str = "",
     parent_route_lineage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable input payload for a branch-isolated MF subagent."""
@@ -4166,9 +4300,12 @@ def build_mf_subagent_input(
     parent_task_id = _parent_task_id_for_contract_view(context)
     runtime_context_id = mf_subagent_runtime_context_id(context)
     child_route_prompt_contract = _child_route_prompt_contract(
+        route_id=route_id,
         route_context_hash=route_context_hash,
         prompt_contract_id=prompt_contract_id,
         prompt_contract_hash=prompt_contract_hash,
+        route_token_ref=route_token_ref,
+        visible_injection_manifest_hash=visible_injection_manifest_hash,
     )
     normalized_parent_route_lineage = _normalize_parent_route_lineage(
         parent_route_lineage,
@@ -4585,15 +4722,46 @@ def validate_mf_subagent_finish_gate(
     )
     startup_evidence = _route_startup_evidence(payload)
     startup_present = _bounded_startup_evidence_present(startup_evidence)
+    observer_command_id = _dispatch_string(
+        payload,
+        names=("observer_command_id",),
+        nested_keys=(
+            ("worker_contract", ("observer_command_id",)),
+            ("evidence", ("observer_command_id",)),
+            ("startup_evidence", ("observer_command_id",)),
+            ("mf_subagent_startup_gate", ("observer_command_id",)),
+        ),
+    ) or _string(startup_evidence.get("observer_command_id"))
+    read_receipt_event_id = _dispatch_string(
+        payload,
+        names=("read_receipt_event_id", "read_receipt_timeline_id"),
+        nested_keys=(
+            ("read_receipt", ("event_id", "timeline_event_id", "timeline_id", "id")),
+            ("worker_contract", ("read_receipt_event_id",)),
+            ("evidence", ("read_receipt_event_id",)),
+            ("startup_evidence", ("read_receipt_event_id",)),
+            ("mf_subagent_startup_gate", ("read_receipt_event_id",)),
+        ),
+    ) or _string(startup_evidence.get("read_receipt_event_id"))
     if not startup_present:
         raise MfSubagentContractError(
             "MF subagent finish gate requires actual mf_subagent_startup evidence "
             "before close-ready"
         )
+    if not observer_command_id:
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires observer_command_id lineage before "
+            "close-ready"
+        )
     if not read_receipt_hash:
         raise MfSubagentContractError(
             "MF subagent finish gate requires mf_subagent_read_receipt before "
             "close-ready"
+        )
+    if not read_receipt_event_id:
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires mf_subagent_read_receipt event lineage "
+            "before close-ready"
         )
 
     return {
@@ -4604,6 +4772,7 @@ def validate_mf_subagent_finish_gate(
         "target_project_id": context.target_project_id or context.project_id,
         "target_project_root": context.target_project_root,
         "task_id": context.task_id,
+        "observer_command_id": observer_command_id,
         "backlog_id": context.backlog_id,
         "branch_ref": context.branch_ref,
         "worktree_path": context.worktree_path,
@@ -4624,6 +4793,7 @@ def validate_mf_subagent_finish_gate(
         "governed_evidence_required": governed_evidence_required,
         "startup_evidence": startup_evidence,
         "read_receipt_hash": read_receipt_hash,
+        "read_receipt_event_id": read_receipt_event_id,
         "gate_receipt_hash": gate_receipt_hash,
         "receipt_gate": {
             "schema_version": "mf_subagent_receipt_gate.v1",
@@ -4631,6 +4801,8 @@ def validate_mf_subagent_finish_gate(
                 governed_evidence_required or graph_trace_evidence.get("present")
             ),
             "read_receipt_present": bool(read_receipt_hash),
+            "read_receipt_event_id_present": bool(read_receipt_event_id),
+            "observer_command_id_present": bool(observer_command_id),
             "gate_receipt_present": bool(gate_receipt_hash),
             "startup_present": startup_present,
             "status": "passed",

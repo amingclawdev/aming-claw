@@ -234,7 +234,16 @@ backlog-specific `execute_backlog_row` command for the same backlog and route
 identity, then pass that command id through CLI/MCP/API as
 `observer_command_id`. Do not use an arbitrary `observer_command_next` result as
 lineage; it is valid only when it is the exact claimed `execute_backlog_row`
-command for this backlog and route identity. Timeline or durable evidence may
+command for this backlog and route identity. The command payload must carry the
+public route identity, `route_token_ref`, and merge queue identity. Existing
+retry commands may supply `merge_queue_id` through documented replay/runtime
+evidence containers, but missing route token, stale/superseded route identity,
+or missing merge queue identity blocks before claim, runtime text, worker
+launch, startup, or counting evidence. The next legal action is to fail or
+supersede that command and enqueue a corrected `execute_backlog_row` for the
+current route, then prepare runtime text, record the worker read receipt, and
+only then record actual startup/counting evidence or launch/resume the worker.
+Timeline or durable evidence may
 store `observer_command_id`, `runtime_context_id`, `launch_text_hash`, the
 generated startup intent packet, branch runtime evidence, graph trace identity,
 and service dispatch evidence, but MUST NOT persist raw launch text.

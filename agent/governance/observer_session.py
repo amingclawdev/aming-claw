@@ -144,10 +144,41 @@ VALID_COMMAND_TYPES = {
 
 EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS = (
     "backlog_id",
+    "merge_queue_id",
     "route_id",
     "route_context_hash",
     "prompt_contract_id",
+    "route_token_ref",
     "visible_injection_manifest_hash",
+)
+EXECUTE_BACKLOG_ROW_STALE_ROUTE_STATUS_FIELDS = (
+    "route_identity_status",
+    "route_context_status",
+    "route_evidence_status",
+    "route_status",
+    "prompt_contract_status",
+)
+EXECUTE_BACKLOG_ROW_SUPERSEDE_ROUTE_FIELDS = (
+    "route_identity_superseded",
+    "route_context_superseded",
+    "route_evidence_superseded",
+    "route_identity_supersede",
+    "superseded_route_identity",
+)
+EXECUTE_BACKLOG_ROW_STALE_ROUTE_STATUSES = {
+    "stale",
+    "superseded",
+    "supersede",
+    "invalidated",
+    "expired",
+    "route_identity_supersede",
+}
+EXECUTE_BACKLOG_ROW_MERGE_QUEUE_CONTAINER_KEYS = (
+    "corrected_replay_instructions",
+    "branch_runtime_evidence",
+    "branch_runtime_context",
+    "graph_identity",
+    "runtime_identity",
 )
 
 ACTION_SESSION_HEARTBEAT = "observer_session_heartbeat"
@@ -1727,18 +1758,31 @@ def _missing_startup_surface_blocker(command: dict[str, Any], *, now: str) -> di
         "status": "blocked",
         "observer_command_id": str(command.get("command_id") or ""),
         "backlog_id": str(payload.get("backlog_id") or ""),
+        "merge_queue_id": _execute_backlog_payload_required_value(payload, "merge_queue_id"),
         "route_id": str(payload.get("route_id") or ""),
         "route_context_hash": str(payload.get("route_context_hash") or ""),
         "prompt_contract_id": str(payload.get("prompt_contract_id") or ""),
+        "route_token_ref": str(payload.get("route_token_ref") or ""),
         "visible_injection_manifest_hash": str(
             payload.get("visible_injection_manifest_hash") or ""
         ),
+        "route_identity": _route_identity_from_payload(payload),
         "claimed_at": str(command.get("claimed_at") or ""),
         "failed_at": now,
+        "next_legal_action": {
+            "tool": "observer_runtime_text_prepare",
+            "description": (
+                "Prepare runtime text from the claimed execute_backlog_row command, "
+                "record mf_subagent_read_receipt, then record actual startup before "
+                "counting worker evidence."
+            ),
+            "observer_command_id": str(command.get("command_id") or ""),
+        },
         "reason": (
             "execute_backlog_row completion requires actual bounded mf_sub startup "
-            "evidence or an explicit terminal dispatch blocker; branch allocation "
-            "and runtime-text startup intent are not startup"
+            "evidence joined to the claimed observer_command_id and prior "
+            "mf_subagent_read_receipt, or an explicit terminal dispatch blocker; "
+            "branch allocation and runtime-text startup intent are not startup"
         ),
     }
 
@@ -1756,15 +1800,27 @@ def _missing_first_progress_blocker(
         "status": "blocked",
         "observer_command_id": str(command.get("command_id") or ""),
         "backlog_id": str(payload.get("backlog_id") or ""),
+        "merge_queue_id": _execute_backlog_payload_required_value(payload, "merge_queue_id"),
         "route_id": str(payload.get("route_id") or ""),
         "route_context_hash": str(payload.get("route_context_hash") or ""),
         "prompt_contract_id": str(payload.get("prompt_contract_id") or ""),
+        "route_token_ref": str(payload.get("route_token_ref") or ""),
         "visible_injection_manifest_hash": str(
             payload.get("visible_injection_manifest_hash") or ""
         ),
+        "route_identity": _route_identity_from_payload(payload),
         "claimed_at": str(command.get("claimed_at") or ""),
         "failed_at": now,
         "progress_watchdog": dict(progress_watchdog),
+        "next_legal_action": {
+            "tool": "task_timeline_append",
+            "description": (
+                "Append implementation, verification, checkpoint, finish-gate, "
+                "or terminal-blocker evidence only after command/read-receipt/"
+                "startup lineage is recorded."
+            ),
+            "observer_command_id": str(command.get("command_id") or ""),
+        },
         "reason": (
             "execute_backlog_row completion cannot treat mf_subagent_startup as "
             "implementation progress; completion requires graph/precheck/route "
@@ -1786,6 +1842,51 @@ def _route_identity_from_payload(payload: Mapping[str, Any] | dict[str, Any]) ->
             payload.get("visible_injection_manifest_hash") or ""
         ),
     }
+
+
+def _execute_backlog_route_payload_containers(payload: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return []
+    containers: list[Mapping[str, Any]] = [payload]
+    for key in (
+        "route_identity",
+        "claimed_route_identity",
+        "route_context",
+        "route_prompt_contract",
+        "route_prompt_bundle",
+        "prompt_contract",
+        "bundle",
+    ):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    return containers
+
+
+def _execute_backlog_route_identity_blockers(payload: Any) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    for container in _execute_backlog_route_payload_containers(payload):
+        for field in EXECUTE_BACKLOG_ROW_STALE_ROUTE_STATUS_FIELDS:
+            status = str(container.get(field) or "").strip().lower().replace("-", "_")
+            if status in EXECUTE_BACKLOG_ROW_STALE_ROUTE_STATUSES:
+                blockers.append(
+                    {
+                        "field": field,
+                        "status": status,
+                        "reason": "stale_or_superseded_route_identity",
+                    }
+                )
+        for field in EXECUTE_BACKLOG_ROW_SUPERSEDE_ROUTE_FIELDS:
+            value = container.get(field)
+            if value is True or (isinstance(value, str) and value.strip()):
+                blockers.append(
+                    {
+                        "field": field,
+                        "status": "superseded",
+                        "reason": "stale_or_superseded_route_identity",
+                    }
+                )
+    return blockers
 
 
 def _command_claim_age_sec(command: dict[str, Any], *, now: str) -> float | None:
@@ -1856,8 +1957,31 @@ def _execute_backlog_payload_missing_fields(payload: Any) -> list[str]:
     return [
         field
         for field in EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS
-        if not str(payload.get(field) or "").strip()
+        if not _execute_backlog_payload_required_value(payload, field)
     ]
+
+
+def _execute_backlog_payload_required_value(payload: Any, field: str) -> str:
+    if not isinstance(payload, Mapping):
+        return ""
+    direct = str(payload.get(field) or "").strip()
+    if direct:
+        return direct
+    if field != "merge_queue_id":
+        return ""
+    for key in EXECUTE_BACKLOG_ROW_MERGE_QUEUE_CONTAINER_KEYS:
+        nested = payload.get(key)
+        if not isinstance(nested, Mapping):
+            continue
+        token = str(nested.get("merge_queue_id") or "").strip()
+        if token:
+            return token
+        context = nested.get("context")
+        if isinstance(context, Mapping):
+            token = str(context.get("merge_queue_id") or "").strip()
+            if token:
+                return token
+    return ""
 
 
 def _execute_backlog_payload_blocker(
@@ -1865,24 +1989,49 @@ def _execute_backlog_payload_blocker(
     *,
     now: str,
     missing: list[str] | None = None,
+    route_identity_blockers: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
     missing_fields = missing if missing is not None else _execute_backlog_payload_missing_fields(payload)
+    identity_blockers = (
+        route_identity_blockers
+        if route_identity_blockers is not None
+        else _execute_backlog_route_identity_blockers(payload)
+    )
+    blocker_id = (
+        "execute_backlog_row_stale_route_identity"
+        if identity_blockers and not missing_fields
+        else "execute_backlog_row_invalid_route_payload"
+    )
     return {
-        "blocker_id": "execute_backlog_row_invalid_route_payload",
+        "blocker_id": blocker_id,
         "dispatch_blocker": True,
         "terminal_dispatch_blocker": True,
         "status": "blocked",
         "observer_command_id": str(command.get("command_id") or ""),
         "command_status": str(command.get("status") or ""),
         "backlog_id": str(payload.get("backlog_id") or ""),
+        "merge_queue_id": _execute_backlog_payload_required_value(payload, "merge_queue_id"),
         "target_session_id": str(command.get("target_session_id") or ""),
         "route_identity": _route_identity_from_payload(payload),
         "missing_required_fields": missing_fields,
+        "route_identity_blockers": identity_blockers,
         "failed_at": now,
+        "next_legal_action": {
+            "tool": "observer_command_fail_or_supersede_then_enqueue",
+            "description": (
+                "Fail or supersede this command, then enqueue and claim a fresh "
+                "backlog-specific execute_backlog_row command with active route "
+                "identity, route_token_ref, merge_queue_id, and branch runtime "
+                "allocation evidence before preparing runtime text or launching "
+                "a worker."
+            ),
+            "required_payload_fields": list(EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS),
+        },
         "reason": (
             "execute_backlog_row command cannot be claimed because its route-bound "
-            "payload is missing required route/backlog evidence"
+            "payload is missing required route/backlog evidence or carries stale "
+            "route identity"
         ),
     }
 
@@ -1902,6 +2051,7 @@ def _execute_backlog_claim_evidence(
         "claimed_at": now,
         "command_type": str(command.get("command_type") or ""),
         "backlog_id": str(payload.get("backlog_id") or ""),
+        "merge_queue_id": _execute_backlog_payload_required_value(payload, "merge_queue_id"),
         "target_session_id": str(command.get("target_session_id") or ""),
         "route_identity": route_identity,
         "precheck_evidence": {
@@ -1932,6 +2082,7 @@ def _observer_command_contract_projection(
         "command_id": str(command.get("command_id") or ""),
         "command_type": str(command.get("command_type") or ""),
         "backlog_id": str(payload.get("backlog_id") or ""),
+        "merge_queue_id": _execute_backlog_payload_required_value(payload, "merge_queue_id"),
         "route_identity": route_identity,
     }
     body = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -1969,6 +2120,15 @@ def _validate_command_payload(command_type: str, payload: Any) -> None:
         raise ValueError(
             "execute_backlog_row payload missing required fields: "
             + ", ".join(missing)
+        )
+    identity_blockers = _execute_backlog_route_identity_blockers(payload)
+    if identity_blockers:
+        blocked_fields = ", ".join(
+            str(item.get("field") or "") for item in identity_blockers if item.get("field")
+        )
+        raise ValueError(
+            "execute_backlog_row payload carries stale or superseded route identity: "
+            + blocked_fields
         )
 
 
@@ -2481,6 +2641,7 @@ def observer_command_consumer_recovery(
 
     payload = diagnosed.get("payload") if isinstance(diagnosed.get("payload"), dict) else {}
     missing = _execute_backlog_payload_missing_fields(payload)
+    route_identity_blockers = _execute_backlog_route_identity_blockers(payload)
     sessions = list_sessions(conn, project_id=pid, limit=100, now=timestamp)
     consumers = [_consumer_session_diagnostic(session, diagnosed) for session in sessions]
     connected = [
@@ -2527,11 +2688,12 @@ def observer_command_consumer_recovery(
         }
     )
 
-    if missing:
+    if missing or route_identity_blockers:
         blocker = _execute_backlog_payload_blocker(
             diagnosed,
             now=timestamp,
             missing=missing,
+            route_identity_blockers=route_identity_blockers,
         )
         base.update(
             {
@@ -2539,11 +2701,7 @@ def observer_command_consumer_recovery(
                 "classification": "claim_validation_error",
                 "blocker": blocker,
                 "next_legal_action": {
-                    "tool": "observer_command_fail",
-                    "description": (
-                        "Fail or supersede the malformed command with a complete "
-                        "route-bound execute_backlog_row payload."
-                    ),
+                    **dict(blocker.get("next_legal_action") or {}),
                     "command_id": str(diagnosed.get("command_id") or ""),
                     "requires_session_token": True,
                 },
@@ -3028,11 +3186,17 @@ def claim_command(
         if str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         else []
     )
-    if missing:
+    route_identity_blockers = (
+        _execute_backlog_route_identity_blockers(payload)
+        if str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
+        else []
+    )
+    if missing or route_identity_blockers:
         blocker = _execute_backlog_payload_blocker(
             command,
             now=timestamp,
             missing=missing,
+            route_identity_blockers=route_identity_blockers,
         )
         result_payload = _command_result(command)
         result_payload["ok"] = False

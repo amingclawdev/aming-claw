@@ -133,7 +133,7 @@ def _insert_mf_sub_graph_query_trace(
             snapshot_id,
             "mcp",
             "mf_subagent",
-            "prompt_context_build",
+            "subagent_context_build",
             run_id,
             parent_task_id,
             runtime_context_id,
@@ -220,8 +220,12 @@ def _finish_gate_evidence(
             "worktree_path": worktree_path,
             "branch_ref": branch_ref,
             "head_commit": head_commit,
+            "route_token_ref": f"rtok-{fence_token}",
+            "observer_command_id": f"cmd-{fence_token}",
+            "read_receipt_event_id": f"rr-{fence_token}",
         },
         "read_receipt_hash": f"sha256:read-{fence_token}",
+        "read_receipt_event_id": f"rr-{fence_token}",
     }
 
 
@@ -1234,6 +1238,7 @@ def test_runtime_text_prepare_accepts_parallel_branch_allocate_evidence(conn, tm
                 route_context_hash="sha256:route-api",
                 prompt_contract_id="rprompt-api",
                 prompt_contract_hash="sha256:prompt-api",
+                route_token_ref="rtok-api",
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),
@@ -1443,6 +1448,7 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
                 "route_id": "route-api",
                 "prompt_contract_id": "rprompt-api",
                 "prompt_contract_hash": "sha256:prompt-api",
+                "route_token_ref": "rtok-api",
                 "visible_injection_manifest_hash": "sha256:visible-api",
                 "main_worktree": str(main),
                 "owned_files": ["agent/observer_runtime.py"],
@@ -1507,6 +1513,7 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
                 "route_id": "route-api",
                 "prompt_contract_id": "rprompt-api",
                 "prompt_contract_hash": "sha256:prompt-api",
+                "route_token_ref": "rtok-api",
                 "visible_injection_manifest_hash": "sha256:visible-api",
                 "main_worktree": str(main),
                 "owned_files": ["agent/observer_runtime.py"],
@@ -1618,6 +1625,7 @@ def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(co
                 "route_context_hash": "sha256:route-api",
                 "route_id": "route-api",
                 "prompt_contract_id": "rprompt-api",
+                "route_token_ref": "rtok-api",
                 "visible_injection_manifest_hash": "sha256:visible-api",
                 "main_worktree": str(main),
                 "owned_files": ["agent/observer_runtime.py"],
@@ -1672,6 +1680,7 @@ def test_observer_runtime_text_prepare_rejects_runtime_context_identity_mismatch
                 "route_context_hash": "sha256:route-api",
                 "route_id": "route-api",
                 "prompt_contract_id": "rprompt-api",
+                "route_token_ref": "rtok-api",
                 "visible_injection_manifest_hash": "sha256:visible-api",
                 "main_worktree": str(main),
                 "owned_files": ["agent/observer_runtime.py"],
@@ -1739,6 +1748,7 @@ def test_observer_runtime_text_prepare_rejects_persisted_runtime_context_mismatc
         "route_context_hash": "sha256:route-api",
         "route_id": "route-api",
         "prompt_contract_id": "rprompt-api",
+        "route_token_ref": "rtok-api",
         "visible_injection_manifest_hash": "sha256:visible-api",
         "main_worktree": str(main),
         "owned_files": ["agent/observer_runtime.py"],
@@ -2218,13 +2228,14 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
             "target_files": ["agent/governance/server.py"],
             "acceptance_criteria": ["close gate projection is ready"],
         },
-        route_identity={
-            "route_id": "route-a4",
-            "route_context_hash": "sha256:route-a4",
-            "prompt_contract_id": "rprompt-a4",
-            "prompt_contract_hash": "sha256:prompt-a4",
-            "visible_injection_manifest_hash": "sha256:visible-a4",
-        },
+            route_identity={
+                "route_id": "route-a4",
+                "route_context_hash": "sha256:route-a4",
+                "prompt_contract_id": "rprompt-a4",
+                "prompt_contract_hash": "sha256:prompt-a4",
+                "route_token_ref": "rtok-a4",
+                "visible_injection_manifest_hash": "sha256:visible-a4",
+            },
         now_iso="2026-06-06T10:01:00Z",
     )
     read_receipt = task_timeline.record_event(
@@ -2298,7 +2309,7 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
             "scope-a4",
             "mcp",
             "mf_subagent",
-            "prompt_context_build",
+            "subagent_context_build",
             _mf_sub_run_id("runtime-a4-task", "fence-a4"),
             "AC-RUNTIME-A4",
             "",
@@ -2978,8 +2989,11 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "route_context_hash": "sha256:route-startup",
                 "prompt_contract_id": "rprompt-startup",
                 "prompt_contract_hash": "sha256:prompt-startup",
+                "route_token_ref": "rtok-startup",
                 "visible_injection_manifest_hash": "sha256:visible-startup",
                 "observer_command_id": "cmd-startup",
+                "read_receipt_hash": "sha256:read-startup",
+                "read_receipt_event_id": "2873",
             },
         )
     )
@@ -2997,6 +3011,88 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
     assert started["timeline_event_recorded"]["event_kind"] == "mf_subagent_startup"
     assert len(events) == 1
     assert events[0]["payload"]["mf_subagent_startup_gate"]["worker_role"] == "mf_sub"
+
+
+def test_parallel_branch_startup_blocks_missing_command_read_receipt_lineage(
+    conn, tmp_path
+):
+    worktree = tmp_path / "worker-startup-missing-lineage"
+    worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        batch_id="PB-api-startup-missing-lineage",
+        task_id="startup-missing-lineage-task",
+        root_task_id="startup-missing-lineage-parent",
+        stage_task_id="startup-missing-lineage-task",
+        backlog_id="FEAT-STARTUP-LINEAGE-GATE",
+        branch_ref="refs/heads/codex/startup-missing-lineage-task",
+        status="worktree_ready",
+        worker_id="startup-lineage-worker",
+        agent_id="startup-lineage-agent",
+        fence_token="fence-startup-lineage",
+        worktree_path=str(worktree),
+        base_commit="base-startup-lineage",
+        head_commit="base-startup-lineage",
+        target_head_commit="target-startup-lineage",
+        merge_queue_id="mergeq-startup-lineage",
+    )
+    upsert_branch_context(
+        conn,
+        runtime_context,
+        now_iso="2026-06-03T07:30:00Z",
+    )
+
+    blocked = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "startup-missing-lineage-task",
+                "parent_task_id": "startup-missing-lineage-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "startup-lineage-worker",
+                "agent_id": "startup-lineage-agent",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "session_token_surrogate": "host-session:lineage",
+                "fence_token": "fence-startup-lineage",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/startup-missing-lineage-task",
+                "head_commit": "head-startup-lineage",
+                "base_commit": "base-startup-lineage",
+                "target_head_commit": "target-startup-lineage",
+                "merge_queue_id": "mergeq-startup-lineage",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                "route_id": "route-startup-lineage",
+                "route_context_hash": "sha256:route-startup-lineage",
+                "prompt_contract_id": "rprompt-startup-lineage",
+                "prompt_contract_hash": "sha256:prompt-startup-lineage",
+                "route_token_ref": "rtok-startup-lineage",
+                "visible_injection_manifest_hash": "sha256:visible-startup-lineage",
+            },
+        )
+    )
+
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="FEAT-STARTUP-LINEAGE-GATE",
+        event_kind="mf_subagent_startup",
+    )
+    assert blocked["ok"] is False
+    assert blocked["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
+    assert "observer_command_id" in blocked["missing_required_fields"]
+    assert "read_receipt_hash" in blocked["missing_required_fields"]
+    assert "read_receipt_event_id" in blocked["missing_required_fields"]
+    assert blocked["next_legal_action"]["tool"] == (
+        "observer_read_receipt_then_startup"
+    )
+    assert events == []
 
 
 def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allocation(
@@ -3066,8 +3162,11 @@ def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allo
                 "route_context_hash": "sha256:route-host-startup",
                 "prompt_contract_id": "rprompt-host-startup",
                 "prompt_contract_hash": "sha256:prompt-host-startup",
+                "route_token_ref": "rtok-host-startup",
                 "visible_injection_manifest_hash": "sha256:visible-host-startup",
                 "observer_command_id": "cmd-host-startup",
+                "read_receipt_hash": "sha256:read-host-startup",
+                "read_receipt_event_id": "2873",
             },
         )
     )
@@ -3147,8 +3246,11 @@ def test_parallel_branch_startup_accepts_codex_cli_host_startup_id_for_observer_
                 "route_context_hash": "sha256:route-codex-cli-startup",
                 "prompt_contract_id": "rprompt-codex-cli-startup",
                 "prompt_contract_hash": "sha256:prompt-codex-cli-startup",
+                "route_token_ref": "rtok-codex-cli-startup",
                 "visible_injection_manifest_hash": "sha256:visible-codex-cli-startup",
                 "observer_command_id": "cmd-codex-cli-startup",
+                "read_receipt_hash": "sha256:read-codex-cli-startup",
+                "read_receipt_event_id": "2873",
             },
         )
     )
@@ -3222,8 +3324,11 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                 "route_context_hash": "sha256:route-host-startup",
                 "prompt_contract_id": "rprompt-host-startup",
                 "prompt_contract_hash": "sha256:prompt-host-startup",
+                "route_token_ref": "rtok-host-startup",
                 "visible_injection_manifest_hash": "sha256:visible-host-startup",
                 "observer_command_id": "cmd-host-startup",
+                "read_receipt_hash": "sha256:read-host-startup",
+                "read_receipt_event_id": "2873",
             },
         )
     )
@@ -3260,8 +3365,11 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                 "route_context_hash": "sha256:route-host-startup",
                 "prompt_contract_id": "rprompt-host-startup",
                 "prompt_contract_hash": "sha256:prompt-host-startup",
+                "route_token_ref": "rtok-host-startup",
                 "visible_injection_manifest_hash": "sha256:visible-host-startup",
                 "observer_command_id": "cmd-host-startup",
+                "read_receipt_hash": "sha256:read-host-startup",
+                "read_receipt_event_id": "2873",
             },
         )
     )
@@ -3300,10 +3408,13 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                     "route_context_hash": "sha256:route-host-startup",
                     "prompt_contract_id": "rprompt-host-startup",
                     "prompt_contract_hash": "sha256:prompt-host-startup",
+                    "route_token_ref": "rtok-host-startup",
                     "visible_injection_manifest_hash": (
                         "sha256:visible-host-startup"
                     ),
                     "observer_command_id": "cmd-host-startup",
+                    "read_receipt_hash": "sha256:read-host-startup",
+                    "read_receipt_event_id": "2873",
                 },
             )
         )
@@ -3342,8 +3453,11 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                 "route_context_hash": "sha256:route-host-startup",
                 "prompt_contract_id": "rprompt-host-startup",
                 "prompt_contract_hash": "sha256:prompt-host-startup",
+                "route_token_ref": "rtok-host-startup",
                 "visible_injection_manifest_hash": "sha256:visible-host-startup",
                 "observer_command_id": "cmd-host-startup",
+                "read_receipt_hash": "sha256:read-host-startup",
+                "read_receipt_event_id": "2873",
             },
         )
     )
@@ -7862,6 +7976,7 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
                     "snapshot_id": "active",
                     "tool": "query_schema",
                     "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
                     "parent_task_id": "subtask-1",
                     "worker_role": "mf_sub",
                     "fence_token": "fence-subtask-1",
@@ -7879,6 +7994,7 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
                     "snapshot_id": "active",
                     "tool": "query_schema",
                     "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
                     "task_id": "subtask-1",
                     "worker_role": "mf_sub",
                     "fence_token": "fence-subtask-1",
@@ -7896,6 +8012,7 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
                     "snapshot_id": "active",
                     "tool": "query_schema",
                     "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
                     "task_id": "subtask-1",
                     "parent_task_id": "parent-task-1",
                     "fence_token": "fence-subtask-1",
@@ -7913,12 +8030,35 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
                     "snapshot_id": "active",
                     "tool": "query_schema",
                     "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
                     "task_id": "subtask-1",
                     "parent_task_id": "parent-task-1",
                     "worker_role": "mf_sub",
                 },
             )
         )
+
+    with pytest.raises(server.GovernanceError) as unsupported_purpose:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "query_purpose": "observer_private_context",
+                    "task_id": "subtask-1",
+                    "parent_task_id": "parent-task-1",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-subtask-1",
+                },
+            )
+        )
+    assert unsupported_purpose.value.code == (
+        "unsupported_mf_subagent_graph_query_purpose"
+    )
 
     upsert_branch_context(
         conn,

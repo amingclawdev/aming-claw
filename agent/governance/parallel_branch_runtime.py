@@ -1434,6 +1434,7 @@ def _runtime_context_evidence_refs(
             "route_context_hash": route_identity.get("route_context_hash", ""),
             "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
             "prompt_contract_hash": route_identity.get("prompt_contract_hash", ""),
+            "route_token_ref": route_identity.get("route_token_ref", ""),
         },
         "timeline": timeline_refs,
         "graph_trace": graph_trace_refs,
@@ -1500,6 +1501,7 @@ def _runtime_context_current_values(
         "prompt_contract_hash": _runtime_context_text(
             route_identity.get("prompt_contract_hash")
         ),
+        "route_token_ref": _runtime_context_text(route_identity.get("route_token_ref")),
         "visible_injection_manifest_hash": _runtime_context_text(
             route_identity.get("visible_injection_manifest_hash")
         ),
@@ -1629,6 +1631,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "evidence_ref": "route_identity",
         },
         {
+            "field": "route_token_ref",
+            "expected_source": "route_prompt_contract.route_token_ref",
+            "producer": "route_prompt_contract",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
             "field": "target_files",
             "expected_source": "contract_revision.payload.target_files",
             "producer": "parallel_branch_runtime",
@@ -1738,6 +1747,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
         {
             "field": "prompt_contract_hash",
             "expected_source": "route_prompt_contract.prompt_contract_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "route_token_ref",
+            "expected_source": "route_prompt_contract.route_token_ref",
             "producer": "route_prompt_contract",
             "consumer": "record_mf_subagent_startup",
             "evidence_ref": "route_identity",
@@ -1886,6 +1902,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
             "evidence_ref": "route_identity",
         },
+        {
+            "field": "route_token_ref",
+            "expected_source": "route_prompt_contract.route_token_ref",
+            "producer": "route_prompt_contract",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "route_identity",
+        },
     ),
     "close": (
         {
@@ -1919,6 +1942,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
         {
             "field": "route_context_hash",
             "expected_source": "route_prompt_contract.route_context_hash",
+            "producer": "route_prompt_contract",
+            "consumer": "close_gate",
+            "evidence_ref": "route_identity",
+        },
+        {
+            "field": "route_token_ref",
+            "expected_source": "route_prompt_contract.route_token_ref",
             "producer": "route_prompt_contract",
             "consumer": "close_gate",
             "evidence_ref": "route_identity",
@@ -2036,6 +2066,7 @@ def build_runtime_context_gate_inputs_view(
         "route_context_hash": values.get("route_context_hash", ""),
         "prompt_contract_id": values.get("prompt_contract_id", ""),
         "prompt_contract_hash": values.get("prompt_contract_hash", ""),
+        "route_token_ref": values.get("route_token_ref", ""),
         "visible_injection_manifest_hash": values.get(
             "visible_injection_manifest_hash",
             "",
@@ -2237,6 +2268,7 @@ def build_runtime_context_close_gate_view(
         ("graph_trace", "graph_trace_ids"),
         ("route_context_hash", "route_context_hash"),
         ("prompt_contract_hash", "prompt_contract_hash"),
+        ("route_token_ref", "route_token_ref"),
         ("merge_queue", "merge_queue_id"),
     )
     checklist = []
@@ -3664,6 +3696,24 @@ def _startup_blocker(
         "message": message,
         "missing": list(missing),
     }
+    if missing:
+        payload["missing_required_fields"] = list(missing)
+    lineage_missing = {
+        "observer_command_id",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+    }.intersection(missing)
+    if lineage_missing:
+        payload["next_legal_action"] = {
+            "tool": "observer_read_receipt_then_startup",
+            "description": (
+                "Use the claimed backlog-specific execute_backlog_row "
+                "observer_command_id, record the mf_sub read receipt under the "
+                "same route lineage, then retry actual startup evidence with "
+                "observer_command_id, read_receipt_hash, and read_receipt_event_id."
+            ),
+            "required_fields": sorted(lineage_missing),
+        }
     if context is not None:
         payload["context"] = {
             "project_id": context.project_id,
@@ -3698,6 +3748,7 @@ def _startup_route_identity(payload: Mapping[str, Any]) -> dict[str, str]:
         "route_context_hash": str(payload.get("route_context_hash") or "").strip(),
         "prompt_contract_id": str(payload.get("prompt_contract_id") or "").strip(),
         "prompt_contract_hash": str(payload.get("prompt_contract_hash") or "").strip(),
+        "route_token_ref": str(payload.get("route_token_ref") or "").strip(),
         "visible_injection_manifest_hash": str(
             payload.get("visible_injection_manifest_hash") or ""
         ).strip(),
@@ -3715,6 +3766,7 @@ def _startup_route_identity_mismatches(
         "route_context_hash",
         "prompt_contract_id",
         "prompt_contract_hash",
+        "route_token_ref",
         "visible_injection_manifest_hash",
     ):
         expected_value = str(expected.get(field) or "").strip()
@@ -3803,6 +3855,7 @@ def record_mf_subagent_startup(
     route_context_hash = str(payload.get("route_context_hash") or "").strip()
     prompt_contract_id = str(payload.get("prompt_contract_id") or "").strip()
     prompt_contract_hash = str(payload.get("prompt_contract_hash") or "").strip()
+    route_token_ref = str(payload.get("route_token_ref") or "").strip()
     visible_manifest = str(payload.get("visible_injection_manifest_hash") or "").strip()
     owned_files = _startup_string_list(payload.get("owned_files"))
     supplied_runtime_context_id = str(payload.get("runtime_context_id") or "").strip()
@@ -3814,6 +3867,15 @@ def record_mf_subagent_startup(
         payload.get("read_receipt_hash") or payload.get("worker_read_receipt_hash") or ""
     ).strip()
     read_receipt = payload.get("read_receipt") if isinstance(payload.get("read_receipt"), Mapping) else {}
+    read_receipt_event_id = str(
+        payload.get("read_receipt_event_id")
+        or payload.get("read_receipt_timeline_id")
+        or read_receipt.get("event_id")
+        or read_receipt.get("timeline_event_id")
+        or read_receipt.get("timeline_id")
+        or read_receipt.get("id")
+        or ""
+    ).strip()
     host_startup_id = str(payload.get("host_startup_id") or "").strip()
     host_session_id = str(
         payload.get("host_session_id")
@@ -3875,9 +3937,12 @@ def record_mf_subagent_startup(
         ("route_context_hash", route_context_hash),
         ("prompt_contract_id", prompt_contract_id),
         ("prompt_contract_hash", prompt_contract_hash),
+        ("route_token_ref", route_token_ref),
         ("visible_injection_manifest_hash", visible_manifest),
         ("owned_files", owned_files),
         ("observer_command_id", observer_command_id),
+        ("read_receipt_hash", read_receipt_hash),
+        ("read_receipt_event_id", read_receipt_event_id),
         ("governance_project_id", governance_project_id),
         ("target_project_id", target_project_id),
     ):
@@ -4155,6 +4220,7 @@ def record_mf_subagent_startup(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "route_token_ref": route_token_ref,
         "visible_injection_manifest_hash": visible_manifest,
         "session_token_hash": token_evidence["session_token_hash"],
         "session_token_surrogate": token_evidence["session_token_surrogate"],
@@ -4165,6 +4231,7 @@ def record_mf_subagent_startup(
         "startup_timing": "actual_worker_started",
         "observer_command_id": observer_command_id,
         "read_receipt_hash": read_receipt_hash,
+        "read_receipt_event_id": read_receipt_event_id,
         "read_receipt": dict(read_receipt),
         "host_startup_id": host_startup_id,
         "host_session_id": host_session_id,
@@ -4174,6 +4241,9 @@ def record_mf_subagent_startup(
             "expected_runtime_context_id": expected_runtime_context_id,
             "runtime_context_id_matches": runtime_context_id == expected_runtime_context_id,
             "route_identity_matches_latest_contract": not route_mismatches,
+            "read_receipt_lineage_present": bool(
+                observer_command_id and read_receipt_hash and read_receipt_event_id
+            ),
             "latest_contract_revision_id": latest_revision.revision_id
             if latest_revision is not None
             else "",
@@ -4199,6 +4269,8 @@ def record_mf_subagent_startup(
         },
         "artifact_refs": {
             "runtime_context_id": runtime_context_id,
+            "observer_command_id": observer_command_id,
+            "read_receipt_event_id": read_receipt_event_id,
             "session_token_evidence_type": token_evidence["session_token_evidence_type"],
         },
         "commit_sha": saved.head_commit,

@@ -29,9 +29,11 @@ def _register(conn: sqlite3.Connection, project_id: str = "demo") -> dict:
 def _execute_backlog_row_payload() -> dict:
     return {
         "backlog_id": "AC-ROUTE-HANDOFF",
+        "merge_queue_id": "mq-route-handoff",
         "route_id": "route-20260602-9cbbd7a9fd",
         "route_context_hash": "sha256:f1641a8d28b2a9211a14d90fed8dda4c40bb87380557f64a81e29e332568c27b",
         "prompt_contract_id": "rprompt-7417905f707deac2",
+        "route_token_ref": "rtok-route-handoff",
         "visible_injection_manifest_hash": "sha256:30e229df0e1948f6c206d954c8226acd9272816a4168216a4258a8ebf0328810",
         "subsystem": "observer",
     }
@@ -87,6 +89,7 @@ STALE_BOOTSTRAP_ROUTE = {
     "route_context_hash": "sha256:stale-bootstrap-route-context",
     "prompt_contract_id": "rprompt-repair-01c5a0404ba10777",
     "prompt_contract_hash": "sha256:stale-bootstrap-prompt-contract",
+    "route_token_ref": "rtok-stale-bootstrap",
     "visible_injection_manifest_hash": "sha256:stale-visible-manifest",
 }
 
@@ -95,12 +98,21 @@ CANONICAL_A3_ROUTE = {
     "route_context_hash": "sha256:6fff2f7365b877da0d6130365c4a5d96c7abb5d151ebb0960e4fc1abc65cec46",
     "prompt_contract_id": "rprompt-repair-e97d980211e2dc1c",
     "prompt_contract_hash": "sha256:ad98e3b14698b479dbb6d2c82d91f11758c1e1a26ab3b222b4d6ea9c8962b245",
+    "route_token_ref": "rtok-canonical-a3",
     "visible_injection_manifest_hash": "sha256:86e97fdf869553c3a339c7aefbe8dfa548e9899627209c070e541df11d0c69e7",
 }
 
 CANONICAL_CONTRACT_HASH = (
     "sha256:091f3bd50e9ad762979b8bc46092a31d18572f3d7f32e2e7649de76e4e23db51"
 )
+
+
+def _stale_execute_backlog_payload(backlog_id: str) -> dict:
+    return {
+        "backlog_id": backlog_id,
+        "merge_queue_id": "mq-route-handoff",
+        **STALE_BOOTSTRAP_ROUTE,
+    }
 
 
 def _route_event(kind: str, event_id: int, route: dict, *, status: str = "passed") -> dict:
@@ -993,7 +1005,9 @@ def test_execute_backlog_row_cli_timeout_blocks_even_with_startup_evidence():
 def test_execute_backlog_row_completion_projects_terminal_from_canonical_close_evidence():
     conn = _conn()
     session = _register(conn)
-    payload = {"backlog_id": "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604", **STALE_BOOTSTRAP_ROUTE}
+    payload = _stale_execute_backlog_payload(
+        "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604"
+    )
     command = observer_session.enqueue_command(
         conn,
         project_id="demo",
@@ -1042,7 +1056,7 @@ def test_execute_backlog_row_completion_projects_terminal_from_canonical_close_e
 def test_execute_backlog_row_completion_does_not_project_without_closed_backlog_state():
     conn = _conn()
     session = _register(conn)
-    payload = {"backlog_id": "AC-NO-CLOSE", **STALE_BOOTSTRAP_ROUTE}
+    payload = _stale_execute_backlog_payload("AC-NO-CLOSE")
     command = observer_session.enqueue_command(
         conn,
         project_id="demo",
@@ -1081,7 +1095,7 @@ def test_execute_backlog_row_completion_does_not_project_without_closed_backlog_
 def test_execute_backlog_row_completion_keeps_blocker_without_superseding_route_relation():
     conn = _conn()
     session = _register(conn)
-    payload = {"backlog_id": "AC-NO-SUPERSESSION", **STALE_BOOTSTRAP_ROUTE}
+    payload = _stale_execute_backlog_payload("AC-NO-SUPERSESSION")
     command = observer_session.enqueue_command(
         conn,
         project_id="demo",
@@ -1129,8 +1143,9 @@ def test_execute_backlog_row_rejects_missing_route_payload_fields():
     with pytest.raises(
         ValueError,
         match=(
-            "missing required fields: route_id, route_context_hash, "
-            "prompt_contract_id, visible_injection_manifest_hash"
+            "missing required fields: merge_queue_id, route_id, "
+            "route_context_hash, prompt_contract_id, route_token_ref, "
+            "visible_injection_manifest_hash"
         ),
     ):
         observer_session.enqueue_command(
@@ -1292,8 +1307,12 @@ def test_invalid_legacy_execute_payload_reports_validation_blocker_and_fails_on_
     assert recovery["status"] == "blocked"
     assert recovery["classification"] == "claim_validation_error"
     assert recovery["blocker"]["blocker_id"] == "execute_backlog_row_invalid_route_payload"
+    assert "merge_queue_id" in recovery["blocker"]["missing_required_fields"]
+    assert "route_token_ref" in recovery["blocker"]["missing_required_fields"]
     assert "route_id" in recovery["blocker"]["missing_required_fields"]
-    assert recovery["next_legal_action"]["tool"] == "observer_command_fail"
+    assert recovery["next_legal_action"]["tool"] == (
+        "observer_command_fail_or_supersede_then_enqueue"
+    )
 
     claimed = observer_session.claim_command(
         conn,
@@ -1309,6 +1328,85 @@ def test_invalid_legacy_execute_payload_reports_validation_blocker_and_fails_on_
     assert claimed["command"]["error"] == "execute_backlog_row_invalid_route_payload"
     assert claimed["claim_blocker"]["missing_required_fields"] == (
         claimed["command"]["result"]["claim_blocker"]["missing_required_fields"]
+    )
+
+
+def test_execute_backlog_row_accepts_nested_corrected_replay_merge_queue() -> None:
+    conn = _conn()
+    payload = _execute_backlog_row_payload()
+    merge_queue_id = payload.pop("merge_queue_id")
+    payload["corrected_replay_instructions"] = {
+        "merge_queue_id": merge_queue_id,
+    }
+    session = _register(conn)
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        notify=True,
+    )
+
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    evidence = claimed["command"]["result"]["observer_claim_evidence"]
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert evidence["merge_queue_id"] == merge_queue_id
+
+
+def test_execute_backlog_row_claim_blocks_missing_route_token_ref() -> None:
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    payload.pop("route_token_ref")
+    command = _insert_legacy_execute_command(conn, payload=payload)
+
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    blocker = claimed["claim_blocker"]
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert blocker["blocker_id"] == "execute_backlog_row_invalid_route_payload"
+    assert blocker["missing_required_fields"] == ["route_token_ref"]
+    assert blocker["next_legal_action"]["tool"] == (
+        "observer_command_fail_or_supersede_then_enqueue"
+    )
+
+
+def test_execute_backlog_row_claim_blocks_superseded_route_identity() -> None:
+    conn = _conn()
+    session = _register(conn)
+    payload = {
+        **_execute_backlog_row_payload(),
+        "route_identity_status": "superseded",
+    }
+    command = _insert_legacy_execute_command(conn, payload=payload)
+
+    claimed = observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    blocker = claimed["claim_blocker"]
+    assert claimed["command"]["status"] == observer_session.COMMAND_STATUS_FAILED
+    assert blocker["blocker_id"] == "execute_backlog_row_stale_route_identity"
+    assert blocker["route_identity_blockers"][0]["field"] == "route_identity_status"
+    assert blocker["next_legal_action"]["tool"] == (
+        "observer_command_fail_or_supersede_then_enqueue"
     )
 
 

@@ -996,16 +996,26 @@ def handle_project_bootstrap(ctx: RequestContext):
     if not workspace_path:
         return 400, {"error": "workspace_path is required"}
     project_id = _bootstrap_route_gate_project_id(ctx.body, workspace_path)
-    route_gate = _optional_route_token_mutation_gate(
-        ctx,
-        action="project_bootstrap",
-        project_id=project_id,
-    )
     route_handoff = _route_bootstrap_handoff(
         ctx.body or {},
         action="project_bootstrap",
         project_id=project_id,
     )
+    handoff_identity = (
+        route_handoff.get("route_identity") if isinstance(route_handoff, Mapping) else {}
+    )
+    if isinstance(handoff_identity, Mapping) and handoff_identity:
+        route_gate = _optional_route_token_mutation_gate(
+            ctx,
+            action="project_bootstrap",
+            project_id=project_id,
+        )
+    else:
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="project_bootstrap",
+            project_id=project_id,
+        )
 
     try:
         result = project_service.bootstrap_project(
@@ -4167,6 +4177,33 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         return _require_graph_governance_operator(ctx, conn, action)
 
     session = _require_graph_governance_mf_subagent(ctx, conn, action)
+    query_purpose = str(body.get("query_purpose") or "").strip()
+    allowed_query_purposes = {
+        "subagent_context_build",
+        "subagent_gate_validation",
+    }
+    if query_purpose not in allowed_query_purposes:
+        raise GovernanceError(
+            "unsupported_mf_subagent_graph_query_purpose",
+            (
+                "mf_subagent graph query requires query_purpose="
+                "subagent_context_build or subagent_gate_validation"
+            ),
+            422,
+            {
+                "query_source": "mf_subagent",
+                "query_purpose": query_purpose,
+                "allowed_query_purposes": sorted(allowed_query_purposes),
+                "next_legal_action": {
+                    "tool": "graph_query",
+                    "description": (
+                        "Retry the audited subagent graph query with "
+                        "query_purpose=subagent_context_build for context lookup "
+                        "or subagent_gate_validation for gate evidence."
+                    ),
+                },
+            },
+        )
     task_id = str(body.get("task_id") or "").strip()
     parent_task_id = str(body.get("parent_task_id") or "").strip()
     worker_role = str(body.get("worker_role") or "").strip().lower().replace("-", "_")
@@ -18371,6 +18408,7 @@ def _route_bootstrap_handoff(
                     "route_context_hash",
                     "prompt_contract_id",
                     "prompt_contract_hash",
+                    "route_token_ref",
                     "visible_injection_manifest_hash",
                 )
                 if payload.get(key)
@@ -18440,7 +18478,12 @@ def _route_waiver_identity_mismatch(
     if not isinstance(route_identity, Mapping) or not route_identity:
         return []
     mismatched: list[str] = []
-    for field in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+    for field in (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    ):
         expected = str(route_identity.get(field) or "").strip()
         supplied = str(waiver.get(field) or "").strip()
         if supplied and expected and supplied != expected:
@@ -18457,6 +18500,7 @@ def _route_identity_public_summary(value: Mapping[str, Any] | None) -> dict[str,
         "route_context_hash",
         "prompt_contract_id",
         "prompt_contract_hash",
+        "route_token_ref",
         "visible_injection_manifest_hash",
     ):
         text = str(value.get(field) or "").strip()
@@ -18481,7 +18525,12 @@ def _backlog_close_route_waiver_identity_block(
 
     waiver = _route_waiver_payload(dict(body) if isinstance(body, Mapping) else {})
     supplied_identity: dict[str, Any] = {**dict(waiver)}
-    for field in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+    for field in (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    ):
         if not supplied_identity.get(field) and route_gate.get(field):
             supplied_identity[field] = route_gate.get(field)
 
@@ -18578,6 +18627,7 @@ _TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS = (
 )
 _TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS = (
     "route_id",
+    "route_token_ref",
     "prompt_contract_hash",
     "visible_injection_manifest_hash",
     "worktree_path",
@@ -18690,12 +18740,17 @@ def _route_identity_mismatch_fields(
     require_required_fields: bool = False,
 ) -> list[str]:
     mismatched: list[str] = []
-    for field in ("route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+    for field in (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    ):
         expected = str(expected_identity.get(field) or "").strip()
         supplied = str(supplied_identity.get(field) or "").strip()
         if (
             require_required_fields
-            and field in {"route_context_hash", "prompt_contract_id"}
+            and field in {"route_context_hash", "prompt_contract_id", "route_token_ref"}
             and expected
             and not supplied
         ):
@@ -18742,6 +18797,7 @@ def _timeline_claimed_route_identity(
             "route_context_hash",
             "prompt_contract_id",
             "prompt_contract_hash",
+            "route_token_ref",
             "visible_injection_manifest_hash",
         ):
             token = str(candidate.get(field) or "").strip()
@@ -18862,6 +18918,8 @@ def _timeline_source_event_route_gate(
         "prompt_contract_id"
     ):
         return {}
+    if not route_identity.get("route_token_ref"):
+        return {}
     source_gate = task_timeline.route_owned_source_event_gate_verification(
         events,
         route_identity=route_identity,
@@ -18880,6 +18938,7 @@ def _timeline_source_event_route_gate(
         "route_context_hash": route_identity.get("route_context_hash", ""),
         "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
         "prompt_contract_hash": route_identity.get("prompt_contract_hash", ""),
+        "route_token_ref": route_identity.get("route_token_ref", ""),
         "visible_injection_manifest_hash": route_identity.get(
             "visible_injection_manifest_hash",
             "",
@@ -20374,6 +20433,11 @@ def _observer_runtime_text_contract_revision_payload(
         "owned_files",
         "target_files",
     )
+    route_identity = (
+        prepared.get("route_identity")
+        if isinstance(prepared.get("route_identity"), Mapping)
+        else _parallel_branch_runtime_contract_route_identity(body)
+    )
     return {
         "schema_version": "observer_runtime_text_contract_revision.v1",
         "source": "observer_runtime_text_prepare",
@@ -20382,6 +20446,10 @@ def _observer_runtime_text_contract_revision_payload(
         "observer_command_id": str(
             prepared.get("observer_command_id") or body.get("observer_command_id") or ""
         ),
+        "merge_queue_id": str(
+            prepared.get("merge_queue_id") or body.get("merge_queue_id") or ""
+        ),
+        "route_identity": dict(route_identity) if isinstance(route_identity, Mapping) else {},
         "target_files": owned_files,
         "owned_files": owned_files,
         "acceptance_criteria": _runtime_context_service_query_values(

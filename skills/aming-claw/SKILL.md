@@ -338,11 +338,19 @@ exception requires `same_worktree_allowed=true`, an explicit operator reason,
 exact dirty-scope evidence, and observer timeline evidence before dispatch.
 Use role/capability boundaries for parallel workers: `mf_sub` sessions may use
 the finish gate and task-scoped audited graph queries with
-`query_source=mf_subagent`, `parent_task_id`/`task_id`, and `fence_token`.
+`query_source=mf_subagent`, `query_purpose=subagent_context_build` or
+`subagent_gate_validation`, `parent_task_id`/`task_id`, and `fence_token`.
 Observer/coordinator remains required for merge queue writes, merge execution,
 graph reconcile/activation, backlog close, ServiceManager/governance restarts,
 worktree cleanup, and other privileged state changes. Do not tell a subagent to
 identify as observer to get graph access.
+For observer-launched `mf_sub` workers, the helper order is fixed: enqueue or
+claim the backlog-specific `execute_backlog_row` command with public route
+identity, `route_token_ref`, and merge queue identity; prepare runtime text;
+record the worker read receipt under that command/route lineage; then record
+actual startup/counting evidence or launch/resume the worker. Missing
+`route_token_ref`, stale/superseded route identity, unsupported graph query
+purpose, or unresolved merge queue identity must block before worker launch.
 For deterministic MF workflow workers, use the privileged-stage graph
 `dispatch -> implementation_wait -> handoff_gate -> merge_gate ->
 merge_queue_entry -> merge_preview -> live_merge -> reconcile -> close_gate ->

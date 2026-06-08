@@ -396,6 +396,7 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
             "route_context_hash": "sha256:route-runtime-context",
             "prompt_contract_id": "rprompt-runtime-context",
             "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
             "visible_injection_manifest_hash": "sha256:visible-runtime-context",
             "raw_private_context": secret,
         },
@@ -410,6 +411,7 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
             "worker_role": "mf_sub",
             "task_id": "task-runtime-context-projection",
             "parent_task_id": "task-parent",
+            "query_purpose": "subagent_context_build",
             "trace_ids": ["gqt-runtime-context"],
         },
         "finish_gate": {
@@ -578,6 +580,7 @@ def _dispatch_payload(**overrides: object) -> dict[str, object]:
         "route_context_hash": "sha256:route-context",
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
+        "route_token_ref": "rtok-worker-visible",
         "owned_files": ["agent/governance/mf_subagent_contract.py"],
         "dirty_scope_check": {
             "status": "passed",
@@ -756,6 +759,7 @@ def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
         "route_context_hash": "sha256:route-context",
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
+        "route_token_ref": "rtok-worker-visible",
     }
     assert evidence["route_lineage"]["parent_route_id"] == "route-20260602-parent"
     assert evidence["route_lineage"]["child_route_context_hash"] == (
@@ -912,6 +916,43 @@ def test_dispatch_gate_rejects_governed_graph_trace_wrong_query_source() -> None
         )
 
 
+def test_dispatch_gate_rejects_unsupported_graph_query_purpose() -> None:
+    with pytest.raises(MfSubagentContractError, match="unsupported query_purpose"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                governed_nontrivial=True,
+                graph_trace_evidence=_graph_trace_evidence(
+                    query_purpose="observer_private_context"
+                ),
+                branch_runtime_evidence=_branch_runtime_evidence(),
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
+
+
+@pytest.mark.parametrize(
+    "query_purpose",
+    ["subagent_context_build", "subagent_gate_validation"],
+)
+def test_dispatch_gate_accepts_supported_graph_query_purposes(
+    query_purpose: str,
+) -> None:
+    gate = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            governed_nontrivial=True,
+            graph_trace_evidence=_graph_trace_evidence(
+                query_purpose=query_purpose
+            ),
+            branch_runtime_evidence=_branch_runtime_evidence(),
+            service_dispatch_evidence=_service_dispatch_evidence(),
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert gate["graph_trace_evidence"]["query_purpose"] == query_purpose
+
+
 @pytest.mark.parametrize(
     "field",
     ["task_id", "parent_task_id", "worker_role", "fence_token"],
@@ -1064,6 +1105,7 @@ def test_dispatch_gate_accepts_optional_prompt_contract_hash_absent() -> None:
         ("base_commit", {"base_commit": ""}),
         ("target_head_commit", {"target_head_commit": ""}),
         ("merge_queue_id", {"merge_queue_id": ""}),
+        ("route_token_ref", {"route_token_ref": ""}),
         ("route_context_hash", {"route_context_hash": ""}),
         ("prompt_contract_id", {"prompt_contract_id": ""}),
     ],
@@ -1144,6 +1186,7 @@ def _route_action_payload(**overrides: object) -> dict[str, object]:
         "route_context_hash": "sha256:route-context",
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
+        "route_token_ref": "rtok-worker-visible",
         "visible_injection_manifest_hash": "sha256:visible-manifest",
         "route_alerts": [{"code": "observer_judger_must_not_implement"}],
         "version_check": {"status": "passed", "dirty": False, "dirty_files": []},
@@ -1202,6 +1245,7 @@ def _startup_evidence(**overrides: object) -> dict[str, object]:
         "route_context_hash": "sha256:route-context",
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
+        "route_token_ref": "rtok-worker-visible",
         "fence_token": "fence-1",
         "actual_cwd": "/repo/.worktrees/task-1",
         "actual_git_root": "/repo/.worktrees/task-1",
@@ -1698,6 +1742,7 @@ def test_route_action_gate_waiver_can_bypass_dirty_or_stale_preconditions() -> N
                 "route_context_hash": "sha256:route-context",
                 "prompt_contract_id": "rprompt-1",
                 "prompt_contract_hash": "sha256:prompt-contract",
+                "route_token_ref": "rtok-worker-visible",
             },
         )
     )
@@ -2140,6 +2185,9 @@ def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
         "route_context_hash": "sha256:child-route-context",
         "prompt_contract_id": "rprompt-child",
         "prompt_contract_hash": "sha256:child-prompt",
+        "route_token_ref": "rtok-finish-visible",
+        "observer_command_id": "cmd-finish",
+        "read_receipt_event_id": "2873",
     }
     payload.update(overrides)
     return payload
@@ -2357,6 +2405,7 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
             "summary": "Ready.",
             "mf_subagent_startup_gate": _finish_startup_evidence(),
             "read_receipt_hash": "sha256:read-finish",
+            "read_receipt_event_id": "2873",
             "gate_receipt_hash": "sha256:gate-finish",
         },
         context=_context(),
@@ -2369,6 +2418,7 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["replay_source"] == FINISH_GATE_REPLAY_SOURCE
     assert gate["merge_queue_ready"] is True
     assert gate["read_receipt_hash"] == "sha256:read-finish"
+    assert gate["read_receipt_event_id"] == "2873"
     assert gate["gate_receipt_hash"] == "sha256:gate-finish"
     assert gate["receipt_gate"]["status"] == "passed"
     assert gate["receipt_gate"]["startup_present"] is True
@@ -2402,6 +2452,7 @@ def test_finish_gate_accepts_nested_startup_evidence_object(nested_key: str) -> 
             "evidence": {
                 nested_key: _finish_startup_evidence(),
                 "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
             },
         },
         context=_context(),
@@ -2409,8 +2460,37 @@ def test_finish_gate_accepts_nested_startup_evidence_object(nested_key: str) -> 
 
     assert gate["startup_evidence"]["schema_version"] == "mf_subagent_startup_gate.v1"
     assert gate["read_receipt_hash"] == "sha256:read-finish"
+    assert gate["read_receipt_event_id"] == "2873"
     assert gate["receipt_gate"]["startup_present"] is True
     assert gate["close_ready"] is True
+
+
+def test_finish_gate_requires_read_receipt_event_lineage() -> None:
+    startup_evidence = _finish_startup_evidence()
+    startup_evidence.pop("read_receipt_event_id")
+    with pytest.raises(MfSubagentContractError, match="event lineage"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "summary": "Ready.",
+                "mf_subagent_startup_gate": startup_evidence,
+                "read_receipt_hash": "sha256:read-finish",
+            },
+            context=_context(),
+        )
 
 
 def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> None:
@@ -2568,6 +2648,7 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
             },
             "mf_subagent_startup_gate": _finish_startup_evidence(),
             "read_receipt_hash": "sha256:read-finish",
+            "read_receipt_event_id": "2873",
             "summary": "Ready.",
         },
         context=_context(),
