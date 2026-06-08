@@ -1,6 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
 
-import { isPrivatePlaybackText } from "../lib/taskPlayback";
 import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
 
 type EvidenceRef = TaskPlaybackFrame["evidence_links"][number];
@@ -364,6 +363,7 @@ function EvidenceInspectorModal({ frame, evidenceRef, onClose }: { frame: TaskPl
   const contextRows = evidenceContextRows(frame, evidenceRef);
   const diagnosisRows = frame.failure_diagnosis.map((fact) => ({ label: fact.label, value: fact.value, source: fact.source }));
   const detailRows = evidenceDetailRows(frame, evidenceRef);
+  const rawSections = evidenceRawSections(frame, evidenceRef);
   return (
     <div className="task-playback-evidence-modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
@@ -391,11 +391,12 @@ function EvidenceInspectorModal({ frame, evidenceRef, onClose }: { frame: TaskPl
         <EvidenceRowSection title="Structured context" rows={contextRows} />
         <EvidenceRowSection title="Failure/blocker diagnosis" rows={diagnosisRows} />
         <EvidenceRowSection title="Sanitized detail rows" rows={detailRows} />
+        <EvidenceRawSection sections={rawSections} />
         <div className="task-playback-evidence-actions">
           <button type="button" onClick={() => copyEvidenceLink(evidenceRef)}>
             Copy evidence ref
           </button>
-          <span>Advanced raw data stays collapsed in the event panel.</span>
+          <span>Raw payload, verification, and artifact_refs_json are inspectable here. Advanced raw data stays collapsed in the event panel.</span>
         </div>
       </section>
     </div>
@@ -419,6 +420,23 @@ function EvidenceRowSection({ title, rows }: { title: string; rows: EvidenceInsp
         ))}
       </dl>
     </div>
+  );
+}
+
+function EvidenceRawSection({ sections }: { sections: TaskPlaybackFrame["detail_inspector"]["raw_sections"] }) {
+  if (sections.length === 0) return null;
+  return (
+    <details className="backlog-inspector-raw task-playback-evidence-section">
+      <summary>Raw event data</summary>
+      <div className="backlog-inspector-json">
+        {sections.map((section) => (
+          <div key={section.label}>
+            <span>{section.redacted ? `${section.label} field-level redactions` : section.label}</span>
+            <pre>{formatInspectorValue(section.value)}</pre>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -510,9 +528,17 @@ function evidenceContextPersistenceRows(evidenceRef: EvidenceRef, rows: Evidence
   if (!["route_context", "prompt_contract", "source_event"].includes(kind)) return rows;
   const baseLabels = new Set(["event", "status", "event type", "phase", "summary"]);
   const hasPersistedContext = rows.some((row) => !baseLabels.has(row.label) && publicEvidenceText(row.value));
+  const identityVerified = routeIdentityVerified(rows);
   const next = [
     ...(isRouteContextOrReadReceiptRef(evidenceRef) ? routeContextBoundaryRows(rows) : []),
     ...rows,
+    ...(isRouteContextOrReadReceiptRef(evidenceRef) ? [{
+      label: "identity verification",
+      value: identityVerified
+        ? "identity verified; showing best canonical/visible route bundle and read receipt evidence"
+        : "identity not verified from persisted public fields",
+      source: "route boundary",
+    }] : []),
     {
       label: "context persistence",
       value: hasPersistedContext ? "public-safe context persisted on this event" : "public-safe context not persisted on this event",
@@ -527,6 +553,17 @@ function evidenceContextPersistenceRows(evidenceRef: EvidenceRef, rows: Evidence
     });
   }
   return next;
+}
+
+function routeIdentityVerified(rows: EvidenceInspectorRow[]): boolean {
+  return rows.some((row) => {
+    const label = row.label.toLowerCase();
+    const value = row.value.toLowerCase();
+    return /route context hash|prompt contract|visible injection|read receipt|route id/.test(label)
+      || /^sha256:/.test(value)
+      || value.includes("rprompt-")
+      || value.includes("route-");
+  });
 }
 
 function routeContextBoundaryRows(rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {
@@ -587,6 +624,15 @@ function rawPathRowsForEvidence(frame: TaskPlaybackFrame, evidenceRef: EvidenceR
     }
   }
   return rows;
+}
+
+function evidenceRawSections(frame: TaskPlaybackFrame, _evidenceRef: EvidenceRef): TaskPlaybackFrame["detail_inspector"]["raw_sections"] {
+  return frame.detail_inspector.raw_sections
+    .filter((section) => ["payload", "verification", "artifact_refs"].includes(section.label))
+    .map((section) => ({
+      ...section,
+      value: sanitizeModalRawValue(section.value, section.label),
+    }));
 }
 
 function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
@@ -703,10 +749,10 @@ function valueAtPath(record: Record<string, unknown>, path: string): unknown {
   }, record);
 }
 
-function publicEvidenceText(value: unknown): string {
+function publicEvidenceText(value: unknown, path = ""): string {
   if (value === null || value === undefined) return "";
   if (Array.isArray(value)) {
-    const values = value.map(publicEvidenceText).filter(Boolean);
+    const values = value.map((item, index) => publicEvidenceText(item, `${path}.${index}`)).filter(Boolean);
     if (values.length === 0) return "";
     const shown = values.slice(0, 6).join(", ");
     return values.length > 6 ? `${shown}, +${values.length - 6}` : shown;
@@ -714,9 +760,9 @@ function publicEvidenceText(value: unknown): string {
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
     const values = Object.entries(record)
-      .filter(([key]) => !isPrivateEvidenceField(key))
+      .filter(([key]) => !isPrivateEvidenceField(path ? `${path}.${key}` : key))
       .map(([key, item]) => {
-        const text = publicEvidenceText(item);
+        const text = publicEvidenceText(item, path ? `${path}.${key}` : key);
         return text ? `${labelFromPath(key)}: ${text}` : "";
       })
       .filter(Boolean);
@@ -724,13 +770,58 @@ function publicEvidenceText(value: unknown): string {
     const shown = values.slice(0, 4).join("; ");
     return values.length > 4 ? `${shown}; +${values.length - 4}` : shown;
   }
-  const text = String(value).replace(/(^|\s)(\/Users\/[^\s,;]+|\/home\/[^\s,;]+|\/var\/folders\/[^\s,;]+|[A-Za-z]:\\[^\s,;]+)/g, "$1[local path redacted]").trim();
-  if (!text || isPrivatePlaybackText(text)) return "";
+  const text = sanitizeModalText(String(value), path);
+  if (!text || text === "[private detail redacted]") return "";
   return text;
 }
 
 function isPrivateEvidenceField(key: string): boolean {
-  return /(^|[_\s-])(raw_prompt|prompt_text|prompt_body|hidden|private|secret|token|provider|filesystem|cwd|worktree_path|host_path|host_home|route_context)([_\s-]|$)/i.test(key);
+  const normalized = key.trim().toLowerCase();
+  const leaf = normalized.split(".").pop() ?? normalized;
+  if (
+    leaf === "route_context"
+    || leaf === "route_identity"
+    || leaf === "prompt_contract"
+    || leaf === "visible_injection_manifest"
+    || leaf === "visible_injection_manifest_hash"
+    || leaf === "judgment_brain_label"
+    || leaf === "route_docs"
+    || leaf === "source_label"
+    || leaf === "body_persisted_status"
+    || /(^|_)(hash|id|ids|refs)$/.test(leaf)
+    || leaf.endsWith("_hash")
+    || leaf.endsWith("_id")
+    || leaf.endsWith("_ids")
+    || leaf.endsWith("_refs")
+  ) {
+    return false;
+  }
+  return /(^|[._\s-])(raw_prompt|raw_private_prompt_text|private_prompt|prompt_text|prompt_body|prompt_payload|hidden_prompt|hidden_context|system_prompt|developer_prompt|secret|credential|credentials|password|api_key|access_token|refresh_token|auth_token|one_time_auth|filesystem|cwd|worktree_path|host_path|host_paths|host_home|raw_private_context|raw_private_route_body|private_route_context_body|private_body|observer_only_context|unmanifested_prompt_text)([._\s-]|$)|(^|[._\s-])token([._\s-]|$)(?!hash)/i.test(normalized);
+}
+
+function sanitizeModalRawValue(value: unknown, path: string): unknown {
+  if (value == null || value === "") return value;
+  if (isPrivateEvidenceField(path)) return "[private detail redacted]";
+  if (Array.isArray(value)) return value.map((item, index) => sanitizeModalRawValue(item, `${path}.${index}`));
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      sanitizeModalRawValue(item, `${path}.${key}`),
+    ]));
+  }
+  return sanitizeModalText(String(value), path);
+}
+
+function sanitizeModalText(value: string, path: string): string {
+  const text = value
+    .replace(/(^|\s)(\/Users\/[^\s,;]+|\/home\/[^\s,;]+|\/var\/folders\/[^\s,;]+|[A-Za-z]:\\[^\s,;]+)/g, "$1[local path redacted]")
+    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,}\b/g, "[token redacted]")
+    .trim();
+  if (isPrivateEvidenceField(path)) return "[private detail redacted]";
+  if (/\[fixture private route context body\]|raw private route body|raw private context body|private route context body/i.test(text)) return "[private detail redacted]";
+  if (/(system|developer|hidden)[-_\s]?prompt\s*[:=]/i.test(text)) return "[private detail redacted]";
+  if (/(one[-_\s]?time[-_\s]?auth|credential|password|api[-_\s]?key|secret)\s*[:=]/i.test(text)) return "[private detail redacted]";
+  return text;
 }
 
 function stableEvidenceRows(rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {

@@ -200,7 +200,15 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
       acceptance_criteria: ["blocked reason visible", "actor context narrative visible"],
       required_evidence: ["implementation", "verification", "close_ready"],
       [PRIVATE_REQUEST_FIELD]: "[fixture private request text]",
-      route_context: "[fixture private route context body]",
+      route_context: {
+        source_label: "Judgment Brain route label",
+        route_docs: ["visible route context bundle", "read receipt context must be inspectable"],
+        visible_bundle: {
+          allowed_actions: ["dispatch bounded worker", "record read receipt"],
+          required_lanes_evidence: ["mf_subagent_read_receipt", "mf_subagent_startup"],
+        },
+        raw_private_route_body: "[fixture private route context body]",
+      },
     },
     created_at: "2026-06-07T11:00:00Z",
   },
@@ -470,6 +478,7 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   const auditRemainingScopeFrame = trace.frames.find((frame) => frame.source_event_id === "#329");
   const routeActionFrame = trace.frames.find((frame) => frame.title === "Route action requested");
   const serviceRouteFrame = trace.frames.find((frame) => frame.title === "Route service completed");
+  const readReceiptFrame = trace.frames.find((frame) => frame.source_event_id === "#204");
   const visible = JSON.stringify({
     close_gate_summary: trace.close_gate_summary,
     frames: trace.frames.map((frame) => ({
@@ -489,7 +498,8 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   assertFixture(Boolean(auditRemainingScopeFrame), "event #329 observer audit remaining-scope frame should hydrate payload_json into playback");
   assertFixture(Boolean(routeActionFrame), "route action frame should exist in the narrative fixture");
   assertFixture(Boolean(serviceRouteFrame), "route service frame should exist in the narrative fixture");
-  if (!promptContextFrame || !rawPromptContextFrame || !auditRemainingScopeFrame || !routeActionFrame || !serviceRouteFrame) throw new Error("missing route narrative fixture frames");
+  assertFixture(Boolean(readReceiptFrame), "read receipt frame should exist in the narrative fixture");
+  if (!promptContextFrame || !rawPromptContextFrame || !auditRemainingScopeFrame || !routeActionFrame || !serviceRouteFrame || !readReceiptFrame) throw new Error("missing route narrative fixture frames");
   assertFixture(
     trace.close_gate_summary.reason_sentence === "Blocked because implementation, verification, and close-ready evidence have not been recorded; the close gate cannot pass until those events exist.",
     "blocked close gate should show a human-readable reason sentence with missing event kinds",
@@ -513,6 +523,15 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   assertFixture(
     promptContextFrame.semantic_chips.some((chip) => chip.label === "required evidence" && chip.value === "implementation"),
     "route prompt context chips should show required evidence context",
+  );
+  const promptPayloadSection = promptContextFrame.detail_inspector.raw_sections.find((section) => section.label === "payload");
+  const promptPayloadVisible = JSON.stringify(promptPayloadSection?.value ?? {});
+  assertFixture(
+    promptPayloadVisible.includes("Judgment Brain route label")
+      && promptPayloadVisible.includes("visible route context bundle")
+      && promptPayloadVisible.includes("mf_subagent_read_receipt")
+      && !promptPayloadVisible.includes("[fixture private route context body]"),
+    "route prompt context raw payload should expose public route docs and Judgment Brain source labels while redacting only the private route body field",
   );
   assertFixture(
     rawPromptContextFrame.summary.includes("AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604")
@@ -559,6 +578,26 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       && !rawPromptInspectorVisible.includes("[fixture private request text]")
       && !rawPromptInspectorVisible.includes("[fixture private route context body]"),
     "event #1750 inspector context should expose route, prompt, and missing-evidence public fields without private raw prompt",
+  );
+  assertFixture(
+    rawPromptContextFrame.detail_inspector.raw_sections.map((section) => section.label).join(",") === "payload,verification,artifact_refs"
+      && rawPromptInspectorVisible.includes("Record matching route context")
+      && rawPromptInspectorVisible.includes("read_receipt_hash")
+      && rawPromptContextFrame.detail_inspector.redaction_count > 0,
+    "event #1750 raw event data should expose payload_json, verification_json, and artifact_refs_json with field-level redactions",
+  );
+  const readReceiptPayloadSection = readReceiptFrame.detail_inspector.raw_sections.find((section) => section.label === "payload");
+  const readReceiptPayloadVisible = JSON.stringify(readReceiptPayloadSection?.value ?? {});
+  assertFixture(
+    readReceiptPayloadVisible.includes("body_persisted_status")
+      && readReceiptPayloadVisible.includes("raw launch text not persisted")
+      && readReceiptPayloadVisible.includes("route_alerts")
+      && readReceiptPayloadVisible.includes("allowed_actions")
+      && readReceiptPayloadVisible.includes("blocked_actions")
+      && readReceiptPayloadVisible.includes("required_lanes_evidence")
+      && readReceiptPayloadVisible.includes("canonical_visible_contract_text_hash")
+      && !readReceiptPayloadVisible.includes("[fixture private request text]"),
+    "read receipt raw payload should expose canonical visible contract fields and route action bounds while redacting private prompt material",
   );
   assertFixture(
     auditRemainingScopeFrame.summary.includes("decision do not close P0 umbrella yet")

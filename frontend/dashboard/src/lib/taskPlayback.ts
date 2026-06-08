@@ -1,9 +1,7 @@
 import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
 import {
-  PRIVATE_TIMELINE_TEXT_KEY,
   isPrivateTimelineText,
   projectTaskTimelineEvent,
-  sanitizePublicTimelineText,
   timelineStatusFromEvent,
   type TaskTimelineEvidenceInspector,
   type TaskTimelineSemanticChip,
@@ -139,11 +137,17 @@ export interface NormalizeTaskPlaybackInput {
 }
 
 const FRAME_STATUS_ORDER: TaskPlaybackFrameStatus[] = ["blocked", "failed", "missing", "running", "waiting", "passed", "recorded", "unknown"];
-export const PRIVATE_EVIDENCE_KEY = PRIVATE_TIMELINE_TEXT_KEY;
+export const PRIVATE_EVIDENCE_KEY =
+  /(^|[._\s-])(raw_prompt|raw_private_prompt_text|private_prompt|prompt_text|prompt_body|prompt_payload|hidden_prompt|hidden_context|system_prompt|developer_prompt|secret|credential|credentials|password|api_key|access_token|refresh_token|auth_token|one_time_auth|filesystem|cwd|worktree_path|host_path|host_paths|host_home|raw_private_context|raw_private_route_body|private_route_context_body|private_body|observer_only_context|unmanifested_prompt_text)([._\s-]|$)|(^|[._\s-])token([._\s-]|$)(?!hash)/i;
 const ABSOLUTE_HOST_PATH = /(^|\s)(\/Users\/[^\s,;:]+|\/home\/[^\s,;:]+|\/var\/folders\/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)/g;
+const TOKEN_VALUE = /\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,}\b/g;
 
 export function isPrivatePlaybackText(value?: string | null): boolean {
   return isPrivateTimelineText(value);
+}
+
+export function sanitizeTaskPlaybackEvidenceText(value: string, path = ""): string {
+  return sanitizeEvidenceString(value, path);
 }
 
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {
@@ -307,7 +311,7 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
     specific_facts: specificFacts,
     failure_diagnosis: failureDiagnosis,
     evidence_links: evidenceLinks,
-    detail_inspector: semantic.inspector,
+    detail_inspector: playbackInspectorFromEvent(publicEvent, semantic),
     evidence_refs: evidenceRefs,
     artifact_refs: artifactRefs,
     has_structured_detail: specificFacts.length > 0 || failureDiagnosis.length > 0 || evidenceLinks.length > 1,
@@ -321,6 +325,62 @@ function hydrateTimelineEventJson(event: TaskTimelineEvent): TaskTimelineEvent {
     payload: hydratedRecord(event.payload, row.payload_json),
     verification: hydratedRecord(event.verification, row.verification_json),
     artifact_refs: hydratedRecord(event.artifact_refs, row.artifact_refs_json),
+  };
+}
+
+function playbackInspectorFromEvent(
+  event: TaskTimelineEvent,
+  semantic: TaskTimelineSemanticProjection,
+): TaskTimelineEvidenceInspector {
+  const payload = sanitizePlaybackInspectorValue(event.payload ?? {}, "payload");
+  const verification = sanitizePlaybackInspectorValue(event.verification ?? {}, "verification");
+  const artifactRefs = sanitizePlaybackInspectorValue(event.artifact_refs ?? {}, "artifact_refs");
+  const rows = stableInspectorRows(semantic.inspector.rows
+    .map((row) => ({
+      kind: sanitizeEvidenceString(row.kind, "inspector.kind"),
+      label: sanitizeEvidenceString(row.label, "inspector.label"),
+      value: sanitizeEvidenceString(row.value, "inspector.value"),
+    }))
+    .filter((row) => row.kind && row.label && row.value && row.value !== "[private detail redacted]"));
+  return {
+    rows,
+    raw_sections: [
+      { label: "payload", value: payload.value, redacted: payload.redaction_count > 0 },
+      { label: "verification", value: verification.value, redacted: verification.redaction_count > 0 },
+      { label: "artifact_refs", value: artifactRefs.value, redacted: artifactRefs.redaction_count > 0 },
+    ],
+    redaction_count: payload.redaction_count + verification.redaction_count + artifactRefs.redaction_count,
+  };
+}
+
+function sanitizePlaybackInspectorValue(value: unknown, path: string): { value: unknown; redaction_count: number } {
+  if (value == null || value === "") return { value, redaction_count: 0 };
+  if (isSensitiveEvidencePath(path)) return { value: "[private detail redacted]", redaction_count: 1 };
+  if (Array.isArray(value)) {
+    let redactionCount = 0;
+    const items = value.map((item, index) => {
+      const result = sanitizePlaybackInspectorValue(item, `${path}.${index}`);
+      redactionCount += result.redaction_count;
+      return result.value;
+    });
+    return { value: items, redaction_count: redactionCount };
+  }
+  if (typeof value === "object") {
+    let redactionCount = 0;
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const nextPath = `${path}.${key}`;
+      const result = sanitizePlaybackInspectorValue(item, nextPath);
+      out[key] = result.value;
+      redactionCount += result.redaction_count;
+    }
+    return { value: out, redaction_count: redactionCount };
+  }
+  const text = String(value);
+  const safe = sanitizeEvidenceString(text, path);
+  return {
+    value: safe,
+    redaction_count: safe !== text ? 1 : 0,
   };
 }
 
@@ -1111,7 +1171,7 @@ function pushFact(
   source: TaskPlaybackStructuredFact["source"],
 ): void {
   const safe = safeText(value);
-  if (!safe || PRIVATE_EVIDENCE_KEY.test(safe)) return;
+  if (!safe || safe === "[private detail redacted]") return;
   facts.push({ kind, label, value: safe, source });
 }
 
@@ -1155,10 +1215,10 @@ function publicValuesAtPaths(event: TaskTimelineEvent, paths: string[]): PublicF
 }
 
 function publicValuesAtPath(event: TaskTimelineEvent, path: string): PublicFieldValue[] {
-  if (PRIVATE_EVIDENCE_KEY.test(path)) return [];
+  if (isSensitiveEvidencePath(path)) return [];
   return stringsFromUnknown(valueAtPath(event as unknown as Record<string, unknown>, path))
     .map(safeText)
-    .filter((value) => value && value !== "[private detail redacted]" && !PRIVATE_EVIDENCE_KEY.test(value))
+    .filter((value) => value && value !== "[private detail redacted]")
     .map((value) => ({ value, path, source: sourceForPath(path) }));
 }
 
@@ -1175,16 +1235,16 @@ function publicOutcomeValuesAtPaths(event: TaskTimelineEvent, paths: string[]): 
 }
 
 function publicOutcomeValuesAtPath(event: TaskTimelineEvent, path: string): PublicFieldValue[] {
-  if (PRIVATE_EVIDENCE_KEY.test(path)) return [];
+  if (isSensitiveEvidencePath(path)) return [];
   return outcomeStringsFromUnknown(valueAtPath(event as unknown as Record<string, unknown>, path))
     .map(safeText)
-    .filter((value) => value && value !== "[private detail redacted]" && !PRIVATE_EVIDENCE_KEY.test(value))
+    .filter((value) => value && value !== "[private detail redacted]")
     .map((value) => ({ value, path, source: sourceForPath(path) }));
 }
 
 function firstCountAtPaths(event: TaskTimelineEvent, paths: string[]): { count: number; source: TaskPlaybackStructuredFact["source"]; path: string } | null {
   for (const path of paths) {
-    if (PRIVATE_EVIDENCE_KEY.test(path)) continue;
+    if (isSensitiveEvidencePath(path)) continue;
     const count = countUnknownItems(valueAtPath(event as unknown as Record<string, unknown>, path));
     if (count > 0) return { count, source: sourceForPath(path), path };
   }
@@ -1195,7 +1255,7 @@ function countUnknownItems(value: unknown): number {
   if (value == null || value === "") return 0;
   if (Array.isArray(value)) return value.filter((item) => safeText(stringFrom(item) || compactUnknown(item))).length;
   if (typeof value === "object") {
-    return Object.keys(value as Record<string, unknown>).filter((key) => !PRIVATE_EVIDENCE_KEY.test(key)).length;
+    return Object.keys(value as Record<string, unknown>).filter((key) => !isSensitiveEvidencePath(key)).length;
   }
   return safeText(String(value)) ? 1 : 0;
 }
@@ -1307,12 +1367,12 @@ function collectPublicStrings(containers: Record<string, unknown>[], keys: strin
   const values: string[] = [];
   for (const container of containers) {
     for (const [key, value] of Object.entries(container)) {
-      if (PRIVATE_EVIDENCE_KEY.test(key)) continue;
+      if (isSensitiveEvidencePath(key)) continue;
       if (!keys.includes(key)) continue;
       values.push(...stringsFromUnknown(value));
     }
   }
-  return stable(values.map(safeText).filter((value) => Boolean(value) && !PRIVATE_EVIDENCE_KEY.test(value))).slice(0, 18);
+  return stable(values.map(safeText).filter((value) => Boolean(value) && value !== "[private detail redacted]")).slice(0, 18);
 }
 
 function stringsFromUnknown(value: unknown): string[] {
@@ -1321,7 +1381,7 @@ function stringsFromUnknown(value: unknown): string[] {
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
     return Object.entries(record)
-      .filter(([key]) => !PRIVATE_EVIDENCE_KEY.test(key))
+      .filter(([key]) => !isSensitiveEvidencePath(key))
       .slice(0, 4)
       .map(([key, item]) => `${titleize(key)}: ${safeText(stringFrom(item) || compactUnknown(item))}`);
   }
@@ -1355,12 +1415,57 @@ function compactUnknown(value: unknown): string {
   if (value == null) return "";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
   if (Array.isArray(value)) return `${value.length} item${value.length === 1 ? "" : "s"}`;
-  const keys = Object.keys(value as Record<string, unknown>).filter((key) => !PRIVATE_EVIDENCE_KEY.test(key));
+  const keys = Object.keys(value as Record<string, unknown>).filter((key) => !isSensitiveEvidencePath(key));
   return keys.length > 0 ? keys.slice(0, 3).join(", ") : "record";
 }
 
+function isSensitiveEvidencePath(path: string): boolean {
+  const normalized = path.trim().toLowerCase();
+  if (!normalized) return false;
+  const leaf = normalized.split(".").pop() ?? normalized;
+  if (
+    leaf === "route_context"
+    || leaf === "route_identity"
+    || leaf === "prompt_contract"
+    || leaf === "visible_injection_manifest"
+    || leaf === "visible_injection_manifest_hash"
+    || leaf === "judgment_brain_label"
+    || leaf === "route_docs"
+    || leaf === "source_label"
+    || leaf === "body_persisted_status"
+    || /(^|_)(hash|id|ids|refs)$/.test(leaf)
+    || leaf.endsWith("_hash")
+    || leaf.endsWith("_id")
+    || leaf.endsWith("_ids")
+    || leaf.endsWith("_refs")
+  ) {
+    return false;
+  }
+  return PRIVATE_EVIDENCE_KEY.test(normalized);
+}
+
+function sanitizeEvidenceString(value: string, path = ""): string {
+  const redacted = value
+    .replace(ABSOLUTE_HOST_PATH, "$1[local path redacted]")
+    .replace(TOKEN_VALUE, "[token redacted]")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!redacted) return "";
+  if (isSensitiveEvidencePath(path) || isSensitiveEvidenceText(redacted, path)) return "[private detail redacted]";
+  return redacted;
+}
+
+function isSensitiveEvidenceText(value: string, path = ""): boolean {
+  const text = value.toLowerCase();
+  if (isSensitiveEvidencePath(path)) return true;
+  if (/\[fixture private route context body\]|raw private route body|raw private context body|private route context body/.test(text)) return true;
+  if (/(system|developer|hidden)[-_\s]?prompt\s*[:=]/i.test(value)) return true;
+  if (/(one[-_\s]?time[-_\s]?auth|credential|password|api[-_\s]?key|secret)\s*[:=]/i.test(value)) return true;
+  return false;
+}
+
 function safeText(value: string): string {
-  return sanitizePublicTimelineText(value).replace(ABSOLUTE_HOST_PATH, "$1[local path redacted]").replace(/\s+/g, " ").trim();
+  return sanitizeEvidenceString(value);
 }
 
 function stringFrom(value: unknown): string {
@@ -1378,9 +1483,9 @@ function eventIdentity(event: TaskTimelineEvent, index: number): string {
 }
 
 function eventDisplayId(event: TaskTimelineEvent): string {
-  if (event.event_id && !PRIVATE_EVIDENCE_KEY.test(event.event_id)) return safeText(event.event_id);
+  if (event.event_id && !isSensitiveEvidenceText(event.event_id, "event_id")) return safeText(event.event_id);
   if (event.id != null) return `#${event.id}`;
-  if (event.trace_id && !PRIVATE_EVIDENCE_KEY.test(event.trace_id)) return safeText(event.trace_id);
+  if (event.trace_id && !isSensitiveEvidenceText(event.trace_id, "trace_id")) return safeText(event.trace_id);
   return "recorded";
 }
 
@@ -1411,6 +1516,16 @@ function stableFacts(facts: TaskPlaybackStructuredFact[]): TaskPlaybackStructure
     seen.add(key);
     return true;
   });
+}
+
+function stableInspectorRows(rows: TaskTimelineEvidenceInspector["rows"]): TaskTimelineEvidenceInspector["rows"] {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    const key = `${row.kind}:${row.label}:${row.value}`;
+    if (!row.kind || !row.label || !row.value || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 36);
 }
 
 function stableEvidence(refs: TaskPlaybackEvidenceRef[]): TaskPlaybackEvidenceRef[] {

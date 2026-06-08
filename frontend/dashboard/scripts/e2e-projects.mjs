@@ -26,7 +26,7 @@ const PARENT_PROJECT = FLAGS.parent || DEFAULT_PARENT;
 const WORKSPACE = path.resolve(FLAGS.workspace || DEFAULT_WORKSPACE);
 const APPLY = FLAGS.apply === true;
 const SKIP_PARENT = FLAGS["skip-parent-isolation"] === true;
-const ONLY = String(FLAGS.only || "").trim();
+const ONLY = String(FLAGS.only || FLAGS.focused || "").trim();
 const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 
 const C = {
@@ -971,11 +971,14 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("Public-safe evidence context"), "Task playback evidence inspector should label its public-safe context boundary");
   assert(playbackPanelSource.includes("Structured context"), "Task playback evidence inspector should show structured context before raw data");
   assert(playbackPanelSource.includes("Sanitized detail rows"), "Task playback evidence inspector should expose sanitized detail rows without dumping JSON");
+  assert(playbackPanelSource.includes("EvidenceRawSection") && playbackPanelSource.includes("Raw event data"), "Task playback evidence inspector should expose raw event data inside the clicked evidence modal");
+  assert(playbackPanelSource.includes("payload, verification, and artifact_refs_json are inspectable here"), "Task playback evidence modal should make payload, verification, and artifact refs directly inspectable");
   assert(playbackPanelSource.includes("Copy evidence ref"), "Task playback evidence inspector should preserve copy-ref behavior");
   assert(playbackPanelSource.includes("Advanced raw data stays collapsed"), "Task playback evidence inspector should keep raw JSON in the collapsed advanced panel");
   assert(playbackPanelSource.includes("rawPathsForEvidenceKind"), "Task playback evidence inspector should extract typed public fields from sanitized raw sections");
   assert(playbackPanelSource.includes("route_context") && playbackPanelSource.includes("prompt_contract"), "Task playback evidence inspector should handle route context and prompt contract refs");
   assert(playbackPanelSource.includes("public-safe context not persisted on this event"), "Task playback evidence inspector should state when public route/prompt/source context was not persisted");
+  assert(playbackPanelSource.includes("identity verified; showing best canonical/visible route bundle and read receipt evidence"), "Task playback evidence inspector should say identity verified when route/prompt identity fields are present");
   assert(playbackPanelSource.includes("routeContextBoundaryRows"), "Task playback evidence inspector should add route/read-receipt public boundary rows");
   assert(playbackPanelSource.includes("raw private prompt text") && playbackPanelSource.includes("hidden and not exposed"), "Task playback read-receipt inspector should explicitly hide private prompt text");
   assert(playbackPanelSource.includes("body persisted status"), "Task playback read-receipt inspector should expose body persistence status");
@@ -999,6 +1002,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("next_expected_action"), "Task playback close-gate summary should expose next expected evidence/action");
   assert(playbackPanelSource.includes("raw_sections"), "Task playback panel should show sanitized/redacted raw evidence sections");
   assert(playbackSource.includes("payload_json") && playbackSource.includes("verification_json") && playbackSource.includes("artifact_refs_json"), "Task playback normalizer should hydrate structured public data from raw JSON timeline columns");
+  assert(playbackSource.includes("sanitizeTaskPlaybackEvidenceText") && playbackSource.includes("raw_private_route_body"), "Task playback normalizer should use local field-level redaction without globally hiding route context fields");
   assert(playbackSource.includes("specific_facts") && playbackSource.includes("failure_diagnosis") && playbackSource.includes("evidence_links"), "Task playback frames should expose structured facts, diagnosis, and evidence links");
   assert(viewSource.includes("redaction_count"), "Backlog evidence inspector should report redacted raw timeline fields");
   assert(playbackTestSource.includes("AC-OBSERVER-COMMAND-QUEUE-ACTIVE-CONSUMER-RECOVERY-20260607"), "Task playback fixture should cover the observer command recovery backlog");
@@ -1016,6 +1020,8 @@ function verifyBacklogEvidenceContract() {
   assert(playbackTestSource.includes("event #1750 specific facts should promote target-file, acceptance-criteria, required-evidence, route/prompt/source, read-receipt, and startup details"), "Task playback fixture should cover read-receipt/startup structured facts");
   assert(playbackTestSource.includes("event #1750 evidence links should include typed timeline, route context, prompt contract, source-event, read-receipt, and startup refs"), "Task playback fixture should cover typed evidence links");
   assert(playbackTestSource.includes("event #1750 inspector context should expose route, prompt, and missing-evidence public fields without private raw prompt"), "Task playback fixture should cover route-context inspector facts");
+  assert(playbackTestSource.includes("Judgment Brain route label") && playbackTestSource.includes("redacting only the private route body field"), "Task playback fixture should cover public Judgment Brain labels and field-level route body redaction");
+  assert(playbackTestSource.includes("payload_json, verification_json, and artifact_refs_json with field-level redactions"), "Task playback fixture should cover raw payload, verification, and artifact refs visibility");
   assert(playbackTestSource.includes("event #329 inspector context should expose audit decision, implemented scope, remaining acceptance, and remaining open facts"), "Task playback fixture should cover audit inspector facts");
   assert(playbackTestSource.includes("route service completion narrative should explain action outcome and missing evidence"), "Task playback fixture should cover service route completion narrative");
   assert(playbackTestSource.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."), "Task playback fixture should cover route/context worker narrative");
@@ -1068,7 +1074,7 @@ async function main() {
         ONLY === "simple-first-entry-engineer-escape-desktop"
       ) {
         verifyOrdinaryUserEntryContract();
-      } else if (ONLY === "backlog-evidence") {
+      } else if (ONLY === "backlog-evidence" || ONLY === "activity-evidence-route-context") {
         verifyBacklogEvidenceContract();
       } else {
         throw new Error(`unknown --only target: ${ONLY}`);
