@@ -950,6 +950,16 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("Specific facts"), "Task playback panel should promote structured facts above auxiliary narrative");
   assert(playbackPanelSource.includes("Failure/blocker diagnosis"), "Task playback panel should promote blocker diagnosis above raw JSON");
   assert(playbackPanelSource.includes("Evidence links"), "Task playback panel should expose typed primary evidence links");
+  assert(playbackPanelSource.includes("EvidenceInspectorModal"), "Task playback evidence links should open a structured inspector modal");
+  assert(playbackPanelSource.includes('aria-haspopup="dialog"'), "Task playback evidence chips should advertise dialog inspection");
+  assert(playbackPanelSource.includes('role="dialog"') && playbackPanelSource.includes('aria-modal="true"'), "Task playback evidence inspector should render as an accessible modal dialog");
+  assert(playbackPanelSource.includes("Public-safe evidence context"), "Task playback evidence inspector should label its public-safe context boundary");
+  assert(playbackPanelSource.includes("Structured context"), "Task playback evidence inspector should show structured context before raw data");
+  assert(playbackPanelSource.includes("Sanitized detail rows"), "Task playback evidence inspector should expose sanitized detail rows without dumping JSON");
+  assert(playbackPanelSource.includes("Copy evidence ref"), "Task playback evidence inspector should preserve copy-ref behavior");
+  assert(playbackPanelSource.includes("Advanced raw data stays collapsed"), "Task playback evidence inspector should keep raw JSON in the collapsed advanced panel");
+  assert(playbackPanelSource.includes("rawPathsForEvidenceKind"), "Task playback evidence inspector should extract typed public fields from sanitized raw sections");
+  assert(playbackPanelSource.includes("route_context") && playbackPanelSource.includes("prompt_contract"), "Task playback evidence inspector should handle route context and prompt contract refs");
   assert(playbackPanelSource.includes("Auxiliary explanation / Actor-context narrative"), "Task playback panel should make actor-context narrative auxiliary copy");
   assert(playbackPanelSource.includes("Advanced raw data"), "Task playback raw evidence should be collapsed under Advanced raw data");
   assert(playbackPanelSource.includes("key={selectedFrame.id}"), "Task playback raw evidence details should remount closed when selecting a new event");
@@ -977,6 +987,8 @@ function verifyBacklogEvidenceContract() {
   assert(playbackTestSource.includes("event #329 failure diagnosis should promote remaining acceptance, remaining open, and next legal action"), "Task playback fixture should cover event #329 remaining scope and next legal action");
   assert(playbackTestSource.includes("event #1750 blocker diagnosis should promote blocker ids, missing evidence, route mismatch, timeout reason, and next legal action"), "Task playback fixture should cover blocked/gated diagnosis fields");
   assert(playbackTestSource.includes("event #1750 evidence links should include typed timeline, route context, prompt contract, and source-event refs"), "Task playback fixture should cover typed evidence links");
+  assert(playbackTestSource.includes("event #1750 inspector context should expose route, prompt, and missing-evidence public fields without private raw prompt"), "Task playback fixture should cover route-context inspector facts");
+  assert(playbackTestSource.includes("event #329 inspector context should expose audit decision, implemented scope, remaining acceptance, and remaining open facts"), "Task playback fixture should cover audit inspector facts");
   assert(playbackTestSource.includes("route service completion narrative should explain action outcome and missing evidence"), "Task playback fixture should cover service route completion narrative");
   assert(playbackTestSource.includes("Bounded worker received task context containing target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden."), "Task playback fixture should cover route/context worker narrative");
   assert(playbackTestSource.includes("Route evidence blocked"), "Task playback fixture should cover route waiver/blocker narrative");
@@ -1005,6 +1017,7 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".task-playback-layout"), "Task playback layout should have stable CSS");
   assert(cssSource.includes(".task-playback-selector"), "Task playback selector should have stable CSS");
   assert(cssSource.includes(".task-playback-panel"), "Task playback panel should have stable CSS");
+  assert(cssSource.includes(".task-playback-evidence-modal") && cssSource.includes(".task-playback-evidence-section"), "Task playback evidence modal should have stable CSS");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }

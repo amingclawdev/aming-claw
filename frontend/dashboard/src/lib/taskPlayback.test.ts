@@ -529,6 +529,15 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.value.includes("route_prompt_context")),
     "event #1750 evidence links should include typed timeline, route context, prompt contract, and source-event refs",
   );
+  const rawPromptInspectorVisible = JSON.stringify(rawPromptContextFrame.detail_inspector.raw_sections.map((section) => section.value));
+  assertFixture(
+    rawPromptInspectorVisible.includes("sha256:fixture-route-1750")
+      && rawPromptInspectorVisible.includes("rprompt-repair-fixture-1750")
+      && rawPromptInspectorVisible.includes("mf_subagent_startup")
+      && !rawPromptInspectorVisible.includes("[fixture private request text]")
+      && !rawPromptInspectorVisible.includes("[fixture private route context body]"),
+    "event #1750 inspector context should expose route, prompt, and missing-evidence public fields without private raw prompt",
+  );
   assertFixture(
     auditRemainingScopeFrame.summary.includes("decision do not close P0 umbrella yet")
       && auditRemainingScopeFrame.summary.includes("Remaining scope")
@@ -550,6 +559,15 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       && auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "remaining open" && fact.value.includes("P0 umbrella"))
       && auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "next legal action" && fact.value.includes("Finish the remaining acceptance or open backlog scope")),
     "event #329 failure diagnosis should promote remaining acceptance, remaining open, and next legal action",
+  );
+  const auditPayloadSection = auditRemainingScopeFrame.detail_inspector.raw_sections.find((section) => section.label === "payload");
+  const auditPayloadVisible = JSON.stringify(auditPayloadSection?.value ?? {});
+  assertFixture(
+    auditPayloadVisible.includes("do not close P0 umbrella yet")
+      && auditPayloadVisible.includes("source-controlled bind/unbind event schema and reducer")
+      && auditPayloadVisible.includes("full-vs-scope parity fixture")
+      && auditPayloadVisible.includes("GRAPH-INCREMENTAL-FILE-BINDING-PARITY-20260525"),
+    "event #329 inspector context should expose audit decision, implemented scope, remaining acceptance, and remaining open facts",
   );
   assertFixture(
     routeActionFrame.detail.includes("authorized or blocked") && routeActionFrame.narrative.outcome.includes("close-ready evidence"),
