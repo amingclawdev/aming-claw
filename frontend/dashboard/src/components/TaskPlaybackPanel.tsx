@@ -367,12 +367,39 @@ function evidenceContextRows(frame: TaskPlaybackFrame, evidenceRef: EvidenceRef)
     if (preferredFacts.has(fact.kind) || preferredFacts.has(fact.label)) rows.push({ label: fact.label, value: fact.value, source: fact.source });
   }
   rows.push(...rawPathRowsForEvidence(frame, evidenceRef));
-  return rows.filter((row) => publicEvidenceText(row.value));
+  return evidenceContextPersistenceRows(evidenceRef.kind, rows).filter((row) => publicEvidenceText(row.value));
+}
+
+function evidenceContextPersistenceRows(kind: EvidenceRef["kind"], rows: EvidenceInspectorRow[]): EvidenceInspectorRow[] {
+  if (!["route_context", "prompt_contract", "source_event"].includes(kind)) return rows;
+  const baseLabels = new Set(["event", "status", "event type", "phase", "summary"]);
+  const hasPersistedContext = rows.some((row) => !baseLabels.has(row.label) && publicEvidenceText(row.value));
+  return [
+    ...rows,
+    {
+      label: "context persistence",
+      value: hasPersistedContext ? "public-safe context persisted on this event" : "public-safe context not persisted on this event",
+      source: kind,
+    },
+  ];
 }
 
 function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
   const shared = ["actor", "lane_receiver", "backlog_id", "stage"];
-  const routeScope = ["route_id", "prompt_contract_id", "topology", "target_file_count", "acceptance_criteria_count", "required_evidence", "source_event_refs"];
+  const routeScope = [
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "topology",
+    "target_file_count",
+    "acceptance_criteria_count",
+    "required_evidence",
+    "source_event_refs",
+    "read_receipt_refs",
+    "startup_refs",
+  ];
   if (kind === "route_context" || kind === "prompt_contract") return new Set([...shared, ...routeScope]);
   if (kind === "timeline_event" || kind === "source_event" || kind === "gate") return new Set([...shared, ...routeScope, "decision"]);
   if (kind === "commit" || kind === "artifact" || kind === "file" || kind === "test") return new Set([...shared, "decision", "closed_rows", "implemented_and_merged"]);
@@ -405,22 +432,57 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "prompt_contract_hash",
     "route_identity.prompt_contract_id",
     "route_identity.prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "route_identity.visible_injection_manifest_hash",
   ];
-  const scope = ["stage", "selected_topology", "recommended_topology", "topology", "target_files", "owned_files", "acceptance_criteria", "required_evidence", "evidence_required", "source_event_refs"];
+  const sourceRefs = [
+    "source_event_id",
+    "source_event_ids",
+    "source_event_refs",
+    "source_event_type",
+    "source_events",
+    "read_receipt_event_id",
+    "read_receipt_event_ids",
+    "read_receipt_event_refs",
+    "read_receipt_hash",
+    "startup_event_id",
+    "startup_event_ids",
+    "startup_event_refs",
+    "startup_intent_event_id",
+  ];
+  const scope = [
+    "stage",
+    "selected_topology",
+    "recommended_topology",
+    "topology",
+    "target_files",
+    "owned_files",
+    "acceptance_criteria",
+    "required_evidence",
+    "evidence_required",
+    ...sourceRefs,
+  ];
   const blockers = [
     "blocker_ids",
     "missing_event_kinds",
     "missing_required_evidence",
     "missing_requirement_ids",
+    "required_before_protected_evidence",
     "route_identity_mismatch",
+    "route_context_gate.missing_requirement_ids",
+    "route_context_gate.missing_required_evidence",
+    "route_context_gate.route_identity_mismatch",
     "stale_reason",
     "timeout_reason",
+    "route_context_stale_reason",
+    "route_context_timeout_reason",
+    "route_token_expired_reason",
     "next_legal_action",
     "next_action",
     "next_expected_action",
   ];
   if (kind === "route_context" || kind === "prompt_contract") return [...identity, ...scope, ...blockers];
-  if (kind === "timeline_event" || kind === "source_event" || kind === "gate" || kind === "precheck") return ["event_id", "source_event_id", "source_event_refs", ...identity, ...blockers];
+  if (kind === "timeline_event" || kind === "source_event" || kind === "gate" || kind === "precheck") return ["event_id", ...sourceRefs, ...identity, ...blockers];
   if (kind === "commit") return ["commit", "commit_hash", "target_commit", "head_commit", "source_commit", "artifact_refs", ...identity];
   if (kind === "artifact" || kind === "file" || kind === "test") return ["artifact_refs", "artifacts", "files", "changed_files", "tests_run", "test_commands", ...identity];
   return [...identity, ...scope, ...blockers];

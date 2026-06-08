@@ -320,9 +320,11 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
       reason: "pending_scope_timeout blocked route identity consumption",
       route_context: "[fixture private route context body]",
       route_id: "route-repair-fixture-1750",
+      read_receipt_event_id: 2893,
       selected_topology: "observer_led_parallel_lanes",
       source_event_ids: ["repair-474fadf0551f130e:route_prompt_context"],
       stage: "dispatch",
+      startup_event_id: 2894,
     }),
     verification_json: JSON.stringify({
       missing_event_kinds: ["implementation", "verification"],
@@ -333,8 +335,10 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
     artifact_refs_json: JSON.stringify({
       prompt_contract_hash: "sha256:fixture-prompt-1750",
       prompt_contract_id: "rprompt-repair-fixture-1750",
+      read_receipt_hash: "sha256:fixture-read-receipt-1750",
       route_context_hash: "sha256:fixture-route-1750",
       source_event_id: "repair-474fadf0551f130e:route_prompt_context",
+      startup_event_id: 2894,
     }),
   } as unknown as TaskTimelineEvent,
   {
@@ -510,8 +514,13 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   assertFixture(
     rawPromptContextFrame.specific_facts.some((fact) => fact.label === "target-file count" && fact.value === "3 target files")
       && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "acceptance-criteria count" && fact.value === "2 acceptance criteria")
-      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "required evidence" && fact.value.includes("implementation")),
-    "event #1750 specific facts should promote target-file, acceptance-criteria, and required-evidence details",
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "required evidence" && fact.value.includes("implementation"))
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "route context hash" && fact.value.includes("sha256:fixture-route-1750"))
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "prompt contract hash" && fact.value.includes("sha256:fixture-prompt-1750"))
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "source event refs" && fact.value.includes("route_prompt_context"))
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "read receipt refs" && fact.value.includes("2893"))
+      && rawPromptContextFrame.specific_facts.some((fact) => fact.label === "startup refs" && fact.value.includes("2894")),
+    "event #1750 specific facts should promote target-file, acceptance-criteria, required-evidence, route/prompt/source, read-receipt, and startup details",
   );
   assertFixture(
     rawPromptContextFrame.failure_diagnosis.some((fact) => fact.label === "blocker ids" && fact.value.includes("route_identity_mismatch"))
@@ -526,8 +535,10 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
     rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "timeline_event" && ref.value === "#1750")
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "route_context" && ref.value === "sha256:fixture-route-1750")
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "prompt_contract" && ref.value === "rprompt-repair-fixture-1750")
-      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.value.includes("route_prompt_context")),
-    "event #1750 evidence links should include typed timeline, route context, prompt contract, and source-event refs",
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.value.includes("route_prompt_context"))
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.label === "read receipt" && ref.value.includes("2893"))
+      && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.label === "startup" && ref.value.includes("2894")),
+    "event #1750 evidence links should include typed timeline, route context, prompt contract, source-event, read-receipt, and startup refs",
   );
   const rawPromptInspectorVisible = JSON.stringify(rawPromptContextFrame.detail_inspector.raw_sections.map((section) => section.value));
   assertFixture(

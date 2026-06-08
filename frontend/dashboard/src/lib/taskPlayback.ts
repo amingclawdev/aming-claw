@@ -372,6 +372,13 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "verification.route_identity.route_id",
     "artifact_refs.route_id",
   ]);
+  pushFirstFact(facts, event, "route_context_hash", "route context hash", [
+    "payload.route_context_hash",
+    "payload.route_identity.route_context_hash",
+    "verification.route_context_hash",
+    "verification.route_identity.route_context_hash",
+    "artifact_refs.route_context_hash",
+  ]);
   pushFirstFact(facts, event, "prompt_contract_id", "prompt contract id", [
     "payload.prompt_contract_id",
     "payload.prompt_contract.prompt_contract_id",
@@ -379,6 +386,21 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "verification.prompt_contract_id",
     "verification.route_identity.prompt_contract_id",
     "artifact_refs.prompt_contract_id",
+  ]);
+  pushFirstFact(facts, event, "prompt_contract_hash", "prompt contract hash", [
+    "payload.prompt_contract_hash",
+    "payload.prompt_contract.prompt_contract_hash",
+    "payload.route_identity.prompt_contract_hash",
+    "verification.prompt_contract_hash",
+    "verification.route_identity.prompt_contract_hash",
+    "artifact_refs.prompt_contract_hash",
+  ]);
+  pushFirstFact(facts, event, "visible_injection_manifest_hash", "visible injection manifest", [
+    "payload.visible_injection_manifest_hash",
+    "payload.route_identity.visible_injection_manifest_hash",
+    "verification.visible_injection_manifest_hash",
+    "verification.route_identity.visible_injection_manifest_hash",
+    "artifact_refs.visible_injection_manifest_hash",
   ]);
   pushFirstFact(facts, event, "stage", "stage", [
     "payload.stage",
@@ -480,6 +502,38 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
   if (sourceEvents.length > 0) {
     pushFact(facts, "source_event_refs", "source event refs", formatCompactList(sourceEvents), sourceForPath(sourceEvents[0].path));
   }
+  const readReceiptRefs = publicValuesAtPaths(event, [
+    "payload.read_receipt_event_id",
+    "payload.read_receipt_event_ids",
+    "payload.read_receipt_event_ref",
+    "payload.read_receipt_event_refs",
+    "payload.read_receipt_hash",
+    "payload.receipt_id",
+    "verification.read_receipt_event_id",
+    "verification.read_receipt_event_refs",
+    "verification.read_receipt_hash",
+    "artifact_refs.read_receipt_event_id",
+    "artifact_refs.read_receipt_event_refs",
+    "artifact_refs.read_receipt_hash",
+  ]);
+  if (readReceiptRefs.length > 0) {
+    pushFact(facts, "read_receipt_refs", "read receipt refs", formatCompactList(readReceiptRefs), sourceForPath(readReceiptRefs[0].path));
+  }
+  const startupRefs = publicValuesAtPaths(event, [
+    "payload.startup_event_id",
+    "payload.startup_event_ids",
+    "payload.startup_event_ref",
+    "payload.startup_event_refs",
+    "payload.startup_intent_event_id",
+    "payload.startup_intent_event_generated",
+    "verification.startup_event_id",
+    "verification.startup_event_refs",
+    "artifact_refs.startup_event_id",
+    "artifact_refs.startup_event_refs",
+  ]);
+  if (startupRefs.length > 0) {
+    pushFact(facts, "startup_refs", "startup refs", formatCompactList(startupRefs), sourceForPath(startupRefs[0].path));
+  }
   return stableFacts(facts).slice(0, 18);
 }
 
@@ -511,13 +565,20 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "payload.missing_required_evidence",
     "payload.missing_requirement_ids",
     "payload.missing_protected_lanes",
+    "payload.required_before_protected_evidence",
+    "payload.required_missing_evidence",
     "payload.route_context_gate.missing_requirement_ids",
+    "payload.route_context_gate.missing_required_evidence",
     "payload.contract_gate.missing_requirement_ids",
+    "payload.contract_gate.missing_required_evidence",
     "verification.missing_required_evidence",
     "verification.missing_requirement_ids",
     "verification.required_before_protected_evidence",
+    "verification.required_missing_evidence",
     "verification.route_context_gate.missing_requirement_ids",
+    "verification.route_context_gate.missing_required_evidence",
     "verification.contract_gate.missing_requirement_ids",
+    "verification.contract_gate.missing_required_evidence",
   ]);
   if (missingRequirements.length > 0) {
     pushFact(diagnosis, "missing_required_evidence", "missing required evidence", formatCompactList(missingRequirements), sourceForPath(missingRequirements[0].path));
@@ -525,10 +586,16 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
   const routeMismatch = publicValuesAtPaths(event, [
     "payload.route_identity_mismatch",
     "payload.mismatched_route_identity",
+    "payload.route_identity.mismatch",
     "payload.identity_recovery.route_identity_mismatch",
+    "payload.route_context_gate.route_identity_mismatch",
+    "payload.contract_gate.route_identity_mismatch",
     "verification.route_identity_mismatch",
     "verification.mismatched_route_identity",
+    "verification.route_identity.mismatch",
     "verification.identity_recovery.route_identity_mismatch",
+    "verification.route_context_gate.route_identity_mismatch",
+    "verification.contract_gate.route_identity_mismatch",
   ]);
   const blockerValues = blockerIds.map((item) => item.value.toLowerCase());
   if (routeMismatch.length > 0) {
@@ -538,15 +605,32 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
   }
   const staleReasons = publicValuesAtPaths(event, [
     "payload.stale_reason",
+    "payload.stale_route_context_reason",
+    "payload.route_context_stale_reason",
     "payload.timeout_reason",
+    "payload.route_context_timeout_reason",
+    "payload.route_token_timeout_reason",
+    "payload.route_token_expired_reason",
     "payload.pending_scope_timeout",
     "payload.failure_reason",
     "payload.reason",
     "payload.last_error",
+    "payload.route_context_gate.stale_reason",
+    "payload.route_context_gate.timeout_reason",
+    "payload.contract_gate.stale_reason",
+    "payload.contract_gate.timeout_reason",
     "verification.stale_reason",
+    "verification.route_context_stale_reason",
     "verification.timeout_reason",
+    "verification.route_context_timeout_reason",
+    "verification.route_token_timeout_reason",
+    "verification.route_token_expired_reason",
     "verification.reason",
     "verification.errors",
+    "verification.route_context_gate.stale_reason",
+    "verification.route_context_gate.timeout_reason",
+    "verification.contract_gate.stale_reason",
+    "verification.contract_gate.timeout_reason",
   ]);
   const staleBlockers = blockerIds.filter((item) => /stale|timeout|timed_out|pending_scope/.test(item.value.toLowerCase()));
   if (staleReasons.length > 0) {
@@ -632,6 +716,7 @@ function evidenceLinksFromEvent(
     "payload.route_id",
     "payload.route_identity.route_id",
     "verification.route_id",
+    "verification.route_identity.route_id",
     "artifact_refs.route_id",
   ]);
   pushEvidenceValues(links, "route_context", "route context", event, [
@@ -644,13 +729,17 @@ function evidenceLinksFromEvent(
   pushEvidenceValues(links, "prompt_contract", "prompt contract", event, [
     "payload.prompt_contract_id",
     "payload.prompt_contract.prompt_contract_id",
+    "payload.route_identity.prompt_contract_id",
     "verification.prompt_contract_id",
+    "verification.route_identity.prompt_contract_id",
     "artifact_refs.prompt_contract_id",
   ]);
   pushEvidenceValues(links, "prompt_contract", "prompt contract hash", event, [
     "payload.prompt_contract_hash",
+    "payload.prompt_contract.prompt_contract_hash",
     "payload.route_identity.prompt_contract_hash",
     "verification.prompt_contract_hash",
+    "verification.route_identity.prompt_contract_hash",
     "artifact_refs.prompt_contract_hash",
   ]);
   pushEvidenceValues(links, "precheck", "precheck", event, [
@@ -665,9 +754,33 @@ function evidenceLinksFromEvent(
     "payload.source_event_ids",
     "payload.source_event_refs",
     "payload.source_event_type",
+    "payload.source_events",
     "verification.source_event_id",
+    "verification.source_event_refs",
     "artifact_refs.source_event_id",
     "artifact_refs.source_event_refs",
+  ]);
+  pushEvidenceValues(links, "source_event", "read receipt", event, [
+    "payload.read_receipt_event_id",
+    "payload.read_receipt_event_ids",
+    "payload.read_receipt_event_ref",
+    "payload.read_receipt_event_refs",
+    "payload.read_receipt_hash",
+    "verification.read_receipt_event_id",
+    "verification.read_receipt_event_refs",
+    "artifact_refs.read_receipt_event_id",
+    "artifact_refs.read_receipt_event_refs",
+  ]);
+  pushEvidenceValues(links, "source_event", "startup", event, [
+    "payload.startup_event_id",
+    "payload.startup_event_ids",
+    "payload.startup_event_ref",
+    "payload.startup_event_refs",
+    "payload.startup_intent_event_id",
+    "verification.startup_event_id",
+    "verification.startup_event_refs",
+    "artifact_refs.startup_event_id",
+    "artifact_refs.startup_event_refs",
   ]);
   links.push(...evidenceRefs);
   links.push(...artifactRefs.slice(0, 12).map((ref) => ({

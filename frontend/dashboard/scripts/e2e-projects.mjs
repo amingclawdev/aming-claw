@@ -960,6 +960,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("Advanced raw data stays collapsed"), "Task playback evidence inspector should keep raw JSON in the collapsed advanced panel");
   assert(playbackPanelSource.includes("rawPathsForEvidenceKind"), "Task playback evidence inspector should extract typed public fields from sanitized raw sections");
   assert(playbackPanelSource.includes("route_context") && playbackPanelSource.includes("prompt_contract"), "Task playback evidence inspector should handle route context and prompt contract refs");
+  assert(playbackPanelSource.includes("public-safe context not persisted on this event"), "Task playback evidence inspector should state when public route/prompt/source context was not persisted");
   assert(playbackPanelSource.includes("Auxiliary explanation / Actor-context narrative"), "Task playback panel should make actor-context narrative auxiliary copy");
   assert(playbackPanelSource.includes("Advanced raw data"), "Task playback raw evidence should be collapsed under Advanced raw data");
   assert(playbackPanelSource.includes("key={selectedFrame.id}"), "Task playback raw evidence details should remount closed when selecting a new event");
@@ -986,7 +987,8 @@ function verifyBacklogEvidenceContract() {
   assert(playbackTestSource.includes("event #329 specific facts should promote decision, closed rows, and implemented/merged outcome facts"), "Task playback fixture should cover event #329 audit outcome facts");
   assert(playbackTestSource.includes("event #329 failure diagnosis should promote remaining acceptance, remaining open, and next legal action"), "Task playback fixture should cover event #329 remaining scope and next legal action");
   assert(playbackTestSource.includes("event #1750 blocker diagnosis should promote blocker ids, missing evidence, route mismatch, timeout reason, and next legal action"), "Task playback fixture should cover blocked/gated diagnosis fields");
-  assert(playbackTestSource.includes("event #1750 evidence links should include typed timeline, route context, prompt contract, and source-event refs"), "Task playback fixture should cover typed evidence links");
+  assert(playbackTestSource.includes("event #1750 specific facts should promote target-file, acceptance-criteria, required-evidence, route/prompt/source, read-receipt, and startup details"), "Task playback fixture should cover read-receipt/startup structured facts");
+  assert(playbackTestSource.includes("event #1750 evidence links should include typed timeline, route context, prompt contract, source-event, read-receipt, and startup refs"), "Task playback fixture should cover typed evidence links");
   assert(playbackTestSource.includes("event #1750 inspector context should expose route, prompt, and missing-evidence public fields without private raw prompt"), "Task playback fixture should cover route-context inspector facts");
   assert(playbackTestSource.includes("event #329 inspector context should expose audit decision, implemented scope, remaining acceptance, and remaining open facts"), "Task playback fixture should cover audit inspector facts");
   assert(playbackTestSource.includes("route service completion narrative should explain action outcome and missing evidence"), "Task playback fixture should cover service route completion narrative");
