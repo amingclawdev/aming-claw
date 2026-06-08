@@ -697,6 +697,62 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         open_result = handle_backlog_list(open_ctx)
         self.assertEqual(open_result["filtered_count"], 0)
 
+    def test_waived_status_is_closed_and_excluded_from_active(self):
+        from governance.server import (
+            handle_backlog_upsert,
+            handle_backlog_list,
+            _BACKLOG_CLOSED_STATUSES,
+            _current_task_row_is_active,
+        )
+
+        # WAIVED is a recognized closed/retired status.
+        self.assertIn("WAIVED", _BACKLOG_CLOSED_STATUSES)
+
+        # Insert one active OPEN row and one WAIVED row. WAIVED is a closed
+        # status, so the upsert carries a route token like the FIXED path.
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": "BW-OPEN"},
+                body={
+                    "title": "Active open row",
+                    "status": "OPEN",
+                    "force_admit": True,
+                },
+            )
+        )
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": "BW-WAIVED"},
+                body={
+                    "title": "Intentionally set-aside row",
+                    "status": "WAIVED",
+                    "details_md": "Waived: superseded by direction change; carries waive reason.",
+                    "force_admit": True,
+                    "route_token": _route_token("backlog_upsert", "BW-WAIVED"),
+                },
+            )
+        )
+
+        # Active backlog list (closed excluded) must not surface the WAIVED row.
+        active_ctx = self._make_ctx(
+            {"project_id": "test-project"},
+            query={"view": "compact", "limit": "50", "include_closed": "false"},
+        )
+        active_result = handle_backlog_list(active_ctx)
+        active_ids = {bug["bug_id"] for bug in active_result["bugs"]}
+        self.assertIn("BW-OPEN", active_ids)
+        self.assertNotIn("BW-WAIVED", active_ids)
+
+        # A WAIVED row is not counted as an active current task.
+        waived_row = {
+            "status": "WAIVED",
+            "runtime_state": "fixed",
+            "chain_stage": "",
+            "mf_type": "",
+            "current_task_id": "",
+        }
+        self.assertFalse(_current_task_row_is_active(waived_row))
+
 
 class TestETLParsing(unittest.TestCase):
     """AC6: ETL dry-run vs apply parity."""

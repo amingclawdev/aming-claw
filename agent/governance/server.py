@@ -21961,6 +21961,10 @@ _BACKLOG_CLOSED_STATUSES = {
     "MERGED",
     "SUPERSEDED",
     "VOID",
+    # WAIVED = an intentional, reason-documented set-aside (must carry a waive
+    # reason / superseded_by); distinct from SUPERSEDED (replaced by a specific
+    # successor) and CANCELLED/VOID (abandoned).
+    "WAIVED",
 }
 _BACKLOG_DEFAULT_LIST_LIMIT = 100
 _BACKLOG_HARD_LIST_LIMIT = 200

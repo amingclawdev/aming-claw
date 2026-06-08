@@ -248,6 +248,11 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      either `route_token` with route context / prompt contract / scope /
      expiry / evidence refs, or an explicit `route_waiver` with reason and
      timeline evidence.
+   - closed/retired backlog statuses (excluded from active list and current
+     task): FIXED, CLOSED, DONE, RESOLVED, CANCELLED, MERGED, SUPERSEDED, VOID,
+     WAIVED. WAIVED — intentional, reason-documented set-aside (carry a waive
+     reason / superseded_by); distinct from SUPERSEDED (replaced) and
+     CANCELLED/VOID (abandoned).
 
 ## Commit
 
