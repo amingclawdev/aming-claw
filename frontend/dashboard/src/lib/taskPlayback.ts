@@ -419,6 +419,54 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
   if (requiredEvidence.length > 0) {
     pushFact(facts, "required_evidence", "required evidence", formatCompactList(requiredEvidence), sourceForPath(requiredEvidence[0].path));
   }
+  pushOutcomeFact(facts, event, "decision", "decision", [
+    "payload.decision",
+    "payload.audit.decision",
+    "payload.outcome.decision",
+    "payload.result.decision",
+    "payload.remaining_scope.decision",
+    "verification.decision",
+    "verification.audit.decision",
+    "verification.outcome.decision",
+    "verification.result.decision",
+    "verification.remaining_scope.decision",
+    "artifact_refs.decision",
+    "artifact_refs.audit.decision",
+    "artifact_refs.outcome.decision",
+    "artifact_refs.remaining_scope.decision",
+  ]);
+  pushOutcomeFact(facts, event, "closed_rows", "closed rows", [
+    "payload.closed_rows",
+    "payload.audit.closed_rows",
+    "payload.outcome.closed_rows",
+    "payload.result.closed_rows",
+    "payload.remaining_scope.closed_rows",
+    "verification.closed_rows",
+    "verification.audit.closed_rows",
+    "verification.outcome.closed_rows",
+    "verification.result.closed_rows",
+    "verification.remaining_scope.closed_rows",
+    "artifact_refs.closed_rows",
+    "artifact_refs.audit.closed_rows",
+    "artifact_refs.outcome.closed_rows",
+    "artifact_refs.remaining_scope.closed_rows",
+  ]);
+  pushOutcomeFact(facts, event, "implemented_and_merged", "implemented and merged", [
+    "payload.implemented_and_merged",
+    "payload.audit.implemented_and_merged",
+    "payload.outcome.implemented_and_merged",
+    "payload.result.implemented_and_merged",
+    "payload.remaining_scope.implemented_and_merged",
+    "verification.implemented_and_merged",
+    "verification.audit.implemented_and_merged",
+    "verification.outcome.implemented_and_merged",
+    "verification.result.implemented_and_merged",
+    "verification.remaining_scope.implemented_and_merged",
+    "artifact_refs.implemented_and_merged",
+    "artifact_refs.audit.implemented_and_merged",
+    "artifact_refs.outcome.implemented_and_merged",
+    "artifact_refs.remaining_scope.implemented_and_merged",
+  ]);
   const sourceEvents = publicValuesAtPaths(event, [
     "payload.source_event_id",
     "payload.source_event_ids",
@@ -506,15 +554,61 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
   } else if (staleBlockers.length > 0) {
     pushFact(diagnosis, "stale_timeout_reason", "stale/timeout reason", formatCompactList(staleBlockers), sourceForPath(staleBlockers[0].path));
   }
+  pushOutcomeFact(diagnosis, event, "remaining_acceptance", "remaining acceptance", [
+    "payload.remaining_acceptance",
+    "payload.audit.remaining_acceptance",
+    "payload.outcome.remaining_acceptance",
+    "payload.result.remaining_acceptance",
+    "payload.remaining_scope.remaining_acceptance",
+    "verification.remaining_acceptance",
+    "verification.audit.remaining_acceptance",
+    "verification.outcome.remaining_acceptance",
+    "verification.result.remaining_acceptance",
+    "verification.remaining_scope.remaining_acceptance",
+    "artifact_refs.remaining_acceptance",
+    "artifact_refs.audit.remaining_acceptance",
+    "artifact_refs.outcome.remaining_acceptance",
+    "artifact_refs.remaining_scope.remaining_acceptance",
+  ]);
+  pushOutcomeFact(diagnosis, event, "remaining_open", "remaining open", [
+    "payload.remaining_open",
+    "payload.audit.remaining_open",
+    "payload.outcome.remaining_open",
+    "payload.result.remaining_open",
+    "payload.remaining_scope.remaining_open",
+    "verification.remaining_open",
+    "verification.audit.remaining_open",
+    "verification.outcome.remaining_open",
+    "verification.result.remaining_open",
+    "verification.remaining_scope.remaining_open",
+    "artifact_refs.remaining_open",
+    "artifact_refs.audit.remaining_open",
+    "artifact_refs.outcome.remaining_open",
+    "artifact_refs.remaining_scope.remaining_open",
+  ]);
   const nextAction = firstPublicValueAtPaths(event, [
+    "payload.next_legal_action.description",
+    "payload.next_legal_action.action",
+    "payload.remaining_scope.next_legal_action.description",
+    "payload.remaining_scope.next_legal_action.action",
     "payload.next_legal_action",
     "payload.next_action",
     "payload.next_expected_action",
+    "payload.legal_next_action",
     "payload.recovery_action",
     "payload.recovery_options",
+    "verification.next_legal_action.description",
+    "verification.next_legal_action.action",
+    "verification.remaining_scope.next_legal_action.description",
+    "verification.remaining_scope.next_legal_action.action",
     "verification.next_legal_action",
     "verification.next_action",
     "verification.next_expected_action",
+    "verification.legal_next_action",
+    "artifact_refs.next_legal_action.description",
+    "artifact_refs.next_legal_action.action",
+    "artifact_refs.remaining_scope.next_legal_action.description",
+    "artifact_refs.remaining_scope.next_legal_action.action",
     "artifact_refs.next_legal_action",
   ]);
   if (nextAction) {
@@ -597,6 +691,11 @@ function eventSummaryFromEvent(
   const promptContract = factValue(facts, "prompt_contract_id");
   const targetCount = factValue(facts, "target_file_count");
   const criteriaCount = factValue(facts, "acceptance_criteria_count");
+  const decision = factValue(facts, "decision");
+  const closedRows = factValue(facts, "closed_rows");
+  const implementedAndMerged = factValue(facts, "implemented_and_merged");
+  const remainingAcceptance = factValue(diagnosis, "remaining_acceptance");
+  const remainingOpen = factValue(diagnosis, "remaining_open");
   const requiredEvidenceCount = firstCountAtPaths(event, [
     "payload.required_evidence",
     "payload.evidence_required",
@@ -614,6 +713,21 @@ function eventSummaryFromEvent(
   }
   const blocker = factValue(diagnosis, "blocker_ids") || factValue(diagnosis, "missing_event_kinds") || factValue(diagnosis, "missing_required_evidence");
   const nextAction = factValue(diagnosis, "next_legal_action");
+  if (hasOutcomeAuditFacts(event, decision, closedRows, implementedAndMerged, remainingAcceptance, remainingOpen)) {
+    const completed = [
+      closedRows ? `closed rows: ${closedRows}` : "",
+      implementedAndMerged ? `implemented and merged: ${implementedAndMerged}` : "",
+    ].filter(Boolean);
+    const remaining = [
+      remainingAcceptance ? `remaining acceptance: ${remainingAcceptance}` : "",
+      remainingOpen ? `remaining open: ${remainingOpen}` : "",
+    ].filter(Boolean);
+    const statusText = decision ? ` with decision ${decision}` : "";
+    const completedText = completed.length > 0 ? ` Completed scope: ${completed.join("; ")}.` : "";
+    const remainingText = remaining.length > 0 ? ` Remaining scope: ${remaining.join("; ")}.` : "";
+    const actionText = nextAction ? ` Next legal action: ${nextAction}.` : "";
+    return `${actor} recorded ${lowercaseFirst(semantic.title)}${backlog ? ` for backlog ${backlog}` : ""}${statusText}.${completedText}${remainingText}${actionText}`.replace(/\s+/g, " ").trim();
+  }
   if (blocker || ["blocked", "failed", "missing"].includes(status)) {
     return `${actor} recorded ${lowercaseFirst(semantic.title)}${backlog ? ` for backlog ${backlog}` : ""}; ${blocker ? `the blocker diagnosis is ${blocker}` : `the status is ${status}`}${nextAction ? `, and the next legal action is ${nextAction}` : ""}.`;
   }
@@ -906,6 +1020,11 @@ function pushCountFact(
   if (count && count.count > 0) pushFact(facts, kind, label, formatCount(count.count, singular, plural), count.source);
 }
 
+function pushOutcomeFact(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent, kind: string, label: string, paths: string[]): void {
+  const values = publicOutcomeValuesAtPaths(event, paths);
+  if (values.length > 0) pushFact(facts, kind, label, formatCompactList(values, 6), sourceForPath(values[0].path));
+}
+
 function firstPublicValueAtPaths(event: TaskTimelineEvent, paths: string[]): PublicFieldValue | null {
   return publicValuesAtPaths(event, paths)[0] ?? null;
 }
@@ -925,6 +1044,26 @@ function publicValuesAtPaths(event: TaskTimelineEvent, paths: string[]): PublicF
 function publicValuesAtPath(event: TaskTimelineEvent, path: string): PublicFieldValue[] {
   if (PRIVATE_EVIDENCE_KEY.test(path)) return [];
   return stringsFromUnknown(valueAtPath(event as unknown as Record<string, unknown>, path))
+    .map(safeText)
+    .filter((value) => value && value !== "[private detail redacted]" && !PRIVATE_EVIDENCE_KEY.test(value))
+    .map((value) => ({ value, path, source: sourceForPath(path) }));
+}
+
+function publicOutcomeValuesAtPaths(event: TaskTimelineEvent, paths: string[]): PublicFieldValue[] {
+  const values: PublicFieldValue[] = [];
+  for (const path of paths) values.push(...publicOutcomeValuesAtPath(event, path));
+  const seen = new Set<string>();
+  return values.filter((item) => {
+    const key = `${item.path}:${item.value}`;
+    if (!item.value || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function publicOutcomeValuesAtPath(event: TaskTimelineEvent, path: string): PublicFieldValue[] {
+  if (PRIVATE_EVIDENCE_KEY.test(path)) return [];
+  return outcomeStringsFromUnknown(valueAtPath(event as unknown as Record<string, unknown>, path))
     .map(safeText)
     .filter((value) => value && value !== "[private detail redacted]" && !PRIVATE_EVIDENCE_KEY.test(value))
     .map((value) => ({ value, path, source: sourceForPath(path) }));
@@ -994,6 +1133,9 @@ function formatCount(count: number, singular: string, plural: string): string {
 }
 
 function inferredNextLegalAction(diagnosis: TaskPlaybackStructuredFact[], status: TaskPlaybackFrameStatus): string {
+  if (factValue(diagnosis, "remaining_acceptance") || factValue(diagnosis, "remaining_open")) {
+    return "Finish the remaining acceptance or open backlog scope, then rerun audit and close-gate verification.";
+  }
   if (factValue(diagnosis, "mismatched_route_identity")) {
     return "Record matching route-context identity evidence, then retry the gated action.";
   }
@@ -1005,6 +1147,20 @@ function inferredNextLegalAction(diagnosis: TaskPlaybackStructuredFact[], status
   }
   if (status === "failed") return "Repair the failing evidence, rerun verification, then request review again.";
   return "Resolve the listed blocker ids, then retry the governed action.";
+}
+
+function hasOutcomeAuditFacts(
+  event: TaskTimelineEvent,
+  decision: string,
+  closedRows: string,
+  implementedAndMerged: string,
+  remainingAcceptance: string,
+  remainingOpen: string,
+): boolean {
+  if (closedRows || implementedAndMerged || remainingAcceptance || remainingOpen) return true;
+  if (!decision) return false;
+  const label = [event.event_type, event.event_kind, event.phase].map((value) => safeText(String(value || "")).toLowerCase()).join(" ");
+  return /audit|remaining.scope|remaining_scope|postmerge|verification/.test(label);
 }
 
 function evidenceKindFromArtifact(ref: TaskPlaybackArtifactRef): TaskPlaybackEvidenceRef["kind"] {
@@ -1057,6 +1213,29 @@ function stringsFromUnknown(value: unknown): string[] {
       .map(([key, item]) => `${titleize(key)}: ${safeText(stringFrom(item) || compactUnknown(item))}`);
   }
   return [String(value)];
+}
+
+function outcomeStringsFromUnknown(value: unknown): string[] {
+  if (value == null || value === "") return [];
+  if (Array.isArray(value)) return value.flatMap(outcomeStringsFromUnknown);
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const primary = firstStringField(record, ["bug_id", "backlog_id", "id", "row_id", "task_id"]);
+    const title = firstStringField(record, ["title", "summary", "label", "name"]);
+    const state = firstStringField(record, ["decision", "status", "state", "result", "action"]);
+    const detail = firstStringField(record, ["description", "reason", "next_action", "next_legal_action"]);
+    const compact = [primary, title, state, detail].filter(Boolean).join(" | ");
+    return compact ? [compact] : stringsFromUnknown(value);
+  }
+  return [String(value)];
+}
+
+function firstStringField(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = stringFrom(record[key]);
+    if (value) return value;
+  }
+  return "";
 }
 
 function compactUnknown(value: unknown): string {

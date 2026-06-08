@@ -337,6 +337,39 @@ export const TASK_PLAYBACK_NARRATIVE_FOCUS_FIXTURE_EVENTS: TaskTimelineEvent[] =
       source_event_id: "repair-474fadf0551f130e:route_prompt_context",
     }),
   } as unknown as TaskTimelineEvent,
+  {
+    id: 329,
+    event_type: "observer.audit.remaining_scope",
+    event_kind: "verification",
+    phase: "postmerge_audit",
+    actor: "observer",
+    status: "blocked",
+    backlog_id: "AC-OBSERVER-OWNED-AGENT-TASK-CONTRACT-QUEUE-20260604",
+    task_id: "repair-474fadf0551f130e",
+    created_at: "2026-06-07T11:06:00Z",
+    payload_json: JSON.stringify({
+      closed_rows: ["UI-ASSET-BINDING-UNBIND-FLOW-20260525", "DOC-BINDING-INVENTORY-STATUS-CONSISTENCY-20260524"],
+      decision: "do not close P0 umbrella yet; commit 0f4e32a is a partial high-priority closure with two prior rows fixed",
+      implemented_and_merged: [
+        "source-controlled bind/unbind event schema and reducer",
+        "guarded unbind API with current-binding validation",
+        "Asset Inbox and Review Queue UI wiring for source-controlled unbind/audit fallback",
+        "raw/effective file inventory binding status",
+        "doc/test/config graph_asset_projection persistence and Asset Inbox consumption",
+        "fixture-backed drift/impact status contract coverage",
+      ],
+      remaining_acceptance: [
+        "full-vs-scope parity fixture or explicit named full-rebuild fallback evidence for bind/unbind transitions",
+        "automatic drift/impact DB event policy for changed vs affected bound assets after merge/worker gate",
+        "SOP/skill guidance for observer reviewed drift decisions",
+        "browser E2E proof for the operator path if required before final P0 close",
+      ],
+      remaining_open: ["GRAPH-INCREMENTAL-FILE-BINDING-PARITY-20260525", "P0 umbrella"],
+    }),
+    artifact_refs_json: JSON.stringify({
+      source_event_id: "329",
+    }),
+  } as unknown as TaskTimelineEvent,
 ];
 
 export function buildTaskPlaybackHistoricalSemanticFixture() {
@@ -419,6 +452,7 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   const trace = buildTaskPlaybackNarrativeFocusFixture();
   const promptContextFrame = trace.frames.find((frame) => frame.title === "Prompt context requested");
   const rawPromptContextFrame = trace.frames.find((frame) => frame.source_event_id === "#1750");
+  const auditRemainingScopeFrame = trace.frames.find((frame) => frame.source_event_id === "#329");
   const routeActionFrame = trace.frames.find((frame) => frame.title === "Route action requested");
   const serviceRouteFrame = trace.frames.find((frame) => frame.title === "Route service completed");
   const visible = JSON.stringify({
@@ -437,9 +471,10 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   });
   assertFixture(Boolean(promptContextFrame), "route prompt context frame should exist in the narrative fixture");
   assertFixture(Boolean(rawPromptContextFrame), "event #1750 route prompt context frame should hydrate payload_json into playback");
+  assertFixture(Boolean(auditRemainingScopeFrame), "event #329 observer audit remaining-scope frame should hydrate payload_json into playback");
   assertFixture(Boolean(routeActionFrame), "route action frame should exist in the narrative fixture");
   assertFixture(Boolean(serviceRouteFrame), "route service frame should exist in the narrative fixture");
-  if (!promptContextFrame || !rawPromptContextFrame || !routeActionFrame || !serviceRouteFrame) throw new Error("missing route narrative fixture frames");
+  if (!promptContextFrame || !rawPromptContextFrame || !auditRemainingScopeFrame || !routeActionFrame || !serviceRouteFrame) throw new Error("missing route narrative fixture frames");
   assertFixture(
     trace.close_gate_summary.reason_sentence === "Blocked because implementation, verification, and close-ready evidence have not been recorded; the close gate cannot pass until those events exist.",
     "blocked close gate should show a human-readable reason sentence with missing event kinds",
@@ -493,6 +528,28 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "prompt_contract" && ref.value === "rprompt-repair-fixture-1750")
       && rawPromptContextFrame.evidence_links.some((ref) => ref.kind === "source_event" && ref.value.includes("route_prompt_context")),
     "event #1750 evidence links should include typed timeline, route context, prompt contract, and source-event refs",
+  );
+  assertFixture(
+    auditRemainingScopeFrame.summary.includes("decision do not close P0 umbrella yet")
+      && auditRemainingScopeFrame.summary.includes("Remaining scope")
+      && auditRemainingScopeFrame.summary.includes("Next legal action"),
+    "event #329 summary should mention the audit decision, remaining scope, and next legal action",
+  );
+  assertFixture(
+    auditRemainingScopeFrame.specific_facts.some((fact) => fact.label === "decision" && fact.value.includes("do not close P0 umbrella yet"))
+      && auditRemainingScopeFrame.specific_facts.some((fact) => fact.label === "closed rows" && fact.value.includes("UI-ASSET-BINDING-UNBIND-FLOW-20260525"))
+      && auditRemainingScopeFrame.specific_facts.some((fact) => fact.label === "closed rows" && fact.value.includes("DOC-BINDING-INVENTORY-STATUS-CONSISTENCY-20260524"))
+      && auditRemainingScopeFrame.specific_facts.some((fact) => fact.label === "implemented and merged" && fact.value.includes("source-controlled bind/unbind event schema and reducer"))
+      && auditRemainingScopeFrame.specific_facts.some((fact) => fact.label === "implemented and merged" && fact.value.includes("fixture-backed drift/impact status contract coverage")),
+    "event #329 specific facts should promote decision, closed rows, and implemented/merged outcome facts",
+  );
+  assertFixture(
+    auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "remaining acceptance" && fact.value.includes("full-vs-scope parity fixture"))
+      && auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "remaining acceptance" && fact.value.includes("browser E2E proof"))
+      && auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "remaining open" && fact.value.includes("GRAPH-INCREMENTAL-FILE-BINDING-PARITY-20260525"))
+      && auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "remaining open" && fact.value.includes("P0 umbrella"))
+      && auditRemainingScopeFrame.failure_diagnosis.some((fact) => fact.label === "next legal action" && fact.value.includes("Finish the remaining acceptance or open backlog scope")),
+    "event #329 failure diagnosis should promote remaining acceptance, remaining open, and next legal action",
   );
   assertFixture(
     routeActionFrame.detail.includes("authorized or blocked") && routeActionFrame.narrative.outcome.includes("close-ready evidence"),
