@@ -912,9 +912,10 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".backlog-inspector-raw"), "Raw inspector payloads should have stable disclosure CSS");
   assert(!cssSource.includes(".fixture-stream-replay"), "Backlog CSS must not include the default fixture stream replay layout");
   assert(!cssSource.includes(".fixture-stream-progress"), "Backlog CSS must not include fixture replay progress styling");
-  assert(appSource.includes('"playback"'), "Dashboard should register a fixed Task Playback view route");
-  assert(appSource.includes("TaskPlaybackView"), "App should render TaskPlaybackView for the playback route");
-  assert(viewSource.includes("view=playback"), "Backlog view should expose a visible playback entry point");
+  assert(appSource.includes('"activity"'), "Dashboard should register Activity as a fixed view route");
+  assert(appSource.includes('toLowerCase() === "playback"') && appSource.includes('return "activity"'), "Dashboard should keep view=playback as a compatibility alias for Activity");
+  assert(appSource.includes('view === "activity"') && appSource.includes("TaskPlaybackView"), "App should render TaskPlaybackView for the Activity route");
+  assert(viewSource.includes("view=activity") && !viewSource.includes("view=playback"), "Backlog view should prefer Activity for activity and playback deep links");
   assert(playbackViewSource.includes("TaskPlaybackPanel"), "Activity view should reuse the public task playback panel");
   assert(playbackPanelSource.includes("Private refs redacted"), "Task playback panel should use public-safe private ref redaction copy");
   assert(sseSource.includes('"task_timeline.appended"'), "Dashboard SSE client should listen for task timeline append events");

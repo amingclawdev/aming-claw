@@ -272,9 +272,9 @@ export default function TreePanel(props: Props) {
           icon="◷"
           label="Activity"
           meta={loading ? "…" : String(backlogCount)}
-          active={activeView === "playback"}
+          active={activeView === "activity"}
           collapsed={collapsed}
-          onClick={() => props.onSelectView("playback")}
+          onClick={() => props.onSelectView("activity")}
         />
       </div>
 

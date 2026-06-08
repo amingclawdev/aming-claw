@@ -40,15 +40,15 @@ const ROUTE_QA_REQUIREMENTS = ["independent_verification_lane"];
 const ROUTE_IDENTITY_REQUIREMENTS = ["route_identity_mismatch", "same_route_identity", "route_identity_cleanup"];
 
 function playbackHref(projectId: string): string {
-  return `?project_id=${encodeURIComponent(projectId)}&view=playback&activity_tab=history`;
+  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history`;
 }
 
 function activityHref(projectId: string, backlogId: string): string {
-  return `?project_id=${encodeURIComponent(projectId)}&view=playback&activity_tab=activity&playback_backlog=${encodeURIComponent(backlogId)}`;
+  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=activity&playback_backlog=${encodeURIComponent(backlogId)}`;
 }
 
 function playbackDetailHref(projectId: string, backlogId: string): string {
-  return `?project_id=${encodeURIComponent(projectId)}&view=playback&activity_tab=history&playback_backlog=${encodeURIComponent(backlogId)}`;
+  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history&playback_backlog=${encodeURIComponent(backlogId)}`;
 }
 
 export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
