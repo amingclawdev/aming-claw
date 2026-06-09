@@ -1065,6 +1065,20 @@ function verifyBacklogEvidenceContract() {
   assert(cssSource.includes(".task-playback-panel"), "Task playback panel should have stable CSS");
   assert(cssSource.includes(".task-playback-evidence-modal") && cssSource.includes(".task-playback-evidence-section"), "Task playback evidence modal should have stable CSS");
   assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
+  // Observer root route context + work modes (AC-OBSERVER-ROOT-ROUTE-CONTEXT-WORK-MODE-20260609)
+  assert(playbackSource.includes('pushSurrogateCloseEvidenceFact') && playbackSource.includes('pushCloseSubGateFacts'), "Task playback should surface surrogate close-evidence and close sub-gate facts");
+  assert(playbackSource.includes('"observer work mode"') && playbackSource.includes('"work-mode transition"'), "Task playback should promote observer work-mode facts");
+  assert(playbackSource.includes('"graph query schema trace"'), "Task playback should promote the graph query schema trace id");
+  assert(playbackSource.includes('"session token evidence type"') && playbackSource.includes('not close-satisfying real-worker evidence (#3104)'), "Task playback should surface session token evidence type and the #3104 surrogate demotion");
+  assert(playbackSource.includes('blocker-resolution gate (#3092)') && playbackSource.includes('cross-ref evidence gate (#3090)') && playbackSource.includes('stale-route evidence gate (#3093/#3094)'), "Task playback should surface close sub-gate statuses for #3092/#3090/#3093/#3094");
+  assert(semanticCatalogSource.includes('observer_work_mode_transition') && semanticCatalogSource.includes('Observer work-mode transition'), "Semantic catalog should narrate observer_work_mode_transition");
+  assert(semanticCatalogSource.includes('observer_hotfix_exception') && semanticCatalogSource.includes('does not promote surrogate startup to close-satisfying real-worker evidence (#3104)'), "Semantic catalog should narrate observer_hotfix_exception and its #3104 boundary");
+  assert(semanticCatalogSource.includes('bounded_implementation_worker_dispatch') && semanticCatalogSource.includes('observer_execution_supervisor'), "Semantic catalog should narrate bounded worker dispatch under observer_execution_supervisor");
+  assert(semanticCatalogSource.includes('independent_verification_lane') && semanticCatalogSource.includes('Independent verification lane'), "Semantic catalog should narrate the independent verification lane");
+  assert(semanticCatalogSource.includes('session_token_evidence_type') && semanticCatalogSource.includes('host-adapter surrogate startup is not close-satisfying real-worker evidence (#3104)'), "Semantic catalog startup entry should narrate surrogate-vs-real session token evidence and #3104");
+  assert(playbackPanelSource.includes('session_token_evidence_type') && playbackPanelSource.includes('surrogate_close_satisfying') && playbackPanelSource.includes('blocker_resolution_gate'), "Task playback evidence modal should surface work-mode, surrogate, and close sub-gate facts");
+  assert(playbackTestSource.includes('AC-OBSERVER-ROOT-ROUTE-CONTEXT-WORK-MODE-20260609') && playbackTestSource.includes('taskPlaybackWorkModeFixtureAssertions'), "Task playback fixture should cover the observer root route context work-mode backlog");
+  ok("Observer root route context, work modes, surrogate close-evidence, and close sub-gates are readable in playback");
   ok("Activity owns current events; Backlog rows expose compact status plus Activity/playback deep links");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }

@@ -254,6 +254,45 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      reason / superseded_by); distinct from SUPERSEDED (replaced) and
      CANCELLED/VOID (abandoned).
 
+## Observer Work Modes and Root Route Context
+
+Read the observer root route context before acting on a row:
+`GET/POST /api/projects/{project_id}/observer-root-route-context`. The runtime
+posture is an explicit `work_mode`:
+
+- `observer_look_before_act` (default): read, inspect, file findings, propose
+  next legal action only. Blocks edit-implementation, self-clear-judge-blocker,
+  dispatch, merge, and close. `next_legal_action` is `record_work_mode_transition`.
+- `observer_execution_supervisor`: dispatch/merge/close coordination is legal.
+  Requires BOTH a recorded `observer_work_mode_transition` event AND a
+  `route_action_precheck` bound to the canonical route identity; the observer
+  cannot widen its own authority by fiat.
+- `observer_hotfix_exception`: narrowly relaxes host-adapter surrogate startup
+  only. Never permits direct implementation or judge self-clear, and a surrogate
+  startup under it is still not close-satisfying real-worker evidence.
+
+`edit_implementation` and `self_clear_judge_blocker` are never allowed for the
+observer in any mode. The root route context exposes the canonical identity
+(`route_id`, `route_context_hash`, `prompt_contract_id`), `work_mode`,
+`loaded_skills`/`loaded_resources`, `graph_query_schema_trace_id`,
+`allowed_actions`/`blocked_actions`, `required_evidence`, and
+`next_legal_action`; the dashboard evidence modal renders these real fields.
+
+## Close-Evidence Integrity Gates
+
+The MF close gate enforces:
+
+- `#3090` cross-ref: close evidence from a different backlog/scope row is
+  rejected unless an accepted bridge/lineage event links the rows.
+- `#3092` blocker-resolution: an observer may propose `pending_judge_review` but
+  must never self-clear a judge blocker; independent judge acceptance is required.
+- `#3093/#3094` stale-route evidence: evidence recorded under a superseded route
+  identity is invalidated and must be re-recorded under the canonical identity.
+- `#3104` surrogate-not-close-satisfying: `session_token_evidence_type =
+  "surrogate"` is never close-satisfying real bounded-worker evidence, even when
+  the startup gate stamps `close_satisfying=true` and even under
+  `observer_hotfix_exception`. Only a real session-token startup is close-satisfying.
+
 ## Commit
 
 Stage explicit files only. Use Chain trailers as MF audit anchors. Chain

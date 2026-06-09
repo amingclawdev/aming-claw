@@ -808,7 +808,7 @@ function readReceiptEvidencePresent(rows: EvidenceInspectorRow[]): boolean {
 }
 
 function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
-  const shared = ["actor", "lane_receiver", "backlog_id", "stage"];
+  const shared = ["actor", "lane_receiver", "backlog_id", "stage", "work_mode", "work_mode_transition"];
   const routeScope = [
     "route_id",
     "route_context_hash",
@@ -827,6 +827,13 @@ function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
     "source_event_refs",
     "read_receipt_refs",
     "startup_refs",
+    "graph_query_schema_trace_id",
+    "session_token_evidence_type",
+    "agent_id_match_mode",
+    "surrogate_close_satisfying",
+    "blocker_resolution_gate",
+    "cross_ref_gate",
+    "stale_route_evidence_gate",
   ];
   if (kind === "route_context" || kind === "read_receipt" || kind === "prompt_contract") return new Set([...shared, ...routeScope]);
   if (kind === "timeline_event" || kind === "source_event" || kind === "gate") return new Set([...shared, ...routeScope, "decision"]);
@@ -904,6 +911,29 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "startup_intent_event_id",
   ];
   const scope = [
+    "work_mode",
+    "to_work_mode",
+    "from_work_mode",
+    "default_work_mode",
+    "route_context.work_mode",
+    "next_legal_action",
+    "next_legal_action.action",
+    "next_legal_action.detail",
+    "graph_query_schema_trace_id",
+    "query_schema_trace_id",
+    "route_context.graph_query_schema_trace_id",
+    "session_token_evidence_type",
+    "mf_subagent_startup_gate.session_token_evidence_type",
+    "identity_join.session_token_evidence_type",
+    "agent_id_match_mode",
+    "mf_subagent_startup_gate.agent_id_match_mode",
+    "identity_join.agent_id_match_mode",
+    "close_satisfying",
+    "counts_as_real_worker_evidence",
+    "surrogate_startup_evidence_gate.close_satisfying",
+    "blocker_resolution_gate.status",
+    "cross_ref_gate.status",
+    "stale_route_evidence_gate.status",
     "body_persisted_status",
     "route_context.body_persisted_status",
     "read_receipt.body_persisted_status",

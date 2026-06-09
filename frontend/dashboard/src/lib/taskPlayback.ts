@@ -478,6 +478,38 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "verification.stage",
     "phase",
   ]);
+  pushFirstFact(facts, event, "work_mode", "observer work mode", [
+    "payload.work_mode",
+    "payload.to_work_mode",
+    "payload.observer_work_mode",
+    "payload.route_context.work_mode",
+    "payload.next_legal_action.work_mode",
+    "verification.work_mode",
+    "verification.to_work_mode",
+    "artifact_refs.work_mode",
+  ]);
+  pushFirstFact(facts, event, "work_mode_transition", "work-mode transition", [
+    "payload.from_work_mode",
+    "payload.work_mode_transition",
+    "verification.from_work_mode",
+  ]);
+  pushFirstFact(facts, event, "graph_query_schema_trace_id", "graph query schema trace", [
+    "payload.graph_query_schema_trace_id",
+    "payload.query_schema_trace_id",
+    "payload.route_context.graph_query_schema_trace_id",
+    "verification.graph_query_schema_trace_id",
+    "verification.query_schema_trace_id",
+    "artifact_refs.graph_query_schema_trace_id",
+  ]);
+  pushFirstFact(facts, event, "agent_id_match_mode", "agent-id match mode", [
+    "payload.agent_id_match_mode",
+    "payload.mf_subagent_startup_gate.agent_id_match_mode",
+    "payload.identity_join.agent_id_match_mode",
+    "verification.agent_id_match_mode",
+    "verification.identity_join.agent_id_match_mode",
+  ]);
+  pushSurrogateCloseEvidenceFact(facts, event);
+  pushCloseSubGateFacts(facts, event);
   pushFirstFact(facts, event, "topology", "topology", [
     "payload.selected_topology",
     "payload.recommended_topology",
@@ -648,7 +680,133 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
   if (startupRefs.length > 0) {
     pushFact(facts, "startup_refs", "startup refs", formatCompactList(startupRefs), sourceForPath(startupRefs[0].path));
   }
-  return stableFacts(facts).slice(0, 18);
+  return stableFacts(facts).slice(0, 24);
+}
+
+// A host-adapter surrogate startup (session_token_evidence_type === "surrogate")
+// is never close-satisfying real bounded-worker evidence (regression #3104), even
+// under an observer_hotfix_exception. Surface the close-satisfying boolean as a
+// plain fact so the evidence modal states it explicitly instead of leaving it in
+// raw JSON.
+function pushSurrogateCloseEvidenceFact(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent): void {
+  // session_token_evidence_type lives under a key containing "token", which the
+  // private-evidence path filter redacts. The category value ("surrogate" |
+  // "real") is itself public and load-bearing for the #3104 close-evidence
+  // demotion, so read it directly from the (already public-safe) payload /
+  // verification objects rather than through the path-redacting helpers.
+  const tokenType = firstNestedStringByKey(event, "session_token_evidence_type");
+  const matchMode = firstPublicValueAtPaths(event, [
+    "payload.agent_id_match_mode",
+    "payload.mf_subagent_startup_gate.agent_id_match_mode",
+    "payload.identity_join.agent_id_match_mode",
+    "verification.agent_id_match_mode",
+    "verification.identity_join.agent_id_match_mode",
+  ]);
+  const tokenTypeNormalized = (tokenType?.value || "").toLowerCase();
+  if (tokenType) {
+    pushFact(facts, "session_token_evidence_type", "session token evidence type", tokenType.value, tokenType.source);
+  }
+  const isSurrogate =
+    tokenTypeNormalized === "surrogate"
+    || (matchMode?.value || "").toLowerCase() === "host_adapter_startup_token_surrogate";
+  if (isSurrogate) {
+    pushFact(
+      facts,
+      "surrogate_close_satisfying",
+      "surrogate close-satisfying",
+      "no — host-adapter surrogate startup is not close-satisfying real-worker evidence (#3104)",
+      tokenType?.source ?? matchMode?.source ?? "semantic",
+    );
+    return;
+  }
+  const declared = firstNestedStringByKey(event, "close_satisfying");
+  // Only annotate the real-worker case when a startup gate explicitly recorded a
+  // real session-token type, so we never invent close-satisfying state.
+  if (tokenTypeNormalized === "real") {
+    pushFact(
+      facts,
+      "surrogate_close_satisfying",
+      "surrogate close-satisfying",
+      declared && declared.value.toLowerCase() === "false"
+        ? "no — startup gate recorded close_satisfying=false"
+        : "yes — real session-token startup is close-satisfying",
+      tokenType?.source ?? "semantic",
+    );
+  }
+}
+
+// Read the first value for a leaf key from the public payload/verification
+// containers, bypassing path-level token redaction for known-safe category
+// fields. The value is still safeText-sanitized before use.
+function firstNestedStringByKey(event: TaskTimelineEvent, key: string): PublicFieldValue | null {
+  const containers: Array<{ source: TaskPlaybackStructuredFact["source"]; record: Record<string, unknown> }> = [
+    { source: "payload", record: asRecord(event.payload) },
+    { source: "verification", record: asRecord(event.verification) },
+  ];
+  for (const { source, record } of containers) {
+    const found = findLeafValue(record, key, 0);
+    if (found) {
+      const safe = safeText(found);
+      if (safe && safe !== "[private detail redacted]") return { value: safe, path: source, source };
+    }
+  }
+  return null;
+}
+
+function findLeafValue(record: Record<string, unknown>, key: string, depth: number): string {
+  if (depth > 3) return "";
+  const direct = record[key];
+  if (typeof direct === "string" || typeof direct === "number" || typeof direct === "boolean") return String(direct);
+  for (const value of Object.values(record)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const nested = findLeafValue(value as Record<string, unknown>, key, depth + 1);
+      if (nested) return nested;
+    }
+  }
+  return "";
+}
+
+// Close-gate sub-gate status facts: blocker-resolution self-clear gate (#3092),
+// cross-ref evidence gate (#3090), and stale-route evidence gate (#3093/#3094).
+// These mirror the backend mf_close_gate_verification sub-gates so the close
+// banner / evidence modal can show which integrity sub-gate passed or blocked.
+function pushCloseSubGateFacts(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent): void {
+  const subGates: Array<{ kind: string; label: string; paths: string[] }> = [
+    {
+      kind: "blocker_resolution_gate",
+      label: "blocker-resolution gate (#3092)",
+      paths: [
+        "payload.blocker_resolution_gate.status",
+        "payload.close_gate.blocker_resolution_gate.status",
+        "verification.blocker_resolution_gate.status",
+        "verification.close_gate.blocker_resolution_gate.status",
+      ],
+    },
+    {
+      kind: "cross_ref_gate",
+      label: "cross-ref evidence gate (#3090)",
+      paths: [
+        "payload.cross_ref_gate.status",
+        "payload.close_gate.cross_ref_gate.status",
+        "verification.cross_ref_gate.status",
+        "verification.close_gate.cross_ref_gate.status",
+      ],
+    },
+    {
+      kind: "stale_route_evidence_gate",
+      label: "stale-route evidence gate (#3093/#3094)",
+      paths: [
+        "payload.stale_route_evidence_gate.status",
+        "payload.close_gate.stale_route_evidence_gate.status",
+        "verification.stale_route_evidence_gate.status",
+        "verification.close_gate.stale_route_evidence_gate.status",
+      ],
+    },
+  ];
+  for (const gate of subGates) {
+    const status = firstPublicValueAtPaths(event, gate.paths);
+    if (status) pushFact(facts, gate.kind, gate.label, status.value, status.source);
+  }
 }
 
 function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybackFrameStatus): TaskPlaybackStructuredFact[] {

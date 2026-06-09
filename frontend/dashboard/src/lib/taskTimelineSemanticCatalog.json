@@ -114,20 +114,23 @@
       "id": "mf_subagent.startup",
       "match": { "event_type": ["mf_subagent.startup"], "event_kind": ["mf_subagent_startup"] },
       "title": "Worker startup recorded",
-      "detail": "A bounded manual-fix worker started inside its assigned branch/worktree lane with public fence evidence.",
+      "detail": "A bounded manual-fix worker started inside its assigned branch/worktree lane with public fence evidence. The startup records its session-token evidence type: a real session-token startup is close-satisfying real-worker evidence, while a host-adapter surrogate startup is not close-satisfying real-worker evidence (#3104).",
       "lane": "worker",
       "actor": "Bounded worker",
       "narrative": {
         "actor": "Bounded worker started the assigned manual-fix lane.",
-        "information": "It produced startup evidence for the worker identity, branch/worktree, fence, and owned files when present.",
-        "context": "The startup record identifies the bounded task lineage and target commit; raw request text and route tokens are not displayed.",
-        "purpose": "This proves implementation work is happening inside the dispatched worker boundary.",
-        "outcome": "The worker lane moved from dispatched to started, which is required before review or close can trust worker evidence."
+        "information": "It produced startup evidence for the worker identity, branch/worktree, fence, owned files, and session-token evidence type (real vs surrogate) when present.",
+        "context": "The startup record identifies the bounded task lineage and target commit; raw request text and route tokens are not displayed. The session_token_evidence_type field distinguishes a real session-token startup from a host-adapter surrogate startup.",
+        "purpose": "This proves implementation work is happening inside the dispatched worker boundary, and whether the startup is real-worker evidence or only a host-adapter surrogate.",
+        "outcome": "A real startup moves the worker lane from dispatched to started so review/close can trust worker evidence; a host-adapter surrogate startup is recorded but is never close-satisfying real-worker evidence (#3104), even under an observer_hotfix_exception."
       },
       "chip_paths": [
         { "label": "worker", "path": "payload.worker_id" },
         { "label": "lane", "path": "payload.lane" },
         { "label": "branch", "path": "payload.branch" },
+        { "label": "session token evidence", "path": "payload.session_token_evidence_type" },
+        { "label": "session token evidence", "path": "payload.mf_subagent_startup_gate.session_token_evidence_type" },
+        { "label": "agent-id match mode", "path": "payload.agent_id_match_mode" },
         { "label": "status", "path": "status" }
       ],
       "evidence_paths": [
@@ -140,7 +143,9 @@
       "detail_paths": [
         { "label": "task", "path": "task_id" },
         { "label": "parent", "path": "payload.parent_task_id" },
-        { "label": "target head", "path": "payload.target_head_commit" }
+        { "label": "target head", "path": "payload.target_head_commit" },
+        { "label": "session token evidence type", "path": "payload.session_token_evidence_type" },
+        { "label": "close satisfying", "path": "payload.close_satisfying" }
       ]
     },
     {
@@ -296,7 +301,10 @@
       "artifact_paths": [],
       "detail_paths": [
         { "label": "missing event kinds", "path": "payload.missing_event_kinds" },
-        { "label": "can close", "path": "payload.can_close" }
+        { "label": "can close", "path": "payload.can_close" },
+        { "label": "blocker-resolution gate (#3092)", "path": "payload.blocker_resolution_gate.status" },
+        { "label": "cross-ref evidence gate (#3090)", "path": "payload.cross_ref_gate.status" },
+        { "label": "stale-route evidence gate (#3093/#3094)", "path": "payload.stale_route_evidence_gate.status" }
       ]
     },
     {
@@ -400,21 +408,22 @@
     },
     {
       "id": "mf_subagent.dispatch",
-      "match": { "event_type": ["mf_subagent.dispatch", "mf_subagent.dispatched"], "event_kind": ["mf_subagent_dispatch", "bounded_implementation_worker_dispatch"] },
-      "title": "Worker dispatch recorded",
-      "detail": "The observer dispatched a bounded worker with target files, acceptance criteria, route identity hashes, and required evidence.",
+      "match": { "event_type": ["mf_subagent.dispatch", "mf_subagent.dispatched", "bounded_implementation_worker_dispatch"], "event_kind": ["mf_subagent_dispatch", "bounded_implementation_worker_dispatch"] },
+      "title": "Bounded worker dispatch recorded",
+      "detail": "The observer dispatched a bounded implementation worker with target files, acceptance criteria, route identity hashes, and required evidence. Dispatch is an observer_execution_supervisor action, so it requires the observer to have transitioned out of look-before-act.",
       "lane": "observer",
       "actor": "Observer",
       "narrative": {
         "actor": "Observer dispatched a bounded implementation worker.",
-        "information": "It produced dispatch evidence for worker identity, file fence, branch/worktree, route identity, and graph trace ids when present.",
-        "context": "Dispatch context contains target files, acceptance criteria, allowed/blocked actions, route identity hashes, and required evidence; private prompt text is hidden.",
-        "purpose": "This starts implementation while preserving the observer-owned merge, close, and reconcile boundaries.",
-        "outcome": "The task gained a bounded worker lane that can produce implementation evidence for review."
+        "information": "It produced dispatch evidence for worker identity, file fence, branch/worktree, route identity, work mode, and graph trace ids when present.",
+        "context": "Dispatch context contains target files, acceptance criteria, allowed/blocked actions, route identity hashes, work mode, and required evidence; private prompt text is hidden.",
+        "purpose": "This starts implementation under the observer_execution_supervisor posture while preserving the observer-owned merge, close, and reconcile boundaries.",
+        "outcome": "The task gained a bounded worker lane that can produce real-worker implementation evidence for review."
       },
       "chip_paths": [
         { "label": "worker", "path": "payload.worker_id" },
         { "label": "lane", "path": "payload.lane" },
+        { "label": "work mode", "path": "payload.work_mode" },
         { "label": "status", "path": "status" }
       ],
       "evidence_paths": [
@@ -428,7 +437,104 @@
       ],
       "detail_paths": [
         { "label": "task", "path": "task_id" },
-        { "label": "branch", "path": "payload.branch" }
+        { "label": "branch", "path": "payload.branch" },
+        { "label": "work mode", "path": "payload.work_mode" }
+      ]
+    },
+    {
+      "id": "observer.work_mode_transition",
+      "match": { "event_type": ["observer_work_mode_transition", "observer.work_mode_transition"], "event_kind": ["observer_work_mode_transition"] },
+      "title": "Observer work-mode transition",
+      "detail": "The observer recorded a work-mode transition (observer_look_before_act -> observer_execution_supervisor). This transition is legal only with both a recorded transition event and a route_action_precheck bound to the canonical route identity.",
+      "lane": "observer",
+      "actor": "Observer",
+      "narrative": {
+        "actor": "Observer transitioned out of look-before-act into an execution-supervisor posture.",
+        "information": "It recorded the from/to work modes and the canonical route identity the transition is bound to.",
+        "context": "Default observer posture is observer_look_before_act, which blocks edit-implementation, self-clear-judge-blocker, dispatch, merge, and close; the transition unlocks dispatch/merge/close coordination but never direct implementation or judge self-clear.",
+        "purpose": "This proves the observer earned dispatch/merge/close coordination authority through an explicit, route-bound transition rather than acting by fiat.",
+        "outcome": "Once accepted, supervisor coordination actions become legal under the canonical route identity; without the bound precheck the transition stays blocked."
+      },
+      "chip_paths": [
+        { "label": "from work mode", "path": "payload.from_work_mode" },
+        { "label": "to work mode", "path": "payload.to_work_mode" },
+        { "label": "to work mode", "path": "payload.work_mode" },
+        { "label": "route", "path": "payload.route_id" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "precheck", "label": "route precheck", "path": "payload.route_action_precheck_event_id" },
+        { "kind": "gate", "label": "route hash", "path": "payload.route_context_hash" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "to work mode", "path": "payload.to_work_mode" },
+        { "label": "blocked until transition", "path": "payload.next_legal_action.blocked_until_transition" },
+        { "label": "backlog", "path": "backlog_id" }
+      ]
+    },
+    {
+      "id": "observer.hotfix_exception",
+      "match": { "event_type": ["observer_hotfix_exception", "observer.hotfix_exception"], "event_kind": ["observer_hotfix_exception"], "phase": ["observer_hotfix_exception"] },
+      "title": "Observer hotfix exception",
+      "detail": "The observer recorded an observer_hotfix_exception mode. This narrowly relaxes host-adapter surrogate startup handling; it does not promote surrogate startup to close-satisfying real-worker evidence (#3104), and never permits direct implementation or judge self-clear.",
+      "lane": "observer",
+      "actor": "Observer",
+      "narrative": {
+        "actor": "Observer entered the observer_hotfix_exception work mode.",
+        "information": "It recorded the hotfix-exception posture and the route identity it applies to.",
+        "context": "Hotfix exception is the only mode that lets a host-adapter surrogate startup proceed under a relaxed identity match; even then the surrogate startup is NOT counted as close-satisfying real-worker evidence.",
+        "purpose": "This documents a narrow, audited relaxation for emergency repair without weakening the real-worker close-evidence requirement.",
+        "outcome": "Surrogate startup may proceed, but close still requires real bounded-worker evidence; the hotfix exception does not satisfy the close gate by itself."
+      },
+      "chip_paths": [
+        { "label": "work mode", "path": "payload.work_mode" },
+        { "label": "route", "path": "payload.route_id" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "gate", "label": "route hash", "path": "payload.route_context_hash" }
+      ],
+      "artifact_paths": [],
+      "detail_paths": [
+        { "label": "reason", "path": "payload.reason" },
+        { "label": "backlog", "path": "backlog_id" }
+      ]
+    },
+    {
+      "id": "independent_verification.lane",
+      "match": { "event_type": ["independent_verification_lane", "independent_verification.lane"], "event_kind": ["independent_verification_lane"] },
+      "title": "Independent verification lane",
+      "detail": "An independent verification lane (separate from the bounded implementation worker) recorded QA evidence so worker output and verification do not come from the same actor.",
+      "lane": "verification",
+      "actor": "Independent verification",
+      "narrative": {
+        "actor": "An independent verification lane reviewed the bounded worker output.",
+        "information": "It produced public QA evidence, test results, graph traces, or changed-file checks separate from the implementation worker.",
+        "context": "The verifier is a distinct lane from the implementation worker; it uses public task evidence and sanitized artifacts, not private prompt or route-token bodies.",
+        "purpose": "This separates implementation from verification so the observer can trust the handoff before close.",
+        "outcome": "The independent verification lane records whether the candidate is ready for merge/close review; it is required QA evidence the close gate checks."
+      },
+      "chip_paths": [
+        { "label": "verifier", "path": "payload.verifier" },
+        { "label": "lane", "path": "payload.lane" },
+        { "label": "passed", "path": "verification.passed" },
+        { "label": "status", "path": "status" }
+      ],
+      "evidence_paths": [
+        { "kind": "timeline_event", "label": "event", "path": "event_id" },
+        { "kind": "graph_trace", "label": "graph trace", "path": "payload.graph_query_trace_ids" },
+        { "kind": "test", "label": "test", "path": "verification.tests_run" }
+      ],
+      "artifact_paths": [
+        { "kind": "test", "path": "verification.tests_run" },
+        { "kind": "file", "path": "payload.changed_files" }
+      ],
+      "detail_paths": [
+        { "label": "result", "path": "payload.result" },
+        { "label": "notes", "path": "payload.public_summary" }
       ]
     },
     {

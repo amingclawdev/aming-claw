@@ -734,9 +734,269 @@ export function taskPlaybackNarrativeFocusFixtureAssertions(): string[] {
   ];
 }
 
+const workModeBacklog: BacklogBug = {
+  bug_id: "AC-OBSERVER-ROOT-ROUTE-CONTEXT-WORK-MODE-20260609",
+  title: "Observer root route context and work modes",
+  status: "OPEN",
+  priority: "P1",
+};
+
+export const TASK_PLAYBACK_WORK_MODE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
+  {
+    id: 301,
+    event_type: "route.action.requested",
+    event_kind: "route_action_precheck",
+    phase: "dispatch",
+    actor: "observer",
+    status: "allowed",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      action: "record_work_mode_transition",
+      work_mode: "observer_look_before_act",
+      route_id: "route-repair-dbc66b929fd8860c",
+      route_context_hash: "sha256:fixture-work-mode-route",
+      prompt_contract_id: "rprompt-repair-dbc66b929fd8860c",
+      graph_query_schema_trace_id: "gqs-fixture-work-mode",
+      allowed_actions: ["read", "inspect", "file_findings", "propose_next"],
+      blocked_actions: ["edit_implementation", "self_clear_judge_blocker", "dispatch_implementation", "merge", "close"],
+      required_evidence: ["route_context", "route_action_precheck", "bounded_implementation_worker_dispatch", "mf_subagent_startup", "independent_verification", "close_ready"],
+      next_legal_action: {
+        action: "observer_work_mode_transition",
+        detail: "record an observer_work_mode_transition event and a route_action_precheck bound to the canonical route identity before any dispatch/merge/close",
+      },
+    },
+    created_at: "2026-06-09T09:00:00Z",
+  },
+  {
+    id: 302,
+    event_type: "observer_work_mode_transition",
+    event_kind: "observer_work_mode_transition",
+    phase: "work_mode_gate",
+    actor: "observer",
+    status: "allowed",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      from_work_mode: "observer_look_before_act",
+      to_work_mode: "observer_execution_supervisor",
+      route_id: "route-repair-dbc66b929fd8860c",
+      route_context_hash: "sha256:fixture-work-mode-route",
+      route_action_precheck_event_id: 301,
+    },
+    created_at: "2026-06-09T09:01:00Z",
+  },
+  {
+    id: 303,
+    event_type: "bounded_implementation_worker_dispatch",
+    event_kind: "bounded_implementation_worker_dispatch",
+    phase: "dispatch",
+    actor: "observer",
+    status: "passed",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      worker_id: "mfsub-work-mode-a",
+      work_mode: "observer_execution_supervisor",
+      graph_query_trace_ids: ["gqt-fixture-work-mode-dispatch"],
+      target_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+    },
+    created_at: "2026-06-09T09:02:00Z",
+  },
+  {
+    id: 304,
+    event_type: "mf_subagent.startup",
+    event_kind: "mf_subagent_startup",
+    phase: "startup_gate",
+    actor: "mf_sub",
+    status: "blocked",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      worker_id: "mfsub-work-mode-surrogate",
+      session_token_evidence_type: "surrogate",
+      agent_id_match_mode: "host_adapter_startup_token_surrogate",
+      close_satisfying: false,
+      [PRIVATE_REQUEST_FIELD]: "[fixture private request text]",
+    },
+    created_at: "2026-06-09T09:03:00Z",
+  },
+  {
+    id: 305,
+    event_type: "mf_subagent.startup",
+    event_kind: "mf_subagent_startup",
+    phase: "startup_gate",
+    actor: "mf_sub",
+    status: "passed",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      worker_id: "mfsub-work-mode-real",
+      session_token_evidence_type: "real",
+      agent_id_match_mode: "session_token",
+      close_satisfying: true,
+      owned_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+    },
+    created_at: "2026-06-09T09:04:00Z",
+  },
+  {
+    id: 306,
+    event_type: "independent_verification_lane",
+    event_kind: "independent_verification_lane",
+    phase: "independent_verification",
+    actor: "qa",
+    status: "passed",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      verifier: "independent-qa",
+      lane: "independent_verification",
+    },
+    verification: {
+      passed: true,
+      tests_run: ["node scripts/e2e-projects.mjs"],
+    },
+    created_at: "2026-06-09T09:05:00Z",
+  },
+  {
+    id: 307,
+    event_type: "observer_hotfix_exception",
+    event_kind: "observer_hotfix_exception",
+    phase: "observer_hotfix_exception",
+    actor: "observer",
+    status: "recorded",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      work_mode: "observer_hotfix_exception",
+      route_id: "route-repair-dbc66b929fd8860c",
+      reason: "emergency repair surrogate startup relaxation",
+    },
+    created_at: "2026-06-09T09:06:00Z",
+  },
+  {
+    id: 308,
+    event_type: "route_token_gate.backlog_close",
+    event_kind: "route_token_gate",
+    phase: "close_gate",
+    actor: "observer",
+    status: "blocked",
+    backlog_id: workModeBacklog.bug_id,
+    task_id: "observer-root-route-context",
+    payload: {
+      close_gate_status: "blocked",
+      can_close: false,
+      missing_event_kinds: ["close_ready"],
+      blocker_resolution_gate: { status: "passed" },
+      cross_ref_gate: { status: "passed" },
+      stale_route_evidence_gate: { status: "blocked" },
+    },
+    created_at: "2026-06-09T09:07:00Z",
+  },
+];
+
+export function buildTaskPlaybackWorkModeFixture() {
+  return normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog: workModeBacklog,
+    taskTimeline: {
+      project_id: "aming-claw",
+      backlog_id: workModeBacklog.bug_id,
+      events: TASK_PLAYBACK_WORK_MODE_FIXTURE_EVENTS,
+      count: TASK_PLAYBACK_WORK_MODE_FIXTURE_EVENTS.length,
+    },
+    gateResponse: null,
+    source: "governed",
+    generatedAt: "2026-06-09T09:08:00Z",
+  });
+}
+
+export function taskPlaybackWorkModeFixtureAssertions(): string[] {
+  const trace = buildTaskPlaybackWorkModeFixture();
+  const transitionFrame = trace.frames.find((frame) => frame.source_event_id === "#302");
+  const dispatchFrame = trace.frames.find((frame) => frame.source_event_id === "#303");
+  const surrogateStartupFrame = trace.frames.find((frame) => frame.source_event_id === "#304");
+  const realStartupFrame = trace.frames.find((frame) => frame.source_event_id === "#305");
+  const independentLaneFrame = trace.frames.find((frame) => frame.source_event_id === "#306");
+  const hotfixFrame = trace.frames.find((frame) => frame.source_event_id === "#307");
+  const closeGateFrame = trace.frames.find((frame) => frame.source_event_id === "#308");
+  const precheckFrame = trace.frames.find((frame) => frame.source_event_id === "#301");
+  assertFixture(Boolean(transitionFrame), "observer work-mode transition frame should exist");
+  assertFixture(Boolean(dispatchFrame), "bounded worker dispatch frame should exist");
+  assertFixture(Boolean(surrogateStartupFrame), "surrogate startup frame should exist");
+  assertFixture(Boolean(realStartupFrame), "real startup frame should exist");
+  assertFixture(Boolean(independentLaneFrame), "independent verification lane frame should exist");
+  assertFixture(Boolean(hotfixFrame), "observer hotfix exception frame should exist");
+  assertFixture(Boolean(closeGateFrame), "close gate frame should exist");
+  assertFixture(Boolean(precheckFrame), "route action precheck frame should exist");
+  if (!transitionFrame || !dispatchFrame || !surrogateStartupFrame || !realStartupFrame || !independentLaneFrame || !hotfixFrame || !closeGateFrame || !precheckFrame) {
+    throw new Error("missing work-mode fixture frames");
+  }
+  const visible = JSON.stringify({
+    frames: trace.frames.map((frame) => ({
+      title: frame.title,
+      detail: frame.detail,
+      narrative: frame.narrative,
+      facts: frame.specific_facts,
+    })),
+  });
+  assertFixture(transitionFrame.title === "Observer work-mode transition", "transition row should be readable");
+  assertFixture(
+    transitionFrame.specific_facts.some((fact) => fact.label === "observer work mode" && fact.value === "observer_execution_supervisor"),
+    "transition frame should promote the target work mode",
+  );
+  assertFixture(
+    transitionFrame.narrative.context.includes("look_before_act") && transitionFrame.narrative.outcome.includes("blocked"),
+    "transition narrative should explain look-before-act defaults and the bound precheck requirement",
+  );
+  assertFixture(
+    dispatchFrame.title === "Bounded worker dispatch recorded"
+      && dispatchFrame.specific_facts.some((fact) => fact.label === "observer work mode" && fact.value === "observer_execution_supervisor"),
+    "bounded worker dispatch frame should show observer_execution_supervisor work mode",
+  );
+  assertFixture(
+    precheckFrame.specific_facts.some((fact) => fact.label === "observer work mode" && fact.value === "observer_look_before_act")
+      && precheckFrame.specific_facts.some((fact) => fact.label === "graph query schema trace" && fact.value === "gqs-fixture-work-mode"),
+    "route precheck frame should promote work mode and graph query schema trace id",
+  );
+  assertFixture(
+    surrogateStartupFrame.specific_facts.some((fact) => fact.label === "session token evidence type" && fact.value === "surrogate")
+      && surrogateStartupFrame.specific_facts.some((fact) => fact.label === "surrogate close-satisfying" && fact.value.includes("not close-satisfying") && fact.value.includes("#3104")),
+    "surrogate startup frame should mark session token type and that surrogate is not close-satisfying (#3104)",
+  );
+  assertFixture(
+    realStartupFrame.specific_facts.some((fact) => fact.label === "session token evidence type" && fact.value === "real")
+      && realStartupFrame.specific_facts.some((fact) => fact.label === "surrogate close-satisfying" && fact.value.includes("real session-token startup is close-satisfying")),
+    "real startup frame should mark a real session-token startup as close-satisfying",
+  );
+  assertFixture(
+    surrogateStartupFrame.detail.includes("not close-satisfying real-worker evidence (#3104)"),
+    "surrogate startup detail should state the #3104 close-evidence demotion",
+  );
+  assertFixture(independentLaneFrame.title === "Independent verification lane", "independent verification lane row should be readable");
+  assertFixture(
+    independentLaneFrame.narrative.context.includes("distinct lane from the implementation worker"),
+    "independent verification lane narrative should separate verification from the implementation worker",
+  );
+  assertFixture(hotfixFrame.title === "Observer hotfix exception", "observer hotfix exception row should be readable");
+  assertFixture(
+    hotfixFrame.detail.includes("does not promote surrogate startup to close-satisfying real-worker evidence (#3104)"),
+    "observer hotfix exception detail should state it does not promote surrogate startup",
+  );
+  assertFixture(
+    closeGateFrame.specific_facts.some((fact) => fact.label === "blocker-resolution gate (#3092)" && fact.value === "passed")
+      && closeGateFrame.specific_facts.some((fact) => fact.label === "cross-ref evidence gate (#3090)" && fact.value === "passed")
+      && closeGateFrame.specific_facts.some((fact) => fact.label === "stale-route evidence gate (#3093/#3094)" && fact.value === "blocked"),
+    "close gate frame should promote blocker-resolution (#3092), cross-ref (#3090), and stale-route (#3093/#3094) sub-gate statuses",
+  );
+  assertFixture(!visible.includes("[fixture private request text]"), "work-mode fixture should keep private request text hidden");
+  return trace.frames.map((frame) => `${frame.title}: ${frame.summary}`);
+}
+
 export const taskPlaybackHistoricalSemanticFixtureSummary = [
   ...taskPlaybackHistoricalSemanticFixtureAssertions(),
   ...taskPlaybackNarrativeFocusFixtureAssertions(),
+  ...taskPlaybackWorkModeFixtureAssertions(),
 ];
 
 function assertFixture(condition: boolean, message: string): void {

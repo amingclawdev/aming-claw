@@ -459,6 +459,71 @@ Chain-Bug-Id: <backlog-id>
 After commit, re-check version/runtime and graph state, reconcile if the graph
 is stale, then close the backlog row with commit and verification evidence.
 
+### Work Modes and the Observer Root Route Context
+
+The runtime encodes the observer posture as an explicit `work_mode`, surfaced by
+the aming-owned observer root route context. There are three canonical modes:
+
+- `observer_look_before_act` (default): the observer may read, inspect, file
+  findings, and propose the next legal action, but must NOT edit implementation,
+  self-clear a judge blocker, dispatch an implementation worker, merge, or close.
+  This is the runtime form of Design Alignment Mode.
+- `observer_execution_supervisor`: dispatch, merge, and close coordination
+  become legal. This is the runtime form of Execution Supervisor Mode. Reaching
+  it requires BOTH a recorded `observer_work_mode_transition` event AND a
+  `route_action_precheck` bound to the canonical route identity — the observer
+  cannot widen its own authority by fiat.
+- `observer_hotfix_exception`: a narrow mode that only relaxes host-adapter
+  surrogate startup handling for emergency repair. It never permits direct
+  implementation or judge self-clear, and a surrogate startup under it is still
+  NOT close-satisfying real-worker evidence.
+
+In every mode, `edit_implementation` and `self_clear_judge_blocker` are
+never-allowed observer actions.
+
+Before acting on a backlog row, read the observer root route context from
+`GET/POST /api/projects/{project_id}/observer-root-route-context`
+(`build_observer_root_route_context`). It returns the canonical contract the
+observer and the dashboard evidence modal both consume:
+
+- `backlog_id`, `route_id`, `route_context_hash`, `prompt_contract_id`
+  (and `prompt_contract_hash`) — the canonical route identity;
+- `work_mode` (default `observer_look_before_act`) and `default_work_mode`;
+- `loaded_skills`, `loaded_resources`;
+- `graph_query_schema_trace_id` — the graph query_schema trace the context was
+  assembled against;
+- `allowed_actions` and `blocked_actions` — derived from the work-mode gate,
+  with route-supplied blocks always further restricting (never widening);
+- `required_evidence` — the close-evidence the row must record
+  (`route_context`, `route_action_precheck`,
+  `bounded_implementation_worker_dispatch`, `mf_subagent_startup`,
+  `independent_verification`, `close_ready`);
+- `next_legal_action` — in look-before-act this is
+  `record_work_mode_transition`; afterwards it is `dispatch_bounded_worker`.
+
+The activity/playback evidence modal reads these REAL fields (no invented
+values) so a reviewer can see the actual route context and graph query trace the
+observer read or queried, with raw event JSON kept collapsed and inspectable.
+
+### Close-Evidence Integrity Gates
+
+The MF close gate enforces these regression sub-gates; the dashboard surfaces
+each as a status fact on the close-gate evidence:
+
+- `#3090` cross-ref gate: close evidence referencing a different backlog/scope
+  row is rejected unless an accepted bridge/lineage event links the rows.
+- `#3092` blocker-resolution gate: an observer may propose a resolution
+  (`pending_judge_review`) but must never self-clear a judge blocker or change
+  the safety model by fiat; independent judge acceptance is required.
+- `#3093/#3094` stale-route evidence gate: close evidence recorded under a
+  superseded route identity is invalidated and must be re-recorded under the
+  canonical identity.
+- `#3104` surrogate-not-close-satisfying: a host-adapter startup-token surrogate
+  (`session_token_evidence_type = "surrogate"`) is never close-satisfying real
+  bounded-worker evidence, even when the live startup gate stamps
+  `close_satisfying=true`, and even under `observer_hotfix_exception`. Only a
+  real session-token startup is close-satisfying.
+
 ## Start Sequence
 
 1. Confirm the workspace root and project id, normally `aming-claw`.
