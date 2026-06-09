@@ -28,6 +28,7 @@ if str(_root) not in sys.path:
 from agent.manager_http_server import (
     ManagerHTTPHandler,
     create_server,
+    derive_runtime_deployment_verification_status,
     _FORBIDDEN_TARGETS,
     _VALID_TARGETS,
     MANAGER_HTTP_HOST,
@@ -421,6 +422,143 @@ class TestRedeployEndpointRuntimeCheckout(unittest.TestCase):
         # leaves stop/spawn uncalled; here we only assert each ran once.)
         mock_stop.assert_called_once()
         mock_spawn.assert_called_once()
+
+
+class TestRuntimeDeploymentVerificationStatusDerivation(unittest.TestCase):
+    """Criterion 4: a live redeploy probe must DERIVE its recorded status from
+    the probe result — a failed probe (HTTP 500 or runtime_checkout_advanced=
+    false) must NOT be recorded as ok/accepted."""
+
+    def test_failed_runtime_checkout_is_not_ok(self):
+        v = derive_runtime_deployment_verification_status(
+            http_status=500,
+            runtime_checkout_advanced=False,
+            step="runtime_checkout",
+        )
+        self.assertFalse(v["ok"])
+        self.assertFalse(v["accepted"])
+        self.assertEqual(v["status"], "runtime_checkout_not_advanced")
+        self.assertNotIn(v["status"], ("ok", "accepted"))
+
+    def test_http_500_with_advanced_checkout_is_not_ok(self):
+        v = derive_runtime_deployment_verification_status(
+            http_status=500,
+            runtime_checkout_advanced=True,
+            healthy=False,
+            step="health_probe",
+        )
+        self.assertFalse(v["ok"])
+        self.assertFalse(v["accepted"])
+        # Status reflects the failure, not ok/accepted.
+        self.assertIn(v["status"], ("probe_failed", "health_probe_failed"))
+
+    def test_successful_probe_is_ok(self):
+        v = derive_runtime_deployment_verification_status(
+            http_status=200,
+            runtime_checkout_advanced=True,
+            healthy=True,
+            step="complete",
+        )
+        self.assertTrue(v["ok"])
+        self.assertTrue(v["accepted"])
+        self.assertEqual(v["status"], "ok")
+
+
+class TestRedeployResponseCarriesProbeDerivedStatus(unittest.TestCase):
+    """Endpoint-level: the redeploy response carries a runtime_deployment_
+    verification block whose status is derived from the probe result."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = create_server("127.0.0.1", 0)
+        cls.server_address = cls.server.server_address
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    @patch("agent.manager_http_server._write_chain_version")
+    @patch("agent.manager_http_server._wait_for_health")
+    @patch("agent.manager_http_server._spawn_governance_process")
+    @patch("agent.manager_http_server._stop_governance_process")
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        side_effect=RuntimeError("runtime_checkout: refusing dirty tree foo.py"),
+    )
+    def test_failed_checkout_response_status_is_not_ok(
+        self, mock_checkout, mock_stop, mock_spawn, mock_health, mock_write
+    ):
+        status, body = _make_request(
+            self.server_address,
+            "POST",
+            "/api/manager/redeploy/governance",
+            {"chain_version": "abc1234"},
+        )
+        self.assertEqual(status, 500)
+        verification = body["runtime_deployment_verification"]
+        self.assertFalse(verification["ok"])
+        self.assertFalse(verification["accepted"])
+        self.assertEqual(verification["status"], "runtime_checkout_not_advanced")
+        self.assertFalse(verification["runtime_checkout_advanced"])
+
+    @patch("agent.manager_http_server._write_chain_version", return_value=True)
+    @patch("agent.manager_http_server._wait_for_health", return_value=False)
+    @patch("agent.manager_http_server._spawn_governance_process")
+    @patch("agent.manager_http_server._stop_governance_process", return_value=True)
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="fullhead0000000000000000000000000000abcd",
+    )
+    def test_failed_health_probe_response_status_is_not_ok(
+        self, mock_checkout, mock_stop, mock_spawn, mock_health, mock_write
+    ):
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_spawn.return_value = mock_proc
+        status, body = _make_request(
+            self.server_address,
+            "POST",
+            "/api/manager/redeploy/governance",
+            {"chain_version": "abc1234"},
+        )
+        self.assertEqual(status, 500)
+        verification = body["runtime_deployment_verification"]
+        self.assertFalse(verification["ok"])
+        self.assertFalse(verification["accepted"])
+        # A failed health probe returns HTTP 500, so the derived status reflects
+        # the failure (never ok/accepted).
+        self.assertIn(verification["status"], ("probe_failed", "health_probe_failed"))
+        mock_write.assert_not_called()
+
+    @patch("agent.manager_http_server._write_chain_version", return_value=True)
+    @patch("agent.manager_http_server._wait_for_health", return_value=True)
+    @patch("agent.manager_http_server._spawn_governance_process")
+    @patch("agent.manager_http_server._stop_governance_process", return_value=True)
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="fullhead0000000000000000000000000000abcd",
+    )
+    def test_successful_redeploy_response_status_is_ok(
+        self, mock_checkout, mock_stop, mock_spawn, mock_health, mock_write
+    ):
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_spawn.return_value = mock_proc
+        status, body = _make_request(
+            self.server_address,
+            "POST",
+            "/api/manager/redeploy/governance",
+            {"chain_version": "abc1234"},
+        )
+        self.assertEqual(status, 200)
+        verification = body["runtime_deployment_verification"]
+        self.assertTrue(verification["ok"])
+        self.assertTrue(verification["accepted"])
+        self.assertEqual(verification["status"], "ok")
 
 
 if __name__ == "__main__":

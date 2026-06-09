@@ -441,3 +441,27 @@ def test_root_route_context_missing_manifest_hash_is_marked_not_dropped():
     assert identity["incomplete"] is True
     assert identity["missing_fields"] == ["visible_injection_manifest_hash"]
     assert identity["incomplete_reason"]
+
+
+def test_command_blocks_close_for_claimed_or_nonterminal_status():
+    # Criterion 3: a still-claimed (or owned/queued/notified) originating
+    # command blocks the backlog close.
+    assert observer_session.command_blocks_close("claimed") is True
+    assert observer_session.command_blocks_close("running") is True
+    assert observer_session.command_blocks_close("queued") is True
+    assert observer_session.command_blocks_close("notified") is True
+    # Empty / unknown disposition fails safe (blocks).
+    assert observer_session.command_blocks_close("") is True
+    assert observer_session.command_blocks_close(None) is True
+    assert observer_session.command_blocks_close("mystery_state") is True
+
+
+def test_command_blocks_close_clears_on_terminal_or_co_resolved():
+    # Criterion 3: completed / failed / cancelled / co-resolved dispositions
+    # do not block the close.
+    assert observer_session.command_blocks_close("completed") is False
+    assert observer_session.command_blocks_close("failed") is False
+    assert observer_session.command_blocks_close("cancelled") is False
+    assert observer_session.command_blocks_close("co_resolved") is False
+    assert observer_session.command_blocks_close("co-resolved-with-close") is False
+    assert observer_session.command_blocks_close("resolved") is False

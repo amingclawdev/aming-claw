@@ -6205,5 +6205,180 @@ def test_close_gate_blocks_when_observer_self_clears_judge_blocker():
     assert "judge_blocker_resolution" in gate["missing_evidence_groups"]["groups"]
 
 
+# ---------------------------------------------------------------------------
+# Close-gate evidence integrity (AC-CLOSE-GATE-EVIDENCE-INTEGRITY-20260609)
+# ---------------------------------------------------------------------------
+
+_CLOSE_BASE_EVENTS = [
+    {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+    {"event_kind": "verification", "phase": "verification", "status": "passed"},
+    {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+]
+
+
+def test_close_gate_rejects_when_cited_approval_excludes_backlog_close():
+    """Criterion 1: a close whose own cited approval forbids close is rejected."""
+    from agent.governance import task_timeline
+
+    events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "payload": {
+                "approval_text": "review_ready only / does not authorize backlog_close",
+            },
+        },
+    ]
+    gate = task_timeline.mf_close_gate_verification(events)
+    assert gate["passed"] is False, gate
+    scope = gate["approval_scope_gate"]
+    assert scope["passed"] is False
+    assert scope["status"] == "blocked"
+    assert scope["approvals_excluding_close"], scope
+    assert "approval_scope" in gate["missing_evidence_groups"]["groups"]
+
+
+def test_close_gate_approval_exclusion_converted_to_waiver_state():
+    """Criterion 1: an explicit recorded close-waiver turns the block into a
+    visible waiver state instead of a silent success."""
+    from agent.governance import task_timeline
+
+    events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "payload": {"approval_text": "review_ready only / does not authorize backlog_close"},
+        },
+        {
+            "event_kind": "backlog_close_waiver",
+            "phase": "close",
+            "status": "accepted",
+            "payload": {"reason": "operator explicit override of review_ready scope"},
+        },
+    ]
+    gate = task_timeline.mf_close_gate_verification(events)
+    scope = gate["approval_scope_gate"]
+    assert scope["passed"] is True
+    assert scope["status"] == "waived"
+    assert scope["has_close_waiver"] is True
+    assert gate["passed"] is True, gate
+
+
+def test_close_gate_allows_approval_that_authorizes_close():
+    """Criterion 1: a normal approval that does not exclude close still passes."""
+    from agent.governance import task_timeline
+
+    events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "payload": {"approval_text": "approved for backlog_close after review"},
+        },
+    ]
+    gate = task_timeline.mf_close_gate_verification(events)
+    assert gate["approval_scope_gate"]["passed"] is True
+    assert gate["passed"] is True, gate
+
+
+def test_fixed_close_waiver_alert_flags_fixed_without_can_close_or_waiver():
+    """Criterion 2: FIXED + can_close=false + no waiver is a governance alert."""
+    from agent.governance import task_timeline
+
+    alert = task_timeline.mf_fixed_close_waiver_alert("FIXED", False, _CLOSE_BASE_EVENTS)
+    assert alert["alert"] is True
+    assert alert["status"] == "alert"
+    assert alert["reason"] == "fixed_row_without_can_close_or_close_waiver"
+
+
+def test_fixed_close_waiver_alert_silenced_by_can_close_or_waiver():
+    """Criterion 2: FIXED with can_close=true OR a visible waiver is not alerted."""
+    from agent.governance import task_timeline
+
+    assert (
+        task_timeline.mf_fixed_close_waiver_alert("FIXED", True, _CLOSE_BASE_EVENTS)["alert"]
+        is False
+    )
+    waiver_events = _CLOSE_BASE_EVENTS + [
+        {
+            "event_kind": "close_gate_waiver",
+            "phase": "close",
+            "status": "accepted",
+            "payload": {"reason": "recorded waiver"},
+        }
+    ]
+    assert (
+        task_timeline.mf_fixed_close_waiver_alert("FIXED", False, waiver_events)["alert"]
+        is False
+    )
+    # A non-FIXED row never alerts regardless of can_close.
+    assert (
+        task_timeline.mf_fixed_close_waiver_alert("OPEN", False, _CLOSE_BASE_EVENTS)["alert"]
+        is False
+    )
+
+
+def test_close_gate_blocks_when_originating_command_still_claimed():
+    """Criterion 3: a still-claimed originating observer command blocks close."""
+    from agent.governance import task_timeline
+
+    events = _CLOSE_BASE_EVENTS + [
+        {
+            "event_kind": "observer_command_claim",
+            "status": "accepted",
+            "payload": {"command_id": "cmd-close-1", "command_status": "claimed"},
+        }
+    ]
+    gate = task_timeline.mf_close_gate_verification(events)
+    assert gate["passed"] is False, gate
+    cmd = gate["command_disposition_gate"]
+    assert cmd["passed"] is False
+    assert cmd["blocking_commands"][0]["command_id"] == "cmd-close-1"
+    assert "command_disposition" in gate["missing_evidence_groups"]["groups"]
+
+
+def test_close_gate_allows_when_originating_command_co_resolved():
+    """Criterion 3: a terminal / co-resolved command does not block close."""
+    from agent.governance import task_timeline
+
+    events = _CLOSE_BASE_EVENTS + [
+        {
+            "event_kind": "observer_command_claim",
+            "status": "accepted",
+            "payload": {"command_id": "cmd-close-2", "command_status": "claimed"},
+        },
+        {
+            "event_kind": "observer_command_complete",
+            "status": "accepted",
+            "payload": {"command_id": "cmd-close-2", "command_status": "completed"},
+        },
+    ]
+    gate = task_timeline.mf_close_gate_verification(events)
+    assert gate["command_disposition_gate"]["passed"] is True, gate
+    assert gate["passed"] is True, gate
+
+    co_resolved = _CLOSE_BASE_EVENTS + [
+        {
+            "event_kind": "observer_command_disposition",
+            "status": "accepted",
+            "payload": {
+                "command_id": "cmd-close-3",
+                "disposition": "co_resolved_with_close",
+            },
+        }
+    ]
+    gate2 = task_timeline.mf_close_gate_verification(co_resolved)
+    assert gate2["command_disposition_gate"]["passed"] is True, gate2
+    assert gate2["passed"] is True
+
+
 if __name__ == "__main__":
     unittest.main()
