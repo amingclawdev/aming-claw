@@ -1129,6 +1129,202 @@ class TestObserverRootRouteContextEndpoint(unittest.TestCase):
         self.assertNotIn("dispatch_implementation", result["blocked_actions"])
         self.assertIn("edit_implementation", result["blocked_actions"])
 
+    # --- AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-INJECTION-MANIFEST-HASH-20260609 ---
+    # Regression: the canonical route identity returned by the endpoint MUST carry
+    # visible_injection_manifest_hash sourced from the route_identity_cleanup pinning
+    # event, so a fresh observer can consume it without forking the route identity.
+
+    _ROUTE_IDENTITY = {
+        "route_context_hash": "sha256:ctx-a226bba",
+        "prompt_contract_id": "rprompt-repair-8884b4374cb18e09",
+        "prompt_contract_hash": "sha256:pc-a226bba",
+    }
+    _MANIFEST_HASH = "sha256:vim-a226bba"
+
+    def _seed_backlog_with_parallel_contract(self, bug_id):
+        from governance.server import handle_backlog_upsert
+
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Root route context manifest pinning",
+                    "status": "OPEN",
+                    "priority": "P1",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        "template_id": "mf_parallel.v1",
+                        "route_id": "route-repair-8884b4374cb18e09",
+                    },
+                },
+            )
+        )
+
+    def _seed_pinned_route_timeline(self, bug_id):
+        """Seed a complete passing route flow pinned by a route_identity_cleanup.
+
+        The cleanup and route_context events both carry the manifest hash; the
+        gate's route_identity summary omits it, so the endpoint must source it from
+        the pinning event. Deterministic — fixed identity + manifest hash.
+        """
+        from governance.db import get_connection
+        from governance import task_timeline
+
+        conn = get_connection("test-project")
+        task_timeline.ensure_schema(conn)
+        identity = dict(self._ROUTE_IDENTITY)
+        manifest = self._MANIFEST_HASH
+        common = {"project_id": "test-project", "backlog_id": bug_id}
+
+        # Pin the canonical identity with a route_identity_cleanup carrying the hash.
+        task_timeline.record_event(
+            conn,
+            event_type="route.identity.cleanup",
+            event_kind="route_identity_cleanup",
+            phase="cleanup",
+            status="passed",
+            payload={
+                "route_identity_cleanup": {**identity},
+                "visible_injection_manifest_hash": manifest,
+            },
+            **common,
+        )
+        # route_context (carries the manifest hash on the consumption event).
+        task_timeline.record_event(
+            conn,
+            event_type="route.context",
+            event_kind="route_context",
+            phase="dispatch",
+            status="passed",
+            payload={
+                "route_context": {**identity, "required_lanes": ["bounded_implementation_worker"]},
+                "visible_injection_manifest_hash": manifest,
+            },
+            **common,
+        )
+        # route_action_precheck.
+        task_timeline.record_event(
+            conn,
+            event_type="route.action.precheck",
+            event_kind="route_action_precheck",
+            phase="pre_mutation",
+            status="allowed",
+            verification={**identity, "allowed_action": "dispatch_worker"},
+            **common,
+        )
+        # bounded implementation worker dispatch.
+        task_timeline.record_event(
+            conn,
+            event_type="mf.subagent.dispatch",
+            event_kind="mf_subagent_dispatch",
+            phase="dispatch",
+            status="passed",
+            payload={
+                "mf_subagent_dispatch_gate": {
+                    **identity,
+                    "worker_id": "mf-sub-test",
+                    "bounded": True,
+                }
+            },
+            **common,
+        )
+        # subagent startup (actual runtime identity present).
+        task_timeline.record_event(
+            conn,
+            event_type="mf.subagent.startup",
+            event_kind="mf_subagent_startup",
+            phase="startup_gate",
+            status="passed",
+            payload={
+                "mf_subagent_startup_gate": {
+                    **identity,
+                    "worker_id": "mf-sub-test",
+                    "fence_token": "fence-86520a67573d",
+                    "actual_cwd": "/repo/.worktrees/mf-sub-test",
+                    "actual_git_root": "/repo/.worktrees/mf-sub-test",
+                    "branch": "refs/heads/codex/mf-sub-test",
+                    "head_commit": "head-test",
+                }
+            },
+            **common,
+        )
+        conn.commit()
+
+    def test_root_route_context_surfaces_pinned_manifest_hash(self):
+        from governance.server import handle_observer_root_route_context_get
+
+        bug_id = "AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-INJECTION-MANIFEST-HASH-20260609"
+        self._seed_backlog_with_parallel_contract(bug_id)
+        self._seed_pinned_route_timeline(bug_id)
+
+        result = handle_observer_root_route_context_get(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                query={"backlog_id": bug_id},
+            )
+        )
+
+        identity = result["canonical_route_identity"]
+        # All five external-identity fields are present and non-empty.
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        ):
+            self.assertIn(field, identity, field)
+            self.assertTrue(identity[field], field)
+        # The manifest hash comes verbatim from the pinning event, surfaced both
+        # top-level and inside the canonical identity.
+        self.assertEqual(
+            identity["visible_injection_manifest_hash"], self._MANIFEST_HASH
+        )
+        self.assertEqual(
+            result["visible_injection_manifest_hash"], self._MANIFEST_HASH
+        )
+        self.assertEqual(
+            identity["route_context_hash"],
+            self._ROUTE_IDENTITY["route_context_hash"],
+        )
+        self.assertEqual(
+            identity["prompt_contract_hash"],
+            self._ROUTE_IDENTITY["prompt_contract_hash"],
+        )
+        # A complete external identity is not flagged incomplete (no fork).
+        self.assertTrue(result["canonical_route_identity_complete"])
+        self.assertNotIn("incomplete", identity)
+
+    def test_root_route_context_without_pinned_manifest_marks_incomplete(self):
+        """BEFORE-style fork repro: no pinning event -> key present-but-empty + flagged.
+
+        With no route timeline the manifest hash is genuinely unavailable. The
+        endpoint must NOT fabricate one and must NOT drop the key; it returns the
+        field empty and flags the identity incomplete so a consumer can refuse to
+        fork knowingly.
+        """
+        from governance.server import handle_observer_root_route_context_get
+
+        bug_id = "AC-OBSERVER-ROOT-ROUTE-CONTEXT-FORK-REPRO-20260609"
+        self._seed_backlog(bug_id)
+
+        result = handle_observer_root_route_context_get(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                query={"backlog_id": bug_id},
+            )
+        )
+
+        identity = result["canonical_route_identity"]
+        self.assertIn("visible_injection_manifest_hash", identity)
+        self.assertEqual(identity["visible_injection_manifest_hash"], "")
+        self.assertEqual(result["visible_injection_manifest_hash"], "")
+        self.assertFalse(result["canonical_route_identity_complete"])
+        self.assertTrue(identity.get("incomplete"))
+        self.assertIn(
+            "visible_injection_manifest_hash", identity.get("missing_fields", [])
+        )
+
     def test_root_route_context_requires_backlog_id(self):
         from governance.server import handle_observer_root_route_context_get
 

@@ -509,6 +509,22 @@ ROOT_ROUTE_CONTEXT_REQUIRED_EVIDENCE = (
     "close_ready",
 )
 
+# The full external-identity surface a fresh observer must be able to consume to
+# re-bind to the canonical route without forking it. All five fields are required
+# for external-identity validation (see observer_repair_run_route_evidence): a
+# canonical identity missing visible_injection_manifest_hash fails the manifest
+# check and causes the consuming observer to mint a NEW identity (a route-identity
+# fork). build_observer_root_route_context therefore always exposes all five keys,
+# present-but-empty when a value is genuinely unavailable, rather than dropping a
+# key.
+ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+)
+
 
 def _root_route_string(value: Any) -> str:
     return str(value or "").strip()
@@ -555,6 +571,13 @@ def build_observer_root_route_context(
     prompt_contract_id = _root_route_string(route.get("prompt_contract_id"))
     route_context_hash = _root_route_string(route.get("route_context_hash"))
     prompt_contract_hash = _root_route_string(route.get("prompt_contract_hash"))
+    # The visible-injection manifest hash is part of the external route identity.
+    # It is pinned by the route_context gate (route_identity_cleanup / passing
+    # route_context event) and surfaced to us via the route_context mapping the
+    # server assembled. Carry it through verbatim — never fabricate it.
+    visible_injection_manifest_hash = _root_route_string(
+        route.get("visible_injection_manifest_hash")
+    )
 
     # Allowed/blocked actions are derived from the work-mode gate, then unioned
     # with any explicit route-supplied allowances/blocks (route blocks always
@@ -601,6 +624,35 @@ def build_observer_root_route_context(
             "blocked_until_transition": [],
         }
 
+    # Assemble the full 5-field external route identity. Every key is always
+    # present (present-but-empty when unavailable) so a consuming observer can
+    # validate it as a complete external identity instead of forking. When the
+    # visible_injection_manifest_hash is absent we keep the key but flag the
+    # identity as incomplete with an explicit reason rather than silently
+    # dropping the field — that omission is exactly what caused the prior
+    # route-identity fork.
+    canonical_route_identity = {
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "visible_injection_manifest_hash": visible_injection_manifest_hash,
+    }
+    missing_identity_fields = [
+        field
+        for field in ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+        if not canonical_route_identity.get(field)
+    ]
+    canonical_route_identity_complete = not missing_identity_fields
+    if not canonical_route_identity_complete:
+        canonical_route_identity["incomplete"] = True
+        canonical_route_identity["missing_fields"] = missing_identity_fields
+        canonical_route_identity["incomplete_reason"] = (
+            "route_context gate did not pin all external-identity fields for this "
+            "backlog row; consuming this identity will not satisfy external-identity "
+            "validation until the missing fields are pinned"
+        )
+
     return {
         "schema_version": ROOT_ROUTE_CONTEXT_SCHEMA_VERSION,
         "backlog_id": _root_route_string(backlog_id),
@@ -608,6 +660,7 @@ def build_observer_root_route_context(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "visible_injection_manifest_hash": visible_injection_manifest_hash,
         "work_mode": mode,
         "default_work_mode": DEFAULT_WORK_MODE,
         "loaded_skills": _root_route_string_list(loaded_skills),
@@ -617,16 +670,8 @@ def build_observer_root_route_context(
         "blocked_actions": blocked_action_list,
         "required_evidence": list(ROOT_ROUTE_CONTEXT_REQUIRED_EVIDENCE),
         "next_legal_action": next_legal_action,
-        "canonical_route_identity": {
-            key: value
-            for key, value in (
-                ("route_id", route_id),
-                ("route_context_hash", route_context_hash),
-                ("prompt_contract_id", prompt_contract_id),
-                ("prompt_contract_hash", prompt_contract_hash),
-            )
-            if value
-        },
+        "canonical_route_identity": canonical_route_identity,
+        "canonical_route_identity_complete": canonical_route_identity_complete,
     }
 
 

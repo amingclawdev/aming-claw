@@ -19992,6 +19992,91 @@ def handle_observer_mode_set(ctx: RequestContext):
         return task_registry.set_observer_mode(conn, project_id, bool(enabled))
 
 
+def _canonical_visible_injection_manifest_hash(
+    events: list[dict[str, Any]],
+    route_context_gate: dict[str, Any],
+    route_identity: dict[str, Any],
+) -> str:
+    """Source the canonical visible_injection_manifest_hash from the pinning event.
+
+    The route_context gate's ``route_identity`` summary intentionally only carries
+    route_context_hash / prompt_contract_id / prompt_contract_hash, so the manifest
+    hash that external-identity validation requires lives only on the raw timeline
+    events. Read it from the event that pins the canonical identity:
+
+      1. the ``route_identity_cleanup`` pinning event (the gate exposes its id), or
+      2. failing that, the first passing ``route_context`` event whose identity
+         matches the canonical route identity.
+
+    Returns the hash verbatim, or an empty string when no pinning event carries
+    one (caller surfaces the empty value as a present-but-empty identity field).
+    """
+    from . import task_timeline
+
+    def _event_id(event: dict[str, Any]) -> str:
+        return str(event.get("id") or event.get("event_id") or "").strip()
+
+    cleanup = route_context_gate.get("route_identity_cleanup") or {}
+    cleanup_event = cleanup.get("event") if isinstance(cleanup, dict) else None
+    cleanup_event_id = ""
+    if isinstance(cleanup_event, dict):
+        cleanup_event_id = str(
+            cleanup_event.get("id") or cleanup_event.get("event_id") or ""
+        ).strip()
+
+    # 1. Prefer the manifest hash carried on the canonical pinning event itself.
+    if cleanup_event_id:
+        for event in events:
+            if not isinstance(event, dict) or _event_id(event) != cleanup_event_id:
+                continue
+            summary = task_timeline.route_context_consumption_event_summary(event)
+            manifest_hash = str(
+                (summary.get("runtime_dispatch_evidence") or {}).get(
+                    "visible_injection_manifest_hash"
+                )
+                or ""
+            ).strip()
+            if manifest_hash:
+                return manifest_hash
+            break
+
+    # 2. Fall back to a passing route_context event matching the canonical identity.
+    canonical_route_context_hash = str(
+        route_identity.get("route_context_hash") or ""
+    ).strip()
+    canonical_prompt_contract_id = str(
+        route_identity.get("prompt_contract_id") or ""
+    ).strip()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        summary = task_timeline.route_context_consumption_event_summary(event)
+        if "route_context" not in (summary.get("categories") or []):
+            continue
+        if not summary.get("passed"):
+            continue
+        identity = summary.get("route_identity") or {}
+        if canonical_route_context_hash and (
+            str(identity.get("route_context_hash") or "").strip()
+            != canonical_route_context_hash
+        ):
+            continue
+        if canonical_prompt_contract_id and (
+            str(identity.get("prompt_contract_id") or "").strip()
+            != canonical_prompt_contract_id
+        ):
+            continue
+        manifest_hash = str(
+            (summary.get("runtime_dispatch_evidence") or {}).get(
+                "visible_injection_manifest_hash"
+            )
+            or ""
+        ).strip()
+        if manifest_hash:
+            return manifest_hash
+    return ""
+
+
 def _observer_root_route_context_state(
     conn,
     project_id: str,
@@ -20039,6 +20124,16 @@ def _observer_root_route_context_state(
         "route_id", str((contract.get("route_id") if isinstance(contract, dict) else "") or "")
     )
     route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
+    # The gate's route_identity summary omits visible_injection_manifest_hash, so
+    # source it from the canonical pinning event and pass it through. Without it
+    # the returned identity is not a complete external identity and a consuming
+    # observer forks the route.
+    if not str(route_context_for_bootstrap.get("visible_injection_manifest_hash") or "").strip():
+        route_context_for_bootstrap["visible_injection_manifest_hash"] = (
+            _canonical_visible_injection_manifest_hash(
+                events, route_context_gate, route_identity
+            )
+        )
 
     context = observer_session.build_observer_root_route_context(
         backlog_id=backlog_id,

@@ -330,3 +330,76 @@ def test_root_route_context_execution_supervisor_unblocks_dispatch():
     # Direct implementation stays blocked regardless of mode.
     assert "edit_implementation" in ctx["blocked_actions"]
     assert ctx["next_legal_action"]["id"] == "dispatch_bounded_worker"
+
+
+def test_root_route_context_surfaces_full_five_field_canonical_identity():
+    """Regression for AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-INJECTION-MANIFEST-HASH.
+
+    When the route_context the server assembled carries the manifest hash pinned by
+    a route_identity_cleanup, the returned canonical identity MUST be a complete
+    external identity: all five fields present and non-empty (route_id,
+    route_context_hash, prompt_contract_id, prompt_contract_hash,
+    visible_injection_manifest_hash). A fresh observer consuming this identity then
+    passes external-identity validation instead of forking the route.
+    """
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-INJECTION-MANIFEST-HASH-20260609",
+        route_context={
+            "route_id": "route-repair-8884b4374cb18e09",
+            "route_context_hash": "sha256:ctx-a226bba",
+            "prompt_contract_id": "rprompt-repair-8884b4374cb18e09",
+            "prompt_contract_hash": "sha256:pc-a226bba",
+            "visible_injection_manifest_hash": "sha256:vim-a226bba",
+        },
+    )
+
+    identity = ctx["canonical_route_identity"]
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert field in identity, field
+        assert identity[field], field
+    # The manifest hash is now surfaced top-level and inside the identity verbatim.
+    assert ctx["visible_injection_manifest_hash"] == "sha256:vim-a226bba"
+    assert identity["visible_injection_manifest_hash"] == "sha256:vim-a226bba"
+    assert identity["prompt_contract_hash"] == "sha256:pc-a226bba"
+    # A complete identity is not flagged incomplete.
+    assert ctx["canonical_route_identity_complete"] is True
+    assert "incomplete" not in identity
+    assert "missing_fields" not in identity
+
+
+def test_root_route_context_missing_manifest_hash_is_marked_not_dropped():
+    """Before/after fork-repro: the BUG was that the manifest hash key was dropped.
+
+    BEFORE the fix the canonical identity omitted visible_injection_manifest_hash
+    entirely, so external-identity validation could not even see it was missing and
+    the consuming observer forked. AFTER the fix the key is always present (empty
+    when genuinely unavailable) and the identity is explicitly flagged incomplete
+    with the missing field listed — deterministic and inspectable, never fabricated.
+    """
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-OBSERVER-ROOT-ROUTE-CONTEXT-FORK-REPRO-20260609",
+        route_context={
+            "route_id": "route-repair-8884b4374cb18e09",
+            "route_context_hash": "sha256:ctx-a226bba",
+            "prompt_contract_id": "rprompt-repair-8884b4374cb18e09",
+            "prompt_contract_hash": "sha256:pc-a226bba",
+            # visible_injection_manifest_hash intentionally absent (the bug input).
+        },
+    )
+
+    identity = ctx["canonical_route_identity"]
+    # The key is PRESENT (not dropped) but empty, and the hash is never fabricated.
+    assert "visible_injection_manifest_hash" in identity
+    assert identity["visible_injection_manifest_hash"] == ""
+    assert ctx["visible_injection_manifest_hash"] == ""
+    # The incompleteness is explicit so a consumer can refuse to fork knowingly.
+    assert ctx["canonical_route_identity_complete"] is False
+    assert identity["incomplete"] is True
+    assert identity["missing_fields"] == ["visible_injection_manifest_hash"]
+    assert identity["incomplete_reason"]
