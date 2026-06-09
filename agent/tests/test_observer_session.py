@@ -367,10 +367,48 @@ def test_root_route_context_surfaces_full_five_field_canonical_identity():
     assert ctx["visible_injection_manifest_hash"] == "sha256:vim-a226bba"
     assert identity["visible_injection_manifest_hash"] == "sha256:vim-a226bba"
     assert identity["prompt_contract_hash"] == "sha256:pc-a226bba"
+    # route_id is part of the five-field external identity too (the field the
+    # server backfills from the pinning event) — assert it verbatim and non-empty.
+    assert ctx["route_id"] == "route-repair-8884b4374cb18e09"
+    assert identity["route_id"] == "route-repair-8884b4374cb18e09"
     # A complete identity is not flagged incomplete.
     assert ctx["canonical_route_identity_complete"] is True
     assert "incomplete" not in identity
     assert "missing_fields" not in identity
+
+
+def test_root_route_context_missing_route_id_is_marked_not_fabricated():
+    """Regression for AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-ROUTE-ID.
+
+    route_id is part of the external identity but is NOT in the gate's
+    route_identity summary, so when the route_context the server assembled does
+    not carry it (and no pinning event supplied it), build_observer_root_route_context
+    must keep the key PRESENT-but-empty and flag the identity incomplete with
+    route_id in missing_fields — never fabricated. The companion endpoint test
+    (test_root_route_context_backfills_route_id_from_pinning_event) covers the
+    happy path where the server sources route_id from the pinning event.
+    """
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-ROUTE-ID-20260609",
+        route_context={
+            # route_id intentionally absent (the residual-bug input).
+            "route_context_hash": "sha256:ctx-a226bba",
+            "prompt_contract_id": "rprompt-repair-8884b4374cb18e09",
+            "prompt_contract_hash": "sha256:pc-a226bba",
+            "visible_injection_manifest_hash": "sha256:vim-a226bba",
+        },
+    )
+
+    identity = ctx["canonical_route_identity"]
+    # The key is PRESENT (not dropped) but empty, and route_id is never fabricated.
+    assert "route_id" in identity
+    assert identity["route_id"] == ""
+    assert ctx["route_id"] == ""
+    # The incompleteness is explicit so a consumer can refuse to fork knowingly.
+    assert ctx["canonical_route_identity_complete"] is False
+    assert identity["incomplete"] is True
+    assert identity["missing_fields"] == ["route_id"]
+    assert identity["incomplete_reason"]
 
 
 def test_root_route_context_missing_manifest_hash_is_marked_not_dropped():

@@ -1140,6 +1140,11 @@ class TestObserverRootRouteContextEndpoint(unittest.TestCase):
         "prompt_contract_hash": "sha256:pc-a226bba",
     }
     _MANIFEST_HASH = "sha256:vim-a226bba"
+    # route_id is part of the external identity but the gate's route_identity
+    # summary omits it (not in MF_ROUTE_IDENTITY_FIELDS); like the manifest hash
+    # it must be sourced from the pinning event. Carried on the cleanup payload
+    # below, mirroring a live route_identity_cleanup event (e.g. timeline 2028).
+    _ROUTE_ID = "route-repair-69cf882ceaa8897f"
 
     def _seed_backlog_with_parallel_contract(self, bug_id):
         from governance.server import handle_backlog_upsert
@@ -1184,7 +1189,8 @@ class TestObserverRootRouteContextEndpoint(unittest.TestCase):
             phase="cleanup",
             status="passed",
             payload={
-                "route_identity_cleanup": {**identity},
+                "route_identity_cleanup": {**identity, "route_id": self._ROUTE_ID},
+                "route_id": self._ROUTE_ID,
                 "visible_injection_manifest_hash": manifest,
             },
             **common,
@@ -1197,7 +1203,12 @@ class TestObserverRootRouteContextEndpoint(unittest.TestCase):
             phase="dispatch",
             status="passed",
             payload={
-                "route_context": {**identity, "required_lanes": ["bounded_implementation_worker"]},
+                "route_context": {
+                    **identity,
+                    "route_id": self._ROUTE_ID,
+                    "required_lanes": ["bounded_implementation_worker"],
+                },
+                "route_id": self._ROUTE_ID,
                 "visible_injection_manifest_hash": manifest,
             },
             **common,
@@ -1291,9 +1302,112 @@ class TestObserverRootRouteContextEndpoint(unittest.TestCase):
             identity["prompt_contract_hash"],
             self._ROUTE_IDENTITY["prompt_contract_hash"],
         )
+        # This seeder's contract carries a route_id, which takes precedence over
+        # the pinning-event route_id (contract route_id is non-empty). The
+        # no-contract-route_id backfill path is covered by
+        # test_root_route_context_backfills_route_id_from_pinning_event.
+        self.assertEqual(identity["route_id"], "route-repair-8884b4374cb18e09")
+        self.assertEqual(result["route_id"], "route-repair-8884b4374cb18e09")
         # A complete external identity is not flagged incomplete (no fork).
         self.assertTrue(result["canonical_route_identity_complete"])
         self.assertNotIn("incomplete", identity)
+        self.assertNotIn("missing_fields", identity)
+
+    def _seed_backlog_with_routeidless_contract(self, bug_id):
+        """Seed a backlog whose chain_trigger contract carries NO route_id.
+
+        This mirrors the live residual-bug row (OPT-GRAPH-SEARCH-STRUCTURE-RANKING):
+        the route_id is pinned only on the route_identity_cleanup event, never on
+        the contract. Without sourcing route_id from the pinning event the endpoint
+        returns route_id="" and an incomplete canonical identity.
+        """
+        from governance.server import handle_backlog_upsert
+
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Root route context route_id pinning",
+                    "status": "OPEN",
+                    "priority": "P1",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        # Deliberately NO route_id on the contract.
+                        "template_id": "mf_parallel.v1",
+                    },
+                },
+            )
+        )
+
+    def test_root_route_context_backfills_route_id_from_pinning_event(self):
+        """Regression for AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-ROUTE-ID-20260609.
+
+        The gate's route_identity summary omits route_id and (in the live repro)
+        the contract carries none either, so route_id lived only on the
+        route_identity_cleanup pinning event. The endpoint MUST source route_id
+        from that pinning event so the returned external identity is complete and
+        a fresh observer can consume it without forking/fabricating route_id.
+        """
+        from governance.server import handle_observer_root_route_context_get
+
+        bug_id = "AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-ROUTE-ID-20260609"
+        self._seed_backlog_with_routeidless_contract(bug_id)
+        self._seed_pinned_route_timeline(bug_id)
+
+        result = handle_observer_root_route_context_get(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                query={"backlog_id": bug_id},
+            )
+        )
+
+        identity = result["canonical_route_identity"]
+        # All five external-identity fields present AND non-empty.
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        ):
+            self.assertIn(field, identity, field)
+            self.assertTrue(identity[field], field)
+        # route_id comes verbatim from the pinning event (NOT the contract, which
+        # had none), surfaced both top-level and inside the canonical identity.
+        self.assertEqual(identity["route_id"], self._ROUTE_ID)
+        self.assertEqual(result["route_id"], self._ROUTE_ID)
+        # Complete external identity -> no fork, not flagged incomplete.
+        self.assertTrue(result["canonical_route_identity_complete"])
+        self.assertNotIn("incomplete", identity)
+        self.assertNotIn("missing_fields", identity)
+
+    def test_root_route_context_route_id_not_fabricated_without_pinning(self):
+        """Negative: no pinning event -> route_id stays empty + incomplete, never faked.
+
+        With a route_id-less contract and no route timeline, route_id is genuinely
+        unavailable. The endpoint must NOT fabricate one and must NOT drop the key;
+        it returns route_id empty and flags the identity incomplete with route_id
+        listed in missing_fields.
+        """
+        from governance.server import handle_observer_root_route_context_get
+
+        bug_id = "AC-OBSERVER-ROOT-ROUTE-CONTEXT-MISSING-ROUTE-ID-NOPIN-20260609"
+        self._seed_backlog_with_routeidless_contract(bug_id)
+
+        result = handle_observer_root_route_context_get(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                query={"backlog_id": bug_id},
+            )
+        )
+
+        identity = result["canonical_route_identity"]
+        self.assertIn("route_id", identity)
+        self.assertEqual(identity["route_id"], "")
+        self.assertEqual(result["route_id"], "")
+        self.assertFalse(result["canonical_route_identity_complete"])
+        self.assertTrue(identity.get("incomplete"))
+        self.assertIn("route_id", identity.get("missing_fields", []))
 
     def test_root_route_context_without_pinned_manifest_marks_incomplete(self):
         """BEFORE-style fork repro: no pinning event -> key present-but-empty + flagged.

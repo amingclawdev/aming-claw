@@ -20077,6 +20077,89 @@ def _canonical_visible_injection_manifest_hash(
     return ""
 
 
+def _canonical_route_id(
+    events: list[dict[str, Any]],
+    route_context_gate: dict[str, Any],
+    route_identity: dict[str, Any],
+) -> str:
+    """Source the canonical route_id from the pinning event.
+
+    Like visible_injection_manifest_hash, route_id is part of the external route
+    identity but is NOT carried by the route_context gate's ``route_identity``
+    summary (route_id is not in MF_ROUTE_IDENTITY_FIELDS). For a row whose
+    canonical identity is pinned by a ``route_identity_cleanup`` event, the
+    route_id therefore lives only on the raw timeline events. Read it from the
+    same pinning event the manifest hash is sourced from:
+
+      1. the ``route_identity_cleanup`` pinning event (the gate exposes its id), or
+      2. failing that, the first passing ``route_context`` event whose identity
+         matches the canonical route identity.
+
+    Returns the route_id verbatim, or an empty string when no pinning event
+    carries one (caller keeps the present-but-empty / incomplete markers; never
+    fabricated).
+    """
+    from . import task_timeline
+
+    def _event_id(event: dict[str, Any]) -> str:
+        return str(event.get("id") or event.get("event_id") or "").strip()
+
+    cleanup = route_context_gate.get("route_identity_cleanup") or {}
+    cleanup_event = cleanup.get("event") if isinstance(cleanup, dict) else None
+    cleanup_event_id = ""
+    if isinstance(cleanup_event, dict):
+        cleanup_event_id = str(
+            cleanup_event.get("id") or cleanup_event.get("event_id") or ""
+        ).strip()
+
+    # 1. Prefer the route_id carried on the canonical pinning event itself.
+    if cleanup_event_id:
+        for event in events:
+            if not isinstance(event, dict) or _event_id(event) != cleanup_event_id:
+                continue
+            summary = task_timeline.route_context_consumption_event_summary(event)
+            route_id = str(
+                (summary.get("runtime_dispatch_evidence") or {}).get("route_id")
+                or ""
+            ).strip()
+            if route_id:
+                return route_id
+            break
+
+    # 2. Fall back to a passing route_context event matching the canonical identity.
+    canonical_route_context_hash = str(
+        route_identity.get("route_context_hash") or ""
+    ).strip()
+    canonical_prompt_contract_id = str(
+        route_identity.get("prompt_contract_id") or ""
+    ).strip()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        summary = task_timeline.route_context_consumption_event_summary(event)
+        if "route_context" not in (summary.get("categories") or []):
+            continue
+        if not summary.get("passed"):
+            continue
+        identity = summary.get("route_identity") or {}
+        if canonical_route_context_hash and (
+            str(identity.get("route_context_hash") or "").strip()
+            != canonical_route_context_hash
+        ):
+            continue
+        if canonical_prompt_contract_id and (
+            str(identity.get("prompt_contract_id") or "").strip()
+            != canonical_prompt_contract_id
+        ):
+            continue
+        route_id = str(
+            (summary.get("runtime_dispatch_evidence") or {}).get("route_id") or ""
+        ).strip()
+        if route_id:
+            return route_id
+    return ""
+
+
 def _observer_root_route_context_state(
     conn,
     project_id: str,
@@ -20123,6 +20206,15 @@ def _observer_root_route_context_state(
     route_context_for_bootstrap.setdefault(
         "route_id", str((contract.get("route_id") if isinstance(contract, dict) else "") or "")
     )
+    # The gate's route_identity summary omits route_id (it is not in
+    # MF_ROUTE_IDENTITY_FIELDS) and the contract may not carry it. When the
+    # canonical identity is pinned by a route_identity_cleanup event, source
+    # route_id from that same pinning event so the returned external identity is
+    # complete and a consuming observer does not have to fork/fabricate it.
+    if not str(route_context_for_bootstrap.get("route_id") or "").strip():
+        route_context_for_bootstrap["route_id"] = _canonical_route_id(
+            events, route_context_gate, route_identity
+        )
     route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
     # The gate's route_identity summary omits visible_injection_manifest_hash, so
     # source it from the canonical pinning event and pass it through. Without it
