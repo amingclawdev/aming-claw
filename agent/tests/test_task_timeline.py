@@ -6179,6 +6179,230 @@ def test_close_gate_accepts_same_backlog_scope_evidence():
     assert gate["rejected_cross_ref_evidence"] == []
 
 
+# ---------------------------------------------------------------------------
+# Multi-lane bridge: one row implemented by >=2 bounded mf_sub lanes under one
+# observer command + route. [AC-CLOSE-CROSS-REF-MULTI-LANE-BRIDGE-20260609]
+# ---------------------------------------------------------------------------
+def _multi_lane_close_evidence():
+    """Two bounded lanes (different task_ids) + a row-level aggregate, all under
+    one backlog_id/project_id/route/observer-command."""
+
+    common_route = {
+        "route_id": "route-1",
+        "route_context_hash": "rch-1",
+        "prompt_contract_id": "pc-1",
+        "observer_command_id": "cmd-1",
+    }
+    lane_canonical = {
+        "id": 1,
+        "event_kind": "mf_subagent_startup",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "task_id": "task-canonical",
+        "payload": dict(common_route, scope="agent/governance"),
+    }
+    lane_sibling = {
+        "id": 2,
+        "event_kind": "mf_subagent_startup",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "task_id": "task-sibling",
+        "payload": dict(common_route, scope="agent/tests"),
+    }
+    row_aggregate = {
+        "id": 3,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "task_id": "",
+        "payload": dict(common_route),
+    }
+    return common_route, lane_canonical, lane_sibling, row_aggregate
+
+
+def test_close_gate_multi_lane_bridge_consumes_bridged_identities():
+    """(a) One row + two lanes + accepted multi-lane bridge declaring both lanes
+    -> cross_ref gate passes with no rejected evidence."""
+
+    from agent.governance import task_timeline
+
+    common_route, lane_canonical, lane_sibling, row_aggregate = (
+        _multi_lane_close_evidence()
+    )
+    # The canonical lane scope is the row scope; the sibling lane scope differs.
+    # Without the bridge the sibling lane would be rejected (see test (b)).
+    row_identity = {
+        "backlog_id": "AC-A",
+        "route_id": "route-1",
+        "prompt_contract_id": "pc-1",
+        "scope": "agent/governance",
+    }
+    bridge = {
+        "id": 4,
+        "event_kind": "cross_ref_lineage_bridge",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "payload": dict(
+            common_route,
+            bridged_identities=[
+                {
+                    "backlog_id": "AC-A",
+                    "project_id": "aming-claw",
+                    "task_id": "task-canonical",
+                },
+                {
+                    "backlog_id": "AC-A",
+                    "project_id": "aming-claw",
+                    "task_id": "task-sibling",
+                },
+            ],
+        ),
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [lane_canonical, lane_sibling, row_aggregate, bridge], row_identity
+    )
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+    # Both lanes + the row-level aggregate (task_id="") are admitted.
+    assert "AC-A|aming-claw|task-canonical" in gate["bridged_lane_membership"]
+    assert "AC-A|aming-claw|task-sibling" in gate["bridged_lane_membership"]
+    assert "AC-A|aming-claw|" in gate["bridged_lane_membership"]
+
+
+def test_close_gate_multi_lane_without_bridge_still_blocks():
+    """(b) One row + two lanes but NO accepted bridge -> the non-canonical lane's
+    evidence is still rejected as a cross_ref mismatch."""
+
+    from agent.governance import task_timeline
+
+    _, lane_canonical, lane_sibling, row_aggregate = _multi_lane_close_evidence()
+    row_identity = {
+        "backlog_id": "AC-A",
+        "scope": "agent/governance",
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [lane_canonical, lane_sibling, row_aggregate], row_identity
+    )
+    assert gate["passed"] is False
+    rejected_scopes = {
+        tuple(sorted(item["mismatches"]))
+        for item in gate["rejected_cross_ref_evidence"]
+    }
+    # The sibling lane's scope differs from the row scope and is rejected.
+    assert any("scope" in mismatch for mismatch in rejected_scopes)
+    assert gate["bridged_lane_membership"] == []
+
+
+def test_close_gate_foreign_row_evidence_still_rejected_3090():
+    """(c) Foreign backlog_id/route with no in-scope bridge -> still rejected.
+    Preserves the #3090 cross-ref identity protection: a bridge that declares a
+    DIFFERENT backlog_id does not admit the foreign evidence."""
+
+    from agent.governance import task_timeline
+
+    row_identity = {"backlog_id": "AC-A", "project_id": "aming-claw"}
+    foreign = {
+        "id": 1,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "backlog_id": "AC-FOREIGN",
+        "project_id": "other-project",
+        "task_id": "task-foreign",
+        "payload": {"backlog_id": "AC-FOREIGN"},
+    }
+    # An accepted bridge exists, but it only declares a sibling for a DIFFERENT
+    # backlog row, so the foreign evidence is NOT covered.
+    bridge = {
+        "id": 2,
+        "event_kind": "cross_ref_lineage_bridge",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "payload": {
+            "bridged_identities": [
+                {
+                    "backlog_id": "AC-A",
+                    "project_id": "aming-claw",
+                    "task_id": "task-sibling",
+                }
+            ]
+        },
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [foreign, bridge], row_identity
+    )
+    assert gate["passed"] is False
+    rejected = gate["rejected_cross_ref_evidence"][0]
+    assert rejected["reason"] == "cross_ref_identity_mismatch"
+    assert rejected["mismatches"]["backlog_id"] == {
+        "expected": "AC-A",
+        "actual": "AC-FOREIGN",
+    }
+
+
+def test_close_gate_bridge_declaring_foreign_backlog_still_blocks_3090():
+    """(d) ADVERSARIAL #3090: a bridge whose payload.bridged_identities[]
+    EXPLICITLY declares a FOREIGN {backlog_id, project_id, task_id} PLUS matching
+    foreign close evidence must STILL be blocked when the trusted row identity is
+    AC-A. A bridge declaring a foreign backlog/project must never admit foreign
+    evidence — neither via the membership consumer nor via the legacy bridged
+    skip scraper. This is the regression whose absence let the hole through."""
+
+    from agent.governance import task_timeline
+
+    # Trusted row identity = AC-A / aming-claw.
+    row_identity = {"backlog_id": "AC-A", "project_id": "aming-claw"}
+    # Foreign close evidence whose backlog_id/project_id differ from the row.
+    foreign_close = {
+        "id": 1,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "backlog_id": "AC-FOREIGN",
+        "project_id": "other-project",
+        "task_id": "task-foreign",
+        "payload": {
+            "backlog_id": "AC-FOREIGN",
+            "project_id": "other-project",
+        },
+    }
+    # An accepted bridge that EXPLICITLY declares the foreign lane as a sibling.
+    bridge = {
+        "id": 2,
+        "event_kind": "cross_ref_lineage_bridge",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "payload": {
+            "bridged_identities": [
+                {
+                    "backlog_id": "AC-FOREIGN",
+                    "project_id": "other-project",
+                    "task_id": "task-foreign",
+                }
+            ]
+        },
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [foreign_close, bridge], row_identity
+    )
+    # Floor holds: the foreign evidence is rejected despite the bridge.
+    assert gate["passed"] is False
+    rejected = gate["rejected_cross_ref_evidence"][0]
+    assert rejected["reason"] == "cross_ref_identity_mismatch"
+    assert rejected["mismatches"]["backlog_id"] == {
+        "expected": "AC-A",
+        "actual": "AC-FOREIGN",
+    }
+    # The foreign lane must NOT have leaked into the accepted membership set, and
+    # the legacy bridged skip scraper must NOT have recorded the foreign backlog.
+    assert gate["bridged_lane_membership"] == []
+    assert "backlog_id=AC-FOREIGN" not in gate["bridged_identities"]
+
+
 def test_close_gate_blocks_when_observer_self_clears_judge_blocker():
     from agent.governance import task_timeline
 
