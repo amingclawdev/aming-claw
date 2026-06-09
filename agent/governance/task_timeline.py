@@ -3947,11 +3947,23 @@ def _cross_ref_bridge_command(event: dict[str, Any]) -> str:
     return _first_event_string(event, MF_CROSS_REF_BRIDGE_COMMAND_FIELDS)
 
 
-def _cross_ref_row_anchor(rows: list[Any]) -> dict[str, str]:
+def _cross_ref_row_anchor(
+    rows: list[Any],
+    trusted: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Derive the row's backlog_id/project_id + accepted route + originating
-    observer command from its own protected close evidence. Used to SCOPE which
-    bridge-declared sibling identities are honored (#3090 boundary)."""
+    observer command. Used to SCOPE which bridge-declared sibling identities are
+    honored (#3090 boundary).
 
+    The TRUSTED caller-supplied identity (``trusted``, from ``row_identity`` /
+    ``expected``) takes PRIORITY for the backlog_id/project_id row anchor. These
+    two fields define the foreign-row floor and must NOT be derivable from
+    attacker-supplied close evidence: if the caller pins them, that value wins
+    and close-evidence values can never redefine the anchor. Route/command
+    dimensions (which legitimately supersede under one row) are still seeded from
+    protected close evidence to scope bridge authority."""
+
+    trusted = trusted or {}
     anchor: dict[str, str] = {
         "backlog_id": "",
         "project_id": "",
@@ -3960,6 +3972,12 @@ def _cross_ref_row_anchor(rows: list[Any]) -> dict[str, str]:
         "prompt_contract_id": "",
         "command": "",
     }
+    # Trusted identity wins for the backlog/project floor BEFORE any event is
+    # consulted; once set from the trusted source it is never overwritten below.
+    for field in ("backlog_id", "project_id"):
+        trusted_value = str(trusted.get(field) or "").strip()
+        if trusted_value:
+            anchor[field] = trusted_value
     for raw in rows:
         event = _mapping(raw)
         if not is_protected_close_evidence(event):
@@ -4025,17 +4043,20 @@ def _cross_ref_bridge_scope_membership(
                 sib_backlog = str(sibling.get("backlog_id") or "").strip()
                 sib_project = str(sibling.get("project_id") or "").strip()
                 sib_task = str(sibling.get("task_id") or "").strip()
-                # Sibling must belong to THIS row: same backlog_id + project_id.
-                # (#3090: a foreign backlog_id/project_id is never bridged in.)
-                if row_backlog and sib_backlog and sib_backlog != row_backlog:
+                # HARD FOREIGN-ROW FLOOR (#3090): a sibling may only vary from the
+                # trusted row anchor by task_id. Any declared backlog_id/project_id
+                # that differs from the trusted anchor is a foreign row and is
+                # NEVER bridged in, regardless of what the bridge declares. The
+                # membership lane is always pinned to the TRUSTED row anchor, so a
+                # bridge cannot inject a foreign backlog/project even by omitting or
+                # mismatching the field.
+                if sib_backlog and sib_backlog != row_backlog:
                     continue
-                if row_project and sib_project and sib_project != row_project:
+                if sib_project and sib_project != row_project:
                     continue
-                backlog = sib_backlog or row_backlog
-                project = sib_project or row_project
-                membership.add((backlog, project, sib_task))
+                membership.add((row_backlog, row_project, sib_task))
                 # Row-level aggregate scope (task_id="") for this lane set.
-                membership.add((backlog, project, ""))
+                membership.add((row_backlog, row_project, ""))
     return membership
 
 
@@ -4057,6 +4078,17 @@ def mf_close_cross_ref_gate_verification(
         for field in MF_CROSS_REF_IDENTITY_FIELDS
         if str((row_identity or {}).get(field) or "").strip()
     }
+    # Trusted backlog/project floor (#3090): the caller-supplied row_identity is
+    # the ONLY trusted source for the backlog_id/project_id anchor. It is computed
+    # up front so it can constrain BOTH the legacy bridged-skip scraper below and
+    # the membership consumer further down. Inferred values (when no row_identity
+    # is supplied) are filled in after the stable-dimension inference.
+    trusted_floor = {
+        field: str((row_identity or {}).get(field) or "").strip()
+        for field in ("backlog_id", "project_id")
+        if str((row_identity or {}).get(field) or "").strip()
+    }
+
     bridged: set[str] = set()
     if any(_event_declares_accepted_bridge(_mapping(event)) for event in rows):
         # An accepted bridge/lineage event links cross-row evidence; collect the
@@ -4066,10 +4098,31 @@ def mf_close_cross_ref_gate_verification(
             if not _event_declares_accepted_bridge(event):
                 continue
             for field in MF_CROSS_REF_IDENTITY_FIELDS:
-                for value in _field_values(event, {f"bridged_{field}", field}):
+                # EXPLICIT bridge authorization: a top-level `bridged_<field>` key
+                # is the deliberate legacy bridge declaration and may authorize a
+                # foreign value for that single field (e.g. bridged_backlog_id).
+                for value in _field_values(event, {f"bridged_{field}"}):
                     text = str(value or "").strip()
                     if text:
                         bridged.add(f"{field}={text}")
+                # IMPLICIT scrape of the plain `<field>` recurses into nested
+                # structures including bridged_identities[]. HARD FOREIGN-ROW FLOOR
+                # (#3090): a foreign backlog_id/project_id buried in a declared
+                # sibling must NEVER be injected into the skip set, or it would
+                # bypass the per-evidence mismatch check. Only admit a plain
+                # backlog_id/project_id that equals the trusted floor; other
+                # dimensions (route_id, prompt_contract_id, scope) legitimately
+                # vary under one row and are unaffected.
+                for value in _field_values(event, {field}):
+                    text = str(value or "").strip()
+                    if not text:
+                        continue
+                    if (
+                        field in trusted_floor
+                        and text != trusted_floor[field]
+                    ):
+                        continue
+                    bridged.add(f"{field}={text}")
 
     # If no explicit row identity is supplied, infer it only from the stable
     # cross-reference dimensions (backlog_id / scope). Route-identity supersession
@@ -4094,10 +4147,18 @@ def mf_close_cross_ref_gate_verification(
     # by accepted, in-scope bridge events. Each honored sibling lane (and the
     # row-level aggregate, task_id="") is admitted into the accepted-scope
     # membership so evidence from a non-canonical lane is not rejected.
-    anchor = _cross_ref_row_anchor(rows)
+    #
+    # The backlog/project floor for the anchor comes from the TRUSTED row
+    # identity with priority over any value scraped from close evidence: a
+    # caller-supplied row_identity pins it directly, and otherwise we fall back to
+    # the identity inferred from the stable cross-ref dimensions (NOT from a bridge
+    # or a single foreign event). Attacker-supplied close evidence can therefore
+    # never redefine the row's backlog/project anchor (#3090).
+    trusted_anchor = dict(trusted_floor)
     for field in ("backlog_id", "project_id"):
-        if not anchor.get(field) and expected.get(field):
-            anchor[field] = str(expected.get(field) or "").strip()
+        if not trusted_anchor.get(field) and expected.get(field):
+            trusted_anchor[field] = str(expected.get(field) or "").strip()
+    anchor = _cross_ref_row_anchor(rows, trusted_anchor)
     lane_membership = _cross_ref_bridge_scope_membership(rows, anchor)
 
     rejected: list[dict[str, Any]] = []
