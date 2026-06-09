@@ -1689,6 +1689,98 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/projects/{project_id}/observer/route-context/issue")
+def handle_observer_route_context_issue(ctx: RequestContext):
+    """Mint an Aming-owned, write-authorizing observer route token.
+
+    This is the native counterpart to the read-only observer repair-run route
+    context: it returns a route token that passes
+    ``validate_route_token_mutation_gate`` (decision ``route_token``) for the
+    observer's protected write actions, plus a consumable ``route_token_ref``
+    and ``merge_queue_id`` (and a ready ``execute_backlog_row_payload``), without
+    depending on any external route provider at runtime.
+    """
+
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+
+    # Authorization: this endpoint mints a WRITE-authorizing route token, so the
+    # caller must declare the observer role. The shared operator gate does not
+    # cleanly apply here — in token-free mode anonymous callers get a coordinator
+    # session, which would let any caller mint write tokens — so we require an
+    # explicit caller_role == "observer" (body, or the X-Caller-Role header the
+    # request may carry) and reject everything else with 403. This mirrors the
+    # token's own CALLER_ROLE ("observer").
+    try:
+        header_role = str(ctx.handler.headers.get("X-Caller-Role", "") or "").strip()
+    except Exception:
+        header_role = ""
+    caller_role = str(body.get("caller_role") or header_role or "").strip().lower()
+    if caller_role != "observer":
+        return 403, {
+            "ok": False,
+            "error": "caller_role must be 'observer' to issue a write-authorizing route token",
+        }
+
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    target_files = body.get("target_files") or body.get("owned_files") or []
+    if not isinstance(target_files, list):
+        return 400, {"ok": False, "error": "target_files must be a list of file paths"}
+    if not backlog_id:
+        return 400, {"ok": False, "error": "backlog_id is required"}
+    if not task_id:
+        return 400, {"ok": False, "error": "task_id is required"}
+    if not target_files:
+        return 400, {"ok": False, "error": "target_files must be a non-empty list of file paths"}
+
+    allowed_actions = body.get("allowed_actions")
+    if allowed_actions is not None and not isinstance(allowed_actions, list):
+        return 400, {"ok": False, "error": "allowed_actions must be a list"}
+    evidence_refs = body.get("evidence_refs")
+    if evidence_refs is not None and not isinstance(evidence_refs, list):
+        return 400, {"ok": False, "error": "evidence_refs must be a list"}
+
+    try:
+        ttl_hours = float(body.get("ttl_hours", 24))
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "error": "ttl_hours must be a number"}
+
+    try:
+        from . import observer_route_context
+
+        project_root = None
+        try:
+            project_root = _graph_governance_project_root(project_id, body)
+        except Exception:
+            project_root = None
+
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            target_files=target_files,
+            allowed_actions=allowed_actions,
+            ttl_hours=ttl_hours,
+            evidence_refs=evidence_refs,
+            project_root=project_root,
+        )
+    except ValueError as exc:
+        return 400, {"ok": False, "error": str(exc)}
+    except Exception as exc:  # pragma: no cover - defensive
+        return 400, {"ok": False, "error": f"route token issuance failed: {exc}"}
+
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "route_token": issued["route_token"],
+        "route_token_ref": issued["route_token_ref"],
+        "merge_queue_id": issued["merge_queue_id"],
+        "execute_backlog_row_payload": issued["execute_backlog_row_payload"],
+        "provider": issued.get("provider", {}),
+    }
+
+
 @route("GET", "/api/projects/{project_id}/project-inbox")
 def handle_project_inbox(ctx: RequestContext):
     project_id = ctx.get_project_id()

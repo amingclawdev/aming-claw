@@ -471,6 +471,50 @@ TOOLS: list[dict] = [
             "required": ["project_id"],
         },
     },
+    {
+        "name": "observer_route_context_issue",
+        "description": (
+            "Mint an Aming-owned, write-authorizing observer route token "
+            "(decision route_token) without any external route provider. "
+            "Authorizes observer orchestration/close actions but blocks direct "
+            "file edits. Also returns a consumable route_token_ref + "
+            "merge_queue_id and an execute_backlog_row_payload."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Backlog id the route token scope binds to.",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task id the route token scope binds to.",
+                },
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Fenced target files for the bounded implementation subagent.",
+                },
+                "allowed_actions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional override of authorized protected actions (defaults to observer orchestration/close set). Wildcard and blocked actions are rejected at mint.",
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra session/command/graph evidence refs to embed.",
+                },
+                "ttl_hours": {
+                    "type": "number",
+                    "description": "Token lifetime in hours (default 24, clamped to a max).",
+                },
+            },
+            "required": ["project_id", "backlog_id", "task_id", "target_files"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -615,6 +659,19 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             if key != "project_id" and value is not None
         }
         return _http("POST", f"/api/projects/{pid}/observer-repair-run/route-evidence", body)
+
+    if name == "observer_route_context_issue":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        # This MCP tool IS the observer's native issuance path; assert the
+        # observer role so the endpoint's caller_role authorization check passes
+        # (unless an explicit caller_role was already supplied by the caller).
+        body.setdefault("caller_role", "observer")
+        return _http("POST", f"/api/projects/{pid}/observer/route-context/issue", body)
 
     raise ValueError(f"Unknown tool: {name!r}")
 
