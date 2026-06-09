@@ -170,3 +170,163 @@ def test_stale_session_rejects_privileged_command_claim():
             session_token=result["session_token"],
             now="2026-05-28T00:03:00Z",
         )
+
+
+# ---------------------------------------------------------------------------
+# Observer work-mode state + gate
+# ---------------------------------------------------------------------------
+def test_work_mode_default_is_observer_look_before_act():
+    assert observer_session.DEFAULT_WORK_MODE == "observer_look_before_act"
+    assert observer_session.normalize_work_mode(None) == "observer_look_before_act"
+    assert observer_session.normalize_work_mode("garbage") == "observer_look_before_act"
+    assert (
+        observer_session.normalize_work_mode("observer-execution-supervisor")
+        == "observer_execution_supervisor"
+    )
+
+
+def test_look_before_act_blocks_implementation_dispatch_merge_close():
+    for action in (
+        "edit_implementation",
+        "self_clear_judge_blocker",
+        "dispatch_implementation",
+        "merge",
+        "close",
+    ):
+        gate = observer_session.work_mode_action_gate(
+            "observer_look_before_act", action
+        )
+        assert gate["allowed"] is False, action
+        assert gate["blocked"] is True
+    # read/inspect/file-findings/propose-next stay allowed.
+    for action in ("read", "inspect", "file_findings", "propose_next"):
+        gate = observer_session.work_mode_action_gate(
+            "observer_look_before_act", action
+        )
+        assert gate["allowed"] is True, action
+
+
+def test_execution_supervisor_unlocks_coordination_but_not_implementation():
+    allow = observer_session.work_mode_action_gate(
+        "observer_execution_supervisor", "dispatch_implementation"
+    )
+    assert allow["allowed"] is True
+    for action in ("merge", "close"):
+        assert observer_session.work_mode_action_gate(
+            "observer_execution_supervisor", action
+        )["allowed"] is True
+    # Direct implementation / judge self-clear are never allowed, even here.
+    for action in ("edit_implementation", "self_clear_judge_blocker"):
+        gate = observer_session.work_mode_action_gate(
+            "observer_execution_supervisor", action
+        )
+        assert gate["allowed"] is False, action
+        assert gate["reason"] == "observer_must_never_perform_this_action"
+
+
+def test_work_mode_transition_requires_event_and_bound_precheck():
+    identity = {
+        "route_id": "route-1",
+        "route_context_hash": "sha256:ctx",
+        "prompt_contract_id": "rprompt-1",
+    }
+    # Empty evidence: transition blocked, both pieces missing.
+    blocked = observer_session.work_mode_transition_gate(
+        [], canonical_route_identity=identity
+    )
+    assert blocked["allowed"] is False
+    assert "work_mode_transition_event" in blocked["missing"]
+    assert "route_action_precheck_bound_to_canonical_route" in blocked["missing"]
+
+    # Transition event alone is still not enough.
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    only_event = observer_session.work_mode_transition_gate(
+        [transition_event], canonical_route_identity=identity
+    )
+    assert only_event["allowed"] is False
+    assert only_event["missing"] == ["route_action_precheck_bound_to_canonical_route"]
+
+    # A precheck bound to the WRONG identity does not unlock the transition.
+    wrong_precheck = {
+        "event_kind": "route_action_precheck",
+        "status": "allowed",
+        "payload": {"route_id": "route-OTHER", "route_context_hash": "sha256:ctx"},
+    }
+    assert observer_session.work_mode_transition_gate(
+        [transition_event, wrong_precheck], canonical_route_identity=identity
+    )["allowed"] is False
+
+    # Transition event + precheck bound to canonical identity unlocks it.
+    bound_precheck = {
+        "event_kind": "route_action_precheck",
+        "status": "allowed",
+        "payload": dict(identity),
+    }
+    allowed = observer_session.work_mode_transition_gate(
+        [transition_event, bound_precheck], canonical_route_identity=identity
+    )
+    assert allowed["allowed"] is True
+    assert allowed["missing"] == []
+
+
+# ---------------------------------------------------------------------------
+# Observer root route context bootstrap
+# ---------------------------------------------------------------------------
+def test_root_route_context_returns_required_fields_with_default_mode():
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-OBSERVER-ROOT-ROUTE-CONTEXT-WORK-MODE-20260609",
+        route_context={
+            "route_id": "route-7",
+            "prompt_contract_id": "rprompt-7",
+            "route_context_hash": "sha256:ctx7",
+        },
+        loaded_skills=["aming-claw"],
+        loaded_resources=["mf-sop.md"],
+        graph_query_schema_trace_id="graph-trace-7",
+    )
+    for field in (
+        "backlog_id",
+        "route_id",
+        "prompt_contract_id",
+        "work_mode",
+        "loaded_skills",
+        "loaded_resources",
+        "graph_query_schema_trace_id",
+        "allowed_actions",
+        "blocked_actions",
+        "required_evidence",
+        "next_legal_action",
+    ):
+        assert field in ctx, field
+    assert ctx["work_mode"] == "observer_look_before_act"
+    assert ctx["route_id"] == "route-7"
+    assert ctx["prompt_contract_id"] == "rprompt-7"
+    assert ctx["graph_query_schema_trace_id"] == "graph-trace-7"
+    assert ctx["loaded_skills"] == ["aming-claw"]
+    # In look-before-act the supervisor actions are blocked and the next legal
+    # action is the work-mode transition.
+    for blocked in ("edit_implementation", "dispatch_implementation", "merge", "close"):
+        assert blocked in ctx["blocked_actions"], blocked
+    assert ctx["next_legal_action"]["id"] == "record_work_mode_transition"
+    assert "route_context" in ctx["required_evidence"]
+
+
+def test_root_route_context_execution_supervisor_unblocks_dispatch():
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-X",
+        work_mode="observer_execution_supervisor",
+        route_context={"route_id": "route-9", "prompt_contract_id": "rprompt-9"},
+    )
+    assert ctx["work_mode"] == "observer_execution_supervisor"
+    assert "dispatch_implementation" not in ctx["blocked_actions"]
+    assert "dispatch_implementation" in ctx["allowed_actions"]
+    # Direct implementation stays blocked regardless of mode.
+    assert "edit_implementation" in ctx["blocked_actions"]
+    assert ctx["next_legal_action"]["id"] == "dispatch_bounded_worker"

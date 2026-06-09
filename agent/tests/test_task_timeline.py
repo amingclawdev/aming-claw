@@ -5974,5 +5974,236 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("dashboard_e2e", str(raised.exception))
 
 
+# ---------------------------------------------------------------------------
+# Observer cannot self-clear judge blockers (regression #3092)
+# ---------------------------------------------------------------------------
+def test_observer_self_cleared_judge_blocker_is_rejected():
+    from agent.governance import task_timeline
+
+    observer_accept = {
+        "id": 1,
+        "event_kind": "blocker_resolution",
+        "actor": "observer",
+        "status": "accepted",
+        "payload": {"finding_kind": "judge_finding"},
+    }
+    gate = task_timeline.mf_blocker_resolution_gate_verification([observer_accept])
+    assert gate["passed"] is False
+    rejected = gate["rejected_observer_resolutions"]
+    assert rejected and rejected[0]["reason"] == "observer_self_cleared_judge_blocker"
+    assert rejected[0]["forced_status"] == "pending_judge_review"
+
+
+def test_observer_judge_blocker_proposal_is_forced_pending_review():
+    from agent.governance import task_timeline
+
+    observer_propose = {
+        "id": 1,
+        "event_kind": "blocker_resolution",
+        "actor": "observer",
+        "status": "proposed",
+        "payload": {"finding_kind": "judge_finding"},
+    }
+    gate = task_timeline.mf_blocker_resolution_gate_verification([observer_propose])
+    # A proposal (not an accept) does not block the close gate, but is forced to
+    # pending_judge_review.
+    assert gate["passed"] is True
+    forced = gate["forced_pending_judge_review"]
+    assert forced and forced[0]["forced_status"] == "pending_judge_review"
+
+
+def test_observer_p0_priority_downgrade_on_judge_finding_is_rejected():
+    from agent.governance import task_timeline
+
+    downgrade = {
+        "id": 1,
+        "event_kind": "blocker_resolution",
+        "actor": "observer",
+        "status": "proposed",
+        "payload": {
+            "finding_kind": "judge_finding",
+            "from_priority": "P0",
+            "to_priority": "P2",
+        },
+    }
+    gate = task_timeline.mf_blocker_resolution_gate_verification([downgrade])
+    assert gate["passed"] is False
+    rejected = gate["rejected_observer_resolutions"][0]
+    assert rejected["reason"] == "observer_safety_priority_downgrade_by_fiat"
+    assert rejected["safety_priority_downgrade"] == {"from": "p0", "to": "p2"}
+
+
+def test_judge_actor_may_accept_judge_blocker():
+    from agent.governance import task_timeline
+
+    judge_accept = {
+        "id": 1,
+        "event_kind": "blocker_resolution",
+        "actor": "judge",
+        "status": "accepted",
+        "payload": {"finding_kind": "judge_finding"},
+    }
+    gate = task_timeline.mf_blocker_resolution_gate_verification([judge_accept])
+    assert gate["passed"] is True
+    assert gate["judge_accepted_resolutions"]
+
+
+# ---------------------------------------------------------------------------
+# Route repair/supersede invalidates stale evidence for close (#3093/#3094)
+# ---------------------------------------------------------------------------
+def test_route_repair_invalidates_stale_read_receipt_and_startup_for_close():
+    from agent.governance import task_timeline
+
+    canonical = dict(ROUTE_IDENTITY)
+    stale = {
+        "route_context_hash": "sha256:stale-route-context",
+        "prompt_contract_id": "rprompt-stale-route",
+        "prompt_contract_hash": "sha256:stale-prompt-contract",
+    }
+    cleanup = {
+        "id": 1,
+        "event_kind": "route_identity_cleanup",
+        "phase": "identity_recovery",
+        "status": "accepted",
+        "payload": {"route_identity_cleanup": {**canonical}},
+    }
+    stale_read_receipt = {
+        "id": 2,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**stale, "read_receipt_hash": "sha256:stale-rr"},
+    }
+    stale_startup = {
+        "id": 3,
+        "event_kind": "mf_subagent_startup",
+        "status": "passed",
+        "payload": {**stale, "fence_token": "fence-stale"},
+    }
+    gate = task_timeline.mf_stale_route_evidence_gate_verification(
+        [cleanup, stale_read_receipt, stale_startup]
+    )
+    assert gate["route_identity_cleanup_applied"] is True
+    superseded_kinds = {
+        item["event_kind"] for item in gate["superseded_close_evidence"]
+    }
+    assert "mf_subagent_read_receipt" in superseded_kinds
+    assert "mf_subagent_startup" in superseded_kinds
+    assert gate["passed"] is False
+
+
+def test_canonical_route_evidence_after_repair_is_not_superseded():
+    from agent.governance import task_timeline
+
+    canonical = dict(ROUTE_IDENTITY)
+    cleanup = {
+        "id": 1,
+        "event_kind": "route_identity_cleanup",
+        "phase": "identity_recovery",
+        "status": "accepted",
+        "payload": {"route_identity_cleanup": {**canonical}},
+    }
+    canonical_read_receipt = {
+        "id": 2,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**canonical, "read_receipt_hash": "sha256:fresh-rr"},
+    }
+    gate = task_timeline.mf_stale_route_evidence_gate_verification(
+        [cleanup, canonical_read_receipt]
+    )
+    assert gate["passed"] is True
+    assert gate["superseded_close_evidence"] == []
+
+
+# ---------------------------------------------------------------------------
+# Close-gate cross-ref rejection (regression #3090)
+# ---------------------------------------------------------------------------
+def test_close_gate_rejects_cross_backlog_evidence_ref():
+    from agent.governance import task_timeline
+
+    row_identity = {"backlog_id": "AC-A"}
+    cross_backlog = {
+        "id": 1,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "payload": {"backlog_id": "AC-B"},
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cross_backlog], row_identity
+    )
+    assert gate["passed"] is False
+    rejected = gate["rejected_cross_ref_evidence"][0]
+    assert rejected["reason"] == "cross_ref_identity_mismatch"
+    assert rejected["mismatches"]["backlog_id"] == {
+        "expected": "AC-A",
+        "actual": "AC-B",
+    }
+
+
+def test_close_gate_accepts_cross_ref_with_bridge_event():
+    from agent.governance import task_timeline
+
+    row_identity = {"backlog_id": "AC-A"}
+    cross_backlog = {
+        "id": 1,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "payload": {"backlog_id": "AC-B"},
+    }
+    bridge = {
+        "id": 2,
+        "event_kind": "lineage_bridge",
+        "status": "accepted",
+        "payload": {"bridged_backlog_id": "AC-B"},
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cross_backlog, bridge], row_identity
+    )
+    assert gate["passed"] is True
+
+
+def test_close_gate_accepts_same_backlog_scope_evidence():
+    from agent.governance import task_timeline
+
+    row_identity = {"backlog_id": "AC-A", "scope": "agent/governance"}
+    same_row = {
+        "id": 1,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "payload": {"backlog_id": "AC-A", "scope": "agent/governance"},
+    }
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [same_row], row_identity
+    )
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+
+
+def test_close_gate_blocks_when_observer_self_clears_judge_blocker():
+    from agent.governance import task_timeline
+
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": "BUG-CLOSE-JUDGE-SELFCLEAR",
+    }
+    events = [
+        *_route_context_consumption_events(),
+        _route_context_qa_verification_event(),
+        {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        {
+            "event_kind": "blocker_resolution",
+            "actor": "observer",
+            "status": "accepted",
+            "payload": {"finding_kind": "judge_finding"},
+        },
+    ]
+    gate = task_timeline.mf_close_gate_verification(events, contract=contract)
+    assert gate["passed"] is False
+    assert gate["blocker_resolution_gate"]["passed"] is False
+    assert "judge_blocker_resolution" in gate["missing_evidence_groups"]["groups"]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -114,6 +114,51 @@ MF_BOUNDED_SUBAGENT_LANE_ID = "bounded_implementation_subagent"
 MF_BOUNDED_SUBAGENT_DISPATCH_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.dispatch"
 MF_BOUNDED_SUBAGENT_REVIEW_READY_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.review_ready"
 
+MF_BLOCKER_RESOLUTION_GATE_SCHEMA_VERSION = "mf_blocker_resolution_gate.v1"
+MF_CROSS_REF_GATE_SCHEMA_VERSION = "mf_close_cross_ref_gate.v1"
+MF_STALE_ROUTE_EVIDENCE_GATE_SCHEMA_VERSION = "mf_stale_route_evidence_gate.v1"
+
+# Statuses an observer must NOT apply to a judge-finding blocker resolution by
+# fiat. Only a judge actor may accept/resolve such a finding.
+MF_JUDGE_BLOCKER_ACCEPT_STATUSES = {
+    "accepted",
+    "resolved",
+    "cleared",
+    "closed",
+    "approved",
+    "passed",
+    "ok",
+}
+MF_JUDGE_ACTOR_TOKENS = ("judge", "judge_review", "judger")
+MF_OBSERVER_ACTOR_TOKENS = ("observer", "observer_coordinator", "coordinator")
+# When an observer touches a judge finding, the only legal recorded state is a
+# proposal pending independent judge review.
+MF_OBSERVER_FORCED_BLOCKER_STATUS = "pending_judge_review"
+# Evidence kinds whose acceptance must be invalidated when recorded under a
+# superseded/stale route identity (route repair forces re-recording).
+MF_STALE_ROUTE_EVIDENCE_KINDS = (
+    "mf_subagent_read_receipt",
+    "mf_subagent_startup",
+    "mf_subagent_dispatch",
+    "bounded_implementation_worker_dispatch",
+    "close_ready",
+)
+# Identity dimensions a close-evidence ref must share with the row it closes.
+# (Route-identity supersession/repair changes route_id/prompt_contract_id under
+# the same backlog/scope; that lineage is handled by the stale-route gate, so
+# the cross-ref gate inferring identity from evidence keys only on backlog/scope.
+# An explicit row_identity may still constrain route_id/prompt_contract_id.)
+MF_CROSS_REF_IDENTITY_FIELDS = (
+    "backlog_id",
+    "route_id",
+    "prompt_contract_id",
+    "scope",
+)
+MF_CROSS_REF_INFERRED_IDENTITY_FIELDS = (
+    "backlog_id",
+    "scope",
+)
+
 MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION = "mf_route_context_consumption_gate.v1"
 MF_ROUTE_OWNED_SOURCE_EVENT_GATE_SCHEMA_VERSION = "mf_route_owned_source_event_gate.v1"
 MF_CLOSE_MISSING_GROUPS_SCHEMA_VERSION = "mf_close_missing_evidence_groups.v1"
@@ -3639,6 +3684,271 @@ def mf_lane_ownership_gate_verification(
     }
 
 
+def _actor_is_judge(actor: str) -> bool:
+    token = _normalize_token(actor)
+    return any(judge in token for judge in MF_JUDGE_ACTOR_TOKENS)
+
+
+def _actor_is_observer(actor: str) -> bool:
+    token = _normalize_token(actor)
+    if _actor_is_judge(token):
+        return False
+    return any(obs in token for obs in MF_OBSERVER_ACTOR_TOKENS)
+
+
+def _event_targets_judge_finding(event: dict[str, Any]) -> bool:
+    """Detect a blocker-resolution event that targets a judge finding."""
+
+    marker = _event_key_text(event)
+    finding_kind = _normalize_token(
+        _first_event_string(
+            event,
+            {"finding_kind", "blocker_kind", "blocker_source", "finding_source"},
+        )
+    )
+    if any(judge in finding_kind for judge in MF_JUDGE_ACTOR_TOKENS):
+        return True
+    return "judge" in marker
+
+
+def _is_blocker_resolution_event(event: dict[str, Any]) -> bool:
+    marker = _normalize_token(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_kind", "event_type", "phase")
+        )
+    )
+    return "blocker_resolution" in marker or "blocker_clearance" in marker
+
+
+def _safety_priority_downgrade(event: dict[str, Any]) -> dict[str, str]:
+    """Return {from,to} when an event lowers a safety-relevant priority."""
+
+    from_priority = _normalize_token(
+        _first_event_string(event, {"from_priority", "previous_priority", "prior_priority"})
+    )
+    to_priority = _normalize_token(
+        _first_event_string(event, {"to_priority", "new_priority", "priority"})
+    )
+    rank = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}
+    if from_priority in rank and to_priority in rank and rank[to_priority] > rank[from_priority]:
+        return {"from": from_priority, "to": to_priority}
+    return {}
+
+
+def mf_blocker_resolution_gate_verification(
+    events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Reject observer self-clearance of judge findings. [regression #3092]
+
+    An observer-actor blocker_resolution / blocker-clearance event that targets a
+    judge finding is forced to ``pending_judge_review``; an observer attempt to
+    set accepted/resolved/cleared, or to downgrade a safety-relevant priority by
+    fiat, is rejected. Only a judge-actor may accept/resolve.
+    """
+
+    rows = events if isinstance(events, list) else []
+    forced: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    accepted_by_judge: list[dict[str, Any]] = []
+    for event in rows:
+        event = _mapping(event)
+        if not event or not _is_blocker_resolution_event(event):
+            continue
+        if not _event_targets_judge_finding(event):
+            continue
+        actor = _text(event.get("actor"))
+        status = _normalize_token(event.get("status") or event.get("decision"))
+        ref = {
+            "id": event.get("id") or event.get("event_id"),
+            "event_kind": event.get("event_kind"),
+            "actor": actor,
+            "status": event.get("status") or event.get("decision"),
+        }
+        if _actor_is_judge(actor):
+            if status in MF_JUDGE_BLOCKER_ACCEPT_STATUSES:
+                accepted_by_judge.append(ref)
+            continue
+        if _actor_is_observer(actor) or not actor:
+            downgrade = _safety_priority_downgrade(event)
+            if status in MF_JUDGE_BLOCKER_ACCEPT_STATUSES or downgrade:
+                rejected.append({
+                    **ref,
+                    "reason": (
+                        "observer_safety_priority_downgrade_by_fiat"
+                        if downgrade
+                        else "observer_self_cleared_judge_blocker"
+                    ),
+                    "forced_status": MF_OBSERVER_FORCED_BLOCKER_STATUS,
+                    "safety_priority_downgrade": downgrade,
+                })
+            else:
+                forced.append({
+                    **ref,
+                    "forced_status": MF_OBSERVER_FORCED_BLOCKER_STATUS,
+                })
+    passed = not rejected
+    return {
+        "schema_version": MF_BLOCKER_RESOLUTION_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "blocked",
+        "rejected_observer_resolutions": rejected,
+        "forced_pending_judge_review": forced,
+        "judge_accepted_resolutions": accepted_by_judge,
+        "forced_status": MF_OBSERVER_FORCED_BLOCKER_STATUS,
+    }
+
+
+def _close_evidence_ref_identity(event: dict[str, Any]) -> dict[str, str]:
+    identity: dict[str, str] = {}
+    for field in MF_CROSS_REF_IDENTITY_FIELDS:
+        value = _first_deep_text(event, field)
+        if value:
+            identity[field] = value
+    return identity
+
+
+def _event_declares_accepted_bridge(event: dict[str, Any]) -> bool:
+    marker = _normalize_token(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_kind", "event_type", "phase")
+        )
+    )
+    if not ("bridge" in marker or "lineage" in marker):
+        return False
+    status = _normalize_token(event.get("status") or event.get("decision"))
+    return status in {"accepted", "passed", "ok", "approved", "succeeded", "reconciled"}
+
+
+def mf_close_cross_ref_gate_verification(
+    events: list[dict[str, Any]] | None,
+    row_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reject close evidence refs from a different row. [regression #3090]
+
+    Close evidence whose backlog_id/route_id/prompt_contract_id/scope differs
+    from the row's is rejected unless an explicit accepted bridge/lineage event
+    links the two. The row identity is inferred from the row_identity argument or
+    from the dominant identity across the supplied evidence.
+    """
+
+    rows = events if isinstance(events, list) else []
+    expected = {
+        field: str((row_identity or {}).get(field) or "").strip()
+        for field in MF_CROSS_REF_IDENTITY_FIELDS
+        if str((row_identity or {}).get(field) or "").strip()
+    }
+    bridged: set[str] = set()
+    if any(_event_declares_accepted_bridge(_mapping(event)) for event in rows):
+        # An accepted bridge/lineage event links cross-row evidence; collect the
+        # identities it authorizes so they are not rejected below.
+        for event in rows:
+            event = _mapping(event)
+            if not _event_declares_accepted_bridge(event):
+                continue
+            for field in MF_CROSS_REF_IDENTITY_FIELDS:
+                for value in _field_values(event, {f"bridged_{field}", field}):
+                    text = str(value or "").strip()
+                    if text:
+                        bridged.add(f"{field}={text}")
+
+    # If no explicit row identity is supplied, infer it only from the stable
+    # cross-reference dimensions (backlog_id / scope). Route-identity supersession
+    # legitimately changes route_id/prompt_contract_id under the same row, so we
+    # do not infer those — the stale-route gate owns that lineage.
+    if not expected:
+        best: dict[str, str] = {}
+        for event in rows:
+            event = _mapping(event)
+            if not is_protected_close_evidence(event):
+                continue
+            candidate = {
+                field: value
+                for field, value in _close_evidence_ref_identity(event).items()
+                if field in MF_CROSS_REF_INFERRED_IDENTITY_FIELDS
+            }
+            if len(candidate) > len(best):
+                best = candidate
+        expected = best
+
+    rejected: list[dict[str, Any]] = []
+    for event in rows:
+        event = _mapping(event)
+        if not is_protected_close_evidence(event):
+            continue
+        identity = _close_evidence_ref_identity(event)
+        mismatches: dict[str, dict[str, str]] = {}
+        for field, want in expected.items():
+            got = identity.get(field, "")
+            if got and got != want and f"{field}={got}" not in bridged:
+                mismatches[field] = {"expected": want, "actual": got}
+        if mismatches:
+            rejected.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "cross_ref_identity_mismatch",
+                "mismatches": mismatches,
+            })
+    passed = not rejected
+    return {
+        "schema_version": MF_CROSS_REF_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "blocked",
+        "row_identity": expected,
+        "bridged_identities": sorted(bridged),
+        "rejected_cross_ref_evidence": rejected,
+    }
+
+
+def mf_stale_route_evidence_gate_verification(
+    events: list[dict[str, Any]] | None,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Invalidate close evidence recorded under a superseded route. [#3093/#3094]
+
+    Builds on the existing route_identity_cleanup handling: when a route identity
+    has been superseded/repaired, prior read_receipt/startup/dispatch/close
+    evidence recorded under the stale identity does NOT count for close and must
+    be re-recorded under the canonical (cleanup) route identity.
+    """
+
+    rows = events if isinstance(events, list) else []
+    route_gate = mf_route_context_gate_verification(rows, contract)
+    cleanup = _mapping(route_gate.get("route_identity_cleanup"))
+    canonical_identity = _mapping(cleanup.get("route_identity"))
+    superseded: list[dict[str, Any]] = []
+    if cleanup.get("applied") and canonical_identity:
+        for event in rows:
+            event = _mapping(event)
+            if not event or _route_event_is_identity_cleanup(event):
+                continue
+            kind = _normalize_token(event.get("event_kind") or event.get("event_type"))
+            if not any(stale in kind for stale in MF_STALE_ROUTE_EVIDENCE_KINDS):
+                continue
+            identity = _route_identity(event)
+            if not identity:
+                continue
+            if not _route_identity_matches_filter(identity, canonical_identity):
+                superseded.append({
+                    "id": event.get("id") or event.get("event_id"),
+                    "event_kind": event.get("event_kind"),
+                    "status": event.get("status") or event.get("decision"),
+                    "reason": "superseded_route_identity_evidence",
+                    "next_action": "re-record under canonical route identity",
+                })
+    passed = not superseded
+    return {
+        "schema_version": MF_STALE_ROUTE_EVIDENCE_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "blocked",
+        "route_identity_cleanup_applied": bool(cleanup.get("applied")),
+        "canonical_route_identity": canonical_identity,
+        "superseded_close_evidence": superseded,
+    }
+
+
 def mf_close_gate_verification(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
@@ -3694,6 +4004,9 @@ def mf_close_gate_verification(
         rows,
         contract,
     )
+    blocker_resolution_gate = mf_blocker_resolution_gate_verification(rows)
+    cross_ref_gate = mf_close_cross_ref_gate_verification(rows)
+    stale_route_evidence_gate = mf_stale_route_evidence_gate_verification(rows, contract)
     missing_evidence_groups = mf_close_missing_evidence_groups(
         missing,
         route_context_gate,
@@ -3726,6 +4039,18 @@ def mf_close_gate_verification(
             "missing": independent_qa_gate.get("missing_requirement_ids", []),
             "next_action": "record a passing independent QA verification timeline event",
         }
+    if not blocker_resolution_gate.get("passed"):
+        groups["judge_blocker_resolution"] = {
+            "label": "judge blocker resolution",
+            "missing": blocker_resolution_gate.get("rejected_observer_resolutions", []),
+            "next_action": "observer cannot self-clear a judge blocker; route to independent judge review",
+        }
+    if not cross_ref_gate.get("passed"):
+        groups["cross_ref_evidence"] = {
+            "label": "cross-reference evidence",
+            "missing": cross_ref_gate.get("rejected_cross_ref_evidence", []),
+            "next_action": "remove evidence from other backlog/scope or record an accepted bridge/lineage event",
+        }
     missing_evidence_groups["groups"] = groups
     route_context_reminder = mf_route_context_reminder(
         route_context_gate,
@@ -3740,6 +4065,13 @@ def mf_close_gate_verification(
         and bool(independent_qa_gate.get("passed"))
         and bool(contract_projection_gate.get("passed"))
         and bool(post_verification_actions_gate.get("passed"))
+        and bool(blocker_resolution_gate.get("passed"))
+        and bool(cross_ref_gate.get("passed"))
+        # Stale-route evidence invalidation is already enforced by the route
+        # context gate (it ignores superseded-identity evidence and requires
+        # canonical re-recording). The stale_route_evidence_gate below is the
+        # explicit, observable projection of that rule; it does not independently
+        # block a close that already carries canonical replacement evidence.
     )
     return {
         "schema_version": "mf_close_timeline_gate.v1",
@@ -3760,6 +4092,9 @@ def mf_close_gate_verification(
         "contract_projection": contract_projection,
         "contract_projection_gate": contract_projection_gate,
         "post_verification_actions_gate": post_verification_actions_gate,
+        "blocker_resolution_gate": blocker_resolution_gate,
+        "cross_ref_gate": cross_ref_gate,
+        "stale_route_evidence_gate": stale_route_evidence_gate,
         "missing_evidence_groups": missing_evidence_groups,
         "route_context_reminder": route_context_reminder,
         "checks": {
@@ -3778,6 +4113,11 @@ def mf_close_gate_verification(
             "has_post_verification_actions": bool(
                 post_verification_actions_gate.get("passed")
             ),
+            "no_observer_self_cleared_judge_blocker": bool(
+                blocker_resolution_gate.get("passed")
+            ),
+            "no_cross_ref_evidence": bool(cross_ref_gate.get("passed")),
+            "no_stale_route_evidence": bool(stale_route_evidence_gate.get("passed")),
             "mf_subagent_read_receipt_gate": str(
                 _mapping(contract_projection.get("read_receipt_gate")).get("status") or ""
             ),

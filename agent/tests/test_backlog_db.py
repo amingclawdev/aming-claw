@@ -1023,5 +1023,120 @@ class TestObserverDocUpdate(unittest.TestCase):
         self.assertIn("backlog_upsert", content)
 
 
+class TestObserverRootRouteContextEndpoint(unittest.TestCase):
+    """Observer root route context bootstrap endpoint (aming-owned)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        os.makedirs(os.path.join(
+            self.tmp.name, "codex-tasks", "state", "governance", "test-project"
+        ), exist_ok=True)
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        _safe_cleanup(self.tmp)
+
+    def _make_ctx(self, path_params, query=None, body=None):
+        ctx = MagicMock()
+        ctx.path_params = path_params
+        ctx.query = query or {}
+        ctx.body = body or {}
+        ctx.get_project_id.return_value = path_params.get("project_id", "")
+        return ctx
+
+    def _seed_backlog(self, bug_id):
+        from governance.server import handle_backlog_upsert
+
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Root route context bootstrap",
+                    "status": "OPEN",
+                    "priority": "P1",
+                    "force_admit": True,
+                },
+            )
+        )
+
+    def test_root_route_context_returns_required_fields_with_default_mode(self):
+        from governance.server import handle_observer_root_route_context_get
+
+        bug_id = "AC-OBSERVER-ROOT-ROUTE-CONTEXT-WORK-MODE-20260609"
+        self._seed_backlog(bug_id)
+
+        result = handle_observer_root_route_context_get(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                query={"backlog_id": bug_id},
+            )
+        )
+
+        for field in (
+            "backlog_id",
+            "route_id",
+            "prompt_contract_id",
+            "work_mode",
+            "loaded_skills",
+            "loaded_resources",
+            "graph_query_schema_trace_id",
+            "allowed_actions",
+            "blocked_actions",
+            "required_evidence",
+            "next_legal_action",
+        ):
+            self.assertIn(field, result)
+        self.assertEqual(result["backlog_id"], bug_id)
+        # Default work mode is observer_look_before_act, with implementation /
+        # dispatch / merge / close blocked.
+        self.assertEqual(result["work_mode"], "observer_look_before_act")
+        for blocked in (
+            "edit_implementation",
+            "dispatch_implementation",
+            "merge",
+            "close",
+        ):
+            self.assertIn(blocked, result["blocked_actions"])
+        self.assertEqual(
+            result["next_legal_action"]["id"], "record_work_mode_transition"
+        )
+        self.assertIn("route_context", result["required_evidence"])
+        self.assertTrue(result["backlog_row_present"])
+
+    def test_root_route_context_post_accepts_work_mode_and_skills(self):
+        from governance.server import handle_observer_root_route_context_post
+
+        bug_id = "AC-OBSERVER-ROOT-ROUTE-CONTEXT-POST-20260609"
+        self._seed_backlog(bug_id)
+
+        result = handle_observer_root_route_context_post(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                body={
+                    "backlog_id": bug_id,
+                    "work_mode": "observer_execution_supervisor",
+                    "loaded_skills": ["aming-claw"],
+                    "loaded_resources": ["mf-sop.md"],
+                },
+            )
+        )
+
+        self.assertEqual(result["work_mode"], "observer_execution_supervisor")
+        self.assertEqual(result["loaded_skills"], ["aming-claw"])
+        self.assertEqual(result["loaded_resources"], ["mf-sop.md"])
+        # Execution supervisor unblocks dispatch but never direct implementation.
+        self.assertNotIn("dispatch_implementation", result["blocked_actions"])
+        self.assertIn("edit_implementation", result["blocked_actions"])
+
+    def test_root_route_context_requires_backlog_id(self):
+        from governance.server import handle_observer_root_route_context_get
+
+        with self.assertRaises(ValueError):
+            handle_observer_root_route_context_get(
+                self._make_ctx({"project_id": "test-project"}, query={})
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

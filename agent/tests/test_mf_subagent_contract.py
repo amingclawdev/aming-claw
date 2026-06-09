@@ -47,6 +47,8 @@ from agent.governance.mf_subagent_contract import (
     validate_route_action_gate,
     route_token_required_failure_details,
     validate_route_token_mutation_gate,
+    surrogate_startup_evidence_gate,
+    _bounded_startup_evidence_present,
 )
 from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
@@ -2907,3 +2909,87 @@ def test_finish_gate_rejects_not_ready_result() -> None:
             },
             context=_context(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Host-adapter surrogate startup is not real-worker close evidence (#3104)
+# ---------------------------------------------------------------------------
+def _real_session_startup() -> dict:
+    return {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,
+        "agent_id_match_mode": "actual_host_worker_bound",
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:real-token",
+        "session_token_present": True,
+        "worktree": "/repo/.worktrees/mf-sub",
+        "worktree_path": "/repo/.worktrees/mf-sub",
+        "fence_token": "fence-real",
+        "actual_cwd": "/repo/.worktrees/mf-sub",
+        "actual_git_root": "/repo/.worktrees/mf-sub",
+        "branch": "refs/heads/codex/mf-sub",
+        "head_commit": "head-real",
+    }
+
+
+def _surrogate_startup() -> dict:
+    startup = _real_session_startup()
+    startup.update(
+        {
+            "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+            "session_token_evidence_type": "surrogate",
+            "session_token_hash": "",
+            "session_token_present": False,
+            "host_adapter_startup_token_accepted": True,
+            "fence_token": "fence-surrogate",
+        }
+    )
+    return startup
+
+
+def test_real_session_startup_is_close_satisfying() -> None:
+    gate = surrogate_startup_evidence_gate(_real_session_startup())
+    assert gate["is_host_adapter_surrogate"] is False
+    assert gate["close_satisfying"] is True
+    assert gate["counts_as_real_worker_evidence"] is True
+    assert _bounded_startup_evidence_present(_real_session_startup()) is True
+
+
+def test_surrogate_startup_not_close_satisfying_without_hotfix_exception() -> None:
+    gate = surrogate_startup_evidence_gate(_surrogate_startup())
+    assert gate["is_host_adapter_surrogate"] is True
+    assert gate["observer_hotfix_exception_present"] is False
+    assert gate["close_satisfying"] is False
+    assert gate["counts_as_real_worker_evidence"] is False
+    assert (
+        gate["reason"]
+        == "host_adapter_surrogate_blocked_without_observer_hotfix_exception"
+    )
+    # The live bounded-worker close-satisfaction check must also demote it,
+    # even though the startup payload stamps close_satisfying=true.
+    assert _bounded_startup_evidence_present(_surrogate_startup()) is False
+
+
+def test_surrogate_startup_with_hotfix_exception_still_not_real_worker_evidence() -> None:
+    hotfix_events = [
+        {
+            "event_kind": "observer_work_mode_transition",
+            "work_mode": "observer_hotfix_exception",
+            "status": "accepted",
+        }
+    ]
+    gate = surrogate_startup_evidence_gate(
+        _surrogate_startup(), events=hotfix_events
+    )
+    assert gate["is_host_adapter_surrogate"] is True
+    assert gate["observer_hotfix_exception_present"] is True
+    # Even under the hotfix exception, surrogate evidence is NOT close-satisfying
+    # real-worker evidence.
+    assert gate["close_satisfying"] is False
+    assert gate["counts_as_real_worker_evidence"] is False
+    assert (
+        gate["reason"]
+        == "host_adapter_surrogate_under_observer_hotfix_exception_not_real_worker_evidence"
+    )

@@ -2807,6 +2807,11 @@ def _bounded_dispatch_evidence_present(evidence: Mapping[str, Any]) -> bool:
 def _bounded_startup_evidence_present(evidence: Mapping[str, Any]) -> bool:
     if _explicit_false(evidence.get("bounded")) or _startup_intent_only(evidence):
         return False
+    # A host-adapter startup-token surrogate is never close-satisfying real
+    # bounded-worker evidence (regression #3104), even when the live startup gate
+    # stamps close_satisfying=true.
+    if _startup_is_host_adapter_surrogate(evidence):
+        return False
     gate_kind = _string(evidence.get("gate_kind") or evidence.get("kind")).lower()
     schema_version = _string(evidence.get("schema_version"))
     bounded_signal = (
@@ -2821,6 +2826,111 @@ def _bounded_startup_evidence_present(evidence: Mapping[str, Any]) -> bool:
         )
     )
     return bounded_signal and _actual_startup_identity_present(evidence)
+
+
+HOST_ADAPTER_SURROGATE_MATCH_MODE = "host_adapter_startup_token_surrogate"
+SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE = "surrogate"
+OBSERVER_HOTFIX_EXCEPTION_MODE = "observer_hotfix_exception"
+SURROGATE_STARTUP_GATE_SCHEMA_VERSION = "mf_surrogate_startup_evidence_gate.v1"
+
+
+def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
+    """True when startup identity came from a host-adapter token surrogate.
+
+    The live startup gate stamps ``agent_id_match_mode`` /
+    ``session_token_evidence_type`` so a surrogate startup is distinguishable from
+    a real session-token startup.
+    """
+
+    if not isinstance(evidence, Mapping):
+        return False
+    match_mode = _string(
+        evidence.get("agent_id_match_mode")
+        or _nested_mapping(evidence, "identity_join").get("agent_id_match_mode")
+    ).lower()
+    token_type = _string(evidence.get("session_token_evidence_type")).lower()
+    if token_type == SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE:
+        return True
+    if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
+        return True
+    return bool(
+        _bool(evidence.get("host_adapter_startup_token_accepted"))
+        and not _string(evidence.get("session_token_hash"))
+        and not _bool(evidence.get("session_token_present"))
+    )
+
+
+def _observer_hotfix_exception_present(events: Any) -> bool:
+    """Detect an explicit observer_hotfix_exception mode event in the evidence."""
+
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(events, Mapping):
+        candidates = [events]
+    elif isinstance(events, Sequence) and not isinstance(events, (str, bytes)):
+        candidates = [item for item in events if isinstance(item, Mapping)]
+    for event in candidates:
+        marker = " ".join(
+            _string(event.get(key))
+            for key in ("event_kind", "event_type", "phase", "work_mode", "mode")
+        ).lower().replace("-", "_").replace(".", "_")
+        if OBSERVER_HOTFIX_EXCEPTION_MODE in marker:
+            status = _string(event.get("status") or event.get("decision")).lower()
+            if status not in _FAIL_STATUSES:
+                return True
+        for nested_key in ("payload", "verification"):
+            nested = _nested_mapping(event, nested_key)
+            nested_mode = _string(
+                nested.get("work_mode") or nested.get("mode")
+            ).lower().replace("-", "_").replace(" ", "_")
+            if nested_mode == OBSERVER_HOTFIX_EXCEPTION_MODE:
+                return True
+    return False
+
+
+def surrogate_startup_evidence_gate(
+    startup_evidence: Mapping[str, Any] | None,
+    *,
+    events: Any = None,
+) -> dict[str, Any]:
+    """Demote host-adapter surrogate startup evidence. [regression #3104]
+
+    When the startup token/identity is a host_adapter_startup_token_surrogate
+    (``session_token_evidence_type == "surrogate"``), the startup must NOT be
+    close-satisfying for a real bounded-worker or independent-QA evidence
+    requirement UNLESS an explicit observer_hotfix_exception mode event is
+    present — and even then it is NOT counted as close-satisfying real-worker
+    evidence. A real session-token startup stays close-satisfying.
+    """
+
+    evidence = startup_evidence if isinstance(startup_evidence, Mapping) else {}
+    is_surrogate = _startup_is_host_adapter_surrogate(evidence)
+    hotfix_exception = _observer_hotfix_exception_present(events)
+    declared_close_satisfying = not _explicit_false(evidence.get("close_satisfying"))
+    if not is_surrogate:
+        close_satisfying = declared_close_satisfying
+        reason = "real_session_token_startup"
+    else:
+        # Surrogate startup is never close-satisfying real-worker evidence,
+        # whether or not a hotfix exception exists. The hotfix exception only
+        # lets the startup proceed under a relaxed identity match — it does not
+        # promote surrogate evidence to real-worker close evidence.
+        close_satisfying = False
+        reason = (
+            "host_adapter_surrogate_under_observer_hotfix_exception_not_real_worker_evidence"
+            if hotfix_exception
+            else "host_adapter_surrogate_blocked_without_observer_hotfix_exception"
+        )
+    return {
+        "schema_version": SURROGATE_STARTUP_GATE_SCHEMA_VERSION,
+        "is_host_adapter_surrogate": is_surrogate,
+        "observer_hotfix_exception_present": hotfix_exception,
+        "declared_close_satisfying": declared_close_satisfying,
+        "close_satisfying": close_satisfying,
+        "counts_as_real_worker_evidence": close_satisfying,
+        "counts_as_independent_qa_evidence": close_satisfying,
+        "status": "close_satisfying" if close_satisfying else "demoted",
+        "reason": reason,
+    }
 
 
 def _startup_evidence_matches(

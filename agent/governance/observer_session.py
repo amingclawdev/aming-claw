@@ -202,6 +202,434 @@ DEFAULT_CAPABILITIES = {
     "command_types": sorted(VALID_COMMAND_TYPES),
 }
 
+# ---------------------------------------------------------------------------
+# Observer work-mode state + gate
+#
+# An observer session moves through work modes. The default is
+# ``observer_look_before_act``: the observer may read, inspect, file findings,
+# and propose the next legal action, but must NOT edit implementation files,
+# self-clear judge blockers, dispatch implementation workers, merge, or close.
+# Moving to ``observer_execution_supervisor`` (where dispatch/close coordination
+# becomes legal) requires an explicit, recorded work_mode transition event AND a
+# route_action_precheck bound to the current canonical route identity. The
+# ``observer_hotfix_exception`` mode is the only path that lets a host-adapter
+# surrogate startup stand in for a real worker (and even then it does not count
+# as close-satisfying real-worker evidence — see mf_subagent_contract).
+# ---------------------------------------------------------------------------
+WORK_MODE_LOOK_BEFORE_ACT = "observer_look_before_act"
+WORK_MODE_EXECUTION_SUPERVISOR = "observer_execution_supervisor"
+WORK_MODE_HOTFIX_EXCEPTION = "observer_hotfix_exception"
+DEFAULT_WORK_MODE = WORK_MODE_LOOK_BEFORE_ACT
+VALID_WORK_MODES = {
+    WORK_MODE_LOOK_BEFORE_ACT,
+    WORK_MODE_EXECUTION_SUPERVISOR,
+    WORK_MODE_HOTFIX_EXCEPTION,
+}
+WORK_MODE_GATE_SCHEMA_VERSION = "observer_work_mode_gate.v1"
+WORK_MODE_TRANSITION_SCHEMA_VERSION = "observer_work_mode_transition_gate.v1"
+WORK_MODE_TRANSITION_EVENT_KIND = "observer_work_mode_transition"
+
+# Canonical observer action vocabulary used by the work-mode gate.
+WORK_MODE_ACTION_READ = "read"
+WORK_MODE_ACTION_INSPECT = "inspect"
+WORK_MODE_ACTION_FILE_FINDINGS = "file_findings"
+WORK_MODE_ACTION_PROPOSE_NEXT = "propose_next"
+WORK_MODE_ACTION_EDIT_IMPLEMENTATION = "edit_implementation"
+WORK_MODE_ACTION_SELF_CLEAR_JUDGE_BLOCKER = "self_clear_judge_blocker"
+WORK_MODE_ACTION_DISPATCH_IMPLEMENTATION = "dispatch_implementation"
+WORK_MODE_ACTION_MERGE = "merge"
+WORK_MODE_ACTION_CLOSE = "close"
+
+# Read/observe-only actions that are always legal for an observer regardless of
+# the active work mode.
+WORK_MODE_ALWAYS_ALLOWED_ACTIONS = {
+    WORK_MODE_ACTION_READ,
+    WORK_MODE_ACTION_INSPECT,
+    WORK_MODE_ACTION_FILE_FINDINGS,
+    WORK_MODE_ACTION_PROPOSE_NEXT,
+}
+
+# Actions that observer_look_before_act always blocks.
+WORK_MODE_LOOK_BEFORE_ACT_BLOCKED_ACTIONS = {
+    WORK_MODE_ACTION_EDIT_IMPLEMENTATION,
+    WORK_MODE_ACTION_SELF_CLEAR_JUDGE_BLOCKER,
+    WORK_MODE_ACTION_DISPATCH_IMPLEMENTATION,
+    WORK_MODE_ACTION_MERGE,
+    WORK_MODE_ACTION_CLOSE,
+}
+
+# An observer must NEVER edit implementation or self-clear a judge blocker by
+# fiat, in any mode. (Dispatch/merge/close coordination becomes legal under
+# execution-supervisor; observer_hotfix_exception narrowly relaxes surrogate
+# startup handling, not direct implementation.)
+WORK_MODE_NEVER_ALLOWED_ACTIONS = {
+    WORK_MODE_ACTION_EDIT_IMPLEMENTATION,
+    WORK_MODE_ACTION_SELF_CLEAR_JUDGE_BLOCKER,
+}
+
+# Per-mode supervisor/coordination actions that become legal once the observer
+# has transitioned out of look-before-act.
+WORK_MODE_SUPERVISOR_ACTIONS = {
+    WORK_MODE_ACTION_DISPATCH_IMPLEMENTATION,
+    WORK_MODE_ACTION_MERGE,
+    WORK_MODE_ACTION_CLOSE,
+}
+
+
+def _normalize_work_mode_action(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def normalize_work_mode(value: Any) -> str:
+    """Return a valid work mode, defaulting to observer_look_before_act."""
+
+    mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return mode if mode in VALID_WORK_MODES else DEFAULT_WORK_MODE
+
+
+def work_mode_action_gate(work_mode: Any, action: Any) -> dict[str, Any]:
+    """Map ``(work_mode, action) -> allowed/blocked`` for an observer session.
+
+    look_before_act blocks edit-implementation, self-clear-judge-blocker,
+    dispatch-implementation, merge, and close. execution_supervisor unlocks the
+    dispatch/merge/close coordination actions but still blocks direct
+    implementation and judge self-clear. hotfix_exception keeps the same
+    coordination posture (its narrow effect is on surrogate startup evidence,
+    handled in mf_subagent_contract).
+    """
+
+    mode = normalize_work_mode(work_mode)
+    normalized_action = _normalize_work_mode_action(action)
+    reason = ""
+    if normalized_action in WORK_MODE_NEVER_ALLOWED_ACTIONS:
+        allowed = False
+        reason = "observer_must_never_perform_this_action"
+    elif normalized_action in WORK_MODE_ALWAYS_ALLOWED_ACTIONS:
+        allowed = True
+    elif normalized_action in WORK_MODE_SUPERVISOR_ACTIONS:
+        allowed = mode in (
+            WORK_MODE_EXECUTION_SUPERVISOR,
+            WORK_MODE_HOTFIX_EXCEPTION,
+        )
+        if not allowed:
+            reason = "requires_observer_execution_supervisor_mode"
+    else:
+        # Unknown actions default to read/observe posture: allowed only when not
+        # one of the blocked supervisor/implementation actions.
+        allowed = mode != WORK_MODE_LOOK_BEFORE_ACT
+        if not allowed:
+            reason = "unknown_action_blocked_in_look_before_act"
+    return {
+        "schema_version": WORK_MODE_GATE_SCHEMA_VERSION,
+        "work_mode": mode,
+        "action": normalized_action,
+        "allowed": allowed,
+        "blocked": not allowed,
+        "status": "allowed" if allowed else "blocked",
+        "reason": reason,
+        "always_allowed_actions": sorted(WORK_MODE_ALWAYS_ALLOWED_ACTIONS),
+        "blocked_actions": sorted(work_mode_blocked_actions(mode)),
+    }
+
+
+def work_mode_blocked_actions(work_mode: Any) -> set[str]:
+    """Return the set of named actions blocked for the given work mode."""
+
+    mode = normalize_work_mode(work_mode)
+    if mode == WORK_MODE_LOOK_BEFORE_ACT:
+        return set(WORK_MODE_LOOK_BEFORE_ACT_BLOCKED_ACTIONS)
+    return set(WORK_MODE_NEVER_ALLOWED_ACTIONS)
+
+
+def work_mode_allowed_actions(work_mode: Any) -> set[str]:
+    """Return the named actions allowed for the given work mode."""
+
+    mode = normalize_work_mode(work_mode)
+    allowed = set(WORK_MODE_ALWAYS_ALLOWED_ACTIONS)
+    if mode in (WORK_MODE_EXECUTION_SUPERVISOR, WORK_MODE_HOTFIX_EXCEPTION):
+        allowed |= set(WORK_MODE_SUPERVISOR_ACTIONS)
+    return allowed
+
+
+def _work_mode_transition_event_matches(
+    event: Mapping[str, Any],
+    *,
+    from_mode: str,
+    to_mode: str,
+) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    kind = str(
+        event.get("event_kind") or event.get("event_type") or ""
+    ).strip().lower().replace("-", "_").replace(".", "_")
+    if WORK_MODE_TRANSITION_EVENT_KIND not in kind:
+        return False
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    if status in {"blocked", "rejected", "denied", "failed", "error"}:
+        return False
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    verification = (
+        event.get("verification") if isinstance(event.get("verification"), Mapping) else {}
+    )
+    declared_from = ""
+    declared_to = ""
+    for source in (event, payload, verification):
+        declared_from = declared_from or normalize_work_mode(
+            source.get("from_work_mode") or source.get("from_mode")
+        ) if (
+            source.get("from_work_mode") or source.get("from_mode")
+        ) else declared_from
+        declared_to = declared_to or normalize_work_mode(
+            source.get("to_work_mode")
+            or source.get("to_mode")
+            or source.get("work_mode")
+        ) if (
+            source.get("to_work_mode")
+            or source.get("to_mode")
+            or source.get("work_mode")
+        ) else declared_to
+    if declared_to and declared_to != normalize_work_mode(to_mode):
+        return False
+    if declared_from and declared_from != normalize_work_mode(from_mode):
+        return False
+    return True
+
+
+def _route_action_precheck_bound_to_identity(
+    event: Mapping[str, Any],
+    canonical_route_identity: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    kind = str(
+        event.get("event_kind") or event.get("event_type") or ""
+    ).strip().lower().replace("-", "_").replace(".", "_")
+    if "route_action_precheck" not in kind:
+        return False
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    if status not in {"allow", "allowed", "passed", "accepted", "ok", "approved"}:
+        return False
+    identity = canonical_route_identity if isinstance(canonical_route_identity, Mapping) else {}
+    expected = {
+        key: str(identity.get(key) or "").strip()
+        for key in ("route_id", "route_context_hash", "prompt_contract_id")
+        if str(identity.get(key) or "").strip()
+    }
+    if not expected:
+        # No canonical identity supplied: a passing precheck is sufficient.
+        return True
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    verification = (
+        event.get("verification") if isinstance(event.get("verification"), Mapping) else {}
+    )
+    for key, want in expected.items():
+        got = ""
+        for source in (event, payload, verification):
+            candidate = str(source.get(key) or "").strip()
+            if candidate:
+                got = candidate
+                break
+        if got != want:
+            return False
+    return True
+
+
+def work_mode_transition_gate(
+    events: Iterable[Mapping[str, Any]] | None,
+    *,
+    from_mode: Any = WORK_MODE_LOOK_BEFORE_ACT,
+    to_mode: Any = WORK_MODE_EXECUTION_SUPERVISOR,
+    canonical_route_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate an observer_look_before_act -> execution_supervisor transition.
+
+    The transition is legal only when BOTH a recorded work_mode transition event
+    and a route_action_precheck bound to the canonical route identity are
+    present in the supplied evidence.
+    """
+
+    rows = list(events or [])
+    normalized_from = normalize_work_mode(from_mode)
+    normalized_to = normalize_work_mode(to_mode)
+    has_transition_event = any(
+        _work_mode_transition_event_matches(
+            event,
+            from_mode=normalized_from,
+            to_mode=normalized_to,
+        )
+        for event in rows
+    )
+    has_bound_precheck = any(
+        _route_action_precheck_bound_to_identity(event, canonical_route_identity)
+        for event in rows
+    )
+    allowed = has_transition_event and has_bound_precheck
+    missing: list[str] = []
+    if not has_transition_event:
+        missing.append("work_mode_transition_event")
+    if not has_bound_precheck:
+        missing.append("route_action_precheck_bound_to_canonical_route")
+    return {
+        "schema_version": WORK_MODE_TRANSITION_SCHEMA_VERSION,
+        "from_work_mode": normalized_from,
+        "to_work_mode": normalized_to,
+        "allowed": allowed,
+        "status": "allowed" if allowed else "blocked",
+        "has_transition_event": has_transition_event,
+        "has_bound_route_action_precheck": has_bound_precheck,
+        "missing": missing,
+        "canonical_route_identity": {
+            key: str((canonical_route_identity or {}).get(key) or "").strip()
+            for key in ("route_id", "route_context_hash", "prompt_contract_id")
+            if isinstance(canonical_route_identity, Mapping)
+            and str((canonical_route_identity or {}).get(key) or "").strip()
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Aming-owned observer root route context bootstrap
+#
+# This assembles the aming-owned root route context an observer consumes before
+# acting on a backlog row. It may be fed the output of the generic route
+# protocol (route_context bundle / route_action gate) but it does NOT fork Brain
+# internals — it normalizes whatever route material is provided into a stable,
+# public-safe observer contract surface keyed by the work-mode posture.
+# ---------------------------------------------------------------------------
+ROOT_ROUTE_CONTEXT_SCHEMA_VERSION = "observer_root_route_context.v1"
+
+# The evidence an observer root route context always declares as required before
+# a backlog row can legally close.
+ROOT_ROUTE_CONTEXT_REQUIRED_EVIDENCE = (
+    "route_context",
+    "route_action_precheck",
+    "bounded_implementation_worker_dispatch",
+    "mf_subagent_startup",
+    "independent_verification",
+    "close_ready",
+)
+
+
+def _root_route_string(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _root_route_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, Mapping):
+        value = list(value.values())
+    if isinstance(value, Iterable):
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            text = str(item or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+        return out
+    return []
+
+
+def build_observer_root_route_context(
+    *,
+    backlog_id: str,
+    work_mode: Any = DEFAULT_WORK_MODE,
+    route_context: Mapping[str, Any] | None = None,
+    loaded_skills: Any = None,
+    loaded_resources: Any = None,
+    graph_query_schema_trace_id: Any = None,
+) -> dict[str, Any]:
+    """Materialize the aming-owned observer root route context for a backlog.
+
+    Returns the required fields: backlog_id, route_id, prompt_contract_id (if
+    present), work_mode (default observer_look_before_act), loaded
+    skills/resources, graph query_schema trace id, allowed_actions,
+    blocked_actions, required_evidence, and next_legal_action.
+    """
+
+    route = route_context if isinstance(route_context, Mapping) else {}
+    mode = normalize_work_mode(work_mode)
+
+    route_id = _root_route_string(route.get("route_id"))
+    prompt_contract_id = _root_route_string(route.get("prompt_contract_id"))
+    route_context_hash = _root_route_string(route.get("route_context_hash"))
+    prompt_contract_hash = _root_route_string(route.get("prompt_contract_hash"))
+
+    # Allowed/blocked actions are derived from the work-mode gate, then unioned
+    # with any explicit route-supplied allowances/blocks (route blocks always
+    # win — a route can only further restrict an observer, never widen the
+    # never-allowed implementation actions).
+    allowed_actions = sorted(work_mode_allowed_actions(mode))
+    blocked_actions = set(work_mode_blocked_actions(mode))
+    route_blocked = _root_route_string_list(route.get("blocked_actions"))
+    blocked_actions.update(
+        _normalize_work_mode_action(action) for action in route_blocked
+    )
+    blocked_action_list = sorted(action for action in blocked_actions if action)
+    allowed_actions = [
+        action for action in allowed_actions if action not in blocked_actions
+    ]
+
+    graph_trace_id = _root_route_string(graph_query_schema_trace_id) or _root_route_string(
+        route.get("graph_query_schema_trace_id")
+        or route.get("query_schema_trace_id")
+    )
+
+    # The next legal action depends on the observer posture. In look-before-act
+    # the only legal forward step is to record the work-mode transition (with a
+    # bound route_action_precheck); afterwards the observer may supervise.
+    if mode == WORK_MODE_LOOK_BEFORE_ACT:
+        next_legal_action = {
+            "id": "record_work_mode_transition",
+            "action": WORK_MODE_TRANSITION_EVENT_KIND,
+            "detail": (
+                "record an observer_work_mode_transition event and a "
+                "route_action_precheck bound to the canonical route identity "
+                "before any dispatch/merge/close"
+            ),
+            "blocked_until_transition": sorted(WORK_MODE_SUPERVISOR_ACTIONS),
+        }
+    else:
+        next_legal_action = {
+            "id": "dispatch_bounded_worker",
+            "action": WORK_MODE_ACTION_DISPATCH_IMPLEMENTATION,
+            "detail": (
+                "dispatch a bounded implementation worker; observer/judge "
+                "coordination is not implementation-worker evidence"
+            ),
+            "blocked_until_transition": [],
+        }
+
+    return {
+        "schema_version": ROOT_ROUTE_CONTEXT_SCHEMA_VERSION,
+        "backlog_id": _root_route_string(backlog_id),
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "work_mode": mode,
+        "default_work_mode": DEFAULT_WORK_MODE,
+        "loaded_skills": _root_route_string_list(loaded_skills),
+        "loaded_resources": _root_route_string_list(loaded_resources),
+        "graph_query_schema_trace_id": graph_trace_id,
+        "allowed_actions": allowed_actions,
+        "blocked_actions": blocked_action_list,
+        "required_evidence": list(ROOT_ROUTE_CONTEXT_REQUIRED_EVIDENCE),
+        "next_legal_action": next_legal_action,
+        "canonical_route_identity": {
+            key: value
+            for key, value in (
+                ("route_id", route_id),
+                ("route_context_hash", route_context_hash),
+                ("prompt_contract_id", prompt_contract_id),
+                ("prompt_contract_hash", prompt_contract_hash),
+            )
+            if value
+        },
+    }
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS observer_sessions (
     session_id          TEXT PRIMARY KEY,

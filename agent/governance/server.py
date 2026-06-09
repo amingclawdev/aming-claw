@@ -19992,6 +19992,121 @@ def handle_observer_mode_set(ctx: RequestContext):
         return task_registry.set_observer_mode(conn, project_id, bool(enabled))
 
 
+def _observer_root_route_context_state(
+    conn,
+    project_id: str,
+    *,
+    backlog_id: str,
+    work_mode: str,
+    loaded_skills=None,
+    loaded_resources=None,
+) -> dict[str, Any]:
+    """Assemble the aming-owned observer root route context for a backlog row.
+
+    Pulls the canonical route identity and graph query_schema trace id from the
+    backlog timeline route-context gate (the generic route protocol output) and
+    normalizes it into the aming-owned observer contract surface.
+    """
+    from . import task_timeline
+
+    row = conn.execute(
+        "SELECT * FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    contract: dict[str, Any] = {}
+    if row:
+        contract = backlog_runtime.parse_json_object(
+            _row_get(row, "chain_trigger_json", "{}")
+        )
+    events = task_timeline.list_events(
+        conn, project_id, backlog_id=backlog_id, limit=1000
+    )
+    route_context_gate = task_timeline.mf_route_context_gate_verification(
+        events, contract=contract
+    )
+    route_identity = route_context_gate.get("route_identity") or {}
+
+    # Graph query_schema trace id: prefer a worker graph-trace id surfaced on the
+    # close gate, else any graph trace ref recorded on the timeline.
+    graph_trace_id = ""
+    close_gate = task_timeline.mf_close_gate_verification(events, contract=contract)
+    worker_graph_trace_gate = close_gate.get("worker_graph_trace_gate") or {}
+    trace_ids = worker_graph_trace_gate.get("trace_ids") or []
+    if isinstance(trace_ids, list) and trace_ids:
+        graph_trace_id = str(trace_ids[0] or "").strip()
+
+    route_context_for_bootstrap = dict(route_identity)
+    route_context_for_bootstrap.setdefault(
+        "route_id", str((contract.get("route_id") if isinstance(contract, dict) else "") or "")
+    )
+    route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
+
+    context = observer_session.build_observer_root_route_context(
+        backlog_id=backlog_id,
+        work_mode=work_mode,
+        route_context=route_context_for_bootstrap,
+        loaded_skills=loaded_skills,
+        loaded_resources=loaded_resources,
+        graph_query_schema_trace_id=graph_trace_id,
+    )
+    context["route_context_gate"] = {
+        "required": bool(route_context_gate.get("required")),
+        "passed": bool(route_context_gate.get("passed")),
+        "status": str(route_context_gate.get("status") or ""),
+        "present_requirement_ids": route_context_gate.get(
+            "present_requirement_ids", []
+        ),
+        "missing_requirement_ids": route_context_gate.get(
+            "missing_requirement_ids", []
+        ),
+    }
+    context["backlog_row_present"] = bool(row)
+    return context
+
+
+@route("GET", "/api/projects/{project_id}/observer-root-route-context")
+def handle_observer_root_route_context_get(ctx: RequestContext):
+    """Return the aming-owned observer root route context for a backlog row.
+
+    Default work_mode is observer_look_before_act. The response carries the
+    backlog/route identity, work-mode-derived allowed/blocked actions, required
+    close evidence, and the next legal action for the observer.
+    """
+    project_id = ctx.get_project_id()
+    backlog_id = str(
+        ctx.query.get("backlog_id") or ctx.query.get("bug_id") or ""
+    ).strip()
+    if not backlog_id:
+        raise ValueError("backlog_id is required")
+    work_mode = observer_session.normalize_work_mode(ctx.query.get("work_mode"))
+    with DBContext(project_id) as conn:
+        return _observer_root_route_context_state(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            work_mode=work_mode,
+        )
+
+
+@route("POST", "/api/projects/{project_id}/observer-root-route-context")
+def handle_observer_root_route_context_post(ctx: RequestContext):
+    """Materialize the observer root route context (body form, supports skills)."""
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    if not backlog_id:
+        raise ValueError("backlog_id is required")
+    work_mode = observer_session.normalize_work_mode(body.get("work_mode"))
+    with DBContext(project_id) as conn:
+        return _observer_root_route_context_state(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            work_mode=work_mode,
+            loaded_skills=body.get("loaded_skills") or body.get("skills"),
+            loaded_resources=body.get("loaded_resources") or body.get("resources"),
+        )
+
+
 @route("GET", "/api/task/{project_id}/list")
 def handle_task_list(ctx: RequestContext):
     project_id = ctx.get_project_id()
