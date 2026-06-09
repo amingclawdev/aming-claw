@@ -426,13 +426,12 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "verification.backlog_id",
     "artifact_refs.backlog_id",
   ]);
-  pushFirstFact(facts, event, "route_id", "route id", [
-    "payload.route_id",
-    "payload.route_identity.route_id",
-    "verification.route_id",
-    "verification.route_identity.route_id",
-    "artifact_refs.route_id",
-  ]);
+  // Route identity must show the CANONICAL route_id (e.g. "route-repair-…"),
+  // never the preview/static placeholder ("event.route_prompt_context.preview")
+  // that some source/service events carry as their route_id. Prefer the
+  // canonical_route_identity / route_context bundle the observer actually read,
+  // and drop any preview placeholder so it is never displayed as canonical.
+  pushCanonicalRouteIdFact(facts, event);
   pushFirstFact(facts, event, "route_context_hash", "route context hash", [
     "payload.route_context_hash",
     "payload.route_identity.route_context_hash",
@@ -497,10 +496,34 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "payload.graph_query_schema_trace_id",
     "payload.query_schema_trace_id",
     "payload.route_context.graph_query_schema_trace_id",
+    "payload.canonical_route_identity.graph_query_schema_trace_id",
     "verification.graph_query_schema_trace_id",
     "verification.query_schema_trace_id",
     "artifact_refs.graph_query_schema_trace_id",
   ]);
+  // The observer root route context surfaces the skills/resources it actually
+  // loaded for the lane. Show them when non-empty so the evidence modal proves
+  // what runtime context was read, instead of leaving it in raw JSON.
+  const loadedSkills = publicValuesAtPaths(event, [
+    "payload.loaded_skills",
+    "payload.route_context.loaded_skills",
+    "payload.route_context.visible_bundle.loaded_skills",
+    "verification.loaded_skills",
+    "artifact_refs.loaded_skills",
+  ]);
+  if (loadedSkills.length > 0) {
+    pushFact(facts, "loaded_skills", "loaded skills", formatCompactList(loadedSkills), sourceForPath(loadedSkills[0].path));
+  }
+  const loadedResources = publicValuesAtPaths(event, [
+    "payload.loaded_resources",
+    "payload.route_context.loaded_resources",
+    "payload.route_context.visible_bundle.loaded_resources",
+    "verification.loaded_resources",
+    "artifact_refs.loaded_resources",
+  ]);
+  if (loadedResources.length > 0) {
+    pushFact(facts, "loaded_resources", "loaded resources", formatCompactList(loadedResources), sourceForPath(loadedResources[0].path));
+  }
   pushFirstFact(facts, event, "agent_id_match_mode", "agent-id match mode", [
     "payload.agent_id_match_mode",
     "payload.mf_subagent_startup_gate.agent_id_match_mode",
@@ -681,6 +704,45 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     pushFact(facts, "startup_refs", "startup refs", formatCompactList(startupRefs), sourceForPath(startupRefs[0].path));
   }
   return stableFacts(facts).slice(0, 24);
+}
+
+// The preview/static placeholder route id (e.g. "event.route_prompt_context.preview")
+// is a source-event preview pointer, not the canonical external route identity the
+// observer read. It must never be surfaced as the canonical route_id (regression:
+// preview value leaking into the close-gate evidence modal as canonical identity).
+const ROUTE_ID_PREVIEW_PLACEHOLDER = /(^|[._])route_prompt_context[._]preview$|^event\.route|(^|[._])preview$/i;
+
+function isPreviewRouteId(value: string): boolean {
+  const normalized = safeText(value).trim();
+  if (!normalized) return true;
+  // Canonical route ids look like "route-…" / "route-repair-…"; anything that
+  // is a preview/static placeholder pointer is rejected as non-canonical.
+  if (/^route-/i.test(normalized)) return false;
+  return ROUTE_ID_PREVIEW_PLACEHOLDER.test(normalized);
+}
+
+// Choose the canonical route_id, preferring the canonical_route_identity /
+// route_context bundle, then any explicit route_id, while skipping the
+// preview/static placeholder so it is never displayed as canonical. If only a
+// preview placeholder exists, no route_id fact is emitted (the preview value is
+// still inspectable in the collapsed raw event JSON).
+function pushCanonicalRouteIdFact(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent): void {
+  const candidates = publicValuesAtPaths(event, [
+    "payload.canonical_route_identity.route_id",
+    "payload.route_context.canonical_route_identity.route_id",
+    "verification.canonical_route_identity.route_id",
+    "verification.route_context.canonical_route_identity.route_id",
+    "artifact_refs.canonical_route_identity.route_id",
+    "payload.route_identity.route_id",
+    "payload.route_context.route_id",
+    "verification.route_identity.route_id",
+    "artifact_refs.route_identity.route_id",
+    "payload.route_id",
+    "verification.route_id",
+    "artifact_refs.route_id",
+  ]);
+  const canonical = candidates.find((item) => !isPreviewRouteId(item.value));
+  if (canonical) pushFact(facts, "route_id", "route id", canonical.value, canonical.source);
 }
 
 // A host-adapter surrogate startup (session_token_evidence_type === "surrogate")
@@ -985,12 +1047,16 @@ function evidenceLinksFromEvent(
     { kind: "timeline_event", label: "timeline event", value: eventDisplayId(event) },
   ];
   pushEvidenceValues(links, "route_context", "route id", event, [
-    "payload.route_id",
+    "payload.canonical_route_identity.route_id",
+    "payload.route_context.canonical_route_identity.route_id",
     "payload.route_identity.route_id",
-    "verification.route_id",
+    "payload.route_context.route_id",
+    "verification.canonical_route_identity.route_id",
     "verification.route_identity.route_id",
+    "payload.route_id",
+    "verification.route_id",
     "artifact_refs.route_id",
-  ]);
+  ], isPreviewRouteId);
   pushEvidenceValues(links, "route_context", "route context", event, [
     "payload.route_context_hash",
     "payload.route_identity.route_context_hash",
@@ -1478,8 +1544,10 @@ function pushEvidenceValues(
   label: string,
   event: TaskTimelineEvent,
   paths: string[],
+  reject?: (value: string) => boolean,
 ): void {
   for (const item of publicValuesAtPaths(event, paths).slice(0, 8)) {
+    if (reject && reject(item.value)) continue;
     links.push({ kind, label, value: item.value });
   }
 }
