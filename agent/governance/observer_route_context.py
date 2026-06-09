@@ -42,6 +42,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+# Import the gate's CANONICAL action normalizer so the mint-time sanitizer and
+# the downstream gate (``mf_subagent_contract.validate_route_token_mutation_gate``
+# via ``_route_action_allowed`` / ``_normalized_action``) can never drift. The
+# gate normalizes BOTH the token's ``allowed_actions`` and the requested action
+# (lowercase, ``-``/``.`` -> ``_``, strip) before membership-testing, so a
+# crafted variant like ``"Edit-Files"`` or ``"APPLY.PATCH"`` would otherwise pass
+# an un-normalized sanitizer at mint and then be ACCEPTED by the gate for the
+# canonical blocked action. Importing the gate's own normalizer guarantees the
+# sanitizer rejects exactly what the gate would later resolve to. This import has
+# no external route-provider side effects (judgment-brain is not pulled in).
+from agent.governance.mf_subagent_contract import (
+    _normalized_action as _gate_normalized_action,
+)
+
 
 SCHEMA_VERSION = "aming_observer_write_route_token.v1"
 PROVIDER_SCHEMA_VERSION = "aming_observer_route_provider.v1"
@@ -264,31 +278,44 @@ def _sanitize_allowed_actions(
 ) -> list[str]:
     """Resolve + sanitize the token's allowed actions.
 
-    When the caller supplies ``allowed_actions`` they are sanitized at mint: the
-    wildcard ``"*"`` and any value intersecting ``BLOCKED_ACTIONS`` are rejected
-    with ``ValueError``. The downstream gate
-    (``mf_subagent_contract.validate_route_token_mutation_gate``) only checks
-    ``allowed_actions`` membership and IGNORES ``blocked_actions``, so an
-    unsanitized ``["*"]`` or ``["edit_files"]`` token would be a privilege
-    over-reach; this is the choke point that prevents it on both the HTTP and
-    MCP issuance paths.
+    When the caller supplies ``allowed_actions`` they are sanitized at mint: each
+    action is first NORMALIZED with the gate's canonical normalizer
+    (``mf_subagent_contract._normalized_action``: lowercase, ``-``/``.`` -> ``_``,
+    strip) BEFORE the wildcard and blocked-action checks. This is required for
+    correctness: the downstream gate normalizes both the stored ``allowed_actions``
+    and the requested action before membership-testing and IGNORES
+    ``blocked_actions``, so an un-normalized sanitizer would let crafted variants
+    (``"Edit-Files"`` -> gate ``"edit_files"``; ``"APPLY.PATCH"`` -> gate
+    ``"apply_patch"``; ``"  *  "`` -> gate ``"*"``) slip through at mint and then
+    be ACCEPTED by the gate for the canonical wildcard / blocked action. We reject
+    (with ``ValueError``) any action whose normalized form is the wildcard ``"*"``
+    or intersects the normalized ``BLOCKED_ACTIONS``, and we STORE the normalized
+    form in the token so the token's ``allowed_actions`` equal exactly what the
+    gate evaluates. This is the choke point that prevents privilege over-reach on
+    both the HTTP and MCP issuance paths.
     """
     caller_supplied = allowed_actions is not None
     actions = list(allowed_actions) if allowed_actions else list(DEFAULT_ALLOWED_ACTIONS)
-    actions_list = _dedupe(_string_list(actions))
-    if not actions_list:
+    raw_actions = _string_list(actions)
+    # Normalize every action with the SAME logic the gate uses, then dedupe on
+    # the normalized form so the stored list matches the gate's evaluated set.
+    normalized_actions = _dedupe(
+        [_gate_normalized_action(action) for action in raw_actions]
+    )
+    if not normalized_actions:
         raise ValueError("allowed_actions must be non-empty")
 
     if caller_supplied:
-        if "*" in actions_list:
+        if "*" in normalized_actions:
             raise ValueError('allowed_actions must not contain the wildcard "*"')
-        overreach = sorted(set(actions_list) & set(BLOCKED_ACTIONS))
+        blocked_normalized = {_gate_normalized_action(b) for b in BLOCKED_ACTIONS}
+        overreach = sorted(set(normalized_actions) & blocked_normalized)
         if overreach:
             raise ValueError(
                 "allowed_actions must not include blocked actions: "
                 + ", ".join(overreach)
             )
-    return actions_list
+    return normalized_actions
 
 
 def build_observer_write_route_token(

@@ -361,6 +361,92 @@ def test_clean_caller_supplied_allowed_actions_accepted():
     assert set(token["allowed_actions"]) == {"task_timeline_append", "backlog_close"}
 
 
+# --- AC4 (HOTFIX): normalize caller-supplied actions to match the gate -------
+#
+# The gate (``_route_action_allowed`` / ``_normalized_action``) normalizes both
+# the token's ``allowed_actions`` AND the requested action (lowercase, ``-``/``.``
+# -> ``_``, strip) before membership-testing and ignores ``blocked_actions``. The
+# mint-time sanitizer MUST apply the same normalization BEFORE the wildcard /
+# blocked-action checks, otherwise a crafted case/separator variant of a blocked
+# action (or the wildcard) bypasses the sanitizer and is then accepted by the
+# gate for the canonical blocked action. AC-OBSERVER-WRITE-AUTH-ROUTE-CONTEXT-GEN.
+
+
+def test_blocked_action_separator_variant_rejected_at_mint():
+    # "Edit-Files" normalizes (gate-side) to "edit_files" which is blocked.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["Edit-Files"])
+
+
+def test_blocked_action_dot_variant_rejected_at_mint():
+    # "APPLY.PATCH" normalizes (gate-side) to "apply_patch" which is blocked.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["APPLY.PATCH"])
+
+
+def test_blocked_action_case_variant_rejected_at_mint():
+    # "edit_FILES" normalizes (gate-side) to "edit_files" which is blocked.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["edit_FILES"])
+
+
+def test_wildcard_with_surrounding_whitespace_rejected_at_mint():
+    # "  *  " normalizes (gate-side) to "*" — the wildcard authorizes ANY action
+    # at the gate, so it must be rejected at mint.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["  *  "])
+
+
+def test_mixed_valid_and_blocked_variant_rejected_at_mint():
+    # A legitimate action mixed with a case/separator variant of a blocked action
+    # must still raise — the whole mint is rejected, not silently filtered.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["task_timeline_append", "Apply-Patch"])
+
+
+def test_blocked_action_variants_parity_with_gate_normalizer():
+    """Parity: for EVERY blocked action, a case/separator variant that the gate
+    would normalize to it must be rejected at mint.
+
+    This guards against the sanitizer and the gate's normalizer drifting: it
+    derives each variant via the gate's OWN ``_normalized_action`` round-trip and
+    asserts the mint rejects it for every blocked action.
+    """
+    from agent.governance.mf_subagent_contract import _normalized_action
+
+    for blocked in observer_route_context.BLOCKED_ACTIONS:
+        canonical = _normalized_action(blocked)
+        # Build a crafted variant: uppercase + swap one "_" for "-" / "." so the
+        # raw string differs from the canonical but normalizes back to it.
+        upper = blocked.upper()
+        variants = {upper, upper.replace("_", "-", 1), upper.replace("_", ".", 1)}
+        for variant in variants:
+            # Sanity: the gate would resolve this variant to the blocked action.
+            assert _normalized_action(variant) == canonical, (
+                f"variant {variant!r} does not normalize to {canonical!r}"
+            )
+            with pytest.raises(ValueError):
+                _token(allowed_actions=[variant])
+
+
+def test_clean_caller_action_with_separators_is_normalized_and_stored():
+    # A non-blocked action supplied in a non-canonical form is normalized and the
+    # NORMALIZED form is stored in the token, so the token's allowed_actions equal
+    # exactly what the gate evaluates (no drift between mint and gate).
+    token = _token(allowed_actions=["Task-Timeline.Append", "BACKLOG_CLOSE"])
+    assert set(token["allowed_actions"]) == {"task_timeline_append", "backlog_close"}
+    # Round-trip: the gate accepts the canonical action against the stored token.
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+
+
 # --- AC4: clamp/reject oversized or non-positive TTL ------------------------
 
 
