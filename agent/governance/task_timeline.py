@@ -117,6 +117,89 @@ MF_BOUNDED_SUBAGENT_REVIEW_READY_ID = f"{MF_BOUNDED_SUBAGENT_LANE_ID}.review_rea
 MF_BLOCKER_RESOLUTION_GATE_SCHEMA_VERSION = "mf_blocker_resolution_gate.v1"
 MF_CROSS_REF_GATE_SCHEMA_VERSION = "mf_close_cross_ref_gate.v1"
 MF_STALE_ROUTE_EVIDENCE_GATE_SCHEMA_VERSION = "mf_stale_route_evidence_gate.v1"
+MF_APPROVAL_SCOPE_GATE_SCHEMA_VERSION = "mf_close_approval_scope_gate.v1"
+MF_COMMAND_DISPOSITION_GATE_SCHEMA_VERSION = "mf_close_command_disposition_gate.v1"
+MF_FIXED_CLOSE_WAIVER_ALERT_SCHEMA_VERSION = "mf_fixed_close_waiver_alert.v1"
+
+# An explicit, recorded close-waiver marker. Distinct from a route_context
+# waiver: this authorizes the backlog_close action itself despite a failing
+# precheck. It must be visible on the timeline (it is never inferred).
+MF_CLOSE_WAIVER_EVENT_TOKENS = (
+    "backlog_close_waiver",
+    "close_gate_waiver",
+    "close_waiver",
+    "mf_close_waiver",
+)
+# Tokens, found in cited human-approval text, that explicitly EXCLUDE the
+# backlog_close action. An approval whose own scope forbids close must not
+# authorize a close.
+MF_APPROVAL_CLOSE_EXCLUSION_TOKENS = (
+    "does_not_authorize_backlog_close",
+    "does_not_authorize_close",
+    "not_authorize_backlog_close",
+    "review_ready_only",
+    "review_ready_not_close",
+    "no_backlog_close",
+    "not_for_backlog_close",
+    "excludes_backlog_close",
+    "close_not_authorized",
+    "backlog_close_not_authorized",
+)
+# Fields on an approval/close-evidence event that carry the human-approval scope
+# text we scan for an explicit close exclusion.
+MF_APPROVAL_SCOPE_FIELDS = {
+    "approval_scope",
+    "approval_text",
+    "human_approval",
+    "human_approval_text",
+    "human_approval_scope",
+    "approved_scope",
+    "operator_approval_text",
+    "operator_approval_scope",
+    "authorizes",
+    "authorized_actions",
+    "approval_note",
+    "approval_notes",
+    "scope_note",
+}
+# Event kinds that may cite a human approval for the close.
+MF_APPROVAL_BEARING_KINDS = (
+    "close_ready",
+    "human_approval",
+    "operator_approval",
+    "backlog_close",
+    "close_approval",
+)
+# Observer-command disposition tracking for the close gate (criterion 3): the
+# originating command must be terminal (completed / co-resolved) before close.
+MF_COMMAND_TERMINAL_STATUSES = {
+    "completed",
+    "complete",
+    "failed",
+    "cancelled",
+    "canceled",
+    "resolved",
+    "co_resolved",
+    "co_resolved_with_close",
+    "terminal",
+    "disposed",
+}
+MF_COMMAND_CLAIMED_STATUSES = {
+    "claimed",
+    "running",
+    "in_progress",
+    "notified",
+    "queued",
+}
+# Event kinds that carry the originating-observer-command disposition.
+MF_COMMAND_DISPOSITION_KINDS = (
+    "observer_command",
+    "observer_command_claim",
+    "observer_command_complete",
+    "observer_command_fail",
+    "observer_command_disposition",
+    "observer_command_terminal",
+)
 
 # Statuses an observer must NOT apply to a judge-finding blocker resolution by
 # fiat. Only a judge actor may accept/resolve such a finding.
@@ -3949,6 +4032,267 @@ def mf_stale_route_evidence_gate_verification(
     }
 
 
+def _event_has_close_waiver(event: dict[str, Any]) -> bool:
+    """Detect an explicit, recorded close-waiver marker on a timeline event.
+
+    A close waiver is never inferred — it must be present as an event-kind /
+    event-type token, or as a truthy ``close_waiver`` style field. It must also
+    carry a passing status so a merely-proposed waiver does not authorize close.
+    """
+
+    if not _event_passed(event):
+        return False
+    marker = _normalize_token(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_kind", "event_type", "phase", "decision")
+        )
+    )
+    if any(token in marker for token in MF_CLOSE_WAIVER_EVENT_TOKENS):
+        return True
+    for value in _event_field_values(
+        event, {"close_waiver", "backlog_close_waiver", "close_gate_waiver"}
+    ):
+        if isinstance(value, dict):
+            if _truthy(value.get("waived") or value.get("approved") or value.get("granted")):
+                return True
+        elif _truthy(value):
+            return True
+    return False
+
+
+def mf_close_waiver_state(events: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Project whether an explicit, visible close-waiver state exists."""
+
+    rows = events if isinstance(events, list) else []
+    waiver_events: list[dict[str, Any]] = []
+    for raw in rows:
+        event = _mapping(raw)
+        if not event:
+            continue
+        if _event_has_close_waiver(event):
+            waiver_events.append(
+                {
+                    "id": event.get("id") or event.get("event_id"),
+                    "event_kind": event.get("event_kind"),
+                    "event_type": event.get("event_type"),
+                    "status": event.get("status") or event.get("decision"),
+                    "reason": _first_event_string(
+                        event, {"reason", "waiver_reason", "close_waiver_reason"}
+                    ),
+                }
+            )
+    return {"has_close_waiver": bool(waiver_events), "waiver_events": waiver_events}
+
+
+def _approval_scope_text(event: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for value in _event_field_values(event, MF_APPROVAL_SCOPE_FIELDS):
+        if isinstance(value, (dict, list)):
+            continue
+        text = str(value or "").strip()
+        if text:
+            parts.append(text)
+    return _normalize_token(" ".join(parts))
+
+
+def _event_cites_approval(event: dict[str, Any]) -> bool:
+    marker = _normalize_token(
+        " ".join(
+            str(event.get(key) or "")
+            for key in ("event_kind", "event_type", "phase")
+        )
+    )
+    if any(kind in marker for kind in MF_APPROVAL_BEARING_KINDS):
+        return True
+    return bool(_approval_scope_text(event)) or _has_operator_approval(event)
+
+
+def mf_close_approval_scope_gate_verification(
+    events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Reject a close whose own cited human approval excludes backlog_close.
+
+    Criterion 1: when the cited approval text explicitly excludes the
+    backlog_close action (e.g. "review_ready only / does not authorize
+    backlog_close"), the close is blocked unless an explicit recorded
+    close-waiver state is also present. A close whose own cited approval forbids
+    it must not succeed silently.
+    """
+
+    rows = events if isinstance(events, list) else []
+    waiver_state = mf_close_waiver_state(rows)
+    has_waiver = bool(waiver_state.get("has_close_waiver"))
+    excluding: list[dict[str, Any]] = []
+    for raw in rows:
+        event = _mapping(raw)
+        if not event or not _event_cites_approval(event):
+            continue
+        scope = _approval_scope_text(event)
+        if not scope:
+            continue
+        matched = [
+            token
+            for token in MF_APPROVAL_CLOSE_EXCLUSION_TOKENS
+            if token in scope
+        ]
+        if matched:
+            excluding.append(
+                {
+                    "id": event.get("id") or event.get("event_id"),
+                    "event_kind": event.get("event_kind"),
+                    "event_type": event.get("event_type"),
+                    "status": event.get("status") or event.get("decision"),
+                    "matched_exclusions": matched,
+                    "reason": "cited_approval_excludes_backlog_close",
+                }
+            )
+    # An explicit close waiver converts the block into a visible, recorded waiver
+    # state rather than a silent success.
+    passed = not excluding or has_waiver
+    return {
+        "schema_version": MF_APPROVAL_SCOPE_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": (
+            "passed"
+            if not excluding
+            else ("waived" if has_waiver else "blocked")
+        ),
+        "has_close_waiver": has_waiver,
+        "close_waiver_state": waiver_state,
+        "approvals_excluding_close": excluding,
+    }
+
+
+def _command_disposition_events(
+    events: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Reduce observer-command events to the latest disposition per command id."""
+
+    latest: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(events):
+        event = _mapping(raw)
+        if not event:
+            continue
+        marker = _normalize_token(
+            " ".join(
+                str(event.get(key) or "")
+                for key in ("event_kind", "event_type", "phase")
+            )
+        )
+        if not any(kind in marker for kind in MF_COMMAND_DISPOSITION_KINDS):
+            continue
+        command_id = _first_event_string(
+            event, {"observer_command_id", "command_id", "originating_command_id"}
+        )
+        if not command_id:
+            continue
+        # Prefer the explicit command-disposition fields over the generic event
+        # status/decision: a complete/fail event commonly carries
+        # status="accepted" at the event level while the command's own
+        # disposition lives in command_status/disposition.
+        status = _normalize_token(
+            _first_event_string(event, {"command_status", "disposition"})
+        )
+        if not status:
+            status = _normalize_token(
+                _first_event_string(event, {"status", "decision"})
+            )
+        # Last write per command id wins (events are ordered oldest→newest).
+        latest[command_id] = {
+            "command_id": command_id,
+            "status": status,
+            "order": index,
+            "event_kind": event.get("event_kind"),
+            "event_type": event.get("event_type"),
+            "id": event.get("id") or event.get("event_id"),
+        }
+    return latest
+
+
+def mf_close_command_disposition_gate_verification(
+    events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Require the originating observer command to be terminal before close.
+
+    Criterion 3: a still-"claimed" (or otherwise non-terminal) originating
+    observer command blocks the close, unless it is co-resolved with the close
+    (a terminal/co_resolved disposition event recorded on the timeline).
+    """
+
+    rows = events if isinstance(events, list) else []
+    dispositions = _command_disposition_events(rows)
+    blocking: list[dict[str, Any]] = []
+    terminal: list[dict[str, Any]] = []
+    for command_id, disposition in dispositions.items():
+        status = disposition.get("status") or ""
+        if status in MF_COMMAND_TERMINAL_STATUSES:
+            terminal.append(disposition)
+        elif status in MF_COMMAND_CLAIMED_STATUSES or not status:
+            blocking.append(
+                {
+                    **disposition,
+                    "reason": "originating_command_not_terminal",
+                    "next_action": (
+                        "complete or co-resolve the originating observer command "
+                        "before/at backlog close"
+                    ),
+                }
+            )
+        else:
+            # Unknown disposition token: treat as non-terminal to fail safe.
+            blocking.append(
+                {
+                    **disposition,
+                    "reason": "originating_command_disposition_unknown",
+                    "next_action": (
+                        "record a terminal/co-resolved disposition for the "
+                        "originating observer command"
+                    ),
+                }
+            )
+    passed = not blocking
+    return {
+        "schema_version": MF_COMMAND_DISPOSITION_GATE_SCHEMA_VERSION,
+        "passed": passed,
+        "status": "passed" if passed else "blocked",
+        "terminal_commands": terminal,
+        "blocking_commands": blocking,
+    }
+
+
+def mf_fixed_close_waiver_alert(
+    status: Any,
+    can_close: Any,
+    events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Governance alert for FIXED rows lacking close authorization.
+
+    Criterion 2: a row in FIXED status with can_close=false and no explicit,
+    visible close-waiver marker is a governance integrity alert (FIXED implies
+    can_close=true OR a visible waiver marker).
+    """
+
+    normalized_status = _normalize_token(status)
+    is_fixed = normalized_status == "fixed"
+    can_close_bool = _truthy(can_close)
+    waiver_state = mf_close_waiver_state(events)
+    has_waiver = bool(waiver_state.get("has_close_waiver"))
+    alert = is_fixed and not can_close_bool and not has_waiver
+    return {
+        "schema_version": MF_FIXED_CLOSE_WAIVER_ALERT_SCHEMA_VERSION,
+        "alert": alert,
+        "status": "alert" if alert else "ok",
+        "is_fixed": is_fixed,
+        "can_close": can_close_bool,
+        "has_close_waiver": has_waiver,
+        "close_waiver_state": waiver_state,
+        "reason": (
+            "fixed_row_without_can_close_or_close_waiver" if alert else ""
+        ),
+    }
+
+
 def mf_close_gate_verification(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
@@ -4007,6 +4351,8 @@ def mf_close_gate_verification(
     blocker_resolution_gate = mf_blocker_resolution_gate_verification(rows)
     cross_ref_gate = mf_close_cross_ref_gate_verification(rows)
     stale_route_evidence_gate = mf_stale_route_evidence_gate_verification(rows, contract)
+    approval_scope_gate = mf_close_approval_scope_gate_verification(rows)
+    command_disposition_gate = mf_close_command_disposition_gate_verification(rows)
     missing_evidence_groups = mf_close_missing_evidence_groups(
         missing,
         route_context_gate,
@@ -4051,6 +4397,24 @@ def mf_close_gate_verification(
             "missing": cross_ref_gate.get("rejected_cross_ref_evidence", []),
             "next_action": "remove evidence from other backlog/scope or record an accepted bridge/lineage event",
         }
+    if not approval_scope_gate.get("passed"):
+        groups["approval_scope"] = {
+            "label": "human-approval scope",
+            "missing": approval_scope_gate.get("approvals_excluding_close", []),
+            "next_action": (
+                "cited approval excludes backlog_close; obtain an approval that "
+                "authorizes close or record an explicit close-waiver state"
+            ),
+        }
+    if not command_disposition_gate.get("passed"):
+        groups["command_disposition"] = {
+            "label": "originating observer command disposition",
+            "missing": command_disposition_gate.get("blocking_commands", []),
+            "next_action": (
+                "complete or co-resolve the originating observer command "
+                "before/at backlog close"
+            ),
+        }
     missing_evidence_groups["groups"] = groups
     route_context_reminder = mf_route_context_reminder(
         route_context_gate,
@@ -4067,6 +4431,8 @@ def mf_close_gate_verification(
         and bool(post_verification_actions_gate.get("passed"))
         and bool(blocker_resolution_gate.get("passed"))
         and bool(cross_ref_gate.get("passed"))
+        and bool(approval_scope_gate.get("passed"))
+        and bool(command_disposition_gate.get("passed"))
         # Stale-route evidence invalidation is already enforced by the route
         # context gate (it ignores superseded-identity evidence and requires
         # canonical re-recording). The stale_route_evidence_gate below is the
@@ -4095,6 +4461,8 @@ def mf_close_gate_verification(
         "blocker_resolution_gate": blocker_resolution_gate,
         "cross_ref_gate": cross_ref_gate,
         "stale_route_evidence_gate": stale_route_evidence_gate,
+        "approval_scope_gate": approval_scope_gate,
+        "command_disposition_gate": command_disposition_gate,
         "missing_evidence_groups": missing_evidence_groups,
         "route_context_reminder": route_context_reminder,
         "checks": {
@@ -4118,6 +4486,10 @@ def mf_close_gate_verification(
             ),
             "no_cross_ref_evidence": bool(cross_ref_gate.get("passed")),
             "no_stale_route_evidence": bool(stale_route_evidence_gate.get("passed")),
+            "approval_authorizes_close": bool(approval_scope_gate.get("passed")),
+            "originating_command_terminal": bool(
+                command_disposition_gate.get("passed")
+            ),
             "mf_subagent_read_receipt_gate": str(
                 _mapping(contract_projection.get("read_receipt_gate")).get("status") or ""
             ),

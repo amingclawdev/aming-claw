@@ -1448,5 +1448,95 @@ class TestObserverRootRouteContextEndpoint(unittest.TestCase):
             )
 
 
+class TestFixedCloseWaiverAlerts(unittest.TestCase):
+    """Criterion 2: FIXED + can_close=false + no-waiver rows surface as a
+    governance alert (AC-CLOSE-GATE-EVIDENCE-INTEGRITY-20260609)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        os.makedirs(os.path.join(
+            self.tmp.name, "codex-tasks", "state", "governance", "test-project"
+        ), exist_ok=True)
+        self._conns = []
+
+    def tearDown(self):
+        for c in self._conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        _safe_cleanup(self.tmp)
+
+    def _get_conn(self, pid="test-project"):
+        from governance.db import get_connection
+        conn = get_connection(pid)
+        self._conns.append(conn)
+        return conn
+
+    def _insert(self, conn, bug_id, status):
+        conn.execute(
+            """INSERT INTO backlog_bugs (bug_id, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (bug_id, status, "2026-06-09", "2026-06-09"),
+        )
+        conn.commit()
+
+    def test_fixed_row_without_can_close_or_waiver_alerts(self):
+        from governance import backlog_db
+
+        conn = self._get_conn()
+        self._insert(conn, "BUG-FIXED-NO-CLOSE", "FIXED")
+        self._insert(conn, "BUG-OPEN", "OPEN")  # non-FIXED is ignored
+
+        result = backlog_db.fixed_close_waiver_alerts(
+            conn,
+            "test-project",
+            can_close_resolver=lambda _bug: False,
+            has_close_waiver_resolver=lambda _bug: False,
+        )
+        self.assertTrue(result["alert"])
+        self.assertEqual(result["alert_count"], 1)
+        self.assertEqual(result["alerts"][0]["bug_id"], "BUG-FIXED-NO-CLOSE")
+        self.assertEqual(
+            result["alerts"][0]["reason"],
+            "fixed_row_without_can_close_or_close_waiver",
+        )
+
+    def test_can_close_true_or_visible_waiver_silences_alert(self):
+        from governance import backlog_db
+
+        conn = self._get_conn()
+        self._insert(conn, "BUG-A", "FIXED")
+        self._insert(conn, "BUG-B", "FIXED")
+
+        # can_close=true => no alert; waiver present => no alert.
+        can_close = {"BUG-A": True, "BUG-B": False}
+        has_waiver = {"BUG-A": False, "BUG-B": True}
+        result = backlog_db.fixed_close_waiver_alerts(
+            conn,
+            "test-project",
+            can_close_resolver=lambda bug: can_close[bug],
+            has_close_waiver_resolver=lambda bug: has_waiver[bug],
+        )
+        self.assertFalse(result["alert"])
+        self.assertEqual(result["alert_count"], 0)
+
+    def test_non_evaluable_row_does_not_alert(self):
+        from governance import backlog_db
+
+        conn = self._get_conn()
+        self._insert(conn, "BUG-NA", "FIXED")
+        # can_close=None means not MF-applicable / not evaluable -> no alert.
+        result = backlog_db.fixed_close_waiver_alerts(
+            conn,
+            "test-project",
+            can_close_resolver=lambda _bug: None,
+            has_close_waiver_resolver=lambda _bug: False,
+        )
+        self.assertFalse(result["alert"])
+
+
 if __name__ == "__main__":
     unittest.main()

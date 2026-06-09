@@ -41,6 +41,54 @@ _FORBIDDEN_TARGETS = {"service_manager"}
 _VALID_TARGETS = {"governance"}
 
 
+RUNTIME_DEPLOYMENT_VERIFICATION_SCHEMA_VERSION = "runtime_deployment_verification.v1"
+
+
+def derive_runtime_deployment_verification_status(
+    *,
+    http_status: int,
+    runtime_checkout_advanced: bool,
+    healthy: Optional[bool] = None,
+    step: str = "",
+    detail: str = "",
+) -> dict:
+    """Derive a runtime_deployment_verification event from the live-probe result.
+
+    Criterion 4: a live redeploy probe must DERIVE its recorded status from the
+    probe result. A failed probe — HTTP 500 (or any non-2xx) or
+    runtime_checkout_advanced=false — must NOT be recorded as ok/accepted; the
+    status must reflect the failure. Only a 2xx response with an advanced
+    runtime checkout (and a passing health probe when reported) is recorded as
+    ``ok``.
+    """
+
+    http_ok = 200 <= int(http_status) < 300
+    health_ok = True if healthy is None else bool(healthy)
+    ok = bool(http_ok and runtime_checkout_advanced and health_ok)
+    if ok:
+        status = "ok"
+    elif not runtime_checkout_advanced:
+        status = "runtime_checkout_not_advanced"
+    elif healthy is False:
+        status = "health_probe_failed"
+    elif not http_ok:
+        status = "probe_failed"
+    else:
+        status = "health_probe_failed"
+    return {
+        "schema_version": RUNTIME_DEPLOYMENT_VERIFICATION_SCHEMA_VERSION,
+        "event_kind": "runtime_deployment_verification",
+        "ok": ok,
+        "status": status,
+        "accepted": ok,
+        "http_status": int(http_status),
+        "runtime_checkout_advanced": bool(runtime_checkout_advanced),
+        "healthy": None if healthy is None else bool(healthy),
+        "step": step,
+        "detail": detail,
+    }
+
+
 def _project_root() -> Path:
     """Return the project root directory (parent of agent/)."""
     return Path(__file__).resolve().parent.parent
@@ -618,6 +666,14 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "runtime_checkout_advanced": False,
                     "detail": f"Runtime checkout failed: {exc}",
                     "pid": None,
+                    "runtime_deployment_verification": (
+                        derive_runtime_deployment_verification_status(
+                            http_status=500,
+                            runtime_checkout_advanced=False,
+                            step="runtime_checkout",
+                            detail=f"Runtime checkout failed: {exc}",
+                        )
+                    ),
                 },
                 500,
             )
@@ -637,7 +693,20 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             log.error("manager_http_server: failed to spawn governance: %s", exc)
             self._send_json(
-                {"ok": False, "detail": f"Failed to spawn governance: {exc}", "pid": None},
+                {
+                    "ok": False,
+                    "detail": f"Failed to spawn governance: {exc}",
+                    "pid": None,
+                    "runtime_deployment_verification": (
+                        derive_runtime_deployment_verification_status(
+                            http_status=500,
+                            runtime_checkout_advanced=True,
+                            healthy=False,
+                            step="spawn",
+                            detail=f"Failed to spawn governance: {exc}",
+                        )
+                    ),
+                },
                 500,
             )
             return
@@ -651,6 +720,15 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "detail": "Governance spawned but health check failed",
                     "pid": proc.pid,
+                    "runtime_deployment_verification": (
+                        derive_runtime_deployment_verification_status(
+                            http_status=500,
+                            runtime_checkout_advanced=True,
+                            healthy=False,
+                            step="health_probe",
+                            detail="Governance spawned but health check failed",
+                        )
+                    ),
                 },
                 500,
             )
@@ -665,6 +743,15 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "detail": "Governance running but failed to write chain_version",
                     "pid": proc.pid,
+                    "runtime_deployment_verification": (
+                        derive_runtime_deployment_verification_status(
+                            http_status=500,
+                            runtime_checkout_advanced=True,
+                            healthy=True,
+                            step="write_chain_version",
+                            detail="Governance running but failed to write chain_version",
+                        )
+                    ),
                 },
                 500,
             )
@@ -678,6 +765,15 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 "chain_version": chain_version,
                 "runtime_checkout_advanced": True,
                 "runtime_head": runtime_head,
+                "runtime_deployment_verification": (
+                    derive_runtime_deployment_verification_status(
+                        http_status=200,
+                        runtime_checkout_advanced=True,
+                        healthy=True,
+                        step="complete",
+                        detail="Governance redeployed successfully",
+                    )
+                ),
             },
             200,
         )

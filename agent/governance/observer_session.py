@@ -62,6 +62,34 @@ TERMINAL_COMMAND_STATUSES = {
     COMMAND_STATUS_CANCELLED,
 }
 
+# A command may also reach a terminal disposition by being co-resolved together
+# with the backlog close it originated. These extra dispositions, in addition to
+# TERMINAL_COMMAND_STATUSES, count as terminal for the close gate (criterion 3).
+COMMAND_STATUS_CO_RESOLVED = "co_resolved"
+CLOSE_TERMINAL_COMMAND_STATUSES = TERMINAL_COMMAND_STATUSES | {
+    COMMAND_STATUS_CO_RESOLVED,
+    "co_resolved_with_close",
+    "resolved",
+    "disposed",
+    "terminal",
+}
+
+
+def command_blocks_close(status: Any) -> bool:
+    """Return True when an originating command's disposition blocks a close.
+
+    Criterion 3: a still-"claimed" (owned, queued, or notified) command — or any
+    non-terminal disposition — blocks the backlog close. A command that has been
+    completed / failed / cancelled / co-resolved with the close does not block.
+    """
+
+    token = str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if token in CLOSE_TERMINAL_COMMAND_STATUSES:
+        return False
+    # Empty or any non-terminal token (claimed/running/queued/notified/unknown)
+    # fails safe: it blocks the close.
+    return True
+
 FIRST_PROGRESS_PASS_STATUSES = {
     "accepted",
     "complete",

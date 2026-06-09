@@ -23125,16 +23125,28 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                     "has_close_ready": True,
                 },
             }
+        can_close = bool(verification.get("passed"))
         result = {
             "ok": True,
             "project_id": pid,
             "bug_id": bug_id,
             "applicable": applicable["is_mf"],
             "reason": applicable["reason"],
-            "can_close": bool(verification.get("passed")),
+            "can_close": can_close,
             "timeline_gate": verification,
             "event_count": len(events),
         }
+        # Criterion 2: surface FIXED + can_close=false + no-waiver as a
+        # governance integrity alert. A row already marked FIXED must carry
+        # can_close=true OR a visible close-waiver marker.
+        fixed_close_alert = task_timeline.mf_fixed_close_waiver_alert(
+            _row_get(row, "status", ""),
+            can_close,
+            events,
+        )
+        result["fixed_close_waiver_alert"] = fixed_close_alert
+        if fixed_close_alert.get("alert"):
+            result["governance_alert"] = fixed_close_alert
         close_impact_check = _build_backlog_close_impact_check(
             conn,
             pid,
