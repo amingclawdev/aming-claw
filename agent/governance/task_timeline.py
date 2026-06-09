@@ -3904,6 +3904,141 @@ def _event_declares_accepted_bridge(event: dict[str, Any]) -> bool:
     return status in {"accepted", "passed", "ok", "approved", "succeeded", "reconciled"}
 
 
+# Fields that pin a single bounded-lane identity within one backlog row. A row
+# implemented by >=2 mf_sub lanes shares backlog_id + project_id but differs by
+# task_id; the row-level aggregate is task_id="".
+MF_CROSS_REF_LANE_FIELDS = ("backlog_id", "project_id", "task_id")
+# Route + originating-command dimensions a bridge must share with the row before
+# its declared sibling identities are honored (scoped bridge authority).
+MF_CROSS_REF_BRIDGE_ROUTE_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+)
+MF_CROSS_REF_BRIDGE_COMMAND_FIELDS = {
+    "observer_command_id",
+    "command_id",
+    "originating_command_id",
+}
+
+
+def _cross_ref_lane_identity(value: Any) -> dict[str, str]:
+    """Extract a {backlog_id, project_id, task_id} lane tuple from an event."""
+
+    return {
+        field: _first_deep_text(value, field)
+        for field in MF_CROSS_REF_LANE_FIELDS
+    }
+
+
+def _cross_ref_lane_key(identity: dict[str, str]) -> tuple[str, ...]:
+    return tuple(str(identity.get(field) or "").strip() for field in MF_CROSS_REF_LANE_FIELDS)
+
+
+def _cross_ref_bridge_route_scope(event: dict[str, Any]) -> tuple[str, ...]:
+    """Route-identity tuple a bridge (or the row) is anchored to."""
+
+    return tuple(
+        _first_deep_text(event, field) for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS
+    )
+
+
+def _cross_ref_bridge_command(event: dict[str, Any]) -> str:
+    return _first_event_string(event, MF_CROSS_REF_BRIDGE_COMMAND_FIELDS)
+
+
+def _cross_ref_row_anchor(rows: list[Any]) -> dict[str, str]:
+    """Derive the row's backlog_id/project_id + accepted route + originating
+    observer command from its own protected close evidence. Used to SCOPE which
+    bridge-declared sibling identities are honored (#3090 boundary)."""
+
+    anchor: dict[str, str] = {
+        "backlog_id": "",
+        "project_id": "",
+        "route_id": "",
+        "route_context_hash": "",
+        "prompt_contract_id": "",
+        "command": "",
+    }
+    for raw in rows:
+        event = _mapping(raw)
+        if not is_protected_close_evidence(event):
+            continue
+        for field in ("backlog_id", "project_id"):
+            if not anchor[field]:
+                anchor[field] = _first_deep_text(event, field)
+        for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
+            if not anchor[field]:
+                anchor[field] = _first_deep_text(event, field)
+        if not anchor["command"]:
+            anchor["command"] = _cross_ref_bridge_command(event)
+    return anchor
+
+
+def _cross_ref_bridge_scope_membership(
+    rows: list[Any],
+    anchor: dict[str, str],
+) -> set[tuple[str, ...]]:
+    """Build the accepted-lane membership set from accepted bridge events.
+
+    Consumes each accepted bridge event's ``payload.bridged_identities[]`` and,
+    for every declared sibling that shares the row's backlog_id + project_id, adds
+    that sibling lane PLUS the row-level aggregate (task_id="") to the membership
+    set. Bridge authority is SCOPED: a bridge is only honored when it shares the
+    row's accepted route identity (route_id / route_context_hash /
+    prompt_contract_id, where both sides declare them) AND the row's originating
+    observer command. This makes the row identity an equivalence class over the
+    declared lane set rather than a winner-take-all latest lineage.
+    """
+
+    membership: set[tuple[str, ...]] = set()
+    row_backlog = str(anchor.get("backlog_id") or "").strip()
+    row_project = str(anchor.get("project_id") or "").strip()
+    row_route = _cross_ref_bridge_route_scope(anchor)
+    row_command = str(anchor.get("command") or "").strip()
+
+    for raw in rows:
+        event = _mapping(raw)
+        if not _event_declares_accepted_bridge(event):
+            continue
+        # Scoped authority: only honor a bridge whose declared route identity and
+        # originating observer command match the row's. Where a dimension is
+        # absent on either side we do not treat it as a mismatch (events do not
+        # always re-declare every route field), but any declared-and-differing
+        # dimension disqualifies the bridge.
+        bridge_route = _cross_ref_bridge_route_scope(event)
+        route_ok = all(
+            (not want) or (not got) or want == got
+            for want, got in zip(row_route, bridge_route)
+        )
+        if not route_ok:
+            continue
+        bridge_command = _cross_ref_bridge_command(event)
+        if row_command and bridge_command and bridge_command != row_command:
+            continue
+
+        for declared in _field_values(event, {"bridged_identities"}):
+            for sibling in _list(declared):
+                sibling = _mapping(sibling)
+                if not sibling:
+                    continue
+                sib_backlog = str(sibling.get("backlog_id") or "").strip()
+                sib_project = str(sibling.get("project_id") or "").strip()
+                sib_task = str(sibling.get("task_id") or "").strip()
+                # Sibling must belong to THIS row: same backlog_id + project_id.
+                # (#3090: a foreign backlog_id/project_id is never bridged in.)
+                if row_backlog and sib_backlog and sib_backlog != row_backlog:
+                    continue
+                if row_project and sib_project and sib_project != row_project:
+                    continue
+                backlog = sib_backlog or row_backlog
+                project = sib_project or row_project
+                membership.add((backlog, project, sib_task))
+                # Row-level aggregate scope (task_id="") for this lane set.
+                membership.add((backlog, project, ""))
+    return membership
+
+
 def mf_close_cross_ref_gate_verification(
     events: list[dict[str, Any]] | None,
     row_identity: dict[str, Any] | None = None,
@@ -3955,12 +4090,32 @@ def mf_close_cross_ref_gate_verification(
                 best = candidate
         expected = best
 
+    # Treat the row identity as an equivalence class over the lane set declared
+    # by accepted, in-scope bridge events. Each honored sibling lane (and the
+    # row-level aggregate, task_id="") is admitted into the accepted-scope
+    # membership so evidence from a non-canonical lane is not rejected.
+    anchor = _cross_ref_row_anchor(rows)
+    for field in ("backlog_id", "project_id"):
+        if not anchor.get(field) and expected.get(field):
+            anchor[field] = str(expected.get(field) or "").strip()
+    lane_membership = _cross_ref_bridge_scope_membership(rows, anchor)
+
     rejected: list[dict[str, Any]] = []
     for event in rows:
         event = _mapping(event)
         if not is_protected_close_evidence(event):
             continue
         identity = _close_evidence_ref_identity(event)
+        # If this evidence's lane {backlog_id, project_id, task_id} is covered by
+        # an accepted in-scope bridge (or its row-level aggregate), it is part of
+        # the row's equivalence class and is not a cross-ref mismatch.
+        lane = _cross_ref_lane_identity(event)
+        lane_key = _cross_ref_lane_key(lane)
+        if lane_key in lane_membership:
+            continue
+        aggregate_key = (lane_key[0], lane_key[1], "")
+        if aggregate_key in lane_membership and lane_key[2] == "":
+            continue
         mismatches: dict[str, dict[str, str]] = {}
         for field, want in expected.items():
             got = identity.get(field, "")
@@ -3981,6 +4136,9 @@ def mf_close_cross_ref_gate_verification(
         "status": "passed" if passed else "blocked",
         "row_identity": expected,
         "bridged_identities": sorted(bridged),
+        "bridged_lane_membership": sorted(
+            {"|".join(key) for key in lane_membership}
+        ),
         "rejected_cross_ref_evidence": rejected,
     }
 
