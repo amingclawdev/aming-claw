@@ -993,10 +993,157 @@ export function taskPlaybackWorkModeFixtureAssertions(): string[] {
   return trace.frames.map((frame) => `${frame.title}: ${frame.summary}`);
 }
 
+const routeContextEvidenceBacklog: BacklogBug = {
+  bug_id: "AC-CLOSE-GATE-EVIDENCE-INTEGRITY-20260609",
+  title: "Close-gate route-context evidence integrity",
+  status: "OPEN",
+  priority: "P0",
+};
+
+// Acceptance criterion 5: the playback/activity evidence modal must surface the
+// REAL canonical route context the observer read — the canonical route_id (not
+// the preview placeholder "event.route_prompt_context.preview"), the
+// route_context_hash / prompt_contract_id, non-empty loaded_skills /
+// loaded_resources, and the per-request graph_query_schema_trace_id.
+export const TASK_PLAYBACK_ROUTE_CONTEXT_EVIDENCE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
+  {
+    id: 501,
+    event_type: "route.prompt_context.requested",
+    event_kind: "route_context",
+    phase: "dispatch",
+    actor: "route service",
+    status: "accepted",
+    backlog_id: routeContextEvidenceBacklog.bug_id,
+    task_id: "repair-9bf3a2ae63a82a2c",
+    payload: {
+      // The static/preview pointer that the source event carries — must NOT be
+      // shown as the canonical route_id.
+      route_id: "event.route_prompt_context.preview",
+      // The canonical route identity the observer actually read.
+      canonical_route_identity: {
+        route_id: "route-repair-9bf3a2ae63a82a2c",
+        route_context_hash: "sha256:fixture-evidence-route-context",
+        prompt_contract_id: "rprompt-repair-9bf3a2ae63a82a2c",
+      },
+      route_context: {
+        loaded_skills: ["aming-claw"],
+        loaded_resources: ["mf-sop.md", "close-gate-evidence.md"],
+        graph_query_schema_trace_id: "gqt-20260609-fc567d7db1",
+      },
+      route_context_hash: "sha256:fixture-evidence-route-context",
+      prompt_contract_id: "rprompt-repair-9bf3a2ae63a82a2c",
+      [PRIVATE_REQUEST_FIELD]: "[fixture private request text]",
+    },
+    created_at: "2026-06-09T12:00:00Z",
+  },
+  {
+    id: 502,
+    event_type: "service.route.completed",
+    event_kind: "route_context",
+    phase: "route_service",
+    actor: "service-router",
+    status: "allowed",
+    backlog_id: routeContextEvidenceBacklog.bug_id,
+    task_id: "repair-9bf3a2ae63a82a2c",
+    payload: {
+      service_id: "route.prompt_alert_bundle",
+      decision: "allow",
+      // Service/source event carries ONLY the preview placeholder route_id; no
+      // canonical route_id fact should be emitted for this frame.
+      route_id: "event.route_prompt_context.preview",
+      route_context_hash: "sha256:fixture-evidence-route-context",
+      prompt_contract_id: "rprompt-repair-9bf3a2ae63a82a2c",
+      source_event_type: "route.prompt_context.requested",
+    },
+    created_at: "2026-06-09T12:01:00Z",
+  },
+];
+
+export function buildTaskPlaybackRouteContextEvidenceFixture() {
+  return normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog: routeContextEvidenceBacklog,
+    taskTimeline: {
+      project_id: "aming-claw",
+      backlog_id: routeContextEvidenceBacklog.bug_id,
+      events: TASK_PLAYBACK_ROUTE_CONTEXT_EVIDENCE_FIXTURE_EVENTS,
+      count: TASK_PLAYBACK_ROUTE_CONTEXT_EVIDENCE_FIXTURE_EVENTS.length,
+    },
+    gateResponse: null,
+    source: "governed",
+    generatedAt: "2026-06-09T12:02:00Z",
+  });
+}
+
+export function taskPlaybackRouteContextEvidenceFixtureAssertions(): string[] {
+  const trace = buildTaskPlaybackRouteContextEvidenceFixture();
+  const requestFrame = trace.frames.find((frame) => frame.source_event_id === "#501");
+  const serviceFrame = trace.frames.find((frame) => frame.source_event_id === "#502");
+  assertFixture(Boolean(requestFrame), "route prompt context request frame should exist");
+  assertFixture(Boolean(serviceFrame), "service route completed frame should exist");
+  if (!requestFrame || !serviceFrame) throw new Error("missing route-context evidence fixture frames");
+
+  const routeIdFact = requestFrame.specific_facts.find((fact) => fact.kind === "route_id");
+  assertFixture(
+    Boolean(routeIdFact) && routeIdFact!.value === "route-repair-9bf3a2ae63a82a2c",
+    "criterion 5: canonical route_id (route-repair-9bf3a2ae63a82a2c) should be the surfaced route id fact",
+  );
+  assertFixture(
+    !requestFrame.specific_facts.some((fact) => fact.value.includes("route_prompt_context.preview")),
+    "criterion 5: the preview placeholder must not be surfaced as a route fact",
+  );
+  // The service/source frame only has the preview placeholder route_id, so no
+  // canonical route_id fact should be emitted there (preview is never canonical).
+  assertFixture(
+    !serviceFrame.specific_facts.some((fact) => fact.kind === "route_id"),
+    "criterion 5: a frame carrying only the preview placeholder route_id should emit no canonical route_id fact",
+  );
+  assertFixture(
+    !serviceFrame.evidence_links.some((ref) => ref.label === "route id" && ref.value.includes("preview")),
+    "criterion 5: preview placeholder route_id must not appear as a canonical route-id evidence link",
+  );
+
+  assertFixture(
+    requestFrame.specific_facts.some((fact) => fact.kind === "route_context_hash" && fact.value.includes("sha256:fixture-evidence-route-context")),
+    "criterion 5: route_context_hash should be surfaced cleanly",
+  );
+  assertFixture(
+    requestFrame.specific_facts.some((fact) => fact.kind === "prompt_contract_id" && fact.value === "rprompt-repair-9bf3a2ae63a82a2c"),
+    "criterion 5: prompt_contract_id should be surfaced cleanly",
+  );
+  assertFixture(
+    requestFrame.specific_facts.some((fact) => fact.kind === "loaded_skills" && fact.value.includes("aming-claw")),
+    "criterion 5: non-empty loaded_skills should be surfaced",
+  );
+  assertFixture(
+    requestFrame.specific_facts.some((fact) => fact.kind === "loaded_resources" && fact.value.includes("mf-sop.md")),
+    "criterion 5: non-empty loaded_resources should be surfaced",
+  );
+  assertFixture(
+    requestFrame.specific_facts.some((fact) => fact.kind === "graph_query_schema_trace_id" && fact.value === "gqt-20260609-fc567d7db1"),
+    "criterion 5: per-request graph_query_schema_trace_id should be surfaced",
+  );
+  // Raw event JSON must remain inspectable (the preview value is still present
+  // in the collapsed payload section) — existing behavior must not regress.
+  const rawVisible = JSON.stringify(requestFrame.detail_inspector.raw_sections.map((section) => section.value));
+  assertFixture(
+    requestFrame.detail_inspector.raw_sections.map((section) => section.label).join(",") === "payload,verification,artifact_refs"
+      && rawVisible.includes("event.route_prompt_context.preview")
+      && rawVisible.includes("route-repair-9bf3a2ae63a82a2c"),
+    "criterion 5: raw event JSON should stay inspectable and still contain both the preview pointer and the canonical route id",
+  );
+  assertFixture(
+    !rawVisible.includes("[fixture private request text]"),
+    "criterion 5: private request text should stay hidden in raw sections",
+  );
+  return trace.frames.map((frame) => `${frame.title}: ${frame.summary}`);
+}
+
 export const taskPlaybackHistoricalSemanticFixtureSummary = [
   ...taskPlaybackHistoricalSemanticFixtureAssertions(),
   ...taskPlaybackNarrativeFocusFixtureAssertions(),
   ...taskPlaybackWorkModeFixtureAssertions(),
+  ...taskPlaybackRouteContextEvidenceFixtureAssertions(),
 ];
 
 function assertFixture(condition: boolean, message: string): void {

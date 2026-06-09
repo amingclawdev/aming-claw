@@ -799,6 +799,16 @@ function routeContextBoundaryRows(rows: EvidenceInspectorRow[]): EvidenceInspect
   ];
 }
 
+// A preview/static placeholder route id (e.g. "event.route_prompt_context.preview")
+// is a source-event preview pointer, not the canonical external route identity.
+// Canonical route ids look like "route-…" / "route-repair-…".
+function isPreviewRouteIdText(value: string): boolean {
+  const normalized = (value || "").trim();
+  if (!normalized) return true;
+  if (/^route-/i.test(normalized)) return false;
+  return /(^|[._])route_prompt_context[._]preview$|^event\.route|(^|[._])preview$/i.test(normalized);
+}
+
 function isRouteContextOrReadReceiptRef(ref: EvidenceRef): boolean {
   return ref.kind === "route_context" || ref.kind === "read_receipt" || (ref.kind === "source_event" && /read[-_\s]?receipt/i.test(`${ref.label} ${ref.value}`));
 }
@@ -828,6 +838,8 @@ function preferredFactKinds(kind: EvidenceRef["kind"]): Set<string> {
     "read_receipt_refs",
     "startup_refs",
     "graph_query_schema_trace_id",
+    "loaded_skills",
+    "loaded_resources",
     "session_token_evidence_type",
     "agent_id_match_mode",
     "surrogate_close_satisfying",
@@ -851,6 +863,9 @@ function rawPathRowsForEvidence(frame: TaskPlaybackFrame, evidenceRef: EvidenceR
       const value = valueAtPath(record, path);
       const text = publicEvidenceText(value);
       if (!text) continue;
+      // Never surface the preview/static placeholder route id as a canonical
+      // "route id" inspector row; only canonical route-* identities are shown.
+      if (path.endsWith("route_id") && isPreviewRouteIdText(text)) continue;
       rows.push({ label: labelFromPath(path), value: text, source: section.redacted ? `${section.label} redacted` : section.label });
     }
   }
@@ -868,6 +883,8 @@ function evidenceRawSections(frame: TaskPlaybackFrame, _evidenceRef: EvidenceRef
 
 function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
   const identity = [
+    "canonical_route_identity.route_id",
+    "route_context.canonical_route_identity.route_id",
     "route_id",
     "route_context_hash",
     "route_context.route_id",
@@ -922,6 +939,11 @@ function rawPathsForEvidenceKind(kind: EvidenceRef["kind"]): string[] {
     "graph_query_schema_trace_id",
     "query_schema_trace_id",
     "route_context.graph_query_schema_trace_id",
+    "canonical_route_identity.graph_query_schema_trace_id",
+    "loaded_skills",
+    "loaded_resources",
+    "route_context.loaded_skills",
+    "route_context.loaded_resources",
     "session_token_evidence_type",
     "mf_subagent_startup_gate.session_token_evidence_type",
     "identity_join.session_token_evidence_type",
