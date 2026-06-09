@@ -46,6 +46,134 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    """Run a git subcommand in *cwd* and return the CompletedProcess.
+
+    Injectable hook: tests override module attribute ``_run_git`` with a fake
+    runner so the dirty/mismatch/clean logic can be exercised against a temp
+    git fixture without invoking the live plugin clone. Kept as a thin wrapper
+    over subprocess.run to match the file's existing subprocess style.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _ensure_plugin_clone_checkout(chain_version: str) -> str:
+    """Advance the plugin-clone runtime checkout to *chain_version*.
+
+    Runs inside _project_root() (the plugin-clone root). Raises RuntimeError on
+    ANY failure (fail loudly) so callers cannot silently report success while
+    the checkout never advanced. Returns the resolved HEAD on success.
+
+    Steps:
+      1. Refuse a dirty tree (uncommitted changes) — never check out over them.
+      2. Ensure the target commit is present (best-effort `git fetch origin`,
+         then verify presence with `git cat-file -t`).
+      3. `git checkout <chain_version>`.
+      4. Verify `git rev-parse HEAD` resolves to the requested commit
+         (accommodating short vs full hashes).
+
+    Live-system guard: under pytest, the REAL git checkout must NOT run unless
+    REDEPLOY_REAL_CHECKOUT=1 is set. When guarded, this is a no-op success that
+    returns the requested chain_version so the endpoint logic still proceeds
+    without touching the live plugin clone.
+    """
+    if os.getenv("PYTEST_CURRENT_TEST") and os.getenv("REDEPLOY_REAL_CHECKOUT") != "1":
+        log.info(
+            "manager_http_server: _ensure_plugin_clone_checkout no-op under pytest "
+            "(REDEPLOY_REAL_CHECKOUT != 1) for chain_version=%s",
+            chain_version,
+        )
+        return chain_version
+
+    root = _project_root()
+
+    # Step 1: refuse a dirty tree.
+    status = _run_git(["status", "--porcelain"], root)
+    if status.returncode != 0:
+        raise RuntimeError(
+            f"runtime_checkout: `git status` failed in {root}: "
+            f"{(status.stderr or status.stdout).strip()}"
+        )
+    dirty = status.stdout.strip()
+    if dirty:
+        raise RuntimeError(
+            "runtime_checkout: refusing to advance checkout over a dirty plugin "
+            f"clone at {root}; uncommitted changes:\n{dirty}"
+        )
+    log.info("manager_http_server: runtime_checkout — plugin clone is clean at %s", root)
+
+    # Step 2: ensure the target commit is present (fetch is best-effort).
+    fetch = _run_git(["fetch", "origin"], root)
+    if fetch.returncode != 0:
+        log.warning(
+            "manager_http_server: runtime_checkout — `git fetch origin` failed "
+            "(non-fatal, will verify commit presence): %s",
+            (fetch.stderr or fetch.stdout).strip(),
+        )
+    else:
+        log.info("manager_http_server: runtime_checkout — fetched origin")
+
+    present = _run_git(["cat-file", "-t", chain_version], root)
+    if present.returncode != 0 or present.stdout.strip() != "commit":
+        raise RuntimeError(
+            f"runtime_checkout: target commit '{chain_version}' is not present in "
+            f"{root} after fetch ({(present.stderr or present.stdout).strip() or 'not a commit'})"
+        )
+    log.info(
+        "manager_http_server: runtime_checkout — target commit %s is present",
+        chain_version,
+    )
+
+    # Step 3: advance the checkout.
+    checkout = _run_git(["checkout", chain_version], root)
+    if checkout.returncode != 0:
+        raise RuntimeError(
+            f"runtime_checkout: `git checkout {chain_version}` failed in {root}: "
+            f"{(checkout.stderr or checkout.stdout).strip()}"
+        )
+    log.info("manager_http_server: runtime_checkout — checked out %s", chain_version)
+
+    # Step 4: verify HEAD == requested commit (handle short vs full hashes).
+    head = _run_git(["rev-parse", "HEAD"], root)
+    if head.returncode != 0:
+        raise RuntimeError(
+            f"runtime_checkout: `git rev-parse HEAD` failed in {root}: "
+            f"{(head.stderr or head.stdout).strip()}"
+        )
+    resolved = head.stdout.strip()
+
+    # Resolve the requested ref to a full hash for an exact comparison; fall
+    # back to a prefix match so a short hash request still validates.
+    requested = _run_git(["rev-parse", chain_version], root)
+    requested_full = requested.stdout.strip() if requested.returncode == 0 else ""
+    matches = bool(requested_full) and resolved == requested_full
+    if not matches:
+        # Prefix tolerance for short vs full hashes when rev-parse of the ref
+        # could not produce a full hash.
+        cv = chain_version.strip().lower()
+        rl = resolved.lower()
+        matches = rl.startswith(cv) or cv.startswith(rl)
+    if not matches:
+        raise RuntimeError(
+            f"runtime_checkout: HEAD verification failed in {root}; HEAD is "
+            f"{resolved} but requested {chain_version} "
+            f"(resolved target {requested_full or 'unknown'})"
+        )
+
+    log.info(
+        "manager_http_server: runtime_checkout — HEAD verified at %s for requested %s",
+        resolved,
+        chain_version,
+    )
+    return resolved
+
+
 def _governance_url() -> str:
     return os.getenv("GOVERNANCE_URL", "http://localhost:40000")
 
@@ -414,6 +542,29 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             chain_version,
         )
 
+        # Step 0: Advance the plugin-clone runtime checkout to chain_version
+        # BEFORE touching the running process. If this fails, the merged code is
+        # not live — return a loud non-ok response and do NOT stop/spawn so the
+        # current governance keeps running unchanged.
+        try:
+            runtime_head = _ensure_plugin_clone_checkout(chain_version)
+        except Exception as exc:
+            log.error(
+                "manager_http_server: runtime checkout did not advance: %s", exc
+            )
+            self._send_json(
+                {
+                    "ok": False,
+                    "step": "runtime_checkout",
+                    "error": str(exc),
+                    "runtime_checkout_advanced": False,
+                    "detail": f"Runtime checkout failed: {exc}",
+                    "pid": None,
+                },
+                500,
+            )
+            return
+
         # Step 1: Stop old governance (probe → SIGTERM 5s → SIGKILL)
         try:
             stopped = _stop_governance_process()
@@ -467,6 +618,8 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 "detail": "Governance redeployed successfully",
                 "pid": proc.pid,
                 "chain_version": chain_version,
+                "runtime_checkout_advanced": True,
+                "runtime_head": runtime_head,
             },
             200,
         )
