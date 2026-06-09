@@ -85,12 +85,21 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertIn("cannot redeploy self", body["detail"])
 
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="abc1234",
+    )
     @patch("agent.manager_http_server._write_chain_version", return_value=True)
     @patch("agent.manager_http_server._wait_for_health", return_value=True)
     @patch("agent.manager_http_server._spawn_governance_process")
     @patch("agent.manager_http_server._stop_governance_process", return_value=True)
-    def test_redeploy_governance_success(self, mock_stop, mock_spawn, mock_health, mock_write):
-        """AC2/AC4: Successful redeploy returns {ok:true, pid:<int>} and calls version-update."""
+    def test_redeploy_governance_success(self, mock_stop, mock_spawn, mock_health, mock_write, mock_checkout):
+        """AC2/AC4: Successful redeploy returns {ok:true, pid:<int>} and calls version-update.
+
+        Defense-in-depth: _ensure_plugin_clone_checkout is patched so this test
+        can NEVER reach a real git operation against the live plugin clone,
+        regardless of test runner (pytest/unittest) or env guards.
+        """
         mock_proc = MagicMock()
         mock_proc.pid = 12345
         mock_spawn.return_value = mock_proc
@@ -109,12 +118,20 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         # AC4: version-update called exactly once
         mock_write.assert_called_once_with("abc1234")
 
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="def5678",
+    )
     @patch("agent.manager_http_server._write_chain_version")
     @patch("agent.manager_http_server._wait_for_health", return_value=False)
     @patch("agent.manager_http_server._spawn_governance_process")
     @patch("agent.manager_http_server._stop_governance_process", return_value=True)
-    def test_redeploy_governance_failure_no_db_write(self, mock_stop, mock_spawn, mock_health, mock_write):
-        """AC3: When health check fails, return {ok:false} and do NOT call version-update."""
+    def test_redeploy_governance_failure_no_db_write(self, mock_stop, mock_spawn, mock_health, mock_write, mock_checkout):
+        """AC3: When health check fails, return {ok:false} and do NOT call version-update.
+
+        Defense-in-depth: _ensure_plugin_clone_checkout patched so no real git
+        runs against the live clone under any runner.
+        """
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_spawn.return_value = mock_proc
@@ -132,11 +149,19 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         # AC3: version-update NOT called
         mock_write.assert_not_called()
 
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="ghi9012",
+    )
     @patch("agent.manager_http_server._write_chain_version")
     @patch("agent.manager_http_server._spawn_governance_process", side_effect=RuntimeError("spawn failed"))
     @patch("agent.manager_http_server._stop_governance_process", return_value=True)
-    def test_redeploy_governance_spawn_failure_no_db_write(self, mock_stop, mock_spawn, mock_write):
-        """AC3: When spawn fails, return {ok:false} and do NOT call version-update."""
+    def test_redeploy_governance_spawn_failure_no_db_write(self, mock_stop, mock_spawn, mock_write, mock_checkout):
+        """AC3: When spawn fails, return {ok:false} and do NOT call version-update.
+
+        Defense-in-depth: _ensure_plugin_clone_checkout patched so no real git
+        runs against the live clone under any runner.
+        """
         status, body = _make_request(
             self.server_address,
             "POST",
@@ -297,10 +322,16 @@ class TestEnsurePluginCloneCheckout(unittest.TestCase):
 
 
 class TestRedeployRuntimeCheckoutNoOpGuard(unittest.TestCase):
-    """Under pytest WITHOUT REDEPLOY_REAL_CHECKOUT=1, no real git checkout runs."""
+    """Under ANY test harness (pytest OR unittest) WITHOUT
+    REDEPLOY_REAL_CHECKOUT=1, no real git checkout runs."""
 
-    def test_no_op_under_pytest(self):
+    def test_no_op_under_test_harness(self):
         import agent.manager_http_server as mod
+        # The harness signal must be detected regardless of runner.
+        self.assertTrue(
+            mod._running_under_test_harness(),
+            "test harness should be detected under pytest or unittest",
+        )
         # Ensure the guard env is not forcing a real checkout.
         prev = os.environ.pop("REDEPLOY_REAL_CHECKOUT", None)
         try:
@@ -384,7 +415,10 @@ class TestRedeployEndpointRuntimeCheckout(unittest.TestCase):
         self.assertTrue(body["runtime_checkout_advanced"])
         self.assertEqual(body["runtime_head"], "fullhead0000000000000000000000000000abcd")
         mock_checkout.assert_called_once_with("abc1234")
-        # Checkout happens before stop/spawn.
+        # The checkout, stop, and spawn helpers were each invoked exactly once.
+        # (Ordering — checkout strictly before stop/spawn — is enforced by
+        # test_checkout_failure_blocks_stop_and_spawn, where a failed checkout
+        # leaves stop/spawn uncalled; here we only assert each ran once.)
         mock_stop.assert_called_once()
         mock_spawn.assert_called_once()
 

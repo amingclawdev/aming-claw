@@ -63,6 +63,57 @@ def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
+def _running_under_test_harness() -> bool:
+    """Return True when executing under a recognized test runner.
+
+    Safety-critical: the real `git checkout` against the live plugin clone must
+    never fire from a test process. The previous guard keyed solely off
+    ``PYTEST_CURRENT_TEST``, which ONLY pytest sets — under ``python -m unittest``
+    (also whitelisted in .aming-claw.yaml) that env var is unset, so the guard
+    silently fell through to the real git logic against the live _project_root().
+
+    This detects BOTH runners (and anything that imports them as the entrypoint):
+      - pytest: ``PYTEST_CURRENT_TEST`` env is set per-test, OR the ``pytest`` /
+        ``_pytest`` modules are imported.
+      - unittest: the ``unittest`` module is imported AND the process was
+        launched as a test run — either ``python -m unittest`` (argv[0] ends in
+        ``__main__.py`` under the unittest package, or "unittest" appears in
+        argv), or a test module is executed directly (sys.modules contains
+        ``unittest`` and the entrypoint argv references a test module).
+
+    Production redeploys (real ServiceManager process, no test harness loaded)
+    do NOT match, so the real checkout still runs there.
+    """
+    # pytest signals.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return True
+    if "pytest" in sys.modules or "_pytest" in sys.modules:
+        return True
+
+    # unittest signals. The unittest module is only imported when a test run
+    # (or test module) loads it; production governance/manager code does not.
+    if "unittest" in sys.modules:
+        argv0 = (sys.argv[0] if sys.argv else "") or ""
+        argv0_lower = argv0.lower()
+        # `python -m unittest ...` → argv[0] is the unittest package __main__.
+        if "unittest" in argv0_lower:
+            return True
+        if any("unittest" in str(a).lower() for a in sys.argv[1:]):
+            return True
+        # Test module executed directly (e.g. `python .../test_foo.py`) which
+        # imported unittest at module load; treat a *_test / test_* entrypoint
+        # as a test run.
+        base = os.path.basename(argv0_lower)
+        if base.startswith("test_") or base.endswith("_test.py") or base == "test.py":
+            return True
+        # pytest/nose can also leave unittest imported; if any loaded module
+        # looks like a test runner, treat as test mode.
+        if any(m in sys.modules for m in ("nose", "nose2")):
+            return True
+
+    return False
+
+
 def _ensure_plugin_clone_checkout(chain_version: str) -> str:
     """Advance the plugin-clone runtime checkout to *chain_version*.
 
@@ -78,15 +129,18 @@ def _ensure_plugin_clone_checkout(chain_version: str) -> str:
       4. Verify `git rev-parse HEAD` resolves to the requested commit
          (accommodating short vs full hashes).
 
-    Live-system guard: under pytest, the REAL git checkout must NOT run unless
-    REDEPLOY_REAL_CHECKOUT=1 is set. When guarded, this is a no-op success that
+    Live-system guard: under ANY recognized test harness (pytest OR unittest,
+    via _running_under_test_harness()), the REAL git checkout must NOT run
+    unless REDEPLOY_REAL_CHECKOUT=1 is explicitly set to exercise the real
+    logic against a temp fixture. When guarded, this is a no-op success that
     returns the requested chain_version so the endpoint logic still proceeds
-    without touching the live plugin clone.
+    without touching the live plugin clone. Production (no test harness) always
+    performs the real checkout.
     """
-    if os.getenv("PYTEST_CURRENT_TEST") and os.getenv("REDEPLOY_REAL_CHECKOUT") != "1":
+    if _running_under_test_harness() and os.getenv("REDEPLOY_REAL_CHECKOUT") != "1":
         log.info(
-            "manager_http_server: _ensure_plugin_clone_checkout no-op under pytest "
-            "(REDEPLOY_REAL_CHECKOUT != 1) for chain_version=%s",
+            "manager_http_server: _ensure_plugin_clone_checkout no-op under test "
+            "harness (REDEPLOY_REAL_CHECKOUT != 1) for chain_version=%s",
             chain_version,
         )
         return chain_version
@@ -155,10 +209,14 @@ def _ensure_plugin_clone_checkout(chain_version: str) -> str:
     matches = bool(requested_full) and resolved == requested_full
     if not matches:
         # Prefix tolerance for short vs full hashes when rev-parse of the ref
-        # could not produce a full hash.
+        # could not produce a full hash. Require a meaningfully long prefix
+        # (>= 7 chars, git's default short-hash length) so an empty or 1-char
+        # value cannot false-pass via startswith().
         cv = chain_version.strip().lower()
         rl = resolved.lower()
-        matches = rl.startswith(cv) or cv.startswith(rl)
+        _MIN_PREFIX = 7
+        if cv and rl and len(cv) >= _MIN_PREFIX:
+            matches = rl.startswith(cv) or (len(rl) >= _MIN_PREFIX and cv.startswith(rl))
     if not matches:
         raise RuntimeError(
             f"runtime_checkout: HEAD verification failed in {root}; HEAD is "
