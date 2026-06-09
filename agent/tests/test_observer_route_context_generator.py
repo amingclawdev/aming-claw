@@ -1,0 +1,649 @@
+"""Tests for the Aming-owned write-authorizing observer route-token generator.
+
+The generator (``agent.governance.observer_route_context``) mints a route token
+that must be accepted by
+``mf_subagent_contract.validate_route_token_mutation_gate`` with decision
+``route_token`` for observer protected write actions when scope matches, while
+keeping direct file-edit actions blocked, staying independent of any external
+route provider at runtime, and never persisting the raw token in clear.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import sys
+
+import pytest
+
+
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from agent.governance import observer_route_context
+from agent.governance.mf_subagent_contract import (
+    MfSubagentContractError,
+    validate_route_token_mutation_gate,
+)
+
+
+_PROJECT = "aming-claw"
+_BACKLOG = "AC-OBSERVER-WRITE-AUTH-ROUTE-CONTEXT-GEN-20260608"
+_TASK = "task-ac-observer-write-20260609-a"
+_TARGET_FILES = [
+    "agent/governance/observer_route_context.py",
+    "agent/governance/server.py",
+]
+_NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _token(**overrides):
+    kwargs = dict(
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        target_files=_TARGET_FILES,
+        now=_NOW,
+    )
+    kwargs.update(overrides)
+    return observer_route_context.build_observer_write_route_token(**kwargs)
+
+
+def _issue(**overrides):
+    kwargs = dict(
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        target_files=_TARGET_FILES,
+        now=_NOW,
+    )
+    kwargs.update(overrides)
+    return observer_route_context.issue_observer_write_route_context(**kwargs)
+
+
+# --- AC2: gate acceptance ---------------------------------------------------
+
+
+def test_gate_accepts_token_for_task_timeline_append():
+    token = _token()
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+    assert result["allowed"] is True
+    assert result["caller_role"] == "observer"
+
+
+def test_gate_accepts_token_for_backlog_close():
+    token = _token()
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="backlog_close",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+
+
+def test_gate_accepts_token_for_execute_backlog_row():
+    token = _token()
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="execute_backlog_row",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+
+
+# --- AC1: write-authorizing, aming-owned, no external provider --------------
+
+
+def test_token_authorizes_protected_write_and_aming_owned():
+    token = _token()
+    assert token["authorizes_protected_write"] is True
+    assert token["read_only"] is False
+    assert token["owner"] == "aming-claw"
+    assert token["external_provider_required"] is False
+    assert token["judgment_brain_required"] is False
+    assert token["schema_version"] == "aming_observer_write_route_token.v1"
+    assert token["route_id"].startswith("route-20260609-")
+    assert token["route_context_hash"].startswith("sha256:")
+    assert token["prompt_contract_id"].startswith("rprompt-aming-")
+    assert token["visible_injection_manifest_hash"].startswith("sha256:")
+    assert token["evidence_refs"]
+    assert token["evidence_refs"][0].startswith("route:")
+
+
+# --- AC3 / AC7: no auth over-reach — direct edits stay blocked --------------
+
+
+def test_token_blocks_direct_edit_actions():
+    token = _token()
+    allowed = set(token["allowed_actions"])
+    blocked = set(token["blocked_actions"])
+    # Observer must not be able to directly edit files via this token.
+    for forbidden in ("edit_files", "edit_file", "apply_patch", "write_file"):
+        assert forbidden not in allowed
+        assert forbidden in blocked
+    assert "run_implementation_command" in blocked
+    assert "close_without_worker_or_subagent_evidence" in blocked
+    # And the gate must reject a direct edit action even with the token present.
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="edit_files",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+
+
+def test_token_does_not_authorize_unlisted_action():
+    # A protected action that is neither in allowed nor blocked must still be
+    # rejected — the gate only allows explicit membership / wildcard.
+    token = _token()
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="some_unlisted_protected_action",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+
+
+# --- AC2/AC7: scope security ------------------------------------------------
+
+
+def test_scope_mismatch_backlog_rejected():
+    token = _token()
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id="AC-SOME-OTHER-BACKLOG-20260609",
+            task_id=_TASK,
+            now=_NOW,
+        )
+
+
+def test_scope_mismatch_project_rejected():
+    token = _token()
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id="some-other-project",
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+
+
+def test_scope_mismatch_task_rejected():
+    token = _token()
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id="task-some-other-001",
+            now=_NOW,
+        )
+
+
+# --- AC2: future expiry / stale identity ------------------------------------
+
+
+def test_expired_token_rejected():
+    token = _token(ttl_hours=1)
+    far_future = _NOW + timedelta(hours=48)
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=far_future,
+        )
+
+
+def test_stale_identity_token_with_tampered_scope_rejected():
+    # If a stale/forked token's embedded scope is mutated to a different task,
+    # the gate must reject it against the real request scope.
+    token = _token()
+    token = dict(token)
+    token["scope"] = dict(token["scope"])
+    token["scope"]["task_id"] = "task-forked-stale-001"
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+
+
+def test_deterministic_identity_for_same_inputs():
+    a = _token()
+    b = _token()
+    assert a["route_id"] == b["route_id"]
+    assert a["route_context_hash"] == b["route_context_hash"]
+    assert a["prompt_contract_id"] == b["prompt_contract_id"]
+    assert a["visible_injection_manifest_hash"] == b["visible_injection_manifest_hash"]
+
+
+# --- AC5: provider selection (config-driven, runtime-independent) ------------
+
+
+def test_provider_defaults_to_aming_local():
+    provider = observer_route_context.resolve_route_provider(_PROJECT)
+    assert provider["source"] == "aming_local_default"
+    assert provider["owner"] == "aming-claw"
+    assert provider["external_provider_required"] is False
+    token = _token()
+    assert token["provider"]["source"] == "aming_local_default"
+
+
+def test_provider_external_recorded_when_configured():
+    fake_config = {
+        "route": {
+            "provider": "external-route-service",
+            "id": "external-route-service",
+            "version": "9.9.9",
+            "model": "external-model",
+        }
+    }
+    provider = observer_route_context.resolve_route_provider(
+        _PROJECT, config=fake_config
+    )
+    assert provider["source"] == "external_provider"
+    assert provider["id"] == "external-route-service"
+    assert provider["version"] == "9.9.9"
+    assert provider["external_provider_required"] is False
+    assert provider["hash"].startswith("sha256:")
+    # The token still embeds the external provider evidence when passed through.
+    token = _token(provider=provider)
+    assert token["provider"]["source"] == "external_provider"
+    assert token["provider"]["id"] == "external-route-service"
+    # External provider config does not weaken the write authorization, and the
+    # token is still accepted by the gate (runtime independence: gate never
+    # calls the external provider).
+    assert token["authorizes_protected_write"] is True
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+
+
+# --- AC1: runtime independence — no external provider import at all ----------
+
+
+def test_import_does_not_pull_external_route_provider():
+    # Importing the generator must not import any external route provider module
+    # (judgment-brain is the canonical external provider).
+    import importlib
+
+    importlib.import_module("agent.governance.observer_route_context")
+    leaked = [
+        name
+        for name in sys.modules
+        if "judgment_brain" in name or "judgment-brain" in name
+    ]
+    assert leaked == [], f"external provider modules leaked into sys.modules: {leaked}"
+
+
+# --- AC3: contract lanes + evidence baked in --------------------------------
+
+
+def test_required_lanes_and_evidence_present():
+    token = _token()
+    lane_ids = {lane["id"] for lane in token["required_lanes"]}
+    assert "observer_intent_capture" in lane_ids
+    assert "bounded_implementation_subagent" in lane_ids
+    assert "independent_verification_subagent" in lane_ids
+    assert "observer_merge_close_gate" in lane_ids
+    for lane in token["required_lanes"]:
+        assert lane["id"] and lane["role"] and lane["purpose"]
+    assert "verification_report" in token["required_evidence"]
+    assert "dirty_scope_check" in token["required_evidence"]
+    assert "bounded_implementation_subagent_id" in token["required_evidence"]
+    assert "independent_verification_subagent_id" in token["required_evidence"]
+
+
+# --- AC4: sanitize caller-supplied allowed_actions at mint ------------------
+
+
+def test_wildcard_allowed_action_rejected_at_mint():
+    # An unsanitized ["*"] would pass the gate for ANY action — privilege
+    # over-reach. It must be rejected at mint with ValueError.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["*"])
+
+
+def test_blocked_action_in_allowed_rejected_at_mint():
+    # The gate ignores blocked_actions, so a blocked action sneaked into
+    # allowed_actions would authorize a direct file edit. Reject at mint.
+    for blocked in ("edit_files", "apply_patch", "write_file"):
+        with pytest.raises(ValueError):
+            _token(allowed_actions=[blocked])
+    # Even mixed with a legitimate action, the intersection must be rejected.
+    with pytest.raises(ValueError):
+        _token(allowed_actions=["task_timeline_append", "edit_file"])
+
+
+def test_clean_caller_supplied_allowed_actions_accepted():
+    # A clean subset of allowed actions still mints successfully.
+    token = _token(allowed_actions=["task_timeline_append", "backlog_close"])
+    assert set(token["allowed_actions"]) == {"task_timeline_append", "backlog_close"}
+
+
+# --- AC4: clamp/reject oversized or non-positive TTL ------------------------
+
+
+def test_ttl_over_max_rejected():
+    assert observer_route_context.MAX_TTL_HOURS == 72.0
+    with pytest.raises(ValueError):
+        _token(ttl_hours=observer_route_context.MAX_TTL_HOURS + 1)
+
+
+def test_ttl_non_positive_rejected():
+    with pytest.raises(ValueError):
+        _token(ttl_hours=0)
+    with pytest.raises(ValueError):
+        _token(ttl_hours=-5)
+
+
+def test_ttl_at_max_boundary_accepted():
+    # Exactly MAX_TTL_HOURS is allowed (only strictly greater is rejected).
+    token = _token(ttl_hours=observer_route_context.MAX_TTL_HOURS)
+    assert token["expires_at"]
+
+
+# --- AC6: consumable route_token_ref + merge_queue_id + execute payload -----
+
+
+def test_issue_returns_consumable_ref_and_merge_queue_id():
+    issued = _issue()
+    assert issued["ok"] is True
+    assert issued["route_token_ref"]
+    assert issued["route_token_ref"].startswith("rtok-")
+    assert issued["merge_queue_id"]
+    assert issued["merge_queue_id"].startswith("mq-")
+    # The full token is present and still gate-valid.
+    result = validate_route_token_mutation_gate(
+        {"route_token": issued["route_token"]},
+        action="execute_backlog_row",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+
+
+def test_execute_backlog_row_payload_has_required_fields():
+    # The issued execute_backlog_row_payload must carry exactly the fields the
+    # observer execute_backlog_row command requires, so it is genuinely
+    # consumable. Mirror observer_session.EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS.
+    issued = _issue()
+    payload = issued["execute_backlog_row_payload"]
+    required = (
+        "backlog_id",
+        "merge_queue_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    )
+    for field in required:
+        assert payload.get(field), f"missing/empty required field: {field}"
+    assert payload["backlog_id"] == _BACKLOG
+    assert payload["route_token_ref"] == issued["route_token_ref"]
+    assert payload["merge_queue_id"] == issued["merge_queue_id"]
+
+    # Cross-check against the live required-fields constant if importable.
+    try:
+        from agent.governance.observer_session import (
+            EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS,
+        )
+    except Exception:
+        EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS = required
+    for field in EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS:
+        assert payload.get(field), f"missing live-required field: {field}"
+
+
+def test_issue_is_deterministic():
+    a = _issue()
+    b = _issue()
+    assert a["route_token_ref"] == b["route_token_ref"]
+    assert a["merge_queue_id"] == b["merge_queue_id"]
+
+
+# --- AC7 / dogfood: redaction — raw token never persisted in the ref --------
+
+
+def test_route_token_ref_does_not_leak_raw_token():
+    issued = _issue()
+    ref = issued["route_token_ref"]
+    token = issued["route_token"]
+    # The opaque ref is a short hashed handle, not the serialized token.
+    assert "authorizes_protected_write" not in ref
+    assert token["route_context_hash"] not in ref
+    assert token["prompt_contract_hash"] not in ref
+    assert len(ref) < 64
+    # The execute payload also carries only the opaque ref, never the raw token.
+    payload = issued["execute_backlog_row_payload"]
+    assert "route_token" not in payload
+    assert payload["route_token_ref"] == ref
+
+
+def test_gate_redacts_raw_token_via_hash():
+    # The gate must not echo the raw token back; it returns a stable hash only.
+    token = _token()
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["route_token_hash"].startswith("sha256:")
+    assert "route_token" not in result
+    assert "allowed_actions" not in result  # raw token internals not echoed
+
+
+# --- AC7: no self-authorizing token — only the real gate may accept ---------
+
+
+def test_token_carries_no_self_accept_decision():
+    # The generator must NOT bake a pre-decided "accepted"/"decision" verdict
+    # into the token; acceptance is the independent gate's job. A self-authorized
+    # verdict would let a caller bypass scope/expiry checks.
+    token = _token()
+    assert "decision" not in token
+    assert "accepted" not in token
+    assert token.get("status") in (None, "")
+
+
+def test_empty_scope_inputs_rejected_at_mint():
+    with pytest.raises(ValueError):
+        _token(backlog_id="")
+    with pytest.raises(ValueError):
+        _token(task_id="")
+    with pytest.raises(ValueError):
+        _token(target_files=[])
+
+
+# --- DOGFOOD: the previous failure mode (empty route_token_ref) is gone ------
+
+
+def test_dogfood_fresh_observer_gets_nonempty_write_route_token_ref():
+    """Dogfood: a fresh observer calling the native generator now gets a
+    NON-EMPTY route_token_ref + merge_queue_id, and that token passes the
+    existing validate_route_token_mutation_gate with decision == "route_token".
+
+    Previously the only native route-context builder was read-only, so a fresh
+    observer got route_token_ref="" and could not legally enqueue
+    execute_backlog_row. This asserts the gap is closed without weakening any
+    close defense (direct edits remain blocked).
+    """
+    issued = _issue()
+
+    # 1) Non-empty, consumable handles (the previously-missing values).
+    assert issued["route_token_ref"], "route_token_ref must be non-empty"
+    assert issued["merge_queue_id"], "merge_queue_id must be non-empty"
+
+    # 2) The minted token passes the EXISTING gate as decision == "route_token".
+    gate = validate_route_token_mutation_gate(
+        {"route_token": issued["route_token"]},
+        action="task_timeline_append",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert gate["decision"] == "route_token"
+    assert gate["allowed"] is True
+    assert gate["caller_role"] == "observer"
+
+    # 3) The execute_backlog_row payload is fully populated (no empty route id).
+    payload = issued["execute_backlog_row_payload"]
+    assert payload["route_token_ref"] == issued["route_token_ref"]
+    assert payload["merge_queue_id"] == issued["merge_queue_id"]
+    assert payload["route_id"]
+
+    # 4) Layered close defense intact: a direct file edit is still blocked.
+    with pytest.raises(MfSubagentContractError):
+        validate_route_token_mutation_gate(
+            {"route_token": issued["route_token"]},
+            action="apply_patch",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+
+    # 5) Raw token text is not leaked into the consumable ref.
+    assert issued["route_token_ref"].startswith("rtok-")
+    assert "authorizes_protected_write" not in issued["route_token_ref"]
+
+
+# --- AC6: HTTP endpoint observer role check ---------------------------------
+
+
+class _FakeHandler:
+    headers: dict = {}
+
+
+class _Ctx:
+    def __init__(self, body):
+        self.handler = _FakeHandler()
+        self.body = body
+        self.path_params = {"project_id": _PROJECT}
+
+    def get_project_id(self):
+        return _PROJECT
+
+
+def test_endpoint_rejects_non_observer_caller_role():
+    """The issuance handler must 403 a non-observer caller.
+
+    The handler reads caller_role from the request body (or X-Caller-Role
+    header) and rejects anything other than "observer" before minting a
+    write-authorizing token.
+    """
+    from agent.governance import server
+
+    # Non-observer caller_role -> 403.
+    code, payload = server.handle_observer_route_context_issue(
+        _Ctx(
+            {
+                "caller_role": "mf_sub",
+                "backlog_id": _BACKLOG,
+                "task_id": _TASK,
+                "target_files": _TARGET_FILES,
+            }
+        )
+    )
+    assert code == 403
+    assert "observer" in payload["error"]
+
+    # Missing caller_role -> 403 as well.
+    code2, _ = server.handle_observer_route_context_issue(
+        _Ctx(
+            {
+                "backlog_id": _BACKLOG,
+                "task_id": _TASK,
+                "target_files": _TARGET_FILES,
+            }
+        )
+    )
+    assert code2 == 403
+
+
+def test_endpoint_accepts_observer_caller_role():
+    from agent.governance import server
+
+    result = server.handle_observer_route_context_issue(
+        _Ctx(
+            {
+                "caller_role": "observer",
+                "backlog_id": _BACKLOG,
+                "task_id": _TASK,
+                "target_files": _TARGET_FILES,
+            }
+        )
+    )
+    # Success path returns a plain dict (200), not a (code, body) tuple.
+    assert isinstance(result, dict)
+    assert result["ok"] is True
+    assert result["route_token"]["authorizes_protected_write"] is True
+    assert result["route_token_ref"]
+    assert result["merge_queue_id"]
+    assert result["execute_backlog_row_payload"]["route_token_ref"] == result[
+        "route_token_ref"
+    ]
+
+
+def test_endpoint_sanitizes_wildcard_allowed_actions():
+    from agent.governance import server
+
+    code, payload = server.handle_observer_route_context_issue(
+        _Ctx(
+            {
+                "caller_role": "observer",
+                "backlog_id": _BACKLOG,
+                "task_id": _TASK,
+                "target_files": _TARGET_FILES,
+                "allowed_actions": ["*"],
+            }
+        )
+    )
+    assert code == 400
+    assert "wildcard" in payload["error"] or "*" in payload["error"]
