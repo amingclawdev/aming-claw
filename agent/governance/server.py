@@ -1614,6 +1614,8 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
             }
         if not external_route_identity and action_precheck:
             external_route_identity = dict(action_precheck)
+        force_supersede = bool(body.get("force_supersede") or False)
+        force_reason = str(body.get("force_reason") or "").strip()
         materialization = observer_repair_run.build_route_service_materialization(
             plan,
             action_precheck_id=action_precheck_id,
@@ -1626,6 +1628,7 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
             if isinstance(body.get("version_check"), dict)
             else {},
             actor=actor,
+            record=record,
         )
         materialization["record"] = record
         materialization["mode"] = "record" if record else "dry_run"
@@ -1633,6 +1636,46 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
             if body.get("include_plan"):
                 materialization["plan"] = plan
             return materialization
+        # AC-REPAIR-RUN-LIVE-IDENTITY-SUPERSEDE-GUARD-20260610:
+        # When record=True and the materialization would write a route.identity.superseded
+        # event, call guard_live_identity_supersession to refuse silent supersession of any
+        # live lane identity that already has accepted startup or QA lineage.
+        if materialization.get("route_identity_supersession"):
+            supersession = materialization["route_identity_supersession"]
+            proposed_superseded = (
+                supersession.get("supplied_route_identity")
+                or supersession.get("proposed_superseded_identity")
+                or external_route_identity
+                or {}
+            )
+            backlog_id_for_guard = str(
+                materialization.get("backlog_id") or ""
+            )
+            guard_timeline_events: list[dict] = []
+            if backlog_id_for_guard:
+                guard_timeline_events = task_timeline.list_events(
+                    conn,
+                    project_id,
+                    backlog_id=backlog_id_for_guard,
+                    limit=200,
+                )
+            guard_result = observer_repair_run.guard_live_identity_supersession(
+                proposed_superseded_identity=proposed_superseded,
+                timeline_events=guard_timeline_events,
+                force_supersede=force_supersede,
+                force_reason=force_reason,
+            )
+            if not guard_result.get("ok"):
+                raise GovernanceError(
+                    "observer_repair_run_supersession_refused",
+                    guard_result.get("reason") or "identity supersession refused by guard",
+                    409,
+                    {
+                        "guard_result": guard_result,
+                        "record_blocked": True,
+                        "record_blocked_reason": "live_identity_supersession_refused",
+                    },
+                )
         if not materialization.get("recordable"):
             raise GovernanceError(
                 "observer_repair_route_evidence_not_recordable",

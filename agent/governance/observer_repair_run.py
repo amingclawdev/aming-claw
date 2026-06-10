@@ -1810,6 +1810,141 @@ def build_repair_run_plan(
     }
 
 
+LIVE_IDENTITY_PROTECTED_EVENT_KINDS = frozenset(
+    {
+        "mf_subagent_startup",
+        "independent_verification",
+        "independent_verification_lane",
+    }
+)
+LIVE_IDENTITY_PROTECTED_STATUSES = frozenset(
+    {
+        "accepted",
+        "passed",
+        "ok",
+        "allowed",
+        "approved",
+    }
+)
+
+_IDENTITY_ONLY_NEXT_LEGAL_ACTIONS = [
+    "supply_external_action_precheck_packet_with_required_source_markers_and_retry",
+    "use_fresh_replay_mint_mode_by_omitting_route_identity_claim_entirely",
+]
+
+
+def guard_live_identity_supersession(
+    *,
+    proposed_superseded_identity: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+    force_supersede: bool = False,
+    force_reason: str = "",
+) -> dict[str, Any]:
+    """Check whether superseding ``proposed_superseded_identity`` is safe.
+
+    Scans ``timeline_events`` for accepted/passed mf_subagent_startup or
+    independent_verification events whose route identity matches the proposed
+    superseded identity.  If any protecting events are found and
+    ``force_supersede`` is not *both* True and accompanied by a non-empty
+    ``force_reason``, the call is refused.
+
+    Returns a dict with keys:
+      ok (bool)           — True when supersession may proceed
+      protected (bool)    — True when protecting events were found
+      protecting_event_ids (list[int])
+      force_accepted (bool)
+      reason (str)
+    """
+    identity = _route_identity_from_public(proposed_superseded_identity)
+    if not identity:
+        return {
+            "ok": True,
+            "protected": False,
+            "protecting_event_ids": [],
+            "force_accepted": False,
+            "reason": "no proposed identity to protect",
+        }
+
+    protecting_event_ids: list[int] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        event_kind = _string(event.get("event_kind") or event.get("event_type"))
+        if event_kind not in LIVE_IDENTITY_PROTECTED_EVENT_KINDS:
+            continue
+        status = _string(event.get("status")).lower()
+        if status not in LIVE_IDENTITY_PROTECTED_STATUSES:
+            continue
+        # Extract the route identity embedded in the event payload / verification
+        payload = _object(event.get("payload"))
+        verification = _object(event.get("verification"))
+        artifact_refs = _object(event.get("artifact_refs"))
+        candidate_identities: list[dict[str, Any]] = []
+        for container in (payload, verification, artifact_refs):
+            candidate_identities.append(_route_identity_from_public(container))
+            for nested_key in (
+                "mf_subagent_startup_gate",
+                "startup_gate",
+                "route_identity",
+                "identity",
+            ):
+                nested = _object(container.get(nested_key))
+                if nested:
+                    candidate_identities.append(_route_identity_from_public(nested))
+        matched = False
+        for candidate in candidate_identities:
+            if not candidate:
+                continue
+            # A match means any non-empty field from identity matches candidate
+            for field in ("route_id", "route_context_hash", "prompt_contract_id", "prompt_contract_hash"):
+                ev_val = _string(candidate.get(field))
+                id_val = _string(identity.get(field))
+                if ev_val and id_val and ev_val == id_val:
+                    matched = True
+                    break
+            if matched:
+                break
+        if matched:
+            protecting_event_ids.append(int(event.get("id") or 0))
+
+    if not protecting_event_ids:
+        return {
+            "ok": True,
+            "protected": False,
+            "protecting_event_ids": [],
+            "force_accepted": False,
+            "reason": "no protecting events found for the proposed superseded identity",
+        }
+
+    # Protecting events exist — require explicit force+reason
+    if force_supersede and force_reason.strip():
+        return {
+            "ok": True,
+            "protected": True,
+            "protecting_event_ids": protecting_event_ids,
+            "force_accepted": True,
+            "force_reason": force_reason.strip(),
+            "reason": (
+                f"supersession allowed by explicit force_supersede+force_reason; "
+                f"protecting event ids: {protecting_event_ids}"
+            ),
+        }
+
+    protecting_ids_str = ", ".join(str(eid) for eid in protecting_event_ids)
+    return {
+        "ok": False,
+        "protected": True,
+        "protecting_event_ids": protecting_event_ids,
+        "force_accepted": False,
+        "reason": (
+            f"supersession refused: the proposed identity has accepted startup or "
+            f"independent_verification evidence on the same backlog row "
+            f"(protecting event ids: {protecting_ids_str}); "
+            f"supply force_supersede=true AND a non-empty force_reason to override"
+        ),
+    }
+
+
 def build_route_service_materialization(
     plan: Mapping[str, Any],
     *,
@@ -1819,6 +1954,7 @@ def build_route_service_materialization(
     graph_status: Mapping[str, Any] | None = None,
     version_check: Mapping[str, Any] | None = None,
     actor: str = "",
+    record: bool = False,
 ) -> dict[str, Any]:
     """Select replayable route-service source events from a repair-run plan."""
 
@@ -1829,6 +1965,44 @@ def build_route_service_materialization(
     selected_action = _string(action_precheck_id) or DEFAULT_ROUTE_ACTION_PRECHECK_ID
     external_identity = _route_identity_from_public(external_route_identity or {})
     external_requested = bool(external_identity)
+
+    # (a) Identity-only fail-loud: when a claimed route_identity is supplied AND
+    # record=True AND the action_precheck packet is missing/empty → error immediately,
+    # record nothing.  This prevents the degrade-to-replay-mint path from silently
+    # superseding a live canonical identity when the caller forgot the precheck.
+    if record and external_requested:
+        packet = _object(action_precheck) if action_precheck is not None else {}
+        if not _external_precheck_marker_present(packet):
+            return {
+                "ok": False,
+                "schema_version": ROUTE_SERVICE_MATERIALIZATION_SCHEMA_VERSION,
+                "repair_run_id": _string(plan.get("repair_run_id")),
+                "project_id": _string(plan.get("project_id")),
+                "root_backlog_ids": [
+                    str(item) for item in _list(plan.get("root_backlog_ids")) if str(item)
+                ],
+                "backlog_id": "",
+                "action_precheck_id": _string(action_precheck_id) or DEFAULT_ROUTE_ACTION_PRECHECK_ID,
+                "recordable": False,
+                "record_blocked": True,
+                "record_blocked_reason": "identity_only_without_action_precheck",
+                "reason": "external action precheck packet or source marker is required",
+                "next_legal_actions": list(_IDENTITY_ONLY_NEXT_LEGAL_ACTIONS),
+                "source_events": [],
+                "missing_source_events": [
+                    f"route.action_precheck:{_string(action_precheck_id) or DEFAULT_ROUTE_ACTION_PRECHECK_ID}"
+                ],
+                "route_service_preview_available": bool(preview.get("available")),
+                "service_generated_route_identity": _object(
+                    preview.get("service_generated_route_identity")
+                ),
+                "counts_as_close_evidence": False,
+                "authorizes_protected_write": False,
+                "authorizes_protected_worker_dispatch_evidence": False,
+                "mode": "record",
+                "record": True,
+            }
+
     source_events: list[dict[str, Any]] = []
     missing: list[str] = []
     generated_identity = _object(preview.get("service_generated_route_identity"))
