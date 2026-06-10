@@ -20640,6 +20640,26 @@ def handle_task_timeline_append(ctx: RequestContext):
                 task_id=ctx.body.get("task_id", ""),
                 commit_sha=ctx.body.get("commit_sha", ""),
             )
+        raw_event_kind = ctx.body.get("event_kind", "")
+        raw_status = ctx.body.get("status", "")
+        raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
+        try:
+            norm_event_kind, norm_status, norm_payload = (
+                task_timeline.validate_and_normalize_mf_read_receipt_append(
+                    event_type=ctx.body.get("event_type", ""),
+                    event_kind=raw_event_kind,
+                    actor=ctx.body.get("actor", ""),
+                    status=raw_status,
+                    payload=raw_payload,
+                )
+            )
+        except ValueError as exc:
+            raise GovernanceError(
+                "mf_read_receipt_validation_failed",
+                str(exc),
+                422,
+                {"error": str(exc), "code": "mf_read_receipt_validation_failed"},
+            )
         result = task_timeline.record_event(
             conn,
             project_id=project_id,
@@ -20649,7 +20669,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             attempt_num=int(ctx.body.get("attempt_num", 0) or 0),
             event_type=ctx.body.get("event_type", ""),
             phase=ctx.body.get("phase", ""),
-            event_kind=ctx.body.get("event_kind", ""),
+            event_kind=norm_event_kind,
             scenario_id=ctx.body.get("scenario_id", ""),
             parent_event_id=_query_int(ctx.body, "parent_event_id", 0),
             correlation_id=ctx.body.get("correlation_id", ""),
@@ -20657,8 +20677,8 @@ def handle_task_timeline_append(ctx: RequestContext):
             decision=ctx.body.get("decision", ""),
             schema_version=_query_int(ctx.body, "schema_version", 2),
             actor=ctx.body.get("actor", ""),
-            status=ctx.body.get("status", ""),
-            payload=_timeline_payload_with_route_gate(ctx.body, route_gate),
+            status=norm_status,
+            payload=norm_payload,
             verification=ctx.body.get("verification") or {},
             artifact_refs=ctx.body.get("artifact_refs") or {},
             trace_id=ctx.body.get("trace_id", ""),

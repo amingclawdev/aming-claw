@@ -1122,6 +1122,109 @@ def _is_mf_subagent_read_receipt_event(event: dict[str, Any]) -> bool:
     )
 
 
+# Projection schema name used in actionable rejection errors so callers can
+# look up what the close gate expects.
+_RECEIPT_PROJECTION_SCHEMA = "runtime_context.timeline_evidence_fields.v1"
+# Fields the close gate requires on a read-receipt event.
+_RECEIPT_LINEAGE_REQUIRED = ("runtime_context_id", "task_id", "parent_task_id", "fence_token")
+# At least one of these hash fields must be present.
+_RECEIPT_HASH_FIELDS = ("read_receipt_hash", "launch_text_hash")
+
+
+def validate_and_normalize_mf_read_receipt_append(
+    event_type: str,
+    event_kind: str,
+    actor: str,
+    status: str,
+    payload: dict[str, Any] | None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Validate and normalize an mf_subagent read-receipt append at write time.
+
+    Called in the server handler before record_event so that malformed receipts
+    are rejected immediately with an actionable error rather than silently
+    accepted and discovered unusable at close.
+
+    Returns (normalized_event_kind, normalized_status, normalized_payload) when
+    the event is not a read-receipt (passthrough) or when the event is a valid
+    read-receipt after normalization.
+
+    Raises ValueError with an actionable message naming the missing projection
+    fields when the event is a read-receipt but is invalid.
+
+    Normalization rules (only applied to detected receipts):
+    - event_kind is set to "mf_subagent_read_receipt" when the event_type marks
+      a receipt but event_kind is absent.
+    - worker_slot_id is set from worker_id in the payload when worker_slot_id is
+      absent and worker_id is present.
+
+    Rejection rules (only applied to detected receipts):
+    - status must be non-empty and a passing status (see MF_CLOSE_PASS_STATUSES).
+    - at least one of read_receipt_hash or launch_text_hash must be present in
+      the payload.
+    - runtime_context_id, task_id, parent_task_id, and fence_token must all be
+      present in the payload (lineage required by the close-gate projection).
+    """
+    p = dict(payload or {})
+    # Build a synthetic event dict so we can reuse _is_mf_subagent_read_receipt_event.
+    probe = {
+        "event_type": event_type,
+        "event_kind": event_kind,
+        "actor": actor,
+        "status": status,
+        "payload": p,
+    }
+    if not _is_mf_subagent_read_receipt_event(probe):
+        # Not a read-receipt — pass through unchanged.
+        return event_kind, status, p
+
+    # --- Normalization ---
+    normalized_kind = event_kind
+    if not str(normalized_kind or "").strip():
+        normalized_kind = "mf_subagent_read_receipt"
+
+    # Normalize worker_slot_id from worker_id when absent.
+    if not str(p.get("worker_slot_id") or "").strip():
+        worker_id = str(p.get("worker_id") or "").strip()
+        if worker_id:
+            p = dict(p)
+            p["worker_slot_id"] = worker_id
+
+    # --- Validation ---
+    missing: list[str] = []
+
+    # status must be present and passing.
+    normalized_status_val = str(status or "").strip()
+    if not normalized_status_val or normalized_status_val not in MF_CLOSE_PASS_STATUSES:
+        missing.append("status (must be one of: " + ", ".join(sorted(MF_CLOSE_PASS_STATUSES)) + ")")
+
+    # At least one of read_receipt_hash or launch_text_hash must be present.
+    has_hash = any(str(p.get(f) or "").strip() for f in _RECEIPT_HASH_FIELDS)
+    if not has_hash:
+        missing.append("read_receipt_hash or launch_text_hash")
+
+    # Lineage fields required for close-gate projection.
+    for field in _RECEIPT_LINEAGE_REQUIRED:
+        if not str(p.get(field) or "").strip():
+            missing.append(field)
+
+    # worker_slot_id must now be present (after normalization attempt).
+    if not str(p.get("worker_slot_id") or "").strip():
+        missing.append("worker_slot_id (or worker_id for normalization)")
+
+    if missing:
+        raise ValueError(
+            "mf_subagent read-receipt append rejected: missing required projection fields "
+            f"for {_RECEIPT_PROJECTION_SCHEMA}: {', '.join(missing)}. "
+            "Required fields: status (passing), "
+            + ", ".join(_RECEIPT_LINEAGE_REQUIRED)
+            + ", worker_slot_id, and at least one of "
+            + "/".join(_RECEIPT_HASH_FIELDS)
+            + "."
+        )
+
+    return normalized_kind, status, p
+
+
 def _container_has_marker_key(value: Any, marker_keys: set[str], *, depth: int = 0) -> bool:
     if depth > 5:
         return False
