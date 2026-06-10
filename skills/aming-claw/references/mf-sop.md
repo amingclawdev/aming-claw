@@ -306,6 +306,31 @@ Chain-Bug-Id: <backlog-id>
 
 Use `[observer-hotfix]` or `manual fix:` in the subject when this is a true MF bypass.
 
+## Live Current-Task Runtime Binding Rule
+
+A backlog row appears as a live entry in the Current activity pool only when
+**all three** of the following hold:
+
+1. `runtime_state` is set to an active value (e.g. `manual_fix_in_progress`).
+2. `current_task_id` is set to the running worker's task id.
+3. `updated_at` is refreshed to reflect recent activity.
+
+A **timeline event alone** (e.g. an `observer_hold` event recorded against the
+backlog id) does **not** make a row live in the runtime pool; it only makes the
+row a candidate for the secondary timeline-based path.
+
+A row with `runtime_state=manual_fix_in_progress` and an **empty
+`current_task_id`** is treated as **stale** and is excluded from the active
+pool and the single-active count.  Workers must call
+`backlog_runtime.update_backlog_runtime` (or the equivalent MCP/API path)
+immediately on startup to bind both fields atomically.  Failing to set
+`current_task_id` while setting `runtime_state` leaves the row stale and
+invisible to the Current activity widget.
+
+**Data note**: 63 rows matching `manual_fix_in_progress` with empty
+`current_task_id` were CANCELLED on 2026-06-09 as part of the cleanup that
+preceded this guard.
+
 ## After Commit
 
 1. Restart/redeploy changed runtime services when needed.
