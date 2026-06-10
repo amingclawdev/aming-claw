@@ -6173,16 +6173,33 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             if context is None:
                 raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
 
-            # INFO-01 hardening: cross-check the body-supplied fence_token against
-            # the server-side runtime context BEFORE running the finish gate.
-            # This prevents a redirected request (e.g. wrong task_id in body) from
-            # accidentally running the gate against the wrong lane's startup events.
+            # INFO-01 unconditional fence gate
+            # (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610):
+            # The fence_token in the request body MUST be present AND must match
+            # the server-resolved runtime context's fence_token.  Body omission
+            # is no longer silently tolerated — a missing body fence_token means
+            # the caller cannot prove it is operating on the correct lane.
+            # Context lookup failure already raises above; here we also refuse if
+            # the context exists but has no fence_token (misconfigured lane).
             body_fence_token = str(ctx.body.get("fence_token") or "").strip()
-            if body_fence_token and context.fence_token and body_fence_token != context.fence_token:
+            if not body_fence_token:
+                raise ValidationError(
+                    "fence_token is required in the finish-gate request body; "
+                    "omission is not permitted — supply the lane's fence_token "
+                    "to prove the request targets the correct lane"
+                )
+            if not context.fence_token:
+                raise ValidationError(
+                    "fence_token not found on server-side runtime context for the "
+                    "resolved lane; lane may be misconfigured — contact the observer"
+                )
+            if body_fence_token != context.fence_token:
                 raise ValidationError(
                     "fence_token mismatch: body fence_token does not match "
                     "server-side runtime context for the resolved lane; "
-                    "ensure task_id and fence_token identify the same lane"
+                    "ensure task_id and fence_token identify the same lane "
+                    "(next legal action: verify task_id and fence_token match "
+                    "the lane allocated for this worker)"
                 )
 
             # F2 security fix: caller-supplied real_startup_events MUST be ignored.
