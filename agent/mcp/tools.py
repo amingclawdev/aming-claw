@@ -610,6 +610,11 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "bug_id": {"type": "string"},
+                "view": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "description": "compact returns can_close + failed_gates only (gate_summary). full (default) returns the complete timeline_gate tree. Existing callers unaffected when view is omitted.",
+                },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
             },
@@ -1697,6 +1702,8 @@ class ToolDispatcher:
             pid = args["project_id"]
             bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
             query = {}
+            if args.get("view"):
+                query["view"] = str(args["view"])
             if "include_events" in args:
                 query["include_events"] = "true" if args.get("include_events") else "false"
             if args.get("limit"):

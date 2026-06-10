@@ -638,6 +638,34 @@ def _acquire_pid_lock():
     with open(lock_path, "w") as f:
         f.write(str(os.getpid()))
 
+def _governance_scratch_dir(project_id: str) -> str:
+    """Return the governance scratch directory for a project, creating it if needed."""
+    base = os.environ.get(
+        "SHARED_VOLUME_PATH",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume"),
+    )
+    scratch = os.path.join(base, "codex-tasks", "state", "governance", project_id, "scratch")
+    os.makedirs(scratch, exist_ok=True)
+    return scratch
+
+
+def _persist_full_payload(project_id: str, name: str, request_id: str, payload: dict) -> tuple[str, str]:
+    """Persist full JSON payload to governance scratch dir.
+
+    Returns (full_payload_path, full_payload_sha256).
+    """
+    import hashlib
+    scratch = _governance_scratch_dir(project_id)
+    safe_req = str(request_id or "").replace("/", "-").replace(":", "-")[:40]
+    filename = f"{name}-{safe_req}.json"
+    path = os.path.join(scratch, filename)
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(raw)
+    digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return path, digest
+
+
 # --- Route Registry ---
 ROUTES = []
 
@@ -1684,7 +1712,54 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
         materialization["recorded_service_event_ids"] = [
             int(event.get("id") or 0) for event in recorded_service_events
         ]
-        return materialization
+        # AC3: Persist full payload to scratch; return compact response.
+        full_payload_path, full_payload_sha256 = _persist_full_payload(
+            project_id,
+            "repair-run-route-evidence",
+            str(ctx.request_id),
+            materialization,
+        )
+        # Collect recorded event ids+kinds+status for compact summary
+        recorded_event_ids = []
+        for ev in recorded_sources + recorded_service_events:
+            recorded_event_ids.append({
+                "id": int(ev.get("id") or 0),
+                "event_kind": str(ev.get("event_kind") or ""),
+                "status": str(ev.get("status") or ""),
+            })
+        # Supersession summary (if present)
+        supersession_summary = {}
+        if materialization.get("superseded_event_ids") or materialization.get("supersession"):
+            supersession_summary = {
+                "superseded_event_ids": materialization.get("superseded_event_ids") or [],
+                "supersession": materialization.get("supersession") or {},
+            }
+        route_identity_used = {
+            key: materialization.get(key) or ""
+            for key in ("route_id", "route_context_hash", "prompt_contract_id", "prompt_contract_hash", "visible_injection_manifest_hash")
+            if materialization.get(key)
+        }
+        # Compact response: include new compact fields + backward-compat keys from materialization
+        # so existing callers (e.g. tests using recorded_source_event_ids / reused_source_event_ids)
+        # are not broken. The large repeated plan/source_events bodies are dropped.
+        compact = {
+            "ok": bool(materialization.get("ok") or materialization.get("recorded")),
+            "recorded": True,
+            # backward-compat keys retained for existing callers
+            "recorded_source_event_ids": materialization["recorded_source_event_ids"],
+            "recorded_service_event_ids": materialization["recorded_service_event_ids"],
+            "reused_source_event_ids": materialization["reused_source_event_ids"],
+            "recorded_service_events": recorded_service_events,
+            # new compact summary fields
+            "recorded_event_ids": recorded_event_ids,
+            "route_identity_used": route_identity_used,
+            "full_payload_path": full_payload_path,
+            "full_payload_sha256": full_payload_sha256,
+            "request_id": str(ctx.request_id),
+        }
+        if supersession_summary:
+            compact["supersession_summary"] = supersession_summary
+        return compact
     finally:
         conn.close()
 
@@ -21060,7 +21135,32 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
             "contract_revision_id": revision.get("revision_id", ""),
             "contract_revision_persisted": True,
         }
-    return prepared
+    # AC3: Persist full payload to scratch; return compact response.
+    full_payload_path, full_payload_sha256 = _persist_full_payload(
+        project_id,
+        "observer-runtime-text-prepare",
+        str(ctx.request_id),
+        prepared,
+    )
+    dispatch_gate_validation = dict(prepared.get("dispatch_gate_validation") or {})
+    dispatch_verdict = {
+        "allowed": bool(dispatch_gate_validation.get("allowed")),
+        "status": str(dispatch_gate_validation.get("status") or ""),
+        "startup_intent_event_generated": bool(dispatch_gate_validation.get("startup_intent_event_generated")),
+    }
+    compact = {
+        "ok": bool(prepared.get("ok")),
+        "status": str(prepared.get("status") or ""),
+        "launch_text": prepared.get("launch_text"),  # host needs it
+        "launch_text_hash": str(prepared.get("launch_text_hash") or ""),
+        "runtime_context_id": str(prepared.get("runtime_context_id") or ""),
+        "observer_command_id": str(prepared.get("observer_command_id") or ""),
+        "dispatch_gate_validation": dispatch_verdict,
+        "full_payload_path": full_payload_path,
+        "full_payload_sha256": full_payload_sha256,
+        "request_id": str(ctx.request_id),
+    }
+    return compact
 
 
 @route("POST", "/api/task/{project_id}/progress")
@@ -23263,11 +23363,16 @@ def handle_backlog_get(ctx: RequestContext):
 
 @route("GET", "/api/backlog/{project_id}/{bug_id}/timeline-gate")
 def handle_backlog_timeline_gate(ctx: RequestContext):
-    """Read-only MF close-gate precheck for backlog timeline evidence."""
+    """Read-only MF close-gate precheck for backlog timeline evidence.
+
+    Pass view=compact for a compact summary (can_close, failed_gates only).
+    Default (view omitted or view=full) returns the full gate tree — existing callers unaffected.
+    """
     pid = ctx.path_params["project_id"]
     bug_id = ctx.path_params["bug_id"]
     include_events = _query_bool(ctx.query, "include_events", False)
     limit = max(1, min(_query_int(ctx.query, "limit", 1000), 1000))
+    view = str(ctx.query.get("view") or "full").strip().lower()
     conn = get_connection(pid)
     try:
         row = conn.execute(
@@ -23308,9 +23413,17 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "applicable": applicable["is_mf"],
             "reason": applicable["reason"],
             "can_close": can_close,
-            "timeline_gate": verification,
             "event_count": len(events),
         }
+        if view == "compact":
+            # Compact view: derive summary from full result without re-evaluating gate logic
+            compact_summary = task_timeline.compact_gate_summary(
+                {**verification, "project_id": pid, "bug_id": bug_id, "applicable": applicable["is_mf"]},
+                request_id=ctx.request_id,
+            )
+            result["gate_summary"] = compact_summary
+        else:
+            result["timeline_gate"] = verification
         # Criterion 2: surface FIXED + can_close=false + no-waiver as a
         # governance integrity alert. A row already marked FIXED must carry
         # can_close=true OR a visible close-waiver marker.
@@ -24043,7 +24156,14 @@ def handle_backlog_close(ctx: RequestContext):
         if chain_stage:
             result["chain_stage"] = chain_stage
         if timeline_gate:
-            result["timeline_gate"] = timeline_gate
+            # AC2: Return compact gate summary instead of the full timeline_gate tree.
+            # Close DECISION logic above is byte-identical; only response payload shrinks.
+            # Callers needing the full tree can call precheck(view=full).
+            from . import task_timeline as _tl
+            result["gate_summary"] = _tl.compact_gate_summary(
+                {**timeline_gate, "bug_id": bug_id},
+                request_id=str(ctx.request_id),
+            )
         result["route_token_gate"] = route_gate
         if close_impact_check:
             result["close_impact_check"] = close_impact_check
