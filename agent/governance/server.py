@@ -6161,7 +6161,38 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             if context is None:
                 raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
 
-            gate = validate_mf_subagent_finish_gate(ctx.body, context=context)
+            # F2 security fix: caller-supplied real_startup_events MUST be ignored.
+            # A caller could fabricate matching startup events to bypass the
+            # surrogate join gate.  Instead, always fetch startup events from the
+            # governance DB (task_timeline_events WHERE event_kind='mf_subagent_startup'
+            # AND task_id=<lane task>).  We build a sanitized payload copy that:
+            #   1. strips all caller-supplied event-list keys
+            #   2. injects DB-sourced events under 'real_startup_events'
+            # and surface 'caller_supplied_real_startup_events_ignored': True when
+            # the caller did include any of those keys.
+            from . import task_timeline as _task_timeline
+            _CALLER_STARTUP_EVENT_KEYS = (
+                "real_startup_events",
+                "startup_events",
+                "timeline_events",
+                "events",
+            )
+            _caller_supplied = any(ctx.body.get(k) for k in _CALLER_STARTUP_EVENT_KEYS)
+            _db_startup_events = _task_timeline.list_events(
+                conn,
+                project_id,
+                task_id=task_id,
+                event_kind="mf_subagent_startup",
+                limit=200,
+            )
+            _sanitized_body: dict[str, Any] = {
+                k: v for k, v in ctx.body.items()
+                if k not in _CALLER_STARTUP_EVENT_KEYS
+            }
+            _sanitized_body["real_startup_events"] = _db_startup_events
+            gate = validate_mf_subagent_finish_gate(_sanitized_body, context=context)
+            if _caller_supplied:
+                gate["caller_supplied_real_startup_events_ignored"] = True
             claimed_head = str(gate.get("head_commit") or "").strip()
             actual_head = ""
             worktree_path = str(context.worktree_path or "")

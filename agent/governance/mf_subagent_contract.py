@@ -2804,14 +2804,24 @@ def _bounded_dispatch_evidence_present(evidence: Mapping[str, Any]) -> bool:
     )
 
 
-def _bounded_startup_evidence_present(evidence: Mapping[str, Any]) -> bool:
+def _bounded_startup_evidence_present(
+    evidence: Mapping[str, Any],
+    *,
+    real_startup_events: Any = None,
+) -> bool:
     if _explicit_false(evidence.get("bounded")) or _startup_intent_only(evidence):
         return False
     # A host-adapter startup-token surrogate is never close-satisfying real
     # bounded-worker evidence (regression #3104), even when the live startup gate
-    # stamps close_satisfying=true.
+    # stamps close_satisfying=true — UNLESS a real worker startup event for the
+    # same lane lineage joins the surrogate by lineage match.
     if _startup_is_host_adapter_surrogate(evidence):
-        return False
+        if not real_startup_events:
+            return False
+        join = _startup_real_worker_join(evidence, real_startup_events=real_startup_events)
+        if not join["joined"]:
+            return False
+        # Surrogate joined by real startup — treat as bounded evidence.
     gate_kind = _string(evidence.get("gate_kind") or evidence.get("kind")).lower()
     schema_version = _string(evidence.get("schema_version"))
     bounded_signal = (
@@ -2832,32 +2842,185 @@ HOST_ADAPTER_SURROGATE_MATCH_MODE = "host_adapter_startup_token_surrogate"
 SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE = "surrogate"
 OBSERVER_HOTFIX_EXCEPTION_MODE = "observer_hotfix_exception"
 SURROGATE_STARTUP_GATE_SCHEMA_VERSION = "mf_surrogate_startup_evidence_gate.v1"
+REAL_WORKER_JOIN_SCHEMA_VERSION = "mf_surrogate_real_worker_join.v1"
+
+# Lineage fields used to match a surrogate startup against a real worker startup.
+_SURROGATE_JOIN_LINEAGE_FIELDS = (
+    "task_id",
+    "worker_slot_id",
+    "runtime_context_id",
+    "fence_token",
+)
 
 
 def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
-    """True when startup identity came from a host-adapter token surrogate.
+    """True when startup identity came from a host-adapter token surrogate only.
+
+    A startup is a true surrogate when the session token is absent and a
+    surrogate string (or host_adapter marker without a real token) was used.
+    A startup that went through the host-adapter path *but* carries a real
+    session-token hash (``session_token_evidence_type == "hash"``) is NOT a
+    surrogate — the worker had a real token and the host-adapter path was only
+    used because the allocation_owner is an observer identity.
 
     The live startup gate stamps ``agent_id_match_mode`` /
-    ``session_token_evidence_type`` so a surrogate startup is distinguishable from
-    a real session-token startup.
+    ``session_token_evidence_type`` so a surrogate startup is distinguishable
+    from a real session-token startup.
     """
 
     if not isinstance(evidence, Mapping):
+        return False
+    token_type = _string(evidence.get("session_token_evidence_type")).lower()
+    # "surrogate" evidence type is always a surrogate — no real token present.
+    if token_type == SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE:
+        return True
+    # Real session token hash present — NOT a surrogate even if the host-adapter
+    # path was used for agent_id matching (allocation_owner is observer).
+    if _string(evidence.get("session_token_hash")) and _bool(
+        evidence.get("session_token_present")
+    ):
         return False
     match_mode = _string(
         evidence.get("agent_id_match_mode")
         or _nested_mapping(evidence, "identity_join").get("agent_id_match_mode")
     ).lower()
-    token_type = _string(evidence.get("session_token_evidence_type")).lower()
-    if token_type == SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE:
-        return True
     if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
-        return True
+        # Only a surrogate if no real session token is present.
+        has_real_token = bool(
+            _string(evidence.get("session_token_hash"))
+            or _bool(evidence.get("session_token_present"))
+        )
+        return not has_real_token
     return bool(
         _bool(evidence.get("host_adapter_startup_token_accepted"))
         and not _string(evidence.get("session_token_hash"))
         and not _bool(evidence.get("session_token_present"))
     )
+
+
+def _startup_real_worker_join(
+    surrogate_evidence: Mapping[str, Any],
+    *,
+    real_startup_events: Any = None,
+) -> dict[str, Any]:
+    """Check whether a surrogate startup can be joined to a real worker startup.
+
+    When the HOST (observer adapter) recorded a surrogate startup, a later REAL
+    parallel_branch_startup from the actual worker with matching lineage
+    (task_id / worker_slot_id / runtime_context_id / fence_token) upgrades the
+    surrogate to close-satisfying evidence.  The join is evidence-based: it
+    requires the real startup to carry matching lineage fields, NOT merely the
+    presence of the surrogate flag.
+
+    Returns a structured result:
+    - ``joined``: True when a real startup event satisfies the join.
+    - ``join_event_id``: the event id of the real startup that satisfied it
+      (empty string when not joined).
+    - ``reason``: human-readable reason for pass or refusal.
+    - ``lineage``: the lineage fields used for matching.
+    """
+
+    surrogate = dict(surrogate_evidence) if isinstance(surrogate_evidence, Mapping) else {}
+    # Extract lineage from surrogate.
+    surrogate_task_id = _string(surrogate.get("task_id"))
+    surrogate_worker_slot_id = _string(
+        surrogate.get("worker_slot_id") or surrogate.get("worker_id")
+    )
+    surrogate_runtime_context_id = _string(surrogate.get("runtime_context_id"))
+    surrogate_fence_token = _string(surrogate.get("fence_token"))
+
+    lineage = {
+        "task_id": surrogate_task_id,
+        "worker_slot_id": surrogate_worker_slot_id,
+        "runtime_context_id": surrogate_runtime_context_id,
+        "fence_token": surrogate_fence_token,
+    }
+
+    if not real_startup_events:
+        return {
+            "schema_version": REAL_WORKER_JOIN_SCHEMA_VERSION,
+            "joined": False,
+            "join_event_id": "",
+            "reason": "surrogate_only_no_real_startup_events_provided",
+            "lineage": lineage,
+        }
+
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(real_startup_events, Mapping):
+        candidates = [real_startup_events]
+    elif isinstance(real_startup_events, Sequence) and not isinstance(
+        real_startup_events, (str, bytes, bytearray)
+    ):
+        for item in real_startup_events:
+            if isinstance(item, Mapping):
+                candidates.append(item)
+
+    for event in candidates:
+        # Accept both raw startup gate dicts and timeline event wrappers.
+        gate: Mapping[str, Any] = event
+        payload = _nested_mapping(event, "payload")
+        if payload:
+            nested_gate = _nested_mapping(payload, "mf_subagent_startup_gate")
+            if nested_gate:
+                gate = nested_gate
+        # A real startup must NOT itself be a surrogate.
+        if _startup_is_host_adapter_surrogate(gate):
+            continue
+        # It must carry a real session token.
+        if not _string(gate.get("session_token_hash")) and not _bool(
+            gate.get("session_token_present")
+        ):
+            token_type = _string(gate.get("session_token_evidence_type")).lower()
+            if token_type not in ("hash",):
+                continue
+        # F3 fix: all four lineage fields must be NON-EMPTY on the candidate
+        # AND equal to the surrogate's lineage.  An empty candidate field means
+        # the event does not carry lineage and must NOT join any surrogate.
+        if surrogate_task_id:
+            candidate_task = _string(gate.get("task_id"))
+            if not candidate_task or candidate_task != surrogate_task_id:
+                continue
+        if surrogate_worker_slot_id:
+            candidate_slot = _string(
+                gate.get("worker_slot_id") or gate.get("worker_id")
+            )
+            if not candidate_slot or candidate_slot != surrogate_worker_slot_id:
+                continue
+        if surrogate_runtime_context_id:
+            candidate_rctx = _string(gate.get("runtime_context_id"))
+            if not candidate_rctx or candidate_rctx != surrogate_runtime_context_id:
+                continue
+        if surrogate_fence_token:
+            candidate_fence = _string(gate.get("fence_token"))
+            if not candidate_fence or candidate_fence != surrogate_fence_token:
+                continue
+        # Matched — extract event id.
+        join_event_id = _string(
+            event.get("id")
+            or event.get("event_id")
+            or event.get("timeline_event_id")
+            or gate.get("startup_event_id")
+            or gate.get("event_id")
+        )
+        return {
+            "schema_version": REAL_WORKER_JOIN_SCHEMA_VERSION,
+            "joined": True,
+            "join_event_id": join_event_id,
+            "reason": "real_worker_startup_lineage_match",
+            "matched_lineage_fields": [
+                f for f in _SURROGATE_JOIN_LINEAGE_FIELDS
+                if lineage.get(f)
+            ],
+            "lineage": lineage,
+        }
+
+    return {
+        "schema_version": REAL_WORKER_JOIN_SCHEMA_VERSION,
+        "joined": False,
+        "join_event_id": "",
+        "reason": "surrogate_only_no_matching_real_startup_in_events",
+        "lineage": lineage,
+    }
 
 
 def _observer_hotfix_exception_present(events: Any) -> bool:
@@ -2891,35 +3054,78 @@ def surrogate_startup_evidence_gate(
     startup_evidence: Mapping[str, Any] | None,
     *,
     events: Any = None,
+    real_startup_events: Any = None,
 ) -> dict[str, Any]:
     """Demote host-adapter surrogate startup evidence. [regression #3104]
 
     When the startup token/identity is a host_adapter_startup_token_surrogate
     (``session_token_evidence_type == "surrogate"``), the startup must NOT be
     close-satisfying for a real bounded-worker or independent-QA evidence
-    requirement UNLESS an explicit observer_hotfix_exception mode event is
-    present — and even then it is NOT counted as close-satisfying real-worker
-    evidence. A real session-token startup stays close-satisfying.
+    requirement UNLESS:
+
+    1. An explicit observer_hotfix_exception mode event is present — but even
+       then it is NOT counted as close-satisfying real-worker evidence. A real
+       session-token startup stays close-satisfying.
+    2. [AC fix] A real worker startup event for the same lane lineage
+       (task_id / worker_slot_id / runtime_context_id / fence_token) exists in
+       ``real_startup_events``.  When a real startup joins the surrogate by
+       lineage match, the surrogate becomes close-satisfying and the join event
+       id is surfaced in the response.  The join is evidence-based — it requires
+       a matching real startup event, NOT a flag that bypasses the gate.
+
+    When neither condition is met and the startup is a true surrogate, the
+    refusal remains.  Surrogate-only lanes stay blocked.
     """
 
     evidence = startup_evidence if isinstance(startup_evidence, Mapping) else {}
     is_surrogate = _startup_is_host_adapter_surrogate(evidence)
     hotfix_exception = _observer_hotfix_exception_present(events)
     declared_close_satisfying = not _explicit_false(evidence.get("close_satisfying"))
+    join_result: dict[str, Any] = {
+        "schema_version": REAL_WORKER_JOIN_SCHEMA_VERSION,
+        "joined": False,
+        "join_event_id": "",
+        "reason": "not_applicable_not_a_surrogate",
+        "lineage": {},
+    }
     if not is_surrogate:
         close_satisfying = declared_close_satisfying
         reason = "real_session_token_startup"
     else:
-        # Surrogate startup is never close-satisfying real-worker evidence,
-        # whether or not a hotfix exception exists. The hotfix exception only
-        # lets the startup proceed under a relaxed identity match — it does not
-        # promote surrogate evidence to real-worker close evidence.
-        close_satisfying = False
-        reason = (
-            "host_adapter_surrogate_under_observer_hotfix_exception_not_real_worker_evidence"
-            if hotfix_exception
-            else "host_adapter_surrogate_blocked_without_observer_hotfix_exception"
-        )
+        # Check whether a real worker startup joins the surrogate by lineage.
+        if real_startup_events:
+            join_result = _startup_real_worker_join(
+                evidence, real_startup_events=real_startup_events
+            )
+        else:
+            join_result = {
+                "schema_version": REAL_WORKER_JOIN_SCHEMA_VERSION,
+                "joined": False,
+                "join_event_id": "",
+                "reason": "surrogate_only_no_real_startup_events_provided",
+                "lineage": {
+                    field: _string(evidence.get(field))
+                    for field in _SURROGATE_JOIN_LINEAGE_FIELDS
+                },
+            }
+        if join_result["joined"]:
+            # A real worker startup with matching lineage upgrades the surrogate.
+            close_satisfying = True
+            reason = (
+                "surrogate_joined_by_real_worker_startup:"
+                + _string(join_result.get("join_event_id"))
+            )
+        else:
+            # Surrogate startup is never close-satisfying real-worker evidence
+            # unless joined by a real startup.  The hotfix exception only lets
+            # the startup proceed under a relaxed identity match — it does NOT
+            # promote surrogate evidence to real-worker close evidence.
+            close_satisfying = False
+            reason = (
+                "host_adapter_surrogate_under_observer_hotfix_exception_not_real_worker_evidence"
+                if hotfix_exception
+                else "host_adapter_surrogate_blocked_without_observer_hotfix_exception"
+            )
     return {
         "schema_version": SURROGATE_STARTUP_GATE_SCHEMA_VERSION,
         "is_host_adapter_surrogate": is_surrogate,
@@ -2930,6 +3136,7 @@ def surrogate_startup_evidence_gate(
         "counts_as_independent_qa_evidence": close_satisfying,
         "status": "close_satisfying" if close_satisfying else "demoted",
         "reason": reason,
+        "real_worker_join": join_result,
     }
 
 
@@ -4831,7 +5038,25 @@ def validate_mf_subagent_finish_gate(
         ),
     )
     startup_evidence = _route_startup_evidence(payload)
-    startup_present = _bounded_startup_evidence_present(startup_evidence)
+    # Extract real_startup_events from the finish-gate payload so the
+    # surrogate join gate can check whether a real worker startup for the same
+    # lane lineage exists.  Callers may pass timeline events under any of:
+    # real_startup_events / startup_events / timeline_events / events.
+    real_startup_events = (
+        payload.get("real_startup_events")
+        or payload.get("startup_events")
+        or payload.get("timeline_events")
+        or payload.get("events")
+    )
+    startup_present = _bounded_startup_evidence_present(
+        startup_evidence, real_startup_events=real_startup_events
+    )
+    # Build a structured surrogate join result for the response.
+    surrogate_join_gate = surrogate_startup_evidence_gate(
+        startup_evidence,
+        events=real_startup_events,
+        real_startup_events=real_startup_events,
+    )
     observer_command_id = _dispatch_string(
         payload,
         names=("observer_command_id",),
@@ -4854,6 +5079,15 @@ def validate_mf_subagent_finish_gate(
         ),
     ) or _string(startup_evidence.get("read_receipt_event_id"))
     if not startup_present:
+        # Produce a structured reason for the refusal to aid debugging.
+        is_surrogate = _startup_is_host_adapter_surrogate(startup_evidence)
+        if is_surrogate and surrogate_join_gate.get("real_worker_join"):
+            join_reason = surrogate_join_gate["real_worker_join"].get("reason", "")
+            raise MfSubagentContractError(
+                "MF subagent finish gate requires actual mf_subagent_startup evidence "
+                "before close-ready; surrogate-only startup is not close-satisfying "
+                f"(join_result: {join_reason})"
+            )
         raise MfSubagentContractError(
             "MF subagent finish gate requires actual mf_subagent_startup evidence "
             "before close-ready"
@@ -4902,6 +5136,7 @@ def validate_mf_subagent_finish_gate(
         ),
         "governed_evidence_required": governed_evidence_required,
         "startup_evidence": startup_evidence,
+        "surrogate_join_gate": surrogate_join_gate,
         "read_receipt_hash": read_receipt_hash,
         "read_receipt_event_id": read_receipt_event_id,
         "gate_receipt_hash": gate_receipt_hash,

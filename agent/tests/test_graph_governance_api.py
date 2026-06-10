@@ -12110,3 +12110,285 @@ def test_managed_ref_bootstrap_api_applies_supplied_refs(conn, monkeypatch):
     assert listed["refs"][0]["ref_name"] == "refs/heads/release/1.x"
     assert listed["refs"][0]["evidence"]["source"] == "operator_dry_run_accept"
     assert listed["decisions"][0]["action"] == "materialize_ref_graph"
+
+
+# ---------------------------------------------------------------------------
+# F2 security fix: server finish-gate handler must IGNORE caller-supplied
+# real_startup_events and source them exclusively from the governance DB.
+# (QA block #3516 finding F2-CRITICAL)
+# ---------------------------------------------------------------------------
+
+def _surrogate_finish_gate_body(
+    *,
+    task_id: str,
+    fence_token: str,
+    worktree_path: str,
+    branch_ref: str,
+    real_startup_events: object = None,
+) -> dict:
+    """Build a finish-gate request body whose startup_evidence is a surrogate."""
+    surrogate_startup = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "started": True,
+        "startup_complete": True,
+        "actual_startup_recorded": True,
+        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+        "session_token_evidence_type": "surrogate",
+        "worker_role": "mf_sub",
+        "fence_token": fence_token,
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "task_id": task_id,
+        "worker_slot_id": f"wslot-{task_id}",
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "head_commit": f"head-{task_id}",
+        "observer_command_id": f"cmd-{fence_token}",
+        "read_receipt_event_id": f"rr-{fence_token}",
+        "route_token_ref": f"rtok-{fence_token}",
+    }
+    body = {
+        "project_id": PID,
+        "task_id": task_id,
+        "status": "review_ready",
+        "changed_files": [],
+        "test_results": {"status": "passed"},
+        "checkpoint_id": f"ckpt-{task_id}",
+        "fence_token": fence_token,
+        "head_commit": f"head-{task_id}",
+        "agent_id": "codex-subagent-api",
+        "startup_evidence": surrogate_startup,
+        "read_receipt_hash": f"sha256:rr-{fence_token}",
+        "read_receipt_event_id": f"rr-{fence_token}",
+        "observer_command_id": f"cmd-{fence_token}",
+    }
+    if real_startup_events is not None:
+        body["real_startup_events"] = real_startup_events
+    return body
+
+
+def _make_real_startup_timeline_event(
+    *,
+    task_id: str,
+    fence_token: str,
+    worktree_path: str,
+    branch_ref: str,
+) -> dict:
+    """A fabricated real worker startup timeline event with matching lineage."""
+    return {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,
+        # NOT a surrogate — real token present.
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:real-token-abc",
+        "session_token_present": True,
+        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+        "host_adapter_startup_token_accepted": True,
+        "worker_role": "mf_sub",
+        "task_id": task_id,
+        "worker_slot_id": f"wslot-{task_id}",
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "fence_token": fence_token,
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "head_commit": f"head-{task_id}",
+        "observer_command_id": f"cmd-{fence_token}",
+        "read_receipt_event_id": f"rr-{fence_token}",
+    }
+
+
+def test_finish_gate_server_ignores_caller_supplied_real_startup_events(conn):
+    """F2 bypass regression: fabricated real_startup_events in the request body
+    must be IGNORED.  A surrogate-only lane (DB has no real startup events for
+    the task) must be refused even when the body carries a perfectly-matching
+    fabricated event.
+    """
+    task_id = "f2-bypass-test-01"
+    fence_token = "fence-f2-bypass"
+    worktree_path = "/tmp/nonexistent-f2-bypass"
+    branch_ref = "refs/heads/f2/bypass-test"
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-f2",
+            head_commit="base-f2",
+            target_head_commit="target-f2",
+            merge_queue_id="mergeq-f2-bypass",
+        ),
+        now_iso="2026-06-10T00:00:00Z",
+    )
+
+    # DB has NO real mf_subagent_startup events for this task.
+    # Fabricate a matching real startup event and pass it in the body.
+    fabricated_event = _make_real_startup_timeline_event(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        real_startup_events=[fabricated_event],
+    )
+
+    # Must be refused because DB has no real startup; caller-supplied events ignored.
+    with pytest.raises(MfSubagentContractError, match="actual mf_subagent_startup evidence"):
+        server.handle_graph_governance_parallel_branch_finish_gate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+
+def test_finish_gate_server_accepts_db_sourced_real_startup_events(conn):
+    """F2 positive path: when the governance DB contains a real mf_subagent_startup
+    for the lane, finish-gate must succeed even if the request body carries NO
+    real_startup_events key (events come from DB only).
+    """
+    task_id = "f2-db-source-test-01"
+    fence_token = "fence-f2-db"
+    worktree_path = "/tmp/nonexistent-f2-db"
+    branch_ref = "refs/heads/f2/db-test"
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-f2-db",
+            head_commit="base-f2-db",
+            target_head_commit="target-f2-db",
+            merge_queue_id="mergeq-f2-db",
+        ),
+        now_iso="2026-06-10T00:01:00Z",
+    )
+
+    # Insert a real mf_subagent_startup event into the DB.
+    real_event_payload = _make_real_startup_timeline_event(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id="AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor="mf_sub",
+        payload={"mf_subagent_startup_gate": real_event_payload},
+    )
+    conn.commit()
+
+    # Body has NO real_startup_events — server must use DB exclusively.
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        # no real_startup_events key
+    )
+
+    result = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert result["ok"] is True, f"Expected ok=True but got: {result}"
+    # The gate should not flag caller-supplied events ignored (none were supplied).
+    assert result["gate"].get("caller_supplied_real_startup_events_ignored") is not True
+
+
+def test_finish_gate_server_flags_caller_supplied_ignored(conn):
+    """F2 transparency: when body does contain real_startup_events,
+    the response should include caller_supplied_real_startup_events_ignored=True,
+    even if the call ultimately succeeds because DB has a matching real startup.
+    """
+    task_id = "f2-flag-test-01"
+    fence_token = "fence-f2-flag"
+    worktree_path = "/tmp/nonexistent-f2-flag"
+    branch_ref = "refs/heads/f2/flag-test"
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-f2-flag",
+            head_commit="base-f2-flag",
+            target_head_commit="target-f2-flag",
+            merge_queue_id="mergeq-f2-flag",
+        ),
+        now_iso="2026-06-10T00:02:00Z",
+    )
+
+    # Insert a real startup into the DB.
+    real_event_payload = _make_real_startup_timeline_event(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id="AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor="mf_sub",
+        payload={"mf_subagent_startup_gate": real_event_payload},
+    )
+    conn.commit()
+
+    # Pass a (now-ignored) real_startup_events in the body.
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        real_startup_events=[{"fabricated": True}],
+    )
+
+    result = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert result["ok"] is True
+    # Transparency flag must be present since caller did supply the key.
+    assert result["gate"].get("caller_supplied_real_startup_events_ignored") is True
