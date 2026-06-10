@@ -803,6 +803,8 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
         "governance_project_id",
         "target_project_id",
         "target_project_root",
+        "merge_queue_id",
+        "merge_preview_id",
     ):
         if column not in columns:
             conn.execute(
