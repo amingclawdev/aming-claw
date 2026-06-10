@@ -6808,6 +6808,7 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
             project_id,
             repo_root_path=root,
             include_unowned=_query_bool(ctx.query, "include_unowned", True),
+            dimension=str(ctx.query.get("dimension") or ""),
         )
     finally:
         conn.close()
@@ -6834,6 +6835,7 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
                 task_id=str(ctx.body.get("task_id") or ""),
                 reason=str(ctx.body.get("reason") or ""),
                 remove_branch=_query_bool(ctx.body, "remove_branch", False),
+                dimension=str(ctx.body.get("dimension") or ""),
             )
         except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
             return 400, exc.payload

@@ -538,7 +538,25 @@ def write_companion_files(
     drift_ledger: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     base_dir = _snapshot_root(project_id, snapshot_id)
-    base_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        import errno as _errno
+        if exc.errno == _errno.ENOSPC:
+            from .stale_artifact_cleanup import cleanup_recommendation as _cr
+            rec = _cr(project_id)
+            raise OSError(
+                exc.errno,
+                (
+                    f"No space left on device while creating snapshot directory for "
+                    f"{project_id}/{snapshot_id}. "
+                    f"Run the graph-snapshots GC to reclaim space: "
+                    f"dry-run via {rec['api']['dry_run']} or MCP tool "
+                    f"'{rec['mcp']['dry_run_tool']}' with dimension='graph_snapshots'."
+                ),
+                str(base_dir),
+            ) from exc
+        raise
 
     graph_bytes = _json(graph_json or {}).encode("utf-8")
     inventory_bytes = _json(file_inventory or []).encode("utf-8")
@@ -548,9 +566,27 @@ def write_companion_files(
     inventory_sha = _sha256_bytes(inventory_bytes)
     drift_sha = _sha256_bytes(drift_bytes)
 
-    (base_dir / "graph.json").write_bytes(graph_bytes)
-    (base_dir / "file_inventory.json").write_bytes(inventory_bytes)
-    (base_dir / "drift_ledger.json").write_bytes(drift_bytes)
+    try:
+        (base_dir / "graph.json").write_bytes(graph_bytes)
+        (base_dir / "file_inventory.json").write_bytes(inventory_bytes)
+        (base_dir / "drift_ledger.json").write_bytes(drift_bytes)
+    except OSError as exc:
+        import errno as _errno
+        if exc.errno == _errno.ENOSPC:
+            from .stale_artifact_cleanup import cleanup_recommendation as _cr
+            rec = _cr(project_id)
+            raise OSError(
+                exc.errno,
+                (
+                    f"No space left on device while writing snapshot files for "
+                    f"{project_id}/{snapshot_id}. "
+                    f"Run the graph-snapshots GC to reclaim space: "
+                    f"dry-run via {rec['api']['dry_run']} or MCP tool "
+                    f"'{rec['mcp']['dry_run_tool']}' with dimension='graph_snapshots'."
+                ),
+                str(base_dir),
+            ) from exc
+        raise
 
     manifest = {
         "project_id": project_id,
@@ -566,6 +602,329 @@ def write_companion_files(
         "inventory_sha256": inventory_sha,
         "drift_sha256": drift_sha,
         "path": str(base_dir),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Snapshot retention policy
+# ---------------------------------------------------------------------------
+
+DEFAULT_SNAPSHOT_KEEP_LAST_N = 10
+
+
+def get_snapshot_retention_config(
+    project_id: str,
+    *,
+    keep_last_n: int | None = None,
+) -> dict[str, Any]:
+    """Return effective retention config, with project-config override support.
+
+    Follows the existing pattern of ``project_service.get_project_config_metadata``.
+    The config path is ``governance.snapshot_retention.keep_last_n``.
+    Falls back to ``DEFAULT_SNAPSHOT_KEEP_LAST_N`` when not configured.
+    """
+    effective_n = int(keep_last_n) if keep_last_n is not None else DEFAULT_SNAPSHOT_KEEP_LAST_N
+    try:
+        from . import project_service
+        metadata = project_service.get_project_config_metadata(project_id) or {}
+        governance = metadata.get("governance") if isinstance(metadata.get("governance"), dict) else {}
+        retention = governance.get("snapshot_retention") if isinstance(governance.get("snapshot_retention"), dict) else {}
+        configured_n = retention.get("keep_last_n")
+        if configured_n is not None:
+            try:
+                effective_n = max(1, int(configured_n))
+            except (TypeError, ValueError):
+                pass
+    except Exception:  # noqa: BLE001 — advisory; default is always safe
+        pass
+    return {
+        "project_id": project_id,
+        "keep_last_n": effective_n,
+        "source": "project_config" if keep_last_n is None else "explicit",
+    }
+
+
+def _bundle_referenced_snapshot_ids() -> set[str]:
+    """Return snapshot_ids that are referenced by plugin bundle manifests.
+
+    These are treated as sealed full baselines and must never be deleted.
+    """
+    from .self_graph_bundle_check import SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH
+    import sys as _sys
+    referenced: set[str] = set()
+    # Walk the installed package tree to locate bundle manifests
+    pkg_root = Path(__file__).resolve().parents[2]
+    candidates: list[Path] = [pkg_root / SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH]
+    # Also search shared-volume for other project bundle manifests if accessible
+    try:
+        from .db import _governance_root
+        groot = _governance_root()
+        if groot.exists():
+            for manifest_path in groot.rglob("self-graph-bundle-manifest.json"):
+                candidates.append(manifest_path)
+    except Exception:  # noqa: BLE001
+        pass
+    for manifest_path in candidates:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            sid = str(manifest.get("snapshot_id") or "").strip()
+            if sid:
+                referenced.add(sid)
+        except Exception:  # noqa: BLE001
+            pass
+    return referenced
+
+
+def select_snapshot_retention_candidates(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    keep_last_n: int | None = None,
+    extra_bundle_snapshot_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Compute retention selection without performing any deletion.
+
+    Returns:
+        {
+            "protected": [{"snapshot_id": ..., "reason": ..., ...}],
+            "candidates": [{"snapshot_id": ..., "age_days": ..., "size_bytes": ..., ...}],
+            "config": {...},
+        }
+
+    Protection rules (NEVER delete):
+    1. The currently active snapshot (status=active or referenced by graph_snapshot_refs).
+    2. Any snapshot whose pending_scope_reconcile row is in RUNNING or QUEUED status
+       (reconcile in progress).
+    3. The last N scope/full snapshots by created_at (default N=10).
+    4. All snapshots referenced by plugin bundle manifests (sealed full baselines).
+    5. Any snapshot with snapshot_kind='full' that is the most recent full baseline.
+    """
+    ensure_schema(conn)
+    config = get_snapshot_retention_config(project_id, keep_last_n=keep_last_n)
+    effective_n = config["keep_last_n"]
+
+    # Collect protected snapshot ids and reasons
+    protected_ids: dict[str, list[str]] = {}
+
+    def _protect(sid: str, reason: str) -> None:
+        protected_ids.setdefault(sid, []).append(reason)
+
+    # Rule 1: active snapshot
+    active_row = conn.execute(
+        "SELECT snapshot_id FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (project_id,),
+    ).fetchone()
+    active_snapshot_id = str(active_row["snapshot_id"] if active_row else "")
+    if active_snapshot_id:
+        _protect(active_snapshot_id, "active_snapshot")
+
+    # Also protect all snapshots pointed to by any ref
+    ref_rows = conn.execute(
+        "SELECT snapshot_id, ref_name FROM graph_snapshot_refs WHERE project_id=?",
+        (project_id,),
+    ).fetchall()
+    for ref_row in ref_rows:
+        _protect(str(ref_row["snapshot_id"]), f"ref_pointer:{ref_row['ref_name']}")
+
+    # Rule 2: reconcile-in-progress (running/queued pending scope rows)
+    in_progress_rows = conn.execute(
+        """
+        SELECT DISTINCT snapshot_id FROM pending_scope_reconcile
+        WHERE project_id=? AND status IN (?, ?) AND snapshot_id != ''
+        """,
+        (project_id, PENDING_STATUS_RUNNING, PENDING_STATUS_QUEUED),
+    ).fetchall()
+    for row in in_progress_rows:
+        sid = str(row["snapshot_id"] or "").strip()
+        if sid:
+            _protect(sid, "reconcile_in_progress")
+
+    # Rule 3: most recent N scope/full snapshots (by created_at DESC)
+    all_scope_full = conn.execute(
+        """
+        SELECT snapshot_id, snapshot_kind, created_at
+        FROM graph_snapshots
+        WHERE project_id=? AND snapshot_kind IN ('scope', 'full')
+        ORDER BY created_at DESC, snapshot_id DESC
+        """,
+        (project_id,),
+    ).fetchall()
+    for idx, row in enumerate(all_scope_full):
+        sid = str(row["snapshot_id"])
+        if idx < effective_n:
+            _protect(sid, f"keep_last_n:{effective_n}")
+
+    # Rule 5: most recent full baseline is always protected (regardless of N)
+    most_recent_full = conn.execute(
+        """
+        SELECT snapshot_id
+        FROM graph_snapshots
+        WHERE project_id=? AND snapshot_kind='full'
+        ORDER BY created_at DESC, snapshot_id DESC
+        LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    if most_recent_full:
+        _protect(str(most_recent_full["snapshot_id"]), "most_recent_full_baseline")
+
+    # Rule 4: bundle-referenced snapshot ids
+    bundle_refs = _bundle_referenced_snapshot_ids()
+    if extra_bundle_snapshot_ids:
+        bundle_refs = bundle_refs | set(extra_bundle_snapshot_ids)
+    for sid in bundle_refs:
+        _protect(sid, "bundle_manifest_reference")
+
+    # Gather all snapshot dirs on disk
+    # Use a sentinel snapshot_id to get the parent reliably:
+    # _snapshot_root(project_id, "_sentinel").parent == .../project_id/graph-snapshots
+    snap_root = _snapshot_root(project_id, "_sentinel").parent
+    disk_snapshot_ids: set[str] = set()
+    try:
+        if snap_root.exists():
+            disk_snapshot_ids = {d.name for d in snap_root.iterdir() if d.is_dir()}
+    except OSError:
+        pass
+
+    # Gather all snapshot ids in DB
+    db_rows = conn.execute(
+        "SELECT snapshot_id, snapshot_kind, status, created_at FROM graph_snapshots WHERE project_id=?",
+        (project_id,),
+    ).fetchall()
+    db_by_id: dict[str, dict[str, Any]] = {str(row["snapshot_id"]): dict(row) for row in db_rows}
+
+    all_ids = (disk_snapshot_ids | set(db_by_id.keys())) - set(protected_ids.keys())
+
+    protected_list: list[dict[str, Any]] = []
+    for sid, reasons in protected_ids.items():
+        row = db_by_id.get(sid, {})
+        dir_path = snap_root / sid
+        protected_list.append({
+            "snapshot_id": sid,
+            "reasons": sorted(set(reasons)),
+            "snapshot_kind": str(row.get("snapshot_kind") or "unknown"),
+            "status": str(row.get("status") or "unknown"),
+            "created_at": str(row.get("created_at") or ""),
+            "dir_exists": dir_path.exists(),
+        })
+
+    candidates_list: list[dict[str, Any]] = []
+    from datetime import timezone as _tz
+    now_ts = datetime.now(_tz.utc)
+    for sid in sorted(all_ids):
+        row = db_by_id.get(sid, {})
+        dir_path = snap_root / sid
+        # Compute age
+        age_days: float | None = None
+        created_at_str = str(row.get("created_at") or "")
+        if created_at_str:
+            try:
+                dt = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_tz.utc)
+                age_days = (now_ts - dt).total_seconds() / 86400
+            except (ValueError, OSError):
+                pass
+        # Compute size
+        size_bytes = 0
+        if dir_path.exists():
+            try:
+                size_bytes = sum(f.stat().st_size for f in dir_path.rglob("*") if f.is_file())
+            except OSError:
+                size_bytes = 0
+        candidates_list.append({
+            "snapshot_id": sid,
+            "snapshot_kind": str(row.get("snapshot_kind") or "unknown"),
+            "status": str(row.get("status") or "disk_only"),
+            "created_at": created_at_str,
+            "age_days": round(age_days, 2) if age_days is not None else None,
+            "size_bytes": size_bytes,
+            "dir_exists": dir_path.exists(),
+            "in_db": sid in db_by_id,
+        })
+
+    return {
+        "project_id": project_id,
+        "config": config,
+        "protected_count": len(protected_list),
+        "candidate_count": len(candidates_list),
+        "protected": protected_list,
+        "candidates": candidates_list,
+    }
+
+
+def run_snapshot_retention_gc(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    keep_last_n: int | None = None,
+    dry_run: bool = True,
+    actor: str = "retention_gc",
+    extra_bundle_snapshot_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Run retention GC on graph-snapshot companion dirs.
+
+    Always honours protection rules; never deletes active/in-progress/sealed-baseline.
+    Pass dry_run=True (the default) to compute candidates without deleting.
+    Returns a dict with deleted_dirs, freed_bytes, candidates, and errors.
+    """
+    import shutil as _shutil
+    selection = select_snapshot_retention_candidates(
+        conn,
+        project_id,
+        keep_last_n=keep_last_n,
+        extra_bundle_snapshot_ids=extra_bundle_snapshot_ids,
+    )
+    snap_root = _snapshot_root(project_id, "_sentinel").parent
+
+    deleted_dirs: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    freed_bytes = 0
+
+    for candidate in selection["candidates"]:
+        sid = str(candidate["snapshot_id"])
+        dir_path = snap_root / sid
+        size_bytes = int(candidate.get("size_bytes") or 0)
+        if dry_run:
+            deleted_dirs.append({
+                "snapshot_id": sid,
+                "path": str(dir_path),
+                "size_bytes": size_bytes,
+                "dry_run": True,
+            })
+            freed_bytes += size_bytes
+            continue
+        if not dir_path.exists():
+            continue
+        try:
+            _shutil.rmtree(dir_path)
+            deleted_dirs.append({
+                "snapshot_id": sid,
+                "path": str(dir_path),
+                "size_bytes": size_bytes,
+                "dry_run": False,
+            })
+            freed_bytes += size_bytes
+        except OSError as exc:
+            errors.append({
+                "snapshot_id": sid,
+                "path": str(dir_path),
+                "error": str(exc),
+            })
+
+    return {
+        "ok": len(errors) == 0,
+        "project_id": project_id,
+        "dry_run": dry_run,
+        "actor": actor,
+        "config": selection["config"],
+        "protected_count": selection["protected_count"],
+        "candidate_count": selection["candidate_count"],
+        "deleted_count": len(deleted_dirs),
+        "freed_bytes": freed_bytes,
+        "freed_mb": round(freed_bytes / (1024 * 1024), 2),
+        "deleted_dirs": deleted_dirs,
+        "errors": errors,
+        "protected": selection["protected"],
+        "candidates": selection["candidates"],
     }
 
 
@@ -1592,6 +1951,20 @@ def activate_graph_snapshot(
             })
         except Exception:  # noqa: BLE001 - advisory
             pass
+    # Post-activation GC: run retention GC automatically after a successful
+    # target-ref activation. This is advisory-only; never blocks activation.
+    gc_result: dict[str, Any] | None = None
+    if target_ref_activation:
+        try:
+            gc_result = run_snapshot_retention_gc(
+                conn,
+                project_id,
+                dry_run=False,
+                actor=f"post_activate:{actor}",
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory; activation already done
+            gc_result = {"ok": False, "error": str(exc), "dry_run": False}
+    result["retention_gc"] = gc_result
     return result
 
 
