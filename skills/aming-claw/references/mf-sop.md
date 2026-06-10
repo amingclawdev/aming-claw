@@ -256,6 +256,16 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 
 ## Observer Work Modes and Root Route Context
 
+Fresh-session bootstrap flow (do this before any mutation):
+1. Load route context (read backlog row + `aming-claw://current-context`).
+2. `GET/POST /api/projects/{project_id}/observer-root-route-context` — read
+   the compact handoff. Pass `graph_query_schema_trace_id` in the POST body
+   if you already ran `graph_query(tool=query_schema)` and have a trace id.
+3. Call `graph_query(tool=query_schema)` to discover the live query contract.
+4. Surface `work_mode` and `next_legal_action` to the user.
+5. Stop here. Do not dispatch/merge/close without a `record_work_mode_transition`
+   event and `route_action_precheck` bound to the canonical route identity.
+
 Read the observer root route context before acting on a row:
 `GET/POST /api/projects/{project_id}/observer-root-route-context`. The runtime
 posture is an explicit `work_mode`:
