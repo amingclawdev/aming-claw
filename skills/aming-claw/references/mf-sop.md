@@ -305,6 +305,46 @@ observer in any mode. The root route context exposes the canonical identity
 `allowed_actions`/`blocked_actions`, `required_evidence`, and
 `next_legal_action`; the dashboard evidence modal renders these real fields.
 
+## observer_repair_run_route_evidence: Two Legal Modes
+
+`observer_repair_run_route_evidence` (record=true) accepts exactly two calling patterns:
+
+**Mode 1 — External-validated precheck packet (canonical repair path)**
+
+Supply both `route_identity` (all 5 canonical fields: `route_id`,
+`route_context_hash`, `prompt_contract_id`, `prompt_contract_hash`,
+`visible_injection_manifest_hash`) AND a non-empty `action_precheck` packet with
+at least one source marker (`action`, `caller_role`, `source_event_id`,
+`allowed`, `status`, etc.).  The packet is validated against the supplied identity
+by `_external_route_action_precheck`; if valid, the external identity is consumed
+and recorded as-is without any mint or supersession.
+
+**Mode 2 — Fresh replay-mint (no claimed identity)**
+
+Omit `route_identity` entirely (or pass an empty mapping).  The service generates
+a new route identity from scratch via `_build_route_service_preview`.  No
+supersession is recorded; the generated identity is canonical from creation.
+
+**Identity-only pattern is illegal (record=true)**
+
+Supplying `route_identity` WITHOUT an `action_precheck` packet (i.e. an empty or
+missing packet) with `record=true` is rejected immediately with
+`record_blocked_reason: identity_only_without_action_precheck`.  Before this guard
+(incident #3384–#3393), the missing precheck caused a silent degrade-to-mint that
+generated a new identity and recorded `route.identity.superseded` declaring the
+supplied (live canonical) identity as superseded — invalidating all previously
+accepted startup/QA evidence on the same backlog row.
+
+**Live-identity supersession guard**
+
+Before recording any `route.identity.superseded` event, the server must call
+`observer_repair_run.guard_live_identity_supersession(...)` against the timeline
+events for the affected backlog row.  If accepted `mf_subagent_startup` or
+`independent_verification` events exist whose route identity matches the proposed
+superseded identity, the supersession is refused unless BOTH `force_supersede=true`
+AND a non-empty `force_reason` are supplied (both are recorded in the supersession
+payload for audit).
+
 ## Close-Evidence Integrity Gates
 
 The MF close gate enforces:

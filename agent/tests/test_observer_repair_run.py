@@ -593,3 +593,268 @@ def test_missing_external_route_action_precheck_source_event_still_blocks():
     assert materialization["missing_source_events"] == [
         "route.action_precheck:external-dispatch-precheck"
     ]
+
+
+# ---------------------------------------------------------------------------
+# AC-REPAIR-RUN-LIVE-IDENTITY-SUPERSEDE-GUARD-20260610
+# Regression tests reproducing the #3384-3393 fork incident.
+# ---------------------------------------------------------------------------
+
+
+def _live_canonical_route_identity():
+    """Simulates the canonical route identity that has accepted startup evidence."""
+    return {
+        "route_id": "route-live-canonical-3384",
+        "route_context_hash": "sha256:live-canonical-route-context-3384",
+        "prompt_contract_id": "rprompt-live-canonical-3384",
+        "prompt_contract_hash": "sha256:live-canonical-prompt-contract-3384",
+        "visible_injection_manifest_hash": "sha256:live-canonical-visible-manifest-3384",
+    }
+
+
+def _accepted_startup_event(route_identity: dict, event_id: int = 3384) -> dict:
+    """Simulate an accepted mf_subagent_startup timeline event with the given identity."""
+    return {
+        "id": event_id,
+        "event_kind": "mf_subagent_startup",
+        "event_type": "mf_subagent.startup",
+        "status": "passed",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                "route_context_hash": route_identity.get("route_context_hash", ""),
+                "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
+                "route_id": route_identity.get("route_id", ""),
+            },
+        },
+        "verification": {},
+        "artifact_refs": {},
+    }
+
+
+def _accepted_verification_event(route_identity: dict, event_id: int = 3390) -> dict:
+    """Simulate an accepted independent_verification timeline event."""
+    return {
+        "id": event_id,
+        "event_kind": "independent_verification",
+        "event_type": "mf.verification",
+        "status": "accepted",
+        "payload": {
+            "route_context_hash": route_identity.get("route_context_hash", ""),
+            "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
+        },
+        "verification": {},
+        "artifact_refs": {},
+    }
+
+
+def test_incident_3384_identity_only_record_true_errors_and_records_nothing():
+    """#3384-3393: route_identity supplied + record=True + empty precheck must fail loudly.
+
+    The buggy path would degrade to replay-mint and record route.identity.superseded
+    against the live canonical identity.  The fix must return ok=False immediately,
+    record nothing, and explain the two valid modes.
+    """
+    row = _single_route_row()
+    live_identity = _live_canonical_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False},
+    )
+
+    # Reproduce incident: identity supplied, record=True, action_precheck empty
+    result = observer_repair_run.build_route_service_materialization(
+        plan,
+        external_route_identity=live_identity,
+        action_precheck={},  # empty — the missing packet that triggered the bug
+        record=True,
+    )
+
+    # Must fail loudly — not ok, not recordable
+    assert result["ok"] is False
+    assert result["recordable"] is False
+    assert result["record_blocked"] is True
+    assert result["record_blocked_reason"] == "identity_only_without_action_precheck"
+    assert (
+        result["reason"] == "external action precheck packet or source marker is required"
+    )
+    # Must not contain any supersession event
+    assert "route_identity_supersession" not in result
+    assert result["source_events"] == []
+    # Must list two valid next_legal_actions
+    assert len(result["next_legal_actions"]) == 2
+    assert any("action_precheck_packet" in a for a in result["next_legal_actions"])
+    assert any("replay_mint" in a or "omitting" in a for a in result["next_legal_actions"])
+
+
+def test_incident_3384_dry_run_behavior_unchanged():
+    """dry-run (record=False) with identity-only still returns supersession lineage as before.
+
+    The identity-only fail-loud guard only fires when record=True.
+    Dry-run mode must remain unchanged so existing callers can preview the plan.
+    """
+    row = _single_route_row()
+    live_identity = _live_canonical_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False},
+    )
+
+    # Dry-run (record=False, the default) must still work as before
+    result = observer_repair_run.build_route_service_materialization(
+        plan,
+        external_route_identity=live_identity,
+        action_precheck={},
+        record=False,
+    )
+
+    # Dry-run result should NOT have record_blocked
+    assert "record_blocked" not in result
+    # Supersession lineage is still produced in dry-run for preview purposes
+    assert "route_identity_supersession" in result
+    assert result["route_identity_consumption"]["superseded"] is True
+
+
+def test_incident_3384_pure_mint_no_identity_unchanged():
+    """Fresh replay-mint (no claimed identity) must be unchanged by the guard."""
+    row = _single_route_row()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False},
+    )
+
+    # No external identity — pure mint mode, record=True
+    result = observer_repair_run.build_route_service_materialization(
+        plan,
+        external_route_identity=None,
+        action_precheck=None,
+        record=True,
+    )
+
+    # Pure mint is not blocked by the guard; it may or may not be recordable
+    # depending on preview availability; the key assertion is no record_blocked
+    assert "record_blocked" not in result
+
+
+def test_guard_live_identity_supersession_refuses_without_force():
+    """guard_live_identity_supersession blocks when protecting events exist and no force."""
+    live_identity = _live_canonical_route_identity()
+    startup_event = _accepted_startup_event(live_identity, event_id=3384)
+
+    result = observer_repair_run.guard_live_identity_supersession(
+        proposed_superseded_identity=live_identity,
+        timeline_events=[startup_event],
+    )
+
+    assert result["ok"] is False
+    assert result["protected"] is True
+    assert 3384 in result["protecting_event_ids"]
+    assert "force_supersede" in result["reason"]
+    assert result["force_accepted"] is False
+
+
+def test_guard_live_identity_supersession_allows_with_force_and_reason():
+    """guard_live_identity_supersession allows when force_supersede=True and force_reason given."""
+    live_identity = _live_canonical_route_identity()
+    startup_event = _accepted_startup_event(live_identity, event_id=3384)
+
+    result = observer_repair_run.guard_live_identity_supersession(
+        proposed_superseded_identity=live_identity,
+        timeline_events=[startup_event],
+        force_supersede=True,
+        force_reason="manual reverse-supersession #3415: recovery operator approval",
+    )
+
+    assert result["ok"] is True
+    assert result["protected"] is True
+    assert result["force_accepted"] is True
+    assert 3384 in result["protecting_event_ids"]
+
+
+def test_guard_live_identity_supersession_refuses_force_without_reason():
+    """force_supersede=True without a non-empty force_reason is still refused."""
+    live_identity = _live_canonical_route_identity()
+    startup_event = _accepted_startup_event(live_identity, event_id=3384)
+
+    result = observer_repair_run.guard_live_identity_supersession(
+        proposed_superseded_identity=live_identity,
+        timeline_events=[startup_event],
+        force_supersede=True,
+        force_reason="",  # empty — must be refused
+    )
+
+    assert result["ok"] is False
+    assert result["force_accepted"] is False
+
+
+def test_guard_live_identity_supersession_passes_no_protecting_events():
+    """guard allows when no protecting events exist for the proposed identity."""
+    live_identity = _live_canonical_route_identity()
+    other_identity = {
+        "route_id": "route-other-9999",
+        "route_context_hash": "sha256:other-context",
+        "prompt_contract_id": "rprompt-other-9999",
+    }
+    # Startup event is for a different identity — not a protector
+    unrelated_event = _accepted_startup_event(other_identity, event_id=9999)
+
+    result = observer_repair_run.guard_live_identity_supersession(
+        proposed_superseded_identity=live_identity,
+        timeline_events=[unrelated_event],
+    )
+
+    assert result["ok"] is True
+    assert result["protected"] is False
+    assert result["protecting_event_ids"] == []
+
+
+def test_guard_live_identity_supersession_matches_verification_events():
+    """guard detects independent_verification events as protectors too."""
+    live_identity = _live_canonical_route_identity()
+    verification_event = _accepted_verification_event(live_identity, event_id=3390)
+
+    result = observer_repair_run.guard_live_identity_supersession(
+        proposed_superseded_identity=live_identity,
+        timeline_events=[verification_event],
+    )
+
+    assert result["ok"] is False
+    assert result["protected"] is True
+    assert 3390 in result["protecting_event_ids"]
+
+
+def test_incident_3384_record_true_with_valid_precheck_still_works():
+    """record=True with identity + valid precheck packet must not be blocked by the guard."""
+    row = _single_route_row()
+    live_identity = _live_canonical_route_identity()
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False},
+    )
+
+    # Valid precheck packet with all source markers
+    result = observer_repair_run.build_route_service_materialization(
+        plan,
+        external_route_identity=live_identity,
+        action_precheck={
+            **live_identity,
+            "caller_role": "observer",
+            "action": "dispatch_bounded_worker",
+            "allowed": True,
+        },
+        record=True,
+    )
+
+    # Must NOT be blocked by identity-only guard
+    assert "record_blocked" not in result
