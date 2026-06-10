@@ -9136,3 +9136,149 @@ svg.graph-svg path.ghit:hover {
     flex-direction: column;
   }
 }
+
+/* -------------------------------------------------------------------------
+ * Layered semantic event detail — headline, relations, nav-back
+ * ------------------------------------------------------------------------- */
+
+/* Role-action headline: leads the detail pane */
+.task-playback-headline {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--ink-50, #f8fafc);
+  border: 1px solid var(--ink-100, #e2e8f0);
+}
+
+.task-playback-headline-text {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-900, #0f172a);
+  line-height: 1.4;
+}
+
+.task-playback-headline-lane {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--ink-100, #e2e8f0);
+  color: var(--ink-700, #334155);
+  white-space: nowrap;
+}
+
+/* Lane-specific tinting for headline actor pill */
+.task-playback-headline-lane.lane-pill-worker { background: #dbeafe; color: #1e40af; }
+.task-playback-headline-lane.lane-pill-verification { background: #d1fae5; color: #065f46; }
+.task-playback-headline-lane.lane-pill-gate { background: #fed7aa; color: #9a3412; }
+.task-playback-headline-lane.lane-pill-observer { background: #ede9fe; color: #4c1d95; }
+.task-playback-headline-lane.lane-pill-content_sys { background: #fef9c3; color: #713f12; }
+
+/* Navigation back button */
+.task-playback-nav-back {
+  margin-bottom: 6px;
+}
+
+.task-playback-nav-back .action-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+/* Relations list — structured cross-event and backlog-row references */
+.task-playback-relations {
+  margin-top: 10px;
+}
+
+.task-playback-relations-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+}
+
+.task-playback-relation-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-playback-relation-label {
+  flex-shrink: 0;
+  min-width: 100px;
+  padding-top: 3px;
+}
+
+.task-playback-relation-kind {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--ink-100, #e2e8f0);
+  color: var(--ink-600, #475569);
+  font-size: 9.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.task-playback-relation-kind--event_ref { background: #dbeafe; color: #1e40af; }
+.task-playback-relation-kind--backlog_row { background: #ede9fe; color: #4c1d95; }
+
+.task-playback-relation-detail {
+  flex: 1 1 0;
+  min-width: 0;
+  margin: 0;
+}
+
+/* Clickable relation link — jumps to the referenced frame */
+.task-playback-relation-link,
+.task-playback-relation-nonav {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 7px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.task-playback-relation-link {
+  border: 1px solid var(--ink-200, #cbd5e1);
+  background: #fff;
+  color: var(--ink-700, #334155);
+  cursor: pointer;
+}
+
+.task-playback-relation-link:hover {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: var(--blue-strong, #1d4ed8);
+}
+
+.task-playback-relation-nonav {
+  border: 1px solid var(--ink-100, #e2e8f0);
+  background: var(--ink-50, #f8fafc);
+  color: var(--ink-500, #64748b);
+}
+
+.task-playback-relation-summary {
+  flex: 1 1 0;
+  min-width: 0;
+  color: var(--ink-500, #64748b);
+  font-size: 10px;
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+
+/* IDs/hashes in the detail pane remain selectable (user-select: text is the browser default).
+ * No additional CSS needed; they are already in <span class="mono"> which inherits normally. */

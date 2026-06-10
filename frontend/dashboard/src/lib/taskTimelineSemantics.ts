@@ -46,12 +46,26 @@ export interface TaskTimelineSemanticNarrative {
   outcome: string;
 }
 
+/** A single relation entry pointing at a referenced event or backlog row. */
+export interface TaskTimelineSemanticRelation {
+  /** Relation category: "event_ref" for timeline events, "backlog_row" for parent/child rows. */
+  kind: "event_ref" | "backlog_row";
+  /** Human-readable label, e.g. "read receipt" or "parent backlog". */
+  label: string;
+  /** The id/value to jump to, e.g. "#3568" or "AC-TIMELINE-..." */
+  value: string;
+  /** One-line semantic summary shown next to the link. */
+  summary: string;
+}
+
 export interface TaskTimelineSemanticProjection {
   schema_version: "task_timeline_semantic_projection.v1";
   catalog_schema_version: string;
   catalog_entry_id: string;
   template_id: string;
   fallback: boolean;
+  /** Role-action headline: WHO (actor role) did WHAT (business action) in sentence form. */
+  headline: string;
   title: string;
   detail: string;
   status: TaskTimelineSemanticStatus;
@@ -69,6 +83,8 @@ export interface TaskTimelineSemanticProjection {
   evidence: TaskTimelineSemanticChip[];
   artifacts: TaskTimelineSemanticChip[];
   inspector: TaskTimelineEvidenceInspector;
+  /** Structured list of referenced event ids and backlog row ids with summaries, for cross-navigation. */
+  relations: TaskTimelineSemanticRelation[];
 }
 
 interface CatalogPath {
@@ -170,6 +186,8 @@ export function projectTaskTimelineEvent(event: TaskTimelineEvent, index = 0): T
   ]);
   const artifacts = collectChips(event, spec.artifact_paths ?? [], "artifact");
   const inspector = buildInspector(event, spec, chips, details, evidence, artifacts);
+  const headline = buildHeadline(event, spec, actorLabel, statusLabel, laneId, fallback);
+  const relations = buildRelations(event);
 
   return {
     schema_version: TASK_TIMELINE_SEMANTIC_PROJECTION_SCHEMA,
@@ -177,6 +195,7 @@ export function projectTaskTimelineEvent(event: TaskTimelineEvent, index = 0): T
     catalog_entry_id: spec.id,
     template_id: spec.id,
     fallback,
+    headline,
     title: catalogLabel(spec.title, CATALOG.fallback.title),
     detail: catalogLabel(spec.detail, CATALOG.fallback.detail),
     status,
@@ -194,6 +213,7 @@ export function projectTaskTimelineEvent(event: TaskTimelineEvent, index = 0): T
     evidence,
     artifacts,
     inspector,
+    relations,
   };
 }
 
@@ -282,6 +302,167 @@ function buildNarrative(
     purpose: catalogLabel(template.purpose, fallback.purpose),
     outcome: catalogLabel(template.outcome, fallback.outcome),
   };
+}
+
+/**
+ * Per-kind headline registry (top ~20 event kinds from real DB data).
+ * Keyed by event_kind (primary) or event_type substring (fallback).
+ * Each entry: { role, action } → produces "$role $action."
+ */
+const HEADLINE_REGISTRY: Record<string, { role: string; action: string }> = {
+  // Worker lane
+  mf_subagent_startup:                    { role: "Bounded worker (mf_sub)",  action: "started in assigned worktree and recorded startup evidence" },
+  mf_subagent_read_receipt:               { role: "Bounded worker (mf_sub)",  action: "acknowledged task contract and recorded read receipt" },
+  mf_subagent_dispatch:                   { role: "Observer",                 action: "dispatched a bounded implementation worker" },
+  bounded_implementation_worker_dispatch: { role: "Observer",                 action: "dispatched a bounded implementation worker" },
+  worker_progress:                        { role: "Bounded worker (mf_sub)",  action: "reported code change progress" },
+  implementation:                         { role: "Bounded worker (mf_sub)",  action: "completed implementation and recorded evidence" },
+  // Verification lane
+  verification:                           { role: "Verification lane",        action: "checked the recorded work and produced QA evidence" },
+  qa_verification:                        { role: "QA reviewer",              action: "evaluated implementation for correctness" },
+  independent_verification:               { role: "Independent verifier",     action: "independently verified worker output" },
+  independent_verification_lane:          { role: "Independent verifier",     action: "completed independent verification lane" },
+  // Gate/close lane
+  close_ready:                            { role: "Observer",                 action: "recorded close-ready evidence for final review" },
+  review_ready:                           { role: "Observer",                 action: "marked the task as review-ready" },
+  route_waiver:                           { role: "Route gate",               action: "recorded a route evidence waiver" },
+  blocker:                                { role: "Governance system",        action: "recorded a blocker preventing progress" },
+  // Observer/route lane
+  service_route:                          { role: "Service router",           action: "completed a scoped route service action" },
+  route_action_precheck:                  { role: "Route service",            action: "ran a route action precheck for the observer" },
+  route_context:                          { role: "Route service",            action: "prepared public task scope for the next lane" },
+  route_identity_cleanup:                 { role: "Observer",                 action: "cleaned up stale route identity entries" },
+  route_identity_supersede:               { role: "Observer",                 action: "superseded a stale route identity with a fresh one" },
+  dispatch:                               { role: "Observer",                 action: "dispatched a governed worker or action" },
+  planning:                               { role: "Observer",                 action: "recorded planning or scenario specification" },
+  scenario_spec:                          { role: "Observer",                 action: "recorded a scenario specification" },
+  observer_poll:                          { role: "Observer",                 action: "polled the governance runtime for status" },
+  observer_mode:                          { role: "Observer",                 action: "transitioned work mode or recorded posture" },
+  precheck:                               { role: "Governance system",        action: "ran a precommit or route action precheck" },
+  audit:                                  { role: "Observer",                 action: "recorded an audit or scope review" },
+  failure:                                { role: "Governance system",        action: "recorded a failure or error event" },
+  architecture_review_lane:              { role: "Architecture reviewer",    action: "reviewed the system design and recorded findings" },
+  observer_cli_terminal_blocker:         { role: "Governance system",        action: "detected a terminal CLI blocker for the observer" },
+};
+
+// Telemetry counter for unmapped event_kinds (V1: console only, no network).
+const _unmappedKindSeen = new Set<string>();
+
+function recordUnmappedKindTelemetry(event_kind: string): void {
+  if (_unmappedKindSeen.has(event_kind)) return;
+  _unmappedKindSeen.add(event_kind);
+  // V1: console-debug only so the developer console shows coverage gaps.
+  if (typeof console !== "undefined" && typeof console.debug === "function") {
+    console.debug("[aming-claw:semantics] unmapped event_kind", event_kind, "— add to HEADLINE_REGISTRY for a richer headline");
+  }
+}
+
+function buildHeadline(
+  event: TaskTimelineEvent,
+  entry: CatalogEntry,
+  actorLabel: string,
+  statusLabel: string,
+  laneId: TaskTimelineSemanticLane,
+  fallback: boolean,
+): string {
+  const eventKind = (event.event_kind || "").trim().toLowerCase();
+  const eventType = (event.event_type || "").trim().toLowerCase();
+
+  // Try per-kind registry first (primary: event_kind, secondary: event_type key match).
+  const registryEntry = HEADLINE_REGISTRY[eventKind] ?? (
+    Object.keys(HEADLINE_REGISTRY).find((key) => eventType.includes(key)) ? HEADLINE_REGISTRY[Object.keys(HEADLINE_REGISTRY).find((key) => eventType.includes(key))!] : undefined
+  );
+
+  if (registryEntry) {
+    const suffix = statusLabel && statusLabel !== "unknown" ? ` (${statusLabel})` : "";
+    return `${registryEntry.role} ${registryEntry.action}${suffix}.`;
+  }
+
+  // Unmapped kind: fire telemetry and produce a generic fallback.
+  if (eventKind && eventKind !== "") {
+    recordUnmappedKindTelemetry(eventKind);
+  }
+
+  // Generic fallback from catalog entry title + actor + lane.
+  if (!fallback) {
+    const title = catalogLabel(entry.title, "");
+    if (title) {
+      return `${actorLabel} — ${title.charAt(0).toLowerCase()}${title.slice(1)}.`;
+    }
+  }
+
+  const lane = laneLabel(laneId);
+  return `${actorLabel} acted in the ${lane} lane${statusLabel && statusLabel !== "unknown" ? ` (${statusLabel})` : ""}.`;
+}
+
+function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[] {
+  const relations: TaskTimelineSemanticRelation[] = [];
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  const artifactRefs = asRecord(event.artifact_refs);
+
+  // Helper: push a relation if value is non-empty.
+  const pushRel = (kind: TaskTimelineSemanticRelation["kind"], label: string, rawValue: unknown, summary: string) => {
+    const v = stringFrom(rawValue);
+    if (!v) return;
+    const safe = sanitizePublicTimelineText(v);
+    if (!safe || safe === "[private detail redacted]") return;
+    relations.push({ kind, label, value: safe, summary });
+  };
+
+  // --- Parent/child backlog row relations ---
+  for (const field of ["backlog_id", "bug_id", "root_backlog_ids", "parent_backlog_id", "child_backlog_ids"]) {
+    const v = payload[field] ?? verification[field] ?? artifactRefs[field] ?? (event as unknown as Record<string, unknown>)[field];
+    if (Array.isArray(v)) {
+      for (const item of v) pushRel("backlog_row", field === "parent_backlog_id" ? "parent backlog" : "backlog row", item, "Referenced backlog row");
+    } else {
+      pushRel("backlog_row", field === "parent_backlog_id" ? "parent backlog" : field === "child_backlog_ids" ? "child backlog" : "backlog row", v, "Referenced backlog row");
+    }
+  }
+
+  // --- Referenced event ids ---
+  const eventRefPaths: Array<[string, string]> = [
+    ["read_receipt_event_id", "read receipt"],
+    ["startup_event_id", "worker startup"],
+    ["source_event_id", "source event"],
+    ["parent_event_id", "parent event"],
+    ["dispatch_event_id", "dispatch event"],
+    ["precheck_id", "route precheck"],
+    ["route_action_precheck_id", "route action precheck"],
+  ];
+  for (const [field, label] of eventRefPaths) {
+    const v = payload[field] ?? verification[field] ?? artifactRefs[field];
+    if (v != null) pushRel("event_ref", label, v, `Referenced ${label}`);
+  }
+
+  // Multi-value event id arrays
+  for (const [field, label] of [["read_receipt_event_ids", "read receipt"], ["source_event_ids", "source event"], ["startup_event_ids", "worker startup"]] as Array<[string, string]>) {
+    const arr = payload[field] ?? verification[field];
+    if (Array.isArray(arr)) {
+      for (const item of arr.slice(0, 6)) pushRel("event_ref", label, item, `Referenced ${label}`);
+    }
+  }
+
+  // --- QA/verification lane references ---
+  const qaVerdictRefs = payload.qa_verdict_refs ?? payload.qa_evidence_refs ?? verification.qa_verdict_refs;
+  if (Array.isArray(qaVerdictRefs)) {
+    for (const item of qaVerdictRefs.slice(0, 6)) pushRel("event_ref", "QA verdict", item, "Referenced QA verdict event");
+  }
+
+  // Lane evidence references
+  const laneEvidenceRefs = payload.lane_evidence_refs ?? payload.route_lane_refs ?? verification.lane_evidence_refs;
+  if (Array.isArray(laneEvidenceRefs)) {
+    for (const item of laneEvidenceRefs.slice(0, 6)) pushRel("event_ref", "lane evidence", item, "Referenced lane evidence event");
+  }
+
+  // De-duplicate by kind+value
+  const seen = new Set<string>();
+  return relations.filter((rel) => {
+    const key = `${rel.kind}:${rel.value}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 20);
 }
 
 function normalizeMatchValue(value: string): string {

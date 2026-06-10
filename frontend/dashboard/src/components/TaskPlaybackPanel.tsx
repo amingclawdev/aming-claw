@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 
 import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
+import type { TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
 
 type EvidenceRef = TaskPlaybackFrame["evidence_links"][number];
 type EvidenceInspectorRow = { label: string; value: string; source?: string };
@@ -11,6 +12,9 @@ type GraphTraceLookupState = {
   rows: EvidenceInspectorRow[];
   error: string;
 };
+
+/** Lightweight navigation stack entry for cross-event/backlog jumping. */
+type NavStackEntry = { frameId: string; label: string };
 
 interface Props {
   trace: TaskPlaybackTrace;
@@ -35,6 +39,8 @@ export default function TaskPlaybackPanel({
   const [eventKindFilter, setEventKindFilter] = useState("all");
   const [eventIdFilter, setEventIdFilter] = useState("");
   const [dateFilter, setDateFilter] = useState<FrameDateFilter>("all");
+  // Navigation stack: records the sequence of frame visits so Back works across cross-refs.
+  const [navStack, setNavStack] = useState<NavStackEntry[]>([]);
   const allFrames = trace.frames;
   const laneOptions = stableStrings(allFrames.map((frame) => frame.lane_id || "unknown"));
   const eventKindOptions = stableStrings(allFrames.map((frame) => frame.event_kind || frame.event_type || "event"));
@@ -55,10 +61,21 @@ export default function TaskPlaybackPanel({
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
   const groupedFrames = groupFramesByDay(filteredFrames);
 
-  const selectFrame = (frameId: string) => {
+  const selectFrame = (frameId: string, pushNav?: { fromFrameId: string; fromLabel: string }) => {
     if (!frameId) return;
+    if (pushNav && pushNav.fromFrameId) {
+      setNavStack((stack) => [...stack.slice(-9), { frameId: pushNav.fromFrameId, label: pushNav.fromLabel }]);
+    }
     onSelectFrame?.(frameId);
     if (!onSelectFrame) setInternalSelectedFrameId(frameId);
+  };
+
+  const navigateBack = () => {
+    const entry = navStack[navStack.length - 1];
+    if (!entry) return;
+    setNavStack((stack) => stack.slice(0, -1));
+    onSelectFrame?.(entry.frameId);
+    if (!onSelectFrame) setInternalSelectedFrameId(entry.frameId);
   };
 
   useEffect(() => {
@@ -68,11 +85,14 @@ export default function TaskPlaybackPanel({
     setEventKindFilter("all");
     setEventIdFilter("");
     setDateFilter("all");
+    setNavStack([]);
   }, [trace.backlog_id]);
 
   useEffect(() => {
     setAdvancedEvidenceOpenFrameId("");
     setSelectedEvidenceRef(null);
+    // Do NOT clear navStack here — the user may have just navigated via a relation link
+    // and we want Back to work from the new frame.
   }, [selectedFrameKey]);
 
   useEffect(() => {
@@ -216,8 +236,26 @@ export default function TaskPlaybackPanel({
                 </div>
                 <span className={`status-badge ${statusClass(selectedFrame.status)}`}>{selectedFrame.status}</span>
               </div>
+
+              {/* Navigation back button — only visible when the nav stack is non-empty */}
+              {navStack.length > 0 ? (
+                <div className="task-playback-nav-back">
+                  <button type="button" className="action-btn" onClick={navigateBack} aria-label="Go back to previous event">
+                    &#8592; Back to {navStack[navStack.length - 1].label}
+                  </button>
+                </div>
+              ) : null}
+
+              {/* 1. ROLE-ACTION HEADLINE — leads the detail pane */}
+              {selectedFrame.headline ? (
+                <div className="task-playback-headline">
+                  <span className="task-playback-headline-text">{selectedFrame.headline}</span>
+                  <span className={`task-playback-headline-lane lane-pill-${selectedFrame.lane_id}`}>{selectedFrame.actor}</span>
+                </div>
+              ) : null}
+
+              {/* 2. BUSINESS-RELEVANT SUMMARY BLOCK: status, decision, key refs */}
               <div className="task-playback-current-meta">
-                <span>{selectedFrame.actor}</span>
                 <span className="mono">{selectedFrame.event_type}</span>
                 <span className="mono">{selectedFrame.phase}</span>
                 <span className="mono">{selectedFrame.source_event_id}</span>
@@ -227,11 +265,22 @@ export default function TaskPlaybackPanel({
                 <strong>Event summary</strong>
                 <p>{selectedFrame.summary}</p>
               </div>
-              <StructuredFactSection title="Specific facts" facts={selectedFrame.specific_facts} />
+              <StructuredFactSection title="Key facts" facts={selectedFrame.specific_facts} />
               <StructuredFactSection title="Failure/blocker diagnosis" facts={selectedFrame.failure_diagnosis} />
+
+              {/* 3. EVIDENCE & RELATIONS LISTS — clickable cross-references */}
+              <RelationLinkSection
+                relations={selectedFrame.relation_links ?? []}
+                frames={allFrames}
+                onJump={(frameId) => selectFrame(frameId, { fromFrameId: selectedFrame.id, fromLabel: selectedFrame.title })}
+              />
               <EvidenceLinkSection links={selectedEvidenceLinks} onInspect={setSelectedEvidenceRef} />
+
+              {/* 4. AUXILIARY EXPLANATION / NARRATIVE — demoted below relations */}
               <ChipSection title="Auxiliary explanation / Actor-context narrative" values={narrativeValues(selectedFrame)} />
               <EventQueryHook frame={selectedFrame} />
+
+              {/* 5. HASHES / IDS / RAW PAYLOAD — collapsed, IDs selectable but demoted */}
               <AdvancedRawDataDetails
                 key={selectedFrame.id}
                 inspector={selectedInspector}
@@ -393,6 +442,64 @@ function EvidenceLinkSection({ links, onInspect }: { links: TaskPlaybackFrame["e
         ))}
         {links.length > 16 ? <em>+{links.length - 16}</em> : null}
       </div>
+    </div>
+  );
+}
+
+/**
+ * RelationLinkSection — renders the structured cross-reference list.
+ * Each entry is clickable: event_ref entries jump to the matching frame by
+ * searching the frame list for the value; backlog_row entries emit a note
+ * (backlog navigation is handled by the parent view, not the panel).
+ */
+function RelationLinkSection({
+  relations,
+  frames,
+  onJump,
+}: {
+  relations: TaskTimelineSemanticRelation[];
+  frames: TaskPlaybackFrame[];
+  onJump: (frameId: string) => void;
+}) {
+  if (relations.length === 0) return null;
+  return (
+    <div className="task-playback-chip-section task-playback-relations">
+      <strong>Event relations &amp; references</strong>
+      <dl className="task-playback-relations-list">
+        {relations.slice(0, 16).map((rel) => {
+          const targetFrame = rel.kind === "event_ref"
+            ? frames.find((frame) => frame.source_event_id === rel.value || frame.id === rel.value)
+            : null;
+          return (
+            <div key={`${rel.kind}:${rel.value}`} className="task-playback-relation-row">
+              <dt className="task-playback-relation-label">
+                <span className={`task-playback-relation-kind task-playback-relation-kind--${rel.kind}`}>{rel.label}</span>
+              </dt>
+              <dd className="task-playback-relation-detail">
+                {targetFrame ? (
+                  <button
+                    type="button"
+                    className="task-playback-relation-link"
+                    title={`Jump to: ${targetFrame.title}`}
+                    onClick={() => onJump(targetFrame.id)}
+                    aria-label={`Navigate to ${rel.label}: ${rel.value}`}
+                  >
+                    <span className="mono">{rel.value}</span>
+                    <span className="task-playback-relation-summary">{targetFrame.headline || targetFrame.summary || targetFrame.title}</span>
+                  </button>
+                ) : (
+                  <span className="task-playback-relation-nonav">
+                    <span className="mono">{rel.value}</span>
+                    <span className="task-playback-relation-summary">
+                      {rel.kind === "backlog_row" ? "Backlog row — open in history selector" : rel.summary}
+                    </span>
+                  </span>
+                )}
+              </dd>
+            </div>
+          );
+        })}
+      </dl>
     </div>
   );
 }
