@@ -163,7 +163,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const activityBug = selectedBug ?? hintedCurrentBug;
   const activityState = activityBug ? activityByBug[activityBug.bug_id] : undefined;
   const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
-  const activityFrameId = selectedActivityFrameId || activityTrace.frames[0]?.id || "";
+  // Current tab is newest-first: default selection is the newest (last) frame.
+  const activityFrameId = selectedActivityFrameId || activityTrace.frames[activityTrace.frames.length - 1]?.id || "";
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -267,7 +268,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       if (isFallbackPoll) {
         recordPollRef.current(new Date().toISOString());
       }
-      setSelectedActivityFrameId((current) => current || trace.frames[0]?.id || "");
+      // Current tab is newest-first: default to the newest (last) frame.
+      setSelectedActivityFrameId((current) => current || trace.frames[trace.frames.length - 1]?.id || "");
     });
   }, [projectId]);
 
@@ -541,6 +543,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               loading={activityState?.loading ?? false}
               error={activityState?.error ?? ""}
               onSelectFrame={setSelectedActivityFrameId}
+              newestFirst
             />
           </div>
         </div>
