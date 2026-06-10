@@ -42,6 +42,10 @@ GATE_KINDS = (
 
 PASS_STATUSES = {"accepted", "allow", "ok", "pass", "passed", "succeeded", "success"}
 GIT_EVIDENCE_IGNORED_PATH_LIMIT = 50
+# Existing-worktree/branch adoption (AC-CLOSE-LINEAGE-EXISTING-WORKTREE-
+# ADOPTION-MODE-20260610): both spellings select the same mode.
+BRANCH_ADOPTION_MODES = {"existing_branch", "adopt_existing_branch"}
+BRANCH_ADOPTION_CHECK_SCHEMA_VERSION = "branch_adoption_check.v1"
 RUNTIME_CONTEXT_GATE_FIELD_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "mf_subagent.dispatch": (
         "runtime_context_id",
@@ -403,6 +407,119 @@ def _single_active_task_status(subject: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _branch_adoption_check(
+    subject: Mapping[str, Any],
+    *,
+    git_evidence: Mapping[str, Any],
+    base_commit: str,
+    branch_ref: str,
+    worktree_path: str,
+) -> dict[str, Any]:
+    """Verify existing-branch adoption evidence against the ACTUAL worktree.
+
+    Adoption may only excuse head!=base when the evidence truthfully attests
+    the real base..head lineage; it never legalizes a fabricated
+    started-at-base/started-now claim, so any failure here leaves the fresh
+    head checks in force.
+    """
+
+    evidence = _mapping(subject.get("branch_adoption_evidence"))
+    errors: list[str] = []
+    adopted_branch_ref = _first_text(evidence, "adopted_branch_ref")
+    adopted_base_commit = _first_text(evidence, "adopted_base_commit")
+    adopted_head_commit = _first_text(evidence, "adopted_head_commit")
+    attestation_source = _first_text(
+        evidence,
+        "attestation_source",
+        "attested_by",
+        "attestation",
+    )
+    if not evidence:
+        errors.append("missing_existing_branch_adoption_evidence")
+    else:
+        if not adopted_branch_ref:
+            errors.append("missing_adopted_branch_ref")
+        if not adopted_base_commit:
+            errors.append("missing_adopted_base_commit")
+        if not adopted_head_commit:
+            errors.append("missing_adopted_head_commit")
+        if not attestation_source:
+            errors.append("missing_adoption_attestation_source")
+
+    actual_head = _text(git_evidence.get("head"))
+    actual_branch = _text(git_evidence.get("branch"))
+    if adopted_head_commit:
+        if not actual_head:
+            errors.append("adoption_actual_head_unavailable")
+        elif actual_head != adopted_head_commit:
+            errors.append("adoption_attested_head_mismatch")
+    if base_commit and adopted_base_commit and adopted_base_commit != base_commit:
+        errors.append("adoption_base_commit_mismatch")
+    if (
+        adopted_branch_ref
+        and branch_ref
+        and _branch_name(adopted_branch_ref) != _branch_name(branch_ref)
+    ):
+        errors.append("adoption_branch_ref_mismatch")
+    if (
+        adopted_branch_ref
+        and actual_branch
+        and _branch_name(adopted_branch_ref) != _branch_name(actual_branch)
+    ):
+        errors.append("adoption_actual_branch_mismatch")
+
+    ancestry_check = ""
+    ancestry_verified = False
+    if adopted_base_commit and adopted_head_commit:
+        is_ancestor = _git_is_ancestor(
+            worktree_path,
+            adopted_base_commit,
+            adopted_head_commit,
+        )
+        if is_ancestor is True:
+            ancestry_check = "git_merge_base_is_ancestor"
+            ancestry_verified = True
+        elif is_ancestor is False:
+            ancestry_check = "git_merge_base_is_ancestor"
+            errors.append("adoption_base_not_ancestor_of_head")
+        elif worktree_path and not _text(git_evidence.get("error")):
+            # A real worktree is available but cannot resolve the attested
+            # commits: treat the base..head claim as fabricated.
+            ancestry_check = "git_merge_base_is_ancestor"
+            errors.append("adoption_ancestry_unverifiable")
+        elif (
+            _text(evidence.get("merge_base"))
+            and _text(evidence.get("merge_base")) == adopted_base_commit
+        ):
+            ancestry_check = "evidence_merge_base_consistency"
+            ancestry_verified = True
+        else:
+            errors.append("missing_adoption_ancestry_evidence")
+
+    deduped = _dedupe(errors)
+    return {
+        "schema_version": BRANCH_ADOPTION_CHECK_SCHEMA_VERSION,
+        "requested": True,
+        "evidence_present": bool(evidence),
+        # Echo so timeline events embedding this gate stay self-sufficient for
+        # the close route_context_gate adoption equivalence check.
+        "branch_adoption_evidence": evidence,
+        "adopted_branch_ref": adopted_branch_ref,
+        "adopted_base_commit": adopted_base_commit,
+        "adopted_head_commit": adopted_head_commit,
+        "attestation_source": attestation_source,
+        "actual_head": actual_head,
+        "actual_branch": actual_branch,
+        "head_matches_adopted_head": bool(
+            actual_head and adopted_head_commit and actual_head == adopted_head_commit
+        ),
+        "ancestry_check": ancestry_check,
+        "ancestry_verified": ancestry_verified,
+        "accepted": not deduped,
+        "errors": deduped,
+    }
+
+
 def _dispatch_gate(
     contract_id: str,
     stage: str,
@@ -433,6 +550,26 @@ def _dispatch_gate(
     adoption_mode = _text(
         subject.get("branch_adoption_mode") or subject.get("adoption_mode")
     ).lower()
+    adoption_requested = adoption_mode in BRANCH_ADOPTION_MODES
+    worker_head_off_base = bool(
+        base_commit and worker_git["head"] and worker_git["head"] != base_commit
+    )
+    branch_adoption: dict[str, Any] = {}
+    if adoption_requested:
+        branch_adoption = _branch_adoption_check(
+            subject,
+            git_evidence=worker_git,
+            base_commit=base_commit,
+            branch_ref=branch_ref,
+            worktree_path=worker_path,
+        )
+        # Adoption verification is enforced exactly when it would excuse a
+        # non-base worker head; at base there is no started-at-base claim to
+        # falsify and legacy pass-evidence semantics stay unchanged.
+        branch_adoption["enforced"] = worker_head_off_base
+        if worker_head_off_base:
+            errors.extend(branch_adoption["errors"])
+    adoption_accepted = adoption_requested and bool(branch_adoption.get("accepted"))
 
     if not owned_files:
         errors.append("missing_write_scope")
@@ -454,7 +591,7 @@ def _dispatch_gate(
         errors.append("dirty_target_main_worktree")
     if worker_git["root"] and target_git["root"] and worker_git["root"] == target_git["root"]:
         errors.append("same_worktree_non_isolated_worker")
-    if base_commit and worker_git["head"] and worker_git["head"] != base_commit:
+    if worker_head_off_base and not adoption_accepted:
         errors.append("worker_head_mismatch")
     if target_head_commit and target_git["head"] and target_git["head"] != target_head_commit:
         errors.append("target_head_mismatch")
@@ -470,7 +607,7 @@ def _dispatch_gate(
         and graph_snapshot_commit != target_head_commit
     ):
         errors.append("graph_snapshot_target_head_mismatch")
-    if adoption_mode in {"existing_branch", "adopt_existing_branch"} and not _has_pass_evidence(
+    if adoption_requested and not _has_pass_evidence(
         subject.get("branch_adoption_evidence")
     ):
         errors.append("missing_existing_branch_adoption_evidence")
@@ -515,6 +652,7 @@ def _dispatch_gate(
         "governance_policy": governance_policy,
         "single_active_task": single_active_task,
         "branch_adoption_mode": adoption_mode,
+        "branch_adoption": branch_adoption,
         "fence_token_present": bool(_text(subject.get("fence_token"))),
         "runtime_context_projection_requirements": projection_requirements,
     }
@@ -560,6 +698,37 @@ def _startup_gate(
     actual_root = _text(actual_runtime_git.get("root"))
     target_root = _text(target_git.get("root"))
 
+    adoption_mode = _text(
+        subject.get("branch_adoption_mode") or subject.get("adoption_mode")
+    ).lower()
+    adoption_requested = adoption_mode in BRANCH_ADOPTION_MODES
+    worker_head_off_base = bool(
+        base_commit
+        and expected_worker_git["head"]
+        and expected_worker_git["head"] != base_commit
+    )
+    actual_head_off_base = bool(
+        base_commit
+        and actual_runtime_git["head"]
+        and actual_runtime_git["head"] != base_commit
+    )
+    branch_adoption: dict[str, Any] = {}
+    if adoption_requested:
+        branch_adoption = _branch_adoption_check(
+            subject,
+            git_evidence=actual_runtime_git,
+            base_commit=base_commit,
+            branch_ref=branch_ref,
+            worktree_path=actual_path or expected_worker_path,
+        )
+        # Enforced exactly when adoption would excuse a non-base head; a
+        # worktree truthfully at base needs no adoption excuse.
+        branch_adoption["enforced"] = worker_head_off_base or actual_head_off_base
+        if worker_head_off_base or actual_head_off_base:
+            errors.extend(branch_adoption["errors"])
+    adoption_accepted = adoption_requested and bool(branch_adoption.get("accepted"))
+    adopted_head_commit = _text(branch_adoption.get("adopted_head_commit"))
+
     if not expected_worker_path:
         errors.append("missing_worker_worktree")
     if not actual_path:
@@ -602,9 +771,13 @@ def _startup_gate(
         errors.append("actual_worktree_is_target_main")
     if expected_root and actual_root and expected_root != actual_root:
         errors.append("actual_worktree_mismatch")
-    if base_commit and expected_worker_git["head"] and expected_worker_git["head"] != base_commit:
+    # Accepted adoption excuses a head parked at the verified adopted head;
+    # everything else keeps the fresh started-at-base requirement.
+    if worker_head_off_base and not (
+        adoption_accepted and expected_worker_git["head"] == adopted_head_commit
+    ):
         errors.append("worker_head_mismatch")
-    if base_commit and actual_runtime_git["head"] and actual_runtime_git["head"] != base_commit:
+    if actual_head_off_base and not adoption_accepted:
         errors.append("actual_head_mismatch")
     if target_head_commit and target_git["head"] and target_git["head"] != target_head_commit:
         errors.append("target_head_mismatch")
@@ -636,6 +809,8 @@ def _startup_gate(
         "branch_ref": branch_ref,
         "base_commit": base_commit,
         "target_head_commit": target_head_commit,
+        "branch_adoption_mode": adoption_mode,
+        "branch_adoption": branch_adoption,
         "fence_token_present": bool(fence_token),
         "actual_fence_token_present": bool(actual_fence_token),
         "fence_token_matches": bool(fence_token and actual_fence_token == fence_token),
@@ -1306,6 +1481,37 @@ def _git(path: str, *args: str) -> str | None:
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()
+
+
+def _git_is_ancestor(path: str, ancestor: str, descendant: str) -> bool | None:
+    """Return git merge-base --is-ancestor truth, or None when unverifiable.
+
+    None covers a missing worktree path, git unavailable, or attested commits
+    the repository cannot resolve (exit code 128).
+    """
+
+    if not path or not ancestor or not descendant:
+        return None
+    try:
+        completed = subprocess.run(
+            ["git", "-C", path, "merge-base", "--is-ancestor", ancestor, descendant],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    return None
+
+
+def _branch_name(value: Any) -> str:
+    text = _text(value)
+    return text[len("refs/heads/"):] if text.startswith("refs/heads/") else text
 
 
 def _parse_status(output: str) -> list[dict[str, str]]:
