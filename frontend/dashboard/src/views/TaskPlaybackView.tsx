@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import { useEventStream } from "../lib/sse";
+import {
+  useEventStreamWithFreshness,
+  sseStatusTone,
+  sseStatusLabel,
+  type SseFreshnessMeta,
+} from "../lib/sse";
 import {
   emptyTaskPlaybackTrace,
   fallbackTaskPlaybackSampleTrace,
@@ -82,6 +87,9 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const activeProjectIdRef = useRef(projectId);
   const inFlightPlaybackKeysRef = useRef<Set<string>>(new Set());
   const playbackControllersRef = useRef<Map<string, AbortController>>(new Map());
+  // Stable ref so refreshActivityTimeline can call recordPoll without a
+  // forward-reference issue (useEventStreamWithFreshness is declared later).
+  const recordPollRef = useRef<(at: string) => void>(() => undefined);
 
   useEffect(() => {
     playbackByBugRef.current = playbackByBug;
@@ -195,7 +203,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       });
   }, [projectId]);
 
-  const refreshActivityTimeline = useCallback((bug: BacklogBug, showLoading: boolean, signal: AbortSignal) => {
+  const refreshActivityTimeline = useCallback((bug: BacklogBug, showLoading: boolean, signal: AbortSignal, isFallbackPoll = false) => {
     const bugId = bug.bug_id;
     if (showLoading) {
       setActivityByBug((states) => ({
@@ -234,29 +242,50 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         gateResponse: gate,
         source: taskTimeline && gate ? "governed" : "governed_partial",
       });
-      setActivityByBug((states) => ({
-        ...states,
-        [bugId]: {
-          loading: false,
-          loaded: true,
-          error: errors.join(" | "),
-          trace,
-          bug: detailBug,
-          taskTimeline,
-          gate,
-          refreshedAt: new Date().toISOString(),
-        },
-      }));
+      // Merge new events without duplicating (deduplication by event id is
+      // handled inside normalizeTaskPlaybackTrace via mergeTimelineEvents).
+      setActivityByBug((states) => {
+        const prev = states[bugId];
+        // Preserve frame selection: if the previous trace had frames the user
+        // selected, keep them unless the new trace is genuinely larger.
+        return {
+          ...states,
+          [bugId]: {
+            loading: false,
+            loaded: true,
+            error: errors.join(" | "),
+            trace,
+            bug: detailBug,
+            taskTimeline,
+            gate,
+            refreshedAt: new Date().toISOString(),
+            // Preserve existing frame selection when merging poll results
+            ...(prev?.loaded && isFallbackPoll ? { _preserveFrameId: true } : {}),
+          },
+        };
+      });
+      if (isFallbackPoll) {
+        recordPollRef.current(new Date().toISOString());
+      }
       setSelectedActivityFrameId((current) => current || trace.frames[0]?.id || "");
     });
   }, [projectId]);
 
-  useEventStream(projectId, {
+  // SSE with freshness metadata. onStale triggers fallback-polling mode.
+  const [sseStaleTrigger, setSseStaleTrigger] = useState(0);
+  const { freshness, recordPoll } = useEventStreamWithFreshness(projectId, {
     enabled: Boolean(projectId),
     onEvent: ({ name }) => {
       if (isActivityLiveEvent(name)) setActivityRefreshSeq((seq) => seq + 1);
     },
-  });
+    onStale: () => {
+      // When SSE goes stale, trigger an immediate fallback poll
+      setSseStaleTrigger((n) => n + 1);
+    },
+  }) as { liveStatus: string; freshness: SseFreshnessMeta; recordPoll: (at: string) => void };
+  // Keep the stable ref in sync so refreshActivityTimeline can call it without
+  // a forward-reference hoisting issue (recordPollRef is declared above the callback).
+  recordPollRef.current = recordPoll;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -301,7 +330,10 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       window.clearInterval(timer);
       controller.abort();
     };
-  }, [activityBug?.bug_id, activityRefreshSeq, projectId, refreshActivityTimeline]);
+    // sseStaleTrigger fires when SSE has been silent > SSE_STALE_THRESHOLD_MS,
+    // causing an immediate fallback poll to keep the activity view current.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activityBug?.bug_id, activityRefreshSeq, sseStaleTrigger, projectId, refreshActivityTimeline]);
 
   useEffect(() => {
     if (!activityBug) return;
@@ -431,6 +463,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         </div>
         <div className="view-header-actions">
           <span className="mono">{projectId}</span>
+          <SseFreshnessBadge freshness={freshness} />
           <span className={`status-badge ${activityTrace.statuses.has_governed_data ? "status-complete" : "status-unknown"}`}>
             {!activityBug ? "no current activity" : activityTrace.source === "fallback_sample" ? "sample fallback" : "governed current stream"}
           </span>
@@ -453,6 +486,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               <strong>Current/runtime stream</strong>
               <span className="mono">{activityBug?.bug_id || "no task"}</span>
             </div>
+            <SseFreshnessDetail freshness={freshness} />
             {activityBug ? (
               <button type="button" className="active" onClick={() => setActivityRefreshSeq((seq) => seq + 1)}>
                 <div>
@@ -467,7 +501,31 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             )}
             <ActivityStreamSummary hint={currentTaskHint} trace={activityTrace} />
             <div className="task-playback-controls">
-              <button type="button" className="action-btn" onClick={() => setActivityRefreshSeq((seq) => seq + 1)}>
+              <button
+                type="button"
+                className="action-btn"
+                title="Force a fresh fetch of the selected backlog and latest timeline, independent of cache or SSE state"
+                onClick={() => {
+                  // Manual refresh: clear loaded state to force a fresh API fetch,
+                  // then bump activityRefreshSeq which re-runs the refresh effect.
+                  if (activityBug) {
+                    const bugId = activityBug.bug_id;
+                    setActivityByBug((states) => ({
+                      ...states,
+                      [bugId]: {
+                        ...(states[bugId] ?? {
+                          loading: false,
+                          loaded: false,
+                          error: "",
+                          trace: emptyTaskPlaybackTrace(projectId, activityBug),
+                        }),
+                        loaded: false,
+                      },
+                    }));
+                  }
+                  setActivityRefreshSeq((seq) => seq + 1);
+                }}
+              >
                 Refresh
               </button>
               <button type="button" className="action-btn" onClick={() => changeMode("history")}>
@@ -808,4 +866,81 @@ function statusClass(status: string): string {
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return `${error.message} ${error.body}`.trim();
   return String(error);
+}
+
+// ---------------------------------------------------------------------------
+// SSE Freshness UI components (criteria b / e)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compact badge shown in the view-header-actions area.
+ * Four states are visually distinct via tone classes that match the existing
+ * live-pill CSS.
+ */
+function SseFreshnessBadge({ freshness }: { freshness: SseFreshnessMeta }) {
+  const tone = sseStatusTone(freshness.status);
+  const label = sseStatusLabel(freshness.status);
+  const title = [
+    `SSE: ${label}`,
+    freshness.lastEventAt ? `last event: ${freshness.lastEventAt}` : "",
+    freshness.lastEventType ? `type: ${freshness.lastEventType}` : "",
+    freshness.staleAgeSecs != null ? `stale age: ${freshness.staleAgeSecs}s` : "",
+    freshness.lastPollAt ? `last poll: ${freshness.lastPollAt}` : "",
+  ].filter(Boolean).join(" | ");
+
+  return (
+    <span
+      className={`sse-freshness-badge live-pill ${tone}`}
+      title={title}
+      aria-label={`SSE stream: ${label}`}
+    >
+      <span className="pill-dot" aria-hidden="true" />
+      {label}
+      {freshness.staleAgeSecs != null && freshness.status !== "live"
+        ? ` (${freshness.staleAgeSecs}s)`
+        : null}
+    </span>
+  );
+}
+
+/**
+ * Inline detail row shown under the "Current/runtime stream" header.
+ * Renders a small metadata block with connection state, last event info,
+ * and fallback poll time. Only shows the stale warning visually when stale.
+ */
+function SseFreshnessDetail({ freshness }: { freshness: SseFreshnessMeta }) {
+  const isStale = freshness.status === "stale" || freshness.status === "fallback-polling";
+  return (
+    <div className={`sse-freshness-detail ${isStale ? "sse-freshness-detail--stale" : ""}`} aria-label="SSE connection detail">
+      <span className="sse-freshness-row">
+        <span className="sse-freshness-label">Connection</span>
+        <span className={`sse-freshness-value sse-freshness-value--${freshness.status}`}>
+          {sseStatusLabel(freshness.status)}
+        </span>
+      </span>
+      {freshness.lastEventAt ? (
+        <span className="sse-freshness-row">
+          <span className="sse-freshness-label">Last event</span>
+          <span className="sse-freshness-value">
+            {freshness.lastEventType ?? "event"}
+            {freshness.lastEventId ? ` #${freshness.lastEventId}` : ""}
+            {" at "}
+            {freshness.lastEventAt.slice(11, 19)}
+          </span>
+        </span>
+      ) : null}
+      {freshness.staleAgeSecs != null && freshness.status !== "live" ? (
+        <span className="sse-freshness-row sse-freshness-row--warn">
+          <span className="sse-freshness-label">Stale age</span>
+          <span className="sse-freshness-value">{freshness.staleAgeSecs}s without SSE message</span>
+        </span>
+      ) : null}
+      {freshness.lastPollAt ? (
+        <span className="sse-freshness-row">
+          <span className="sse-freshness-label">Last poll</span>
+          <span className="sse-freshness-value">{freshness.lastPollAt.slice(11, 19)}</span>
+        </span>
+      ) : null}
+    </div>
+  );
 }
