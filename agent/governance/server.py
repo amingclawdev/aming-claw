@@ -22984,11 +22984,23 @@ def _current_task_row_is_active(row: sqlite3.Row) -> bool:
     status = str(_row_get(row, "status", "") or "").strip().upper()
     if status in _BACKLOG_CLOSED_STATUSES:
         return False
+    runtime_state = str(_row_get(row, "runtime_state", "") or "").strip()
+    current_task_id = str(_row_get(row, "current_task_id", "") or "").strip()
+    # A row whose runtime_state signals an active manual-fix but whose
+    # current_task_id is empty has no live worker bound to it.  Treat it as
+    # stale and exclude it from the active pool so it does not displace a
+    # genuinely active row — regardless of backlog status.
+    # (Data cleanup: 63 such rows were CANCELLED on 2026-06-09.)
+    if _CURRENT_TASK_ACTIVE_RUNTIME_RE.search(runtime_state) and not current_task_id:
+        return False
     if status in _CURRENT_TASK_ACTIVE_BACKLOG_STATUSES:
         return True
     marker = " ".join(
-        str(_row_get(row, key, "") or "")
-        for key in ("runtime_state", "chain_stage", "mf_type", "current_task_id")
+        [runtime_state]
+        + [
+            str(_row_get(row, key, "") or "")
+            for key in ("chain_stage", "mf_type", "current_task_id")
+        ]
     )
     return bool(marker.strip() and _CURRENT_TASK_ACTIVE_RUNTIME_RE.search(marker))
 
