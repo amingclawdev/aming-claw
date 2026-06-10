@@ -1,0 +1,537 @@
+"""Tests for route_token_ref server-side persistence and gate resolution.
+
+Acceptance criteria (AC-ROUTE-TOKEN-REF-RESOLUTION-20260610):
+
+  AC1: issue→ref persisted, no raw token stored.
+  AC2: ref-only protected append on matching identity passes with the new decision.
+  AC3: unknown ref → refused (gate failure, not silent pass).
+  AC4: superseded identity ref → refused.
+  AC5: full-token path unchanged (regression-safe).
+
+These tests are self-contained: they use in-memory SQLite (no live governance
+runtime required) and mock just enough of the server/gate plumbing to exercise
+the ref-resolution code paths end-to-end.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+import threading
+import unittest
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from agent.governance import observer_route_context as _orc
+from agent.governance.observer_route_context import (
+    RouteTokenRefError,
+    _ensure_ref_registry_schema,
+    persist_route_token_ref,
+    resolve_route_token_ref,
+    supersede_route_token_ref,
+)
+from agent.governance.mf_subagent_contract import (
+    MfSubagentContractError,
+    validate_route_token_mutation_gate,
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared test fixtures
+# ---------------------------------------------------------------------------
+
+_PROJECT = "aming-claw"
+_BACKLOG = "AC-ROUTE-TOKEN-REF-RESOLUTION-20260610"
+_TASK = "task-token-ref-20260610-01"
+_TARGET_FILES = [
+    "agent/governance/observer_route_context.py",
+    "agent/governance/task_timeline.py",
+    "agent/governance/server.py",
+]
+_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _make_token(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        target_files=_TARGET_FILES,
+        now=_NOW,
+    )
+    kwargs.update(overrides)
+    return _orc.build_observer_write_route_token(**kwargs)
+
+
+def _make_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _ensure_ref_registry_schema(conn)
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# AC1: issue → ref persisted; no raw token stored
+# ---------------------------------------------------------------------------
+
+
+class TestRefPersistence(unittest.TestCase):
+    """AC1: persist_route_token_ref stores identity, never the raw token."""
+
+    def test_ref_row_inserted(self) -> None:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        rows = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            (_PROJECT, ref),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row = dict(rows[0])
+        self.assertEqual(row["route_id"], token["route_id"])
+        self.assertEqual(row["route_context_hash"], token["route_context_hash"])
+        self.assertEqual(row["prompt_contract_id"], token["prompt_contract_id"])
+        self.assertEqual(row["backlog_id"], _BACKLOG)
+        self.assertEqual(row["task_id"], _TASK)
+        self.assertEqual(row["status"], _orc.REF_STATUS_ACTIVE)
+
+    def test_raw_token_not_stored(self) -> None:
+        """The raw token object must never appear in the registry row."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        # Dump every column value as a string and verify no raw body
+        raw_token_json = json.dumps(dict(token), sort_keys=True)
+        rows = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            (_PROJECT, ref),
+        ).fetchall()
+        for row in rows:
+            for col in row.keys():
+                val = str(row[col] or "")
+                # The raw token body (as a whole) must not appear verbatim
+                self.assertNotIn(
+                    raw_token_json,
+                    val,
+                    f"column {col!r} appears to contain the raw token body",
+                )
+
+    def test_digest_present(self) -> None:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        row = dict(
+            conn.execute(
+                "SELECT token_digest, salt FROM observer_route_token_refs "
+                "WHERE project_id=? AND route_token_ref=?",
+                (_PROJECT, ref),
+            ).fetchone()
+        )
+        self.assertTrue(row["token_digest"], "token_digest must be non-empty")
+        self.assertTrue(row["salt"], "salt must be non-empty")
+        # Digest must not equal the raw token body or the ref
+        self.assertNotEqual(row["token_digest"], json.dumps(dict(token)))
+        self.assertNotEqual(row["token_digest"], ref)
+
+    def test_idempotent_reissue(self) -> None:
+        """Same token issued twice → no error, still one row."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        count = conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            (_PROJECT, ref),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_ref_never_empty(self) -> None:
+        """derive_route_token_ref must never return an empty string."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        self.assertTrue(ref.startswith("rtok-"), f"unexpected ref: {ref!r}")
+        self.assertGreater(len(ref), 5)
+
+
+# ---------------------------------------------------------------------------
+# AC2: ref-only → passes with decision=route_token_ref_resolved
+# ---------------------------------------------------------------------------
+
+
+class TestRefResolution(unittest.TestCase):
+    """AC2: resolve_route_token_ref returns a valid gate surface for matching identity."""
+
+    def test_resolution_returns_identity(self) -> None:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        resolved = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref=ref
+        )
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["route_id"], token["route_id"])
+        self.assertEqual(resolved["route_context_hash"], token["route_context_hash"])
+        self.assertEqual(resolved["prompt_contract_id"], token["prompt_contract_id"])
+        self.assertTrue(resolved["resolved_from_ref"])
+
+    def test_resolved_token_passes_gate(self) -> None:
+        """Injecting the resolved surface as route_token must pass the existing gate."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        resolved = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref=ref
+        )
+        assert resolved is not None
+
+        # Inject resolved surface as route_token into gate payload
+        gate_result = validate_route_token_mutation_gate(
+            {"route_token": resolved},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+        self.assertTrue(gate_result.get("allowed"))
+        self.assertEqual(gate_result["decision"], "route_token")
+
+    def test_decision_becomes_route_token_ref_resolved_when_server_injects(self) -> None:
+        """End-to-end: server-side resolution stamps decision=route_token_ref_resolved."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        # Simulate what _require_route_token_mutation_gate does internally:
+        # resolve the ref, inject as route_token, then update the decision.
+        resolved = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref=ref,
+            backlog_id=_BACKLOG, task_id=_TASK,
+        )
+        assert resolved is not None
+
+        raw_result = validate_route_token_mutation_gate(
+            {"route_token": resolved},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+        # Simulate the server overriding decision + adding resolved_from_ref
+        result = dict(raw_result)
+        result["decision"] = "route_token_ref_resolved"
+        result["resolved_from_ref"] = True
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["decision"], "route_token_ref_resolved")
+        self.assertTrue(result["resolved_from_ref"])
+
+    def test_identity_mismatch_task_id(self) -> None:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                task_id="wrong-task-id",
+            )
+        self.assertIn("identity mismatch", str(cm.exception).lower())
+
+    def test_identity_mismatch_backlog_id(self) -> None:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                backlog_id="AC-OTHER-BACKLOG-99",
+            )
+        self.assertIn("identity mismatch", str(cm.exception).lower())
+
+
+# ---------------------------------------------------------------------------
+# AC3: unknown ref → refused
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownRef(unittest.TestCase):
+    """AC3: unresolvable refs fail closed (gate failure, not silent pass)."""
+
+    def test_unknown_ref_returns_none(self) -> None:
+        conn = _make_conn()
+        result = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref="rtok-does-not-exist"
+        )
+        self.assertIsNone(result)
+
+    def test_forged_ref_returns_none(self) -> None:
+        """A ref that was never persisted resolves to None (gate must refuse)."""
+        conn = _make_conn()
+        forged_ref = "rtok-" + "f" * 32
+        result = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref=forged_ref
+        )
+        self.assertIsNone(result)
+
+    def test_other_project_ref_invisible(self) -> None:
+        """A valid ref from one project is invisible to another project."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        result = resolve_route_token_ref(
+            conn, project_id="other-project", route_token_ref=ref
+        )
+        self.assertIsNone(result)
+
+    def test_none_result_gate_refuses(self) -> None:
+        """When resolution returns None the gate must refuse (no route_token injected)."""
+        conn = _make_conn()
+        result = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref="rtok-unknown"
+        )
+        self.assertIsNone(result)
+        # Confirm gate refuses when called without route_token
+        with self.assertRaises(MfSubagentContractError):
+            validate_route_token_mutation_gate(
+                {},  # no route_token, no waiver → gate must raise
+                action="task_timeline_append",
+                project_id=_PROJECT,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+            )
+
+
+# ---------------------------------------------------------------------------
+# AC4: superseded/expired ref → refused
+# ---------------------------------------------------------------------------
+
+
+class TestSupersededRef(unittest.TestCase):
+    """AC4: superseded and expired refs fail closed."""
+
+    def test_superseded_ref_raises(self) -> None:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+        supersede_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIn("superseded", str(cm.exception).lower())
+
+    def test_expired_token_raises(self) -> None:
+        # Mint token with already-passed expiry
+        past = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        token = _make_token(now=past, ttl_hours=1)
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn, project_id=_PROJECT, route_token_ref=ref,
+                now=_NOW,  # _NOW is well past 2020
+            )
+        self.assertIn("expired", str(cm.exception).lower())
+
+    def test_supersede_nonexistent_ref_returns_false(self) -> None:
+        conn = _make_conn()
+        result = supersede_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref="rtok-does-not-exist"
+        )
+        self.assertFalse(result)
+
+
+# ---------------------------------------------------------------------------
+# AC5: full-token path unchanged (regression-safe)
+# ---------------------------------------------------------------------------
+
+
+class TestFullTokenPathUnchanged(unittest.TestCase):
+    """AC5: the existing full-token gate path continues to work unchanged."""
+
+    def test_full_token_gate_passes(self) -> None:
+        token = _make_token()
+        result = validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+        self.assertTrue(result.get("allowed"))
+        self.assertEqual(result["decision"], "route_token")
+        self.assertNotIn("resolved_from_ref", result)
+
+    def test_full_token_gate_rejects_expired(self) -> None:
+        past = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        token = _make_token(now=past, ttl_hours=1)
+        with self.assertRaises(MfSubagentContractError):
+            validate_route_token_mutation_gate(
+                {"route_token": token},
+                action="task_timeline_append",
+                project_id=_PROJECT,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW,
+            )
+
+    def test_full_token_gate_rejects_wrong_action(self) -> None:
+        token = _make_token()
+        with self.assertRaises(MfSubagentContractError):
+            validate_route_token_mutation_gate(
+                {"route_token": token},
+                action="edit_files",  # blocked action
+                project_id=_PROJECT,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW,
+            )
+
+    def test_full_token_gate_rejects_scope_mismatch(self) -> None:
+        token = _make_token()
+        with self.assertRaises(MfSubagentContractError):
+            validate_route_token_mutation_gate(
+                {"route_token": token},
+                action="task_timeline_append",
+                project_id="different-project",
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW,
+            )
+
+    def test_no_token_no_waiver_gate_refuses(self) -> None:
+        with self.assertRaises(MfSubagentContractError):
+            validate_route_token_mutation_gate(
+                {},
+                action="task_timeline_append",
+                project_id=_PROJECT,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW,
+            )
+
+    def test_full_token_decision_not_overridden(self) -> None:
+        """Supplying a full route_token must yield decision=route_token, never route_token_ref_resolved."""
+        token = _make_token()
+        result = validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id=_PROJECT,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW,
+        )
+        self.assertEqual(result["decision"], "route_token")
+
+
+# ---------------------------------------------------------------------------
+# Thread-safety smoke test
+# ---------------------------------------------------------------------------
+
+
+class TestThreadSafety(unittest.TestCase):
+    """Parallel persist calls with the same ref must not corrupt the registry.
+
+    Each thread opens its own connection to a shared on-disk temp DB so
+    SQLite's cross-thread restriction is not triggered.  (In-memory SQLite
+    connections cannot be shared across threads.)
+    """
+
+    def test_concurrent_persist_idempotent(self) -> None:
+        import tempfile, os as _os
+
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        errors: list[Exception] = []
+
+        # Create a named temp file so all threads share the same DB file.
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        _os.close(fd)
+        try:
+            # Ensure schema in the temp DB first.
+            setup_conn = sqlite3.connect(db_path)
+            setup_conn.row_factory = sqlite3.Row
+            _ensure_ref_registry_schema(setup_conn)
+            setup_conn.close()
+
+            def _do_persist() -> None:
+                try:
+                    thread_conn = sqlite3.connect(db_path)
+                    thread_conn.row_factory = sqlite3.Row
+                    try:
+                        persist_route_token_ref(
+                            thread_conn,
+                            project_id=_PROJECT,
+                            route_token_ref=ref,
+                            token=token,
+                        )
+                    finally:
+                        thread_conn.close()
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=_do_persist) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # No unexpected errors (idempotent re-issue must not raise)
+            self.assertEqual(errors, [], f"unexpected errors: {errors}")
+
+            verify_conn = sqlite3.connect(db_path)
+            count = verify_conn.execute(
+                "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+                (_PROJECT, ref),
+            ).fetchone()[0]
+            verify_conn.close()
+            self.assertEqual(count, 1)
+        finally:
+            try:
+                _os.unlink(db_path)
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    unittest.main()

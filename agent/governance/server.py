@@ -1888,7 +1888,26 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     except Exception as exc:  # pragma: no cover - defensive
         return 400, {"ok": False, "error": f"route token issuance failed: {exc}"}
 
-    return {
+    # Persist the ref→token-digest mapping so gate resolution can work without
+    # the caller re-supplying the full token body.  Failure is non-fatal for the
+    # HTTP response (the caller still receives the full token and can use the
+    # full-token path), but we log a warning in the payload.
+    ref_persist_warning: str = ""
+    try:
+        conn = get_connection(project_id)
+        try:
+            observer_route_context.persist_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=issued["route_token_ref"],
+                token=issued["route_token"],
+            )
+        finally:
+            conn.close()
+    except Exception as exc:  # pragma: no cover - defensive
+        ref_persist_warning = f"route_token_ref persist failed (ref-resolution disabled): {exc}"
+
+    response: dict = {
         "ok": True,
         "project_id": project_id,
         "route_token": issued["route_token"],
@@ -1896,7 +1915,11 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         "merge_queue_id": issued["merge_queue_id"],
         "execute_backlog_row_payload": issued["execute_backlog_row_payload"],
         "provider": issued.get("provider", {}),
+        "ref_registered": not bool(ref_persist_warning),
     }
+    if ref_persist_warning:
+        response["ref_persist_warning"] = ref_persist_warning
+    return response
 
 
 @route("GET", "/api/projects/{project_id}/project-inbox")
@@ -18540,6 +18563,60 @@ def _timeline_payload_with_route_gate(
     return payload
 
 
+def _resolve_route_token_ref_server_side(
+    body: dict,
+    *,
+    pid: str,
+    backlog_id: str = "",
+    task_id: str = "",
+) -> dict | None:
+    """Attempt server-side resolution of a route_token_ref in the request body.
+
+    Returns the public token surface dict (ready to be injected as ``route_token``
+    in the gate payload) if and only if:
+    - The body contains ``route_token_ref`` but NO full ``route_token``.
+    - The ref resolves to an active, non-expired, identity-matching entry.
+
+    Returns ``None`` in all other cases (unknown ref, missing ref, body already
+    has a full token). The caller must treat a ``None`` result as requiring the
+    full-token path (no weakening of existing gate behavior).
+
+    Fails closed: any ``RouteTokenRefError`` from the registry is re-raised so
+    the caller can surface it as a gate failure.
+    """
+    from . import observer_route_context as _orc
+
+    if body.get("route_token"):
+        # Full token present — ref resolution is not needed; leave body unchanged.
+        return None
+
+    route_token_ref = str(body.get("route_token_ref") or "").strip()
+    if not route_token_ref:
+        return None
+
+    try:
+        from .db import get_connection as _get_conn
+        conn = _get_conn(pid)
+    except Exception:
+        return None
+
+    try:
+        resolved = _orc.resolve_route_token_ref(
+            conn,
+            project_id=pid,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return resolved
+
+
 def _require_route_token_mutation_gate(
     ctx: RequestContext,
     *,
@@ -18554,12 +18631,45 @@ def _require_route_token_mutation_gate(
         route_token_required_failure_details,
         validate_route_token_mutation_gate,
     )
+    from . import observer_route_context as _orc
+
+    pid = project_id if project_id is not None else ctx.get_project_id()
+    body = _body_with_metadata_route_gate(ctx.body or {}, metadata)
+
+    # --- Ref-resolution fast path -------------------------------------------
+    # When the caller supplies route_token_ref WITHOUT a full route_token,
+    # attempt server-side resolution.  The resolved surface is injected as
+    # route_token so the existing validate_route_token_mutation_gate logic runs
+    # unchanged.  resolved_from_ref=True is added to the gate result so callers
+    # can distinguish the two passing forms.
+    # Fails closed: RouteTokenRefError surfaces as a 422 gate failure just like
+    # an invalid full token.
+    resolved_from_ref: bool = False
+    try:
+        resolved = _resolve_route_token_ref_server_side(
+            body,
+            pid=pid,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+        if resolved is not None:
+            resolved_from_ref = True
+            # Inject the resolved public surface as route_token; gate validates it.
+            body = dict(body)
+            body["route_token"] = resolved
+    except _orc.RouteTokenRefError as exc:
+        raise GovernanceError(
+            "route_token_required",
+            str(exc),
+            422,
+            route_token_required_failure_details(action=action, reason=str(exc)),
+        ) from exc
 
     try:
-        return validate_route_token_mutation_gate(
-            _body_with_metadata_route_gate(ctx.body or {}, metadata),
+        result = validate_route_token_mutation_gate(
+            body,
             action=action,
-            project_id=project_id if project_id is not None else ctx.get_project_id(),
+            project_id=pid,
             backlog_id=backlog_id,
             task_id=task_id,
         )
@@ -18570,6 +18680,13 @@ def _require_route_token_mutation_gate(
             422,
             route_token_required_failure_details(action=action, reason=str(exc)),
         ) from exc
+
+    if resolved_from_ref:
+        result = dict(result)
+        result["decision"] = "route_token_ref_resolved"
+        result["resolved_from_ref"] = True
+
+    return result
 
 
 def _optional_route_token_mutation_gate(
@@ -18582,7 +18699,11 @@ def _optional_route_token_mutation_gate(
     metadata: dict | None = None,
 ) -> dict:
     body = _body_with_metadata_route_gate(ctx.body or {}, metadata)
-    if not _body_has_route_token_input(body) and not _body_has_route_waiver(body):
+    has_ref_only = bool(
+        not body.get("route_token")
+        and body.get("route_token_ref")
+    )
+    if not _body_has_route_token_input(body) and not _body_has_route_waiver(body) and not has_ref_only:
         return {}
     return _require_route_token_mutation_gate(
         ctx,
