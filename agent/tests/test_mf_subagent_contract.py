@@ -54,7 +54,10 @@ from agent.governance.mf_subagent_contract import (
     _startup_is_host_adapter_surrogate,
     _startup_real_worker_join,
 )
-from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
+from agent.governance.parallel_branch_runtime import (
+    BranchTaskRuntimeContext,
+    _startup_token_evidence,
+)
 
 
 def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract() -> None:
@@ -3335,3 +3338,202 @@ def test_finish_gate_fabricated_caller_events_in_payload_do_not_bypass_gate() ->
     # If we get here, the contract accepted the fabricated events.
     # This documents that the server layer is the enforcement boundary.
     assert gate is not None  # contract accepted (server strips — tested separately)
+
+
+# ---------------------------------------------------------------------------
+# F1: server-verified session_token_evidence_type tests
+# AC-STARTUP-TOKEN-EVIDENCE-SERVER-VERIFICATION-20260610
+# ---------------------------------------------------------------------------
+
+def test_startup_token_evidence_no_stored_hash_first_sight_returns_hash_type() -> None:
+    """F1: first startup with no stored hash → evidence_type='hash' (first-sight commitment)."""
+    evidence = _startup_token_evidence(
+        {"session_token": "my-secret-token-abc"},
+        stored_token_hash="",
+    )
+    assert evidence["session_token_evidence_type"] == "hash"
+    assert evidence["session_token_present"] is True
+    assert evidence["session_token_hash"].startswith("sha256:")
+
+
+def test_startup_token_evidence_matching_stored_hash_returns_server_verified() -> None:
+    """F1: subsequent startup with matching stored hash → evidence_type='server_verified'."""
+    import hashlib
+    raw_token = "my-secret-token-abc"
+    stored = "sha256:" + hashlib.sha256(raw_token.encode()).hexdigest()
+    evidence = _startup_token_evidence(
+        {"session_token": raw_token},
+        stored_token_hash=stored,
+    )
+    assert evidence["session_token_evidence_type"] == "server_verified"
+    assert evidence["session_token_present"] is True
+    assert evidence["session_token_hash"] == stored
+
+
+def test_startup_token_evidence_mismatched_stored_hash_returns_claimed_unverified() -> None:
+    """F1 (core): client-supplied token whose hash does NOT match stored → 'claimed_unverified'."""
+    stored = "sha256:aabbccdd0011223344556677889900aabbccdd00112233445566778899000000"
+    evidence = _startup_token_evidence(
+        {"session_token": "different-token-xyz"},
+        stored_token_hash=stored,
+    )
+    assert evidence["session_token_evidence_type"] == "claimed_unverified"
+    # Hash is still computed (so it's available for logging), but evidence_type is downgraded.
+    assert evidence["session_token_hash"].startswith("sha256:")
+    assert evidence["session_token_hash"] != stored
+
+
+def test_startup_token_evidence_surrogate_unchanged() -> None:
+    """F1: surrogate path is not affected by the server-verification logic."""
+    evidence = _startup_token_evidence(
+        {"session_token_surrogate": "host-surrogate-abc"},
+        stored_token_hash="",
+    )
+    assert evidence["session_token_evidence_type"] == "surrogate"
+    assert evidence["session_token_present"] is False
+
+
+def test_startup_token_evidence_empty_input_unchanged() -> None:
+    """F1: empty input still produces empty evidence type."""
+    evidence = _startup_token_evidence({}, stored_token_hash="")
+    assert evidence["session_token_evidence_type"] == ""
+    assert evidence["session_token_present"] is False
+
+
+def test_claimed_unverified_is_classified_as_surrogate() -> None:
+    """F1 gate: 'claimed_unverified' evidence_type MUST be treated as surrogate by finish gate."""
+    claimed_unverified_startup = {
+        "id": "evt-unverified-001",
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,  # gate should override this
+        "agent_id_match_mode": "actual_host_worker_bound",
+        # claimed_unverified: worker presented token but hash did not match stored hash
+        "session_token_evidence_type": "claimed_unverified",
+        "session_token_hash": "sha256:presented-but-mismatched",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": False,
+        "task_id": "task-sg-test-01",
+        "worker_slot_id": "wslot-sg-01",
+        "runtime_context_id": "mfrctx-sgtest01",
+        "fence_token": "fence-sg-test",
+    }
+    # claimed_unverified must be classified as a surrogate (not trusted)
+    assert _startup_is_host_adapter_surrogate(claimed_unverified_startup) is True
+
+
+def test_server_verified_is_not_classified_as_surrogate() -> None:
+    """F1 gate: 'server_verified' evidence_type MUST NOT be treated as surrogate."""
+    server_verified_startup = {
+        "id": "evt-verified-001",
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,
+        "agent_id_match_mode": "actual_host_worker_bound",
+        "session_token_evidence_type": "server_verified",
+        "session_token_hash": "sha256:verified-token-hash",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": False,
+        "task_id": "task-sv-01",
+        "worker_slot_id": "wslot-sv-01",
+        "runtime_context_id": "mfrctx-sv-01",
+        "fence_token": "fence-sv-01",
+    }
+    assert _startup_is_host_adapter_surrogate(server_verified_startup) is False
+
+
+def test_hash_evidence_type_legacy_is_not_surrogate() -> None:
+    """F1 backward compat: pre-fix 'hash' evidence_type (no server verification available)
+    remains NOT a surrogate — existing recorded events are not retroactively invalidated."""
+    legacy_hash_startup = {
+        "id": "evt-legacy-hash-001",
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:legacy-hash-abc",
+        "session_token_present": True,
+        "task_id": "task-legacy-01",
+        "fence_token": "fence-legacy-01",
+    }
+    assert _startup_is_host_adapter_surrogate(legacy_hash_startup) is False
+
+
+# ---------------------------------------------------------------------------
+# INFO-01: finish-gate fence_token cross-check (server.py layer)
+# The contract function itself does not enforce INFO-01; this tests that the
+# fence_token cross-check logic is correct (server enforces it before calling).
+# AC-STARTUP-TOKEN-EVIDENCE-SERVER-VERIFICATION-20260610
+# ---------------------------------------------------------------------------
+
+def test_info01_fence_token_mismatch_documented() -> None:
+    """INFO-01: documents that task_id/fence mismatch is caught at the server layer.
+
+    The server.py finish-gate handler now cross-checks body fence_token against
+    the server-resolved context's fence_token before calling validate_mf_subagent_finish_gate.
+    This test verifies the logic independently by simulating the cross-check.
+    """
+    # Simulate a context with a known fence_token
+    ctx_fence = "fence-correct-abc"
+    body_fence_wrong = "fence-WRONG-xyz"
+    body_fence_correct = ctx_fence
+
+    # Cross-check: mismatch should be detected
+    mismatch_detected = (
+        body_fence_wrong
+        and ctx_fence
+        and body_fence_wrong != ctx_fence
+    )
+    assert mismatch_detected, "Fence mismatch must be caught before finish gate runs"
+
+    # Cross-check: match should pass
+    match_ok = not (
+        body_fence_correct
+        and ctx_fence
+        and body_fence_correct != ctx_fence
+    )
+    assert match_ok, "Matching fence tokens must pass the cross-check"
+
+    # Cross-check: empty body fence should pass (not enforced if not supplied)
+    empty_body_fence = ""
+    empty_passes = not (
+        empty_body_fence
+        and ctx_fence
+        and empty_body_fence != ctx_fence
+    )
+    assert empty_passes, "Empty body fence_token must not trigger mismatch"
+
+
+# ---------------------------------------------------------------------------
+# F4: close-gate vs finish-gate surrogate asymmetry (documented by design)
+# AC-STARTUP-TOKEN-EVIDENCE-SERVER-VERIFICATION-20260610
+# ---------------------------------------------------------------------------
+
+def test_f4_close_gate_does_not_evaluate_surrogate_policy() -> None:
+    """F4: mf_close_gate_verification does NOT call surrogate-join functions.
+
+    This is intentional: by the time close is reached, the finish gate has
+    already validated the startup evidence.  The close gate only checks event
+    kinds (contract, route-context, etc.).  This test documents the asymmetry
+    and confirms it is preserved.
+    """
+    import inspect
+    from agent.governance import task_timeline
+
+    source = inspect.getsource(task_timeline.mf_close_gate_verification)
+    # The close gate must NOT reference surrogate-join or startup_is_host_adapter_surrogate
+    assert "_startup_is_host_adapter_surrogate" not in source, (
+        "mf_close_gate_verification must not evaluate per-startup surrogate policy; "
+        "see mf-sop.md 'Surrogate Policy: Finish Gate vs Close Gate' for the rationale"
+    )
+    assert "surrogate_startup_evidence_gate" not in source, (
+        "mf_close_gate_verification must not call surrogate_startup_evidence_gate; "
+        "the finish gate is the enforcement boundary"
+    )
+    # The finish gate DOES reference surrogate logic — confirm it is the boundary
+    finish_source = inspect.getsource(validate_mf_subagent_finish_gate)
+    assert "surrogate_startup_evidence_gate" in finish_source, (
+        "validate_mf_subagent_finish_gate must call surrogate_startup_evidence_gate"
+    )

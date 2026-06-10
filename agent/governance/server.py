@@ -6161,6 +6161,18 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             if context is None:
                 raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
 
+            # INFO-01 hardening: cross-check the body-supplied fence_token against
+            # the server-side runtime context BEFORE running the finish gate.
+            # This prevents a redirected request (e.g. wrong task_id in body) from
+            # accidentally running the gate against the wrong lane's startup events.
+            body_fence_token = str(ctx.body.get("fence_token") or "").strip()
+            if body_fence_token and context.fence_token and body_fence_token != context.fence_token:
+                raise ValidationError(
+                    "fence_token mismatch: body fence_token does not match "
+                    "server-side runtime context for the resolved lane; "
+                    "ensure task_id and fence_token identify the same lane"
+                )
+
             # F2 security fix: caller-supplied real_startup_events MUST be ignored.
             # A caller could fabricate matching startup events to bypass the
             # surrogate join gate.  Instead, always fetch startup events from the

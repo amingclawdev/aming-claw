@@ -2859,13 +2859,24 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     A startup is a true surrogate when the session token is absent and a
     surrogate string (or host_adapter marker without a real token) was used.
     A startup that went through the host-adapter path *but* carries a real
-    session-token hash (``session_token_evidence_type == "hash"``) is NOT a
-    surrogate — the worker had a real token and the host-adapter path was only
-    used because the allocation_owner is an observer identity.
+    session-token hash that was server-verified is NOT a surrogate — the worker
+    had a real token and the server confirmed it.
 
     The live startup gate stamps ``agent_id_match_mode`` /
     ``session_token_evidence_type`` so a surrogate startup is distinguishable
     from a real session-token startup.
+
+    Evidence-type semantics (set by ``_startup_token_evidence`` in
+    ``parallel_branch_runtime.py``):
+    - ``'server_verified'``: server confirmed hash against allocation-time record.
+      NOT a surrogate.
+    - ``'hash'``: first-sight commitment — server recorded the hash.  NOT a
+      surrogate.
+    - ``'claimed_unverified'``: worker presented a token but its hash did NOT
+      match the server-recorded allocation hash.  Classified as a SURROGATE
+      (token claim is unverified — treat same as no real token).
+    - ``'surrogate'``: no session token; surrogate string supplied.  Surrogate.
+    - ``''`` (empty): no token.  May be surrogate depending on match_mode.
     """
 
     if not isinstance(evidence, Mapping):
@@ -2874,8 +2885,18 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     # "surrogate" evidence type is always a surrogate — no real token present.
     if token_type == SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE:
         return True
-    # Real session token hash present — NOT a surrogate even if the host-adapter
-    # path was used for agent_id matching (allocation_owner is observer).
+    # "claimed_unverified": worker presented a token but the server found a hash
+    # mismatch — the claim is not trustworthy; treat as surrogate.
+    if token_type == "claimed_unverified":
+        return True
+    # Server-verified or first-sight hash: NOT a surrogate.
+    if token_type in ("server_verified", "hash"):
+        if _string(evidence.get("session_token_hash")) and _bool(
+            evidence.get("session_token_present")
+        ):
+            return False
+    # Legacy path: real session token hash present without explicit evidence type
+    # (e.g. startup events recorded before this fix) — NOT a surrogate.
     if _string(evidence.get("session_token_hash")) and _bool(
         evidence.get("session_token_present")
     ):
