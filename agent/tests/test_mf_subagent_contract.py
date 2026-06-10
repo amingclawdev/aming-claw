@@ -27,11 +27,13 @@ from agent.governance.mf_subagent_contract import (
     MF_SUB_ROLE,
     OBSERVER_COORDINATOR_ROLE,
     OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION,
+    REAL_WORKER_JOIN_SCHEMA_VERSION,
     ROUTE_ACTION_GATE_SCHEMA_VERSION,
     ROUTE_TOKEN_REQUIRED_FAILURE_SCHEMA_VERSION,
     ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
     RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION,
     SERVICE_DISPATCH_SCHEMA_VERSION,
+    SURROGATE_STARTUP_GATE_SCHEMA_VERSION,
     VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
     MfSubagentContractError,
@@ -49,6 +51,8 @@ from agent.governance.mf_subagent_contract import (
     validate_route_token_mutation_gate,
     surrogate_startup_evidence_gate,
     _bounded_startup_evidence_present,
+    _startup_is_host_adapter_surrogate,
+    _startup_real_worker_join,
 )
 from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
@@ -2993,3 +2997,173 @@ def test_surrogate_startup_with_hotfix_exception_still_not_real_worker_evidence(
         gate["reason"]
         == "host_adapter_surrogate_under_observer_hotfix_exception_not_real_worker_evidence"
     )
+
+
+# ---------------------------------------------------------------------------
+# Surrogate join: real worker startup upgrades surrogate via lineage match
+# (AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605)
+# ---------------------------------------------------------------------------
+
+def _surrogate_startup_with_lineage() -> dict:
+    """A surrogate startup with full lineage fields for join matching."""
+    startup = _surrogate_startup()
+    startup.update(
+        {
+            "task_id": "task-sg-test-01",
+            "worker_slot_id": "wslot-sg-01",
+            "runtime_context_id": "mfrctx-sgtest01",
+            "fence_token": "fence-sg-test",
+        }
+    )
+    return startup
+
+
+def _real_worker_startup_matching_lineage(event_id: str = "evt-real-001") -> dict:
+    """A real worker startup event that matches the surrogate lineage."""
+    return {
+        "id": event_id,
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,
+        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+        # Real session token present — NOT a true surrogate.
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:real-token-hash-abc",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": True,
+        "task_id": "task-sg-test-01",
+        "worker_slot_id": "wslot-sg-01",
+        "runtime_context_id": "mfrctx-sgtest01",
+        "fence_token": "fence-sg-test",
+        "worktree": "/repo/.worktrees/sg-test",
+        "worktree_path": "/repo/.worktrees/sg-test",
+        "actual_cwd": "/repo/.worktrees/sg-test",
+        "actual_git_root": "/repo/.worktrees/sg-test",
+        "branch": "refs/heads/task-sg-test",
+        "head_commit": "head-sg-real",
+    }
+
+
+def _real_worker_startup_mismatched_lineage() -> dict:
+    """A real worker startup event with DIFFERENT lineage — should NOT join."""
+    startup = _real_worker_startup_matching_lineage("evt-mismatch-001")
+    startup["task_id"] = "task-DIFFERENT-01"
+    startup["worker_slot_id"] = "wslot-DIFFERENT"
+    return startup
+
+
+def test_host_adapter_real_token_is_not_surrogate() -> None:
+    """A startup that used host-adapter path but has a real session token is NOT a surrogate."""
+    real_token_startup = _real_worker_startup_matching_lineage()
+    assert _startup_is_host_adapter_surrogate(real_token_startup) is False
+
+
+def test_surrogate_only_startup_is_surrogate() -> None:
+    """A startup with session_token_evidence_type==surrogate and no real token IS a surrogate."""
+    assert _startup_is_host_adapter_surrogate(_surrogate_startup()) is True
+    assert _startup_is_host_adapter_surrogate(_surrogate_startup_with_lineage()) is True
+
+
+def test_surrogate_only_still_refused_without_real_startup_events() -> None:
+    """Surrogate-only (no real_startup_events) must stay blocked."""
+    gate = surrogate_startup_evidence_gate(
+        _surrogate_startup_with_lineage(), real_startup_events=None
+    )
+    assert gate["is_host_adapter_surrogate"] is True
+    assert gate["close_satisfying"] is False
+    assert gate["counts_as_real_worker_evidence"] is False
+    join = gate["real_worker_join"]
+    assert join["joined"] is False
+    assert "surrogate_only" in join["reason"]
+    # _bounded_startup_evidence_present must also refuse
+    assert _bounded_startup_evidence_present(
+        _surrogate_startup_with_lineage(), real_startup_events=None
+    ) is False
+
+
+def test_surrogate_joined_by_matching_real_startup_passes() -> None:
+    """Surrogate + real startup with matching lineage -> joined, close-satisfying."""
+    real_event = _real_worker_startup_matching_lineage("evt-real-join-001")
+    gate = surrogate_startup_evidence_gate(
+        _surrogate_startup_with_lineage(),
+        real_startup_events=[real_event],
+    )
+    assert gate["is_host_adapter_surrogate"] is True
+    assert gate["close_satisfying"] is True
+    assert gate["counts_as_real_worker_evidence"] is True
+    assert gate["status"] == "close_satisfying"
+    join = gate["real_worker_join"]
+    assert join["joined"] is True
+    assert join["join_event_id"] == "evt-real-join-001"
+    assert join["reason"] == "real_worker_startup_lineage_match"
+    # _bounded_startup_evidence_present must also pass when real events provided
+    assert _bounded_startup_evidence_present(
+        _surrogate_startup_with_lineage(), real_startup_events=[real_event]
+    ) is True
+
+
+def test_surrogate_not_joined_by_mismatched_real_startup() -> None:
+    """Surrogate + real startup with DIFFERENT lineage -> still refused."""
+    mismatched_event = _real_worker_startup_mismatched_lineage()
+    gate = surrogate_startup_evidence_gate(
+        _surrogate_startup_with_lineage(),
+        real_startup_events=[mismatched_event],
+    )
+    assert gate["is_host_adapter_surrogate"] is True
+    assert gate["close_satisfying"] is False
+    assert gate["counts_as_real_worker_evidence"] is False
+    join = gate["real_worker_join"]
+    assert join["joined"] is False
+    # _bounded_startup_evidence_present must also refuse
+    assert _bounded_startup_evidence_present(
+        _surrogate_startup_with_lineage(), real_startup_events=[mismatched_event]
+    ) is False
+
+
+def test_startup_real_worker_join_direct() -> None:
+    """Direct test of _startup_real_worker_join helper."""
+    surrogate = _surrogate_startup_with_lineage()
+    real_event = _real_worker_startup_matching_lineage("evt-direct-001")
+
+    # Matching lineage -> joined
+    join = _startup_real_worker_join(surrogate, real_startup_events=[real_event])
+    assert join["joined"] is True
+    assert join["join_event_id"] == "evt-direct-001"
+    assert join["schema_version"] == REAL_WORKER_JOIN_SCHEMA_VERSION
+
+    # No events -> not joined
+    join_empty = _startup_real_worker_join(surrogate, real_startup_events=None)
+    assert join_empty["joined"] is False
+
+    # Mismatched lineage -> not joined
+    mismatched = _real_worker_startup_mismatched_lineage()
+    join_mismatch = _startup_real_worker_join(surrogate, real_startup_events=[mismatched])
+    assert join_mismatch["joined"] is False
+
+
+def test_surrogate_join_gate_response_schema_version() -> None:
+    """surrogate_startup_evidence_gate response has correct schema_version and join field."""
+    gate_no_join = surrogate_startup_evidence_gate(_surrogate_startup_with_lineage())
+    assert gate_no_join["schema_version"] == SURROGATE_STARTUP_GATE_SCHEMA_VERSION
+    assert "real_worker_join" in gate_no_join
+
+    real_event = _real_worker_startup_matching_lineage()
+    gate_joined = surrogate_startup_evidence_gate(
+        _surrogate_startup_with_lineage(), real_startup_events=[real_event]
+    )
+    assert gate_joined["schema_version"] == SURROGATE_STARTUP_GATE_SCHEMA_VERSION
+    assert "real_worker_join" in gate_joined
+    assert gate_joined["real_worker_join"]["schema_version"] == REAL_WORKER_JOIN_SCHEMA_VERSION
+
+
+def test_real_session_startup_gate_unaffected_by_new_join_path() -> None:
+    """Existing real-session-token startup tests still pass with the new join path."""
+    gate = surrogate_startup_evidence_gate(
+        _real_session_startup(), real_startup_events=None
+    )
+    assert gate["is_host_adapter_surrogate"] is False
+    assert gate["close_satisfying"] is True
+    assert gate["counts_as_real_worker_evidence"] is True
+    # The join gate is not applicable when not a surrogate
+    assert gate["real_worker_join"]["reason"] == "not_applicable_not_a_surrogate"
