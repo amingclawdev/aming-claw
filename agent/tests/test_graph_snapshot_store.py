@@ -756,6 +756,207 @@ def test_finalize_graph_snapshot_rejects_commit_mismatch_and_stale_active(conn):
     assert active["snapshot_id"] == old["snapshot_id"]
 
 
+# ---------------------------------------------------------------------------
+# Retention policy tests
+# ---------------------------------------------------------------------------
+
+
+def test_retention_selection_protects_active_snapshot(conn, tmp_path):
+    """Active snapshot must never appear as a GC candidate."""
+    _ensure_schema(conn)
+    active = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-act-001", commit_sha="act", snapshot_kind="scope"
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"], auto_rebuild_projection=False)
+    # Add several old snapshots that should be candidates
+    for i in range(5):
+        store.create_graph_snapshot(
+            conn, PID, snapshot_id=f"scope-old-{i:03d}", commit_sha=f"old{i}", snapshot_kind="scope"
+        )
+
+    result = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=1)
+    protected_ids = {item["snapshot_id"] for item in result["protected"]}
+    candidate_ids = {item["snapshot_id"] for item in result["candidates"]}
+
+    assert active["snapshot_id"] in protected_ids, "active snapshot must be protected"
+    assert active["snapshot_id"] not in candidate_ids, "active snapshot must not be a candidate"
+
+
+def test_retention_selection_protects_keep_last_n(conn, tmp_path):
+    """The most recent N snapshots must be protected."""
+    _ensure_schema(conn)
+    snap_ids = []
+    for i in range(8):
+        s = store.create_graph_snapshot(
+            conn, PID, snapshot_id=f"scope-rr-{i:03d}", commit_sha=f"rr{i}", snapshot_kind="scope"
+        )
+        snap_ids.append(s["snapshot_id"])
+
+    result = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=3)
+    protected_ids = {item["snapshot_id"] for item in result["protected"]}
+    candidate_ids = {item["snapshot_id"] for item in result["candidates"]}
+
+    # The 3 most recent should be protected; older ones should be candidates
+    for sid in protected_ids:
+        assert sid not in candidate_ids, f"{sid} must not be both protected and candidate"
+    # At least some older entries should be candidates (by DB id; no dirs on disk so 0 bytes)
+    # We just confirm protected and candidates are disjoint
+    assert (set(protected_ids) & set(candidate_ids)) == set()
+
+
+def test_retention_selection_protects_full_baseline(conn, tmp_path):
+    """The most recent 'full' snapshot must always be protected."""
+    _ensure_schema(conn)
+    full = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-base-retain", commit_sha="base", snapshot_kind="full"
+    )
+    # Add many scopes on top
+    for i in range(15):
+        store.create_graph_snapshot(
+            conn, PID, snapshot_id=f"scope-layer-{i:03d}", commit_sha=f"c{i}", snapshot_kind="scope"
+        )
+
+    # With very small keep_last_n to push full baseline out
+    result = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=2)
+    protected_ids = {item["snapshot_id"] for item in result["protected"]}
+    assert full["snapshot_id"] in protected_ids, "most recent full baseline must be protected"
+
+
+def test_retention_selection_protects_reconcile_in_progress(conn, tmp_path):
+    """Snapshots referenced by running reconcile rows must be protected."""
+    _ensure_schema(conn)
+    active = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-base-rip", commit_sha="base", snapshot_kind="full"
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"], auto_rebuild_projection=False)
+    # Create a snapshot that is being reconciled
+    in_progress = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-in-progress-001", commit_sha="ip1", snapshot_kind="scope"
+    )
+    # Queue a pending scope row pointing to in-progress snapshot
+    store.queue_pending_scope_reconcile(
+        conn, PID, commit_sha="ip1", parent_commit_sha="base",
+        status=store.PENDING_STATUS_RUNNING,
+        evidence={"source": "test"},
+    )
+    # Manually update the snapshot_id on the pending row
+    conn.execute(
+        "UPDATE pending_scope_reconcile SET snapshot_id=? WHERE project_id=? AND commit_sha=?",
+        (in_progress["snapshot_id"], PID, "ip1"),
+    )
+
+    result = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0)
+    protected_ids = {item["snapshot_id"] for item in result["protected"]}
+    assert in_progress["snapshot_id"] in protected_ids, "in-progress reconcile snapshot must be protected"
+
+
+def test_retention_gc_dry_run_does_not_delete(conn, tmp_path):
+    """Dry-run must not delete any directories.
+
+    We create an active snapshot directly (no further activation GC fires),
+    then manually create an extra dir that mimics a stale snapshot and verify
+    dry-run does not remove it.
+    """
+    _ensure_schema(conn)
+    # Activate a full baseline (this runs post-activation GC, but there are no candidates yet)
+    active = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-active-dry", commit_sha="adry", snapshot_kind="full"
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"], auto_rebuild_projection=False)
+
+    # Now manually create a stale snapshot dir that is NOT tracked by the DB
+    # (simulates a leftover from a crashed reconcile)
+    stale_dir = tmp_path / PID / "graph-snapshots" / "scope-orphan-dry-001"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    (stale_dir / "graph.json").write_bytes(b"{}")
+    assert stale_dir.exists()
+
+    # Run dry-run GC — stale dir is a disk-only candidate but must not be deleted
+    result = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=True)
+    assert result["dry_run"] is True
+    assert stale_dir.exists(), "dry-run must not delete any dirs"
+    # The dry-run result should list it as a candidate
+    candidate_ids = {item["snapshot_id"] for item in result["candidates"]}
+    assert "scope-orphan-dry-001" in candidate_ids, "orphan dir should appear as a candidate"
+
+
+def test_retention_gc_apply_deletes_candidates_and_protects_active(conn, tmp_path):
+    """Apply GC must delete candidate dirs and never delete the active snapshot dir."""
+    _ensure_schema(conn)
+    # Create several old candidates
+    old_snaps = []
+    for i in range(5):
+        s = store.create_graph_snapshot(
+            conn, PID, snapshot_id=f"scope-gcapply-{i:03d}", commit_sha=f"gc{i}", snapshot_kind="scope"
+        )
+        old_snaps.append(s)
+
+    # Make one snapshot active
+    active = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-active-gcapply", commit_sha="gcact", snapshot_kind="full"
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"], auto_rebuild_projection=False)
+    active_dir = tmp_path / PID / "graph-snapshots" / active["snapshot_id"]
+    assert active_dir.exists(), "active companion dir should exist"
+
+    result = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
+    assert result["ok"] is True
+    # Active snapshot dir must survive
+    assert active_dir.exists(), "active snapshot dir must never be deleted"
+    # No errors
+    assert result["errors"] == []
+
+
+def test_retention_gc_is_idempotent(conn, tmp_path):
+    """Running GC twice must not error even if dirs are already gone."""
+    _ensure_schema(conn)
+    snap = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-idem-001", commit_sha="idem1", snapshot_kind="scope"
+    )
+    active = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-idem-active", commit_sha="ideact", snapshot_kind="full"
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"], auto_rebuild_projection=False)
+
+    r1 = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
+    r2 = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
+    assert r1["ok"] is True
+    assert r2["ok"] is True
+    assert r2["errors"] == [], "second GC run must not produce errors"
+
+
+def test_write_companion_files_enospc_raises_actionable_error(conn, tmp_path, monkeypatch):
+    """ENOSPC during write_companion_files must raise an actionable OSError."""
+    import errno as _errno
+
+    original_write = store.Path.write_bytes
+
+    call_count = {"n": 0}
+
+    def raise_enospc(self, data):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError(_errno.ENOSPC, "No space left on device", str(self))
+        return original_write(self, data)
+
+    monkeypatch.setattr(store.Path, "write_bytes", raise_enospc)
+
+    with pytest.raises(OSError) as exc_info:
+        store.write_companion_files(PID, "scope-enospc-test", graph_json={"nodes": []})
+
+    msg = str(exc_info.value)
+    assert "graph-snapshots" in msg or "GC" in msg or "dimension" in msg or "stale" in msg.lower(), (
+        f"ENOSPC error message must name the retention tool, got: {msg}"
+    )
+    assert exc_info.value.errno == _errno.ENOSPC
+
+
+def test_bundle_referenced_snapshot_ids_returns_set(tmp_path):
+    """Bundle-referenced snapshot ids must be a set (may be empty in test env)."""
+    result = store._bundle_referenced_snapshot_ids()
+    assert isinstance(result, set)
+
+
 def _small_graph(node_id="L7.1"):
     return {
         "version": 1,

@@ -18,6 +18,11 @@ from . import task_timeline
 ACTION_REMOVE_BATCH_WORKTREE = "remove_stale_batch_worktree"
 ACTION_CLEAR_BACKLOG_WORKTREE_REFERENCE = "clear_terminal_backlog_worktree_reference"
 ACTION_RETAIN_APPEND_ONLY_EVIDENCE = "retain_append_only_evidence"
+ACTION_REMOVE_STALE_GRAPH_SNAPSHOT = "remove_stale_graph_snapshot"
+
+DIMENSION_WORKTREES = "worktrees"
+DIMENSION_GRAPH_SNAPSHOTS = "graph_snapshots"
+ALL_DIMENSIONS = {DIMENSION_WORKTREES, DIMENSION_GRAPH_SNAPSHOTS}
 
 TERMINAL_BACKLOG_STATUSES = {
     "ABANDONED",
@@ -271,14 +276,97 @@ def _count_related_timeline_events(
     return int(row["count"] if hasattr(row, "keys") else row[0])
 
 
+def _build_graph_snapshot_candidates(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Return graph-snapshot dimension candidates in the same conservative model as worktrees."""
+    from .graph_snapshot_store import select_snapshot_retention_candidates
+    try:
+        selection = select_snapshot_retention_candidates(conn, project_id)
+    except Exception as exc:  # noqa: BLE001
+        return [{
+            "candidate_id": _candidate_id("graph_snapshots_error", str(exc)),
+            "artifact_type": "graph_snapshot_dir",
+            "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
+            "snapshot_id": "",
+            "path": "",
+            "safe_to_apply": False,
+            "refusal_reasons": [f"retention_selection_error:{exc}"],
+            "evidence": {"error": str(exc)},
+        }]
+    candidates: list[dict[str, Any]] = []
+    for item in selection.get("candidates", []):
+        sid = str(item.get("snapshot_id") or "")
+        dir_path = str(item.get("dir_exists") and item.get("snapshot_id") or "")
+        from .graph_snapshot_store import _snapshot_root
+        actual_path = str(_snapshot_root(project_id, sid)) if sid else ""
+        exists = bool(item.get("dir_exists"))
+        safe = bool(exists and sid)
+        refusal_reasons: list[str] = []
+        if not exists:
+            refusal_reasons.append("snapshot_dir_missing")
+        if not sid:
+            refusal_reasons.append("snapshot_id_empty")
+        candidates.append({
+            "candidate_id": _candidate_id("graph_snapshot", sid or actual_path),
+            "artifact_type": "graph_snapshot_dir",
+            "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
+            "snapshot_id": sid,
+            "path": actual_path,
+            "safe_to_apply": safe,
+            "refusal_reasons": refusal_reasons,
+            "evidence": {
+                "snapshot_kind": str(item.get("snapshot_kind") or ""),
+                "status": str(item.get("status") or ""),
+                "created_at": str(item.get("created_at") or ""),
+                "age_days": item.get("age_days"),
+                "size_bytes": int(item.get("size_bytes") or 0),
+                "in_db": bool(item.get("in_db")),
+                "exists": exists,
+                "append_only_evidence_retained": True,
+            },
+        })
+    # Also surface protected as refusals (informational)
+    for item in selection.get("protected", []):
+        sid = str(item.get("snapshot_id") or "")
+        from .graph_snapshot_store import _snapshot_root
+        actual_path = str(_snapshot_root(project_id, sid)) if sid else ""
+        candidates.append({
+            "candidate_id": _candidate_id("graph_snapshot_protected", sid),
+            "artifact_type": "graph_snapshot_dir",
+            "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
+            "snapshot_id": sid,
+            "path": actual_path,
+            "safe_to_apply": False,
+            "refusal_reasons": [f"protected:{r}" for r in (item.get("reasons") or ["protected"])],
+            "evidence": {
+                "snapshot_kind": str(item.get("snapshot_kind") or ""),
+                "status": str(item.get("status") or ""),
+                "created_at": str(item.get("created_at") or ""),
+                "protected": True,
+                "exists": bool(item.get("dir_exists")),
+                "append_only_evidence_retained": True,
+            },
+        })
+    return candidates
+
+
 def build_stale_artifact_cleanup_projection(
     conn: sqlite3.Connection,
     project_id: str,
     *,
     repo_root_path: str | Path,
     include_unowned: bool = True,
+    dimension: str = "",
 ) -> dict[str, Any]:
-    """Return a dry-run projection; no artifacts or append-only evidence are deleted."""
+    """Return a dry-run projection; no artifacts or append-only evidence are deleted.
+
+    Pass dimension='graph_snapshots' to scope to graph-snapshot candidates only.
+    Pass dimension='worktrees' (or omit) to scope to worktree candidates only.
+    Omitting dimension includes both (full projection).
+    """
+    dim = str(dimension or "").strip().lower()
 
     root = batch_jobs.repo_root(repo_root_path)
     stale_report = batch_jobs.report_stale_worktrees(conn, project_id, repo_root_path=root)
@@ -412,27 +500,43 @@ def build_stale_artifact_cleanup_projection(
         task_ids=terminal_task_ids,
         backlog_ids=terminal_backlog_ids,
     )
-    safe_count = sum(1 for item in candidates if item.get("safe_to_apply"))
-    unsafe_count = len(candidates) - safe_count
+    # Add graph-snapshot dimension candidates unless scoped to worktrees only
+    snapshot_candidates: list[dict[str, Any]] = []
+    if dim != DIMENSION_WORKTREES:
+        snapshot_candidates = _build_graph_snapshot_candidates(conn, project_id)
+
+    # Filter worktree candidates if scoped to snapshots only
+    if dim == DIMENSION_GRAPH_SNAPSHOTS:
+        all_candidates = snapshot_candidates
+    else:
+        all_candidates = candidates + snapshot_candidates
+
+    safe_count = sum(1 for item in all_candidates if item.get("safe_to_apply"))
+    unsafe_count = len(all_candidates) - safe_count
     return {
         "ok": True,
         "mode": "dry_run",
         "dry_run": True,
         "project_id": project_id,
         "repo_root": str(root),
+        "dimension": dim or "all",
         "summary": {
-            "candidate_count": len(candidates),
+            "candidate_count": len(all_candidates),
             "safe_apply_count": safe_count,
             "unsafe_candidate_count": unsafe_count,
             "stale_worktree_count": len(stale_paths),
             "backlog_reference_count": sum(
-                1 for item in candidates
+                1 for item in all_candidates
                 if item["artifact_type"] == "backlog_worktree_reference"
+            ),
+            "graph_snapshot_count": len(snapshot_candidates),
+            "graph_snapshot_safe_count": sum(
+                1 for item in snapshot_candidates if item.get("safe_to_apply")
             ),
             "append_only_graph_trace_count": len(retained_traces),
             "append_only_timeline_event_count": timeline_event_count,
         },
-        "candidates": candidates,
+        "candidates": all_candidates,
         "append_only_retained": {
             "policy": "retain_append_only_evidence",
             "action": ACTION_RETAIN_APPEND_ONLY_EVIDENCE,
@@ -554,6 +658,7 @@ def apply_stale_artifact_cleanup(
     task_id: str = "",
     reason: str = "",
     remove_branch: bool = False,
+    dimension: str = "",
 ) -> dict[str, Any]:
     """Apply explicit safe cleanup candidates and record timeline evidence."""
 
@@ -562,6 +667,7 @@ def apply_stale_artifact_cleanup(
         project_id,
         repo_root_path=repo_root_path,
         include_unowned=True,
+        dimension=dimension,
     )
     if not candidate_ids:
         payload = {
@@ -621,6 +727,22 @@ def apply_stale_artifact_cleanup(
             backlog_ref = str(candidate.get("backlog_id") or "")
             _clear_backlog_worktree_reference(conn, backlog_ref, cleanup_record=cleanup_record)
             applied.append({**candidate, "result": {"cleared": True, "backlog_id": backlog_ref}})
+        elif candidate["action"] == ACTION_REMOVE_STALE_GRAPH_SNAPSHOT:
+            snap_path = str(candidate.get("path") or "")
+            snap_id = str(candidate.get("snapshot_id") or "")
+            result_detail: dict[str, Any] = {"snapshot_id": snap_id, "path": snap_path}
+            if snap_path and Path(snap_path).exists():
+                try:
+                    shutil.rmtree(snap_path)
+                    result_detail["removed"] = True
+                except OSError as exc:
+                    result_detail["removed"] = False
+                    result_detail["error"] = str(exc)
+            else:
+                result_detail["removed"] = False
+                result_detail["reason"] = "dir_already_missing"
+            cleanup_record["result"] = result_detail
+            applied.append({**candidate, "result": result_detail})
 
     timeline_event = task_timeline.record_event(
         conn,
