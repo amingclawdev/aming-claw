@@ -112,6 +112,13 @@ const CATALOG = semanticCatalog as TaskTimelineSemanticCatalog;
 export const TASK_TIMELINE_SEMANTIC_PROJECTION_SCHEMA = "task_timeline_semantic_projection.v1";
 export const TASK_TIMELINE_SEMANTIC_CATALOG_SCHEMA = CATALOG.schema_version;
 
+/**
+ * PRIVATE_TIMELINE_TEXT_KEY is used exclusively for redacting rendered private
+ * BODY TEXT inside timeline event payloads.  It must never be used to decide
+ * row-level visibility (whether a backlog row appears in the playback list).
+ * Row visibility is driven by the explicit privacy_level / public_safe flags
+ * emitted by the backend compact-bug serialiser.
+ */
 export const PRIVATE_TIMELINE_TEXT_KEY =
   /(raw[-_\s]?prompt|prompt[-_\s]?(text|body|payload)|hidden|private|secret|\btoken\b(?![-_\s]?hash)|provider[-_\s]?(context|payload|config)|filesystem|cwd|worktree[-_\s]?path|host[-_\s]?(path|home|cwd)|judgment[-_\s]?brain|\bjb[-_][a-z0-9][a-z0-9_-]*|\bac[-_]judge[-_][a-z0-9][a-z0-9_-]*|private[-_\s]?judge|judge[-_\s]?mode|judge[-_\s]?(private|route|routing|precheck|provider|prompt|context|memory|brain|lineage|contract))/i;
 

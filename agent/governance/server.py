@@ -22457,6 +22457,36 @@ def _backlog_full_bug(row: sqlite3.Row | dict) -> dict:
     return bug
 
 
+def _backlog_compact_bug_privacy(raw: dict) -> tuple[str, bool]:
+    """Return (privacy_level, public_safe) for a raw backlog row.
+
+    Precedence (highest first):
+      1. Explicit top-level ``privacy_level`` field on the row.
+      2. ``bypass_policy.privacy_level`` / ``bypass_policy.public_safe`` keys.
+      3. Default: "public" / True (safe for existing rows).
+    """
+    # Explicit top-level field wins.
+    if "privacy_level" in raw:
+        level = str(raw["privacy_level"] or "public").strip().lower()
+        public_safe = level != "private"
+        return level, public_safe
+    # Fall through to bypass_policy.
+    policy = backlog_runtime.parse_json_object(raw.get("bypass_policy_json", "{}"))
+    if not isinstance(policy, dict):
+        policy = {}
+    if "privacy_level" in policy:
+        level = str(policy["privacy_level"] or "public").strip().lower()
+        public_safe = bool(policy.get("public_safe", level != "private"))
+        return level, public_safe
+    if "public_safe" in policy:
+        pub = policy["public_safe"]
+        if pub is False:
+            return "private", False
+        return "public", True
+    # Default: public.
+    return "public", True
+
+
 def _backlog_compact_bug(row: sqlite3.Row | dict) -> dict:
     raw = dict(row)
     target_files = _string_list_field(raw.get("target_files"), limit=3)
@@ -22464,6 +22494,7 @@ def _backlog_compact_bug(row: sqlite3.Row | dict) -> dict:
     acceptance = _string_list_field(raw.get("acceptance_criteria"), limit=2)
     required_docs = _string_list_field(raw.get("required_docs"), limit=3)
     provenance_paths = _string_list_field(raw.get("provenance_paths"), limit=3)
+    privacy_level, public_safe = _backlog_compact_bug_privacy(raw)
     return {
         "bug_id": raw.get("bug_id", ""),
         "title": raw.get("title", ""),
@@ -22494,6 +22525,8 @@ def _backlog_compact_bug(row: sqlite3.Row | dict) -> dict:
         "required_docs": required_docs,
         "provenance_paths": provenance_paths,
         "contract_summary": _backlog_contract_summary(raw.get("chain_trigger_json")),
+        "privacy_level": privacy_level,
+        "public_safe": public_safe,
         "compact": True,
     }
 

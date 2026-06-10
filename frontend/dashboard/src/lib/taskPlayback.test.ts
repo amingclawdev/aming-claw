@@ -1,5 +1,5 @@
 import type { BacklogBug, TaskTimelineEvent } from "../types";
-import { normalizeTaskPlaybackTrace } from "./taskPlayback";
+import { isBacklogRowPrivate, normalizeTaskPlaybackTrace } from "./taskPlayback";
 
 const PRIVATE_REQUEST_FIELD = "raw_" + "prompt";
 
@@ -1149,3 +1149,104 @@ export const taskPlaybackHistoricalSemanticFixtureSummary = [
 function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
 }
+
+// ---------------------------------------------------------------------------
+// AC-PLAYBACK-ROW-PRIVACY-FLAG-NOT-REGEX-20260608: explicit flag tests
+// ---------------------------------------------------------------------------
+
+function taskPlaybackPrivacyFlagAssertions(): string[] {
+  // 1. A public row whose title mentions an external provider name is NOT hidden.
+  const externalProviderRow: BacklogBug = {
+    bug_id: "AC-REMOVE-OPENAI-DEPENDENCY-20260101",
+    title: "Remove openai dependency from inference layer",
+    status: "OPEN",
+    priority: "P2",
+    // No privacy_level, no public_safe — defaults to public.
+  };
+  assertFixture(
+    !isBacklogRowPrivate(externalProviderRow),
+    "privacy flag: a public row whose title mentions an external provider must NOT be hidden",
+  );
+
+  // 2. A row without any privacy fields is public (default).
+  const plainRow: BacklogBug = {
+    bug_id: "AC-PLAIN-PUBLIC-20260101",
+    title: "Plain public backlog row",
+    status: "OPEN",
+    priority: "P3",
+  };
+  assertFixture(
+    !isBacklogRowPrivate(plainRow),
+    "privacy flag: a row with no privacy fields must be treated as public (default)",
+  );
+
+  // 3. An explicitly private row is hidden.
+  const explicitlyPrivateRow: BacklogBug = {
+    bug_id: "AC-PRIVATE-ROW-20260101",
+    title: "Private judge routing configuration",
+    status: "OPEN",
+    priority: "P1",
+    privacy_level: "private",
+  };
+  assertFixture(
+    isBacklogRowPrivate(explicitlyPrivateRow),
+    "privacy flag: a row with privacy_level=private must be hidden",
+  );
+
+  // 4. A row with public_safe=false is hidden.
+  const publicSafeFalseRow: BacklogBug = {
+    bug_id: "AC-PUBLIC-SAFE-FALSE-20260101",
+    title: "Internal route configuration",
+    status: "OPEN",
+    priority: "P1",
+    public_safe: false,
+  };
+  assertFixture(
+    isBacklogRowPrivate(publicSafeFalseRow),
+    "privacy flag: a row with public_safe=false must be hidden",
+  );
+
+  // 5. A row with privacy_level=public and public_safe=true is not hidden.
+  const explicitlyPublicRow: BacklogBug = {
+    bug_id: "AC-EXPLICIT-PUBLIC-20260101",
+    title: "Explicit public row",
+    status: "OPEN",
+    priority: "P2",
+    privacy_level: "public",
+    public_safe: true,
+  };
+  assertFixture(
+    !isBacklogRowPrivate(explicitlyPublicRow),
+    "privacy flag: a row with privacy_level=public must not be hidden",
+  );
+
+  // 6. Body text of an explicitly-private row: isPrivatePlaybackText still
+  //    catches private-keyword body text (PRIVATE_TIMELINE_TEXT_KEY is body-only).
+  //    This is a separate concern from row visibility — we only verify that the
+  //    function is callable and handles a private body correctly.
+  //    (The actual body redaction happens inside normalizeTaskPlaybackTrace.)
+  //    We just verify isBacklogRowPrivate does NOT read body text.
+  const privateBodyPublicRow: BacklogBug = {
+    bug_id: "AC-PRIVATE-BODY-PUBLIC-ROW-20260101",
+    // Title contains "raw_prompt" keyword — under the old regex this would hide the row.
+    title: "Fix raw_prompt serialization in the event log",
+    status: "OPEN",
+    priority: "P2",
+    // No privacy_level set — must be public.
+  };
+  assertFixture(
+    !isBacklogRowPrivate(privateBodyPublicRow),
+    "privacy flag: row visibility must not depend on title keyword matching; only explicit flag counts",
+  );
+
+  return [
+    "privacy flag: external-provider title row is not hidden (public default)",
+    "privacy flag: plain row with no privacy fields is public",
+    "privacy flag: privacy_level=private row is hidden",
+    "privacy flag: public_safe=false row is hidden",
+    "privacy flag: privacy_level=public row is not hidden",
+    "privacy flag: keyword-in-title row is not hidden (explicit flag only)",
+  ];
+}
+
+export const taskPlaybackPrivacyFlagFixtureSummary = taskPlaybackPrivacyFlagAssertions();
