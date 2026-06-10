@@ -117,6 +117,23 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
     Do not use a blind `observer_command_next` result as lineage unless it is
     the exact claimed `execute_backlog_row` command for this backlog and route
     identity;
+  - when recording the worker `mf_subagent_read_receipt` timeline event, the
+    append is validated at write time (AC-READ-RECEIPT-APPEND-WRITE-VALIDATION-20260610).
+    A receipt append MUST include all of the following or it will be rejected
+    with an actionable error naming the missing fields
+    (`runtime_context.timeline_evidence_fields.v1`):
+      - `event_kind`: must be `"mf_subagent_read_receipt"` (normalized automatically
+        from `event_type` when absent, but supply it explicitly to avoid ambiguity);
+      - `status`: must be a passing value (`ok`, `accepted`, `passed`, or `succeeded`);
+      - `payload.runtime_context_id`: required lineage field;
+      - `payload.task_id`: required lineage field;
+      - `payload.parent_task_id`: required lineage field;
+      - `payload.fence_token`: required lineage field;
+      - `payload.worker_slot_id`: required for projection matching (normalized
+        from `payload.worker_id` when absent, but supply both to be safe);
+      - at least one of `payload.read_receipt_hash` or `payload.launch_text_hash`;
+    A receipt accepted at write time that satisfies these fields is matchable by
+    `mf_subagent_read_receipt_gate_verification` under the same lineage filter;
   - when route topology or instantiated evidence names
     `architecture_review_lane` or `qa_evidence_gate_review`, record those
      review lanes as first-class evidence. Do not make architecture review

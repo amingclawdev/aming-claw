@@ -6765,5 +6765,265 @@ def test_close_gate_allows_when_originating_command_co_resolved():
     assert gate2["passed"] is True
 
 
+# ---------------------------------------------------------------------------
+# Tests for AC-READ-RECEIPT-APPEND-WRITE-VALIDATION-20260610:
+# validate_and_normalize_mf_read_receipt_append
+# ---------------------------------------------------------------------------
+
+_RECEIPT_LINEAGE = {
+    "runtime_context_id": "mfrctx-test-val",
+    "task_id": "task-val-01",
+    "parent_task_id": "task-val-01",
+    "worker_slot_id": "claude-mfsub-val-01",
+    "fence_token": "fence-val-abc",
+    "read_receipt_hash": "sha256:test-receipt-hash-abc",
+}
+
+
+def _well_formed_receipt_payload(**overrides):
+    """Return a well-formed mf_subagent read-receipt payload."""
+    p = dict(_RECEIPT_LINEAGE)
+    p.update(overrides)
+    return p
+
+
+def test_validate_receipt_rejects_event_3367_exact_shape():
+    """Regression: event #3367 had event_type='mf_subagent_read_receipt',
+    EMPTY event_kind, EMPTY status, and MISSING worker_slot_id / read_receipt_hash.
+    The validator must reject it with an actionable error naming the missing fields."""
+    from agent.governance import task_timeline
+
+    # Reproduce #3367's exact incoming shape:
+    # event_type marks a receipt but kind/status/hash/worker_slot_id are absent.
+    with unittest.TestCase().assertRaises(ValueError) as ctx:
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type="mf_subagent_read_receipt",
+            event_kind="",
+            actor="mf_sub:worker-b4",
+            status="",
+            payload={
+                "runtime_context_id": "mfrctx-b4",
+                "task_id": "task-b4-bootstrap-handoff-20260610-01",
+                "parent_task_id": "task-b4-bootstrap-handoff-20260610-01",
+                # worker_slot_id intentionally absent (replicating #3367)
+                "fence_token": "fence-b4-abc",
+                # read_receipt_hash intentionally absent (replicating #3367)
+                "launch_text_hash": "",  # also empty
+            },
+        )
+
+    msg = str(ctx.exception)
+    # Error must name the projection schema.
+    assert "runtime_context.timeline_evidence_fields.v1" in msg, msg
+    # Error must list specific missing fields.
+    assert "status" in msg, msg
+    assert "worker_slot_id" in msg or "read_receipt_hash" in msg, msg
+
+
+def test_validate_receipt_rejects_missing_status():
+    """A receipt with a good payload but no status is rejected."""
+    from agent.governance import task_timeline
+
+    with unittest.TestCase().assertRaises(ValueError) as ctx:
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type="mf_subagent.read_receipt",
+            event_kind="mf_subagent_read_receipt",
+            actor="mf_sub:worker",
+            status="",
+            payload=_well_formed_receipt_payload(),
+        )
+
+    msg = str(ctx.exception)
+    assert "status" in msg, msg
+    assert "runtime_context.timeline_evidence_fields.v1" in msg, msg
+
+
+def test_validate_receipt_rejects_non_passing_status():
+    """A receipt with a non-passing status (e.g. 'failed') is rejected."""
+    from agent.governance import task_timeline
+
+    with unittest.TestCase().assertRaises(ValueError) as ctx:
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type="mf_subagent.read_receipt",
+            event_kind="mf_subagent_read_receipt",
+            actor="mf_sub:worker",
+            status="failed",
+            payload=_well_formed_receipt_payload(),
+        )
+
+    msg = str(ctx.exception)
+    assert "status" in msg, msg
+
+
+def test_validate_receipt_rejects_missing_both_hashes():
+    """A receipt missing both read_receipt_hash and launch_text_hash is rejected."""
+    from agent.governance import task_timeline
+
+    payload = _well_formed_receipt_payload()
+    payload.pop("read_receipt_hash")
+    # launch_text_hash also absent
+
+    with unittest.TestCase().assertRaises(ValueError) as ctx:
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type="mf_subagent.read_receipt",
+            event_kind="mf_subagent_read_receipt",
+            actor="mf_sub:worker",
+            status="ok",
+            payload=payload,
+        )
+
+    msg = str(ctx.exception)
+    assert "read_receipt_hash" in msg or "launch_text_hash" in msg, msg
+
+
+def test_validate_receipt_accepts_launch_text_hash_without_read_receipt_hash():
+    """launch_text_hash alone satisfies the hash requirement."""
+    from agent.governance import task_timeline
+
+    payload = _well_formed_receipt_payload()
+    payload.pop("read_receipt_hash")
+    payload["launch_text_hash"] = "sha256:launch-abc"
+
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        actor="mf_sub:worker",
+        status="ok",
+        payload=payload,
+    )
+    assert kind == "mf_subagent_read_receipt"
+    assert status == "ok"
+
+
+def test_validate_receipt_rejects_missing_lineage_fields():
+    """A receipt missing lineage fields (runtime_context_id, task_id,
+    parent_task_id, fence_token) is rejected with those field names in the error."""
+    from agent.governance import task_timeline
+
+    payload = {"read_receipt_hash": "sha256:test", "worker_slot_id": "slot-1"}
+    # All lineage fields absent.
+
+    with unittest.TestCase().assertRaises(ValueError) as ctx:
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type="mf_subagent.read_receipt",
+            event_kind="mf_subagent_read_receipt",
+            actor="mf_sub:worker",
+            status="ok",
+            payload=payload,
+        )
+
+    msg = str(ctx.exception)
+    assert "runtime_context_id" in msg, msg
+    assert "task_id" in msg, msg
+    assert "fence_token" in msg, msg
+
+
+def test_validate_receipt_normalizes_empty_event_kind():
+    """When event_type marks a receipt but event_kind is empty, it is normalized
+    to 'mf_subagent_read_receipt'."""
+    from agent.governance import task_timeline
+
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf_subagent.read_receipt",
+        event_kind="",   # empty — must be normalized
+        actor="mf_sub:worker",
+        status="ok",
+        payload=_well_formed_receipt_payload(),
+    )
+    assert kind == "mf_subagent_read_receipt"
+    assert status == "ok"
+
+
+def test_validate_receipt_normalizes_worker_slot_id_from_worker_id():
+    """When worker_slot_id is absent but worker_id is present, worker_slot_id
+    is normalized from worker_id."""
+    from agent.governance import task_timeline
+
+    payload = _well_formed_receipt_payload()
+    payload.pop("worker_slot_id")
+    payload["worker_id"] = "claude-mfsub-slot-norm"
+
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        actor="mf_sub:worker",
+        status="ok",
+        payload=payload,
+    )
+    assert p["worker_slot_id"] == "claude-mfsub-slot-norm"
+
+
+def test_validate_receipt_accepts_well_formed_shape_3366():
+    """Shape #3366: event_kind + status + read_receipt_hash all present — passes unchanged."""
+    from agent.governance import task_timeline
+
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        actor="mf_sub:worker",
+        status="ok",
+        payload=_well_formed_receipt_payload(),
+    )
+    assert kind == "mf_subagent_read_receipt"
+    assert status == "ok"
+    assert "read_receipt_hash" in p
+
+
+def test_validate_receipt_accepts_well_formed_shape_3369_hash_empty_launch_text_hash():
+    """Shape #3369: event_kind + status present, read_receipt_hash empty but
+    launch_text_hash provided — passes (and matched the gate on kind+status+hash)."""
+    from agent.governance import task_timeline
+
+    payload = _well_formed_receipt_payload()
+    # Simulate #3369: read_receipt_hash empty string, launch_text_hash present
+    payload["read_receipt_hash"] = ""
+    payload["launch_text_hash"] = "sha256:launch-3369"
+
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        actor="mf_sub:worker",
+        status="ok",
+        payload=payload,
+    )
+    assert kind == "mf_subagent_read_receipt"
+    assert status == "ok"
+
+
+def test_validate_receipt_passthrough_for_non_receipt_event():
+    """Non-receipt events are passed through unchanged — no validation applied."""
+    from agent.governance import task_timeline
+
+    # A plain implementation event should pass through without any validation.
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf.implementation",
+        event_kind="implementation",
+        actor="mf_sub:worker",
+        status="",  # empty status — OK for non-receipt
+        payload={"changed_files": ["foo.py"]},
+    )
+    assert kind == "implementation"
+    assert status == ""
+
+
+def test_validate_receipt_error_message_names_projection_schema():
+    """The error message must name the projection schema so the caller knows
+    which gate definition requires the listed fields."""
+    from agent.governance import task_timeline
+
+    with unittest.TestCase().assertRaises(ValueError) as ctx:
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type="mf_subagent_read_receipt",
+            event_kind="",
+            actor="mf_sub",
+            status="",
+            payload={},
+        )
+
+    msg = str(ctx.exception)
+    assert "runtime_context.timeline_evidence_fields.v1" in msg, msg
+    assert "mf_subagent read-receipt append rejected" in msg, msg
+
+
 if __name__ == "__main__":
     unittest.main()
