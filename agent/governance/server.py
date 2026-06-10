@@ -1722,6 +1722,38 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
                     artifact_refs=dict(event.get("artifact_refs") or {}),
                     correlation_id=correlation_id,
                 )
+            # F5-LIFECYCLE: when a route.identity.superseded event is recorded
+            # (event_kind == "route_identity_supersede"), invalidate any active
+            # route_token_ref that was bound to the superseded identity.  The
+            # route_token_ref is sourced from the event payload's
+            # route_identity_supersession.supplied.route_token_ref (set by the
+            # repair-run plan builder).  A stale-identity ref presented afterward
+            # will refuse via resolve_route_token_ref's status check (fail closed).
+            from .observer_repair_run import ROUTE_IDENTITY_SUPERSESSION_EVENT_KIND
+            if str(event.get("event_kind") or "") == ROUTE_IDENTITY_SUPERSESSION_EVENT_KIND:
+                from . import observer_route_context as _orc_f5
+                _evt_payload = dict(event.get("payload") or {})
+                _supersession = (
+                    _evt_payload.get("route_identity_supersession")
+                    or _evt_payload.get("supplied")
+                    or {}
+                )
+                if isinstance(_supersession, dict):
+                    _sup_identity = (
+                        _supersession.get("supplied")
+                        or _supersession
+                    )
+                    if isinstance(_sup_identity, dict):
+                        _sup_ref = str(_sup_identity.get("route_token_ref") or "").strip()
+                        if _sup_ref:
+                            try:
+                                _orc_f5.supersede_route_token_ref(
+                                    conn,
+                                    project_id=project_id,
+                                    route_token_ref=_sup_ref,
+                                )
+                            except Exception:
+                                pass  # Best-effort; non-fatal — ref stays active at worst.
             service_events = task_timeline.list_events(
                 conn,
                 project_id,
@@ -18600,6 +18632,8 @@ def _resolve_route_token_ref_server_side(
     pid: str,
     backlog_id: str = "",
     task_id: str = "",
+    route_id: str = "",
+    route_context_hash: str = "",
 ) -> dict | None:
     """Attempt server-side resolution of a route_token_ref in the request body.
 
@@ -18614,6 +18648,11 @@ def _resolve_route_token_ref_server_side(
 
     Fails closed: any ``RouteTokenRefError`` from the registry is re-raised so
     the caller can surface it as a gate failure.
+
+    F2-BINDING: ``route_id`` and ``route_context_hash`` are forwarded from the
+    request context into ``resolve_route_token_ref`` so that identity-binding
+    checks are enforced.  A ref whose stored identity does not match the request
+    route context will raise ``RouteTokenRefError`` (fails closed).
     """
     from . import observer_route_context as _orc
 
@@ -18638,6 +18677,8 @@ def _resolve_route_token_ref_server_side(
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
+            route_id=route_id,
+            route_context_hash=route_context_hash,
         )
     finally:
         try:
@@ -18675,6 +18716,20 @@ def _require_route_token_mutation_gate(
     # can distinguish the two passing forms.
     # Fails closed: RouteTokenRefError surfaces as a 422 gate failure just like
     # an invalid full token.
+    #
+    # F2-BINDING: extract route_id and route_context_hash from the request body
+    # (protected appends carry both in their payload/route_token scope) and
+    # forward them into the resolution call so that identity-binding checks are
+    # actually enforced.  An identity-mismatched ref will raise RouteTokenRefError
+    # (fail closed) instead of silently skipping the check.
+    _req_route_id = str(body.get("route_id") or "").strip()
+    _req_route_context_hash = str(body.get("route_context_hash") or "").strip()
+    # Also check nested route_token / route_waiver structures for the fields.
+    _rt_scope = body.get("route_token") if isinstance(body.get("route_token"), dict) else {}
+    if not _req_route_id:
+        _req_route_id = str(_rt_scope.get("route_id") or "").strip()
+    if not _req_route_context_hash:
+        _req_route_context_hash = str(_rt_scope.get("route_context_hash") or "").strip()
     resolved_from_ref: bool = False
     try:
         resolved = _resolve_route_token_ref_server_side(
@@ -18682,6 +18737,8 @@ def _require_route_token_mutation_gate(
             pid=pid,
             backlog_id=backlog_id,
             task_id=task_id,
+            route_id=_req_route_id,
+            route_context_hash=_req_route_context_hash,
         )
         if resolved is not None:
             resolved_from_ref = True

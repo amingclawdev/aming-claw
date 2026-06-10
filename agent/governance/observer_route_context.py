@@ -886,9 +886,18 @@ def supersede_route_token_ref(
     project_id: str,
     route_token_ref: str,
 ) -> bool:
-    """Mark a route_token_ref as superseded (e.g. after token rotation).
+    """Mark a route_token_ref as superseded.
 
-    Returns True if the ref was found and updated, False if not found.
+    Called by the lifecycle wire (F5) when a ``route.identity.superseded``
+    (``route_identity_supersede``) event is recorded during repair-run
+    route-evidence processing.  After supersession,
+    ``resolve_route_token_ref`` will raise ``RouteTokenRefError`` for this
+    ref, so any stale-identity ref presented afterward is refused (fail
+    closed).
+
+    Returns True if the ref was found and updated, False if not found (e.g.
+    ref was already superseded, never persisted, or belongs to a different
+    project).
     """
     project_id = _string(project_id)
     route_token_ref = _string(route_token_ref)
