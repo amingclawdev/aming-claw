@@ -222,6 +222,7 @@ MF_OBSERVER_FORCED_BLOCKER_STATUS = "pending_judge_review"
 MF_STALE_ROUTE_EVIDENCE_KINDS = (
     "mf_subagent_read_receipt",
     "mf_subagent_startup",
+    "mf_subagent_startup_adoption",
     "mf_subagent_dispatch",
     "bounded_implementation_worker_dispatch",
     "close_ready",
@@ -317,6 +318,14 @@ MF_ROUTE_WORKER_REQUIREMENTS = (
     "bounded_implementation_worker_dispatch",
     "mf_subagent_startup",
 )
+# Existing-worktree adoption equivalence for the mf_subagent_startup
+# requirement (AC-CLOSE-LINEAGE-EXISTING-WORKTREE-ADOPTION-MODE-20260610).
+# Markers are compared in _route_marker-normalized form.
+MF_STARTUP_ADOPTION_EVENT_MARKERS = {
+    "mf_subagent_startup_adoption",
+    "mf_subagent_startup_adoption_gate",
+}
+MF_BRANCH_ADOPTION_MODES = {"existing_branch", "adopt_existing_branch"}
 MF_ROUTE_IDENTITY_REQUIREMENTS = (
     "route_identity_mismatch",
     "same_route_identity",
@@ -363,6 +372,8 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
             "mf_subagent_dispatch",
             "mf_subagent_dispatch_gate",
             "mf_subagent_startup",
+            "mf_subagent_startup_adoption",
+            "mf_subagent_startup_adoption_gate",
             "mf_subagent_startup_gate",
             "qa_verification",
         }
@@ -2255,6 +2266,52 @@ def _route_actual_startup_identity_present(event: dict[str, Any]) -> bool:
     )
 
 
+def _route_event_is_startup_adoption(event: dict[str, Any]) -> bool:
+    """Detect an existing-worktree adoption startup-equivalent event."""
+
+    markers = {_route_marker(marker) for marker in _route_event_markers(event)}
+    if markers.intersection(MF_STARTUP_ADOPTION_EVENT_MARKERS):
+        return True
+    adoption_mode = _route_marker(_first_deep_text(event, "branch_adoption_mode"))
+    if adoption_mode in MF_BRANCH_ADOPTION_MODES:
+        return True
+    return bool(_first_deep_mapping(event, "branch_adoption_evidence"))
+
+
+def _route_startup_adoption_evidence_valid(event: dict[str, Any]) -> bool:
+    """Require a truthful adoption attestation bound to the recorded head.
+
+    Adoption never satisfies the startup requirement when evidence is missing
+    or the attested adopted head does not equal the event's ACTUAL recorded
+    head: that would accept a false started-now/at-base claim.
+    """
+
+    evidence = _first_deep_mapping(event, "branch_adoption_evidence")
+    if not evidence:
+        return False
+    adopted_branch_ref = str(evidence.get("adopted_branch_ref") or "").strip()
+    adopted_base_commit = str(evidence.get("adopted_base_commit") or "").strip()
+    adopted_head_commit = str(evidence.get("adopted_head_commit") or "").strip()
+    attestation_source = str(
+        evidence.get("attestation_source")
+        or evidence.get("attested_by")
+        or evidence.get("attestation")
+        or ""
+    ).strip()
+    if not (
+        adopted_branch_ref
+        and adopted_base_commit
+        and adopted_head_commit
+        and attestation_source
+    ):
+        return False
+    actual_head = (
+        _first_deep_text(event, "head_commit")
+        or _first_deep_text(event, "branch_head")
+    )
+    return bool(actual_head) and actual_head == adopted_head_commit
+
+
 def _route_event_is_identity_cleanup(event: dict[str, Any]) -> bool:
     markers = {_route_marker(marker) for marker in _route_event_markers(event)}
     return bool(markers.intersection(MF_ROUTE_IDENTITY_CLEANUP_MARKERS))
@@ -2354,6 +2411,9 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
             "mf_subagent_startup_gate",
             "startup_gate",
             "startup_evidence",
+            "mf_subagent_startup_adoption",
+            "mf_subagent.startup_adoption",
+            "mf_subagent_startup_adoption_gate",
         }
     ):
         categories.add("mf_subagent_startup")
@@ -2701,6 +2761,22 @@ def mf_route_context_gate_verification(
                 "event_kind": event.get("event_kind"),
                 "status": event.get("status") or event.get("decision"),
                 "reason": "missing_actual_startup_identity",
+                "categories": ["mf_subagent_startup"],
+            })
+            categories = set(categories)
+            categories.discard("mf_subagent_startup")
+            if not categories:
+                continue
+        if (
+            "mf_subagent_startup" in categories
+            and _route_event_is_startup_adoption(event)
+            and not _route_startup_adoption_evidence_valid(event)
+        ):
+            ignored.append({
+                "id": event.get("id") or event.get("event_id"),
+                "event_kind": event.get("event_kind"),
+                "status": event.get("status") or event.get("decision"),
+                "reason": "invalid_branch_adoption_evidence",
                 "categories": ["mf_subagent_startup"],
             })
             categories = set(categories)
