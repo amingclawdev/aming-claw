@@ -3345,6 +3345,38 @@ a:hover { text-decoration: underline; }
   width: 110px;
 }
 
+/* New-events follow-latest banner (Current tab, newestFirst mode) */
+.task-playback-new-events-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid #93c5fd;
+  border-radius: 6px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.task-playback-jump-latest {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: #1d4ed8;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+  border-radius: 5px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.task-playback-jump-latest:hover {
+  background: #bfdbfe;
+}
+
 .task-playback-panel {
   display: grid;
   gap: 10px;

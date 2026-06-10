@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 
 import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
 import type { TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
@@ -23,6 +23,8 @@ interface Props {
   error?: string;
   onSelectFrame?: (frameId: string) => void;
   compact?: boolean;
+  /** When true, the event list renders newest event at the top (Current tab). */
+  newestFirst?: boolean;
 }
 
 export default function TaskPlaybackPanel({
@@ -32,6 +34,7 @@ export default function TaskPlaybackPanel({
   error = "",
   onSelectFrame,
   compact = false,
+  newestFirst = false,
 }: Props) {
   const [internalSelectedFrameId, setInternalSelectedFrameId] = useState("");
   const [statusFilter, setStatusFilter] = useState<FrameStatusFilter>("all");
@@ -41,11 +44,24 @@ export default function TaskPlaybackPanel({
   const [dateFilter, setDateFilter] = useState<FrameDateFilter>("all");
   // Navigation stack: records the sequence of frame visits so Back works across cross-refs.
   const [navStack, setNavStack] = useState<NavStackEntry[]>([]);
+
+  // Follow-latest state: tracks whether the user has manually navigated away from
+  // the newest event so we can show a "N new events — jump to latest" affordance.
+  const [followMode, setFollowMode] = useState(true);
+  const prevFrameCountRef = useRef(0);
+  const [newEventCount, setNewEventCount] = useState(0);
+
   const allFrames = trace.frames;
   const laneOptions = stableStrings(allFrames.map((frame) => frame.lane_id || "unknown"));
   const eventKindOptions = stableStrings(allFrames.map((frame) => frame.event_kind || frame.event_type || "event"));
   const dateOptions = frameDateOptions(allFrames);
   const filteredFrames = filterPlaybackFrames(allFrames, statusFilter, laneFilter, eventKindFilter, eventIdFilter, dateFilter);
+
+  // In newestFirst mode: newest event is frames[frames.length - 1] (oldest-first in
+  // the underlying array). The list is displayed reversed; the "latest" is always
+  // allFrames[allFrames.length - 1].
+  const latestFrameId = allFrames.length > 0 ? allFrames[allFrames.length - 1].id : "";
+
   const effectiveSelectedFrameId = selectedFrameId || internalSelectedFrameId;
   const selectedFrame =
     allFrames.find((frame) => frame.id === effectiveSelectedFrameId) ??
@@ -59,15 +75,35 @@ export default function TaskPlaybackPanel({
   const gate = trace.close_gate_summary;
   const selectedEvidenceLinks = selectedFrame?.evidence_links ?? selectedFrame?.evidence_refs ?? [];
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
-  const groupedFrames = groupFramesByDay(filteredFrames);
 
-  const selectFrame = (frameId: string, pushNav?: { fromFrameId: string; fromLabel: string }) => {
+  // In newestFirst mode: reverse the filtered list so newest events appear at top.
+  const displayFrames = newestFirst ? [...filteredFrames].reverse() : filteredFrames;
+  const groupedFrames = groupFramesByDay(displayFrames);
+
+  const selectFrame = (frameId: string, pushNav?: { fromFrameId: string; fromLabel: string }, fromUser = false) => {
     if (!frameId) return;
     if (pushNav && pushNav.fromFrameId) {
       setNavStack((stack) => [...stack.slice(-9), { frameId: pushNav.fromFrameId, label: pushNav.fromLabel }]);
     }
     onSelectFrame?.(frameId);
     if (!onSelectFrame) setInternalSelectedFrameId(frameId);
+    // If user manually selects a frame that isn't the latest, leave follow mode.
+    if (newestFirst && fromUser) {
+      if (frameId !== latestFrameId) {
+        setFollowMode(false);
+      } else {
+        setFollowMode(true);
+        setNewEventCount(0);
+      }
+    }
+  };
+
+  const jumpToLatest = () => {
+    if (!latestFrameId) return;
+    setFollowMode(true);
+    setNewEventCount(0);
+    onSelectFrame?.(latestFrameId);
+    if (!onSelectFrame) setInternalSelectedFrameId(latestFrameId);
   };
 
   const navigateBack = () => {
@@ -78,6 +114,29 @@ export default function TaskPlaybackPanel({
     if (!onSelectFrame) setInternalSelectedFrameId(entry.frameId);
   };
 
+  // Follow-latest effect: when newestFirst is active and follow mode is on,
+  // auto-select the newest frame whenever new frames arrive. When follow mode
+  // is off, accumulate the count of new frames for the affordance banner.
+  useEffect(() => {
+    if (!newestFirst) return;
+    const prev = prevFrameCountRef.current;
+    const current = allFrames.length;
+    prevFrameCountRef.current = current;
+    if (current <= prev) return; // no new frames
+    const added = current - prev;
+    if (followMode) {
+      // Auto-follow: select the newest frame.
+      if (latestFrameId) {
+        onSelectFrame?.(latestFrameId);
+        if (!onSelectFrame) setInternalSelectedFrameId(latestFrameId);
+      }
+    } else {
+      // User navigated away — accumulate new event count for the affordance.
+      setNewEventCount((n) => n + added);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allFrames.length, newestFirst]);
+
   useEffect(() => {
     setInternalSelectedFrameId("");
     setStatusFilter("all");
@@ -86,7 +145,13 @@ export default function TaskPlaybackPanel({
     setEventIdFilter("");
     setDateFilter("all");
     setNavStack([]);
-  }, [trace.backlog_id]);
+    // Reset follow state when backlog changes.
+    if (newestFirst) {
+      setFollowMode(true);
+      setNewEventCount(0);
+      prevFrameCountRef.current = 0;
+    }
+  }, [trace.backlog_id, newestFirst]);
 
   useEffect(() => {
     setAdvancedEvidenceOpenFrameId("");
@@ -155,8 +220,16 @@ export default function TaskPlaybackPanel({
       {trace.frames.length > 0 ? (
         <div className="task-playback-body">
           <div className="task-playback-event-column task-playback-main">
+            {newestFirst && !followMode && newEventCount > 0 ? (
+              <div className="task-playback-new-events-banner" role="status" aria-live="polite">
+                <span>{newEventCount} new event{newEventCount === 1 ? "" : "s"}</span>
+                <button type="button" className="action-btn task-playback-jump-latest" onClick={jumpToLatest}>
+                  Jump to latest
+                </button>
+              </div>
+            ) : null}
             <div className="task-playback-controls" aria-label="Playback event controls">
-              <button type="button" className="action-btn" onClick={() => selectFrame(filteredFrames[filteredFrames.length - 1]?.id || allFrames[allFrames.length - 1]?.id || "")}>
+              <button type="button" className="action-btn" onClick={() => { selectFrame(latestFrameId || filteredFrames[0]?.id || allFrames[allFrames.length - 1]?.id || "", undefined, true); }}>
                 Latest
               </button>
               <button type="button" className="action-btn" onClick={() => selectFrame(selectedFrame?.id || filteredFrames[0]?.id || "")}>
@@ -206,7 +279,7 @@ export default function TaskPlaybackPanel({
                       <button
                         type="button"
                         className={frame.id === selectedFrame?.id ? "active" : ""}
-                        onClick={() => selectFrame(frame.id)}
+                        onClick={() => selectFrame(frame.id, undefined, true)}
                       >
                         <span className={`task-playback-dot status-${frame.status}`} />
                         <div>
@@ -272,7 +345,7 @@ export default function TaskPlaybackPanel({
               <RelationLinkSection
                 relations={selectedFrame.relation_links ?? []}
                 frames={allFrames}
-                onJump={(frameId) => selectFrame(frameId, { fromFrameId: selectedFrame.id, fromLabel: selectedFrame.title })}
+                onJump={(frameId) => selectFrame(frameId, { fromFrameId: selectedFrame.id, fromLabel: selectedFrame.title }, true)}
               />
               <EvidenceLinkSection links={selectedEvidenceLinks} onInspect={setSelectedEvidenceRef} />
 
