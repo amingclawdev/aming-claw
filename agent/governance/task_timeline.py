@@ -4840,6 +4840,75 @@ def mf_close_gate_verification(
     }
 
 
+def compact_gate_summary(
+    full_result: dict[str, Any],
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Derive the compact precheck/gate summary from a full mf_close_gate_verification result.
+
+    Returns only the fields needed to understand close-readiness:
+    ok, project_id, bug_id, applicable, can_close, missing_event_kinds,
+    failed_gates (gates with passed=false only), route_identity (canonical 3 hashes),
+    event_count, and request_id.
+
+    The full gate tree is NOT re-evaluated; this is a projection of the existing result.
+    """
+    passed = bool(full_result.get("passed") or full_result.get("can_close"))
+    can_close = passed
+
+    missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+
+    gate_keys = [
+        "contract_gate",
+        "route_context_gate",
+        "lane_ownership_gate",
+        "worker_graph_trace_gate",
+        "independent_qa_gate",
+        "contract_projection_gate",
+        "post_verification_actions_gate",
+        "blocker_resolution_gate",
+        "cross_ref_gate",
+        "approval_scope_gate",
+        "command_disposition_gate",
+    ]
+    failed_gates = []
+    for key in gate_keys:
+        gate = _mapping(full_result.get(key))
+        if not gate:
+            continue
+        if not bool(gate.get("passed")):
+            missing_req = list(gate.get("missing_requirement_ids") or [])
+            failed_gates.append({
+                "gate": key,
+                "status": str(gate.get("status") or "failed"),
+                "missing_requirement_ids": missing_req,
+            })
+
+    # Route identity from route_context_gate
+    route_ctx_gate = _mapping(full_result.get("route_context_gate"))
+    route_identity: dict[str, Any] = {}
+    for hash_key in ("route_context_hash", "prompt_contract_hash", "visible_injection_manifest_hash"):
+        val = str(route_ctx_gate.get(hash_key) or full_result.get(hash_key) or "").strip()
+        if val:
+            route_identity[hash_key] = val
+
+    summary: dict[str, Any] = {
+        "ok": True,
+        "can_close": can_close,
+        "missing_event_kinds": missing_event_kinds,
+        "failed_gates": failed_gates,
+        "event_count": int(full_result.get("event_count") or 0),
+    }
+    for opt_key in ("project_id", "bug_id", "applicable"):
+        if full_result.get(opt_key) is not None:
+            summary[opt_key] = full_result[opt_key]
+    if route_identity:
+        summary["route_identity"] = route_identity
+    if request_id:
+        summary["request_id"] = request_id
+    return summary
+
+
 def _observer_command_route_identity(payload: dict[str, Any] | None) -> dict[str, str]:
     source = _mapping(payload)
     identity = {

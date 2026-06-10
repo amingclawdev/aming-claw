@@ -3328,6 +3328,46 @@ def _runtime_text_worker_prompt(
 
 
 def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
+    """Build the bounded worker launch text with one canonical runtime contract JSON block.
+
+    AC4: Deduplicate embedded JSON — branch_runtime_evidence and graph_first_obligations
+    appear multiple times in the raw payload (inside dispatch_gate and at top level).
+    Emit one canonical 'Runtime contract JSON' block and replace in-payload duplicates
+    with a short reference line pointing to that block by hash.
+
+    The launch_text_hash is sha256 of the resulting full text — same recipe, smaller text.
+    Worker-facing required instructions remain complete.
+    """
+    # Build a compact copy of the payload with duplicates replaced by reference lines.
+    compact_payload: dict[str, Any] = {}
+    for key, value in payload.items():
+        compact_payload[key] = value
+
+    # Identify duplicated sub-objects: graph_first_obligations appears at top level AND
+    # inside dispatch_gate (as dispatch_graph_obligation and graph_first_obligations).
+    # branch_runtime_evidence appears at top level AND inside dispatch_gate.
+    gfo = compact_payload.get("graph_first_obligations")
+    bre_top = compact_payload.get("branch_runtime_evidence")
+    dispatch_gate = compact_payload.get("dispatch_gate")
+    if isinstance(dispatch_gate, Mapping) and (gfo is not None or bre_top is not None):
+        deduped_gate = dict(dispatch_gate)
+        if gfo is not None:
+            gfo_json = json.dumps(gfo, sort_keys=True, separators=(",", ":"))
+            gfo_hash = "sha256:" + hashlib.sha256(gfo_json.encode()).hexdigest()[:12]
+            deduped_gate["dispatch_graph_obligation"] = (
+                f"see Runtime contract JSON above under graph_first_obligations; hash {gfo_hash}"
+            )
+            deduped_gate["graph_first_obligations"] = (
+                f"see Runtime contract JSON above under graph_first_obligations; hash {gfo_hash}"
+            )
+        if bre_top is not None:
+            bre_json = json.dumps(bre_top, sort_keys=True, separators=(",", ":"))
+            bre_hash = "sha256:" + hashlib.sha256(bre_json.encode()).hexdigest()[:12]
+            deduped_gate["branch_runtime_evidence"] = (
+                f"see Runtime contract JSON above under branch_runtime_evidence; hash {bre_hash}"
+            )
+        compact_payload["dispatch_gate"] = deduped_gate
+
     return (
         "You are a bounded mf_sub implementation worker for Aming Claw.\n\n"
         "Follow the runtime context exactly. Raw private route/context-pack "
@@ -3360,7 +3400,7 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "final evidence; if the precheck is not applicable, record the concrete "
         "reason.\n\n"
         "Runtime contract JSON:\n"
-        + json.dumps(payload, indent=2, sort_keys=True)
+        + json.dumps(compact_payload, indent=2, sort_keys=True)
     )
 
 
