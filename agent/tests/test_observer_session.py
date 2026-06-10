@@ -465,3 +465,259 @@ def test_command_blocks_close_clears_on_terminal_or_co_resolved():
     assert observer_session.command_blocks_close("co_resolved") is False
     assert observer_session.command_blocks_close("co-resolved-with-close") is False
     assert observer_session.command_blocks_close("resolved") is False
+
+
+# ---------------------------------------------------------------------------
+# GAP 2 regression tests — bootstrap compact handoff (AC-OBSERVER-ROOT-ROUTE-
+# BOOTSTRAP-COMPACT-HANDOFF-20260609)
+# ---------------------------------------------------------------------------
+
+_DOCUMENTED_COMPACT_FIELDS = {
+    "backlog_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "work_mode",
+    "default_work_mode",
+    "allowed_actions",
+    "blocked_actions",
+    "required_evidence",
+    "loaded_skills",
+    "loaded_resources",
+    "graph_query_schema_trace_id",
+    "next_legal_action",
+    "canonical_route_identity",
+}
+
+# Provider names that must never appear in a public-safe response.
+_PRIVATE_PROVIDER_NAMES = {"openai", "anthropic", "claude", "codex", "gpt"}
+
+
+def _build_full_route_context() -> dict:
+    return {
+        "route_id": "route-20260610-abc123",
+        "route_context_hash": "sha256:abc123ctx",
+        "prompt_contract_id": "rprompt-abc123",
+        "prompt_contract_hash": "sha256:abc123pc",
+        "visible_injection_manifest_hash": "sha256:abc123vim",
+    }
+
+
+def test_compact_output_contains_exactly_documented_fields_no_raw_provider_body():
+    """GAP 2 (i): compact default output contains exactly the documented fields
+    and no raw provider body or provider-private fields.
+    """
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-BOOTSTRAP-COMPACT-20260609",
+        route_context=_build_full_route_context(),
+        loaded_skills=["aming-claw"],
+        loaded_resources=["mf-sop.md"],
+        graph_query_schema_trace_id="gqt-20260610-abc123",
+    )
+
+    # Every documented field must be present.
+    for field in _DOCUMENTED_COMPACT_FIELDS:
+        assert field in ctx, f"missing documented field: {field}"
+
+    # No raw provider body or provider-naming fields may leak into the response.
+    ctx_str = str(ctx).lower()
+    for provider in _PRIVATE_PROVIDER_NAMES:
+        assert provider not in ctx_str, (
+            f"provider name {provider!r} leaked into compact output"
+        )
+
+
+def test_public_safe_boundary_no_private_provider_names_or_raw_prompt_text():
+    """GAP 2 (ii): public-safe boundary — response never contains private
+    provider names or raw prompt text fields.
+    """
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-BOOTSTRAP-PUBLIC-SAFE-20260609",
+        route_context=_build_full_route_context(),
+        loaded_skills=["aming-claw"],
+        loaded_resources=["aming-claw://skill"],
+    )
+
+    response_str = str(ctx).lower()
+
+    # No raw prompt text fields.
+    assert "raw_prompt" not in response_str
+    assert "raw_context" not in response_str
+    assert "provider_body" not in response_str
+
+    # No private provider names.
+    for provider in _PRIVATE_PROVIDER_NAMES:
+        assert provider not in response_str, (
+            f"private provider name {provider!r} must not appear in public response"
+        )
+
+
+def test_no_recorded_route_identity_returns_valid_look_before_act_handoff():
+    """GAP 2 (iii): when the row has no recorded route identity, the response
+    still returns a valid look-before-act handoff with a defined next_legal_action.
+    Asserts the REAL current behavior, not invented behavior.
+    """
+    # Supply no route_context — simulates a backlog row that has no recorded
+    # route identity (no route_context gate has fired yet).
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-BOOTSTRAP-NO-ROUTE-IDENTITY-20260609",
+    )
+
+    # Must be a valid handoff regardless — no exception, all mandatory fields
+    # present, and next_legal_action resolves to the look-before-act blocker.
+    for field in _DOCUMENTED_COMPACT_FIELDS:
+        assert field in ctx, f"missing field with no route identity: {field}"
+
+    # With no recorded identity the canonical identity is incomplete but present.
+    identity = ctx["canonical_route_identity"]
+    assert "route_id" in identity
+    assert "route_context_hash" in identity
+    assert "prompt_contract_id" in identity
+    assert "prompt_contract_hash" in identity
+    assert "visible_injection_manifest_hash" in identity
+
+    # All five fields are empty (not fabricated) when no identity is available.
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert identity[field] == "", (
+            f"field {field!r} should be empty-not-fabricated when no route identity"
+        )
+
+    # Identity is flagged incomplete.
+    assert ctx["canonical_route_identity_complete"] is False
+    assert identity.get("incomplete") is True
+
+    # The next legal action is the real look-before-act blocker.
+    nla = ctx["next_legal_action"]
+    assert nla["id"] == "record_work_mode_transition"
+
+
+def test_next_legal_action_differs_between_modes():
+    """GAP 2 (iv): next_legal_action differs between observer_look_before_act
+    (record_work_mode_transition) and observer_execution_supervisor
+    (dispatch_bounded_worker).  Tests the gate function directly.
+    """
+    # Look-before-act (default mode).
+    look = observer_session.build_observer_root_route_context(
+        backlog_id="AC-MODE-LBA-20260609",
+        route_context=_build_full_route_context(),
+        work_mode="observer_look_before_act",
+    )
+    assert look["next_legal_action"]["id"] == "record_work_mode_transition"
+
+    # Execution supervisor mode — dispatcher gate should open.
+    sup = observer_session.build_observer_root_route_context(
+        backlog_id="AC-MODE-SUP-20260609",
+        route_context=_build_full_route_context(),
+        work_mode="observer_execution_supervisor",
+    )
+    assert sup["next_legal_action"]["id"] == "dispatch_bounded_worker"
+
+    # The two modes must return different next_legal_action ids.
+    assert look["next_legal_action"]["id"] != sup["next_legal_action"]["id"]
+
+    # Supervisor mode must not block dispatch.
+    assert "dispatch_implementation" not in sup["blocked_actions"]
+    assert "dispatch_implementation" in sup["allowed_actions"]
+
+    # Look-before-act must block supervisor actions until transition.
+    assert "dispatch_implementation" in look["blocked_actions"]
+
+
+# ---------------------------------------------------------------------------
+# GAP 1 regression tests — POST handler binds caller-supplied trace id
+# (server._is_plausible_graph_trace_id and POST body binding)
+# ---------------------------------------------------------------------------
+
+
+def test_is_plausible_graph_trace_id_accepts_valid_format():
+    """The server-side plausibility check accepts gqt-YYYYMMDD-hex strings."""
+    from agent.governance.server import _is_plausible_graph_trace_id
+
+    assert _is_plausible_graph_trace_id("gqt-20260610-abc123ef90") is True
+    assert _is_plausible_graph_trace_id("gqt-20260610-c2445c014f") is True
+    assert _is_plausible_graph_trace_id("gqt-20260101-0000000000") is True
+
+
+def test_is_plausible_graph_trace_id_rejects_invalid():
+    """The plausibility check rejects non-gqt strings, blanks, and injections."""
+    from agent.governance.server import _is_plausible_graph_trace_id
+
+    assert _is_plausible_graph_trace_id("") is False
+    assert _is_plausible_graph_trace_id(None) is False
+    assert _is_plausible_graph_trace_id("trace-123") is False
+    assert _is_plausible_graph_trace_id("gqt-2026-abc") is False          # 4-digit date
+    assert _is_plausible_graph_trace_id("gqt-20260610-") is False          # empty hex
+    assert _is_plausible_graph_trace_id("gqt-20260610-ABCDEF") is False    # uppercase hex
+    assert _is_plausible_graph_trace_id("gqt-20260610-abc xyz") is False   # spaces
+    assert _is_plausible_graph_trace_id("arbitrary-string") is False
+
+
+def test_post_handler_binds_caller_trace_id_via_state_function():
+    """GAP 1: _observer_root_route_context_state prefers a plausible caller-
+    supplied graph_query_schema_trace_id over the (empty) timeline-derived one.
+    Uses a minimal in-memory DB that has no timeline events.
+    """
+    import sqlite3
+    from unittest.mock import patch
+    from agent.governance import task_timeline, backlog_runtime
+    from agent.governance.server import _observer_root_route_context_state
+    from agent.governance import observer_session as obs
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    # Ensure minimal schema so the state function can run.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS backlog_bugs "
+        "(bug_id TEXT PRIMARY KEY, chain_trigger_json TEXT)"
+    )
+    task_timeline.ensure_schema(conn)
+
+    caller_trace = "gqt-20260610-c2445c014f"
+
+    result = _observer_root_route_context_state(
+        conn,
+        "demo",
+        backlog_id="AC-TRACE-BIND-TEST-20260609",
+        work_mode=obs.normalize_work_mode(None),
+        caller_graph_query_schema_trace_id=caller_trace,
+    )
+
+    # The caller-supplied plausible trace id must be echoed in the response.
+    assert result["graph_query_schema_trace_id"] == caller_trace
+
+
+def test_post_handler_ignores_implausible_caller_trace_id():
+    """GAP 1: when the caller supplies an implausible trace id, the state
+    function falls back to the timeline-derived value (empty when no events).
+    """
+    import sqlite3
+    from agent.governance import task_timeline
+    from agent.governance.server import _observer_root_route_context_state
+    from agent.governance import observer_session as obs
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS backlog_bugs "
+        "(bug_id TEXT PRIMARY KEY, chain_trigger_json TEXT)"
+    )
+    task_timeline.ensure_schema(conn)
+
+    result = _observer_root_route_context_state(
+        conn,
+        "demo",
+        backlog_id="AC-TRACE-BIND-IGNORE-TEST-20260609",
+        work_mode=obs.normalize_work_mode(None),
+        caller_graph_query_schema_trace_id="not-a-valid-trace-id",
+    )
+
+    # Implausible trace id must not be echoed — falls back to empty.
+    assert result["graph_query_schema_trace_id"] == ""

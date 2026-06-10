@@ -20252,6 +20252,23 @@ def _canonical_route_id(
     return ""
 
 
+def _is_plausible_graph_trace_id(value: Any) -> bool:
+    """Defensive format check for a caller-supplied graph query schema trace id.
+
+    Accepts the documented gqt-YYYYMMDD-<hex> format.  This is a string-only
+    check — no server-side ledger resolution is attempted.  Invalid or
+    unsupported formats are silently dropped so callers cannot inject arbitrary
+    strings into the response field.
+    """
+    import re
+
+    s = str(value or "").strip()
+    if not s:
+        return False
+    # Documented format: gqt-YYYYMMDD-<hex chars>
+    return bool(re.match(r"^gqt-\d{8}-[0-9a-f]+$", s))
+
+
 def _observer_root_route_context_state(
     conn,
     project_id: str,
@@ -20260,12 +20277,17 @@ def _observer_root_route_context_state(
     work_mode: str,
     loaded_skills=None,
     loaded_resources=None,
+    caller_graph_query_schema_trace_id: Any = None,
 ) -> dict[str, Any]:
     """Assemble the aming-owned observer root route context for a backlog row.
 
     Pulls the canonical route identity and graph query_schema trace id from the
     backlog timeline route-context gate (the generic route protocol output) and
     normalizes it into the aming-owned observer contract surface.
+
+    When the caller supplies a plausible graph_query_schema_trace_id (format
+    gqt-YYYYMMDD-hex) it is preferred over the timeline-derived trace id so
+    that a fresh session which already ran query_schema can bind its own trace.
     """
     from . import task_timeline
 
@@ -20285,14 +20307,19 @@ def _observer_root_route_context_state(
     )
     route_identity = route_context_gate.get("route_identity") or {}
 
-    # Graph query_schema trace id: prefer a worker graph-trace id surfaced on the
-    # close gate, else any graph trace ref recorded on the timeline.
+    # Graph query_schema trace id: if the caller supplied a plausible trace id
+    # (a fresh session that already ran query_schema passes its own gqt-* id),
+    # use that.  Otherwise fall back to the worker graph-trace id surfaced on
+    # the close gate, then to any graph trace ref recorded on the timeline.
     graph_trace_id = ""
-    close_gate = task_timeline.mf_close_gate_verification(events, contract=contract)
-    worker_graph_trace_gate = close_gate.get("worker_graph_trace_gate") or {}
-    trace_ids = worker_graph_trace_gate.get("trace_ids") or []
-    if isinstance(trace_ids, list) and trace_ids:
-        graph_trace_id = str(trace_ids[0] or "").strip()
+    if _is_plausible_graph_trace_id(caller_graph_query_schema_trace_id):
+        graph_trace_id = str(caller_graph_query_schema_trace_id).strip()
+    else:
+        close_gate = task_timeline.mf_close_gate_verification(events, contract=contract)
+        worker_graph_trace_gate = close_gate.get("worker_graph_trace_gate") or {}
+        trace_ids = worker_graph_trace_gate.get("trace_ids") or []
+        if isinstance(trace_ids, list) and trace_ids:
+            graph_trace_id = str(trace_ids[0] or "").strip()
 
     route_context_for_bootstrap = dict(route_identity)
     route_context_for_bootstrap.setdefault(
@@ -20368,13 +20395,23 @@ def handle_observer_root_route_context_get(ctx: RequestContext):
 
 @route("POST", "/api/projects/{project_id}/observer-root-route-context")
 def handle_observer_root_route_context_post(ctx: RequestContext):
-    """Materialize the observer root route context (body form, supports skills)."""
+    """Materialize the observer root route context (body form, supports skills).
+
+    Accepts an optional graph_query_schema_trace_id field (format
+    gqt-YYYYMMDD-hex).  When plausible, it is echoed back in the response
+    field of the same name so a caller that already ran query_schema in a
+    fresh session can bind its own trace id to the returned handoff.
+    """
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     if not backlog_id:
         raise ValueError("backlog_id is required")
     work_mode = observer_session.normalize_work_mode(body.get("work_mode"))
+    caller_trace_id = (
+        body.get("graph_query_schema_trace_id")
+        or body.get("query_schema_trace_id")
+    )
     with DBContext(project_id) as conn:
         return _observer_root_route_context_state(
             conn,
@@ -20383,6 +20420,7 @@ def handle_observer_root_route_context_post(ctx: RequestContext):
             work_mode=work_mode,
             loaded_skills=body.get("loaded_skills") or body.get("skills"),
             loaded_resources=body.get("loaded_resources") or body.get("resources"),
+            caller_graph_query_schema_trace_id=caller_trace_id,
         )
 
 
