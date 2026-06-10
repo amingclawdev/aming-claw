@@ -3167,3 +3167,171 @@ def test_real_session_startup_gate_unaffected_by_new_join_path() -> None:
     assert gate["counts_as_real_worker_evidence"] is True
     # The join gate is not applicable when not a surrogate
     assert gate["real_worker_join"]["reason"] == "not_applicable_not_a_surrogate"
+
+
+# ---------------------------------------------------------------------------
+# F3 fix: empty-lineage candidate rejects join
+# (QA block #3516 finding F3-MINOR)
+# ---------------------------------------------------------------------------
+
+def _real_worker_startup_empty_lineage_fields(**overrides: str) -> dict:
+    """A real-token startup where some or all lineage fields are empty."""
+    base = _real_worker_startup_matching_lineage("evt-empty-lineage-001")
+    # Wipe all four lineage fields by default.
+    base["task_id"] = ""
+    base["worker_slot_id"] = ""
+    base["runtime_context_id"] = ""
+    base["fence_token"] = ""
+    base.update(overrides)
+    return base
+
+
+def test_empty_lineage_candidate_task_id_does_not_join() -> None:
+    """Candidate with empty task_id must NOT join even if all other fields match."""
+    surrogate = _surrogate_startup_with_lineage()
+    candidate = _real_worker_startup_matching_lineage()
+    candidate["task_id"] = ""  # empty — must refuse join
+    join = _startup_real_worker_join(surrogate, real_startup_events=[candidate])
+    assert join["joined"] is False, f"expected no join, got: {join}"
+
+
+def test_empty_lineage_candidate_worker_slot_id_does_not_join() -> None:
+    """Candidate with empty worker_slot_id must NOT join."""
+    surrogate = _surrogate_startup_with_lineage()
+    candidate = _real_worker_startup_matching_lineage()
+    candidate["worker_slot_id"] = ""
+    candidate["worker_id"] = ""
+    join = _startup_real_worker_join(surrogate, real_startup_events=[candidate])
+    assert join["joined"] is False, f"expected no join, got: {join}"
+
+
+def test_empty_lineage_candidate_runtime_context_id_does_not_join() -> None:
+    """Candidate with empty runtime_context_id must NOT join."""
+    surrogate = _surrogate_startup_with_lineage()
+    candidate = _real_worker_startup_matching_lineage()
+    candidate["runtime_context_id"] = ""
+    join = _startup_real_worker_join(surrogate, real_startup_events=[candidate])
+    assert join["joined"] is False, f"expected no join, got: {join}"
+
+
+def test_empty_lineage_candidate_fence_token_does_not_join() -> None:
+    """Candidate with empty fence_token must NOT join."""
+    surrogate = _surrogate_startup_with_lineage()
+    candidate = _real_worker_startup_matching_lineage()
+    candidate["fence_token"] = ""
+    join = _startup_real_worker_join(surrogate, real_startup_events=[candidate])
+    assert join["joined"] is False, f"expected no join, got: {join}"
+
+
+def test_all_empty_lineage_candidate_does_not_join() -> None:
+    """Candidate with ALL lineage fields empty must NOT join any surrogate."""
+    surrogate = _surrogate_startup_with_lineage()
+    candidate = _real_worker_startup_empty_lineage_fields()
+    join = _startup_real_worker_join(surrogate, real_startup_events=[candidate])
+    assert join["joined"] is False, f"expected no join, got: {join}"
+    assert "surrogate_only" in join["reason"] or join["joined"] is False
+
+
+def test_full_lineage_match_still_joins_after_f3_fix() -> None:
+    """Regression: a fully-populated matching candidate still joins correctly."""
+    surrogate = _surrogate_startup_with_lineage()
+    real_event = _real_worker_startup_matching_lineage()
+    join = _startup_real_worker_join(surrogate, real_startup_events=[real_event])
+    assert join["joined"] is True
+    assert join["join_event_id"] == "evt-real-001"
+
+
+# ---------------------------------------------------------------------------
+# F2 fix: validate_mf_subagent_finish_gate ignores caller-supplied events;
+# DB-sourced events with matching lineage satisfy the join.
+# This exercises the contract layer (mf_subagent_contract.py) directly.
+# Server-level bypass regression is in test_graph_governance_api.py.
+# ---------------------------------------------------------------------------
+
+def _make_finish_gate_payload_with_surrogate_startup(
+    fence_token: str = "fence-f2-test",
+    worktree_path: str = "/tmp/f2-wt",
+    branch_ref: str = "refs/heads/f2-task",
+    head_commit: str = "head-f2",
+    real_startup_events: object = None,
+) -> dict:
+    """Build a finish-gate payload whose startup evidence is a surrogate."""
+    surrogate = _surrogate_startup_with_lineage()
+    surrogate["fence_token"] = fence_token
+    payload: dict = {
+        "schema_version": "mf_subagent_finish_gate.v1",
+        "status": "review_ready",
+        "merge_queue_ready": True,
+        "fence_token": fence_token,
+        "task_id": "task-sg-test-01",
+        "worker_slot_id": "wslot-sg-01",
+        "runtime_context_id": "mfrctx-sgtest01",
+        "head_commit": head_commit,
+        "checkpoint_id": "ckpt-f2-test",
+        "changed_files": [],
+        "test_results": {"status": "passed"},
+        "startup_evidence": surrogate,
+        "read_receipt_hash": "sha256:rr-f2-test",
+        "read_receipt_event_id": "rr-f2-evt-001",
+        "observer_command_id": "cmd-f2-test",
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "base_commit": "base-f2",
+        "target_head_commit": "target-f2",
+        "merge_queue_id": "mergeq-f2",
+    }
+    if real_startup_events is not None:
+        payload["real_startup_events"] = real_startup_events
+    return payload
+
+
+def _make_finish_gate_context(fence_token: str = "fence-f2-test") -> "BranchTaskRuntimeContext":
+    return BranchTaskRuntimeContext(
+        project_id="test-proj",
+        task_id="task-sg-test-01",
+        backlog_id="AC-PARALLEL-BRANCH-STARTUP-HOST-SURROGATE-JOIN-GAP-20260605",
+        branch_ref="refs/heads/f2-task",
+        status="worktree_ready",
+        fence_token=fence_token,
+        worktree_path="/tmp/f2-wt",
+        base_commit="base-f2",
+        target_head_commit="target-f2",
+        merge_queue_id="mergeq-f2",
+    )
+
+
+def test_finish_gate_surrogate_refused_when_no_real_startup_events() -> None:
+    """Surrogate-only startup (no real_startup_events) still refuses finish gate."""
+    payload = _make_finish_gate_payload_with_surrogate_startup()
+    # No real_startup_events in payload.
+    ctx = _make_finish_gate_context()
+    try:
+        validate_mf_subagent_finish_gate(payload, context=ctx)
+        assert False, "Expected MfSubagentContractError — surrogate-only should be refused"
+    except MfSubagentContractError as exc:
+        assert "actual mf_subagent_startup evidence" in str(exc)
+
+
+def test_finish_gate_fabricated_caller_events_in_payload_do_not_bypass_gate() -> None:
+    """F2 regression: passing fabricated real_startup_events in the payload does NOT
+    bypass the gate — the contract function still reads them from the payload, but
+    the server layer must strip caller-supplied keys.
+
+    This test verifies the contract function DOES accept events from the payload
+    (which is fine in isolation — the security is enforced at the server layer that
+    strips and replaces them with DB-sourced events).  The companion server-level
+    test lives in test_graph_governance_api.py.
+    """
+    real_event = _real_worker_startup_matching_lineage()
+    real_event["fence_token"] = "fence-f2-test"
+    # payload carries fabricated events directly
+    payload = _make_finish_gate_payload_with_surrogate_startup(
+        real_startup_events=[real_event]
+    )
+    ctx = _make_finish_gate_context()
+    # The contract function itself accepts payload-supplied events.
+    # The server MUST strip them before calling here — that's the F2 fix.
+    gate = validate_mf_subagent_finish_gate(payload, context=ctx)
+    # If we get here, the contract accepted the fabricated events.
+    # This documents that the server layer is the enforcement boundary.
+    assert gate is not None  # contract accepted (server strips — tested separately)

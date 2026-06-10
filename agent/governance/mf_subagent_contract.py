@@ -2973,24 +2973,26 @@ def _startup_real_worker_join(
             token_type = _string(gate.get("session_token_evidence_type")).lower()
             if token_type not in ("hash",):
                 continue
-        # Lineage must match — all non-empty surrogate lineage fields must agree.
+        # F3 fix: all four lineage fields must be NON-EMPTY on the candidate
+        # AND equal to the surrogate's lineage.  An empty candidate field means
+        # the event does not carry lineage and must NOT join any surrogate.
         if surrogate_task_id:
             candidate_task = _string(gate.get("task_id"))
-            if candidate_task and candidate_task != surrogate_task_id:
+            if not candidate_task or candidate_task != surrogate_task_id:
                 continue
         if surrogate_worker_slot_id:
             candidate_slot = _string(
                 gate.get("worker_slot_id") or gate.get("worker_id")
             )
-            if candidate_slot and candidate_slot != surrogate_worker_slot_id:
+            if not candidate_slot or candidate_slot != surrogate_worker_slot_id:
                 continue
         if surrogate_runtime_context_id:
             candidate_rctx = _string(gate.get("runtime_context_id"))
-            if candidate_rctx and candidate_rctx != surrogate_runtime_context_id:
+            if not candidate_rctx or candidate_rctx != surrogate_runtime_context_id:
                 continue
         if surrogate_fence_token:
             candidate_fence = _string(gate.get("fence_token"))
-            if candidate_fence and candidate_fence != surrogate_fence_token:
+            if not candidate_fence or candidate_fence != surrogate_fence_token:
                 continue
         # Matched — extract event id.
         join_event_id = _string(
