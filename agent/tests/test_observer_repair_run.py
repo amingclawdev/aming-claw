@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import unittest
+from unittest import mock
 
 from agent.governance import observer_repair_run
 
@@ -858,3 +862,319 @@ def test_incident_3384_record_true_with_valid_precheck_still_works():
 
     # Must NOT be blocked by identity-only guard
     assert "record_blocked" not in result
+
+
+# ---------------------------------------------------------------------------
+# Server-level / runtime-path tests (AC-REPAIR-RUN-LIVE-IDENTITY-SUPERSEDE-GUARD-20260610)
+# These tests exercise the HTTP server handler path to prove guard_live_identity_supersession
+# is wired in and enforced end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def _server_conn(tmp_dir: str):
+    """Set up a temp project DB for server handler tests."""
+    os.environ["SHARED_VOLUME_PATH"] = tmp_dir
+    os.makedirs(
+        os.path.join(tmp_dir, "codex-tasks", "state", "governance", "proj"),
+        exist_ok=True,
+    )
+    from agent.governance.db import get_connection
+
+    return get_connection("proj")
+
+
+def _server_ctx(body: dict | None = None, *, project_id: str = "proj"):
+    """Build a minimal RequestContext for the route-evidence handler."""
+    from agent.governance import server
+
+    return server.RequestContext(
+        None,
+        "POST",
+        {"project_id": project_id},
+        {},
+        body or {},
+        "req-server-test",
+        "",
+        "",
+    )
+
+
+def _insert_backlog_row(conn, bug_id: str):
+    """Insert a minimal MF-in-progress backlog row."""
+    contract = {"template_id": "mf_parallel.v1", "contract_instance_id": bug_id}
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, target_files, test_files,
+            acceptance_criteria, chain_trigger_json, mf_type, bypass_policy_json,
+            created_at, updated_at)
+           VALUES (?, ?, 'MF_IN_PROGRESS', 'P0', ?, ?, ?, ?, 'chain_rescue', ?,
+                   '2026-06-10T00:00:00Z', '2026-06-10T00:00:00Z')""",
+        (
+            bug_id,
+            "Guard server path test",
+            json.dumps(["agent/governance/observer_repair_run.py"]),
+            json.dumps(["agent/tests/test_observer_repair_run.py"]),
+            json.dumps(["server-level guard test"]),
+            json.dumps(contract),
+            json.dumps({"mf_type": "chain_rescue"}),
+        ),
+    )
+    conn.commit()
+
+
+def _insert_startup_timeline_event(conn, bug_id: str, route_identity: dict, event_id_hint: int = 9001):
+    """Record a fake accepted mf_subagent_startup timeline event to act as a live-identity protector."""
+    from agent.governance import task_timeline
+
+    task_timeline.record_event(
+        conn,
+        project_id="proj",
+        backlog_id=bug_id,
+        event_type="mf_subagent.startup",
+        phase="startup",
+        event_kind="mf_subagent_startup",
+        actor="observer-test",
+        status="passed",
+        payload={
+            "mf_subagent_startup_gate": {
+                "route_context_hash": route_identity.get("route_context_hash", ""),
+                "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
+                "route_id": route_identity.get("route_id", ""),
+            },
+        },
+        verification={},
+        artifact_refs={},
+        correlation_id=f"startup-test-{event_id_hint}",
+    )
+    conn.commit()
+
+
+class TestServerPathGuardWiring(unittest.TestCase):
+    """Server-level tests: guard_live_identity_supersession wired into recording path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _server_conn(self.tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_server_identity_only_record_true_returns_error_without_precheck(self):
+        """AC1: identity-only record=true through HTTP path errors naming missing precheck."""
+        from agent.governance import server
+
+        bug_id = "BUG-SERVER-GUARD-IDENTITY-ONLY-20260610"
+        _insert_backlog_row(self.conn, bug_id)
+
+        live_identity = _live_canonical_route_identity()
+        # Call handler with record=True, route_identity supplied, action_precheck empty
+        with self.assertRaises(server.GovernanceError) as cm:
+            server.handle_observer_repair_run_route_evidence(
+                _server_ctx(
+                    body={
+                        "root_backlog_ids": [bug_id],
+                        "actor": "observer-test",
+                        "record": True,
+                        "route_identity": live_identity,
+                        "action_precheck": {},  # missing — triggers guard
+                        "version_check": {"ok": True, "dirty": False, "dirty_files": []},
+                    }
+                )
+            )
+        # The error must come from build_route_service_materialization (record_blocked)
+        # which is re-raised as GovernanceError by the not-recordable path
+        err = cm.exception
+        self.assertIn(err.code, (
+            "observer_repair_route_evidence_not_recordable",
+            "observer_repair_run_supersession_refused",
+        ), f"unexpected error code: {err.code}")
+
+    def test_server_external_validated_mode_allowed(self):
+        """AC1 counterpart: external-validated (precheck packet + identity) must succeed."""
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-SERVER-GUARD-EXTERNAL-VALIDATED-20260610"
+        _insert_backlog_row(self.conn, bug_id)
+
+        identity = {
+            "route_context_hash": "sha256:server-guard-external-validated-context",
+            "prompt_contract_id": "rprompt-server-guard-validated",
+            "prompt_contract_hash": "sha256:server-guard-validated-hash",
+            "visible_injection_manifest_hash": "sha256:server-guard-validated-manifest",
+        }
+
+        # record=True with a valid external precheck — should NOT be blocked
+        result = server.handle_observer_repair_run_route_evidence(
+            _server_ctx(
+                body={
+                    "root_backlog_ids": [bug_id],
+                    "actor": "observer-test",
+                    "record": True,
+                    "action_precheck_id": "external-dispatch-precheck",
+                    "route_identity": identity,
+                    "action_precheck": {
+                        **identity,
+                        "caller_role": "observer",
+                        "action": "dispatch_bounded_worker",
+                        "allowed": True,
+                    },
+                    "version_check": {"ok": True, "dirty": False, "dirty_files": []},
+                }
+            )
+        )
+        self.assertTrue(result["recorded"], result)
+
+    def test_server_guard_invoked_refuses_supersession_of_live_identity(self):
+        """AC2: supersession of identity with accepted startup lineage is refused without force."""
+        from agent.governance import server
+
+        bug_id = "BUG-SERVER-GUARD-SUPERSESSION-REFUSED-20260610"
+        _insert_backlog_row(self.conn, bug_id)
+
+        # Canonical live identity has an accepted startup event
+        live_identity = {
+            "route_id": "route-server-guard-live-9001",
+            "route_context_hash": "sha256:server-guard-live-context-9001",
+            "prompt_contract_id": "rprompt-server-guard-live-9001",
+            "prompt_contract_hash": "sha256:server-guard-live-hash-9001",
+            "visible_injection_manifest_hash": "sha256:server-guard-live-manifest-9001",
+        }
+        _insert_startup_timeline_event(self.conn, bug_id, live_identity)
+
+        # Patch build_route_service_materialization to return a supersession materialization
+        # (mimicking the dry-run supersession path that attempt-1 tests already cover)
+        fake_supersession_materialization = {
+            "ok": True,
+            "recordable": True,
+            "backlog_id": bug_id,
+            "route_identity_supersession": {
+                "supplied_route_identity": live_identity,
+                "source_event": {
+                    "event_type": "route.identity.superseded",
+                    "event_kind": "route_identity_supersede",
+                    "backlog_id": bug_id,
+                    "payload": {},
+                    "phase": "dispatch",
+                    "status": "requested",
+                    "source_event_id": "supersession-test",
+                },
+            },
+            "source_events": [
+                {
+                    "event_type": "route.identity.superseded",
+                    "event_kind": "route_identity_supersede",
+                    "backlog_id": bug_id,
+                    "payload": {},
+                    "phase": "dispatch",
+                    "status": "requested",
+                    "source_event_id": "supersession-test",
+                }
+            ],
+            "missing_source_events": [],
+        }
+
+        with mock.patch.object(
+            observer_repair_run,
+            "build_route_service_materialization",
+            return_value=fake_supersession_materialization,
+        ):
+            with self.assertRaises(server.GovernanceError) as cm:
+                server.handle_observer_repair_run_route_evidence(
+                    _server_ctx(
+                        body={
+                            "root_backlog_ids": [bug_id],
+                            "actor": "observer-test",
+                            "record": True,
+                            "route_identity": live_identity,
+                            "action_precheck": {
+                                **live_identity,
+                                "caller_role": "observer",
+                                "action": "dispatch_bounded_worker",
+                                "allowed": True,
+                            },
+                            "version_check": {"ok": True, "dirty": False},
+                        }
+                    )
+                )
+            err = cm.exception
+            self.assertEqual(
+                err.code,
+                "observer_repair_run_supersession_refused",
+                f"guard must refuse supersession; got: {err.code}",
+            )
+            self.assertIn("protecting", err.message)
+
+    def test_server_guard_invoked_allows_with_force_supersede_and_reason(self):
+        """AC2: supersession with force_supersede=true + force_reason bypasses guard."""
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-SERVER-GUARD-SUPERSESSION-FORCED-20260610"
+        _insert_backlog_row(self.conn, bug_id)
+
+        live_identity = {
+            "route_id": "route-server-guard-forced-9002",
+            "route_context_hash": "sha256:server-guard-forced-context-9002",
+            "prompt_contract_id": "rprompt-server-guard-forced-9002",
+            "prompt_contract_hash": "sha256:server-guard-forced-hash-9002",
+            "visible_injection_manifest_hash": "sha256:server-guard-forced-manifest-9002",
+        }
+        _insert_startup_timeline_event(self.conn, bug_id, live_identity, event_id_hint=9002)
+
+        fake_supersession_materialization = {
+            "ok": True,
+            "recordable": True,
+            "backlog_id": bug_id,
+            "route_identity_supersession": {
+                "supplied_route_identity": live_identity,
+                "source_event": {
+                    "event_type": "route.identity.superseded",
+                    "event_kind": "route_identity_supersede",
+                    "backlog_id": bug_id,
+                    "payload": {},
+                    "phase": "dispatch",
+                    "status": "requested",
+                    "source_event_id": "supersession-forced-test",
+                },
+            },
+            "source_events": [
+                {
+                    "event_type": "route.identity.superseded",
+                    "event_kind": "route_identity_supersede",
+                    "backlog_id": bug_id,
+                    "payload": {},
+                    "phase": "dispatch",
+                    "status": "requested",
+                    "source_event_id": "supersession-forced-test",
+                }
+            ],
+            "missing_source_events": [],
+        }
+
+        # With force_supersede=True and a non-empty force_reason, guard must allow
+        with mock.patch.object(
+            observer_repair_run,
+            "build_route_service_materialization",
+            return_value=fake_supersession_materialization,
+        ):
+            result = server.handle_observer_repair_run_route_evidence(
+                _server_ctx(
+                    body={
+                        "root_backlog_ids": [bug_id],
+                        "actor": "observer-test",
+                        "record": True,
+                        "route_identity": live_identity,
+                        "action_precheck": {
+                            **live_identity,
+                            "caller_role": "observer",
+                            "action": "dispatch_bounded_worker",
+                            "allowed": True,
+                        },
+                        "version_check": {"ok": True, "dirty": False},
+                        "force_supersede": True,
+                        "force_reason": "operator-approved recovery #9002",
+                    }
+                )
+            )
+        self.assertTrue(result["recorded"], result)
