@@ -4290,6 +4290,13 @@ def mf_stale_route_evidence_gate_verification(
     has been superseded/repaired, prior read_receipt/startup/dispatch/close
     evidence recorded under the stale identity does NOT count for close and must
     be re-recorded under the canonical (cleanup) route identity.
+
+    Rerecorded-under-canonical exemption: if a passing event of the same
+    stale-evidence kind has been recorded under the canonical identity, the
+    old-identity event is reported in ``rerecorded_close_evidence`` (as an
+    audit pair) instead of blocking in ``superseded_close_evidence``.  Only
+    kinds for which every matched stale token has a canonical counterpart are
+    exempted; partial coverage still blocks.
     """
 
     rows = events if isinstance(events, list) else []
@@ -4297,18 +4304,58 @@ def mf_stale_route_evidence_gate_verification(
     cleanup = _mapping(route_gate.get("route_identity_cleanup"))
     canonical_identity = _mapping(cleanup.get("route_identity"))
     superseded: list[dict[str, Any]] = []
+    rerecorded: list[dict[str, Any]] = []
+
     if cleanup.get("applied") and canonical_identity:
+        # Build map: stale-kind token -> canonical event id, for each
+        # passing event recorded under the canonical route identity.
+        # An event may match multiple stale tokens (e.g. a kind that contains
+        # both "startup" and "dispatch" substrings) – all matched tokens are
+        # recorded so the superseded loop can require full coverage.
+        canonical_kinds: dict[str, Any] = {}
         for event in rows:
             event = _mapping(event)
             if not event or _route_event_is_identity_cleanup(event):
-                continue
-            kind = _normalize_token(event.get("event_kind") or event.get("event_type"))
-            if not any(stale in kind for stale in MF_STALE_ROUTE_EVIDENCE_KINDS):
                 continue
             identity = _route_identity(event)
             if not identity:
                 continue
             if not _route_identity_matches_filter(identity, canonical_identity):
+                continue
+            # Only passing events count as canonical rerecords.
+            status = str(event.get("status") or event.get("decision") or "").strip().lower()
+            if not (bool(event.get("passed")) or status in MF_ROUTE_CONTEXT_PASS_STATUSES):
+                continue
+            kind = _normalize_token(event.get("event_kind") or event.get("event_type"))
+            event_id = event.get("id") or event.get("event_id")
+            for stale_token in MF_STALE_ROUTE_EVIDENCE_KINDS:
+                if stale_token in kind:
+                    # First canonical match wins per token.
+                    if stale_token not in canonical_kinds:
+                        canonical_kinds[stale_token] = event_id
+
+        for event in rows:
+            event = _mapping(event)
+            if not event or _route_event_is_identity_cleanup(event):
+                continue
+            kind = _normalize_token(event.get("event_kind") or event.get("event_type"))
+            matched_tokens = [t for t in MF_STALE_ROUTE_EVIDENCE_KINDS if t in kind]
+            if not matched_tokens:
+                continue
+            identity = _route_identity(event)
+            if not identity:
+                continue
+            if _route_identity_matches_filter(identity, canonical_identity):
+                continue
+            # All matched stale tokens must have canonical counterparts for exemption.
+            if all(t in canonical_kinds for t in matched_tokens):
+                rerecorded.append({
+                    "superseded_id": event.get("id") or event.get("event_id"),
+                    "event_kind": event.get("event_kind"),
+                    "canonical_event_ids": [canonical_kinds[t] for t in matched_tokens],
+                    "reason": "superseded_route_identity_evidence_rerecorded",
+                })
+            else:
                 superseded.append({
                     "id": event.get("id") or event.get("event_id"),
                     "event_kind": event.get("event_kind"),
@@ -4324,6 +4371,7 @@ def mf_stale_route_evidence_gate_verification(
         "route_identity_cleanup_applied": bool(cleanup.get("applied")),
         "canonical_route_identity": canonical_identity,
         "superseded_close_evidence": superseded,
+        "rerecorded_close_evidence": rerecorded,
     }
 
 
