@@ -574,6 +574,72 @@ a:hover { text-decoration: underline; }
   font-size: 9.5px;
 }
 
+/* ---------- SSE Freshness Badge (AC-ACTIVITY-SSE-STALE-CURRENT-STREAM-20260609) ----------
+   Compact chip in the view-header-actions area. Reuses .live-pill tone classes so
+   live=green, reconnecting=amber, stale=red, fallback-polling=amber.
+   Four states are visually distinct per criterion (e). */
+.sse-freshness-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+}
+/* stale uses red tone — reuse the existing red CSS vars */
+.sse-freshness-badge.tone-red {
+  background: var(--red-bg, #fee2e2);
+  color: var(--red-fg, #991b1b);
+}
+.sse-freshness-badge.tone-red .pill-dot {
+  background: var(--red, #dc2626);
+}
+
+/* Inline metadata block below the "Current/runtime stream" header */
+.sse-freshness-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 8px;
+  background: var(--ink-50, #f8fafc);
+  border: 1px solid var(--ink-150, #e2e8f0);
+  border-radius: var(--radius-card, 6px);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.sse-freshness-detail--stale {
+  background: var(--red-bg, #fee2e2);
+  border-color: var(--red, #dc2626);
+}
+.sse-freshness-row {
+  display: flex;
+  gap: 6px;
+}
+.sse-freshness-row--warn {
+  color: var(--red-fg, #991b1b);
+  font-weight: 500;
+}
+.sse-freshness-label {
+  color: var(--ink-400, #94a3b8);
+  min-width: 80px;
+  flex-shrink: 0;
+}
+.sse-freshness-value {
+  color: var(--ink-700, #334155);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  word-break: break-all;
+}
+.sse-freshness-value--live { color: var(--green-fg, #166534); }
+.sse-freshness-value--reconnecting { color: var(--amber-fg, #92400e); }
+.sse-freshness-value--stale { color: var(--red-fg, #991b1b); font-weight: 600; }
+.sse-freshness-value--fallback-polling { color: var(--amber-fg, #92400e); }
+
 /* ---------- Banner ---------- */
 
 .banner-stale-graph {
