@@ -28,14 +28,14 @@
         "--governance-url",
         "http://localhost:40000"
       ],
-      "cwd": "/Users/yingzhang/aming-claw/aming-claw",
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
         "GOVERNANCE_URL": "http://localhost:40000",
         "MANAGER_URL": "http://127.0.0.1:40101",
         "MEMORY_BACKEND": "docker",
-        "PYTHONPATH": "/Users/yingzhang/aming-claw/aming-claw"
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}"
       }
     }
   }
