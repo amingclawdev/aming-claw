@@ -47,6 +47,7 @@ from agent.governance.parallel_branch_runtime import (
     materialize_branch_worktree,
     plan_branch_runtime_context,
     queue_merge_item_for_branch_context,
+    record_branch_finish_gate,
     record_mf_subagent_startup,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
@@ -1217,3 +1218,208 @@ def test_pb012_branch_contexts_are_isolated_by_project_and_batch() -> None:
     assert project_b.branch_ref == "refs/heads/codex/project-b-shared-task"
     assert list_branch_contexts(conn, "project-a", batch_id="batch-a") == [project_a]
     assert list_branch_contexts(conn, "project-a", batch_id="batch-b") == []
+
+
+def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
+    """AC1-3: allocate persists merge_queue_id; startup→finish_gate round-trip succeeds.
+
+    Also covers the migration path: a table created without the merge_queue_id column
+    (simulating a pre-migration DB) must have the column added by ensure_branch_runtime_schema
+    so that subsequent allocate→startup→finish_gate can complete without "context missing
+    required fields: merge_queue_id" or "not merge-queue ready" errors.
+    """
+    # ── Part A: fresh table — allocate persists merge_queue_id ──────────────
+    conn_fresh = _runtime_conn()
+
+    task_id = "mq-finish-task"
+    mq_id = "mq-test-allocate-persist-001"
+    fence = "fence-mq-finish"
+
+    # plan_branch_runtime_context mirrors what the allocate handler calls;
+    # it computes branch_ref and worktree_path from the slug + workspace_root.
+    context_planned = plan_branch_runtime_context(
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        root_task_id="parent-mq-finish",
+        backlog_id="AC-ALLOCATE-PERSIST-MERGE-QUEUE-ID-20260609",
+        worker_id="worker-mq-finish",
+        worker_slot_id="worker-mq-finish",
+        agent_id="agent-mq-finish",
+        workspace_root=str(tmp_path),
+        fence_token=fence,
+        base_commit="base-mq-finish",
+        target_head_commit="target-mq-finish",
+        merge_queue_id=mq_id,
+    )
+    upsert_branch_context(conn_fresh, context_planned, now_iso=NOW)
+
+    # AC1: persisted context must carry the merge_queue_id
+    saved = get_branch_context(conn_fresh, PROJECT_ID, task_id)
+    assert saved is not None
+    assert saved.merge_queue_id == mq_id, (
+        f"allocate did not persist merge_queue_id: got {saved.merge_queue_id!r}"
+    )
+
+    # Simulate startup (record_mf_subagent_startup requires worktree-ready state;
+    # actual_cwd must match the worktree_path computed by plan_branch_runtime_context).
+    from dataclasses import replace as _replace
+    assigned_worktree = context_planned.worktree_path
+    import os
+    os.makedirs(assigned_worktree, exist_ok=True)
+
+    ready_context = _replace(context_planned, status=STATE_WORKTREE_READY)
+    upsert_branch_context(conn_fresh, ready_context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn_fresh,
+        ready_context,
+        route_identity={
+            "route_id": "route-mq-finish",
+            "route_context_hash": "sha256:route-mq-finish",
+            "prompt_contract_id": "rprompt-mq-finish",
+            "prompt_contract_hash": "sha256:prompt-mq-finish",
+            "route_token_ref": "rtok-mq-finish",
+            "visible_injection_manifest_hash": "sha256:visible-mq-finish",
+        },
+        now_iso=NOW,
+    )
+    startup_result = record_mf_subagent_startup(
+        conn_fresh,
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "parent_task_id": "parent-mq-finish",
+            "worker_role": "mf_sub",
+            "worker_id": "worker-mq-finish",
+            "worker_slot_id": "worker-mq-finish",
+            "agent_id": "agent-mq-finish",
+            "session_token": "session-mq-finish",
+            "runtime_context_id": branch_runtime_context_id(PROJECT_ID, task_id),
+            "fence_token": fence,
+            "actual_cwd": assigned_worktree,
+            "actual_git_root": assigned_worktree,
+            "branch": context_planned.branch_ref,
+            "head_commit": "head-mq-finish",
+            "base_commit": "base-mq-finish",
+            "target_head_commit": "target-mq-finish",
+            "merge_queue_id": mq_id,
+            "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+            "route_id": "route-mq-finish",
+            "route_context_hash": "sha256:route-mq-finish",
+            "prompt_contract_id": "rprompt-mq-finish",
+            "prompt_contract_hash": "sha256:prompt-mq-finish",
+            "route_token_ref": "rtok-mq-finish",
+            "visible_injection_manifest_hash": "sha256:visible-mq-finish",
+            "observer_command_id": "cmd-mq-finish",
+            "read_receipt_hash": "sha256:read-mq-finish",
+            "read_receipt_event_id": "9001",
+        },
+        now_iso=NOW,
+    )
+    assert startup_result["ok"] is True, (
+        f"startup failed: {startup_result.get('blocker_id')} — {startup_result}"
+    )
+
+    # AC2: after startup the stored context still has merge_queue_id
+    running = get_branch_context(conn_fresh, PROJECT_ID, task_id)
+    assert running is not None
+    assert running.merge_queue_id == mq_id, (
+        f"startup wiped merge_queue_id: got {running.merge_queue_id!r}"
+    )
+    # merge_queue_ready check: _require_context in mf_subagent_contract requires
+    # merge_queue_id to be non-empty; assert it directly as the unit evidence.
+    assert running.merge_queue_id != "", (
+        "finish_gate would reject: context.merge_queue_id is empty after startup"
+    )
+
+    # record_branch_finish_gate must succeed and preserve merge_queue_id (AC3)
+    finished = record_branch_finish_gate(
+        conn_fresh,
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        checkpoint_id="ckpt-mq-finish",
+        fence_token=fence,
+        head_commit="head-mq-finish",
+        now_iso=NOW,
+    )
+    assert finished.merge_queue_id == mq_id, (
+        f"finish_gate cleared merge_queue_id: got {finished.merge_queue_id!r}"
+    )
+
+    # ── Part B: old-schema table (no merge_queue_id column) ──────────────────
+    # Simulate a DB created before merge_queue_id was added by using the full
+    # current schema SQL but dropping the two merge columns.  ensure_branch_runtime_schema
+    # must add them via ALTER TABLE and leave existing rows readable.
+    # Build an old-schema SQL without merge_queue_id / merge_preview_id columns.
+    # Only the contexts table column definitions are stripped; the filter is
+    # scoped to avoid accidentally removing the PRIMARY KEY / INDEX lines in
+    # other tables (parallel_branch_merge_queue_items) that reference merge_queue_id.
+    # A column definition line starts with whitespace, a column name, whitespace,
+    # and a type keyword — we match by the DEFAULT '' suffix which is unique to
+    # column defs in this DDL.
+    import re as _re
+    _col_def_pattern = _re.compile(
+        r"^\s+(merge_queue_id|merge_preview_id)\s+TEXT NOT NULL DEFAULT ''"
+    )
+    from agent.governance.parallel_branch_runtime import PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL
+    old_schema_sql = "\n".join(
+        line
+        for line in PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL.splitlines()
+        if not _col_def_pattern.match(line)
+    )
+
+    conn_old = sqlite3.connect(":memory:")
+    conn_old.row_factory = sqlite3.Row
+    conn_old.executescript(old_schema_sql)
+    conn_old.execute(
+        """
+        INSERT INTO parallel_branch_runtime_contexts
+            (project_id, task_id, fence_token, branch_ref, agent_id, worker_id,
+             base_commit, target_head_commit, status, created_at, updated_at)
+        VALUES
+            ('proj-old', 'task-old', 'fence-old', 'refs/heads/old', 'agent-old',
+             'worker-old', 'base-old', 'target-old', 'worktree_ready',
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """
+    )
+    conn_old.commit()
+    # Verify merge_queue_id column is missing before migration
+    pre_cols = {
+        str(r["name"] if hasattr(r, "keys") else r[1])
+        for r in conn_old.execute("PRAGMA table_info(parallel_branch_runtime_contexts)").fetchall()
+    }
+    assert "merge_queue_id" not in pre_cols, "pre-condition: old table must lack merge_queue_id"
+
+    # Run migration
+    ensure_branch_runtime_schema(conn_old)
+
+    # Column must now exist
+    post_cols = {
+        str(r["name"] if hasattr(r, "keys") else r[1])
+        for r in conn_old.execute("PRAGMA table_info(parallel_branch_runtime_contexts)").fetchall()
+    }
+    assert "merge_queue_id" in post_cols, (
+        "ensure_branch_runtime_schema did not add merge_queue_id column to old table"
+    )
+    assert "merge_preview_id" in post_cols, (
+        "ensure_branch_runtime_schema did not add merge_preview_id column to old table"
+    )
+
+    # Existing row must be readable with merge_queue_id defaulting to empty string
+    old_ctx = get_branch_context(conn_old, "proj-old", "task-old")
+    assert old_ctx is not None
+    assert old_ctx.merge_queue_id == "", (
+        f"old row merge_queue_id should default to empty, got {old_ctx.merge_queue_id!r}"
+    )
+
+    # After upsert with a merge_queue_id, the value must persist
+    upsert_branch_context(
+        conn_old,
+        _replace(old_ctx, merge_queue_id="mq-old-migrated"),
+        now_iso=NOW,
+    )
+    migrated = get_branch_context(conn_old, "proj-old", "task-old")
+    assert migrated is not None
+    assert migrated.merge_queue_id == "mq-old-migrated", (
+        f"upsert after migration did not persist merge_queue_id, got {migrated.merge_queue_id!r}"
+    )
