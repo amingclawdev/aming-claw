@@ -305,6 +305,31 @@ observer in any mode. The root route context exposes the canonical identity
 `allowed_actions`/`blocked_actions`, `required_evidence`, and
 `next_legal_action`; the dashboard evidence modal renders these real fields.
 
+## Route Token Passing Forms
+
+Protected governance calls (`task_timeline_append`, `backlog_close`, etc.) accept
+the route token evidence in two forms.  Both produce a valid, audited gate result;
+only the decision value differs:
+
+**Form A — full token (authoritative, always works):**
+Pass the full `route_token` object in the request body.  The gate validates
+inline and returns `decision=route_token`.
+
+**Form B — ref-only (preferred low-token form, ~3.5 KB saved per call):**
+Pass only `route_token_ref` (the `rtok-…` string returned by
+`POST /api/projects/{project_id}/observer/route-context/issue`).  The gate
+resolves the ref server-side from the persisted registry and returns
+`decision=route_token_ref_resolved` plus `resolved_from_ref=true`.
+
+Ref-only calls fail closed: an unknown ref, a superseded/expired ref, or a
+ref whose stored identity does not match the request scope (`task_id`,
+`backlog_id`, `route_context_hash`) is rejected with the same 422 as an
+invalid full token.  The full-token path is never weakened.
+
+To use Form B, the token must have been issued via the HTTP endpoint (which
+persists the ref automatically) or via `observer_route_context.persist_route_token_ref`
+before the protected call is made.
+
 ## Close-Evidence Integrity Gates
 
 The MF close gate enforces:

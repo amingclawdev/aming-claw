@@ -39,7 +39,10 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import sqlite3
+import threading
 from typing import Any
 
 # Import the gate's CANONICAL action normalizer so the mint-time sanitizer and
@@ -590,3 +593,319 @@ def issue_observer_write_route_context(
         ),
         "expires_at": token.get("expires_at", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Route-token ref registry — server-side persistence
+# ---------------------------------------------------------------------------
+# NEVER store the raw token body.  The registry maps:
+#   route_token_ref  ->  salted digest of token body + public identity fields
+# so that a caller supplying only the ref can be granted the same gate result
+# as a caller supplying the full token, without the secret traveling again.
+#
+# The salt is derived per-ref so an attacker who learns the digest cannot
+# brute-force the token body with a rainbow table over a fixed salt.
+
+REF_REGISTRY_SCHEMA_VERSION = "route_token_ref_registry.v1"
+_REF_SALT_LEN = 16  # bytes of per-entry entropy, hex-encoded in DB
+_REF_REGISTRY_LOCK = threading.RLock()
+
+# Status values
+REF_STATUS_ACTIVE = "active"
+REF_STATUS_SUPERSEDED = "superseded"
+REF_STATUS_EXPIRED = "expired"
+
+
+def _token_digest(token: Mapping[str, Any], salt: str) -> str:
+    """Return a salted SHA-256 hex digest of the canonical token body.
+
+    The token body is JSON-canonicalized (sorted keys, compact separators) then
+    prefixed with the per-entry salt before hashing.  The raw token is NEVER
+    stored.  The digest is used only for equality comparison at resolution time.
+    """
+    canonical = json.dumps(
+        dict(token), sort_keys=True, separators=(",", ":"), default=str
+    )
+    data = f"{salt}:{canonical}".encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
+    """Create the route_token_ref_registry table if it does not exist."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS observer_route_token_refs (
+            project_id          TEXT NOT NULL,
+            route_token_ref     TEXT NOT NULL,
+            token_digest        TEXT NOT NULL,
+            salt                TEXT NOT NULL,
+            route_id            TEXT NOT NULL DEFAULT '',
+            route_context_hash  TEXT NOT NULL DEFAULT '',
+            prompt_contract_id  TEXT NOT NULL DEFAULT '',
+            prompt_contract_hash TEXT NOT NULL DEFAULT '',
+            visible_injection_manifest_hash TEXT NOT NULL DEFAULT '',
+            backlog_id          TEXT NOT NULL DEFAULT '',
+            task_id             TEXT NOT NULL DEFAULT '',
+            caller_role         TEXT NOT NULL DEFAULT '',
+            allowed_actions_json TEXT NOT NULL DEFAULT '[]',
+            expires_at          TEXT NOT NULL DEFAULT '',
+            evidence_refs_json  TEXT NOT NULL DEFAULT '[]',
+            scope_json          TEXT NOT NULL DEFAULT '{}',
+            status              TEXT NOT NULL DEFAULT 'active',
+            issued_at           TEXT NOT NULL DEFAULT '',
+            created_at          TEXT NOT NULL,
+            PRIMARY KEY (project_id, route_token_ref)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_route_token_refs_status
+            ON observer_route_token_refs (project_id, status, route_token_ref)
+        """
+    )
+
+
+def persist_route_token_ref(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    token: Mapping[str, Any],
+) -> None:
+    """Persist a minted token into the ref registry.
+
+    Stores only a salted digest of the token body — never the raw token.  If an
+    entry for this (project_id, route_token_ref) already exists its digest is
+    compared; a mismatch raises ValueError (collision / tampering).  An identical
+    re-issue is silently accepted (idempotent).
+
+    Thread-safe: holds ``_REF_REGISTRY_LOCK`` around the upsert.
+    """
+    project_id = _string(project_id)
+    route_token_ref = _string(route_token_ref)
+    if not project_id or not route_token_ref:
+        raise ValueError("project_id and route_token_ref are required")
+    if not isinstance(token, Mapping):
+        raise ValueError("token must be a mapping")
+
+    salt = os.urandom(_REF_SALT_LEN).hex()
+    digest = _token_digest(token, salt)
+
+    scope = dict(token.get("scope") or {})
+    allowed_actions = list(token.get("allowed_actions") or [])
+    evidence_refs = list(token.get("evidence_refs") or [])
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    _ensure_ref_registry_schema(conn)
+    with _REF_REGISTRY_LOCK:
+        # Check for existing entry
+        row = conn.execute(
+            "SELECT token_digest, salt, status FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (project_id, route_token_ref),
+        ).fetchone()
+        if row is not None:
+            existing_digest = _token_digest(token, row["salt"])
+            if existing_digest != row["token_digest"]:
+                raise ValueError(
+                    "route_token_ref collision: a different token body is already "
+                    f"registered under ref {route_token_ref!r}"
+                )
+            # Idempotent re-issue: same token, already registered — nothing to do.
+            return
+
+        conn.execute(
+            """
+            INSERT INTO observer_route_token_refs
+                (project_id, route_token_ref, token_digest, salt,
+                 route_id, route_context_hash, prompt_contract_id,
+                 prompt_contract_hash, visible_injection_manifest_hash,
+                 backlog_id, task_id, caller_role,
+                 allowed_actions_json, expires_at, evidence_refs_json,
+                 scope_json, status, issued_at, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                project_id,
+                route_token_ref,
+                digest,
+                salt,
+                _string(token.get("route_id")),
+                _string(token.get("route_context_hash")),
+                _string(token.get("prompt_contract_id")),
+                _string(token.get("prompt_contract_hash")),
+                _string(token.get("visible_injection_manifest_hash")),
+                _string(scope.get("backlog_id")),
+                _string(scope.get("task_id")),
+                _string(token.get("caller_role")),
+                json.dumps(allowed_actions),
+                _string(token.get("expires_at")),
+                json.dumps(evidence_refs),
+                json.dumps(scope),
+                REF_STATUS_ACTIVE,
+                _string(token.get("issued_at")) or now_str,
+                now_str,
+            ),
+        )
+        conn.commit()
+
+
+def resolve_route_token_ref(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    route_id: str = "",
+    route_context_hash: str = "",
+    task_id: str = "",
+    backlog_id: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a route_token_ref to its stored public identity.
+
+    Returns a dict of public token fields sufficient for the gate (route identity,
+    allowed_actions, scope, expiry, evidence_refs) **without** the raw token body.
+    Returns ``None`` when the ref is unknown.
+
+    Fails closed:
+    - Unknown ref → ``None`` (caller must treat as gate failure).
+    - ``status != 'active'`` (superseded / expired) → raises
+      ``RouteTokenRefError`` with the status.
+    - Identity mismatch (route_id / route_context_hash / task_id / backlog_id
+      when supplied) → raises ``RouteTokenRefError``.
+    - Expired (``expires_at`` in the past) → raises ``RouteTokenRefError``.
+    """
+    project_id = _string(project_id)
+    route_token_ref = _string(route_token_ref)
+    if not project_id or not route_token_ref:
+        return None
+
+    try:
+        _ensure_ref_registry_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (project_id, route_token_ref),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+    if row is None:
+        return None
+
+    row_dict = dict(row)
+    status = _string(row_dict.get("status"))
+    if status != REF_STATUS_ACTIVE:
+        raise RouteTokenRefError(
+            f"route_token_ref {route_token_ref!r} is not active (status={status!r}); "
+            "ref resolution refused"
+        )
+
+    # Identity binding checks — only when the caller supplies non-empty values.
+    if route_id:
+        stored_route_id = _string(row_dict.get("route_id"))
+        if stored_route_id and stored_route_id != _string(route_id):
+            raise RouteTokenRefError(
+                f"route_token_ref identity mismatch: route_id {route_id!r} does not "
+                f"match registered {stored_route_id!r}"
+            )
+    if route_context_hash:
+        stored_rch = _string(row_dict.get("route_context_hash"))
+        if stored_rch and stored_rch != _string(route_context_hash):
+            raise RouteTokenRefError(
+                "route_token_ref identity mismatch: route_context_hash does not match"
+            )
+    if task_id:
+        stored_task = _string(row_dict.get("task_id"))
+        if stored_task and stored_task != _string(task_id):
+            raise RouteTokenRefError(
+                f"route_token_ref identity mismatch: task_id {task_id!r} does not "
+                f"match registered {stored_task!r}"
+            )
+    if backlog_id:
+        stored_bl = _string(row_dict.get("backlog_id"))
+        if stored_bl and stored_bl != _string(backlog_id):
+            raise RouteTokenRefError(
+                f"route_token_ref identity mismatch: backlog_id {backlog_id!r} does not "
+                f"match registered {stored_bl!r}"
+            )
+
+    # Expiry check
+    expires_at = _string(row_dict.get("expires_at"))
+    if expires_at:
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        try:
+            expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if now_dt >= expires_dt:
+                raise RouteTokenRefError(
+                    f"route_token_ref {route_token_ref!r} has expired (expires_at={expires_at!r})"
+                )
+        except (ValueError, TypeError):
+            pass  # Unparseable expiry: do not block resolution
+
+    # Reconstruct a public-only token surface (sufficient for the gate)
+    try:
+        allowed_actions = json.loads(row_dict.get("allowed_actions_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        allowed_actions = []
+    try:
+        evidence_refs = json.loads(row_dict.get("evidence_refs_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        evidence_refs = []
+    try:
+        scope = json.loads(row_dict.get("scope_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        scope = {}
+
+    return {
+        "schema_version": REF_REGISTRY_SCHEMA_VERSION,
+        "route_token_ref": route_token_ref,
+        "route_id": _string(row_dict.get("route_id")),
+        "route_context_hash": _string(row_dict.get("route_context_hash")),
+        "prompt_contract_id": _string(row_dict.get("prompt_contract_id")),
+        "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
+        "visible_injection_manifest_hash": _string(
+            row_dict.get("visible_injection_manifest_hash")
+        ),
+        "caller_role": _string(row_dict.get("caller_role")),
+        "allowed_actions": allowed_actions,
+        "evidence_refs": evidence_refs,
+        "expires_at": expires_at,
+        "scope": scope,
+        "status": status,
+        "resolved_from_ref": True,
+    }
+
+
+def supersede_route_token_ref(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+) -> bool:
+    """Mark a route_token_ref as superseded (e.g. after token rotation).
+
+    Returns True if the ref was found and updated, False if not found.
+    """
+    project_id = _string(project_id)
+    route_token_ref = _string(route_token_ref)
+    if not project_id or not route_token_ref:
+        return False
+    try:
+        _ensure_ref_registry_schema(conn)
+        cursor = conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=? AND status=?",
+            (REF_STATUS_SUPERSEDED, project_id, route_token_ref, REF_STATUS_ACTIVE),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except sqlite3.OperationalError:
+        return False
+
+
+class RouteTokenRefError(Exception):
+    """Raised by resolve_route_token_ref for non-active / mismatched refs."""
