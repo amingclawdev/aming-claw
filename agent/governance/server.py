@@ -1722,6 +1722,18 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
                     artifact_refs=dict(event.get("artifact_refs") or {}),
                     correlation_id=correlation_id,
                 )
+            # F5-LIFECYCLE / F-SUPERSESSION-HOOK: delegate to the shared helper
+            # so that extraction + invalidation logic is identical across both
+            # the repair-run path and the direct-append path.  A DB failure is
+            # logged as a warning (not swallowed silently) but does NOT abort
+            # the parent record.  See _apply_supersession_hook_if_needed.
+            _apply_supersession_hook_if_needed(
+                conn,
+                project_id=project_id,
+                event_kind=str(event.get("event_kind") or ""),
+                event_type=str(event.get("event_type") or ""),
+                payload=dict(event.get("payload") or {}),
+            )
             service_events = task_timeline.list_events(
                 conn,
                 project_id,
@@ -18612,6 +18624,8 @@ def _resolve_route_token_ref_server_side(
     pid: str,
     backlog_id: str = "",
     task_id: str = "",
+    route_id: str = "",
+    route_context_hash: str = "",
 ) -> dict | None:
     """Attempt server-side resolution of a route_token_ref in the request body.
 
@@ -18626,6 +18640,11 @@ def _resolve_route_token_ref_server_side(
 
     Fails closed: any ``RouteTokenRefError`` from the registry is re-raised so
     the caller can surface it as a gate failure.
+
+    F2-BINDING: ``route_id`` and ``route_context_hash`` are forwarded from the
+    request context into ``resolve_route_token_ref`` so that identity-binding
+    checks are enforced.  A ref whose stored identity does not match the request
+    route context will raise ``RouteTokenRefError`` (fails closed).
     """
     from . import observer_route_context as _orc
 
@@ -18650,6 +18669,8 @@ def _resolve_route_token_ref_server_side(
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
+            route_id=route_id,
+            route_context_hash=route_context_hash,
         )
     finally:
         try:
@@ -18687,6 +18708,20 @@ def _require_route_token_mutation_gate(
     # can distinguish the two passing forms.
     # Fails closed: RouteTokenRefError surfaces as a 422 gate failure just like
     # an invalid full token.
+    #
+    # F2-BINDING: extract route_id and route_context_hash from the request body
+    # (protected appends carry both in their payload/route_token scope) and
+    # forward them into the resolution call so that identity-binding checks are
+    # actually enforced.  An identity-mismatched ref will raise RouteTokenRefError
+    # (fail closed) instead of silently skipping the check.
+    _req_route_id = str(body.get("route_id") or "").strip()
+    _req_route_context_hash = str(body.get("route_context_hash") or "").strip()
+    # Also check nested route_token / route_waiver structures for the fields.
+    _rt_scope = body.get("route_token") if isinstance(body.get("route_token"), dict) else {}
+    if not _req_route_id:
+        _req_route_id = str(_rt_scope.get("route_id") or "").strip()
+    if not _req_route_context_hash:
+        _req_route_context_hash = str(_rt_scope.get("route_context_hash") or "").strip()
     resolved_from_ref: bool = False
     try:
         resolved = _resolve_route_token_ref_server_side(
@@ -18694,6 +18729,8 @@ def _require_route_token_mutation_gate(
             pid=pid,
             backlog_id=backlog_id,
             task_id=task_id,
+            route_id=_req_route_id,
+            route_context_hash=_req_route_context_hash,
         )
         if resolved is not None:
             resolved_from_ref = True
@@ -20795,6 +20832,83 @@ def handle_task_gates(ctx: RequestContext):
     return {"task_id": task_id, "gate_events": events, "count": len(events)}
 
 
+# ---------------------------------------------------------------------------
+# F-SUPERSESSION-HOOK: shared helper used by BOTH the repair-run path
+# (handle_observer_repair_run_route_evidence) and the direct-append path
+# (handle_task_timeline_append) to invalidate a route_token_ref when a
+# route_identity_supersede / route.identity.superseded event is written.
+# Single definition — no copy-paste divergence allowed.
+# ---------------------------------------------------------------------------
+
+#: Event markers that signal a route-identity supersession.  Both event_kind
+#: and event_type values are accepted so callers can use either form.
+MF_ROUTE_IDENTITY_CLEANUP_MARKERS: frozenset[str] = frozenset(
+    {
+        "route_identity_supersede",       # event_kind canonical value
+        "route.identity.superseded",      # event_type canonical value
+        "route_identity_cleanup",         # legacy cleanup alias
+        "route.identity.cleanup",         # legacy cleanup event_type alias
+    }
+)
+
+
+def _apply_supersession_hook_if_needed(
+    conn: "sqlite3.Connection",
+    project_id: str,
+    event_kind: str,
+    event_type: str,
+    payload: dict,
+) -> None:
+    """Extract route_token_ref from *payload* and call supersede_route_token_ref.
+
+    Called after a supersession event is successfully written to the timeline,
+    regardless of which handler path (repair-run or direct-append) triggered
+    the write.  The invalidation is **best-effort** — a DB failure is logged as
+    a warning but does NOT abort the parent append.
+
+    Extraction logic mirrors the repair-run path: looks for
+    ``payload.route_identity_supersession.supplied.route_token_ref`` with
+    fallback to ``payload.route_identity_supersession.route_token_ref`` and
+    ``payload.supplied.route_token_ref``.
+    """
+    kind = str(event_kind or "").strip()
+    etype = str(event_type or "").strip()
+    if kind not in MF_ROUTE_IDENTITY_CLEANUP_MARKERS and etype not in MF_ROUTE_IDENTITY_CLEANUP_MARKERS:
+        return  # not a supersession event — nothing to do
+
+    from . import observer_route_context as _orc_hook
+
+    _supersession_block = (
+        payload.get("route_identity_supersession")
+        or payload.get("supplied")
+        or {}
+    )
+    if not isinstance(_supersession_block, dict):
+        return
+    _identity_block = (
+        _supersession_block.get("supplied")
+        or _supersession_block
+    )
+    if not isinstance(_identity_block, dict):
+        return
+    _ref = str(_identity_block.get("route_token_ref") or "").strip()
+    if not _ref:
+        return
+    try:
+        _orc_hook.supersede_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=_ref,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "supersede_route_token_ref best-effort failed for ref=%r project=%r: %s",
+            _ref,
+            project_id,
+            exc,
+        )
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
@@ -20892,6 +21006,18 @@ def handle_task_timeline_append(ctx: RequestContext):
             artifact_refs=ctx.body.get("artifact_refs") or {},
             trace_id=ctx.body.get("trace_id", ""),
             commit_sha=ctx.body.get("commit_sha", ""),
+        )
+        # F-SUPERSESSION-HOOK-DIRECT-APPEND: after a successful append, check
+        # whether this event is a route-identity supersession and invalidate any
+        # active route_token_ref that was bound to the superseded identity.
+        # Uses the shared helper to guarantee identical extraction logic with
+        # the repair-run path (no copy-paste divergence).
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=project_id,
+            event_kind=raw_event_kind,
+            event_type=str(ctx.body.get("event_type", "")),
+            payload=dict(norm_payload) if isinstance(norm_payload, dict) else {},
         )
         if route_gate:
             result["route_token_gate"] = route_gate

@@ -805,14 +805,28 @@ def resolve_route_token_ref(
     # Identity binding checks — only when the caller supplies non-empty values.
     if route_id:
         stored_route_id = _string(row_dict.get("route_id"))
-        if stored_route_id and stored_route_id != _string(route_id):
+        # F2-BINDING-FAIL-CLOSED: when the caller supplies route_id and the stored
+        # entry has an EMPTY value, refuse — the binding cannot be corroborated.
+        # (A stored non-empty value that differs is also refused, as before.)
+        if not stored_route_id:
+            raise RouteTokenRefError(
+                f"route_token_ref binding cannot be corroborated: route_id {route_id!r} "
+                "was supplied but the registered entry has no stored route_id"
+            )
+        if stored_route_id != _string(route_id):
             raise RouteTokenRefError(
                 f"route_token_ref identity mismatch: route_id {route_id!r} does not "
                 f"match registered {stored_route_id!r}"
             )
     if route_context_hash:
         stored_rch = _string(row_dict.get("route_context_hash"))
-        if stored_rch and stored_rch != _string(route_context_hash):
+        # F2-BINDING-FAIL-CLOSED: same logic for route_context_hash.
+        if not stored_rch:
+            raise RouteTokenRefError(
+                "route_token_ref binding cannot be corroborated: route_context_hash "
+                "was supplied but the registered entry has no stored route_context_hash"
+            )
+        if stored_rch != _string(route_context_hash):
             raise RouteTokenRefError(
                 "route_token_ref identity mismatch: route_context_hash does not match"
             )
@@ -886,9 +900,18 @@ def supersede_route_token_ref(
     project_id: str,
     route_token_ref: str,
 ) -> bool:
-    """Mark a route_token_ref as superseded (e.g. after token rotation).
+    """Mark a route_token_ref as superseded.
 
-    Returns True if the ref was found and updated, False if not found.
+    Called by the lifecycle wire (F5) when a ``route.identity.superseded``
+    (``route_identity_supersede``) event is recorded during repair-run
+    route-evidence processing.  After supersession,
+    ``resolve_route_token_ref`` will raise ``RouteTokenRefError`` for this
+    ref, so any stale-identity ref presented afterward is refused (fail
+    closed).
+
+    Returns True if the ref was found and updated, False if not found (e.g.
+    ref was already superseded, never persisted, or belongs to a different
+    project).
     """
     project_id = _string(project_id)
     route_token_ref = _string(route_token_ref)

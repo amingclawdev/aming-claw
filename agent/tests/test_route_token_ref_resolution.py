@@ -8,6 +8,15 @@ Acceptance criteria (AC-ROUTE-TOKEN-REF-RESOLUTION-20260610):
   AC4: superseded identity ref → refused.
   AC5: full-token path unchanged (regression-safe).
 
+QA followups (AC-ROUTE-TOKEN-REF-BINDING-AND-LIFECYCLE-20260610):
+
+  F2-BINDING: resolve_route_token_ref enforces route_id / route_context_hash
+    binding when the request carries them — an identity-mismatched ref must
+    raise RouteTokenRefError (fail closed).
+  F5-LIFECYCLE: when a route_identity_supersede event is processed,
+    supersede_route_token_ref marks the bound ref as superseded; subsequent
+    resolve calls for that ref must raise RouteTokenRefError.
+
 These tests are self-contained: they use in-memory SQLite (no live governance
 runtime required) and mock just enough of the server/gate plumbing to exercise
 the ref-resolution code paths end-to-end.
@@ -531,6 +540,460 @@ class TestThreadSafety(unittest.TestCase):
                 _os.unlink(db_path)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# F2-BINDING: route_id / route_context_hash mismatch → refused (fail closed)
+# ---------------------------------------------------------------------------
+
+
+class TestF2BindingRouteIdentityMismatch(unittest.TestCase):
+    """F2: resolve_route_token_ref enforces route_id and route_context_hash binding.
+
+    An identity-mismatched ref must raise RouteTokenRefError (fail closed),
+    not silently resolve to the stored identity.
+    """
+
+    def _persist_ref(self) -> tuple[sqlite3.Connection, str, dict]:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+        return conn, ref, token
+
+    def test_route_id_mismatch_raises(self) -> None:
+        """Supplying a different route_id than the stored one → RouteTokenRefError."""
+        conn, ref, token = self._persist_ref()
+        wrong_route_id = "route-ffffffffffffffff"
+        self.assertNotEqual(token.get("route_id", ""), wrong_route_id)
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                route_id=wrong_route_id,
+            )
+        self.assertIn("identity mismatch", str(cm.exception).lower())
+
+    def test_route_context_hash_mismatch_raises(self) -> None:
+        """Supplying a different route_context_hash than the stored one → RouteTokenRefError."""
+        conn, ref, token = self._persist_ref()
+        wrong_rch = "sha256:" + "0" * 64
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                route_context_hash=wrong_rch,
+            )
+        self.assertIn("identity mismatch", str(cm.exception).lower())
+
+    def test_matching_route_id_resolves_ok(self) -> None:
+        """Supplying the correct route_id → resolution succeeds (positive control)."""
+        conn, ref, token = self._persist_ref()
+        resolved = resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            route_id=token["route_id"],
+        )
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["route_id"], token["route_id"])
+
+    def test_matching_route_context_hash_resolves_ok(self) -> None:
+        """Supplying the correct route_context_hash → resolution succeeds."""
+        conn, ref, token = self._persist_ref()
+        resolved = resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            route_context_hash=token["route_context_hash"],
+        )
+        self.assertIsNotNone(resolved)
+
+    def test_empty_route_id_skips_check(self) -> None:
+        """Omitting route_id (empty string) → binding check is skipped (existing behavior)."""
+        conn, ref, _token = self._persist_ref()
+        # No route_id supplied → must still resolve successfully (no regression)
+        resolved = resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            route_id="",  # explicit empty → skip check
+        )
+        self.assertIsNotNone(resolved)
+
+    def test_both_mismatched_raises(self) -> None:
+        """Both route_id and route_context_hash wrong → RouteTokenRefError on first check."""
+        conn, ref, _token = self._persist_ref()
+        with self.assertRaises(RouteTokenRefError):
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                route_id="route-ffffffffffffffff",
+                route_context_hash="sha256:" + "0" * 64,
+            )
+
+
+# ---------------------------------------------------------------------------
+# F5-LIFECYCLE: supersession event → previously-active ref refuses afterward
+# ---------------------------------------------------------------------------
+
+
+class TestF5LifecycleSupersessionInvalidatesRef(unittest.TestCase):
+    """F5: supersede_route_token_ref (called on route_identity_supersede events)
+    invalidates the active ref.  Subsequent resolution raises RouteTokenRefError.
+    """
+
+    def test_supersession_invalidates_active_ref(self) -> None:
+        """After supersede_route_token_ref, the ref resolves to RouteTokenRefError."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        # Confirm ref resolves before supersession
+        resolved_before = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref=ref
+        )
+        self.assertIsNotNone(resolved_before)
+
+        # Simulate F5: route_identity_supersede event triggers supersession
+        supersede_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+
+        # After supersession the ref must be refused
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn, project_id=_PROJECT, route_token_ref=ref
+            )
+        self.assertIn("superseded", str(cm.exception).lower())
+
+    def test_superseded_ref_refused_even_with_correct_identity(self) -> None:
+        """A superseded ref must refuse even when route_id / backlog_id match exactly."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+        supersede_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+
+        # Presenting the exact matching identity must still refuse
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                route_id=token["route_id"],
+                route_context_hash=token["route_context_hash"],
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+            )
+        self.assertIn("superseded", str(cm.exception).lower())
+
+    def test_supersession_idempotent(self) -> None:
+        """Calling supersede_route_token_ref twice on the same ref is safe."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        result1 = supersede_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        result2 = supersede_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertTrue(result1)   # first call finds active row
+        self.assertFalse(result2)  # second call: already superseded, no row updated
+
+    def test_supersession_does_not_affect_different_ref(self) -> None:
+        """Superseding ref A must not affect ref B from a different token."""
+        token_a = _make_token()
+        token_b = _make_token(backlog_id="AC-OTHER-20260610")
+        ref_a = _orc.derive_route_token_ref(token_a)
+        ref_b = _orc.derive_route_token_ref(token_b)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref_a, token=token_a)
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref_b, token=token_b)
+
+        supersede_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref_a)
+
+        # ref_b must remain active
+        resolved_b = resolve_route_token_ref(
+            conn, project_id=_PROJECT, route_token_ref=ref_b
+        )
+        self.assertIsNotNone(resolved_b)
+
+
+# ---------------------------------------------------------------------------
+# QA-FIX #3580: F-SUPERSESSION-HOOK-DIRECT-APPEND
+# Verify that _apply_supersession_hook_if_needed (the shared helper) correctly
+# invalidates an active ref when called with a supersession event — covering
+# both the "direct-append path" and the "repair-run path regression" cases.
+# ---------------------------------------------------------------------------
+
+
+def _make_supersession_payload(route_token_ref: str) -> dict:
+    """Build a minimal payload as the repair-run plan builder would write it."""
+    return {
+        "route_identity_supersession": {
+            "supplied": {
+                "route_token_ref": route_token_ref,
+            }
+        }
+    }
+
+
+class TestDirectAppendPathSupersession(unittest.TestCase):
+    """F-SUPERSESSION-HOOK-DIRECT-APPEND: shared helper invalidates ref via
+    the direct-append path (simulated via _apply_supersession_hook_if_needed).
+    """
+
+    def _setup(self) -> tuple[sqlite3.Connection, str]:
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+        return conn, ref
+
+    def _call_shared_helper(
+        self,
+        conn: sqlite3.Connection,
+        ref: str,
+        event_kind: str = "route_identity_supersede",
+        event_type: str = "",
+    ) -> None:
+        """Invoke _apply_supersession_hook_if_needed as the direct-append handler would."""
+        from agent.governance.server import _apply_supersession_hook_if_needed
+        payload = _make_supersession_payload(ref)
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=_PROJECT,
+            event_kind=event_kind,
+            event_type=event_type,
+            payload=payload,
+        )
+
+    def test_direct_append_event_kind_invalidates_ref(self) -> None:
+        """After calling the shared helper with event_kind=route_identity_supersede,
+        the previously-active ref must refuse on resolution.
+        """
+        conn, ref = self._setup()
+
+        # Confirm active before hook
+        before = resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIsNotNone(before)
+
+        # Simulate direct-append path supersession via shared helper
+        self._call_shared_helper(conn, ref, event_kind="route_identity_supersede")
+
+        # Must refuse afterward
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIn("superseded", str(cm.exception).lower())
+
+    def test_direct_append_event_type_invalidates_ref(self) -> None:
+        """The event_type='route.identity.superseded' marker also triggers invalidation."""
+        conn, ref = self._setup()
+
+        self._call_shared_helper(conn, ref, event_kind="", event_type="route.identity.superseded")
+
+        with self.assertRaises(RouteTokenRefError):
+            resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+
+    def test_non_supersession_event_does_not_invalidate(self) -> None:
+        """A normal event_kind (e.g. 'worker_progress') must NOT invalidate the ref."""
+        conn, ref = self._setup()
+
+        from agent.governance.server import _apply_supersession_hook_if_needed
+        payload = _make_supersession_payload(ref)
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=_PROJECT,
+            event_kind="worker_progress",
+            event_type="task.progress",
+            payload=payload,
+        )
+
+        # Ref must still be active
+        result = resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIsNotNone(result)
+
+    def test_shared_helper_no_ref_in_payload_is_noop(self) -> None:
+        """Empty route_token_ref in payload → no-op, no exception."""
+        conn, ref = self._setup()
+
+        from agent.governance.server import _apply_supersession_hook_if_needed
+        # Payload without route_token_ref
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=_PROJECT,
+            event_kind="route_identity_supersede",
+            event_type="",
+            payload={"route_identity_supersession": {"supplied": {}}},
+        )
+
+        # Ref untouched — still active
+        result = resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIsNotNone(result)
+
+
+class TestRepairRunPathRegressionSupersession(unittest.TestCase):
+    """Regression: the repair-run path must still invalidate via the shared helper."""
+
+    def test_repair_run_path_still_invalidates(self) -> None:
+        """After migrating the repair-run F5 code to use _apply_supersession_hook_if_needed,
+        the repair-run path continues to invalidate refs correctly.
+        """
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        # Confirm active before
+        before = resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIsNotNone(before)
+
+        # Directly call the shared helper as the repair-run path now does
+        from agent.governance.server import _apply_supersession_hook_if_needed
+        payload = _make_supersession_payload(ref)
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=_PROJECT,
+            event_kind="route_identity_supersede",
+            event_type="route.identity.superseded",
+            payload=payload,
+        )
+
+        # Ref must be refused
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+        self.assertIn("superseded", str(cm.exception).lower())
+
+    def test_repair_run_legacy_cleanup_kind_also_invalidates(self) -> None:
+        """The route_identity_cleanup alias is also in MF_ROUTE_IDENTITY_CLEANUP_MARKERS."""
+        token = _make_token(backlog_id="AC-LEGACY-CLEANUP-TEST-20260610")
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        from agent.governance.server import _apply_supersession_hook_if_needed
+        payload = _make_supersession_payload(ref)
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=_PROJECT,
+            event_kind="route_identity_cleanup",
+            event_type="",
+            payload=payload,
+        )
+
+        with self.assertRaises(RouteTokenRefError):
+            resolve_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref)
+
+
+# ---------------------------------------------------------------------------
+# QA-FIX #3580: F-BINDING-STORED-EMPTY-BYPASS
+# observer_route_context.py:808 — when caller supplies route_id but stored is
+# empty, the binding cannot be corroborated and must refuse (fail closed).
+# Caller omitting route_id keeps the existing skip-check behavior.
+# ---------------------------------------------------------------------------
+
+
+class TestF2BindingStoredEmptyBypass(unittest.TestCase):
+    """F-BINDING-STORED-EMPTY-BYPASS: stored-empty + caller-supplied → refused;
+    caller omits → unchanged (existing skip-check behavior).
+    """
+
+    def _persist_ref_without_route_id(self) -> tuple[sqlite3.Connection, str, dict]:
+        """Persist a ref but manually clear stored route_id to simulate the empty case."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+        # Manually blank out route_id and route_context_hash in the DB row
+        conn.execute(
+            "UPDATE observer_route_token_refs SET route_id='', route_context_hash='' "
+            "WHERE project_id=? AND route_token_ref=?",
+            (_PROJECT, ref),
+        )
+        conn.commit()
+        return conn, ref, token
+
+    def test_stored_empty_route_id_caller_supplied_refuses(self) -> None:
+        """Caller supplies route_id but stored row has empty route_id → refused."""
+        conn, ref, _token = self._persist_ref_without_route_id()
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                route_id="route-20260610-any",
+            )
+        msg = str(cm.exception).lower()
+        # Either "cannot be corroborated" or "identity mismatch"
+        self.assertTrue(
+            "corroborated" in msg or "mismatch" in msg,
+            f"unexpected error: {cm.exception}",
+        )
+
+    def test_stored_empty_route_context_hash_caller_supplied_refuses(self) -> None:
+        """Caller supplies route_context_hash but stored row has empty value → refused."""
+        conn, ref, _token = self._persist_ref_without_route_id()
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            resolve_route_token_ref(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=ref,
+                route_context_hash="sha256:" + "a" * 64,
+            )
+        msg = str(cm.exception).lower()
+        self.assertTrue(
+            "corroborated" in msg or "mismatch" in msg,
+            f"unexpected error: {cm.exception}",
+        )
+
+    def test_caller_omits_route_id_stored_empty_still_resolves(self) -> None:
+        """Caller omits route_id entirely — stored-empty check is skipped (existing behavior)."""
+        conn, ref, _token = self._persist_ref_without_route_id()
+
+        # No route_id supplied → the binding dimension is simply absent → skip check
+        result = resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            # no route_id kwarg
+        )
+        self.assertIsNotNone(result)
+
+    def test_caller_explicit_empty_route_id_skips_check(self) -> None:
+        """Passing route_id='' (explicit empty) is treated as 'not supplied' → check skipped."""
+        conn, ref, _token = self._persist_ref_without_route_id()
+
+        result = resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            route_id="",
+        )
+        self.assertIsNotNone(result)
+
+    def test_stored_populated_route_id_caller_matches_resolves(self) -> None:
+        """Positive control: stored non-empty route_id + matching caller → resolves OK."""
+        token = _make_token()
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        result = resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            route_id=token["route_id"],
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["route_id"], token["route_id"])
 
 
 if __name__ == "__main__":
