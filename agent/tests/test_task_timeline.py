@@ -6116,6 +6116,167 @@ def test_canonical_route_evidence_after_repair_is_not_superseded():
 
 
 # ---------------------------------------------------------------------------
+# Rerecorded-under-canonical exemption (AC-STALE-ROUTE-GATE-RERECORD-EXEMPTION-20260610)
+# ---------------------------------------------------------------------------
+def test_all_stale_kinds_rerecorded_under_canonical_passes():
+    """All stale-identity events have canonical counterparts → passed=True, rerecorded pairs listed, superseded empty."""
+    from agent.governance import task_timeline
+
+    canonical = dict(ROUTE_IDENTITY)
+    stale = {
+        "route_context_hash": "sha256:stale-route-context",
+        "prompt_contract_id": "rprompt-stale-route",
+        "prompt_contract_hash": "sha256:stale-prompt-contract",
+    }
+    cleanup = {
+        "id": 1,
+        "event_kind": "route_identity_cleanup",
+        "phase": "identity_recovery",
+        "status": "accepted",
+        "payload": {"route_identity_cleanup": {**canonical}},
+    }
+    # Stale-identity events (old route)
+    stale_read_receipt = {
+        "id": 10,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**stale, "read_receipt_hash": "sha256:stale-rr"},
+    }
+    stale_startup = {
+        "id": 11,
+        "event_kind": "mf_subagent_startup",
+        "status": "passed",
+        "payload": {**stale, "fence_token": "fence-stale"},
+    }
+    stale_close_ready = {
+        "id": 12,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "payload": {**stale},
+    }
+    stale_dispatch = {
+        "id": 13,
+        "event_kind": "mf_subagent_dispatch",
+        "status": "ok",
+        "payload": {**stale},
+    }
+    # Canonical rerecords of all the above kinds
+    canonical_read_receipt = {
+        "id": 20,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**canonical, "read_receipt_hash": "sha256:canon-rr"},
+    }
+    canonical_startup = {
+        "id": 21,
+        "event_kind": "mf_subagent_startup",
+        "status": "passed",
+        "payload": {**canonical, "fence_token": "fence-canon"},
+    }
+    canonical_close_ready = {
+        "id": 22,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "payload": {**canonical},
+    }
+    canonical_dispatch = {
+        "id": 23,
+        "event_kind": "mf_subagent_dispatch",
+        "status": "ok",
+        "payload": {**canonical},
+    }
+
+    events = [
+        cleanup,
+        stale_read_receipt, stale_startup, stale_close_ready, stale_dispatch,
+        canonical_read_receipt, canonical_startup, canonical_close_ready, canonical_dispatch,
+    ]
+    gate = task_timeline.mf_stale_route_evidence_gate_verification(events)
+
+    assert gate["passed"] is True, f"Expected passed but got: {gate}"
+    assert gate["superseded_close_evidence"] == [], gate["superseded_close_evidence"]
+    rerecorded_ids = {item["superseded_id"] for item in gate["rerecorded_close_evidence"]}
+    assert rerecorded_ids == {10, 11, 12, 13}, rerecorded_ids
+    for item in gate["rerecorded_close_evidence"]:
+        assert item["reason"] == "superseded_route_identity_evidence_rerecorded"
+        assert item["canonical_event_ids"]
+
+
+def test_partial_rerecord_blocks_missing_kind():
+    """Canonical rerecord missing for one kind → passed=False, only that kind in superseded."""
+    from agent.governance import task_timeline
+
+    canonical = dict(ROUTE_IDENTITY)
+    stale = {
+        "route_context_hash": "sha256:stale-route-context",
+        "prompt_contract_id": "rprompt-stale-route",
+        "prompt_contract_hash": "sha256:stale-prompt-contract",
+    }
+    cleanup = {
+        "id": 1,
+        "event_kind": "route_identity_cleanup",
+        "phase": "identity_recovery",
+        "status": "accepted",
+        "payload": {"route_identity_cleanup": {**canonical}},
+    }
+    stale_read_receipt = {
+        "id": 10,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**stale, "read_receipt_hash": "sha256:stale-rr"},
+    }
+    stale_startup = {
+        "id": 11,
+        "event_kind": "mf_subagent_startup",
+        "status": "passed",
+        "payload": {**stale, "fence_token": "fence-stale"},
+    }
+    # Only canonical read_receipt is present; startup has no canonical counterpart.
+    canonical_read_receipt = {
+        "id": 20,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**canonical, "read_receipt_hash": "sha256:canon-rr"},
+    }
+
+    events = [cleanup, stale_read_receipt, stale_startup, canonical_read_receipt]
+    gate = task_timeline.mf_stale_route_evidence_gate_verification(events)
+
+    assert gate["passed"] is False, f"Expected blocked but got: {gate}"
+    superseded_kinds = {item["event_kind"] for item in gate["superseded_close_evidence"]}
+    assert "mf_subagent_startup" in superseded_kinds, superseded_kinds
+    assert "mf_subagent_read_receipt" not in superseded_kinds, superseded_kinds
+    rerecorded_ids = {item["superseded_id"] for item in gate["rerecorded_close_evidence"]}
+    assert 10 in rerecorded_ids, rerecorded_ids
+    assert 11 not in rerecorded_ids, rerecorded_ids
+
+
+def test_no_cleanup_applied_both_lists_empty():
+    """No route_identity_cleanup in events → gate passes and both lists are empty (unchanged behavior)."""
+    from agent.governance import task_timeline
+
+    canonical = dict(ROUTE_IDENTITY)
+    read_receipt = {
+        "id": 1,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "payload": {**canonical, "read_receipt_hash": "sha256:rr"},
+    }
+    startup = {
+        "id": 2,
+        "event_kind": "mf_subagent_startup",
+        "status": "passed",
+        "payload": {**canonical, "fence_token": "fence-a"},
+    }
+
+    gate = task_timeline.mf_stale_route_evidence_gate_verification([read_receipt, startup])
+
+    assert gate["passed"] is True, f"Expected passed but got: {gate}"
+    assert gate["superseded_close_evidence"] == []
+    assert gate["rerecorded_close_evidence"] == []
+
+
+# ---------------------------------------------------------------------------
 # Close-gate cross-ref rejection (regression #3090)
 # ---------------------------------------------------------------------------
 def test_close_gate_rejects_cross_backlog_evidence_ref():
