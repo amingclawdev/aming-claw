@@ -7,6 +7,7 @@ import {
   type TaskTimelineSemanticChip,
   type TaskTimelineSemanticNarrative,
   type TaskTimelineSemanticProjection,
+  type TaskTimelineSemanticRelation,
 } from "./taskTimelineSemantics";
 
 export const TASK_PLAYBACK_TRACE_SCHEMA = "task_playback_trace.v1";
@@ -56,6 +57,8 @@ export interface TaskPlaybackFrame {
   event_type: string;
   event_kind: string;
   phase: string;
+  /** Role-action headline: WHO did WHAT in sentence form. Leads the detail pane. */
+  headline: string;
   title: string;
   detail: string;
   summary: string;
@@ -67,6 +70,8 @@ export interface TaskPlaybackFrame {
   specific_facts: TaskPlaybackStructuredFact[];
   failure_diagnosis: TaskPlaybackStructuredFact[];
   evidence_links: TaskPlaybackEvidenceRef[];
+  /** Structured cross-reference links: related events + parent/child backlog rows, each clickable. */
+  relation_links: TaskTimelineSemanticRelation[];
   detail_inspector: TaskTimelineEvidenceInspector;
   evidence_refs: TaskPlaybackEvidenceRef[];
   artifact_refs: TaskPlaybackArtifactRef[];
@@ -313,6 +318,7 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
     event_type: semantic.event_type_label,
     event_kind: semantic.event_kind_label,
     phase: semantic.phase_label,
+    headline: semantic.headline,
     title: semantic.title,
     detail: semantic.detail,
     summary: eventSummaryFromEvent(publicEvent, semantic, status, specificFacts, failureDiagnosis),
@@ -324,6 +330,7 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
     specific_facts: specificFacts,
     failure_diagnosis: failureDiagnosis,
     evidence_links: evidenceLinks,
+    relation_links: semantic.relations,
     detail_inspector: playbackInspectorFromEvent(publicEvent, semantic),
     evidence_refs: evidenceRefs,
     artifact_refs: artifactRefs,
