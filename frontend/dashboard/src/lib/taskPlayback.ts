@@ -1846,3 +1846,70 @@ function stableArtifacts(refs: TaskPlaybackArtifactRef[]): TaskPlaybackArtifactR
     return true;
   });
 }
+
+// ---------------------------------------------------------------------------
+// Pure display helpers — extracted from TaskPlaybackPanel so they are
+// unit-testable without React (AC-PLAYBACK-SEMANTICS-TEST-COVERAGE-20260610).
+// The component still owns all UI state; these are the pure, side-effect-free
+// computations that the component delegates to.
+// ---------------------------------------------------------------------------
+
+/** Lightweight nav-stack entry used by pushPlaybackNavStack / popPlaybackNavStack. */
+export interface PlaybackNavEntry {
+  frameId: string;
+  label: string;
+}
+
+/**
+ * Return the frames in display order.
+ *
+ * In newestFirst mode the underlying `frames` array is oldest-first (ascending
+ * created_at order), so the display list is reversed so the newest event
+ * appears at the top.  This is a pure function — it does not mutate the input.
+ */
+export function displayPlaybackFrames(
+  frames: TaskPlaybackFrame[],
+  newestFirst: boolean,
+): TaskPlaybackFrame[] {
+  return newestFirst ? [...frames].reverse() : frames;
+}
+
+/**
+ * Return the id of the latest (newest) frame, i.e. `frames[frames.length - 1].id`,
+ * or "" when the array is empty.
+ *
+ * In the underlying data model frames are always stored oldest-first, so the
+ * newest event is the last element regardless of the newestFirst display flag.
+ */
+export function latestPlaybackFrameId(frames: TaskPlaybackFrame[]): string {
+  return frames.length > 0 ? frames[frames.length - 1].id : "";
+}
+
+/**
+ * Push a new entry onto the nav stack, keeping at most 10 entries total.
+ *
+ * Returns a new array (pure, does not mutate the input).
+ */
+export function pushPlaybackNavStack(
+  stack: PlaybackNavEntry[],
+  entry: PlaybackNavEntry,
+): PlaybackNavEntry[] {
+  // Keep the 9 most-recent existing entries + the new one = 10 total.
+  return [...stack.slice(-9), entry];
+}
+
+/**
+ * Pop the top entry from the nav stack.
+ *
+ * Returns `{ entry, stack }` where `entry` is the popped value (or null when
+ * the stack was empty) and `stack` is the new array without that entry.
+ */
+export function popPlaybackNavStack(
+  stack: PlaybackNavEntry[],
+): { entry: PlaybackNavEntry | null; stack: PlaybackNavEntry[] } {
+  if (stack.length === 0) return { entry: null, stack: [] };
+  return {
+    entry: stack[stack.length - 1],
+    stack: stack.slice(0, -1),
+  };
+}
