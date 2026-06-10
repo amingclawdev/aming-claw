@@ -384,6 +384,38 @@ The MF close gate enforces:
   "surrogate"` is never close-satisfying real bounded-worker evidence, even when
   the startup gate stamps `close_satisfying=true` and even under
   `observer_hotfix_exception`. Only a real session-token startup is close-satisfying.
+- `#3516-F1` server-verified token evidence: `session_token_evidence_type` in
+  startup events may now be `'server_verified'` (server confirmed hash matches
+  allocation-time record), `'hash'` (first-sight commitment, server stores the
+  hash), `'claimed_unverified'` (presented token hash did NOT match stored hash —
+  treated as surrogate), `'surrogate'`, or `''`.  Only `'server_verified'` and
+  `'hash'` and the legacy `'hash'` (pre-fix events) exempt startups from surrogate
+  classification in the finish gate.  `'claimed_unverified'` is classified as
+  surrogate.  Existing recorded startup events with `'hash'` are NOT retroactively
+  invalidated; the stricter gate behavior applies to NEW startups only.
+
+## Surrogate Policy: Finish Gate vs Close Gate (F4 asymmetry — by design)
+
+The finish gate (`validate_mf_subagent_finish_gate` in
+`agent/governance/mf_subagent_contract.py`) evaluates per-startup surrogate
+classification via `_startup_is_host_adapter_surrogate` and
+`surrogate_startup_evidence_gate`.  A surrogate startup without a real-worker
+join blocks the finish gate.
+
+The close gate (`mf_close_gate_verification` in `agent/governance/task_timeline.py`)
+does NOT evaluate per-startup surrogate status.  This is intentional: the close
+gate checks timeline event kinds (contract, route-context, lane-ownership,
+worker-graph-trace, independent-QA, etc.) that are already separately gated
+upstream.  A lane that passes the finish gate has already proven its startup is
+non-surrogate or has been joined by a real-worker startup; by the time close is
+reached the startup evidence is settled and does not need re-evaluation.
+
+If the close gate were to re-evaluate startup surrogate policy, it would need
+access to the same runtime-context DB queries the finish gate uses — introducing
+a coupling that is not warranted for the close gate's purpose.  If future work
+requires close-gate startup re-validation (e.g. for multi-lane rollup), add an
+explicit `mf_subagent_startup_verification` timeline event kind to carry the
+joined verdict rather than re-running the surrogate logic at close time.
 
 ## Commit
 

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     base_commit       TEXT NOT NULL DEFAULT '',
     head_commit       TEXT NOT NULL DEFAULT '',
     target_head_commit TEXT NOT NULL DEFAULT '',
+    session_token_hash TEXT NOT NULL DEFAULT '',
     snapshot_id       TEXT NOT NULL DEFAULT '',
     projection_id     TEXT NOT NULL DEFAULT '',
     merge_queue_id    TEXT NOT NULL DEFAULT '',
@@ -356,6 +357,7 @@ class BranchTaskRuntimeContext:
     base_commit: str = ""
     head_commit: str = ""
     target_head_commit: str = ""
+    session_token_hash: str = ""
     snapshot_id: str = ""
     projection_id: str = ""
     merge_queue_id: str = ""
@@ -805,6 +807,7 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
         "target_project_root",
         "merge_queue_id",
         "merge_preview_id",
+        "session_token_hash",
     ):
         if column not in columns:
             conn.execute(
@@ -1116,6 +1119,10 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
         base_commit=row["base_commit"] or "",
         head_commit=row["head_commit"] or "",
         target_head_commit=row["target_head_commit"] or "",
+        session_token_hash=(
+            row["session_token_hash"] if "session_token_hash" in row_keys else ""
+        )
+        or "",
         snapshot_id=row["snapshot_id"] or "",
         projection_id=row["projection_id"] or "",
         merge_queue_id=row["merge_queue_id"] or "",
@@ -2599,13 +2606,14 @@ def upsert_branch_context(
             target_project_id, target_project_root, attempt, lease_id,
             lease_expires_at, fence_token, branch_ref, ref_name, worktree_id,
             worktree_path, base_commit, head_commit, target_head_commit,
+            session_token_hash,
             snapshot_id, projection_id, merge_queue_id, merge_preview_id,
             rollback_epoch, replay_epoch, status, depends_on_json,
             checkpoint_id, replay_source, last_recovery_action,
             created_at, updated_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
             runtime_context_id = excluded.runtime_context_id,
@@ -2637,6 +2645,10 @@ def upsert_branch_context(
             base_commit = excluded.base_commit,
             head_commit = excluded.head_commit,
             target_head_commit = excluded.target_head_commit,
+            session_token_hash = CASE
+                WHEN excluded.session_token_hash != '' THEN excluded.session_token_hash
+                ELSE parallel_branch_runtime_contexts.session_token_hash
+            END,
             snapshot_id = excluded.snapshot_id,
             projection_id = excluded.projection_id,
             merge_queue_id = excluded.merge_queue_id,
@@ -2682,6 +2694,7 @@ def upsert_branch_context(
             context.base_commit,
             context.head_commit,
             context.target_head_commit,
+            context.session_token_hash,
             context.snapshot_id,
             context.projection_id,
             context.merge_queue_id,
@@ -3643,7 +3656,35 @@ def _startup_host_adapter_identity(
     )
 
 
-def _startup_token_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _startup_token_evidence(
+    payload: Mapping[str, Any],
+    *,
+    stored_token_hash: str = "",
+) -> dict[str, Any]:
+    """Compute session-token evidence for a startup.
+
+    ``session_token_evidence_type`` semantics:
+    - ``'server_verified'``: the worker presented a raw session_token and the
+      server verified its hash against ``stored_token_hash`` recorded at first
+      sight.  This is the only evidence type that exempts a startup from
+      surrogate classification in the finish gate.
+    - ``'hash'``: the worker presented a raw session_token and this is the
+      FIRST startup for the lane (no prior stored hash exists).  The server
+      records the hash now (first-sight commitment).  Also exempts from
+      surrogate classification because the server itself is committing the hash.
+    - ``'claimed_unverified'``: the worker presented a raw session_token but the
+      server already holds a DIFFERENT hash for this lane — the presented token
+      does not match.  The startup is treated as unverified and the finish gate
+      MUST classify it as a surrogate.  Existing refusal paths are not weakened.
+    - ``'surrogate'``: no session_token was presented; a surrogate string was
+      supplied instead.  Always classified as surrogate in the finish gate.
+    - ``''`` (empty): no token and no surrogate.
+
+    Backward compatibility: existing recorded startup events with
+    ``session_token_evidence_type='hash'`` are NOT retroactively invalidated;
+    the gate-behavior change (downgrading unverified claims) applies only to NEW
+    startups processed after this fix lands.
+    """
     session_token = str(payload.get("session_token") or "").strip()
     surrogate = str(
         payload.get("session_token_surrogate")
@@ -3651,13 +3692,26 @@ def _startup_token_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         or ""
     ).strip()
     if session_token:
+        computed_hash = (
+            "sha256:" + hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+        )
+        stored = str(stored_token_hash or "").strip()
+        if stored:
+            # Server already holds the expected hash — verify presented token.
+            if computed_hash == stored:
+                evidence_type = "server_verified"
+            else:
+                # Mismatch: presented token does not match allocation-time hash.
+                evidence_type = "claimed_unverified"
+        else:
+            # First startup for this lane: server commits the hash now (first-sight).
+            evidence_type = "hash"
         return {
-            "session_token_hash": "sha256:"
-            + hashlib.sha256(session_token.encode("utf-8")).hexdigest(),
+            "session_token_hash": computed_hash,
             "session_token_present": True,
             "session_token_persisted": False,
             "session_token_surrogate": surrogate,
-            "session_token_evidence_type": "hash",
+            "session_token_evidence_type": evidence_type,
         }
     if surrogate:
         return {
@@ -3845,7 +3899,10 @@ def record_mf_subagent_startup(
         or context.agent_id
         or ""
     ).strip()
-    token_evidence = _startup_token_evidence(payload)
+    token_evidence = _startup_token_evidence(
+        payload,
+        stored_token_hash=context.session_token_hash if context is not None else "",
+    )
     actual_cwd = str(payload.get("actual_cwd") or payload.get("cwd") or "").strip()
     actual_git_root = str(payload.get("actual_git_root") or payload.get("git_root") or "").strip()
     branch = str(payload.get("branch") or payload.get("branch_ref") or "").strip()
@@ -4153,6 +4210,15 @@ def record_mf_subagent_startup(
             },
         )
 
+    # For first-sight ('hash') startups, persist the server-computed token hash
+    # so subsequent startups can be server-verified.  For 'claimed_unverified'
+    # startups the stored hash is already set and we pass '' to preserve it via
+    # the CASE WHEN guard in upsert_branch_context.
+    _persist_token_hash = (
+        token_evidence["session_token_hash"]
+        if token_evidence["session_token_evidence_type"] in ("hash", "server_verified")
+        else ""
+    )
     saved = upsert_branch_context(
         conn,
         replace(
@@ -4167,6 +4233,7 @@ def record_mf_subagent_startup(
             target_project_id=target_project_id,
             target_project_root=target_project_root,
             head_commit=head_commit,
+            session_token_hash=_persist_token_hash,
             last_recovery_action="mf_subagent_startup_recorded",
         ),
         now_iso=now_iso,
