@@ -147,6 +147,18 @@ export function isPrivatePlaybackText(value?: string | null): boolean {
   return isPrivateTimelineText(value);
 }
 
+/**
+ * Returns true when a backlog row should be hidden from public playback views.
+ *
+ * Visibility is driven ONLY by the explicit privacy_level / public_safe flags
+ * that the backend compact-bug serialiser emits.  Name/title/chain-stage
+ * substring heuristics must not be used here: a public row whose title
+ * mentions an external provider or tool name must not be silently hidden.
+ */
+export function isBacklogRowPrivate(bug: BacklogBug): boolean {
+  return bug.privacy_level === "private" || bug.public_safe === false;
+}
+
 export function sanitizeTaskPlaybackEvidenceText(value: string, path = ""): string {
   return sanitizeEvidenceString(value, path);
 }

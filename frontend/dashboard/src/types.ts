@@ -750,6 +750,10 @@ export interface BacklogBug {
   provenance_count?: number;
   contract_summary?: BacklogContractSummary;
   observer_command_projection?: ObserverCommandBacklogProjection;
+  /** Explicit privacy classification emitted by the backend compact-bug serialiser. */
+  privacy_level?: "public" | "private" | string;
+  /** True when the row is safe to display in public playback views. Defaults to true. */
+  public_safe?: boolean;
   compact?: boolean;
 }
 

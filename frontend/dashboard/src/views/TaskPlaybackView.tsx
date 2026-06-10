@@ -9,7 +9,7 @@ import {
 import {
   emptyTaskPlaybackTrace,
   fallbackTaskPlaybackSampleTrace,
-  isPrivatePlaybackText,
+  isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
   type TaskPlaybackTrace,
 } from "../lib/taskPlayback";
@@ -793,15 +793,7 @@ function matchesGateFilter(filter: GateFilter, bug: BacklogBug, state?: Playback
 }
 
 function isPrivatePlaybackBacklog(bug: BacklogBug): boolean {
-  const fields = [
-    bug.bug_id,
-    bug.title,
-    bug.runtime_state,
-    bug.chain_stage,
-    bug.mf_type,
-    bug.contract_summary?.template_id,
-  ];
-  return fields.some((field) => isPrivatePlaybackText(String(field || "")));
+  return isBacklogRowPrivate(bug);
 }
 
 function playbackRowMeta(bug: BacklogBug, state?: PlaybackLoadState): string {
