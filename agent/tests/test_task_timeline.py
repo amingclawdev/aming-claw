@@ -3159,6 +3159,252 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(ready["worker_graph_trace_gate"]["trace_ids"], ["gqt-policy-close"])
         self.assertTrue(ready["independent_qa_gate"]["passed"])
 
+    # -----------------------------------------------------------------------
+    # BUG-ROUTE-CONTEXT-CLOSE-GATE-QA-20260531: independence-by-identity tests
+    # -----------------------------------------------------------------------
+
+    def _parallel_contract_with_iv(self):
+        """Return a contract that declares independent_verification_required."""
+        return {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-IV-TEST",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+
+    def _startup_event(self, worker_slot_id: str) -> dict:
+        """Return a minimal startup event that registers a worker identity."""
+        return {
+            "event_kind": "mf_subagent_startup",
+            "phase": "startup_gate",
+            "actor": worker_slot_id,
+            "status": "passed",
+            "payload": {
+                "mf_subagent_startup_gate": {
+                    "worker_slot_id": worker_slot_id,
+                    "worker_id": worker_slot_id,
+                    "agent_id": worker_slot_id,
+                }
+            },
+        }
+
+    def test_topology_policy_required_missing_iv_fails_independent_qa_gate(self):
+        """Topology with independent_verification_required=True needs IV evidence."""
+        from agent.governance import task_timeline
+
+        contract = self._parallel_contract_with_iv()
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        result = task_timeline._independent_qa_gate(base_events, {}, contract=contract)
+        self.assertTrue(result["required"], result)
+        self.assertTrue(result["topology_required"], result)
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["missing_requirement_ids"], ["independent_qa"])
+        self.assertIn("independent_qa", result["reason"])
+
+    def test_topology_policy_not_required_passes_without_iv(self):
+        """Lightweight single-lane topology does NOT require IV evidence."""
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_workflow_runtime.v1",
+            "contract_instance_id": "BUG-SINGLE-LANE",
+            "route_topology_policy": {
+                "selected_topology": "lightweight_single_lane",
+                "required_lanes": ["single_bounded_worker"],
+                "independent_verification_required": False,
+            },
+            "governance_policy": {
+                "profile": "third-party-public",
+                "requirements": {"independent_qa": False},
+            },
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+        ]
+        result = task_timeline._independent_qa_gate(base_events, {}, contract=contract)
+        self.assertFalse(result["required"], result)
+        self.assertTrue(result["passed"], result)
+
+    def test_worker_self_appended_iv_event_is_rejected(self):
+        """IV evidence from the same worker (actor = worker_slot_id) must NOT count.
+        Live incidents #3750/#3811.
+        """
+        from agent.governance import task_timeline
+
+        worker_id = "codex-worker-impl-01"
+        events = [
+            self._startup_event(worker_id),
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": worker_id,  # same as implementation worker — invalid
+                "status": "passed",
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertTrue(result["required"], result)
+        self.assertFalse(result["passed"], result)
+        self.assertTrue(result["rejected_evidence_events"], result)
+        self.assertEqual(
+            result["rejected_evidence_events"][0]["reason"],
+            "reviewer_is_known_worker",
+        )
+        self.assertIn(worker_id, result["known_worker_slot_ids"])
+
+    def test_plain_observer_without_reviewer_identity_does_not_count(self):
+        """A raw 'observer' verification event without reviewer identity does not count."""
+        from agent.governance import task_timeline
+
+        events = [
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "observer",  # plain observer, no on-behalf, no payload.reviewer
+                "status": "passed",
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertTrue(result["required"], result)
+        self.assertFalse(result["passed"], result)
+        self.assertTrue(result["rejected_evidence_events"], result)
+        self.assertEqual(
+            result["rejected_evidence_events"][0]["reason"],
+            "plain_observer_no_independent_reviewer",
+        )
+
+    def test_observer_on_behalf_with_independent_reviewer_counts(self):
+        """Observer-on-behalf transport with independent reviewer DOES count.
+        This is the established daily pattern — breaking it would brick every close.
+        """
+        from agent.governance import task_timeline
+
+        worker_id = "codex-worker-impl-01"
+        reviewer_id = "qa-reviewer-external-01"
+        events = [
+            self._startup_event(worker_id),
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": f"observer-on-behalf-of:{reviewer_id}",
+                "status": "passed",
+                "payload": {
+                    "qa_verdict_refs": ["evt-123"],
+                },
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertTrue(result["required"], result)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(len(result["evidence_events"]), 1)
+        self.assertEqual(result["evidence_events"][0]["reviewer_identity"], reviewer_id)
+
+    def test_payload_reviewer_with_independent_identity_counts(self):
+        """Observer transport with payload.reviewer set to independent reviewer counts."""
+        from agent.governance import task_timeline
+
+        worker_id = "codex-worker-impl-01"
+        reviewer_id = "qa-external-reviewer-99"
+        events = [
+            self._startup_event(worker_id),
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "observer",  # plain observer transport
+                "status": "passed",
+                "payload": {
+                    "reviewer": reviewer_id,
+                    "qa_verdict_refs": ["evt-456"],
+                },
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["evidence_events"][0]["reviewer_identity"], reviewer_id)
+
+    def test_qa_review_direct_independent_actor_counts(self):
+        """Direct qa_review event from a non-worker, non-observer actor counts."""
+        from agent.governance import task_timeline
+
+        worker_id = "codex-worker-impl-01"
+        events = [
+            self._startup_event(worker_id),
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "passed",
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(len(result["evidence_events"]), 1)
+        self.assertEqual(result["evidence_events"][0]["reviewer_identity"], "qa-lane-reviewer")
+
+    def test_observer_with_verdict_refs_counts_as_independent(self):
+        """Observer transport with qa_verdict_refs (even without on-behalf prefix) counts."""
+        from agent.governance import task_timeline
+
+        events = [
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {"qa_verdict_refs": ["evt-789"]},
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        # observer with verdict_refs is treated as a legitimate relay
+        self.assertTrue(result["passed"], result)
+
+    def test_close_gate_passes_for_fixed_rows_without_iv_topology(self):
+        """Rows without IV topology and without strict governance policy are unaffected.
+        Backward-compat: already-FIXED rows with no independent_verification_required
+        and third-party-public profile still close normally.
+        """
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_workflow_runtime.v1",
+            "governance_policy": {
+                "profile": "third-party-public",
+                "requirements": {
+                    "graph_first_evidence": True,
+                    "worker_graph_trace": False,
+                    "independent_qa": False,
+                    "single_active_task": False,
+                    "close_timeline": True,
+                },
+            },
+        }
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        result = task_timeline.mf_close_gate_verification(events, contract=contract)
+        self.assertTrue(result["passed"], result)
+        self.assertFalse(result["independent_qa_gate"]["required"])
+        self.assertTrue(result["independent_qa_gate"]["passed"])
+
     def test_close_timeline_policy_can_disable_required_close_event_kinds(self):
         from agent.governance import task_timeline
 
