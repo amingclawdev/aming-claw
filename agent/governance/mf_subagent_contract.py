@@ -463,6 +463,90 @@ def canonical_contract_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+# Format regex: "sha256:" followed by exactly 64 lowercase hex characters.
+_SHA256_HASH_FORMAT = "sha256:"
+_SHA256_HEX_LEN = 64
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_valid_sha256_format(claimed: str) -> bool:
+    """Return True when *claimed* matches the sha256:<64 lowercase hex> format floor."""
+    if not claimed.startswith(_SHA256_HASH_FORMAT):
+        return False
+    hex_part = claimed[len(_SHA256_HASH_FORMAT):]
+    if len(hex_part) != _SHA256_HEX_LEN:
+        return False
+    return all(c in _HEX_CHARS for c in hex_part)
+
+
+def verify_content_hash(
+    claimed_hash: str,
+    obj: Any,
+    *,
+    field_name: str = "hash",
+) -> dict[str, Any]:
+    """Verify a claimed sha256 content hash.
+
+    Two-tier check:
+    1. FORMAT FLOOR: *claimed_hash* must match ``sha256:<64 lowercase hex>``.
+       Forged/copied junk (e.g. ``sha256:rr-...``, uppercase hex, wrong length)
+       is rejected here regardless of whether *obj* is present.
+    2. CONTENT VERIFY: when *obj* is not None, recompute
+       ``canonical_contract_hash(obj)`` (same stable serialization as the
+       producer) and require equality with *claimed_hash*.  Mismatch →
+       structured ``content_hash_mismatch`` refusal.  Object absent → format
+       floor only (presence semantics unchanged for backward compatibility).
+
+    Returns a dict with keys:
+    - ``ok`` (bool)
+    - ``status``: ``"verified"`` | ``"format_error"`` | ``"content_hash_mismatch"``
+    - ``field_name``
+    - ``claimed_hash``
+    - ``object_present`` (bool)
+    - ``computed_hash`` (only when object present)
+    """
+    result_base: dict[str, Any] = {
+        "field_name": field_name,
+        "claimed_hash": claimed_hash,
+        "object_present": obj is not None,
+    }
+    if not _is_valid_sha256_format(claimed_hash):
+        return {
+            **result_base,
+            "ok": False,
+            "status": "format_error",
+            "reason": (
+                f"{field_name} must be sha256:<64 lowercase hex>; "
+                f"got: {claimed_hash!r}"
+            ),
+        }
+    if obj is None:
+        # Format floor passed; object absent — presence semantics unchanged.
+        return {
+            **result_base,
+            "ok": True,
+            "status": "format_verified",
+        }
+    computed = canonical_contract_hash(obj)
+    if computed != claimed_hash:
+        return {
+            **result_base,
+            "ok": False,
+            "status": "content_hash_mismatch",
+            "computed_hash": computed,
+            "reason": (
+                f"{field_name} content mismatch: "
+                f"claimed {claimed_hash!r} != computed {computed!r}"
+            ),
+        }
+    return {
+        **result_base,
+        "ok": True,
+        "status": "verified",
+        "computed_hash": computed,
+    }
+
+
 def _string_list_from_mapping(source: Mapping[str, Any], *keys: str) -> list[str]:
     for key in keys:
         value = source.get(key)
@@ -3757,6 +3841,48 @@ def _validate_route_token(
         raise MfSubagentContractError("route_token expired")
 
     _validate_route_scope(token, request_scope=request_scope)
+
+    # Content-hash verification for wired hash fields.
+    # Each verify_content_hash call:
+    # - Rejects forged/ill-formed hash strings (format floor).
+    # - When the corresponding object is present in the token, recomputes and
+    #   checks equality (content verify).  Object absent → format floor only.
+    hash_verification: dict[str, Any] = {}
+
+    if route_context_hash:
+        route_context_obj = token.get("route_context")
+        rv = verify_content_hash(
+            route_context_hash,
+            route_context_obj,
+            field_name="route_context_hash",
+        )
+        hash_verification["route_context_hash"] = rv
+        if not rv["ok"]:
+            raise MfSubagentContractError(rv["reason"])
+
+    if prompt_contract_hash:
+        prompt_contract_obj = token.get("prompt_contract")
+        rv = verify_content_hash(
+            prompt_contract_hash,
+            prompt_contract_obj,
+            field_name="prompt_contract_hash",
+        )
+        hash_verification["prompt_contract_hash"] = rv
+        if not rv["ok"]:
+            raise MfSubagentContractError(rv["reason"])
+
+    visible_injection_manifest_hash = _string(token.get("visible_injection_manifest_hash"))
+    if visible_injection_manifest_hash:
+        manifest_obj = token.get("visible_injection_manifest")
+        rv = verify_content_hash(
+            visible_injection_manifest_hash,
+            manifest_obj,
+            field_name="visible_injection_manifest_hash",
+        )
+        hash_verification["visible_injection_manifest_hash"] = rv
+        if not rv["ok"]:
+            raise MfSubagentContractError(rv["reason"])
+
     return {
         "schema_version": ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
         "allowed": True,
@@ -3772,6 +3898,7 @@ def _validate_route_token(
         "evidence_refs": evidence_refs,
         "scope": _route_scope_summary(token, request_scope),
         "required_fields": list(_ROUTE_TOKEN_REQUIRED_FIELDS),
+        "hash_verification": hash_verification,
     }
 
 

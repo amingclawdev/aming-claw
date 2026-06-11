@@ -1858,10 +1858,13 @@ def test_route_action_gate_rejects_observer_direct_implementation_before_dispatc
 
 
 def _route_token(**overrides: object) -> dict[str, object]:
+    # Use valid sha256:<64 hex> format for hash fields (required by format floor).
+    _rc_hash = canonical_contract_hash({"route_id": "test-route", "project": "aming-claw"})
+    _pc_hash = canonical_contract_hash({"prompt_contract_id": "rprompt-1", "version": 1})
     token: dict[str, object] = {
-        "route_context_hash": "sha256:route-context",
+        "route_context_hash": _rc_hash,
         "prompt_contract_id": "rprompt-1",
-        "prompt_contract_hash": "sha256:prompt-contract",
+        "prompt_contract_hash": _pc_hash,
         "caller_role": "observer",
         "allowed_action": "backlog_close",
         "project_id": "aming-claw",
@@ -1884,7 +1887,7 @@ def test_route_token_mutation_gate_accepts_bounded_token() -> None:
     assert gate["schema_version"] == ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION
     assert gate["allowed"] is True
     assert gate["decision"] == "route_token"
-    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["route_context_hash"].startswith("sha256:")
     assert gate["prompt_contract_id"] == "rprompt-1"
     assert gate["route_token_hash"].startswith("sha256:")
 
@@ -3794,3 +3797,313 @@ def test_context_lookup_failure_check_exists_in_server_gate() -> None:
     assert "fence_token not found on server-side" in source, (
         "server.py finish-gate must refuse when context has no fence_token"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC-ROUTE-CONTEXT-CONTENT-HASH-VERIFY-GATE-20260608
+# Content-hash verifier tests
+# ---------------------------------------------------------------------------
+
+from agent.governance.mf_subagent_contract import (
+    verify_content_hash,
+    canonical_contract_hash,
+)
+from agent.governance.service_router import _route_prompt_identity
+
+
+# -- Format floor tests --
+
+def test_verify_content_hash_good_digest_passes() -> None:
+    """A well-formed sha256:<64 lowercase hex> digest passes the format floor."""
+    good = "sha256:" + "a" * 64
+    result = verify_content_hash(good, None, field_name="test_hash")
+    assert result["ok"] is True
+    assert result["status"] == "format_verified"
+    assert result["object_present"] is False
+
+
+def test_verify_content_hash_rr_prefix_rejected() -> None:
+    """Forged/copied junk like sha256:rr-... must be rejected at the format floor."""
+    bad = "sha256:rr-route-context-hash-forgery-value-padding000000000000000000000"
+    result = verify_content_hash(bad, None, field_name="route_context_hash")
+    assert result["ok"] is False
+    assert result["status"] == "format_error"
+    assert "route_context_hash" in result["reason"]
+
+
+def test_verify_content_hash_uppercase_hex_rejected() -> None:
+    """Uppercase hex in sha256:<...> is rejected — only lowercase is valid."""
+    bad = "sha256:" + "A" * 64
+    result = verify_content_hash(bad, None, field_name="test_hash")
+    assert result["ok"] is False
+    assert result["status"] == "format_error"
+
+
+def test_verify_content_hash_wrong_length_rejected() -> None:
+    """A hex part that is not exactly 64 characters is rejected."""
+    too_short = "sha256:" + "a" * 32
+    result = verify_content_hash(too_short, None, field_name="test_hash")
+    assert result["ok"] is False
+    assert result["status"] == "format_error"
+
+    too_long = "sha256:" + "a" * 65
+    result2 = verify_content_hash(too_long, None, field_name="test_hash")
+    assert result2["ok"] is False
+    assert result2["status"] == "format_error"
+
+
+def test_verify_content_hash_missing_prefix_rejected() -> None:
+    """A plain hex string without the sha256: prefix is rejected."""
+    no_prefix = "a" * 64
+    result = verify_content_hash(no_prefix, None, field_name="test_hash")
+    assert result["ok"] is False
+    assert result["status"] == "format_error"
+
+
+# -- Content match / mismatch tests --
+
+def test_verify_content_hash_content_match_passes() -> None:
+    """When the object is present and the hash matches, status is verified."""
+    obj = {"key": "value", "nested": {"x": 1}}
+    good_hash = canonical_contract_hash(obj)
+    result = verify_content_hash(good_hash, obj, field_name="route_context_hash")
+    assert result["ok"] is True
+    assert result["status"] == "verified"
+    assert result["computed_hash"] == good_hash
+    assert result["object_present"] is True
+
+
+def test_verify_content_hash_content_mismatch_rejected() -> None:
+    """When the object is present and the hash does NOT match, status is content_hash_mismatch."""
+    obj = {"key": "value"}
+    wrong_hash = canonical_contract_hash({"key": "different_value"})
+    result = verify_content_hash(wrong_hash, obj, field_name="route_context_hash")
+    assert result["ok"] is False
+    assert result["status"] == "content_hash_mismatch"
+    assert "mismatch" in result["reason"]
+    assert result["computed_hash"] != wrong_hash
+
+
+def test_verify_content_hash_object_absent_format_floor_only() -> None:
+    """When the object is absent, only the format floor applies (no content check)."""
+    real_hash = canonical_contract_hash({"any": "object"})
+    # object=None → format floor only, no content check
+    result = verify_content_hash(real_hash, None, field_name="route_context_hash")
+    assert result["ok"] is True
+    assert result["status"] == "format_verified"
+    assert result["object_present"] is False
+
+
+# -- Wired sites: route_context, prompt_contract, manifest --
+
+def _make_valid_token(
+    *,
+    route_context_hash: str | None = None,
+    route_context: dict | None = None,
+    prompt_contract_hash: str | None = None,
+    prompt_contract: dict | None = None,
+    visible_injection_manifest_hash: str | None = None,
+    visible_injection_manifest: dict | None = None,
+) -> dict:
+    """Build a minimal valid route_token payload for gate tests."""
+    from datetime import datetime, timezone, timedelta
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    obj_rc = route_context or {"route_id": "r1", "project": "p"}
+    obj_pc = prompt_contract or {"id": "pc1", "version": "1"}
+    rc_hash = route_context_hash if route_context_hash is not None else canonical_contract_hash(obj_rc)
+    pc_hash = prompt_contract_hash if prompt_contract_hash is not None else canonical_contract_hash(obj_pc)
+    token: dict = {
+        "route_context_hash": rc_hash,
+        "prompt_contract_id": "rprompt-test-001",
+        "prompt_contract_hash": pc_hash,
+        "caller_role": "mf_sub",
+        "allowed_action": "task_timeline_append",
+        "expires_at": expires,
+        "evidence_refs": ["evt-001"],
+        "scope": {"project_id": "test-proj"},
+    }
+    if route_context is not None:
+        token["route_context"] = route_context
+    if prompt_contract is not None:
+        token["prompt_contract"] = prompt_contract
+    if visible_injection_manifest_hash is not None:
+        token["visible_injection_manifest_hash"] = visible_injection_manifest_hash
+    if visible_injection_manifest is not None:
+        token["visible_injection_manifest"] = visible_injection_manifest
+    return token
+
+
+def test_validate_route_token_route_context_match_passes() -> None:
+    """route_context present and hash matches → accepted, hash_verification recorded."""
+    obj = {"route_id": "r1", "project": "p"}
+    token = _make_valid_token(route_context=obj)
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+        project_id="test-proj",
+    )
+    assert result["allowed"] is True
+    hv = result["hash_verification"]
+    assert hv["route_context_hash"]["ok"] is True
+    assert hv["route_context_hash"]["status"] == "verified"
+
+
+def test_validate_route_token_route_context_mismatch_rejected() -> None:
+    """route_context present but hash mismatches → MfSubagentContractError raised."""
+    obj_real = {"route_id": "r1", "project": "p"}
+    wrong_hash = canonical_contract_hash({"route_id": "different"})
+    token = _make_valid_token(route_context_hash=wrong_hash, route_context=obj_real)
+    with pytest.raises(MfSubagentContractError, match="mismatch"):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+            project_id="test-proj",
+        )
+
+
+def test_validate_route_token_route_context_absent_format_floor_passes() -> None:
+    """route_context absent but hash is well-formed → accepted (format floor only)."""
+    # Do not include route_context in the token.
+    obj = {"route_id": "r1", "project": "p"}
+    rc_hash = canonical_contract_hash(obj)
+    token = _make_valid_token(route_context_hash=rc_hash)
+    # No route_context key → object absent → format floor only
+    assert "route_context" not in token
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+        project_id="test-proj",
+    )
+    assert result["allowed"] is True
+    hv = result["hash_verification"]
+    assert hv["route_context_hash"]["ok"] is True
+    assert hv["route_context_hash"]["status"] == "format_verified"
+
+
+def test_validate_route_token_forged_route_context_hash_rejected() -> None:
+    """A forged/ill-formed route_context_hash is rejected at the format floor."""
+    token = _make_valid_token(route_context_hash="sha256:rr-route-forgery-" + "0" * 46)
+    with pytest.raises(MfSubagentContractError, match="sha256"):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+        )
+
+
+def test_validate_route_token_prompt_contract_match_passes() -> None:
+    """prompt_contract present and hash matches → accepted."""
+    obj = {"id": "pc1", "version": "1"}
+    token = _make_valid_token(prompt_contract=obj)
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+    )
+    assert result["allowed"] is True
+    hv = result["hash_verification"]
+    assert hv["prompt_contract_hash"]["ok"] is True
+    assert hv["prompt_contract_hash"]["status"] == "verified"
+
+
+def test_validate_route_token_prompt_contract_mismatch_rejected() -> None:
+    """prompt_contract present but hash mismatches → error."""
+    obj_real = {"id": "pc1", "version": "1"}
+    wrong_hash = canonical_contract_hash({"id": "different"})
+    token = _make_valid_token(prompt_contract_hash=wrong_hash, prompt_contract=obj_real)
+    with pytest.raises(MfSubagentContractError, match="mismatch"):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+        )
+
+
+def test_validate_route_token_manifest_match_passes() -> None:
+    """visible_injection_manifest present and hash matches → accepted."""
+    manifest_obj = {"manifest_key": "manifest_value", "version": 2}
+    manifest_hash = canonical_contract_hash(manifest_obj)
+    token = _make_valid_token(
+        visible_injection_manifest_hash=manifest_hash,
+        visible_injection_manifest=manifest_obj,
+    )
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+    )
+    assert result["allowed"] is True
+    hv = result["hash_verification"]
+    assert hv["visible_injection_manifest_hash"]["ok"] is True
+    assert hv["visible_injection_manifest_hash"]["status"] == "verified"
+
+
+def test_validate_route_token_manifest_mismatch_rejected() -> None:
+    """visible_injection_manifest present but hash mismatches → error."""
+    manifest_obj = {"manifest_key": "real"}
+    wrong_hash = canonical_contract_hash({"manifest_key": "forged"})
+    token = _make_valid_token(
+        visible_injection_manifest_hash=wrong_hash,
+        visible_injection_manifest=manifest_obj,
+    )
+    with pytest.raises(MfSubagentContractError, match="mismatch"):
+        validate_route_token_mutation_gate(
+            {"route_token": token},
+            action="task_timeline_append",
+        )
+
+
+def test_validate_route_token_manifest_absent_format_floor_passes() -> None:
+    """visible_injection_manifest_hash present but manifest object absent → format floor only."""
+    manifest_hash = canonical_contract_hash({"any": "obj"})
+    token = _make_valid_token(visible_injection_manifest_hash=manifest_hash)
+    assert "visible_injection_manifest" not in token
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+    )
+    assert result["allowed"] is True
+    hv = result["hash_verification"]
+    assert hv["visible_injection_manifest_hash"]["ok"] is True
+    assert hv["visible_injection_manifest_hash"]["status"] == "format_verified"
+
+
+def test_gate_output_records_hash_verification() -> None:
+    """Accepted gate result must include hash_verification dict."""
+    obj = {"route_id": "r1"}
+    token = _make_valid_token(route_context=obj)
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="task_timeline_append",
+    )
+    assert "hash_verification" in result
+    assert isinstance(result["hash_verification"], dict)
+
+
+# -- service_router._route_prompt_identity hash format floor --
+
+def test_route_prompt_identity_rejects_ill_formed_route_context_hash() -> None:
+    """_route_prompt_identity must drop ill-formed route_context_hash strings."""
+    forged_hash = "sha256:rr-not-hex-padding-000000000000000000000000000000000000000000000"
+    result = _route_prompt_identity({"route_context_hash": forged_hash})
+    assert "route_context_hash" not in result
+
+
+def test_route_prompt_identity_accepts_valid_route_context_hash() -> None:
+    """_route_prompt_identity keeps a valid sha256:<64 hex> route_context_hash."""
+    valid_hash = "sha256:" + "a" * 64
+    result = _route_prompt_identity({"route_context_hash": valid_hash})
+    assert result.get("route_context_hash") == valid_hash
+
+
+def test_route_prompt_identity_rejects_ill_formed_prompt_contract_hash() -> None:
+    """_route_prompt_identity must drop ill-formed prompt_contract_hash strings."""
+    forged_hash = "sha256:rr-not-hex-padding-000000000000000000000000000000000000000000000"
+    result = _route_prompt_identity({"prompt_contract_hash": forged_hash})
+    assert "prompt_contract_hash" not in result
+
+
+def test_route_prompt_identity_computes_manifest_hash_when_manifest_present() -> None:
+    """_route_prompt_identity computes and records manifest hash from the object."""
+    from agent.governance.mf_subagent_contract import canonical_contract_hash as cch
+    manifest = {"inject_key": "inject_val"}
+    expected_hash = cch(manifest)
+    bundle = {"visible_injection_manifest": manifest}
+    result = _route_prompt_identity({"route_prompt_bundle": bundle})
+    assert result.get("visible_injection_manifest_hash") == expected_hash
