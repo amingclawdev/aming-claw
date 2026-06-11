@@ -6428,6 +6428,37 @@ a:hover { text-decoration: underline; }
 .toast.error { background: #7f1d1d; }
 .toast.success { background: #14532d; }
 
+/* Version-mismatch sticky banner — unobtrusive, at the bottom of the page */
+.version-mismatch-banner {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 7px 16px;
+  background: var(--ink-800, #1e293b);
+  color: var(--ink-100, #f1f5f9);
+  font-size: 11px;
+  border-top: 1px solid var(--ink-600, #475569);
+}
+.version-mismatch-reload {
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--ink-400, #94a3b8);
+  background: transparent;
+  color: var(--ink-100, #f1f5f9);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.version-mismatch-reload:hover {
+  background: var(--ink-700, #334155);
+}
+
 .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: var(--ink-300); border-radius: 3px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }

@@ -9,6 +9,8 @@ interface ImportMetaEnv {
 }
 
 declare const __DEFAULT_WORKSPACE_ROOT__: string;
+/** Build-time git short HEAD. "dev" in Vite serve mode (banner disabled). */
+declare const __DASHBOARD_BUILD__: string;
 
 interface ImportMeta {
   readonly env: ImportMetaEnv;
