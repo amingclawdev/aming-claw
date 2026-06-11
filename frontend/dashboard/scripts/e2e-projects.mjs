@@ -1079,6 +1079,22 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes('session_token_evidence_type') && playbackPanelSource.includes('surrogate_close_satisfying') && playbackPanelSource.includes('blocker_resolution_gate'), "Task playback evidence modal should surface work-mode, surrogate, and close sub-gate facts");
   assert(playbackTestSource.includes('AC-OBSERVER-ROOT-ROUTE-CONTEXT-WORK-MODE-20260609') && playbackTestSource.includes('taskPlaybackWorkModeFixtureAssertions'), "Task playback fixture should cover the observer root route context work-mode backlog");
   ok("Observer root route context, work modes, surrogate close-evidence, and close sub-gates are readable in playback");
+  // B1/B2 UE blockers: canonical URL helpers and deep-link event selection (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611)
+  assert(playbackSource.includes("buildPlaybackUrl"), "Task playback lib should export buildPlaybackUrl canonical URL builder");
+  assert(playbackSource.includes("findFrameIdByEventParam"), "Task playback lib should export findFrameIdByEventParam for async deep-link resolution");
+  assert(playbackSource.includes("readPlaybackEventParam"), "Task playback lib should export readPlaybackEventParam URL param reader");
+  assert(playbackSource.includes("PLAYBACK_URL_PARAMS"), "Task playback lib should export PLAYBACK_URL_PARAMS canonical param map");
+  assert(playbackSource.includes('"view"') && playbackSource.includes('"activity_tab"') && playbackSource.includes('"playback_backlog"') && playbackSource.includes('"playback_event"'), "PLAYBACK_URL_PARAMS should cover view, activity_tab, playback_backlog, and playback_event");
+  assert(playbackViewSource.includes("buildPlaybackUrl") && playbackViewSource.includes("findFrameIdByEventParam") && playbackViewSource.includes("readPlaybackEventParam"), "Activity view should use canonical URL helpers for deep-link navigation");
+  assert(playbackViewSource.includes("selectedEventParam") && playbackViewSource.includes("setSelectedEventParam"), "Activity view should track playback_event URL param state for async deep-link resolution");
+  assert(playbackViewSource.includes("navigateToPlayback(card.backlog_id, eventId)"), "Activity card click should pass event id to navigateToPlayback for deep-link URL");
+  assert(playbackViewSource.includes("findFrameIdByEventParam(state.trace.frames, selectedEventParam)"), "Activity view should resolve deep-link frame id only after trace is loaded (async race guard)");
+  assert(playbackTestSource.includes("buildPlaybackUrl") && playbackTestSource.includes("findFrameIdByEventParam"), "Task playback fixture should cover canonical URL builder and deep-link frame resolution");
+  assert(playbackTestSource.includes("view=activity") && playbackTestSource.includes("activity_tab=history") && playbackTestSource.includes("playback_backlog="), "Task playback URL tests should assert canonical view=activity&activity_tab=history&playback_backlog= form");
+  // B3/B4 UE blockers: bounded scroll containers and mobile layout (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611)
+  assert(cssSource.includes(".task-playback-body"), "Task playback body grid should have stable CSS");
+  assert(cssSource.includes("task-playback-event-column"), "Task playback event-list column should have stable CSS for bounded independent scroll");
+  assert(cssSource.includes("task-playback-detail-column"), "Task playback detail column should have stable CSS for bounded independent scroll");
   ok("Activity owns current events; Backlog rows expose compact status plus Activity/playback deep links");
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }

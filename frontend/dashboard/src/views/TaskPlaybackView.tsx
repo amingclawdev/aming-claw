@@ -13,6 +13,10 @@ import {
   normalizeTaskPlaybackTrace,
   projectEventToCard,
   sliceEventPage,
+  buildPlaybackUrl,
+  findFrameIdByEventParam,
+  readPlaybackEventParam,
+  PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
   type ActivityEventCard,
 } from "../lib/taskPlayback";
@@ -28,8 +32,8 @@ type StatusFilter = "open" | "fixed" | "all";
 type GateFilter = "all" | "gate_candidate" | "timeline_loaded" | "blocked_gate" | "no_timeline";
 type ActivityMode = "activity" | "history";
 
-const PLAYBACK_BACKLOG_PARAM = "playback_backlog";
-const ACTIVITY_TAB_PARAM = "activity_tab";
+const PLAYBACK_BACKLOG_PARAM = PLAYBACK_URL_PARAMS.playback_backlog;
+const ACTIVITY_TAB_PARAM = PLAYBACK_URL_PARAMS.activity_tab;
 const PLAYBACK_TIMELINE_LIMIT = 250;
 const ACTIVITY_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_REFRESH_MS = 5000;
@@ -100,6 +104,10 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [localActivityBugId, setLocalActivityBugId] = useState<string>("");
   const [activityRefreshSeq, setActivityRefreshSeq] = useState(0);
   const [selectedFrameId, setSelectedFrameId] = useState<string>("");
+  // B1: event-id deep-link param — when the user arrives via a card click that
+  // included a playback_event param, we hold the raw event-id string here and
+  // resolve it to a frame once the trace finishes loading (async race guard).
+  const [selectedEventParam, setSelectedEventParam] = useState<string>(() => readPlaybackEventParam());
   const [selectedActivityFrameId, setSelectedActivityFrameId] = useState<string>("");
   // Current tab event card pager state (IA item A — 10 cards/page).
   const [eventsPage, setEventsPage] = useState(0);
@@ -145,6 +153,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setActivityRefreshSeq(0);
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
+    setSelectedEventParam("");
     setSelectedActivityFrameId("");
     setEventsPage(0);
     setPlaying(false);
@@ -178,6 +187,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     const handlePopState = () => {
       setSelectedBugId(readSelectedBacklogId());
       setMode(readActivityMode());
+      // B1: restore the event-id deep-link param on browser Back/Forward.
+      setSelectedEventParam(readPlaybackEventParam());
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -531,6 +542,25 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       });
   }, [projectId, selectedLoadBugId]);
 
+  // B1: Async deep-link race guard.
+  // When the URL carries a playback_event param and the trace for the selected
+  // backlog has just finished loading, resolve the param to the matching frame
+  // id and select it, then clear the pending param so subsequent frame
+  // changes are user-driven.
+  useEffect(() => {
+    if (!selectedEventParam) return;
+    const state = selectedBugId ? playbackByBug[selectedBugId] : undefined;
+    if (!state?.loaded || state.loading) return; // wait for load
+    const resolvedFrameId = findFrameIdByEventParam(state.trace.frames, selectedEventParam);
+    if (resolvedFrameId) {
+      setSelectedFrameId(resolvedFrameId);
+      setPlaying(false);
+    }
+    // Clear the pending param regardless of whether we found a match so we
+    // don't re-run this on every subsequent trace update.
+    setSelectedEventParam("");
+  }, [selectedEventParam, selectedBugId, playbackByBug]);
+
   useEffect(() => {
     if (!playing || activeTrace.frames.length <= 1) return undefined;
     const delay = Math.max(500, 1700 / speed);
@@ -551,6 +581,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const selectBug = (bugId: string) => {
     setSelectedBugId(bugId);
     setSelectedFrameId("");
+    // Clear any pending deep-link event param — user is manually switching rows.
+    setSelectedEventParam("");
     setPlaying(false);
     writeSelectedBacklogId(bugId);
   };
@@ -646,14 +678,18 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             onPageChange={(page) => setEventsPage(page)}
             onCardClick={(card) => {
               if (card.backlog_id) {
-                // F4 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
-                // Use pushState (via the navigate helpers below) so that clicking
-                // a card pushes a new history entry; the browser Back button
-                // restores the Current tab card list (popstate handler already
-                // reads the ACTIVITY_TAB_PARAM and restores the mode).
-                navigateToPlayback(card.backlog_id);
+                // B1 (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611):
+                // Carry the event id in the URL (playback_event param) so that
+                // the Playback view can select the matching frame after load.
+                // F4: Use pushState so the browser Back button restores the
+                // Current tab card list (popstate handler reads ACTIVITY_TAB_PARAM).
+                const eventId = card.id != null ? String(card.id) : "";
+                navigateToPlayback(card.backlog_id, eventId);
                 setSelectedBugId(card.backlog_id);
                 setSelectedFrameId("");
+                // Store the event param so the async deep-link effect can resolve
+                // it once the trace finishes loading.
+                setSelectedEventParam(eventId);
                 setPlaying(false);
                 setMode("history");
               }
@@ -950,15 +986,18 @@ function writeActivityMode(mode: ActivityMode): void {
  * specific backlog row.  Uses pushState so the browser Back button restores the
  * Current tab (the popstate handler reads ACTIVITY_TAB_PARAM and PLAYBACK_BACKLOG_PARAM).
  *
+ * B1 (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611): optional eventId carries the
+ * clicked event through the deep-link so the playback view selects that frame after
+ * the trace loads.
+ *
  * F4 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611): card clicks must
  * push a new history entry, not replace, so Back returns to the Activity card list.
  */
-function navigateToPlayback(backlogId: string): void {
+function navigateToPlayback(backlogId: string, eventId?: string): void {
   if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  url.searchParams.set(PLAYBACK_BACKLOG_PARAM, backlogId);
-  url.searchParams.set(ACTIVITY_TAB_PARAM, "history");
-  window.history.pushState({ playback_backlog: backlogId, activity_tab: "history" }, "", `${url.pathname}${url.search}${url.hash}`);
+  const projectId = new URLSearchParams(window.location.search).get("project_id") || "";
+  const path = buildPlaybackUrl(projectId, backlogId, eventId ?? null);
+  window.history.pushState({ playback_backlog: backlogId, activity_tab: "history", playback_event: eventId ?? "" }, "", path);
 }
 
 function isOpenBug(bug: BacklogBug): boolean {

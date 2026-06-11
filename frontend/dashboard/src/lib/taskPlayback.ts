@@ -2105,3 +2105,105 @@ function frameFromEventPublic(event: TaskTimelineEvent, index: number): TaskPlay
 }
 
 // projectTaskTimelineEvent is already imported at the top of this module.
+
+// ---------------------------------------------------------------------------
+// Playback deep-link URL helpers (B1 / B2 — UE blockers AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611)
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical URL params used by the Playback deep-link contract.
+ *
+ * Canonical route (B2):
+ *   /dashboard?project_id=<pid>&view=activity&activity_tab=history
+ *             &playback_backlog=<backlog_id>[&playback_event=<event_id>]
+ *
+ * The old `view=playback` form is normalised to `view=activity` by App.tsx
+ * but does NOT preserve `playback_backlog` / `playback_event` / `activity_tab`.
+ * Always use the canonical form above when constructing shareable links.
+ */
+export const PLAYBACK_URL_PARAMS = {
+  /** view=activity (canonical; view=playback is a legacy alias) */
+  view: "view",
+  /** activity_tab=history to land on the Playback history tab */
+  activity_tab: "activity_tab",
+  /** playback_backlog=<backlog_id> */
+  playback_backlog: "playback_backlog",
+  /** playback_event=<event_id> — selects a specific frame by event id */
+  playback_event: "playback_event",
+} as const;
+
+/**
+ * Build the canonical deep-link URL for a playback row + optionally a specific
+ * event frame.  This is the contract URL referenced in B2 (smoke paths, docs,
+ * e2e script).
+ *
+ * @param projectId  - governance project id
+ * @param backlogId  - backlog row id (playback_backlog param)
+ * @param eventId    - optional event id to pre-select a frame (playback_event param)
+ * @param base       - base URL; defaults to window.location.href when in browser
+ */
+export function buildPlaybackUrl(
+  projectId: string,
+  backlogId: string,
+  eventId?: string | number | null,
+  base?: string,
+): string {
+  const href = base ?? (typeof window !== "undefined" ? window.location.href : "http://localhost/dashboard");
+  const url = new URL(href);
+  url.searchParams.set("project_id", projectId);
+  url.searchParams.set(PLAYBACK_URL_PARAMS.view, "activity");
+  url.searchParams.set(PLAYBACK_URL_PARAMS.activity_tab, "history");
+  url.searchParams.set(PLAYBACK_URL_PARAMS.playback_backlog, backlogId);
+  if (eventId != null && eventId !== "") {
+    url.searchParams.set(PLAYBACK_URL_PARAMS.playback_event, String(eventId));
+  } else {
+    url.searchParams.delete(PLAYBACK_URL_PARAMS.playback_event);
+  }
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+/**
+ * Read the playback_event URL param.  Returns "" when absent.
+ */
+export function readPlaybackEventParam(): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get(PLAYBACK_URL_PARAMS.playback_event)?.trim() || "";
+}
+
+/**
+ * Given a set of playback frames and a raw event-id param value (string/number
+ * coming from the URL), find the matching frame id.
+ *
+ * Matching strategy (order):
+ *  1. Exact frame.id match (includes both numeric "#101" and string ids).
+ *  2. source_event_id match (e.g. "#101" stored as display id).
+ *  3. Numeric id coercion: if param is a plain number string, also try "#N".
+ *
+ * Returns "" when no frame matches (caller falls back to default frame selection).
+ */
+export function findFrameIdByEventParam(
+  frames: TaskPlaybackFrame[],
+  eventParam: string,
+): string {
+  if (!eventParam || frames.length === 0) return "";
+  const param = eventParam.trim();
+  // 1. Exact frame.id match.
+  const byId = frames.find((f) => f.id === param);
+  if (byId) return byId.id;
+  // 2. source_event_id match.
+  const bySourceId = frames.find((f) => f.source_event_id === param);
+  if (bySourceId) return bySourceId.id;
+  // 3. Numeric: try both plain number and "#N" form.
+  if (/^\d+$/.test(param)) {
+    const hashForm = `#${param}`;
+    const byHash = frames.find((f) => f.id === hashForm || f.source_event_id === hashForm);
+    if (byHash) return byHash.id;
+  }
+  // 4. Hash-prefixed: try stripping "#" to get plain number.
+  if (param.startsWith("#")) {
+    const plain = param.slice(1);
+    const byPlain = frames.find((f) => f.id === plain || f.source_event_id === plain);
+    if (byPlain) return byPlain.id;
+  }
+  return "";
+}
