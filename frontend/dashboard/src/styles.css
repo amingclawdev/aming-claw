@@ -9629,6 +9629,27 @@ svg.graph-svg path.ghit:hover {
   outline-offset: -2px;
 }
 
+.activity-event-card--disabled {
+  background: var(--ink-50, #f8fafc);
+  border-color: var(--border, #e2e8f0);
+  box-shadow: none;
+  opacity: 0.72;
+}
+.activity-event-card--disabled:hover {
+  border-color: var(--border, #e2e8f0);
+  box-shadow: none;
+}
+.activity-event-card--disabled .activity-event-card-btn,
+.activity-event-card-btn:disabled {
+  cursor: not-allowed;
+}
+.activity-event-card--disabled .activity-event-card-kind,
+.activity-event-card--disabled .activity-event-card-headline,
+.activity-event-card--disabled .activity-event-card-actor,
+.activity-event-card--disabled .activity-event-card-evidence {
+  color: var(--ink-400, #94a3b8);
+}
+
 /* Card meta row: time, status chip, actor, backlog tag */
 .activity-event-card-meta {
   display: flex;
