@@ -2800,6 +2800,12 @@ function ueBlockerUrlAssertions(): string[] {
   assertFixture(url3.includes("playback_event=1234"), `buildPlaybackUrl must emit numeric event id as string (got: ${url3})`);
   results.push(`buildPlaybackUrl with numeric eventId OK: ${url3}`);
 
+  const staleEventBase = "http://localhost/dashboard?project_id=aming-claw&view=activity&activity_tab=history&playback_backlog=AC-SOME-BLOCKER-20260611&playback_event=4000";
+  const url3b = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", 3994, staleEventBase);
+  assertFixture(url3b.includes("playback_event=3994"), `buildPlaybackUrl must replace stale playback_event with clicked event id (got: ${url3b})`);
+  assertFixture(!url3b.includes("playback_event=4000"), `buildPlaybackUrl must not preserve stale playback_event after same-backlog ref jump (got: ${url3b})`);
+  results.push(`buildPlaybackUrl replaces stale same-backlog playback_event OK: ${url3b}`);
+
   // ── buildPlaybackUrl — null/empty event id must not emit param ───────────
   const url4 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", null, base);
   assertFixture(!url4.includes("playback_event"), `buildPlaybackUrl with null eventId must not emit playback_event (got: ${url4})`);

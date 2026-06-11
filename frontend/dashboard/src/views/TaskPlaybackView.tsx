@@ -609,6 +609,25 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedFrameId(activeTrace.frames[0]?.id || "");
   };
 
+  const navigateToPlaybackEvent = useCallback((backlogId: string, eventId?: string | number | null) => {
+    const targetBacklogId = backlogId.trim();
+    if (!targetBacklogId) return;
+    const nextEventId = eventId != null ? String(eventId) : "";
+    navigateToPlayback(targetBacklogId, nextEventId);
+    setSelectedBugId(targetBacklogId);
+    setMode("history");
+    setPlaying(false);
+    if (nextEventId) {
+      const warmFrames = playbackByBugRef.current[targetBacklogId]?.trace.frames ?? [];
+      const resolution = resolveSelectedFrameIdForEventParam(warmFrames, nextEventId, "");
+      setSelectedFrameId(resolution.matched ? resolution.frameId : "");
+      setSelectedEventParam(nextEventId);
+    } else {
+      setSelectedFrameId("");
+      setSelectedEventParam("");
+    }
+  }, [setSelectedEventParam]);
+
   const changeMode = (next: ActivityMode) => {
     setMode(next);
     writeActivityMode(next);
@@ -807,6 +826,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 setSelectedFrameId(frameId);
                 setPlaying(false);
               }}
+              onNavigateToPlayback={navigateToPlaybackEvent}
             />
           </div>
         </div>
