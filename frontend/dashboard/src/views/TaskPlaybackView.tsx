@@ -14,8 +14,8 @@ import {
   projectEventToCard,
   sliceEventPage,
   buildPlaybackUrl,
-  findFrameIdByEventParam,
   readPlaybackEventParam,
+  resolveSelectedFrameIdForEventParam,
   PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
   type ActivityEventCard,
@@ -542,24 +542,29 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       });
   }, [projectId, selectedLoadBugId]);
 
-  // B1: Async deep-link race guard.
-  // When the URL carries a playback_event param and the trace for the selected
-  // backlog has just finished loading, resolve the param to the matching frame
-  // id and select it, then clear the pending param so subsequent frame
-  // changes are user-driven.
+  useEffect(() => {
+    if (mode !== "activity") return;
+    setSelectedEventParam("");
+    clearPlaybackEventParam();
+  }, [mode]);
+
+  // B1: Async + warm-cache deep-link race guard.
+  // Whenever playback_event changes and frames are already available, resolve
+  // it immediately. This covers both cold loads and current-backlog warm clicks.
   useEffect(() => {
     if (!selectedEventParam) return;
     const state = selectedBugId ? playbackByBug[selectedBugId] : undefined;
-    if (!state?.loaded || state.loading) return; // wait for load
-    const resolvedFrameId = findFrameIdByEventParam(state.trace.frames, selectedEventParam);
-    if (resolvedFrameId) {
-      setSelectedFrameId(resolvedFrameId);
+    const frames = state?.trace.frames ?? [];
+    if (frames.length === 0 || state?.loading) return;
+    const resolution = resolveSelectedFrameIdForEventParam(frames, selectedEventParam, selectedFrameId);
+    if (resolution.matched) {
+      setSelectedFrameId(resolution.frameId);
       setPlaying(false);
     }
-    // Clear the pending param regardless of whether we found a match so we
-    // don't re-run this on every subsequent trace update.
+    // Clear the pending state regardless of whether we found a match so later
+    // event-card clicks for the same warm trace can re-resolve a new param.
     setSelectedEventParam("");
-  }, [selectedEventParam, selectedBugId, playbackByBug]);
+  }, [selectedEventParam, selectedBugId, selectedFrameId, playbackByBug]);
 
   useEffect(() => {
     if (!playing || activeTrace.frames.length <= 1) return undefined;
@@ -686,9 +691,12 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 const eventId = card.id != null ? String(card.id) : "";
                 navigateToPlayback(card.backlog_id, eventId);
                 setSelectedBugId(card.backlog_id);
-                setSelectedFrameId("");
+                const warmFrames = playbackByBugRef.current[card.backlog_id]?.trace.frames ?? [];
+                const resolution = resolveSelectedFrameIdForEventParam(warmFrames, eventId, "");
+                setSelectedFrameId(resolution.matched ? resolution.frameId : "");
                 // Store the event param so the async deep-link effect can resolve
-                // it once the trace finishes loading.
+                // it once the trace finishes loading, or re-resolve a warm trace
+                // if the clicked backlog is already open.
                 setSelectedEventParam(eventId);
                 setPlaying(false);
                 setMode("history");
@@ -971,6 +979,7 @@ function writeSelectedBacklogId(backlogId: string): void {
   if (typeof window === "undefined") return;
   const url = new URL(window.location.href);
   url.searchParams.set(PLAYBACK_BACKLOG_PARAM, backlogId);
+  url.searchParams.delete(PLAYBACK_URL_PARAMS.playback_event);
   window.history.replaceState({ playback_backlog: backlogId }, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
@@ -978,7 +987,16 @@ function writeActivityMode(mode: ActivityMode): void {
   if (typeof window === "undefined") return;
   const url = new URL(window.location.href);
   url.searchParams.set(ACTIVITY_TAB_PARAM, mode);
+  if (mode === "activity") url.searchParams.delete(PLAYBACK_URL_PARAMS.playback_event);
   window.history.replaceState({ activity_tab: mode }, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function clearPlaybackEventParam(): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has(PLAYBACK_URL_PARAMS.playback_event)) return;
+  url.searchParams.delete(PLAYBACK_URL_PARAMS.playback_event);
+  window.history.replaceState({ activity_tab: "activity" }, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
 /**
@@ -1104,16 +1122,19 @@ function ActivityEventCardList({
           const at = card.at
             ? new Date(card.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })
             : "";
+          const canOpenPlayback = Boolean(card.backlog_id);
           return (
             <li
               key={card.id}
-              className={`activity-event-card activity-event-card--${statusCls}${showNewAnimation ? " activity-event-card--new" : ""}`}
+              className={`activity-event-card activity-event-card--${statusCls}${showNewAnimation ? " activity-event-card--new" : ""}${canOpenPlayback ? "" : " activity-event-card--disabled"}`}
             >
               <button
                 type="button"
                 className="activity-event-card-btn"
                 onClick={() => onCardClick(card)}
-                title={card.backlog_id ? `Open playback history for ${card.backlog_id}` : card.headline}
+                disabled={!canOpenPlayback}
+                aria-label={canOpenPlayback ? `Open playback history for ${card.backlog_id}` : `Playback unavailable for ${card.event_kind}`}
+                title={canOpenPlayback ? `Open playback history for ${card.backlog_id}` : "Playback unavailable: event has no backlog_id"}
               >
                 <div className="activity-event-card-meta">
                   <span className="activity-event-card-time mono">{at}</span>
