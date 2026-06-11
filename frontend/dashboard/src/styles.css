@@ -9373,3 +9373,43 @@ svg.graph-svg path.ghit:hover {
 
 /* IDs/hashes in the detail pane remain selectable (user-select: text is the browser default).
  * No additional CSS needed; they are already in <span class="mono"> which inherits normally. */
+
+/* ── Status-word inline emphasis chips ──────────────────────────────────────
+ * Small inline chips that highlight governance status words (passed/blocked/
+ * failed/running etc.) within detail-pane text. They stay inline with text
+ * height and do not cause layout shift. Colors reuse the existing palette
+ * variables; the same variables are used for dark-mode handling elsewhere. */
+.status-word-chip {
+  display: inline;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: inherit;
+  line-height: inherit;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.status-word-chip--positive {
+  background: var(--green-bg, #dcfce7);
+  color: var(--green-fg, #166534);
+}
+
+.status-word-chip--negative {
+  background: var(--red-bg, #fee2e2);
+  color: var(--red-fg, #991b1b);
+}
+
+.status-word-chip--neutral {
+  background: var(--blue-bg, #dbeafe);
+  color: var(--blue-fg, #1e40af);
+}
+
+/* ── Reference-object tint ──────────────────────────────────────────────────
+ * Light background tint for mono-rendered governance IDs (event ids, AC- ids,
+ * task-/rtok-/fence-/mq-/mfrctx- prefixed strings) in the detail pane.
+ * Combines with .mono for the full "code token" visual treatment. */
+.ref-tint {
+  background: var(--ink-100, #e2e8f0);
+  border-radius: 3px;
+  padding: 0 3px;
+}

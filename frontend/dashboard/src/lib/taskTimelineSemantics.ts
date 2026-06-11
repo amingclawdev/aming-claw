@@ -789,3 +789,59 @@ function stableRows(rows: TaskTimelineEvidenceInspectorRow[]): TaskTimelineEvide
     return true;
   }).slice(0, 36);
 }
+
+// ── Semantic status-word emphasis ────────────────────────────────────────────
+
+export type StatusWordClass = "positive" | "negative" | "neutral";
+
+/**
+ * Classify a single word for inline chip rendering.
+ *
+ * Returns a chip class when the word (case-insensitive, whole-word) belongs to
+ * the governance status vocabulary, or null for everything else (no false chips).
+ *
+ * Whole-word contract: callers must split on word boundaries before calling
+ * this function. "passed" inside "surpassed" must NOT be classified.
+ */
+export function classifyStatusWord(word: string): StatusWordClass | null {
+  if (!word) return null;
+  if (/^(passed|accepted|ok|validated|close_satisfying|succeeded)$/i.test(word)) return "positive";
+  if (/^(blocked|failed|refused|rejected|denied)$/i.test(word)) return "negative";
+  if (/^(allowed|requested|pending|running)$/i.test(word)) return "neutral";
+  return null;
+}
+
+export interface TextSegment {
+  text: string;
+  chipClass: StatusWordClass | null;
+}
+
+/**
+ * Split a plain-text string into segments for inline chip rendering.
+ *
+ * Non-word runs (spaces, punctuation) are emitted as plain segments (chipClass
+ * null). Word tokens are classified via classifyStatusWord; if classified they
+ * get the matching chip class, otherwise they are plain.
+ *
+ * Empty string → [].
+ */
+export function segmentTextWithStatusChips(text: string): TextSegment[] {
+  if (!text) return [];
+  // Split on word-boundary transitions: capture both word tokens and non-word runs.
+  const tokens = text.split(/(\b\w+\b)/);
+  const segments: TextSegment[] = [];
+  for (const token of tokens) {
+    if (!token) continue;
+    // A token is a "word" if it matches \w+ exactly (captured group).
+    const isWord = /^\w+$/.test(token);
+    const chipClass = isWord ? classifyStatusWord(token) : null;
+    const last = segments[segments.length - 1];
+    if (chipClass === null && last && last.chipClass === null) {
+      // Merge consecutive plain segments for compact output.
+      last.text += token;
+    } else {
+      segments.push({ text: token, chipClass });
+    }
+  }
+  return segments;
+}
