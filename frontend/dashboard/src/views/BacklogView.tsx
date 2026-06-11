@@ -5,8 +5,10 @@ import {
   projectGateMatrix,
   sanitizePublicTimelineText,
   sanitizeTimelineInspectorValue,
+  semanticLaneLabel,
 } from "../lib/taskTimelineSemantics";
-import type { GateMatrixRow, GateMatrixProjection } from "../lib/taskTimelineSemantics";
+import type { GateMatrixRow, GateMatrixProjection, TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
+import { ReferencesAndEvidenceSection } from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
   BacklogResponse,
@@ -484,8 +486,6 @@ export default function BacklogView({ backlog, projectId }: Props) {
                     key={bug.bug_id}
                     bug={bug}
                     projectId={projectId}
-                    timeline={timelineByBug[bug.bug_id]}
-                    onLoadTimeline={() => loadTimeline(bug.bug_id, false)}
                     onOpenDetail={() => openDetail(bug.bug_id)}
                   />
                 ))}
@@ -515,14 +515,10 @@ export default function BacklogView({ backlog, projectId }: Props) {
 function BacklogRow({
   bug,
   projectId,
-  timeline,
-  onLoadTimeline,
   onOpenDetail,
 }: {
   bug: BacklogBug;
   projectId: string;
-  timeline?: TimelineState;
-  onLoadTimeline: () => void;
   onOpenDetail: () => void;
 }) {
   const files = listFrom(bug.target_files);
@@ -564,12 +560,6 @@ function BacklogRow({
           <a className="backlog-detail-link" href={playbackDetailHref(projectId, bug.bug_id)} aria-label={`Open playback for ${bug.bug_id}`}>
             Open playback
           </a>
-          <button type="button" className="timeline-toggle off" onClick={onLoadTimeline}>
-            {timeline?.loading ? "Loading status" : timeline?.loaded && !timeline.error ? "Timeline status" : "Check timeline"}
-            {timeline?.loaded && !timeline.error ? (
-              <span className="timeline-toggle-count">{timeline.count ?? timeline.events.length}</span>
-            ) : null}
-          </button>
           {bug.details_md ? <div className="backlog-details">{truncate(bug.details_md, 220)}</div> : null}
           {criteria.length > 0 ? (
             <div className="backlog-criteria">
@@ -1015,6 +1005,16 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
           </div>
           <ArtifactPills summary={artifacts} />
           {routeEvidenceCards.length > 0 ? <RouteEvidenceCards cards={routeEvidenceCards} /> : null}
+          {(semantic?.relations ?? []).length > 0 ? (
+            <ReferencesAndEvidenceSection
+              relations={(semantic?.relations ?? []) as TaskTimelineSemanticRelation[]}
+              links={[]}
+              frames={[]}
+              onJump={() => undefined}
+              onInspect={() => undefined}
+              frameId=""
+            />
+          ) : null}
           <details className="backlog-inspector-raw">
             <summary>Inspect public timeline details</summary>
             <div className="backlog-inspector-json">
@@ -2448,7 +2448,10 @@ function timelineLaneDisplayLabel(id: string, context: TimelineLaneContext): str
   for (const alias of context.workerAliases.values()) {
     if (id === `worker_${cssToken(alias)}`) return `Subagents / Workers · ${alias}`;
   }
-  return id.startsWith("worker_") ? `Subagents / Workers · ${titleizeLane(id.replace(/^worker_/, ""))}` : titleizeLane(id);
+  if (id.startsWith("worker_")) return `Subagents / Workers · ${titleizeLane(id.replace(/^worker_/, ""))}`;
+  const semantic = semanticLaneLabel(id);
+  if (semantic) return semantic;
+  return titleizeLane(id);
 }
 
 function rawWorkerKeyForEvent(event: TaskTimelineEvent): string {

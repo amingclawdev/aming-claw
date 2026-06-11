@@ -606,7 +606,7 @@ const CATEGORY_ORDER: ReferenceCategory[] = [
  * - Evidence refs grouped by category; evidence items open the inspector modal.
  * - "Copy event refs" button sits top-right of the section header.
  */
-function ReferencesAndEvidenceSection({
+export function ReferencesAndEvidenceSection({
   relations,
   links,
   frames,
