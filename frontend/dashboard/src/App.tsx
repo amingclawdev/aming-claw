@@ -44,6 +44,11 @@ import ProjectInboxView from "./views/ProjectInboxView";
 
 export type ViewName = "projects" | "inbox" | "overview" | "graph" | "operations" | "review" | "assets" | "backlog" | "activity";
 
+// Build stamp injected by vite.config.ts at build time.
+// "dev" in Vite serve mode → banner is always disabled in development.
+const DASHBOARD_BUILD_STAMP: string =
+  typeof __DASHBOARD_BUILD__ !== "undefined" ? __DASHBOARD_BUILD__ : "dev";
+
 const DASHBOARD_PROJECT_STORAGE_KEY = "aming-claw.dashboard.projectId";
 const DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY = "aming-claw.dashboard.sidebarCollapsed";
 const DASHBOARD_PROJECT_ID_PARAM = "project_id";
@@ -288,6 +293,35 @@ export default function App() {
   >({});
   const [assetImpactBusyId, setAssetImpactBusyId] = useState<string | null>(null);
   const [assetImpactError, setAssetImpactError] = useState<string | null>(null);
+
+  // Version-mismatch banner: compare build stamp with running server version.
+  // We require the mismatch to persist across 2 consecutive health observations
+  // to avoid flicker during mid-deploy races. "dev" stamp disables the banner.
+  const versionMismatchCountRef = useRef(0);
+  const [versionMismatchSeen, setVersionMismatchSeen] = useState(false);
+
+  // Track consecutive version mismatches to debounce mid-deploy races.
+  useEffect(() => {
+    const serverVersion = data?.health?.version;
+    if (
+      DASHBOARD_BUILD_STAMP === "dev" ||
+      !serverVersion ||
+      serverVersion === "unknown"
+    ) {
+      // Dev mode or no health data: reset count, never show banner.
+      versionMismatchCountRef.current = 0;
+      return;
+    }
+    const mismatch = !serverVersion.startsWith(DASHBOARD_BUILD_STAMP) &&
+      !DASHBOARD_BUILD_STAMP.startsWith(serverVersion);
+    if (mismatch) {
+      versionMismatchCountRef.current += 1;
+      if (versionMismatchCountRef.current >= 2) setVersionMismatchSeen(true);
+    } else {
+      versionMismatchCountRef.current = 0;
+      setVersionMismatchSeen(false);
+    }
+  }, [data?.health?.version]);
 
   useEffect(() => {
     multiSelectIdsRef.current = multiSelectIds;
@@ -1439,6 +1473,22 @@ export default function App() {
           handleQueueReconcile();
         }}
       />
+      {versionMismatchSeen ? (
+        <div className="version-mismatch-banner" role="status" aria-live="polite">
+          <span>
+            Dashboard updated (<span className="mono">{DASHBOARD_BUILD_STAMP}</span>
+            {" → "}
+            <span className="mono">{data?.health?.version ?? "?"}</span>)
+          </span>
+          <button
+            type="button"
+            className="version-mismatch-reload"
+            onClick={() => window.location.reload()}
+          >
+            Reload
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
