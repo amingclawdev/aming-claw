@@ -35,6 +35,7 @@ interface Props {
   loading?: boolean;
   error?: string;
   onSelectFrame?: (frameId: string) => void;
+  onNavigateToPlayback?: (backlogId: string, eventId?: string | number | null) => void;
   compact?: boolean;
   /** When true, the event list renders newest event at the top (Current tab). */
   newestFirst?: boolean;
@@ -46,6 +47,7 @@ export default function TaskPlaybackPanel({
   loading = false,
   error = "",
   onSelectFrame,
+  onNavigateToPlayback,
   compact = false,
   newestFirst = false,
 }: Props) {
@@ -358,6 +360,7 @@ export default function TaskPlaybackPanel({
                 frames={allFrames}
                 projectId={trace.project_id}
                 currentBacklogId={trace.backlog_id}
+                onNavigateToPlayback={onNavigateToPlayback}
                 onJump={(frameId) => selectFrame(frameId, { fromFrameId: selectedFrame.id, fromLabel: selectedFrame.title }, true)}
                 onInspect={setSelectedEvidenceRef}
                 frameId={selectedFrame.id}
@@ -657,11 +660,12 @@ export function ReferencesAndEvidenceSection({
   const handleRelationClick = (rel: TaskTimelineSemanticRelation) => {
     if (rel.kind === "event_ref") {
       const targetFrameId = findFrameIdByEventParam(frames, rel.value);
+      const targetBacklogId = rel.backlog_id?.trim() || fallbackBacklogId;
       if (targetFrameId) {
+        if (targetBacklogId) navigateToPlayback(targetBacklogId, rel.value);
         onJump?.(targetFrameId);
         return;
       }
-      const targetBacklogId = rel.backlog_id?.trim() || fallbackBacklogId;
       if (targetBacklogId) navigateToPlayback(targetBacklogId, rel.value);
       return;
     }
@@ -685,6 +689,7 @@ export function ReferencesAndEvidenceSection({
     if (action === "event") {
       const targetFrameId = findFrameIdByEventParam(frames, ref.value);
       if (targetFrameId) {
+        if (fallbackBacklogId) navigateToPlayback(fallbackBacklogId, ref.value);
         onJump?.(targetFrameId);
         return;
       }
