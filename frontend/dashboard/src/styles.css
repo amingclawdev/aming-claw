@@ -3183,10 +3183,11 @@ a:hover { text-decoration: underline; }
   gap: 12px;
   align-items: stretch;
   /* Bound the layout to the viewport so each column scrolls independently.
-     160px accounts for the app header, view padding, and the Activity view
-     header/tabs above the layout. Adjust via --playback-layout-offset if the
-     header height changes. */
-  --playback-layout-offset: 160px;
+     196px accounts for the full header stack above the layout:
+       .header ~50px + .view padding-top 18px + .view-header ~65px
+       + gaps 28px + .task-playback-segmented 30px + margin ~5px.
+     Adjust via --playback-layout-offset if the header stack height changes. */
+  --playback-layout-offset: 196px;
   height: calc(100vh - var(--playback-layout-offset));
   min-height: 380px;
   overflow: hidden;
