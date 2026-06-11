@@ -46,6 +46,9 @@ export default function TaskPlaybackPanel({
   // Navigation stack: records the sequence of frame visits so Back works across cross-refs.
   const [navStack, setNavStack] = useState<NavStackEntry[]>([]);
 
+  // Ref for the currently-selected frame list item so we can scroll it into view.
+  const selectedFrameItemRef = useRef<HTMLLIElement | null>(null);
+
   // Follow-latest state: tracks whether the user has manually navigated away from
   // the newest event so we can show a "N new events — jump to latest" affordance.
   const [followMode, setFollowMode] = useState(true);
@@ -160,6 +163,15 @@ export default function TaskPlaybackPanel({
     // Do NOT clear navStack here — the user may have just navigated via a relation link
     // and we want Back to work from the new frame.
   }, [selectedFrameKey]);
+
+  // F1 (AC2): scroll the selected frame item into view inside the bounded scroll column
+  // whenever the effective selection changes. Uses block:'nearest' so the item only
+  // scrolls when it is outside the visible area (no jarring jumps when already visible).
+  // Covers: manual select, follow-latest auto-select, jump-to-latest, relation-nav back.
+  useEffect(() => {
+    if (!effectiveSelectedFrameId) return;
+    selectedFrameItemRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [effectiveSelectedFrameId]);
 
   useEffect(() => {
     if (!selectedEvidenceRef) return undefined;
@@ -276,7 +288,7 @@ export default function TaskPlaybackPanel({
                     <span className="mono">{group.day}</span>
                   </li>
                   {group.frames.map((frame) => (
-                    <li key={frame.id}>
+                    <li key={frame.id} ref={frame.id === selectedFrame?.id ? selectedFrameItemRef : null}>
                       <button
                         type="button"
                         className={frame.id === selectedFrame?.id ? "active" : ""}
