@@ -15,6 +15,7 @@ from agent.governance.contract_template_registry import (
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
     validate_route_token_mutation_gate,
+    verify_content_hash,
 )
 from agent.governance.service_registry import (
     ServiceDescriptor,
@@ -554,30 +555,49 @@ def _route_prompt_identity(result: Mapping[str, Any]) -> dict[str, Any]:
     route_context_gate = _mapping(result.get("route_context_gate"))
     prompt_contract = _mapping(bundle.get("prompt_contract"))
     visible_manifest = _mapping(bundle.get("visible_injection_manifest"))
+
+    raw_route_context_hash = _string(
+        result.get("route_context_hash")
+        or bundle.get("route_context_hash")
+        or hashes.get("route_context_hash")
+        or action_gate.get("route_context_hash")
+        or route_context_gate.get("route_context_hash")
+    )
+    raw_prompt_contract_hash = _string(
+        result.get("prompt_contract_hash")
+        or bundle.get("prompt_contract_hash")
+        or hashes.get("prompt_contract_hash")
+        or action_gate.get("prompt_contract_hash")
+        or route_context_gate.get("prompt_contract_hash")
+    )
+
+    # Apply format-floor verification on accepted hash strings.
+    # Object absent here (we only have the string) → format floor only.
+    # Ill-formed strings are discarded rather than propagated.
+    def _accept_hash(claimed: str, field: str) -> str:
+        if not claimed:
+            return ""
+        rv = verify_content_hash(claimed, None, field_name=field)
+        return claimed if rv["ok"] else ""
+
     identity = {
-        "route_context_hash": _string(
-            result.get("route_context_hash")
-            or bundle.get("route_context_hash")
-            or hashes.get("route_context_hash")
-            or action_gate.get("route_context_hash")
-            or route_context_gate.get("route_context_hash")
-        ),
+        "route_context_hash": _accept_hash(raw_route_context_hash, "route_context_hash"),
         "prompt_contract_id": _string(
             result.get("prompt_contract_id")
             or prompt_contract.get("prompt_contract_id")
             or action_gate.get("prompt_contract_id")
             or route_context_gate.get("prompt_contract_id")
         ),
-        "prompt_contract_hash": _string(
-            result.get("prompt_contract_hash")
-            or bundle.get("prompt_contract_hash")
-            or hashes.get("prompt_contract_hash")
-            or action_gate.get("prompt_contract_hash")
-            or route_context_gate.get("prompt_contract_hash")
-        ),
+        "prompt_contract_hash": _accept_hash(raw_prompt_contract_hash, "prompt_contract_hash"),
     }
     if visible_manifest:
-        identity["visible_injection_manifest_hash"] = _sha256_json(visible_manifest)
+        # The manifest object is present; compute the canonical hash.
+        computed = _sha256_json(visible_manifest)
+        # Verify the computed hash meets the format floor (always true for
+        # _sha256_json output, but run through verifier for consistency).
+        rv = verify_content_hash(computed, visible_manifest, field_name="visible_injection_manifest_hash")
+        if rv["ok"]:
+            identity["visible_injection_manifest_hash"] = computed
     return {
         key: value
         for key, value in identity.items()
