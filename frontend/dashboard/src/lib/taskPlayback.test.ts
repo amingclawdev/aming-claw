@@ -2433,7 +2433,9 @@ export const taskPlaybackIaEventCardsReferencesSummary: string[] = [
   ...taskPlaybackTruncateHashAssertions(),
   ...taskPlaybackCategorizeEvidenceRefAssertions(),
   ...taskPlaybackSliceEventPageAssertions(),
+];
 
+// ---------------------------------------------------------------------------
 // AC-CONTRACT-GATE-VERIFICATION-MATRIX-20260610 — AC5
 // projectGateMatrix four-quadrant coverage
 // Quadrants:
