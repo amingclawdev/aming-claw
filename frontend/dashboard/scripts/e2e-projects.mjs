@@ -879,14 +879,21 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("ActivityStreamSummary"), "Current activity should summarize worker, QA, close-gate, latest event, next evidence, and blocker state");
   assert(playbackViewSource.includes('"no current activity"'), "Current activity should expose a clear empty state when no backlog row is active");
   assert(playbackViewSource.includes("setSelectedActivityFrameId(\"\")"), "Activity view should reset stale selected playback frames on project switch");
-  assert(viewSource.includes("activityHref") && viewSource.includes("playbackDetailHref"), "Backlog rows should build Activity and playback deep links");
-  assert(viewSource.includes("Open activity") && viewSource.includes("Open playback"), "Backlog rows should expose Activity and playback deep links");
-  assert(viewSource.includes("Timeline status") && viewSource.includes("Check timeline") && viewSource.includes("timeline-toggle-count"), "Backlog rows should expose compact timeline status instead of full current events");
+  // AC-BACKLOG-DETAIL-SEMANTIC-REUSE-20260610 (merge 561f2ac): operator AC-1 removed Open activity;
+  // rows now have Open detail (button) + Open playback (link); href fn is playbackHref not activityHref;
+  // playbackDetailHref targets activity_tab=activity (live) per backlog-reuse contract.
+  assert(viewSource.includes("playbackHref") && viewSource.includes("playbackDetailHref"), "Backlog rows should build Activity and playback deep links");
+  assert(viewSource.includes("Open playback") && !viewSource.includes("Open activity"), "Backlog rows expose Open playback deep link; Open activity was removed by operator AC-1");
+  // Inline timeline-toggle (Timeline status/Check timeline/timeline-toggle-count) was replaced by BacklogDetailModal;
+  // compact timeline is now deferred to the modal via loadTimeline + BacklogDetailModal with Timeline DAG.
+  assert(viewSource.includes("BacklogDetailModal") && viewSource.includes("loadTimeline"), "Backlog rows expose compact timeline through the detail modal (inline toggle replaced by BacklogDetailModal)");
   assert(!viewSource.includes("CurrentTaskTimelinePanel"), "Backlog view should not render a full current task timeline panel");
   assert(!viewSource.includes("currentTaskHintFor"), "Backlog view should not own the current-task hint fetch");
   assert(!viewSource.includes("useEventStream(projectId"), "Backlog view should not own live current-task SSE refresh");
   assert(!viewSource.includes("refreshCurrentTaskTimeline"), "Backlog view should not carry the full current event refresh loop");
-  assert(!viewSource.includes("TaskPlaybackPanel"), "Backlog view should not render the full task playback panel inline");
+  // BacklogView imports named sub-components (ReferencesAndEvidenceSection, EventSemanticDetail) from
+  // TaskPlaybackPanel but must not render the full <TaskPlaybackPanel> component inline.
+  assert(!viewSource.includes("<TaskPlaybackPanel"), "Backlog view should not render the full task playback panel inline");
   assert(
     playbackViewSource.includes("const activityBug = selectedBug ?? localOverrideBug ?? hintedCurrentBug")
       && !playbackViewSource.includes("const activityBug = hintedCurrentBug"),
