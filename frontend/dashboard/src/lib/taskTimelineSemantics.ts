@@ -424,35 +424,66 @@ function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[
   const eventRefPaths: Array<[string, string]> = [
     ["read_receipt_event_id", "read receipt"],
     ["startup_event_id", "worker startup"],
+    ["startup_timeline_event_id", "startup timeline event"],
+    ["continuation_startup_event_id", "continuation startup event"],
     ["source_event_id", "source event"],
     ["parent_event_id", "parent event"],
     ["dispatch_event_id", "dispatch event"],
+    ["dispatch_ref", "dispatch ref"],
     ["precheck_id", "route precheck"],
     ["route_action_precheck_id", "route action precheck"],
+    ["reversal_of_event", "reversal of event"],
   ];
   for (const [field, label] of eventRefPaths) {
     const v = payload[field] ?? verification[field] ?? artifactRefs[field];
-    if (v != null) pushRel("event_ref", label, v, `Referenced ${label}`);
+    if (v != null) pushRel("event_ref", label, normalizeEventId(v), `Referenced ${label}`);
   }
 
   // Multi-value event id arrays
-  for (const [field, label] of [["read_receipt_event_ids", "read receipt"], ["source_event_ids", "source event"], ["startup_event_ids", "worker startup"]] as Array<[string, string]>) {
-    const arr = payload[field] ?? verification[field];
+  for (const [field, label] of [["read_receipt_event_ids", "read receipt"], ["source_event_ids", "source event"], ["startup_event_ids", "worker startup"], ["worker_progress_refs", "worker progress"], ["qa_refs", "QA ref"]] as Array<[string, string]>) {
+    const arr = payload[field] ?? verification[field] ?? artifactRefs[field];
     if (Array.isArray(arr)) {
-      for (const item of arr.slice(0, 6)) pushRel("event_ref", label, item, `Referenced ${label}`);
+      for (const item of arr.slice(0, 6)) pushRel("event_ref", label, normalizeEventId(item), `Referenced ${label}`);
     }
   }
 
   // --- QA/verification lane references ---
-  const qaVerdictRefs = payload.qa_verdict_refs ?? payload.qa_evidence_refs ?? verification.qa_verdict_refs;
+  const qaVerdictRefs = payload.qa_verdict_refs ?? payload.qa_evidence_refs ?? verification.qa_verdict_refs ?? artifactRefs.qa_verdict_refs;
   if (Array.isArray(qaVerdictRefs)) {
-    for (const item of qaVerdictRefs.slice(0, 6)) pushRel("event_ref", "QA verdict", item, "Referenced QA verdict event");
+    for (const item of qaVerdictRefs.slice(0, 6)) pushRel("event_ref", "QA verdict", normalizeEventId(item), "Referenced QA verdict event");
   }
 
   // Lane evidence references
   const laneEvidenceRefs = payload.lane_evidence_refs ?? payload.route_lane_refs ?? verification.lane_evidence_refs;
   if (Array.isArray(laneEvidenceRefs)) {
-    for (const item of laneEvidenceRefs.slice(0, 6)) pushRel("event_ref", "lane evidence", item, "Referenced lane evidence event");
+    for (const item of laneEvidenceRefs.slice(0, 6)) pushRel("event_ref", "lane evidence", normalizeEventId(item), "Referenced lane evidence event");
+  }
+
+  // --- checkpoint_id: string fact entry (not clickable, kind="fact") ---
+  const checkpointId = payload.checkpoint_id ?? verification.checkpoint_id ?? artifactRefs.checkpoint_id;
+  if (checkpointId != null) {
+    const v = stringFrom(checkpointId);
+    if (v) {
+      const safe = sanitizePublicTimelineText(v);
+      if (safe && safe !== "[private detail redacted]") {
+        relations.push({ kind: "event_ref", label: "checkpoint", value: safe, summary: "Checkpoint id for this branch task" });
+      }
+    }
+  }
+
+  // --- bridged_identities[].task_id from cross_ref_lineage_bridge ---
+  const bridgedIdentities = payload.bridged_identities ?? verification.bridged_identities ?? artifactRefs.bridged_identities;
+  if (Array.isArray(bridgedIdentities)) {
+    for (const identity of bridgedIdentities.slice(0, 8)) {
+      const rec = asRecord(identity);
+      const taskIdVal = stringFrom(rec.task_id);
+      if (taskIdVal) {
+        const safe = sanitizePublicTimelineText(taskIdVal);
+        if (safe && safe !== "[private detail redacted]") {
+          relations.push({ kind: "backlog_row", label: "bridged task", value: safe, summary: "Task id from cross-ref lineage bridge" });
+        }
+      }
+    }
   }
 
   // De-duplicate by kind+value
@@ -665,6 +696,13 @@ function stringFrom(value: unknown): string {
   if (typeof value === "string") return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
+}
+
+/** Normalize int or numeric-string event ids to string form. */
+function normalizeEventId(value: unknown): string {
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return value.trim();
+  return stringFrom(value);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
