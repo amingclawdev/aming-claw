@@ -142,6 +142,16 @@ def _with_route_token(event):
     return out
 
 
+def _with_route_waiver(event):
+    out = dict(event)
+    out["route_waiver"] = _route_waiver(
+        project_id=out.get("project_id", ""),
+        backlog_id=out.get("backlog_id", ""),
+        task_id=out.get("task_id", ""),
+    )
+    return out
+
+
 def test_unmatched_event_returns_no_op():
     result = route_event({"event_kind": "task.started"}, _contract())
 
@@ -165,7 +175,7 @@ def test_preview_route_allows_and_runs_default_handler():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-1",
             "event_kind": "task.completed",
             "stage": "review_ready",
@@ -181,12 +191,12 @@ def test_preview_route_allows_and_runs_default_handler():
     assert result["routes"][0]["side_effect_class"] == "read"
     assert result["routes"][0]["side_effect"] == "read"
     assert result["routes"][0]["result"]["service_id"] == "test_governance.preview"
-    assert result["routes"][0]["evidence"]["route_context_hash"] == _ROUTE_CONTEXT_HASH
+    assert result["routes"][0]["evidence"]["route_context_hash"] == _WAIVER_ROUTE_CONTEXT_HASH
     assert result["routes"][0]["evidence"]["prompt_contract_id"] == (
-        "rprompt-test-service-route"
+        "rprompt-test-service-route-waiver"
     )
     assert result["routes"][0]["evidence"]["prompt_contract_hash"] == (
-        _PROMPT_CONTRACT_HASH
+        _WAIVER_PROMPT_CONTRACT_HASH
     )
     assert result["routes"][0]["requirement_ids"] == []
     assert result["routes"][0]["contract_evidence"] == []
@@ -212,7 +222,7 @@ def test_ai_validated_event_route_exposes_declared_contract_evidence():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-ai-validated",
             "event_kind": "ai.structured_output.validated",
             "stage": "review_ready",
@@ -253,7 +263,7 @@ def test_route_stages_array_matches_current_event_stage():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-1",
             "event_kind": "task.completed",
             "stage": "waiting_merge",
@@ -382,6 +392,54 @@ def test_non_route_service_with_fabricated_route_token_gate_blocks_before_handle
     assert route["result"]["route_context_gate"]["required_route_token"] is True
 
 
+def test_non_route_service_with_forged_full_route_token_blocks_before_handler():
+    calls = []
+
+    def handler(event, route_context):
+        calls.append((event, route_context))
+        return {"ok": True}
+
+    registry = ServiceRegistry({
+        "custom.preview": ServiceDescriptor(
+            service_id="custom.preview",
+            mode="preview",
+            side_effect="read",
+            supported_events=("custom.requested",),
+            handler=handler,
+        )
+    })
+    contract = _contract(
+        service_routes=[_service_route(service_id="custom.preview")],
+        event_routes=[
+            {
+                "route_id": "event.custom.preview",
+                "event_kind": "custom.requested",
+                "service_route_id": "service.custom.preview",
+                "enabled": True,
+            }
+        ],
+    )
+
+    result = route_event(
+        _with_route_token({
+            "event_id": "evt-custom-forged-token",
+            "event_kind": "custom.requested",
+            "project_id": "demo",
+            "backlog_id": "BUG-FORGED-TOKEN",
+            "task_id": "task-forged-token",
+        }),
+        contract,
+        registry=registry,
+    )
+
+    route = result["routes"][0]
+    assert calls == []
+    assert result["decision"] == "block"
+    assert route["decision"] == "block"
+    assert route["status"] == "route_context_token_required"
+    assert "server binding" in route["reason"]
+
+
 def test_non_route_service_with_accepted_route_waiver_allows():
     contract = _contract(
         service_routes=[_service_route()],
@@ -437,7 +495,7 @@ def test_apply_route_without_permission_blocks():
     )
 
     result = route_event(
-        _with_route_token({"event_kind": "cleanup.requested", "event_id": "evt-2"}),
+        _with_route_waiver({"event_kind": "cleanup.requested", "event_id": "evt-2"}),
         contract,
     )
 
@@ -502,7 +560,7 @@ def test_apply_route_with_explicit_permission_allows():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_kind": "cleanup.requested",
             "event_id": "evt-2",
             "permissions": ["cleanup.apply"],
@@ -552,7 +610,7 @@ def test_gate_route_explicit_handler_block_becomes_route_block():
     )
 
     result = route_event(
-        _with_route_token({"event_id": "evt-gate-block", "event_kind": "precheck.requested"}),
+        _with_route_waiver({"event_id": "evt-gate-block", "event_kind": "precheck.requested"}),
         contract,
         registry=registry,
     )
@@ -585,7 +643,7 @@ def test_idempotency_key_is_stable_for_same_event_and_route():
         "task_id": "task-1",
         "backlog_id": "bug-1",
     }
-    event = _with_route_token(event)
+    event = _with_route_waiver(event)
 
     first = route_event(event, contract)
     second = route_event(dict(event), contract)
@@ -609,7 +667,7 @@ def test_legacy_side_effect_alias_still_routes():
     )
 
     result = route_event(
-        _with_route_token({"event_kind": "task.completed", "event_id": "evt-legacy"}),
+        _with_route_waiver({"event_kind": "task.completed", "event_id": "evt-legacy"}),
         contract,
     )
 
@@ -640,7 +698,7 @@ def test_observer_reminder_echo_route_returns_only_safe_reminder_fields():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-reminder",
             "event_kind": "observer.command.notified",
             "project_id": "demo",

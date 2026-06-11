@@ -2392,6 +2392,69 @@ class TestTaskTimeline(unittest.TestCase):
             {"route_context_token_required"},
         )
 
+    def test_task_completed_timeline_event_with_bound_route_token_records_allowed_service(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-SERVICE-ROUTER-BOUND-TOKEN"
+        task_id = "task-router-bound-token"
+        self._insert_router_backlog(
+            bug_id=bug_id,
+            contract={
+                "parallel_contract": {
+                    "contract_instance_id": bug_id,
+                    "service_routes": [
+                        {
+                            "route_id": "service.test_governance.preview",
+                            "service_id": "test_governance.preview",
+                            "mode": "preview",
+                            "side_effect_class": "read",
+                        }
+                    ],
+                    "event_routes": [
+                        {
+                            "route_id": "event.task_completed.preview",
+                            "event_kind": "task.completed",
+                            "service_route_id": "service.test_governance.preview",
+                            "enabled": True,
+                        }
+                    ],
+                }
+            },
+        )
+        issued = self._issue_route_token(
+            bug_id,
+            task_id=task_id,
+            allowed_actions=["service_route"],
+        )
+
+        source = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id=task_id,
+            backlog_id=bug_id,
+            event_type="task.completed",
+            actor="worker",
+            status="succeeded",
+            payload={"route_token": issued["route_token"]},
+        )
+        self.conn.commit()
+
+        routed = task_timeline.list_events(
+            self.conn,
+            "proj",
+            parent_event_id=source["id"],
+            event_kind="service_route",
+        )
+
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0]["event_type"], "service.route.completed")
+        payload = routed[0]["payload"]
+        gate = payload["result"]["route_context_gate"]
+        self.assertEqual(payload["status"], "allowed")
+        self.assertEqual(gate["decision"], "route_token")
+        self.assertTrue(gate["server_issued_binding"])
+        self.assertEqual(gate["route_token_ref"], issued["route_token_ref"])
+
     def test_timeline_append_redacts_top_level_route_token_payload(self):
         from agent.governance import server, task_timeline
 
