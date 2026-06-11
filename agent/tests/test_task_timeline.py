@@ -2805,6 +2805,11 @@ class TestTaskTimeline(unittest.TestCase):
                     bug_id=bug_id,
                     task_id="task-ai-route",
                 ),
+                "route_waiver": _route_waiver(
+                    "service_route",
+                    bug_id=bug_id,
+                    task_id="task-ai-route",
+                ),
             },
         )
         self.conn.commit()
@@ -2868,6 +2873,11 @@ class TestTaskTimeline(unittest.TestCase):
                     "command_id": "cmd-1",
                 },
                 "route_token_gate": _bound_route_token_gate(
+                    "service_route",
+                    bug_id=bug_id,
+                    task_id="task-reminder-echo",
+                ),
+                "route_waiver": _route_waiver(
                     "service_route",
                     bug_id=bug_id,
                     task_id="task-reminder-echo",
