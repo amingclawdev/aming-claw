@@ -9,7 +9,8 @@ import {
   type PlaybackNavEntry,
   type TaskPlaybackFrame,
 } from "./taskPlayback";
-import { projectTaskTimelineEvent } from "./taskTimelineSemantics";
+import { projectTaskTimelineEvent, projectGateMatrix } from "./taskTimelineSemantics";
+import type { GateMatrixProjection } from "./taskTimelineSemantics";
 
 const PRIVATE_REQUEST_FIELD = "raw_" + "prompt";
 
@@ -2204,4 +2205,178 @@ function taskPlaybackSegmentTextAssertions(): string[] {
 export const taskPlaybackStatusWordEmphasisSummary: string[] = [
   ...taskPlaybackStatusWordClassifyAssertions(),
   ...taskPlaybackSegmentTextAssertions(),
+];
+
+// ---------------------------------------------------------------------------
+// AC-CONTRACT-GATE-VERIFICATION-MATRIX-20260610 — AC5
+// projectGateMatrix four-quadrant coverage
+// Quadrants:
+//   (i)   gate present + contract evidence
+//   (ii)  gate present without QA/IV evidence (rows show missing)
+//   (iii) applicable=false (rows=[] honest)
+//   (iv)  mangled/unknown-gate JSON (no throw, generic fallback)
+// ---------------------------------------------------------------------------
+
+function projectGateMatrixQuadrantAssertions(): string[] {
+  // ── (i) Gate present + contract evidence ───────────────────────────────
+  // Shape mirrors a real mf_timeline_precheck response with a passing route-context gate.
+  // Evidence events carry event_kind and status so AC1 label rendering can be verified.
+  const gateWithEvidence = {
+    passed: true,
+    status: "passed",
+    required_event_kinds: ["implementation", "verification", "close_ready"],
+    present_event_kinds: ["implementation", "verification", "close_ready"],
+    missing_event_kinds: [] as string[],
+    route_context_gate: {
+      passed: true,
+      required: true,
+      required_requirement_ids: ["route_context", "mf_subagent_startup"],
+      present_requirement_ids: ["route_context", "mf_subagent_startup"],
+      missing_requirement_ids: [] as string[],
+      evidence_events: {
+        route_context: [
+          { id: 3792, event_kind: "route_action_precheck", phase: "dispatch", status: "allowed" },
+        ],
+        mf_subagent_startup: [
+          { id: 3797, event_kind: "mf_subagent_startup", phase: "startup_gate", status: "passed" },
+        ],
+      } as Record<string, unknown>,
+    },
+  };
+  const matrixI: GateMatrixProjection = projectGateMatrix(gateWithEvidence, true);
+  assertFixture(matrixI.gatePresent, "quadrant(i): gatePresent should be true");
+  assertFixture(matrixI.applicable, "quadrant(i): applicable should be true");
+  assertFixture(matrixI.overallPassed, "quadrant(i): overallPassed should reflect gate.passed=true");
+  assertFixture(matrixI.rows.length > 0, "quadrant(i): rows should be non-empty when gate is present");
+  const implRow = matrixI.rows.find((r) => r.id === "implementation");
+  assertFixture(Boolean(implRow), "quadrant(i): implementation row should exist");
+  assertFixture(implRow?.status === "passed", `quadrant(i): implementation row status should be passed, got ${implRow?.status}`);
+  const routeCtxRow = matrixI.rows.find((r) => r.id === "route_context");
+  assertFixture(Boolean(routeCtxRow), "quadrant(i): route_context row should exist from route_context_gate");
+  assertFixture(routeCtxRow?.status === "passed", `quadrant(i): route_context row status should be passed`);
+  assertFixture(
+    routeCtxRow?.evidenceEventIds.includes("3792") === true,
+    `quadrant(i): route_context row evidenceEventIds should contain "3792", got ${JSON.stringify(routeCtxRow?.evidenceEventIds)}`,
+  );
+  // AC1: evidenceLabels should be populated with event_kind · status
+  assertFixture(
+    (routeCtxRow?.evidenceLabels ?? []).some((label) => label.includes("route_action_precheck") && label.includes("allowed")),
+    `quadrant(i): route_context evidenceLabels should contain "route_action_precheck · allowed", got ${JSON.stringify(routeCtxRow?.evidenceLabels)}`,
+  );
+  const startupRow = matrixI.rows.find((r) => r.id === "mf_subagent_startup");
+  assertFixture(
+    (startupRow?.evidenceLabels ?? []).some((label) => label.includes("mf_subagent_startup") && label.includes("passed")),
+    `quadrant(i): mf_subagent_startup evidenceLabels should contain "mf_subagent_startup · passed"`,
+  );
+
+  // ── (ii) Gate present without QA/IV evidence (rows show missing) ────────
+  // Shape matches a gate response that has required rows but missing evidence.
+  const gateWithMissing = {
+    passed: false,
+    status: "blocked",
+    required_event_kinds: ["implementation", "verification", "close_ready"],
+    present_event_kinds: ["implementation"] as string[],
+    missing_event_kinds: ["verification", "close_ready"],
+    route_context_gate: {
+      passed: false,
+      required: true,
+      required_requirement_ids: ["mf_subagent_startup", "independent_verification_lane"],
+      present_requirement_ids: ["mf_subagent_startup"] as string[],
+      missing_requirement_ids: ["independent_verification_lane"],
+      evidence_events: {
+        mf_subagent_startup: [
+          { id: 3797, event_kind: "mf_subagent_startup", phase: "startup_gate", status: "passed" },
+        ],
+      } as Record<string, unknown>,
+    },
+  };
+  const matrixII: GateMatrixProjection = projectGateMatrix(gateWithMissing, true);
+  assertFixture(!matrixII.overallPassed, "quadrant(ii): overallPassed should be false when gate is blocked");
+  const verificationRow = matrixII.rows.find((r) => r.id === "verification");
+  assertFixture(Boolean(verificationRow), "quadrant(ii): verification row should exist");
+  assertFixture(verificationRow?.status === "missing", `quadrant(ii): verification row status should be missing, got ${verificationRow?.status}`);
+  assertFixture(
+    Boolean(verificationRow?.nextAction) && verificationRow!.nextAction.toLowerCase().includes("verification"),
+    `quadrant(ii): verification row nextAction should mention 'verification', got "${verificationRow?.nextAction}"`,
+  );
+  const ivRow = matrixII.rows.find((r) => r.id === "independent_verification_lane");
+  assertFixture(Boolean(ivRow), "quadrant(ii): independent_verification_lane row should exist");
+  assertFixture(ivRow?.status === "missing", `quadrant(ii): independent_verification_lane status should be missing, got ${ivRow?.status}`);
+  assertFixture(ivRow?.evidenceEventIds.length === 0, "quadrant(ii): missing IV row should have no evidence event ids");
+  const startupPresentRow = matrixII.rows.find((r) => r.id === "mf_subagent_startup");
+  assertFixture(startupPresentRow?.status === "passed", "quadrant(ii): mf_subagent_startup should be passed (present)");
+  assertFixture(
+    (startupPresentRow?.evidenceLabels ?? []).some((l) => l.includes("mf_subagent_startup")),
+    "quadrant(ii): mf_subagent_startup evidenceLabels should be populated for present row",
+  );
+
+  // ── (iii) applicable=false → rows=[] honest ──────────────────────────────
+  // When applicable=false the gate is not subject to close: rows must be empty
+  // and overallPassed=true (not-applicable rows are honest pass-throughs).
+  const matrixIII_withGate: GateMatrixProjection = projectGateMatrix(gateWithEvidence, false);
+  assertFixture(!matrixIII_withGate.applicable, "quadrant(iii): applicable should be false");
+  assertFixture(matrixIII_withGate.rows.length === 0, `quadrant(iii): rows should be [] when applicable=false, got ${matrixIII_withGate.rows.length}`);
+  assertFixture(matrixIII_withGate.overallPassed, "quadrant(iii): overallPassed should be true (not applicable = honest pass)");
+  // Also: no gate at all + applicable=false → same shape
+  const matrixIII_noGate: GateMatrixProjection = projectGateMatrix(undefined, false);
+  assertFixture(matrixIII_noGate.rows.length === 0, "quadrant(iii): rows=[] when no gate and not applicable");
+  assertFixture(!matrixIII_noGate.gatePresent, "quadrant(iii): gatePresent=false when gate is undefined");
+
+  // ── (iv) Mangled/unknown-gate JSON → no throw, generic fallback ─────────
+  // Feed gate shapes with unknown keys and nullish sub-gates; must not throw.
+  const mangledGate = {
+    passed: false,
+    status: "unknown",
+    required_event_kinds: ["implementation"],
+    present_event_kinds: [] as string[],
+    missing_event_kinds: ["implementation"],
+    // unknown extra keys must be ignored
+    zz_unknown_gate_9999: { some_field: true },
+    route_context_gate: undefined,
+    contract_gate: undefined,
+    // evidence_events with a non-array value (not a record of arrays)
+    contract_projection: {
+      status: "stale",
+      stale: true,
+      divergent: false,
+      read_receipt_gate: { passed: false, status: "missing", read_receipt_event_id: undefined },
+    },
+  } as unknown as Parameters<typeof projectGateMatrix>[0];
+  let matrixIV: GateMatrixProjection | null = null;
+  let threwIV = false;
+  try {
+    matrixIV = projectGateMatrix(mangledGate, true);
+  } catch {
+    threwIV = true;
+  }
+  assertFixture(!threwIV, "quadrant(iv): projectGateMatrix must not throw on mangled/unknown gate JSON");
+  assertFixture(matrixIV !== null, "quadrant(iv): projectGateMatrix must return a value on mangled input");
+  assertFixture(matrixIV!.schema_version === "gate_matrix_projection.v1", "quadrant(iv): schema_version must be present");
+  assertFixture(Array.isArray(matrixIV!.rows), "quadrant(iv): rows must be an array on mangled input");
+  // The required_event_kinds row is still emitted (generic fallback works)
+  const implRowIV = matrixIV!.rows.find((r) => r.id === "implementation");
+  assertFixture(Boolean(implRowIV), "quadrant(iv): generic timeline row should be emitted even for mangled gate");
+  assertFixture(implRowIV?.status === "missing", "quadrant(iv): implementation row should be missing (present_event_kinds=[])");
+  // Ensure every row has the evidenceLabels array (regression: new field must always be present)
+  for (const row of matrixIV!.rows) {
+    assertFixture(
+      Array.isArray(row.evidenceLabels),
+      `quadrant(iv): row ${row.id} must have evidenceLabels array`,
+    );
+  }
+
+  return [
+    `quadrant(i): gate present + evidence — rows=${matrixI.rows.length}, overallPassed=${matrixI.overallPassed}`,
+    `quadrant(i): route_context evidenceEventIds include 3792, label has route_action_precheck·allowed`,
+    `quadrant(ii): gate present, missing evidence — verification/IV rows show status=missing`,
+    `quadrant(ii): mf_subagent_startup present row has evidenceLabels`,
+    `quadrant(iii): applicable=false → rows=[], overallPassed=true (not applicable)`,
+    `quadrant(iii): no gate + not applicable → rows=[], gatePresent=false`,
+    `quadrant(iv): mangled gate JSON → no throw, schema_version present, rows is array`,
+    `quadrant(iv): all rows have evidenceLabels array (new field always populated)`,
+  ];
+}
+
+export const taskPlaybackGateMatrixQuadrantSummary: string[] = [
+  ...projectGateMatrixQuadrantAssertions(),
 ];

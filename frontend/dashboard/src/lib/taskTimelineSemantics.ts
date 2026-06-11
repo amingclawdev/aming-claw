@@ -873,6 +873,13 @@ export interface GateMatrixRow {
   nextAction: string;
   /** Event ids that count as evidence for this row (for deep-link to playback). */
   evidenceEventIds: string[];
+  /**
+   * AC1: enriched labels for evidence events.
+   * Each entry corresponds 1-to-1 with evidenceEventIds.
+   * Format: "event_kind · status" (e.g. "route_action_precheck · allowed").
+   * Empty string when kind/status are not available.
+   */
+  evidenceLabels: string[];
 }
 
 /** The full matrix projection consumed by the ContractGateMatrix component. */
@@ -949,17 +956,25 @@ const FAMILY_LABELS: Record<GateMatrixRow["family"], string> = {
   other:             "Other checks",
 };
 
-function eventIdsFromGateEvents(gateEvents: unknown): string[] {
+function eventIdsFromGateEvents(gateEvents: unknown): { ids: string[]; labels: string[] } {
   const ids: string[] = [];
-  if (!Array.isArray(gateEvents)) return ids;
+  const labels: string[] = [];
+  if (!Array.isArray(gateEvents)) return { ids, labels };
   for (const item of gateEvents) {
     if (item && typeof item === "object") {
       const rec = item as Record<string, unknown>;
       const id = rec.id ?? rec.event_id ?? rec.timeline_event_id;
-      if (id != null) ids.push(String(id));
+      if (id != null) {
+        ids.push(String(id));
+        // AC1: build "event_kind · status" label for each evidence event
+        const kind = typeof rec.event_kind === "string" ? rec.event_kind : (typeof rec.phase === "string" ? rec.phase : "");
+        const status = typeof rec.status === "string" ? rec.status : "";
+        const label = [kind, status].filter(Boolean).join(" · ");
+        labels.push(label);
+      }
     }
   }
-  return ids;
+  return { ids, labels };
 }
 
 /**
@@ -1028,6 +1043,7 @@ export function projectGateMatrix(
       status: isPassed ? "passed" : isMissing ? "missing" : "unknown",
       nextAction: isMissing ? `Append ${id.replace(/_/g, " ")} event to the task timeline` : "",
       evidenceEventIds: [],
+      evidenceLabels: [],
     });
   }
 
@@ -1040,7 +1056,7 @@ export function projectGateMatrix(
     const evidenceMap = rg.evidence_events ?? {};
     for (const id of Array.from(rgRequired)) {
       const eventsForId = (evidenceMap as Record<string, unknown>)[id];
-      const evidenceIds = eventIdsFromGateEvents(eventsForId);
+      const { ids: evidenceIds, labels: evidenceLabels } = eventIdsFromGateEvents(eventsForId);
       rows.push({
         id,
         label: gateRowLabel(id),
@@ -1050,11 +1066,13 @@ export function projectGateMatrix(
         status: rgPresent.has(id) ? "passed" : rgMissing.has(id) ? "missing" : "unknown",
         nextAction: rgMissing.has(id) ? `Record ${gateRowLabel(id).toLowerCase()}` : "",
         evidenceEventIds: evidenceIds,
+        evidenceLabels,
       });
     }
     // Add any present-but-not-required items as informational
     for (const id of Array.from(rgPresent)) {
       if (!rgRequired.has(id)) {
+        const { ids: evidenceIds, labels: evidenceLabels } = eventIdsFromGateEvents((evidenceMap as Record<string, unknown>)[id]);
         rows.push({
           id,
           label: gateRowLabel(id),
@@ -1063,7 +1081,8 @@ export function projectGateMatrix(
           required: false,
           status: "passed",
           nextAction: "",
-          evidenceEventIds: eventIdsFromGateEvents((evidenceMap as Record<string, unknown>)[id]),
+          evidenceEventIds: evidenceIds,
+          evidenceLabels,
         });
       }
     }
@@ -1076,7 +1095,7 @@ export function projectGateMatrix(
     const cgPresent = new Set(cg.present_requirement_ids ?? []);
     const cgMissing = new Set(cg.missing_requirement_ids ?? []);
     const cgEvents = cg.evidence_events ?? [];
-    const cgEventIds = eventIdsFromGateEvents(cgEvents);
+    const { ids: cgEventIds, labels: cgEventLabels } = eventIdsFromGateEvents(cgEvents);
     if (cgRequired.size > 0) {
       for (const id of Array.from(cgRequired)) {
         rows.push({
@@ -1088,6 +1107,7 @@ export function projectGateMatrix(
           status: cgPresent.has(id) ? "passed" : cgMissing.has(id) ? "missing" : "unknown",
           nextAction: cgMissing.has(id) ? `Record contract evidence for ${id}` : "",
           evidenceEventIds: cgPresent.has(id) ? cgEventIds : [],
+          evidenceLabels: cgPresent.has(id) ? cgEventLabels : [],
         });
       }
     } else if (cg.passed !== undefined) {
@@ -1101,6 +1121,7 @@ export function projectGateMatrix(
         status: cg.passed ? "passed" : "failed",
         nextAction: cg.passed ? "" : "Check contract requirement ids",
         evidenceEventIds: cg.passed ? cgEventIds : [],
+        evidenceLabels: cg.passed ? cgEventLabels : [],
       });
     }
   }
@@ -1120,6 +1141,7 @@ export function projectGateMatrix(
         status: rrGate.passed ? "passed" : rrGate.status === "not_required" ? "not_applicable" : "missing",
         nextAction: rrGate.passed ? "" : "Record mf_subagent_read_receipt before counted evidence events",
         evidenceEventIds: rrId != null ? [String(rrId)] : [],
+        evidenceLabels: [],
       });
     }
     rows.push({
@@ -1131,6 +1153,7 @@ export function projectGateMatrix(
       status: cp.status === "current" ? "passed" : cp.divergent ? "failed" : cp.stale ? "failed" : "unknown",
       nextAction: cp.stale || cp.divergent ? "Re-run the route service to refresh the contract projection" : "",
       evidenceEventIds: [],
+      evidenceLabels: [],
     });
   }
 
@@ -1145,6 +1168,7 @@ export function projectGateMatrix(
       status: gate.cross_ref_gate.passed ? "passed" : "failed",
       nextAction: gate.cross_ref_gate.passed ? "" : "Check cross-ref gate: foreign-row identity mismatch",
       evidenceEventIds: [],
+      evidenceLabels: [],
     });
   }
 
@@ -1160,6 +1184,7 @@ export function projectGateMatrix(
       status: wg.passed ? "passed" : "missing",
       nextAction: wg.passed ? "" : "Run graph_query with query_source=mf_subagent and record trace evidence",
       evidenceEventIds: wg.trace_ids ?? [],
+      evidenceLabels: (wg.trace_ids ?? []).map(() => ""),
     });
   }
 
@@ -1175,6 +1200,7 @@ export function projectGateMatrix(
       status: qa.passed ? "passed" : "missing",
       nextAction: qa.passed ? "" : "Run the independent QA verification lane",
       evidenceEventIds: [],
+      evidenceLabels: [],
     });
   }
 

@@ -797,7 +797,7 @@ function BacklogDetailModal({
             <EvidenceInspector node={selectedNode} />
           </div>
         ) : (
-          <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} matrix={gateMatrix} backlogId={fallbackBugId} projectId={projectId} />
+          <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} matrix={gateMatrix} backlogId={fallbackBugId} projectId={projectId} acceptanceCriteria={listFrom(bug?.acceptance_criteria)} />
         )}
       </section>
     </div>
@@ -1366,6 +1366,7 @@ function ContractGatePanel({
   matrix,
   backlogId,
   projectId,
+  acceptanceCriteria,
 }: {
   audit: ContractAudit;
   response?: BacklogTimelineGateResponse;
@@ -1373,6 +1374,7 @@ function ContractGatePanel({
   matrix: GateMatrixProjection;
   backlogId: string;
   projectId: string;
+  acceptanceCriteria?: string[];
 }) {
   const gateState = gateEvidenceState(response, audit.events);
   return (
@@ -1442,6 +1444,27 @@ function ContractGatePanel({
         {gateState.noGate ? <NoGateNotice reason={gateState.reason} /> : gate ? <GateSummary gate={gate} response={response} /> : null}
         {gate ? <RouteContextGuidancePanel gate={gate} /> : null}
       </div>
+
+      {/* ── Acceptance criteria (free-text, AC2) ───────────────────────── */}
+      {acceptanceCriteria && acceptanceCriteria.length > 0 ? (
+        <div className="backlog-modal-section">
+          <div className="backlog-modal-section-head">
+            <span>Acceptance criteria (free-text)</span>
+            <span className="mono">{acceptanceCriteria.length} criterion{acceptanceCriteria.length === 1 ? "" : "s"}</span>
+          </div>
+          <div className="backlog-contract-requirements">
+            {acceptanceCriteria.map((criterion, i) => (
+              <div key={i} className="contract-requirement-card">
+                <div className="contract-req-header">
+                  <span className="mono contract-req-id">{i + 1}</span>
+                  <span className="contract-req-text">{criterion}</span>
+                  <span className="status-badge status-unknown">not independently verified</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {/* ── Raw payloads ────────────────────────────────────────────────── */}
       <div className="backlog-modal-section">
@@ -1550,16 +1573,19 @@ function GateMatrixRowView({
       <div className="gate-matrix-cell gate-matrix-evidence" role="cell">
         {row.evidenceEventIds.length > 0 ? (
           <div className="gate-matrix-evidence-ids">
-            {row.evidenceEventIds.slice(0, 5).map((id) => (
-              <a
-                key={id}
-                className="gate-matrix-evidence-link mono"
-                href={evidenceDeepLink(id)}
-                title={`Open playback for event #${id}`}
-              >
-                #{id}
-              </a>
-            ))}
+            {row.evidenceEventIds.slice(0, 5).map((id, i) => {
+              const label = row.evidenceLabels?.[i] ?? "";
+              return (
+                <a
+                  key={id}
+                  className="gate-matrix-evidence-link mono"
+                  href={evidenceDeepLink(id)}
+                  title={`Open playback for event #${id}${label ? ` (${label})` : ""}`}
+                >
+                  #{id}{label ? <span className="gate-matrix-evidence-kind"> {label}</span> : null}
+                </a>
+              );
+            })}
             {row.evidenceEventIds.length > 5 ? (
               <em className="mono">+{row.evidenceEventIds.length - 5}</em>
             ) : null}
