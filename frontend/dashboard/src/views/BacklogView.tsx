@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import {
   projectTaskTimelineEvent,
+  projectGateMatrix,
   sanitizePublicTimelineText,
   sanitizeTimelineInspectorValue,
 } from "../lib/taskTimelineSemantics";
+import type { GateMatrixRow, GateMatrixProjection } from "../lib/taskTimelineSemantics";
 import type {
   BacklogBug,
   BacklogResponse,
@@ -496,6 +498,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
         <BacklogDetailModal
           bug={selectedBug}
           fallbackBugId={selectedBugId}
+          projectId={projectId}
           timeline={selectedTimeline}
           loadingBug={detailLoadingByBug[selectedBugId] ?? false}
           error={detailErrorByBug[selectedBugId] ?? ""}
@@ -629,6 +632,7 @@ function BacklogRow({
 function BacklogDetailModal({
   bug,
   fallbackBugId,
+  projectId,
   timeline,
   loadingBug,
   error,
@@ -639,6 +643,7 @@ function BacklogDetailModal({
 }: {
   bug: BacklogBug | null;
   fallbackBugId: string;
+  projectId: string;
   timeline?: TimelineState;
   loadingBug: boolean;
   error: string;
@@ -651,6 +656,10 @@ function BacklogDetailModal({
   const gate = timeline?.gate?.timeline_gate;
   const dag = useMemo(() => buildTimelineDag(bug, events, gate), [bug, events, gate]);
   const contractAudit = useMemo(() => buildContractAudit(bug, events, gate, timeline?.gate), [bug, events, gate, timeline?.gate]);
+  const gateMatrix = useMemo(
+    () => projectGateMatrix(gate, timeline?.gate?.applicable !== false),
+    [gate, timeline?.gate],
+  );
   const [activeTab, setActiveTab] = useState<DetailTab>("timeline");
   const [selectedNodeId, setSelectedNodeId] = useState<string>("");
   const selectedNode = dag.nodes.find((node) => node.id === selectedNodeId) ?? dag.nodes[0] ?? null;
@@ -788,7 +797,7 @@ function BacklogDetailModal({
             <EvidenceInspector node={selectedNode} />
           </div>
         ) : (
-          <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} />
+          <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} matrix={gateMatrix} backlogId={fallbackBugId} projectId={projectId} />
         )}
       </section>
     </div>
@@ -1354,17 +1363,44 @@ function ContractGatePanel({
   audit,
   response,
   gate,
+  matrix,
+  backlogId,
+  projectId,
 }: {
   audit: ContractAudit;
   response?: BacklogTimelineGateResponse;
   gate?: MfCloseTimelineGate;
+  matrix: GateMatrixProjection;
+  backlogId: string;
+  projectId: string;
 }) {
   const gateState = gateEvidenceState(response, audit.events);
   return (
     <div className="backlog-modal-tab-panel" role="tabpanel">
+
+      {/* ── PRIMARY: Contract × Gate verification matrix ───────────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
-          <span>Original contract inputs</span>
+          <span>Contract & Gate verification matrix</span>
+          <span className={`status-badge ${!matrix.gatePresent ? "status-unknown" : !matrix.applicable ? "status-unknown" : matrix.overallPassed ? "status-complete" : "status-failed"}`}>
+            {!matrix.gatePresent ? "gate not loaded" : !matrix.applicable ? "not applicable" : matrix.overallPassed ? "passed" : "blocked"}
+          </span>
+        </div>
+        {!matrix.applicable ? (
+          <div className="timeline-empty">This backlog row is not subject to the MF close gate.</div>
+        ) : !matrix.gatePresent ? (
+          <div className="timeline-empty">Gate data not yet loaded. Expand the timeline to fetch gate evidence.</div>
+        ) : matrix.rows.length === 0 ? (
+          <div className="timeline-empty">No gate requirement rows were found in the loaded gate response.</div>
+        ) : (
+          <GateVerificationMatrix rows={matrix.rows} backlogId={backlogId} projectId={projectId} />
+        )}
+      </div>
+
+      {/* ── Original contract inputs ────────────────────────────────────── */}
+      <div className="backlog-modal-section">
+        <div className="backlog-modal-section-head">
+          <span>Contract inputs</span>
           <span className={`status-badge ${audit.contract.valid ? "status-complete" : audit.contract.empty ? "status-unknown" : "status-failed"}`}>
             {audit.contract.empty ? "missing" : audit.contract.valid ? "parsed" : "invalid json"}
           </span>
@@ -1380,25 +1416,25 @@ function ContractGatePanel({
         </div>
       </div>
 
-      <div className="backlog-modal-section">
-        <div className="backlog-modal-section-head">
-          <span>Requirement evidence map</span>
-          <span className="mono">{audit.requirements.length} requirement{audit.requirements.length === 1 ? "" : "s"}</span>
-        </div>
-        {audit.requirements.length === 0 ? (
-          <div className="timeline-empty">No contract evidence requirements were declared.</div>
-        ) : (
+      {/* ── Requirement evidence map (from chain_trigger_json) ──────────── */}
+      {audit.requirements.length > 0 ? (
+        <div className="backlog-modal-section">
+          <div className="backlog-modal-section-head">
+            <span>Contract requirement evidence</span>
+            <span className="mono">{audit.requirements.length} requirement{audit.requirements.length === 1 ? "" : "s"}</span>
+          </div>
           <div className="backlog-contract-requirements">
             {audit.requirements.map((requirement) => (
               <ContractRequirementCard key={requirement.id} requirement={requirement} />
             ))}
           </div>
-        )}
-      </div>
+        </div>
+      ) : null}
 
+      {/* ── Gate summary cards ──────────────────────────────────────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
-          <span>Gate evidence</span>
+          <span>Gate detail cards</span>
           <span className={`status-badge ${gateState.noGate ? "status-unknown" : gate?.passed ? "status-complete" : "status-failed"}`}>
             {gateState.noGate ? "no gate evidence" : gate?.status || "recorded"}
           </span>
@@ -1407,6 +1443,7 @@ function ContractGatePanel({
         {gate ? <RouteContextGuidancePanel gate={gate} /> : null}
       </div>
 
+      {/* ── Raw payloads ────────────────────────────────────────────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
           <span>Raw contract / gate payloads</span>
@@ -1417,6 +1454,123 @@ function ContractGatePanel({
           <RawPayloadBlock label="parsed contract root" value={audit.contract.valid ? audit.contract.root : { error: audit.contract.error || "missing" }} />
           <RawPayloadBlock label="timeline gate raw" value={response ?? { state: "not recorded" }} />
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── GateVerificationMatrix ───────────────────────────────────────────────────
+
+function matrixStatusClass(status: GateMatrixRow["status"]): string {
+  if (status === "passed") return "status-complete";
+  if (status === "failed" || status === "missing") return "status-failed";
+  if (status === "not_applicable") return "status-unknown";
+  return "status-unknown";
+}
+
+function GateVerificationMatrix({
+  rows,
+  backlogId,
+  projectId,
+}: {
+  rows: GateMatrixRow[];
+  backlogId: string;
+  projectId: string;
+}) {
+  // Group by family, preserve order of first appearance
+  const familyOrder: GateMatrixRow["family"][] = [];
+  const byFamily = new Map<GateMatrixRow["family"], GateMatrixRow[]>();
+  for (const row of rows) {
+    if (!byFamily.has(row.family)) {
+      byFamily.set(row.family, []);
+      familyOrder.push(row.family);
+    }
+    byFamily.get(row.family)!.push(row);
+  }
+
+  return (
+    <div className="gate-matrix" role="table" aria-label="Contract and gate verification matrix">
+      <div className="gate-matrix-header" role="row">
+        <span role="columnheader">Requirement</span>
+        <span role="columnheader">Required?</span>
+        <span role="columnheader">Status</span>
+        <span role="columnheader">Evidence / next action</span>
+      </div>
+      {familyOrder.map((family) => {
+        const familyRows = byFamily.get(family)!;
+        const label = familyRows[0]?.familyLabel ?? family;
+        return (
+          <div key={family} className="gate-matrix-family" role="rowgroup">
+            <div className="gate-matrix-family-head" role="row">
+              <span role="cell" className="mono">{label}</span>
+            </div>
+            {familyRows.map((row) => (
+              <GateMatrixRowView key={row.id} row={row} backlogId={backlogId} projectId={projectId} />
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function GateMatrixRowView({
+  row,
+  backlogId,
+  projectId,
+}: {
+  row: GateMatrixRow;
+  backlogId: string;
+  projectId: string;
+}) {
+  const evidenceDeepLink = (eventId: string): string => {
+    return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history&playback_backlog=${encodeURIComponent(backlogId)}&playback_event=${encodeURIComponent(eventId)}`;
+  };
+
+  return (
+    <div className={`gate-matrix-row status-row-${row.status}`} role="row">
+      {/* Column 1: Requirement label + raw id */}
+      <div className="gate-matrix-cell gate-matrix-label" role="cell">
+        <span className="gate-matrix-req-label">{row.label}</span>
+        <em className="mono gate-matrix-req-id">{row.id}</em>
+      </div>
+      {/* Column 2: Required? */}
+      <div className="gate-matrix-cell" role="cell">
+        <span className={`gate-matrix-req-flag ${row.required ? "required" : "optional"}`}>
+          {row.required ? "required" : "optional"}
+        </span>
+      </div>
+      {/* Column 3: Status chip */}
+      <div className="gate-matrix-cell" role="cell">
+        <span className={`status-badge ${matrixStatusClass(row.status)}`}>
+          {row.status.replace(/_/g, " ")}
+        </span>
+      </div>
+      {/* Column 4: Evidence event ids (deep-linkable) + next action */}
+      <div className="gate-matrix-cell gate-matrix-evidence" role="cell">
+        {row.evidenceEventIds.length > 0 ? (
+          <div className="gate-matrix-evidence-ids">
+            {row.evidenceEventIds.slice(0, 5).map((id) => (
+              <a
+                key={id}
+                className="gate-matrix-evidence-link mono"
+                href={evidenceDeepLink(id)}
+                title={`Open playback for event #${id}`}
+              >
+                #{id}
+              </a>
+            ))}
+            {row.evidenceEventIds.length > 5 ? (
+              <em className="mono">+{row.evidenceEventIds.length - 5}</em>
+            ) : null}
+          </div>
+        ) : null}
+        {row.nextAction ? (
+          <p className="gate-matrix-next-action">{row.nextAction}</p>
+        ) : null}
+        {row.evidenceEventIds.length === 0 && !row.nextAction ? (
+          <span className="muted">—</span>
+        ) : null}
       </div>
     </div>
   );
