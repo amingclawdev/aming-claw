@@ -1941,19 +1941,35 @@ export interface ActivityEventCard {
  * event card list.
  */
 export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard {
-  const id = typeof event.id === "number" ? event.id : String(event.id ?? "");
-  const at = (event.created_at ?? "").trim();
-  const event_kind = (event.event_kind ?? event.event_type ?? "event").trim();
-  const event_type = (event.event_type ?? "").trim();
-  const status = (event.status ?? "unknown").trim();
-  const actor = String(event.actor ?? "").trim();
-  const backlog_id = (event.backlog_id ?? "").trim();
-  const task_id = (event.task_id ?? "").trim();
+  const publicEvent = hydrateTimelineEventJson(event);
+  const id = typeof publicEvent.id === "number" ? publicEvent.id : String(publicEvent.id ?? "");
+  const at = (publicEvent.created_at ?? "").trim();
+  const event_kind = (publicEvent.event_kind ?? publicEvent.event_type ?? "event").trim();
+  const event_type = (publicEvent.event_type ?? "").trim();
+  const status = (publicEvent.status ?? "unknown").trim();
+  const actor = String(publicEvent.actor ?? "").trim();
+  const backlog_id = firstPublicValueAtPaths(publicEvent, [
+    "backlog_id",
+    "payload.backlog_id",
+    "payload.bug_id",
+    "payload.root_backlog_id",
+    "payload.root_backlog_ids",
+    "payload.backlog_ids",
+    "verification.backlog_id",
+    "artifact_refs.backlog_id",
+  ])?.value ?? "";
+  const task_id = firstPublicValueAtPaths(publicEvent, [
+    "task_id",
+    "payload.task_id",
+    "payload.stage_task_id",
+    "verification.task_id",
+    "artifact_refs.task_id",
+  ])?.value ?? "";
   // Build a headline from the semantic projection helper; fall back to compact
   // event_kind / status text when the projection is unavailable.
   let headline = "";
   try {
-    const projection = projectTaskTimelineEvent(event, 0);
+    const projection = projectTaskTimelineEvent(publicEvent, 0);
     headline = projection.headline || projection.title || "";
   } catch {
     headline = `${event_kind}${status ? ` — ${status}` : ""}`;
@@ -1972,7 +1988,7 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
   let evidence_count = 0;
   const evidence_types: string[] = [];
   try {
-    const frame = frameFromEventPublic(event, 0);
+    const frame = frameFromEventPublic(publicEvent, 0);
     // Exclude any evidence link whose value equals the event's own display id
     // (self-references: kind=timeline_event + kind=gate both get value=source_event_id
     // on minimal events via the semantic evidence pipeline).  Self-reference links
@@ -2206,4 +2222,27 @@ export function findFrameIdByEventParam(
     if (byPlain) return byPlain.id;
   }
   return "";
+}
+
+export interface PlaybackEventParamResolution {
+  frameId: string;
+  matched: boolean;
+}
+
+/**
+ * Resolve a playback_event param against an already-available frame list.
+ *
+ * The warm-cache path in TaskPlaybackView calls this whenever the URL/event
+ * param changes, even if the trace did not reload.  A missing param match keeps
+ * the current valid frame selected instead of forcing a silent frame-1 fallback.
+ */
+export function resolveSelectedFrameIdForEventParam(
+  frames: TaskPlaybackFrame[],
+  eventParam: string,
+  currentFrameId = "",
+): PlaybackEventParamResolution {
+  const frameId = findFrameIdByEventParam(frames, eventParam);
+  if (frameId) return { frameId, matched: true };
+  const currentExists = Boolean(currentFrameId && frames.some((frame) => frame.id === currentFrameId));
+  return { frameId: currentExists ? currentFrameId : "", matched: false };
 }

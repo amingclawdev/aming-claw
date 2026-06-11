@@ -13,6 +13,7 @@ import {
   groupEvidenceRefsByCategory,
   buildPlaybackUrl,
   findFrameIdByEventParam,
+  resolveSelectedFrameIdForEventParam,
   PLAYBACK_URL_PARAMS,
   type PlaybackNavEntry,
   type TaskPlaybackFrame,
@@ -2270,6 +2271,23 @@ function taskPlaybackProjectEventToCardAssertions(): string[] {
   assertIa(typeof minCard.headline === "string", "minimal event: headline is string");
   assertIa(minCard.evidence_count === 0, "minimal event: evidence_count is 0");
 
+  const payloadBacklogCard = projectEventToCard({
+    id: 9002,
+    event_type: "task_timeline_append",
+    event_kind: "implementation",
+    phase: "implementation",
+    actor: "mf_sub",
+    status: "passed",
+    backlog_id: "",
+    task_id: "",
+    created_at: "2026-06-11T08:01:00Z",
+    payload: { backlog_id: "AC-PAYLOAD-BACKLOG-20260611" },
+  });
+  assertIa(
+    payloadBacklogCard.backlog_id === "AC-PAYLOAD-BACKLOG-20260611",
+    `payload backlog_id fallback, got ${payloadBacklogCard.backlog_id}`,
+  );
+
   return [
     "projectEventToCard: id field projected correctly (number)",
     "projectEventToCard: id field projected correctly (string coercion)",
@@ -2278,6 +2296,7 @@ function taskPlaybackProjectEventToCardAssertions(): string[] {
     "projectEventToCard: headline is non-empty string",
     "projectEventToCard: evidence_count is number, evidence_types is array",
     "projectEventToCard: minimal event: graceful fallback for all fields",
+    "projectEventToCard: payload backlog_id fallback keeps linked card affordance",
   ];
 }
 
@@ -2825,6 +2844,13 @@ function ueBlockerUrlAssertions(): string[] {
   const r8 = findFrameIdByEventParam([], "abc-def");
   assertFixture(r8 === "", `findFrameIdByEventParam empty frames: expected '', got '${r8}'`);
   results.push("findFrameIdByEventParam empty frames returns empty string");
+
+  // ── Warm/cached trace event-param changes re-select the new frame ────────
+  const warmFirst = resolveSelectedFrameIdForEventParam(sampleFrames, "src-001", "").frameId;
+  const warmSecond = resolveSelectedFrameIdForEventParam(sampleFrames, "3100", warmFirst).frameId;
+  assertFixture(warmFirst === "abc-def", `warm event-param first selection should resolve to abc-def, got '${warmFirst}'`);
+  assertFixture(warmSecond === "some-long-event-id", `warm event-param change should resolve to some-long-event-id, got '${warmSecond}'`);
+  results.push("warm cached playback_event changes re-select the changed event frame");
 
   return results;
 }
