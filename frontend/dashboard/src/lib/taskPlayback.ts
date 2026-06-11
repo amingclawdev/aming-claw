@@ -2262,3 +2262,14 @@ export function resolveSelectedFrameIdForEventParam(
   const currentExists = Boolean(currentFrameId && frames.some((frame) => frame.id === currentFrameId));
   return { frameId: currentExists ? currentFrameId : "", matched: false };
 }
+
+export function resolveInitialPlaybackFrameId(
+  frames: TaskPlaybackFrame[],
+  eventParam: string,
+  currentFrameId = "",
+): string {
+  if (currentFrameId && frames.some((frame) => frame.id === currentFrameId)) return currentFrameId;
+  const resolution = resolveSelectedFrameIdForEventParam(frames, eventParam, "");
+  if (resolution.matched) return resolution.frameId;
+  return frames[0]?.id || "";
+}

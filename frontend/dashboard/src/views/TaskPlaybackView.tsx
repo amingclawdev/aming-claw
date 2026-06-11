@@ -15,6 +15,7 @@ import {
   sliceEventPage,
   buildPlaybackUrl,
   readPlaybackEventParam,
+  resolveInitialPlaybackFrameId,
   resolveSelectedFrameIdForEventParam,
   PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
@@ -107,7 +108,12 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   // B1: event-id deep-link param — when the user arrives via a card click that
   // included a playback_event param, we hold the raw event-id string here and
   // resolve it to a frame once the trace finishes loading (async race guard).
-  const [selectedEventParam, setSelectedEventParam] = useState<string>(() => readPlaybackEventParam());
+  const [selectedEventParam, setSelectedEventParamState] = useState<string>(() => readPlaybackEventParam());
+  const selectedEventParamRef = useRef(readPlaybackEventParam());
+  const setSelectedEventParam = useCallback((value: string) => {
+    selectedEventParamRef.current = value;
+    setSelectedEventParamState(value);
+  }, []);
   const [selectedActivityFrameId, setSelectedActivityFrameId] = useState<string>("");
   // Current tab event card pager state (IA item A — 10 cards/page).
   const [eventsPage, setEventsPage] = useState(0);
@@ -153,7 +159,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setActivityRefreshSeq(0);
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
-    setSelectedEventParam("");
+    setSelectedEventParam(readPlaybackEventParam());
     setSelectedActivityFrameId("");
     setEventsPage(0);
     setPlaying(false);
@@ -518,7 +524,13 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           },
         }));
         if (selectedBugRef.current?.bug_id === bugId) {
-          setSelectedFrameId((current) => current || trace.frames[0]?.id || "");
+          setSelectedFrameId((current) => (
+            resolveInitialPlaybackFrameId(
+              trace.frames,
+              selectedEventParamRef.current || readPlaybackEventParam(),
+              current,
+            )
+          ));
         }
       })
       .catch((error: unknown) => {

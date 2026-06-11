@@ -15,6 +15,7 @@ import {
   isPlaybackEventEvidenceRef,
   buildPlaybackUrl,
   findFrameIdByEventParam,
+  resolveInitialPlaybackFrameId,
   resolveSelectedFrameIdForEventParam,
   PLAYBACK_URL_PARAMS,
   type PlaybackNavEntry,
@@ -2863,6 +2864,15 @@ function ueBlockerUrlAssertions(): string[] {
   assertFixture(warmFirst === "abc-def", `warm event-param first selection should resolve to abc-def, got '${warmFirst}'`);
   assertFixture(warmSecond === "some-long-event-id", `warm event-param change should resolve to some-long-event-id, got '${warmSecond}'`);
   results.push("warm cached playback_event changes re-select the changed event frame");
+
+  // ── Direct reload initial selection: URL event wins before frame-1 fallback ──
+  const directReloadSelection = resolveInitialPlaybackFrameId(sampleFrames, "3100", "");
+  assertFixture(directReloadSelection === "some-long-event-id", `direct reload playback_event=3100 should select matching frame, got '${directReloadSelection}'`);
+  const currentStableSelection = resolveInitialPlaybackFrameId(sampleFrames, "3100", "abc-def");
+  assertFixture(currentStableSelection === "abc-def", `current valid selection should remain stable, got '${currentStableSelection}'`);
+  const initialFallbackSelection = resolveInitialPlaybackFrameId(sampleFrames, "does-not-exist", "");
+  assertFixture(initialFallbackSelection === "abc-def", `missing playback_event should fall back to first frame, got '${initialFallbackSelection}'`);
+  results.push("direct reload playback_event selects event frame before first-frame fallback");
 
   return results;
 }
