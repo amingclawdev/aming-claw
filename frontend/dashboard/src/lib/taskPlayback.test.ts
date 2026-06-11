@@ -1,5 +1,15 @@
 import type { BacklogBug, TaskTimelineEvent } from "../types";
-import { isBacklogRowPrivate, normalizeTaskPlaybackTrace } from "./taskPlayback";
+import {
+  isBacklogRowPrivate,
+  normalizeTaskPlaybackTrace,
+  displayPlaybackFrames,
+  latestPlaybackFrameId,
+  pushPlaybackNavStack,
+  popPlaybackNavStack,
+  type PlaybackNavEntry,
+  type TaskPlaybackFrame,
+} from "./taskPlayback";
+import { projectTaskTimelineEvent } from "./taskTimelineSemantics";
 
 const PRIVATE_REQUEST_FIELD = "raw_" + "prompt";
 
@@ -1250,3 +1260,487 @@ function taskPlaybackPrivacyFlagAssertions(): string[] {
 }
 
 export const taskPlaybackPrivacyFlagFixtureSummary = taskPlaybackPrivacyFlagAssertions();
+
+// ---------------------------------------------------------------------------
+// AC-PLAYBACK-SEMANTICS-TEST-COVERAGE-20260610
+// Wave-C semantic + ordering features: QA #3579 F1 + #3636 F1
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// a. buildHeadline: registry hit for representative top event_kinds
+//    (tested via projectTaskTimelineEvent → frame.headline)
+// ---------------------------------------------------------------------------
+
+function taskPlaybackHeadlineCoverageAssertions(): string[] {
+  // Helper: build a minimal event and project it, return the headline.
+  function headline(event_kind: string, event_type: string, status: string, actor: string): string {
+    const event: TaskTimelineEvent = {
+      id: 9000,
+      event_type,
+      event_kind,
+      phase: "test",
+      actor,
+      status,
+      created_at: "2026-06-10T00:00:00Z",
+    };
+    return projectTaskTimelineEvent(event).headline;
+  }
+
+  // 1. mf_subagent_startup → "Bounded worker (mf_sub) started…"
+  const startupH = headline("mf_subagent_startup", "mf_subagent.startup", "passed", "mf_sub");
+  assertFixture(
+    startupH.startsWith("Bounded worker (mf_sub) started"),
+    `headline mf_subagent_startup: expected starts with "Bounded worker (mf_sub) started", got "${startupH}"`,
+  );
+  assertFixture(
+    startupH.includes("(passed)"),
+    `headline mf_subagent_startup: expected status suffix (passed), got "${startupH}"`,
+  );
+
+  // 2. verification → "Verification lane checked…"
+  const verH = headline("verification", "task_timeline_append", "passed", "qa");
+  assertFixture(
+    verH.startsWith("Verification lane"),
+    `headline verification: expected starts with "Verification lane", got "${verH}"`,
+  );
+
+  // 3. close_ready → "Observer recorded close-ready evidence…"
+  const closeH = headline("close_ready", "observer.close_ready", "passed", "observer");
+  assertFixture(
+    closeH.startsWith("Observer recorded close-ready evidence"),
+    `headline close_ready: expected starts with "Observer recorded close-ready evidence", got "${closeH}"`,
+  );
+
+  // 4. service_route → "Service router completed…"
+  const srH = headline("service_route", "service.route.completed", "allowed", "service-router");
+  assertFixture(
+    srH.startsWith("Service router"),
+    `headline service_route: expected starts with "Service router", got "${srH}"`,
+  );
+
+  // 5. qa_review (not in registry) → falls back to actor + lane sentence form
+  //    (not mapped → fires telemetry hook and produces generic form)
+  const qaReviewH = headline("qa_review", "qa.review.completed", "passed", "qa");
+  assertFixture(
+    typeof qaReviewH === "string" && qaReviewH.length > 0,
+    `headline qa_review: expected non-empty fallback headline, got "${qaReviewH}"`,
+  );
+
+  // 6. implementation → "Bounded worker (mf_sub) completed implementation…"
+  const implH = headline("implementation", "task_timeline_append", "passed", "mf_sub");
+  assertFixture(
+    implH.startsWith("Bounded worker (mf_sub) completed implementation"),
+    `headline implementation: expected starts with "Bounded worker (mf_sub) completed implementation", got "${implH}"`,
+  );
+
+  // 7. Generic fallback for a completely unknown kind — must produce a non-empty string
+  //    and must NOT contain the registry entry for a known kind.
+  const unknownH = headline("zz_totally_unknown_kind_9999", "zz_unknown_event_type", "recorded", "system");
+  assertFixture(
+    typeof unknownH === "string" && unknownH.length > 0,
+    `headline unknown kind: expected non-empty fallback string, got "${unknownH}"`,
+  );
+  assertFixture(
+    !unknownH.startsWith("Bounded worker (mf_sub) started"),
+    `headline unknown kind: must not borrow a known-kind headline, got "${unknownH}"`,
+  );
+
+  // 8. Unmapped-kind telemetry: projectTaskTimelineEvent with an unmapped kind must
+  //    still return a valid projection (no throw) — proves the telemetry hook fired
+  //    without crashing.
+  const projection = projectTaskTimelineEvent({
+    id: 9999,
+    event_type: "zz_unmapped_event_type_telemetry_probe",
+    event_kind: "zz_unmapped_kind_telemetry_probe",
+    phase: "test",
+    actor: "test",
+    status: "recorded",
+    created_at: "2026-06-10T00:00:00Z",
+  });
+  assertFixture(
+    projection.schema_version === "task_timeline_semantic_projection.v1",
+    "unmapped-kind telemetry: projectTaskTimelineEvent must return a valid projection without throwing",
+  );
+  assertFixture(
+    typeof projection.headline === "string" && projection.headline.length > 0,
+    "unmapped-kind telemetry: headline must be non-empty even for an unmapped kind",
+  );
+
+  return [
+    `headline mf_subagent_startup: ${startupH}`,
+    `headline verification: ${verH}`,
+    `headline close_ready: ${closeH}`,
+    `headline service_route: ${srH}`,
+    `headline qa_review (fallback): ${qaReviewH}`,
+    `headline implementation: ${implH}`,
+    `headline unknown kind (generic fallback): ${unknownH}`,
+    `headline unmapped-kind telemetry probe: ok`,
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// b. buildRelations: extraction from payload with route_lane_refs /
+//    qa_verdict_refs / parent_event_id / lane_evidence map; cap; empty payload
+// ---------------------------------------------------------------------------
+
+function taskPlaybackRelationsCoverageAssertions(): string[] {
+  // Helper: project a single event and return its relation_links.
+  function relations(event: Partial<TaskTimelineEvent>): ReturnType<typeof projectTaskTimelineEvent>["relations"] {
+    return projectTaskTimelineEvent({
+      id: 8000,
+      event_type: "test_event",
+      event_kind: "test_kind",
+      phase: "test",
+      actor: "test",
+      status: "recorded",
+      created_at: "2026-06-10T00:00:00Z",
+      ...event,
+    }).relations;
+  }
+
+  // 1. route_lane_refs in payload → extracted as event_ref relations
+  const routeLaneRels = relations({
+    payload: {
+      route_lane_refs: ["evt-lane-1", "evt-lane-2"],
+    },
+  });
+  assertFixture(
+    routeLaneRels.some((r) => r.kind === "event_ref" && r.value === "evt-lane-1"),
+    `relations route_lane_refs: expected event_ref for evt-lane-1, got ${JSON.stringify(routeLaneRels.map((r) => r.value))}`,
+  );
+  assertFixture(
+    routeLaneRels.some((r) => r.kind === "event_ref" && r.value === "evt-lane-2"),
+    `relations route_lane_refs: expected event_ref for evt-lane-2, got ${JSON.stringify(routeLaneRels.map((r) => r.value))}`,
+  );
+
+  // 2. qa_verdict_refs → extracted as event_ref relations
+  const qaVerdictRels = relations({
+    payload: {
+      qa_verdict_refs: ["verdict-101", "verdict-102"],
+    },
+  });
+  assertFixture(
+    qaVerdictRels.some((r) => r.kind === "event_ref" && r.value === "verdict-101"),
+    `relations qa_verdict_refs: expected event_ref for verdict-101`,
+  );
+
+  // 3. parent_event_id in payload → extracted as parent event event_ref
+  const parentRels = relations({
+    payload: { parent_event_id: "evt-parent-42" },
+  });
+  assertFixture(
+    parentRels.some((r) => r.kind === "event_ref" && r.value === "evt-parent-42"),
+    `relations parent_event_id: expected event_ref for evt-parent-42`,
+  );
+
+  // 4. backlog_id on event root → extracted as backlog_row relation
+  const backlogRels = relations({
+    backlog_id: "AC-TEST-RELATIONS-20260610",
+  });
+  assertFixture(
+    backlogRels.some((r) => r.kind === "backlog_row" && r.value === "AC-TEST-RELATIONS-20260610"),
+    `relations backlog_id: expected backlog_row for AC-TEST-RELATIONS-20260610`,
+  );
+
+  // 5. Cap behavior: more than 20 unique refs must be capped at 20
+  const manyRefs = Array.from({ length: 25 }, (_, i) => `evt-cap-${i}`);
+  const capRels = relations({
+    payload: {
+      source_event_ids: manyRefs,
+    },
+  });
+  assertFixture(
+    capRels.length <= 20,
+    `relations cap: expected <= 20 relations, got ${capRels.length}`,
+  );
+
+  // 6. Missing / empty payload → empty relations array
+  const emptyRels = relations({ payload: {} });
+  assertFixture(
+    Array.isArray(emptyRels),
+    "relations empty payload: expected an array",
+  );
+  // An event with only backlog_id=undefined and no payload fields should return [].
+  const noPayloadRels = relations({});
+  assertFixture(
+    Array.isArray(noPayloadRels) && noPayloadRels.length === 0,
+    `relations no payload: expected empty array, got ${noPayloadRels.length} items`,
+  );
+
+  return [
+    `relations route_lane_refs: ${routeLaneRels.length} items`,
+    `relations qa_verdict_refs: ${qaVerdictRels.length} items`,
+    `relations parent_event_id: ${parentRels.length} items`,
+    `relations backlog_id: ${backlogRels.length} items`,
+    `relations cap (${manyRefs.length} inputs → ${capRels.length} capped)`,
+    `relations empty payload: ${emptyRels.length} items`,
+    `relations no payload: ${noPayloadRels.length} items`,
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// c. TaskPlaybackFrame projection: headline + relation_links populated by
+//    normalizeTaskPlaybackTrace / projectTaskTimelineEvent path
+// ---------------------------------------------------------------------------
+
+function taskPlaybackFrameProjectionAssertions(): string[] {
+  const backlog: BacklogBug = {
+    bug_id: "AC-PLAYBACK-SEMANTICS-TEST-COVERAGE-20260610",
+    title: "Playback semantics test coverage",
+    status: "OPEN",
+    priority: "P1",
+  };
+  const events: TaskTimelineEvent[] = [
+    {
+      id: 7001,
+      event_type: "mf_subagent.startup",
+      event_kind: "mf_subagent_startup",
+      phase: "startup_gate",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: "AC-PLAYBACK-SEMANTICS-TEST-COVERAGE-20260610",
+      payload: {
+        worker_id: "mfsub-cov-test-01",
+        read_receipt_event_id: "7000",
+        route_lane_refs: ["evt-cov-lane-1"],
+      },
+      created_at: "2026-06-10T12:00:00Z",
+    },
+    {
+      id: 7002,
+      event_type: "task_timeline_append",
+      event_kind: "implementation",
+      phase: "implementation",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: "AC-PLAYBACK-SEMANTICS-TEST-COVERAGE-20260610",
+      payload: {
+        changed_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+        qa_verdict_refs: ["verdict-cov-01"],
+      },
+      created_at: "2026-06-10T12:01:00Z",
+    },
+  ];
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events, count: events.length },
+    gateResponse: null,
+    source: "governed",
+  });
+
+  assertFixture(trace.frames.length === 2, `frame projection: expected 2 frames, got ${trace.frames.length}`);
+
+  const startupFrame = trace.frames.find((f) => f.source_event_id === "#7001");
+  const implFrame = trace.frames.find((f) => f.source_event_id === "#7002");
+  assertFixture(Boolean(startupFrame), "frame projection: startup frame #7001 should exist");
+  assertFixture(Boolean(implFrame), "frame projection: implementation frame #7002 should exist");
+  if (!startupFrame || !implFrame) throw new Error("missing frame projection test frames");
+
+  // headline is populated
+  assertFixture(
+    startupFrame.headline.startsWith("Bounded worker (mf_sub) started"),
+    `frame projection: startup headline should start with "Bounded worker (mf_sub) started", got "${startupFrame.headline}"`,
+  );
+  assertFixture(
+    implFrame.headline.startsWith("Bounded worker (mf_sub) completed implementation"),
+    `frame projection: impl headline should start with "Bounded worker (mf_sub) completed implementation", got "${implFrame.headline}"`,
+  );
+
+  // relation_links are populated from payload fields
+  assertFixture(
+    startupFrame.relation_links.some((r) => r.kind === "event_ref" && r.value === "evt-cov-lane-1"),
+    "frame projection: startup relation_links should contain lane evidence event_ref",
+  );
+  assertFixture(
+    startupFrame.relation_links.some((r) => r.kind === "event_ref" && r.value === "7000"),
+    "frame projection: startup relation_links should contain read_receipt_event_id event_ref",
+  );
+  assertFixture(
+    implFrame.relation_links.some((r) => r.kind === "event_ref" && r.value === "verdict-cov-01"),
+    "frame projection: impl relation_links should contain qa_verdict_refs event_ref",
+  );
+  assertFixture(
+    startupFrame.relation_links.some((r) => r.kind === "backlog_row" && r.value === "AC-PLAYBACK-SEMANTICS-TEST-COVERAGE-20260610"),
+    "frame projection: startup relation_links should contain backlog_id backlog_row",
+  );
+
+  return [
+    `frame projection: startup headline = ${startupFrame.headline}`,
+    `frame projection: impl headline = ${implFrame.headline}`,
+    `frame projection: startup relation_links count = ${startupFrame.relation_links.length}`,
+    `frame projection: impl relation_links count = ${implFrame.relation_links.length}`,
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// d. Newest-first + follow: displayPlaybackFrames, latestPlaybackFrameId
+// ---------------------------------------------------------------------------
+
+function taskPlaybackNewestFirstAssertions(): string[] {
+  // Build a minimal fake frame for ordering tests.
+  function fakeFrame(id: string, seq: number): TaskPlaybackFrame {
+    return {
+      id,
+      sequence: seq,
+      at: `2026-06-10T12:0${seq}:00Z`,
+      lane_id: "observer",
+      source_event_id: `#${seq}`,
+      event_type: "test",
+      event_kind: "test",
+      phase: "test",
+      headline: `Frame ${id}`,
+      title: `Frame ${id}`,
+      detail: "",
+      summary: "",
+      status: "recorded",
+      actor: "test",
+      narrative: { actor: "", information: "", context: "", purpose: "", outcome: "" },
+      semantic_entry_id: "test",
+      semantic_chips: [],
+      specific_facts: [],
+      failure_diagnosis: [],
+      evidence_links: [],
+      relation_links: [],
+      detail_inspector: { rows: [], raw_sections: [], redaction_count: 0 },
+      evidence_refs: [],
+      artifact_refs: [],
+      has_structured_detail: false,
+    };
+  }
+
+  const frames = [fakeFrame("frame-a", 1), fakeFrame("frame-b", 2), fakeFrame("frame-c", 3)];
+
+  // 1. newestFirst=false → same order as input
+  const oldestFirst = displayPlaybackFrames(frames, false);
+  assertFixture(
+    oldestFirst[0].id === "frame-a" && oldestFirst[2].id === "frame-c",
+    `displayPlaybackFrames(false): expected same order, got [${oldestFirst.map((f) => f.id).join(",")}]`,
+  );
+
+  // 2. newestFirst=true → reversed order
+  const newestFirst = displayPlaybackFrames(frames, true);
+  assertFixture(
+    newestFirst[0].id === "frame-c" && newestFirst[2].id === "frame-a",
+    `displayPlaybackFrames(true): expected reversed order [frame-c,frame-b,frame-a], got [${newestFirst.map((f) => f.id).join(",")}]`,
+  );
+
+  // 3. Input not mutated
+  assertFixture(
+    frames[0].id === "frame-a",
+    "displayPlaybackFrames: input array must not be mutated",
+  );
+
+  // 4. Empty array edge case
+  const emptyDisplay = displayPlaybackFrames([], true);
+  assertFixture(emptyDisplay.length === 0, "displayPlaybackFrames: empty array should return empty array");
+
+  // 5. latestPlaybackFrameId: returns last frame's id
+  assertFixture(
+    latestPlaybackFrameId(frames) === "frame-c",
+    `latestPlaybackFrameId: expected "frame-c", got "${latestPlaybackFrameId(frames)}"`,
+  );
+
+  // 6. latestPlaybackFrameId: empty array → ""
+  assertFixture(
+    latestPlaybackFrameId([]) === "",
+    `latestPlaybackFrameId: empty array should return "", got "${latestPlaybackFrameId([])}"`,
+  );
+
+  // 7. Initial selection = frames[length-1] (newest frame in oldest-first array)
+  //    Simulate: when a trace loads, the initial selectedFrameId should point to
+  //    the newest event (latestPlaybackFrameId is the answer).
+  const traceFrames = [fakeFrame("old-1", 1), fakeFrame("old-2", 2), fakeFrame("new-3", 3)];
+  const initialId = latestPlaybackFrameId(traceFrames);
+  assertFixture(
+    initialId === "new-3",
+    `initial selection: latestPlaybackFrameId should point to newest frame "new-3", got "${initialId}"`,
+  );
+
+  return [
+    "displayPlaybackFrames(false): oldest-first order preserved",
+    "displayPlaybackFrames(true): reversed to newest-first",
+    "displayPlaybackFrames: input not mutated",
+    "displayPlaybackFrames(empty): returns []",
+    `latestPlaybackFrameId: returns last frame id (${latestPlaybackFrameId(frames)})`,
+    "latestPlaybackFrameId(empty): returns ''",
+    `initial selection: latestPlaybackFrameId = ${initialId}`,
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// e. Nav-stack: push/back/bounded(10)/missing event_ref graceful fallback
+// ---------------------------------------------------------------------------
+
+function taskPlaybackNavStackAssertions(): string[] {
+  const entry = (id: string): PlaybackNavEntry => ({ frameId: id, label: `Frame ${id}` });
+
+  // 1. Push single entry onto empty stack
+  const s1 = pushPlaybackNavStack([], entry("A"));
+  assertFixture(s1.length === 1 && s1[0].frameId === "A", `navStack push single: expected [A], got ${JSON.stringify(s1.map((e) => e.frameId))}`);
+
+  // 2. Push preserves existing entries
+  const s2 = pushPlaybackNavStack([entry("A"), entry("B")], entry("C"));
+  assertFixture(
+    s2.length === 3 && s2[2].frameId === "C",
+    `navStack push append: expected [A,B,C], got ${JSON.stringify(s2.map((e) => e.frameId))}`,
+  );
+
+  // 3. Bounded at 10 — pushing the 11th entry drops the oldest
+  let stack: PlaybackNavEntry[] = [];
+  for (let i = 1; i <= 10; i++) stack = pushPlaybackNavStack(stack, entry(`e${i}`));
+  assertFixture(stack.length === 10, `navStack bounded: expected 10 entries after 10 pushes, got ${stack.length}`);
+  const s11 = pushPlaybackNavStack(stack, entry("e11"));
+  assertFixture(
+    s11.length === 10 && s11[0].frameId === "e2" && s11[9].frameId === "e11",
+    `navStack bounded(10): after 11 pushes expected [e2..e11], got [${s11[0].frameId}..${s11[9].frameId}]`,
+  );
+
+  // 4. Pop from non-empty stack
+  const { entry: popped, stack: after } = popPlaybackNavStack([entry("X"), entry("Y"), entry("Z")]);
+  assertFixture(popped !== null && popped.frameId === "Z", `navStack pop: expected popped=Z, got ${popped?.frameId}`);
+  assertFixture(
+    after.length === 2 && after[1].frameId === "Y",
+    `navStack pop: remaining stack should be [X,Y], got ${JSON.stringify(after.map((e) => e.frameId))}`,
+  );
+
+  // 5. Back navigation: popPlaybackNavStack returns null when stack is empty (graceful fallback)
+  const { entry: noEntry, stack: emptyAfter } = popPlaybackNavStack([]);
+  assertFixture(noEntry === null, "navStack pop empty: entry should be null");
+  assertFixture(emptyAfter.length === 0, "navStack pop empty: stack should remain empty");
+
+  // 6. Missing event_ref graceful fallback: calling pop on a single-entry stack
+  //    returns that entry and leaves an empty stack (not an error)
+  const { entry: single, stack: afterSingle } = popPlaybackNavStack([entry("only")]);
+  assertFixture(single !== null && single.frameId === "only", `navStack pop single: expected "only", got ${single?.frameId}`);
+  assertFixture(afterSingle.length === 0, "navStack pop single: stack should be empty after");
+
+  // 7. Input not mutated by pushPlaybackNavStack
+  const original = [entry("orig")];
+  pushPlaybackNavStack(original, entry("new"));
+  assertFixture(original.length === 1, "navStack push: input array must not be mutated");
+
+  // 8. Input not mutated by popPlaybackNavStack
+  const orig2 = [entry("orig2")];
+  popPlaybackNavStack(orig2);
+  assertFixture(orig2.length === 1, "navStack pop: input array must not be mutated");
+
+  return [
+    "navStack push single: ok",
+    "navStack push append: ok",
+    "navStack bounded(10): ok",
+    "navStack pop: ok",
+    "navStack pop empty (graceful): ok",
+    "navStack pop single: ok",
+    "navStack push not mutating: ok",
+    "navStack pop not mutating: ok",
+  ];
+}
+
+export const taskPlaybackSemanticsCoverageFixtureSummary: string[] = [
+  ...taskPlaybackHeadlineCoverageAssertions(),
+  ...taskPlaybackRelationsCoverageAssertions(),
+  ...taskPlaybackFrameProjectionAssertions(),
+  ...taskPlaybackNewestFirstAssertions(),
+  ...taskPlaybackNavStackAssertions(),
+];

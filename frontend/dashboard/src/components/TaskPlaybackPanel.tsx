@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 
-import type { TaskPlaybackFrame, TaskPlaybackTrace } from "../lib/taskPlayback";
+import type { TaskPlaybackFrame, TaskPlaybackTrace, PlaybackNavEntry } from "../lib/taskPlayback";
+import { displayPlaybackFrames, latestPlaybackFrameId, pushPlaybackNavStack, popPlaybackNavStack } from "../lib/taskPlayback";
 import type { TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
 
 type EvidenceRef = TaskPlaybackFrame["evidence_links"][number];
@@ -14,7 +15,7 @@ type GraphTraceLookupState = {
 };
 
 /** Lightweight navigation stack entry for cross-event/backlog jumping. */
-type NavStackEntry = { frameId: string; label: string };
+type NavStackEntry = PlaybackNavEntry;
 
 interface Props {
   trace: TaskPlaybackTrace;
@@ -60,7 +61,7 @@ export default function TaskPlaybackPanel({
   // In newestFirst mode: newest event is frames[frames.length - 1] (oldest-first in
   // the underlying array). The list is displayed reversed; the "latest" is always
   // allFrames[allFrames.length - 1].
-  const latestFrameId = allFrames.length > 0 ? allFrames[allFrames.length - 1].id : "";
+  const latestFrameId = latestPlaybackFrameId(allFrames);
 
   const effectiveSelectedFrameId = selectedFrameId || internalSelectedFrameId;
   const selectedFrame =
@@ -77,13 +78,13 @@ export default function TaskPlaybackPanel({
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
 
   // In newestFirst mode: reverse the filtered list so newest events appear at top.
-  const displayFrames = newestFirst ? [...filteredFrames].reverse() : filteredFrames;
+  const displayFrames = displayPlaybackFrames(filteredFrames, newestFirst);
   const groupedFrames = groupFramesByDay(displayFrames);
 
   const selectFrame = (frameId: string, pushNav?: { fromFrameId: string; fromLabel: string }, fromUser = false) => {
     if (!frameId) return;
     if (pushNav && pushNav.fromFrameId) {
-      setNavStack((stack) => [...stack.slice(-9), { frameId: pushNav.fromFrameId, label: pushNav.fromLabel }]);
+      setNavStack((stack) => pushPlaybackNavStack(stack, { frameId: pushNav.fromFrameId, label: pushNav.fromLabel }));
     }
     onSelectFrame?.(frameId);
     if (!onSelectFrame) setInternalSelectedFrameId(frameId);
@@ -107,9 +108,9 @@ export default function TaskPlaybackPanel({
   };
 
   const navigateBack = () => {
-    const entry = navStack[navStack.length - 1];
+    const { entry, stack } = popPlaybackNavStack(navStack);
     if (!entry) return;
-    setNavStack((stack) => stack.slice(0, -1));
+    setNavStack(stack);
     onSelectFrame?.(entry.frameId);
     if (!onSelectFrame) setInternalSelectedFrameId(entry.frameId);
   };
