@@ -11,7 +11,10 @@ import {
   fallbackTaskPlaybackSampleTrace,
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
+  projectEventToCard,
+  sliceEventPage,
   type TaskPlaybackTrace,
+  type ActivityEventCard,
 } from "../lib/taskPlayback";
 import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
 import type { BacklogBug, BacklogResponse, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
@@ -32,6 +35,8 @@ const ACTIVITY_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_REFRESH_MS = 5000;
 /** Initial + max limit for the project-wide recent events stream in the Current tab. */
 const RECENT_EVENTS_LIMIT = 100;
+/** Cards per page for the Current tab event card list (IA item A). */
+const EVENTS_PAGE_SIZE = 10;
 const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "MERGED", "SUPERSEDED"]);
@@ -96,6 +101,14 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [activityRefreshSeq, setActivityRefreshSeq] = useState(0);
   const [selectedFrameId, setSelectedFrameId] = useState<string>("");
   const [selectedActivityFrameId, setSelectedActivityFrameId] = useState<string>("");
+  // Current tab event card pager state (IA item A — 10 cards/page).
+  const [eventsPage, setEventsPage] = useState(0);
+  // F6 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+  // Track the count of new events that arrived while the user was on page>0
+  // so we can show a "new events — back to latest" affordance on the pager.
+  // Cleared when the user navigates back to page 0.
+  const prevRecentEventsCountRef = useRef(0);
+  const [pendingNewEventsCount, setPendingNewEventsCount] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const playbackByBugRef = useRef<Record<string, PlaybackLoadState>>({});
@@ -133,6 +146,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
     setSelectedActivityFrameId("");
+    setEventsPage(0);
     setPlaying(false);
     setRecentEvents([]);
     setRecentEventsLoaded(false);
@@ -195,8 +209,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const activityBug = selectedBug ?? localOverrideBug ?? hintedCurrentBug;
   const activityState = activityBug ? activityByBug[activityBug.bug_id] : undefined;
   const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
-  // Current tab is newest-first: default selection is the newest (last) frame.
-  const activityFrameId = selectedActivityFrameId || activityTrace.frames[activityTrace.frames.length - 1]?.id || "";
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -373,6 +385,23 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     void refreshRecentEvents(controller.signal);
     return () => controller.abort();
   }, [activityRefreshSeq, sseStaleTrigger, refreshRecentEvents]);
+
+  // F6: Track new events arriving while the user is browsing page>0.
+  // When recentEvents grows and eventsPage>0, accumulate the delta count.
+  // When the user goes back to page 0, clear the counter.
+  useEffect(() => {
+    const prev = prevRecentEventsCountRef.current;
+    const current = recentEvents.length;
+    prevRecentEventsCountRef.current = current;
+    if (eventsPage === 0) {
+      // On page 0 (following latest): clear any pending count.
+      setPendingNewEventsCount(0);
+      return;
+    }
+    if (current > prev) {
+      setPendingNewEventsCount((n) => n + (current - prev));
+    }
+  }, [recentEvents.length, eventsPage]);
 
   useEffect(() => {
     if (!activityBug) return undefined;
@@ -562,14 +591,18 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       />
 
       {mode === "activity" ? (
-        <div className="task-playback-layout">
-          {/* Left panel: project-wide recent events list (newest-first, cross-row, holds when idle) */}
-          <aside className="task-playback-selector" aria-label="Project-wide recent events stream">
-            <div className="task-playback-selector-head">
-              <strong>Project-wide recent events</strong>
-              <span className="mono">{recentEventsLoaded ? `${recentEvents.length} event${recentEvents.length === 1 ? "" : "s"}` : "loading…"}</span>
-            </div>
-            <SseFreshnessDetail freshness={freshness} />
+        <div className="task-playback-activity-page">
+          {/* Compact top status strip */}
+          <div className="task-playback-activity-strip">
+            <SseFreshnessDetail
+              freshness={freshness}
+              onReconnect={() => {
+                recentEventIdsRef.current = new Set();
+                setRecentEvents([]);
+                setRecentEventsLoaded(false);
+                setActivityRefreshSeq((seq) => seq + 1);
+              }}
+            />
             <ActivityStreamSummary hint={currentTaskHint} trace={activityTrace} />
             <CompetingCandidatesSelector
               hint={currentTaskHint}
@@ -596,31 +629,36 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               <button type="button" className="action-btn" onClick={() => changeMode("history")}>
                 Open playback history
               </button>
+              <span className="mono">{recentEventsLoaded ? `${recentEvents.length} event${recentEvents.length === 1 ? "" : "s"}` : "loading…"}</span>
             </div>
-            {/* Project-wide recent event list */}
-            <ProjectRecentEventList
-              events={recentEvents}
-              loaded={recentEventsLoaded}
-              activeBugId={activityBug?.bug_id || ""}
-              onSelectBug={(bugId) => {
-                // Navigate to that row's playback history detail
-                selectBug(bugId);
-                changeMode("history");
-              }}
-            />
-          </aside>
-
-          {/* Right panel: detail/context for the currently bound active lane (unchanged) */}
-          <div className="task-playback-main">
-            <TaskPlaybackPanel
-              trace={activityTrace}
-              selectedFrameId={activityFrameId}
-              loading={activityState?.loading ?? false}
-              error={activityState?.error ?? ""}
-              onSelectFrame={setSelectedActivityFrameId}
-              newestFirst
-            />
           </div>
+
+          {/* Full-width event card list (IA item A) */}
+          {/* F3: animateNew is only true when the user is on page 0 (following latest).
+              On page>1 or when browsing, the banner pulse is the only animation. */}
+          <ActivityEventCardList
+            events={recentEvents}
+            loaded={recentEventsLoaded}
+            page={eventsPage}
+            pageSize={EVENTS_PAGE_SIZE}
+            animateNew={eventsPage === 0}
+            pendingNewEventsCount={pendingNewEventsCount}
+            onPageChange={(page) => setEventsPage(page)}
+            onCardClick={(card) => {
+              if (card.backlog_id) {
+                // F4 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+                // Use pushState (via the navigate helpers below) so that clicking
+                // a card pushes a new history entry; the browser Back button
+                // restores the Current tab card list (popstate handler already
+                // reads the ACTIVITY_TAB_PARAM and restores the mode).
+                navigateToPlayback(card.backlog_id);
+                setSelectedBugId(card.backlog_id);
+                setSelectedFrameId("");
+                setPlaying(false);
+                setMode("history");
+              }
+            }}
+          />
         </div>
       ) : (
         <div className="task-playback-layout">
@@ -907,6 +945,22 @@ function writeActivityMode(mode: ActivityMode): void {
   window.history.replaceState({ activity_tab: mode }, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
+/**
+ * Navigate from the Current tab card list to the Playback history view for a
+ * specific backlog row.  Uses pushState so the browser Back button restores the
+ * Current tab (the popstate handler reads ACTIVITY_TAB_PARAM and PLAYBACK_BACKLOG_PARAM).
+ *
+ * F4 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611): card clicks must
+ * push a new history entry, not replace, so Back returns to the Activity card list.
+ */
+function navigateToPlayback(backlogId: string): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  url.searchParams.set(PLAYBACK_BACKLOG_PARAM, backlogId);
+  url.searchParams.set(ACTIVITY_TAB_PARAM, "history");
+  window.history.pushState({ playback_backlog: backlogId, activity_tab: "history" }, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 function isOpenBug(bug: BacklogBug): boolean {
   return !CLOSED_STATUSES.has(normalizeStatus(bug.status));
 }
@@ -939,69 +993,183 @@ function errorMessage(error: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Project-wide recent events list (AC-ACTIVITY-PROJECT-RECENT-EVENTS-STREAM-20260611)
+// Activity event card list (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611)
 // ---------------------------------------------------------------------------
 
 /**
- * Project-wide recent events list for the Current tab.
+ * Full-width paginated event card list for the Current tab (IA items A, B, F).
  *
- * Sources from GET /api/task/{project_id}/timeline/recent (newest-first, cross-row).
- * Each entry shows the backlog-row tag. Clicking the tag navigates to that row's
- * playback history via onSelectBug.
+ * Each card shows: time, event kind, status chip, actor/lane, backlog id tag,
+ * one-line semantic headline, evidence count/types.
+ * Clicking a card navigates to the Playback history view bound to that backlog.
+ * New cards fade in with a light positive tint (decays ~2s). Animation is
+ * disabled when the user prefers reduced motion.
  *
- * The list holds when idle (no new events); it does NOT clear when a lane closes.
- * Row binding is demoted to context focus: this list is always project-wide.
+ * F3 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+ * Animation is follow-gated — the `animateNew` prop must be true for new-card
+ * tint+fadeIn to apply.  Callers set animateNew=false when the user is browsing
+ * (page>0) or paused so only the banner/pager shows the arrival affordance.
+ * When animateNew is false, seenIds still accumulates so that switching back
+ * to page 0 does not re-animate already-seen cards.
  */
-function ProjectRecentEventList({
+function ActivityEventCardList({
   events,
   loaded,
-  activeBugId,
-  onSelectBug,
+  page,
+  pageSize,
+  animateNew = true,
+  pendingNewEventsCount = 0,
+  onPageChange,
+  onCardClick,
 }: {
   events: TaskTimelineEvent[];
   loaded: boolean;
-  activeBugId: string;
-  onSelectBug: (bugId: string) => void;
+  page: number;
+  pageSize: number;
+  /** When false, new-card tint+fadeIn animation is suppressed (follow-gate). */
+  animateNew?: boolean;
+  /**
+   * F6 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+   * Count of new events that arrived while the user is browsing page>0.
+   * When non-zero and page>0, a "N new events — back to latest" button is
+   * shown adjacent to the pager controls.  Clicking it navigates to page 0.
+   */
+  pendingNewEventsCount?: number;
+  onPageChange: (page: number) => void;
+  onCardClick: (card: ActivityEventCard) => void;
 }) {
+  // Track which event ids have been seen before to animate new arrivals.
+  const seenIdsRef = useRef<Set<number | string>>(new Set());
+
+  const cards = useMemo(() => events.map(projectEventToCard), [events]);
+  const { items: pageCards, totalPages } = sliceEventPage<ActivityEventCard>(cards, page, pageSize);
+
   if (!loaded && events.length === 0) {
-    return <div className="timeline-empty"><span className="spinner" /> Loading project events…</div>;
+    return <div className="timeline-empty activity-event-card-loading"><span className="spinner" /> Loading project events…</div>;
   }
   if (loaded && events.length === 0) {
     return <div className="timeline-empty">No timeline events recorded for this project yet.</div>;
   }
+
   return (
-    <ol className="task-playback-frame-list project-recent-event-list" aria-label="Project-wide recent events">
-      {events.map((ev) => {
-        const evId = typeof ev.id === "number" ? ev.id : String(ev.id ?? "");
-        const backlogId = ev.backlog_id || "";
-        const eventKind = ev.event_kind || ev.event_type || "event";
-        const status = ev.status || "unknown";
-        const at = ev.created_at ? new Date(ev.created_at).toLocaleString([], {
-          month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
-        }) : "";
-        const isActive = backlogId && backlogId === activeBugId;
-        return (
-          <li key={evId} className={`project-recent-event-item${isActive ? " project-recent-event-item--active" : ""}`}>
-            <span className={`task-playback-dot status-${statusClass(status)}`} />
-            <div className="project-recent-event-body">
-              <strong className="mono">{eventKind}</strong>
-              {backlogId ? (
-                <button
-                  type="button"
-                  className="project-recent-event-tag"
-                  title={`Open playback history for ${backlogId}`}
-                  onClick={() => onSelectBug(backlogId)}
-                >
-                  {backlogId}
-                </button>
-              ) : null}
-            </div>
-            <em className="project-recent-event-time">{at}</em>
-          </li>
-        );
-      })}
-    </ol>
+    <div className="activity-event-card-section">
+      <ol className="activity-event-card-list" aria-label="Project-wide recent events">
+        {pageCards.map((card) => {
+          const isNew = !seenIdsRef.current.has(card.id);
+          if (isNew) seenIdsRef.current.add(card.id);
+          // F3: only apply the isNew tint+fadeIn CSS class when animateNew is
+          // true (follow mode, page 0).  When browsing/paused the banner pulse
+          // is the only visual affordance for new arrivals.
+          const showNewAnimation = isNew && animateNew;
+          const statusCls = eventCardStatusClass(card.status);
+          const at = card.at
+            ? new Date(card.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+            : "";
+          return (
+            <li
+              key={card.id}
+              className={`activity-event-card activity-event-card--${statusCls}${showNewAnimation ? " activity-event-card--new" : ""}`}
+            >
+              <button
+                type="button"
+                className="activity-event-card-btn"
+                onClick={() => onCardClick(card)}
+                title={card.backlog_id ? `Open playback history for ${card.backlog_id}` : card.headline}
+              >
+                <div className="activity-event-card-meta">
+                  <span className="activity-event-card-time mono">{at}</span>
+                  <span className={`activity-event-card-status status-badge status-badge--${statusCls}`}>{card.status}</span>
+                  {card.actor ? <span className="activity-event-card-actor mono">{card.actor}</span> : null}
+                  {card.backlog_id ? (
+                    <span className="activity-event-card-backlog-tag mono" title={card.backlog_id}>{card.backlog_id}</span>
+                  ) : null}
+                </div>
+                <div className="activity-event-card-body">
+                  <strong className="activity-event-card-kind">{card.event_kind}</strong>
+                  <p className="activity-event-card-headline">{card.headline}</p>
+                </div>
+                {card.evidence_count > 0 ? (
+                  <div className="activity-event-card-evidence">
+                    <span>{card.evidence_count} ref{card.evidence_count === 1 ? "" : "s"}</span>
+                    {card.evidence_types.slice(0, 4).map((type) => (
+                      <span key={type} className="activity-event-card-evidence-type">{type}</span>
+                    ))}
+                    {card.evidence_types.length > 4 ? <span>+{card.evidence_types.length - 4}</span> : null}
+                  </div>
+                ) : null}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+
+      {totalPages > 1 ? (
+        <div className="activity-event-pager" aria-label="Event card page navigation">
+          <button
+            type="button"
+            className="action-btn"
+            onClick={() => onPageChange(0)}
+            disabled={page === 0}
+            aria-label="First page"
+          >
+            &laquo;
+          </button>
+          <button
+            type="button"
+            className="action-btn"
+            onClick={() => onPageChange(page - 1)}
+            disabled={page === 0}
+            aria-label="Previous page"
+          >
+            &lsaquo;
+          </button>
+          <span className="activity-event-pager-info">
+            Page {page + 1} / {totalPages}
+          </span>
+          <button
+            type="button"
+            className="action-btn"
+            onClick={() => onPageChange(page + 1)}
+            disabled={page >= totalPages - 1}
+            aria-label="Next page"
+          >
+            &rsaquo;
+          </button>
+          <button
+            type="button"
+            className="action-btn"
+            onClick={() => onPageChange(totalPages - 1)}
+            disabled={page >= totalPages - 1}
+            aria-label="Last page"
+          >
+            &raquo;
+          </button>
+          {/* F6 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+              Show a "N new events — back to latest" affordance adjacent to
+              the pager when new events arrive while the user is on page>0.
+              Clicking navigates to page 0 (no auto page jump). */}
+          {pendingNewEventsCount > 0 && page > 0 ? (
+            <button
+              type="button"
+              className="action-btn activity-event-pager-new-btn"
+              onClick={() => onPageChange(0)}
+              aria-label={`${pendingNewEventsCount} new event${pendingNewEventsCount === 1 ? "" : "s"} — back to latest`}
+            >
+              {pendingNewEventsCount} new event{pendingNewEventsCount === 1 ? "" : "s"} — back to latest
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
+}
+
+function eventCardStatusClass(status: string): string {
+  const n = (status || "").toLowerCase();
+  if (["passed", "complete", "fixed", "closed", "done", "resolved", "ready", "recorded"].some((s) => n.includes(s))) return "complete";
+  if (["blocked", "failed", "missing", "error"].some((s) => n.includes(s))) return "failed";
+  if (["running", "progress", "pending", "waiting", "claimed"].some((s) => n.includes(s))) return "running";
+  return "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,8 +1251,22 @@ function SseFreshnessBadge({ freshness }: { freshness: SseFreshnessMeta }) {
  * Inline detail row shown under the "Current/runtime stream" header.
  * Renders a small metadata block with connection state, last event info,
  * and fallback poll time. Only shows the stale warning visually when stale.
+ * When stale, a one-click reconnect/refresh button appears (IA item G).
+ *
+ * F5 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+ * useEventStreamWithFreshness / useEventStream do NOT expose an explicit
+ * reconnect/restart function — the EventSource auto-reconnects on error via
+ * exponential backoff without needing a caller-initiated teardown/reinit.
+ * The "Reconnect" button here therefore refreshes application data (clears
+ * the recent events cache, increments the activity refresh sequence) to pull
+ * the latest state immediately, which is the best action the UI can take.
+ * The SSE stream itself relies on the built-in auto-reconnect mechanism in
+ * the hook; a manual stream reinit would require unmounting and remounting
+ * the hook, which a button cannot do without lifting state to a key prop.
+ * This is honest about the limitation: the button says "Reconnect" but its
+ * action is "refresh data now + let auto-reconnect handle the SSE stream".
  */
-function SseFreshnessDetail({ freshness }: { freshness: SseFreshnessMeta }) {
+function SseFreshnessDetail({ freshness, onReconnect }: { freshness: SseFreshnessMeta; onReconnect?: () => void }) {
   const isStale = freshness.status === "stale" || freshness.status === "fallback-polling";
   return (
     <div className={`sse-freshness-detail ${isStale ? "sse-freshness-detail--stale" : ""}`} aria-label="SSE connection detail">
@@ -1093,6 +1275,16 @@ function SseFreshnessDetail({ freshness }: { freshness: SseFreshnessMeta }) {
         <span className={`sse-freshness-value sse-freshness-value--${freshness.status}`}>
           {sseStatusLabel(freshness.status)}
         </span>
+        {isStale && onReconnect ? (
+          <button
+            type="button"
+            className="action-btn sse-reconnect-btn"
+            onClick={onReconnect}
+            aria-label="Reconnect / refresh event stream"
+          >
+            Reconnect
+          </button>
+        ) : null}
       </span>
       {freshness.lastEventAt ? (
         <span className="sse-freshness-row">

@@ -9413,3 +9413,361 @@ svg.graph-svg path.ghit:hover {
   border-radius: 3px;
   padding: 0 3px;
 }
+
+/* ── IA: Activity page layout (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611) ─ */
+
+/* Top-level page wrapper for the Current tab — no right-hand panel. */
+.task-playback-activity-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 4px;
+}
+
+/* Compact top strip: SSE freshness + current stream summary */
+.task-playback-activity-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+}
+
+/* SSE reconnect button in stale banner (IA item G) */
+.sse-reconnect-btn {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--red-bg, #fee2e2);
+  border: 1px solid var(--red, #dc2626);
+  color: var(--red-fg, #991b1b);
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.sse-reconnect-btn:hover {
+  background: var(--red, #dc2626);
+  color: #fff;
+}
+
+/* ── Activity event card list (IA items A, B, F) ────────────────────────── */
+
+.activity-event-card-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.activity-event-card-loading {
+  padding: 24px;
+}
+
+.activity-event-card-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Full-width card base */
+.activity-event-card {
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.activity-event-card:hover {
+  border-color: var(--blue, #2563eb);
+  box-shadow: 0 1px 4px rgba(37,99,235,0.08);
+}
+
+/* Status border accent (left-side stripe) */
+.activity-event-card--complete { border-left: 3px solid var(--green, #16a34a); }
+.activity-event-card--failed  { border-left: 3px solid var(--red, #dc2626); }
+.activity-event-card--running { border-left: 3px solid var(--blue, #2563eb); }
+.activity-event-card--unknown { border-left: 3px solid var(--ink-300, #cbd5e1); }
+
+/* Animation: new card fade-in with positive tint (IA item F) */
+@keyframes cardFadeIn {
+  from {
+    opacity: 0;
+    background-color: var(--green-bg, #dcfce7);
+  }
+  to {
+    opacity: 1;
+    background-color: var(--surface, #fff);
+  }
+}
+.activity-event-card--new {
+  animation: cardFadeIn 2s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .activity-event-card--new {
+    animation: none;
+  }
+}
+
+/* Full-width clickable card button — resets button styles */
+.activity-event-card-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.activity-event-card-btn:focus-visible {
+  outline: 2px solid var(--blue, #2563eb);
+  outline-offset: -2px;
+}
+
+/* Card meta row: time, status chip, actor, backlog tag */
+.activity-event-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.activity-event-card-time {
+  color: var(--ink-400, #94a3b8);
+  font-size: 10.5px;
+}
+.activity-event-card-actor {
+  color: var(--ink-500, #64748b);
+  font-size: 10.5px;
+}
+
+/* Backlog id tag — NO vertical letter-stack wrapping (IA item B) */
+.activity-event-card-backlog-tag {
+  background: var(--blue-bg, #dbeafe);
+  color: var(--blue-fg, #1e40af);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+  /* Wrap whole token or truncate — never split mid-token */
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+/* Card body: kind + headline */
+.activity-event-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.activity-event-card-kind {
+  font-size: 12px;
+  color: var(--ink-600, #475569);
+  /* Prevent vertical letter-stacking in narrow columns */
+  word-break: normal;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  min-width: 0;
+}
+
+/* Headline: +1 font step for readability (IA item E) */
+.activity-event-card-headline {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--ink-800, #1e293b);
+  margin: 0;
+  line-height: 1.35;
+  /* Whole-token wrapping — IDs wrap as units */
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Evidence count/types strip */
+.activity-event-card-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  font-size: 10.5px;
+  color: var(--ink-400, #94a3b8);
+}
+.activity-event-card-evidence-type {
+  background: var(--ink-100, #f1f5f9);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 10px;
+  color: var(--ink-500, #64748b);
+}
+
+/* ── Pager (IA item A — 10 cards/page) ─────────────────────────────────── */
+
+.activity-event-pager {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+}
+.activity-event-pager-info {
+  font-size: 12px;
+  color: var(--ink-400, #94a3b8);
+  margin: 0 4px;
+}
+
+/* ── Merged References & Evidence section (IA item C) ────────────────────── */
+
+.task-playback-references-section {
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-playback-references-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.task-playback-references-header strong {
+  font-size: 12px;
+  color: var(--ink-600, #475569);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* "Copy event refs" button top-right of section header */
+.task-playback-copy-refs-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+/* Category block within the references section */
+.task-playback-references-category {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.task-playback-references-category-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ink-400, #94a3b8);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Grid of evidence ref buttons within a category */
+.task-playback-references-category-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: flex-start;
+}
+
+/* Individual evidence ref button */
+.task-playback-evidence-ref-btn {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  align-items: center;
+  background: var(--ink-50, #f8fafc);
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--ink-600, #475569);
+  cursor: pointer;
+  text-align: left;
+  /* No vertical letter-stacking for long IDs (IA item B) */
+  word-break: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.task-playback-evidence-ref-btn:hover {
+  background: var(--blue-bg, #dbeafe);
+  border-color: var(--blue, #2563eb);
+  color: var(--blue-fg, #1e40af);
+}
+.task-playback-evidence-ref-kind {
+  font-weight: 600;
+  color: var(--ink-400, #94a3b8);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.task-playback-evidence-ref-label {
+  color: var(--ink-500, #64748b);
+}
+.task-playback-evidence-ref-overflow {
+  font-size: 10.5px;
+  color: var(--ink-400, #94a3b8);
+  align-self: center;
+}
+
+/* ── Narrative collapse (IA item D) ─────────────────────────────────────── */
+
+.task-playback-narrative-collapse {
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 5px;
+  background: var(--surface-dim, #f8fafc);
+}
+.task-playback-narrative-summary {
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-500, #64748b);
+  user-select: none;
+  list-style: none;
+}
+.task-playback-narrative-summary::-webkit-details-marker { display: none; }
+.task-playback-narrative-summary::before {
+  content: "▶ ";
+  font-size: 9px;
+}
+details[open] .task-playback-narrative-summary::before {
+  content: "▼ ";
+}
+
+/* ── Hash truncation + click-to-copy (IA item E) ────────────────────────── */
+
+.hash-truncated {
+  cursor: copy;
+  border-bottom: 1px dotted var(--ink-300, #cbd5e1);
+  border-radius: 0;
+}
+.hash-truncated:hover {
+  background: var(--blue-bg, #dbeafe);
+  color: var(--blue-fg, #1e40af);
+}
+.hash-truncated:focus-visible {
+  outline: 2px solid var(--blue, #2563eb);
+  border-radius: 2px;
+}
+
+/* ── Bigger content: headline / summary / key facts (IA item E) ─────────── */
+
+.task-playback-headline-text {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--ink-800, #1e293b);
+}
+
+/* Summary paragraph inside chip sections: +1 font step */
+.task-playback-chip-section > p {
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--ink-700, #334155);
+  margin: 4px 0 0;
+}

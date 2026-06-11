@@ -1913,3 +1913,195 @@ export function popPlaybackNavStack(
     stack: stack.slice(0, -1),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Activity event card helpers (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES)
+// ---------------------------------------------------------------------------
+
+/** One card in the Current-tab event card list. */
+export interface ActivityEventCard {
+  id: number | string;
+  at: string;
+  event_kind: string;
+  event_type: string;
+  status: string;
+  actor: string;
+  backlog_id: string;
+  task_id: string;
+  /** One-line semantic headline. */
+  headline: string;
+  /** Count of evidence_links in the projected frame. */
+  evidence_count: number;
+  /** Evidence kind types present (deduplicated). */
+  evidence_types: string[];
+}
+
+/**
+ * Project a raw TaskTimelineEvent to an ActivityEventCard for the Current tab
+ * event card list.
+ */
+export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard {
+  const id = typeof event.id === "number" ? event.id : String(event.id ?? "");
+  const at = (event.created_at ?? "").trim();
+  const event_kind = (event.event_kind ?? event.event_type ?? "event").trim();
+  const event_type = (event.event_type ?? "").trim();
+  const status = (event.status ?? "unknown").trim();
+  const actor = String(event.actor ?? "").trim();
+  const backlog_id = (event.backlog_id ?? "").trim();
+  const task_id = (event.task_id ?? "").trim();
+  // Build a headline from the semantic projection helper; fall back to compact
+  // event_kind / status text when the projection is unavailable.
+  let headline = "";
+  try {
+    const projection = projectTaskTimelineEvent(event, 0);
+    headline = projection.headline || projection.title || "";
+  } catch {
+    headline = `${event_kind}${status ? ` — ${status}` : ""}`;
+  }
+  if (!headline) headline = `${event_kind}${status ? ` — ${status}` : ""}`;
+  // Collect evidence types from the projected frame when available.
+  // F1 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+  // The card's evidence_count must NOT include the mandatory self-link
+  // (kind="timeline_event" whose value is the event's own display id —
+  // e.g. "#9001" or "recorded").  Showing "1 evidence" for a minimal
+  // event that carries no real references is misleading.  We count only
+  // non-self references (where value ≠ eventDisplayId of this event).
+  // The self-link stays in frame.evidence_links for the panel inspector
+  // so the raw event id is always clickable; it is just excluded from
+  // the card count so "0 refs" means "no references beyond itself".
+  let evidence_count = 0;
+  const evidence_types: string[] = [];
+  try {
+    const frame = frameFromEventPublic(event, 0);
+    // Exclude any evidence link whose value equals the event's own display id
+    // (self-references: kind=timeline_event + kind=gate both get value=source_event_id
+    // on minimal events via the semantic evidence pipeline).  Self-reference links
+    // are always inspectable in the panel; they must not inflate the card count.
+    const selfId = frame.source_event_id; // e.g. "#9001" or "recorded"
+    const nonSelfLinks = frame.evidence_links.filter(
+      (ref) => ref.value !== selfId,
+    );
+    evidence_count = nonSelfLinks.length;
+    const seen = new Set<string>();
+    for (const ref of nonSelfLinks) {
+      if (!seen.has(ref.kind)) { seen.add(ref.kind); evidence_types.push(ref.kind); }
+    }
+  } catch { /* no-op */ }
+  return { id, at, event_kind, event_type, status, actor, backlog_id, task_id, headline, evidence_count, evidence_types };
+}
+
+/**
+ * Slice a page out of an event array (zero-indexed page, size is items-per-page).
+ * Returns `{ items, totalPages, page }`.
+ */
+export function sliceEventPage<T>(
+  items: T[],
+  page: number,
+  pageSize: number,
+): { items: T[]; totalPages: number; page: number } {
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = safePage * pageSize;
+  return { items: items.slice(start, start + pageSize), totalPages, page: safePage };
+}
+
+/**
+ * Truncate a sha256/sha-prefixed hash to the form `sha256:xxxx…yyyy` for
+ * compact display. Non-hash strings are returned unchanged.
+ *
+ * Format: prefix + first 4 hex chars + `…` + last 4 hex chars.
+ * Full value should be shown only in click-to-copy / Advanced raw data.
+ */
+export function truncateHash(value: string): string {
+  if (!value) return value;
+  const trimmed = value.trim();
+  const match = /^(sha256:|sha512:|sha1:)?([0-9a-f]{8,})$/i.exec(trimmed);
+  if (!match) return trimmed;
+  const prefix = match[1] ?? "sha256:";
+  const hex = match[2];
+  if (hex.length <= 12) return trimmed;
+  return `${prefix}${hex.slice(0, 4)}…${hex.slice(-4)}`;
+}
+
+/**
+ * Reference category mapping for the merged "References & Evidence" section.
+ * Maps an evidence ref `kind` to one of 6 typed categories.
+ */
+export type ReferenceCategory =
+  | "timeline_events"
+  | "backlog_and_task"
+  | "route_and_prompt"
+  | "gate_and_verification"
+  | "commit_and_artifact"
+  | "graph_and_trace";
+
+export function categorizeEvidenceRef(kind: TaskPlaybackEvidenceRef["kind"]): ReferenceCategory {
+  switch (kind) {
+    case "timeline_event":
+    case "source_event":
+      return "timeline_events";
+    case "gate":
+    case "precheck":
+      return "gate_and_verification";
+    case "route_context":
+    case "read_receipt":
+    case "prompt_contract":
+      return "route_and_prompt";
+    case "commit":
+    case "file":
+    case "test":
+    case "artifact":
+      return "commit_and_artifact";
+    case "graph_trace":
+    case "node":
+      return "graph_and_trace";
+    case "content_sys":
+    default:
+      // Backlog/task refs are detected by value pattern (AC-…/task-…).
+      return "backlog_and_task";
+  }
+}
+
+/**
+ * Group evidence refs into the 6 typed categories.
+ * Refs with values matching backlog/task id patterns are promoted to
+ * `backlog_and_task` regardless of their `kind`.
+ */
+export function groupEvidenceRefsByCategory(
+  refs: TaskPlaybackEvidenceRef[],
+): Record<ReferenceCategory, TaskPlaybackEvidenceRef[]> {
+  const result: Record<ReferenceCategory, TaskPlaybackEvidenceRef[]> = {
+    timeline_events: [],
+    backlog_and_task: [],
+    route_and_prompt: [],
+    gate_and_verification: [],
+    commit_and_artifact: [],
+    graph_and_trace: [],
+  };
+  for (const ref of refs) {
+    const value = ref.value ?? "";
+    // Backlog rows (AC-…) and task ids (task-…/cmd-…) → backlog_and_task
+    if (/^(AC-|task-|cmd-|mq-)/i.test(value)) {
+      result.backlog_and_task.push(ref);
+    } else {
+      result[categorizeEvidenceRef(ref.kind)].push(ref);
+    }
+  }
+  return result;
+}
+
+// Helper: expose frameFromEvent for card projection (internal, not exported from module boundary).
+function frameFromEventPublic(event: TaskTimelineEvent, index: number): TaskPlaybackFrame {
+  // Re-use the internal frameFromEvent path via normalizeTaskPlaybackTrace on a
+  // single-event trace (avoids duplicating projection logic).
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "",
+    backlog: { bug_id: event.backlog_id ?? "card", title: "", status: "", priority: "P3" },
+    taskTimeline: { project_id: "", backlog_id: event.backlog_id ?? "card", events: [event], count: 1 },
+    gateResponse: null,
+    source: "governed",
+  });
+  return trace.frames[index] ?? trace.frames[0];
+}
+
+// projectTaskTimelineEvent is already imported at the top of this module.
