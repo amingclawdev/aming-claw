@@ -3341,6 +3341,10 @@ a:hover { text-decoration: underline; }
   height: 100%;
 }
 
+.task-playback-event-column {
+  min-width: 0; /* scroll behavior delivered via .task-playback-main; anchor for e2e contract */
+}
+
 .task-playback-controls {
   justify-content: space-between;
   min-height: 42px;

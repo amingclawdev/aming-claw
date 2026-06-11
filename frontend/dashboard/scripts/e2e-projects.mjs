@@ -863,7 +863,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("Current activity") && playbackViewSource.includes("Playback history"), "Activity view should expose current stream and playback history tabs");
   assert(playbackViewSource.includes("currentTaskHintFor"), "Activity view should fetch the backend current-task hint");
   assert(playbackViewSource.includes("/current-task?limit=10"), "Activity view should use the current-task API fallback");
-  assert(playbackViewSource.includes("useEventStream(projectId"), "Activity view should reuse the dashboard SSE stream");
+  assert(playbackViewSource.includes("useEventStreamWithFreshness(projectId"), "Activity view should reuse the dashboard SSE stream");
   assert(playbackViewSource.includes("isActivityLiveEvent"), "Activity view should refresh on live activity events");
   assert(playbackViewSource.includes("activityRefreshSeq"), "Activity view should bridge SSE events into immediate refreshes");
   assert(playbackViewSource.includes("task_timeline.appended"), "Activity view should refresh on task timeline append events");
