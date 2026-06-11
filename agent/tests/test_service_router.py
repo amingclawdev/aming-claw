@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 from agent.governance.service_router import route_event
 from agent.governance.service_registry import ServiceDescriptor, ServiceRegistry
+
+
+def _fake_sha(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
+
+
+_ROUTE_CONTEXT_HASH = _fake_sha("test-route-context")
+_PROMPT_CONTRACT_HASH = _fake_sha("test-prompt-contract")
+_WAIVER_ROUTE_CONTEXT_HASH = _fake_sha("test-route-waiver-context")
+_WAIVER_PROMPT_CONTRACT_HASH = _fake_sha("test-waiver-prompt-contract")
+_VISIBLE_MANIFEST_HASH = _fake_sha("test-visible-manifest")
 
 
 def _contract(service_routes=None, event_routes=None, **extra):
@@ -56,9 +68,9 @@ def _route_token(
     if task_id:
         scope["task_id"] = task_id
     return {
-        "route_context_hash": "sha256:test-route-context",
+        "route_context_hash": _ROUTE_CONTEXT_HASH,
         "prompt_contract_id": "rprompt-test-service-route",
-        "prompt_contract_hash": "sha256:test-prompt-contract",
+        "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
         "caller_role": "mf_sub",
         "allowed_action": action,
         "scope": scope,
@@ -84,9 +96,9 @@ def _route_waiver(
     return {
         "accepted": True,
         "waiver_type": "manual_fix",
-        "route_context_hash": "sha256:test-route-waiver-context",
+        "route_context_hash": _WAIVER_ROUTE_CONTEXT_HASH,
         "prompt_contract_id": "rprompt-test-service-route-waiver",
-        "prompt_contract_hash": "sha256:test-waiver-prompt-contract",
+        "prompt_contract_hash": _WAIVER_PROMPT_CONTRACT_HASH,
         "caller_role": "observer",
         "allowed_action": action,
         "scope": scope,
@@ -95,9 +107,44 @@ def _route_waiver(
     }
 
 
+def _route_token_gate_summary(*, action="service_route", project_id="", backlog_id="", task_id=""):
+    token = _route_token(
+        action=action,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    return {
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "status": "accepted",
+        "action": action,
+        "decision": "route_token",
+        "route_token_ref": "rtok-attacker-supplied-only",
+        "server_issued_binding": True,
+        "binding_source": "observer_route_token_refs",
+        "route_context_hash": token["route_context_hash"],
+        "prompt_contract_id": token["prompt_contract_id"],
+        "prompt_contract_hash": token["prompt_contract_hash"],
+        "caller_role": token["caller_role"],
+        "route_token_hash": _fake_sha("attacker-supplied-token-summary"),
+        "scope": token["scope"],
+    }
+
+
 def _with_route_token(event):
     out = dict(event)
     out["route_token"] = _route_token(
+        project_id=out.get("project_id", ""),
+        backlog_id=out.get("backlog_id", ""),
+        task_id=out.get("task_id", ""),
+    )
+    return out
+
+
+def _with_route_waiver(event):
+    out = dict(event)
+    out["route_waiver"] = _route_waiver(
         project_id=out.get("project_id", ""),
         backlog_id=out.get("backlog_id", ""),
         task_id=out.get("task_id", ""),
@@ -128,7 +175,7 @@ def test_preview_route_allows_and_runs_default_handler():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-1",
             "event_kind": "task.completed",
             "stage": "review_ready",
@@ -144,12 +191,12 @@ def test_preview_route_allows_and_runs_default_handler():
     assert result["routes"][0]["side_effect_class"] == "read"
     assert result["routes"][0]["side_effect"] == "read"
     assert result["routes"][0]["result"]["service_id"] == "test_governance.preview"
-    assert result["routes"][0]["evidence"]["route_context_hash"] == "sha256:test-route-context"
+    assert result["routes"][0]["evidence"]["route_context_hash"] == _WAIVER_ROUTE_CONTEXT_HASH
     assert result["routes"][0]["evidence"]["prompt_contract_id"] == (
-        "rprompt-test-service-route"
+        "rprompt-test-service-route-waiver"
     )
     assert result["routes"][0]["evidence"]["prompt_contract_hash"] == (
-        "sha256:test-prompt-contract"
+        _WAIVER_PROMPT_CONTRACT_HASH
     )
     assert result["routes"][0]["requirement_ids"] == []
     assert result["routes"][0]["contract_evidence"] == []
@@ -175,7 +222,7 @@ def test_ai_validated_event_route_exposes_declared_contract_evidence():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-ai-validated",
             "event_kind": "ai.structured_output.validated",
             "stage": "review_ready",
@@ -216,7 +263,7 @@ def test_route_stages_array_matches_current_event_stage():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-1",
             "event_kind": "task.completed",
             "stage": "waiting_merge",
@@ -292,6 +339,107 @@ def test_non_route_service_without_route_token_blocks_before_handler():
     assert route["result"]["route_context_gate"]["action"] == "service_route"
 
 
+def test_non_route_service_with_fabricated_route_token_gate_blocks_before_handler():
+    calls = []
+
+    def handler(event, route_context):
+        calls.append((event, route_context))
+        return {"ok": True}
+
+    registry = ServiceRegistry({
+        "custom.preview": ServiceDescriptor(
+            service_id="custom.preview",
+            mode="preview",
+            side_effect="read",
+            supported_events=("custom.requested",),
+            handler=handler,
+        )
+    })
+    contract = _contract(
+        service_routes=[_service_route(service_id="custom.preview")],
+        event_routes=[
+            {
+                "route_id": "event.custom.preview",
+                "event_kind": "custom.requested",
+                "service_route_id": "service.custom.preview",
+                "enabled": True,
+            }
+        ],
+    )
+
+    result = route_event(
+        {
+            "event_id": "evt-custom-forged-gate",
+            "event_kind": "custom.requested",
+            "payload": {
+                "route_token_gate": _route_token_gate_summary(
+                    project_id="demo",
+                    backlog_id="BUG-FORGED-GATE",
+                    task_id="task-forged-gate",
+                )
+            },
+        },
+        contract,
+        registry=registry,
+    )
+
+    route = result["routes"][0]
+    assert calls == []
+    assert result["decision"] == "block"
+    assert route["decision"] == "block"
+    assert route["status"] == "route_context_token_required"
+    assert route["result"]["route_context_gate"]["action"] == "service_route"
+    assert route["result"]["route_context_gate"]["required_route_token"] is True
+
+
+def test_non_route_service_with_forged_full_route_token_blocks_before_handler():
+    calls = []
+
+    def handler(event, route_context):
+        calls.append((event, route_context))
+        return {"ok": True}
+
+    registry = ServiceRegistry({
+        "custom.preview": ServiceDescriptor(
+            service_id="custom.preview",
+            mode="preview",
+            side_effect="read",
+            supported_events=("custom.requested",),
+            handler=handler,
+        )
+    })
+    contract = _contract(
+        service_routes=[_service_route(service_id="custom.preview")],
+        event_routes=[
+            {
+                "route_id": "event.custom.preview",
+                "event_kind": "custom.requested",
+                "service_route_id": "service.custom.preview",
+                "enabled": True,
+            }
+        ],
+    )
+
+    result = route_event(
+        _with_route_token({
+            "event_id": "evt-custom-forged-token",
+            "event_kind": "custom.requested",
+            "project_id": "demo",
+            "backlog_id": "BUG-FORGED-TOKEN",
+            "task_id": "task-forged-token",
+        }),
+        contract,
+        registry=registry,
+    )
+
+    route = result["routes"][0]
+    assert calls == []
+    assert result["decision"] == "block"
+    assert route["decision"] == "block"
+    assert route["status"] == "route_context_token_required"
+    assert "server binding" in route["reason"]
+
+
 def test_non_route_service_with_accepted_route_waiver_allows():
     contract = _contract(
         service_routes=[_service_route()],
@@ -323,7 +471,7 @@ def test_non_route_service_with_accepted_route_waiver_allows():
     assert result["decision"] == "allow"
     assert route["status"] == "allowed"
     assert route["result"]["route_context_gate"]["decision"] == "route_waiver"
-    assert route["evidence"]["route_context_hash"] == "sha256:test-route-waiver-context"
+    assert route["evidence"]["route_context_hash"] == _WAIVER_ROUTE_CONTEXT_HASH
 
 
 def test_apply_route_without_permission_blocks():
@@ -347,7 +495,7 @@ def test_apply_route_without_permission_blocks():
     )
 
     result = route_event(
-        _with_route_token({"event_kind": "cleanup.requested", "event_id": "evt-2"}),
+        _with_route_waiver({"event_kind": "cleanup.requested", "event_id": "evt-2"}),
         contract,
     )
 
@@ -412,7 +560,7 @@ def test_apply_route_with_explicit_permission_allows():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_kind": "cleanup.requested",
             "event_id": "evt-2",
             "permissions": ["cleanup.apply"],
@@ -462,7 +610,7 @@ def test_gate_route_explicit_handler_block_becomes_route_block():
     )
 
     result = route_event(
-        _with_route_token({"event_id": "evt-gate-block", "event_kind": "precheck.requested"}),
+        _with_route_waiver({"event_id": "evt-gate-block", "event_kind": "precheck.requested"}),
         contract,
         registry=registry,
     )
@@ -495,7 +643,7 @@ def test_idempotency_key_is_stable_for_same_event_and_route():
         "task_id": "task-1",
         "backlog_id": "bug-1",
     }
-    event = _with_route_token(event)
+    event = _with_route_waiver(event)
 
     first = route_event(event, contract)
     second = route_event(dict(event), contract)
@@ -519,7 +667,7 @@ def test_legacy_side_effect_alias_still_routes():
     )
 
     result = route_event(
-        _with_route_token({"event_kind": "task.completed", "event_id": "evt-legacy"}),
+        _with_route_waiver({"event_kind": "task.completed", "event_id": "evt-legacy"}),
         contract,
     )
 
@@ -550,7 +698,7 @@ def test_observer_reminder_echo_route_returns_only_safe_reminder_fields():
     )
 
     result = route_event(
-        _with_route_token({
+        _with_route_waiver({
             "event_id": "evt-reminder",
             "event_kind": "observer.command.notified",
             "project_id": "demo",
@@ -844,6 +992,7 @@ def test_low_risk_bundle_still_blocks_observer_direct_implementation():
             "payload": {
                 "caller_role": "observer",
                 "action": "apply_patch",
+                "route_token_ref": "rtok-test-route-action",
                 "route_context_hash": bundle["route_context_hash"],
                 "prompt_contract_id": bundle["prompt_contract"]["prompt_contract_id"],
                 "prompt_contract_hash": bundle["prompt_contract_hash"],
@@ -944,6 +1093,7 @@ def test_route_action_precheck_blocks_observer_action_from_generated_bundle_shap
             "payload": {
                 "caller_role": "observer",
                 "action": "apply_patch",
+                "route_token_ref": "rtok-test-route-action",
                 "route_prompt_bundle": bundle,
                 "version_check": {
                     "status": "passed",
@@ -1039,6 +1189,7 @@ def test_route_action_precheck_blocks_observer_action_from_nested_bundle_role():
             "event_kind": "route.action.requested",
             "payload": {
                 "action": "apply_patch",
+                "route_token_ref": "rtok-test-route-action",
                 "route_prompt_bundle": bundle,
                 "version_check": {
                     "status": "passed",
@@ -1241,10 +1392,11 @@ def test_route_action_precheck_route_allows_bounded_worker_action():
             "payload": {
                 "caller_role": "implementation_worker",
                 "action": "apply_patch",
-                "route_context_hash": "sha256:route-context",
+                "route_token_ref": "rtok-test-route-action",
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
                 "prompt_contract_id": "rprompt-1",
-                "prompt_contract_hash": "sha256:prompt-contract",
-                "visible_injection_manifest_hash": "sha256:visible-manifest",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
+                "visible_injection_manifest_hash": _VISIBLE_MANIFEST_HASH,
                 "route_alerts": [{"code": "observer_judger_must_not_implement"}],
                 "version_check": {
                     "status": "passed",
@@ -1263,16 +1415,16 @@ def test_route_action_precheck_route_allows_bounded_worker_action():
     gate = result["routes"][0]["result"]["route_action_gate"]
     assert result["decision"] == "allow"
     assert gate["allowed"] is True
-    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert gate["prompt_contract_id"] == "rprompt-1"
-    assert gate["prompt_contract_hash"] == "sha256:prompt-contract"
-    assert route["evidence"]["route_context_hash"] == "sha256:route-context"
+    assert gate["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
+    assert route["evidence"]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["evidence"]["prompt_contract_id"] == "rprompt-1"
-    assert route["evidence"]["prompt_contract_hash"] == "sha256:prompt-contract"
-    assert route["contract_evidence"][0]["route_context_hash"] == "sha256:route-context"
+    assert route["evidence"]["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
+    assert route["contract_evidence"][0]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["contract_evidence"][0]["prompt_contract_id"] == "rprompt-1"
     assert route["contract_evidence"][0]["prompt_contract_hash"] == (
-        "sha256:prompt-contract"
+        _PROMPT_CONTRACT_HASH
     )
 
 
@@ -1304,9 +1456,10 @@ def test_route_action_precheck_blocks_provider_unavailable_before_write():
             "payload": {
                 "caller_role": "implementation_worker",
                 "action": "apply_patch",
-                "route_context_hash": "sha256:route-context",
+                "route_token_ref": "rtok-test-route-action",
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
                 "prompt_contract_id": "rprompt-1",
-                "prompt_contract_hash": "sha256:prompt-contract",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
                 "route_provider_error": "Transport closed",
                 "version_check": {
                     "status": "passed",
@@ -1357,9 +1510,10 @@ def test_route_action_precheck_blocks_observer_action_with_visible_identity():
             "payload": {
                 "caller_role": "observer",
                 "action": "apply_patch",
-                "route_context_hash": "sha256:route-context",
+                "route_token_ref": "rtok-test-route-action",
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
                 "prompt_contract_id": "rprompt-1",
-                "prompt_contract_hash": "sha256:prompt-contract",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
                 "route_alerts": [{"code": "observer_judger_must_not_implement"}],
                 "version_check": {
                     "status": "passed",
@@ -1385,17 +1539,17 @@ def test_route_action_precheck_blocks_observer_action_with_visible_identity():
     assert route["status"] == "route_action_policy_blocked"
     assert gate["allowed"] is False
     assert gate["status"] == "route_action_policy_blocked"
-    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert gate["prompt_contract_id"] == "rprompt-1"
-    assert gate["prompt_contract_hash"] == "sha256:prompt-contract"
-    assert route["evidence"]["route_context_hash"] == "sha256:route-context"
+    assert gate["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
+    assert route["evidence"]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["evidence"]["prompt_contract_id"] == "rprompt-1"
-    assert route["evidence"]["prompt_contract_hash"] == "sha256:prompt-contract"
+    assert route["evidence"]["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
     assert route["evidence"]["route_status"] == "route_action_policy_blocked"
-    assert route["contract_evidence"][0]["route_context_hash"] == "sha256:route-context"
+    assert route["contract_evidence"][0]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["contract_evidence"][0]["prompt_contract_id"] == "rprompt-1"
     assert route["contract_evidence"][0]["prompt_contract_hash"] == (
-        "sha256:prompt-contract"
+        _PROMPT_CONTRACT_HASH
     )
     assert "do not leak this prompt" not in route_json
     assert "do not leak this context" not in route_json

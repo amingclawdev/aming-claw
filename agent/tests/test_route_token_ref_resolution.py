@@ -46,6 +46,7 @@ from agent.governance.observer_route_context import (
     persist_route_token_ref,
     resolve_route_token_ref,
     supersede_route_token_ref,
+    verify_route_token_binding,
 )
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
@@ -65,7 +66,7 @@ _TARGET_FILES = [
     "agent/governance/task_timeline.py",
     "agent/governance/server.py",
 ]
-_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _make_token(**overrides: Any) -> dict[str, Any]:
@@ -180,6 +181,18 @@ class TestRefPersistence(unittest.TestCase):
         ref = _orc.derive_route_token_ref(token)
         self.assertTrue(ref.startswith("rtok-"), f"unexpected ref: {ref!r}")
         self.assertGreater(len(ref), 5)
+
+    def test_same_identity_reissue_gets_fresh_ref(self) -> None:
+        """Same route identity reissued later must not collide at persist time."""
+        first = _make_token(now=_NOW)
+        later = _make_token(now=_NOW.replace(hour=13))
+
+        self.assertEqual(first["route_id"], later["route_id"])
+        self.assertNotEqual(first["issued_at"], later["issued_at"])
+        self.assertNotEqual(
+            _orc.derive_route_token_ref(first),
+            _orc.derive_route_token_ref(later),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +358,97 @@ class TestUnknownRef(unittest.TestCase):
                 backlog_id=_BACKLOG,
                 task_id=_TASK,
             )
+
+
+class TestFullTokenServerBinding(unittest.TestCase):
+    def test_full_token_without_embedded_ref_accepts_identity_digest_match(self) -> None:
+        token = _make_token(now=_NOW)
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        verified = verify_route_token_binding(
+            conn,
+            project_id=_PROJECT,
+            token=token,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+            now=_NOW.replace(minute=1),
+        )
+
+        self.assertTrue(verified["server_issued_binding"])
+        self.assertEqual(verified["route_token_ref"], ref)
+
+    def test_root_scoped_full_token_accepts_worker_request_task_id(self) -> None:
+        token = _make_token(now=_NOW)
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        verified = verify_route_token_binding(
+            conn,
+            project_id=_PROJECT,
+            token=token,
+            backlog_id=_BACKLOG,
+            task_id="worker-task-under-same-backlog",
+            now=_NOW.replace(minute=1),
+        )
+
+        self.assertTrue(verified["server_issued_binding"])
+        self.assertEqual(verified["scope"]["task_id"], _TASK)
+
+    def test_forged_full_token_without_registry_row_is_refused(self) -> None:
+        token = _make_token(now=_NOW)
+        conn = _make_conn()
+
+        with self.assertRaises(RouteTokenRefError) as cm:
+            verify_route_token_binding(
+                conn,
+                project_id=_PROJECT,
+                token=token,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW.replace(minute=1),
+            )
+        self.assertIn("no active", str(cm.exception))
+
+    def test_full_token_allowed_actions_superset_is_refused(self) -> None:
+        token = _make_token(now=_NOW, allowed_actions=["task_timeline_append"])
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        forged = dict(token)
+        forged["allowed_actions"] = [*token["allowed_actions"], "backlog_close"]
+        with self.assertRaises(RouteTokenRefError) as cm:
+            verify_route_token_binding(
+                conn,
+                project_id=_PROJECT,
+                token=forged,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW.replace(minute=1),
+            )
+        self.assertIn("allowed_actions exceed", str(cm.exception))
+
+    def test_full_token_digest_mismatch_is_refused(self) -> None:
+        token = _make_token(now=_NOW)
+        ref = _orc.derive_route_token_ref(token)
+        conn = _make_conn()
+        persist_route_token_ref(conn, project_id=_PROJECT, route_token_ref=ref, token=token)
+
+        forged = dict(token)
+        forged["evidence_refs"] = [*token["evidence_refs"], "timeline:forged-extra"]
+        with self.assertRaises(RouteTokenRefError) as cm:
+            verify_route_token_binding(
+                conn,
+                project_id=_PROJECT,
+                token=forged,
+                backlog_id=_BACKLOG,
+                task_id=_TASK,
+                now=_NOW.replace(minute=1),
+            )
+        self.assertIn("digest mismatch", str(cm.exception))
 
 
 # ---------------------------------------------------------------------------

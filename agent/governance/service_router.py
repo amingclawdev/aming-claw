@@ -33,6 +33,9 @@ ROUTE_CONTEXT_GATE_EXEMPT_SERVICE_IDS = {
     "route.prompt_alert_bundle",
     "route.action_precheck",
 }
+_TRUSTED_ROUTE_TOKEN_BINDING_KEY = "_service_router_trusted_route_token_binding"
+_TRUSTED_ROUTE_TOKEN_BINDING_MARKER_KEY = "_service_router_trusted_route_token_binding_marker"
+_TRUSTED_ROUTE_TOKEN_BINDING_MARKER = object()
 _ROUTE_CONTEXT_GATE_KEYS = (
     "route_token",
     "route_waiver",
@@ -85,7 +88,10 @@ def route_timeline_event(
             "routes": [],
         }
 
-    router_event = _normalize_timeline_event(timeline_event)
+    router_event = _with_trusted_route_token_binding(
+        conn,
+        _normalize_timeline_event(timeline_event),
+    )
     result = route_event(
         router_event,
         contract,
@@ -394,13 +400,19 @@ def _validate_service_route_context_gate(
     if service_id in ROUTE_CONTEXT_GATE_EXEMPT_SERVICE_IDS:
         return {"allowed": True, "status": "exempt", "action": SERVICE_ROUTE_CONTEXT_GATE_ACTION}
     payload = _route_context_gate_payload(event)
+    full_token_supplied = payload.get("route_token") not in (None, "", {}, [])
+    trusted_binding = {}
+    if event.get(_TRUSTED_ROUTE_TOKEN_BINDING_MARKER_KEY) is _TRUSTED_ROUTE_TOKEN_BINDING_MARKER:
+        trusted_binding = _mapping(event.get(_TRUSTED_ROUTE_TOKEN_BINDING_KEY))
     try:
         gate = validate_route_token_mutation_gate(
             payload,
             action=SERVICE_ROUTE_CONTEXT_GATE_ACTION,
             project_id=_event_scope_value(event, "project_id"),
             backlog_id=_event_scope_value(event, "backlog_id"),
-            task_id=_event_scope_value(event, "task_id"),
+            task_id="",
+            require_server_binding=full_token_supplied,
+            server_binding=trusted_binding if full_token_supplied else None,
         )
     except MfSubagentContractError as exc:
         return {
@@ -446,6 +458,122 @@ def _with_route_context_identity(
         if value:
             out[key] = value
     return out
+
+
+def _with_trusted_route_token_binding(
+    conn: sqlite3.Connection,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach registry-proven binding evidence for durable timeline routing.
+
+    Caller payloads may contain redacted ``route_token_gate`` summaries for
+    storage/evidence, but those summaries are not authorization.  This helper
+    uses the durable governance DB to verify a full token or resolve a ref, then
+    passes the resulting binding through an internal event field consumed by the
+    service-route gate.
+    """
+    from . import observer_route_context as _orc
+
+    payload = _route_context_gate_payload(event)
+    project_id = _event_scope_value(event, "project_id")
+    backlog_id = _event_scope_value(event, "backlog_id")
+    if not project_id:
+        return dict(event)
+
+    token = _route_token_mapping(payload.get("route_token"))
+    route_token_ref = _route_token_ref_locator(event, token)
+    if token:
+        try:
+            binding = _orc.verify_route_token_binding(
+                conn,
+                project_id=project_id,
+                token=token,
+                route_token_ref=route_token_ref,
+                backlog_id=backlog_id,
+                task_id="",
+                route_id=_string(token.get("route_id")),
+                route_context_hash=_string(token.get("route_context_hash")),
+                prompt_contract_id=_string(token.get("prompt_contract_id")),
+            )
+        except _orc.RouteTokenRefError:
+            return dict(event)
+        out = dict(event)
+        out[_TRUSTED_ROUTE_TOKEN_BINDING_KEY] = {
+            **dict(binding),
+            "server_issued_binding": True,
+            "binding_source": "observer_route_token_refs",
+        }
+        out[_TRUSTED_ROUTE_TOKEN_BINDING_MARKER_KEY] = _TRUSTED_ROUTE_TOKEN_BINDING_MARKER
+        return out
+
+    if not route_token_ref:
+        return dict(event)
+
+    gate = _route_token_gate_summary(event)
+    try:
+        resolved = _orc.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id="",
+            route_id=_string(gate.get("route_id")),
+            route_context_hash=_string(gate.get("route_context_hash")),
+        )
+    except _orc.RouteTokenRefError:
+        return dict(event)
+    if not resolved:
+        return dict(event)
+
+    out = dict(event)
+    out_payload = dict(_mapping(out.get("payload")))
+    out_payload["route_token"] = resolved
+    out["payload"] = out_payload
+    out["route_token"] = resolved
+    out[_TRUSTED_ROUTE_TOKEN_BINDING_KEY] = {
+        **dict(resolved),
+        "server_issued_binding": True,
+        "binding_source": "observer_route_token_refs",
+    }
+    out[_TRUSTED_ROUTE_TOKEN_BINDING_MARKER_KEY] = _TRUSTED_ROUTE_TOKEN_BINDING_MARKER
+    return out
+
+
+def _route_token_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        value = parsed
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _route_token_gate_summary(event: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _mapping(event.get("payload"))
+    gate = event.get("route_token_gate")
+    if gate in (None, "", {}, []):
+        gate = payload.get("route_token_gate")
+    return dict(gate) if isinstance(gate, Mapping) else {}
+
+
+def _route_token_ref_locator(
+    event: Mapping[str, Any],
+    token: Mapping[str, Any] | None = None,
+) -> str:
+    payload = _mapping(event.get("payload"))
+    gate = _route_token_gate_summary(event)
+    candidates = (
+        event.get("route_token_ref"),
+        payload.get("route_token_ref"),
+        (token or {}).get("route_token_ref") if isinstance(token, Mapping) else "",
+        gate.get("route_token_ref") if gate.get("server_issued_binding") is True else "",
+    )
+    for candidate in candidates:
+        ref = _string(candidate)
+        if ref:
+            return ref
+    return ""
 
 
 def _with_route_context_gate_result(
