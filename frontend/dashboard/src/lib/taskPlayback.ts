@@ -1960,13 +1960,30 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
   }
   if (!headline) headline = `${event_kind}${status ? ` — ${status}` : ""}`;
   // Collect evidence types from the projected frame when available.
+  // F1 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611):
+  // The card's evidence_count must NOT include the mandatory self-link
+  // (kind="timeline_event" whose value is the event's own display id —
+  // e.g. "#9001" or "recorded").  Showing "1 evidence" for a minimal
+  // event that carries no real references is misleading.  We count only
+  // non-self references (where value ≠ eventDisplayId of this event).
+  // The self-link stays in frame.evidence_links for the panel inspector
+  // so the raw event id is always clickable; it is just excluded from
+  // the card count so "0 refs" means "no references beyond itself".
   let evidence_count = 0;
   const evidence_types: string[] = [];
   try {
     const frame = frameFromEventPublic(event, 0);
-    evidence_count = frame.evidence_links.length;
+    // Exclude any evidence link whose value equals the event's own display id
+    // (self-references: kind=timeline_event + kind=gate both get value=source_event_id
+    // on minimal events via the semantic evidence pipeline).  Self-reference links
+    // are always inspectable in the panel; they must not inflate the card count.
+    const selfId = frame.source_event_id; // e.g. "#9001" or "recorded"
+    const nonSelfLinks = frame.evidence_links.filter(
+      (ref) => ref.value !== selfId,
+    );
+    evidence_count = nonSelfLinks.length;
     const seen = new Set<string>();
-    for (const ref of frame.evidence_links) {
+    for (const ref of nonSelfLinks) {
       if (!seen.has(ref.kind)) { seen.add(ref.kind); evidence_types.push(ref.kind); }
     }
   } catch { /* no-op */ }

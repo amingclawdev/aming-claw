@@ -722,6 +722,16 @@ function ReferencesAndEvidenceSection({
   );
 }
 
+/**
+ * Returns true when a fact value looks like a sha256/sha-prefixed hash or
+ * a bare 64-hex string.  These should render truncated (click-to-copy) instead
+ * of as a raw StatusWordText so long sha256 hashes do not overflow the card.
+ * F2 (AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611).
+ */
+function isHashValue(value: string): boolean {
+  return /^(sha256:|sha512:|sha1:)?[0-9a-f]{48,}$/i.test(value.trim());
+}
+
 function StructuredFactSection({ title, facts }: { title: string; facts: TaskPlaybackFrame["specific_facts"] }) {
   if (facts.length === 0) return null;
   return (
@@ -730,7 +740,10 @@ function StructuredFactSection({ title, facts }: { title: string; facts: TaskPla
       <div>
         {facts.slice(0, 10).map((fact) => (
           <span key={`${fact.label}:${fact.value}`}>
-            {fact.label}: <StatusWordText text={fact.value} />
+            {fact.label}:{" "}
+            {isHashValue(fact.value)
+              ? <TruncatedHashSpan value={fact.value} mono />
+              : <StatusWordText text={fact.value} />}
           </span>
         ))}
         {facts.length > 10 ? <em>+{facts.length - 10}</em> : null}
