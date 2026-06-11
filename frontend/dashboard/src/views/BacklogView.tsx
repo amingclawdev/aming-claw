@@ -5,8 +5,10 @@ import {
   projectGateMatrix,
   sanitizePublicTimelineText,
   sanitizeTimelineInspectorValue,
+  semanticLaneLabel,
 } from "../lib/taskTimelineSemantics";
-import type { GateMatrixRow, GateMatrixProjection } from "../lib/taskTimelineSemantics";
+import type { GateMatrixRow, GateMatrixProjection, TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
+import { ReferencesAndEvidenceSection, EventSemanticDetail } from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
   BacklogResponse,
@@ -45,12 +47,8 @@ function playbackHref(projectId: string): string {
   return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history`;
 }
 
-function activityHref(projectId: string, backlogId: string): string {
-  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=activity&playback_backlog=${encodeURIComponent(backlogId)}`;
-}
-
 function playbackDetailHref(projectId: string, backlogId: string): string {
-  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history&playback_backlog=${encodeURIComponent(backlogId)}`;
+  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=activity&playback_backlog=${encodeURIComponent(backlogId)}`;
 }
 
 export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
@@ -484,8 +482,6 @@ export default function BacklogView({ backlog, projectId }: Props) {
                     key={bug.bug_id}
                     bug={bug}
                     projectId={projectId}
-                    timeline={timelineByBug[bug.bug_id]}
-                    onLoadTimeline={() => loadTimeline(bug.bug_id, false)}
                     onOpenDetail={() => openDetail(bug.bug_id)}
                   />
                 ))}
@@ -515,14 +511,10 @@ export default function BacklogView({ backlog, projectId }: Props) {
 function BacklogRow({
   bug,
   projectId,
-  timeline,
-  onLoadTimeline,
   onOpenDetail,
 }: {
   bug: BacklogBug;
   projectId: string;
-  timeline?: TimelineState;
-  onLoadTimeline: () => void;
   onOpenDetail: () => void;
 }) {
   const files = listFrom(bug.target_files);
@@ -558,18 +550,9 @@ function BacklogRow({
           >
             Open detail
           </button>
-          <a className="backlog-detail-link" href={activityHref(projectId, bug.bug_id)} aria-label={`Open activity for ${bug.bug_id}`}>
-            Open activity
-          </a>
           <a className="backlog-detail-link" href={playbackDetailHref(projectId, bug.bug_id)} aria-label={`Open playback for ${bug.bug_id}`}>
             Open playback
           </a>
-          <button type="button" className="timeline-toggle off" onClick={onLoadTimeline}>
-            {timeline?.loading ? "Loading status" : timeline?.loaded && !timeline.error ? "Timeline status" : "Check timeline"}
-            {timeline?.loaded && !timeline.error ? (
-              <span className="timeline-toggle-count">{timeline.count ?? timeline.events.length}</span>
-            ) : null}
-          </button>
           {bug.details_md ? <div className="backlog-details">{truncate(bug.details_md, 220)}</div> : null}
           {criteria.length > 0 ? (
             <div className="backlog-criteria">
@@ -779,7 +762,7 @@ function BacklogDetailModal({
                               className={`backlog-dag-node status-${node.status} ${selectedNode?.id === node.id ? "selected" : ""}`}
                               style={{ gridColumn: `${node.phaseIndex + 1} / span 1` }}
                               onClick={() => setSelectedNodeId(node.id)}
-                              title={node.inferred ? "Lane/phase inferred from event fields" : node.label}
+                              title={node.inferred ? `Lane/phase inferred — ${node.headline}` : node.headline}
                             >
                               <span>{node.label}</span>
                               <em>{node.statusLabel}</em>
@@ -794,7 +777,7 @@ function BacklogDetailModal({
               ) : null}
             </div>
 
-            <EvidenceInspector node={selectedNode} />
+            <EvidenceInspector node={selectedNode} projectId={projectId} onJumpToBacklog={onSelectRelated} />
           </div>
         ) : (
           <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} matrix={gateMatrix} backlogId={fallbackBugId} projectId={projectId} acceptanceCriteria={listFrom(bug?.acceptance_criteria)} />
@@ -961,26 +944,19 @@ function ArtifactPills({ summary, compact = false }: { summary: EventArtifactSum
   );
 }
 
-function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
+function EvidenceInspector({
+  node,
+  projectId,
+  onJumpToBacklog,
+}: {
+  node: TimelineDagNode | null;
+  projectId?: string;
+  onJumpToBacklog?: (backlogId: string) => void;
+}) {
   const event = node?.event;
   const semantic = event ? projectTaskTimelineEvent(event) : null;
   const artifacts = event ? timelineEventArtifacts(event) : emptyArtifactSummary();
   const routeEvidenceCards = event ? buildRouteEvidenceCards(event) : [];
-  const rows = stableInspectorRows([
-    { label: "event_type", value: event?.event_type },
-    { label: "event_kind", value: event?.event_kind },
-    { label: "actor", value: event?.actor },
-    { label: "display_actor", value: event ? displayActorForEvent(event) : "" },
-    { label: "raw_lane", value: event ? rawLaneKeyForEvent(event) : node?.rawLane },
-    { label: "phase", value: semantic?.phase_label ?? event?.phase },
-    { label: "status", value: semantic?.status_label ?? event?.status ?? node?.statusLabel },
-    { label: "created_at", value: event?.created_at },
-    { label: "commit_sha", value: event?.commit_sha },
-    { label: "backlog_id", value: event?.backlog_id },
-    { label: "task_id", value: event?.task_id },
-    { label: "attempt_num", value: event?.attempt_num },
-    ...(semantic?.inspector.rows ?? []),
-  ]);
   const fallbackVerification = sanitizeTimelineInspectorValue(event?.verification ?? node?.syntheticVerification ?? {});
   const fallbackArtifacts = sanitizeTimelineInspectorValue(event?.artifact_refs ?? {});
   const fallbackPayload = sanitizeTimelineInspectorValue(event?.payload ?? node?.syntheticPayload ?? {});
@@ -991,6 +967,33 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
   ];
   const redactionCount = semantic?.inspector.redaction_count
     ?? fallbackVerification.redaction_count + fallbackArtifacts.redaction_count + fallbackPayload.redaction_count;
+
+  // Build a minimal frame-compatible shim so EventSemanticDetail can render the
+  // shared L1/L2/L3 layered detail (AC-4: same component in both surfaces).
+  const eventSemanticFrame = event && semantic ? {
+    headline: semantic.headline,
+    actor: semantic.actor_label,
+    lane_id: semantic.lane_id,
+    event_type: event.event_type,
+    phase: semantic.phase_label,
+    source_event_id: String(event.event_id ?? event.id ?? ""),
+    summary: semantic.narrative.information,
+    specific_facts: semantic.chips.map((chip) => ({
+      kind: chip.kind,
+      label: chip.label,
+      value: chip.value,
+      source: "semantic" as const,
+    })),
+    failure_diagnosis: semantic.inspector.rows
+      .filter((row) => /block|fail|miss|error/i.test(`${row.label} ${row.value}`))
+      .map((row) => ({
+        kind: "detail",
+        label: row.label,
+        value: String(row.value ?? ""),
+        source: "semantic" as const,
+      })),
+  } : null;
+
   return (
     <div className="backlog-evidence-inspector">
       <div className="backlog-modal-section-head">
@@ -999,25 +1002,58 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
       </div>
       {node ? (
         <>
-          <div className="backlog-inspector-grid">
-            {rows.map((row) => (
-              <div key={`${row.label}:${row.value}`}>
-                <span>{row.label}</span>
-                <strong className="mono">{row.value == null || row.value === "" ? "-" : String(row.value)}</strong>
-              </div>
-            ))}
-            {redactionCount > 0 ? (
-              <div>
-                <span>redactions</span>
-                <strong className="mono">{redactionCount}</strong>
-              </div>
-            ) : null}
-          </div>
+          {/* AC-4: shared EventSemanticDetail (L1 headline, L2 summary, L3 facts/blockers) */}
+          {eventSemanticFrame ? <EventSemanticDetail frame={eventSemanticFrame} /> : null}
           <ArtifactPills summary={artifacts} />
           {routeEvidenceCards.length > 0 ? <RouteEvidenceCards cards={routeEvidenceCards} /> : null}
+          {/* F5: ReferencesAndEvidenceSection with real handlers */}
+          {(semantic?.relations ?? []).length > 0 ? (
+            <ReferencesAndEvidenceSection
+              relations={(semantic?.relations ?? []) as TaskTimelineSemanticRelation[]}
+              links={[]}
+              frames={[]}
+              onJump={(frameId) => {
+                // Jump to the backlog row whose id matches (cross-backlog navigation)
+                if (onJumpToBacklog) {
+                  onJumpToBacklog(frameId);
+                } else if (projectId) {
+                  // Navigate to the playback deep-link for this backlog id
+                  window.history.pushState(
+                    {},
+                    "",
+                    playbackDetailHref(projectId, frameId),
+                  );
+                  window.dispatchEvent(new PopStateEvent("popstate"));
+                }
+              }}
+              onInspect={(ref) => {
+                // Navigate to the playback deep-link for the backlog row referenced.
+                // ref.kind is a narrow literal union; cast to string for future-proof comparison.
+                const refKind = ref.kind as string;
+                if (projectId && ref.value && (refKind === "backlog_row" || refKind === "backlog")) {
+                  window.history.pushState(
+                    {},
+                    "",
+                    playbackDetailHref(projectId, ref.value),
+                  );
+                  window.dispatchEvent(new PopStateEvent("popstate"));
+                } else if (onJumpToBacklog && ref.value) {
+                  onJumpToBacklog(ref.value);
+                }
+              }}
+              frameId={String(event?.event_id ?? event?.id ?? "")}
+            />
+          ) : null}
+          {/* Hashes / raw payload stay collapsed per AC-4 */}
           <details className="backlog-inspector-raw">
             <summary>Inspect public timeline details</summary>
             <div className="backlog-inspector-json">
+              {redactionCount > 0 ? (
+                <div>
+                  <span>redactions</span>
+                  <strong className="mono">{redactionCount}</strong>
+                </div>
+              ) : null}
               {rawSections.map((section) => (
                 <div key={section.label}>
                   <span>{section.redacted ? `${section.label} redacted` : section.label}</span>
@@ -1032,19 +1068,6 @@ function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
       )}
     </div>
   );
-}
-
-function stableInspectorRows(rows: Array<{ label: string; value: unknown }>): Array<{ label: string; value: unknown }> {
-  const seen = new Set<string>();
-  return rows.filter((row) => {
-    if (row.value == null || row.value === "") return false;
-    const safeValue = sanitizePublicTimelineText(String(row.value));
-    const key = `${row.label}:${safeValue}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    row.value = safeValue;
-    return true;
-  }).slice(0, 32);
 }
 
 interface RouteEvidenceCard {
@@ -2226,7 +2249,10 @@ interface TimelineDagLane {
 
 interface TimelineDagNode {
   id: string;
+  /** L1 display label (truncated headline for card). */
   label: string;
+  /** Full headline sentence for hover title. */
+  headline: string;
   lane: string;
   rawLane: string;
   phase: string;
@@ -2275,9 +2301,13 @@ function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], _
     const semantic = projectTaskTimelineEvent(event, index);
     const phase = phaseLabelForEvent(event, index);
     const lane = timelineLaneIdForEvent(event, laneContext);
+    // AC-2: use registry headline as L1; truncate for card, keep full for hover.
+    const fullHeadline = semantic.headline || timelineNodeLabel(event, index);
+    const truncatedLabel = fullHeadline.length > 52 ? `${fullHeadline.slice(0, 49)}…` : fullHeadline;
     const eventNode: TimelineDagNode = {
       id: `event:${timelineEventKey(event, index)}`,
-      label: timelineNodeLabel(event, index),
+      label: truncatedLabel,
+      headline: fullHeadline,
       lane,
       rawLane: rawLaneKeyForEvent(event),
       phase,
@@ -2448,13 +2478,20 @@ function timelineLaneDisplayLabel(id: string, context: TimelineLaneContext): str
   for (const alias of context.workerAliases.values()) {
     if (id === `worker_${cssToken(alias)}`) return `Subagents / Workers · ${alias}`;
   }
-  return id.startsWith("worker_") ? `Subagents / Workers · ${titleizeLane(id.replace(/^worker_/, ""))}` : titleizeLane(id);
+  if (id.startsWith("worker_")) return `Subagents / Workers · ${titleizeLane(id.replace(/^worker_/, ""))}`;
+  const semantic = semanticLaneLabel(id);
+  if (semantic) return semantic;
+  return titleizeLane(id);
 }
 
 function rawWorkerKeyForEvent(event: TaskTimelineEvent): string {
   const payload = asRecord(event.payload);
   const verification = asRecord(event.verification);
   return (
+    // worker_slot_id is the stable per-worker identity — check it first so
+    // receipt/startup/implementation events all collapse into the same lane.
+    stringField(payload, "worker_slot_id") ||
+    stringField(verification, "worker_slot_id") ||
     stringField(payload, "worker_id") ||
     stringField(payload, "agent_id") ||
     stringField(payload, "parallel_agent_id") ||

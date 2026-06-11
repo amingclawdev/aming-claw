@@ -716,6 +716,33 @@ function laneLabel(id: TaskTimelineSemanticLane): string {
   return "Observer";
 }
 
+/**
+ * Public helper: returns the semantic short label for a lane family string.
+ * Accepts both `TaskTimelineSemanticLane` values and free-form lane strings
+ * (e.g. raw event lane keys) so DAG/backlog detail can reuse the same labels
+ * without duplicating the mapping table.
+ *
+ * Returns null when the string does not map to a recognised lane family —
+ * callers should fall back to their own label in that case.
+ */
+export function semanticLaneLabel(raw: string): string | null {
+  const normalized = (raw || "").trim().toLowerCase();
+  if (!normalized) return null;
+  // Exact matches for canonical lane ids
+  if (normalized === "content_sys" || normalized === "content-sys") return "content-sys";
+  if (normalized === "gate") return "Close gate";
+  if (normalized === "verification") return "Verification";
+  if (normalized === "worker") return "Bounded worker";
+  if (normalized === "observer") return "Observer";
+  // Prefix/substring matches for composite lane ids (e.g. "worker_frontend_1")
+  if (normalized.startsWith("worker")) return "Bounded worker";
+  if (normalized.includes("gate") || normalized.includes("merge") || normalized.includes("close")) return "Close gate";
+  if (normalized.includes("verify") || normalized.includes("test") || normalized.includes("qa")) return "Verification";
+  if (normalized.includes("content") && normalized.includes("sys")) return "content-sys";
+  if (normalized === "observer" || normalized.includes("observer")) return "Observer";
+  return null;
+}
+
 function actorForEvent(event: TaskTimelineEvent, lane: TaskTimelineSemanticLane): string {
   if (lane === "worker") return "Bounded worker";
   if (lane === "gate") return "Aming Claw gate";
