@@ -873,11 +873,11 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("refreshActivityTimeline"), "Activity view should refresh task detail, timeline, and gate together");
   assert(playbackViewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Activity view should refresh backlog row detail during live polling");
   assert(playbackViewSource.includes("activityMountedRef"), "Activity view should guard async refreshes after unmount");
-  assert(playbackViewSource.includes("const activityBug = selectedBug ?? hintedCurrentBug"), "Current activity should prefer URL-selected backlog and fall back to the current-task hint");
+  assert(playbackViewSource.includes("const activityBug = selectedBug ?? localOverrideBug ?? hintedCurrentBug"), "Current activity should prefer URL-selected backlog, then local-override, then fall back to the current-task hint");
   assert(!playbackViewSource.includes("activeTaskCandidates") && !playbackViewSource.includes("secondaryActivityBugs"), "Current activity must not render a backlog/history candidate list");
   assert(playbackViewSource.includes('latestFrame?.event_kind || hintText(latestEvent, "event_kind")'), "Activity summary should prefer the selected activity trace before hint latest-event text");
   assert(playbackViewSource.includes("ActivityStreamSummary"), "Current activity should summarize worker, QA, close-gate, latest event, next evidence, and blocker state");
-  assert(playbackViewSource.includes("No actively running observer task or command is recorded"), "Current activity should expose a clear empty state");
+  assert(playbackViewSource.includes('"no current activity"'), "Current activity should expose a clear empty state when no backlog row is active");
   assert(playbackViewSource.includes("setSelectedActivityFrameId(\"\")"), "Activity view should reset stale selected playback frames on project switch");
   assert(viewSource.includes("activityHref") && viewSource.includes("playbackDetailHref"), "Backlog rows should build Activity and playback deep links");
   assert(viewSource.includes("Open activity") && viewSource.includes("Open playback"), "Backlog rows should expose Activity and playback deep links");
@@ -888,9 +888,9 @@ function verifyBacklogEvidenceContract() {
   assert(!viewSource.includes("refreshCurrentTaskTimeline"), "Backlog view should not carry the full current event refresh loop");
   assert(!viewSource.includes("TaskPlaybackPanel"), "Backlog view should not render the full task playback panel inline");
   assert(
-    playbackViewSource.includes("const activityBug = selectedBug ?? hintedCurrentBug")
+    playbackViewSource.includes("const activityBug = selectedBug ?? localOverrideBug ?? hintedCurrentBug")
       && !playbackViewSource.includes("const activityBug = hintedCurrentBug"),
-    "Activity view should not let stale current-task hints override URL-selected backlog rows",
+    "Activity view should not let stale current-task hints override URL-selected or locally-overridden backlog rows",
   );
   assert(!viewSource.includes("FIXTURE_PROJECT_STREAM_REPLAY_FRAMES"), "Backlog view must not render default fixture stream replay frames");
   assert(!viewSource.includes("FixtureStreamReplay"), "Backlog view must not render the default fixture stream replay panel");
