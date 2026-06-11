@@ -2078,6 +2078,22 @@ export function categorizeEvidenceRef(kind: TaskPlaybackEvidenceRef["kind"]): Re
   }
 }
 
+const PLAYBACK_BACKLOG_REF_VALUE = /^(AC-|task-|cmd-|mq-)/i;
+const PLAYBACK_HASH_REF_VALUE = /^(sha256:|sha512:|sha1:)?[0-9a-f]{24,}$/i;
+const PLAYBACK_EVENTISH_REF_VALUE = /^(#?\d+|evt[-_:]|event[-_:])/i;
+
+export function isPlaybackBacklogRefValue(value: string): boolean {
+  return PLAYBACK_BACKLOG_REF_VALUE.test(value.trim());
+}
+
+export function isPlaybackEventEvidenceRef(ref: Pick<TaskPlaybackEvidenceRef, "kind" | "label" | "value">): boolean {
+  const value = (ref.value ?? "").trim();
+  if (!value || isPlaybackBacklogRefValue(value) || PLAYBACK_HASH_REF_VALUE.test(value)) return false;
+  if (ref.kind === "timeline_event" || ref.kind === "source_event") return true;
+  if (ref.kind === "read_receipt") return PLAYBACK_EVENTISH_REF_VALUE.test(value) || /\bevent\b/i.test(ref.label);
+  return false;
+}
+
 /**
  * Group evidence refs into the 6 typed categories.
  * Refs with values matching backlog/task id patterns are promoted to
@@ -2097,7 +2113,7 @@ export function groupEvidenceRefsByCategory(
   for (const ref of refs) {
     const value = ref.value ?? "";
     // Backlog rows (AC-…) and task ids (task-…/cmd-…) → backlog_and_task
-    if (/^(AC-|task-|cmd-|mq-)/i.test(value)) {
+    if (isPlaybackBacklogRefValue(value)) {
       result.backlog_and_task.push(ref);
     } else {
       result[categorizeEvidenceRef(ref.kind)].push(ref);

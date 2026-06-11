@@ -1,7 +1,18 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 
 import type { TaskPlaybackFrame, TaskPlaybackTrace, PlaybackNavEntry, TaskPlaybackEvidenceRef, ReferenceCategory } from "../lib/taskPlayback";
-import { displayPlaybackFrames, latestPlaybackFrameId, pushPlaybackNavStack, popPlaybackNavStack, truncateHash, groupEvidenceRefsByCategory } from "../lib/taskPlayback";
+import {
+  buildPlaybackUrl,
+  displayPlaybackFrames,
+  findFrameIdByEventParam,
+  groupEvidenceRefsByCategory,
+  isPlaybackBacklogRefValue,
+  isPlaybackEventEvidenceRef,
+  latestPlaybackFrameId,
+  popPlaybackNavStack,
+  pushPlaybackNavStack,
+  truncateHash,
+} from "../lib/taskPlayback";
 import type { TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
 import { segmentTextWithStatusChips } from "../lib/taskTimelineSemantics";
 
@@ -345,6 +356,8 @@ export default function TaskPlaybackPanel({
                 relations={selectedFrame.relation_links ?? []}
                 links={selectedEvidenceLinks}
                 frames={allFrames}
+                projectId={trace.project_id}
+                currentBacklogId={trace.backlog_id}
                 onJump={(frameId) => selectFrame(frameId, { fromFrameId: selectedFrame.id, fromLabel: selectedFrame.title }, true)}
                 onInspect={setSelectedEvidenceRef}
                 frameId={selectedFrame.id}
@@ -594,16 +607,22 @@ const CATEGORY_ORDER: ReferenceCategory[] = [
 export function ReferencesAndEvidenceSection({
   relations,
   links,
-  frames,
+  frames = [],
+  projectId,
+  currentBacklogId,
   onJump,
   onInspect,
+  onNavigateToPlayback,
   frameId,
 }: {
   relations: TaskTimelineSemanticRelation[];
   links: TaskPlaybackEvidenceRef[];
-  frames: TaskPlaybackFrame[];
-  onJump: (frameId: string) => void;
+  frames?: TaskPlaybackFrame[];
+  projectId?: string;
+  currentBacklogId?: string;
+  onJump?: (frameId: string) => void;
   onInspect: (ref: TaskPlaybackEvidenceRef) => void;
+  onNavigateToPlayback?: (backlogId: string, eventId?: string | number | null) => void;
   frameId: string;
 }) {
   const grouped = groupEvidenceRefsByCategory(links);
@@ -612,10 +631,69 @@ export function ReferencesAndEvidenceSection({
   if (!hasRelations && !hasLinks) return null;
 
   const frame = frames.find((f) => f.id === frameId) ?? null;
+  const fallbackBacklogId = currentBacklogId?.trim() || "";
 
   const handleCopyEventRefs = () => {
     if (!frame) return;
     void navigator.clipboard?.writeText(eventRefsText(frame));
+  };
+
+  const navigateToPlayback = (backlogId: string, eventId?: string | number | null) => {
+    const targetBacklogId = backlogId.trim();
+    if (!targetBacklogId) return;
+    if (onNavigateToPlayback) {
+      onNavigateToPlayback(targetBacklogId, eventId);
+      return;
+    }
+    if (!projectId || typeof window === "undefined") return;
+    const nextUrl = buildPlaybackUrl(projectId, targetBacklogId, eventId);
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextUrl !== currentUrl) {
+      window.history.pushState({ backlogId: targetBacklogId, eventId: eventId ?? null }, "", nextUrl);
+    }
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  };
+
+  const handleRelationClick = (rel: TaskTimelineSemanticRelation) => {
+    if (rel.kind === "event_ref") {
+      const targetFrameId = findFrameIdByEventParam(frames, rel.value);
+      if (targetFrameId) {
+        onJump?.(targetFrameId);
+        return;
+      }
+      const targetBacklogId = rel.backlog_id?.trim() || fallbackBacklogId;
+      if (targetBacklogId) navigateToPlayback(targetBacklogId, rel.value);
+      return;
+    }
+    if (rel.kind === "backlog_row" && isPlaybackBacklogRefValue(rel.value)) {
+      navigateToPlayback(rel.value);
+    }
+  };
+
+  const evidenceRefAction = (ref: TaskPlaybackEvidenceRef): "event" | "backlog" | "inspect" => {
+    if (isPlaybackBacklogRefValue(ref.value)) return "backlog";
+    if (isPlaybackEventEvidenceRef(ref)) return "event";
+    return "inspect";
+  };
+
+  const handleEvidenceRefClick = (ref: TaskPlaybackEvidenceRef) => {
+    const action = evidenceRefAction(ref);
+    if (action === "backlog") {
+      navigateToPlayback(ref.value);
+      return;
+    }
+    if (action === "event") {
+      const targetFrameId = findFrameIdByEventParam(frames, ref.value);
+      if (targetFrameId) {
+        onJump?.(targetFrameId);
+        return;
+      }
+      if (fallbackBacklogId) {
+        navigateToPlayback(fallbackBacklogId, ref.value);
+        return;
+      }
+    }
+    onInspect(ref);
   };
 
   return (
@@ -640,25 +718,30 @@ export function ReferencesAndEvidenceSection({
           <span className="task-playback-references-category-label">Related events</span>
           <dl className="task-playback-relations-list">
             {relations.slice(0, 16).map((rel) => {
-              const targetFrame = rel.kind === "event_ref"
-                ? frames.find((f) => f.source_event_id === rel.value || f.id === rel.value)
-                : null;
+              const targetFrameId = rel.kind === "event_ref" ? findFrameIdByEventParam(frames, rel.value) : "";
+              const targetFrame = targetFrameId ? frames.find((f) => f.id === targetFrameId) ?? null : null;
+              const canNavigateToPlayback =
+                (rel.kind === "event_ref" && Boolean(rel.backlog_id?.trim() || fallbackBacklogId)) ||
+                (rel.kind === "backlog_row" && isPlaybackBacklogRefValue(rel.value));
+              const canNavigate = Boolean(targetFrame || canNavigateToPlayback);
               return (
                 <div key={`${rel.kind}:${rel.value}`} className="task-playback-relation-row">
                   <dt className="task-playback-relation-label">
                     <span className={`task-playback-relation-kind task-playback-relation-kind--${rel.kind}`}>{rel.label}</span>
                   </dt>
                   <dd className="task-playback-relation-detail">
-                    {targetFrame ? (
+                    {canNavigate ? (
                       <button
                         type="button"
                         className="task-playback-relation-link"
-                        title={`Jump to: ${targetFrame.title}`}
-                        onClick={() => onJump(targetFrame.id)}
+                        title={targetFrame ? `Jump to: ${targetFrame.title}` : "Open playback deep link"}
+                        onClick={() => handleRelationClick(rel)}
                         aria-label={`Navigate to ${rel.label}: ${rel.value}`}
                       >
                         <span className="mono">{rel.value}</span>
-                        <span className="task-playback-relation-summary">{targetFrame.headline || targetFrame.summary || targetFrame.title}</span>
+                        <span className="task-playback-relation-summary">
+                          {targetFrame?.headline || targetFrame?.summary || targetFrame?.title || rel.summary || "Open playback"}
+                        </span>
                       </button>
                     ) : (
                       <span className="task-playback-relation-nonav">
@@ -684,20 +767,23 @@ export function ReferencesAndEvidenceSection({
           <div key={cat} className="task-playback-references-category">
             <span className="task-playback-references-category-label">{CATEGORY_LABELS[cat]}</span>
             <div className="task-playback-references-category-items">
-              {catRefs.slice(0, 12).map((ref) => (
-                <button
-                  type="button"
-                  key={`${ref.kind}:${ref.label}:${ref.value}`}
-                  className="task-playback-evidence-ref-btn"
-                  onClick={() => onInspect(ref)}
-                  title={`Inspect ${ref.kind}: ${ref.value}`}
-                  aria-haspopup="dialog"
-                >
-                  <span className="task-playback-evidence-ref-kind">{ref.kind}</span>
-                  <span className="task-playback-evidence-ref-label">{ref.label}</span>
-                  <TruncatedHashSpan value={ref.value} mono />
-                </button>
-              ))}
+              {catRefs.slice(0, 12).map((ref) => {
+                const action = evidenceRefAction(ref);
+                return (
+                  <button
+                    type="button"
+                    key={`${ref.kind}:${ref.label}:${ref.value}`}
+                    className="task-playback-evidence-ref-btn"
+                    onClick={() => handleEvidenceRefClick(ref)}
+                    title={action === "inspect" ? `Inspect ${ref.kind}: ${ref.value}` : `Open playback reference: ${ref.value}`}
+                    aria-haspopup={action === "inspect" ? "dialog" : undefined}
+                  >
+                    <span className="task-playback-evidence-ref-kind">{ref.kind}</span>
+                    <span className="task-playback-evidence-ref-label">{ref.label}</span>
+                    <TruncatedHashSpan value={ref.value} mono />
+                  </button>
+                );
+              })}
               {catRefs.length > 12 ? <em className="task-playback-evidence-ref-overflow">+{catRefs.length - 12} more</em> : null}
             </div>
           </div>
