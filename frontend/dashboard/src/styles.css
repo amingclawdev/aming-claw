@@ -3181,7 +3181,15 @@ a:hover { text-decoration: underline; }
   display: grid;
   grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
+  /* Bound the layout to the viewport so each column scrolls independently.
+     160px accounts for the app header, view padding, and the Activity view
+     header/tabs above the layout. Adjust via --playback-layout-offset if the
+     header height changes. */
+  --playback-layout-offset: 160px;
+  height: calc(100vh - var(--playback-layout-offset));
+  min-height: 380px;
+  overflow: hidden;
 }
 
 .task-playback-selector,
@@ -3193,11 +3201,15 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-selector {
-  position: sticky;
-  top: 82px;
+  /* Removed sticky positioning: the selector is now a bounded scroll column
+     that fills its grid cell height. Scrolling is scoped to this column so
+     the right detail panel stays in view. */
   display: grid;
+  align-content: start;
   gap: 10px;
   padding: 12px;
+  overflow-y: auto;
+  height: 100%;
 }
 
 .task-playback-selector-head,
@@ -3271,8 +3283,8 @@ a:hover { text-decoration: underline; }
 .task-playback-row-list {
   display: grid;
   gap: 7px;
-  max-height: calc(100vh - 310px);
-  overflow: auto;
+  /* max-height removed: the parent .task-playback-selector column now handles
+     overflow-y: auto so the whole left column scrolls as one unit. */
   padding-right: 2px;
 }
 
@@ -3320,7 +3332,12 @@ a:hover { text-decoration: underline; }
 .task-playback-main {
   min-width: 0;
   display: grid;
+  align-content: start;
   gap: 10px;
+  /* Right column: independently scrollable so it stays in view when the
+     left selector column is scrolled. */
+  overflow-y: auto;
+  height: 100%;
 }
 
 .task-playback-controls {
@@ -7908,8 +7925,18 @@ svg.graph-svg path.ghit:hover {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .task-playback-selector {
-    position: static;
+  /* Narrow layout: restore normal page scroll — each stacked column grows
+     naturally and the outer .main scrolls as usual. */
+  .task-playback-layout {
+    height: auto;
+    min-height: unset;
+    overflow: visible;
+  }
+
+  .task-playback-selector,
+  .task-playback-main {
+    height: auto;
+    overflow-y: visible;
   }
 
   .task-playback-evidence-modal-backdrop {
