@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 from agent.governance.service_router import route_event
 from agent.governance.service_registry import ServiceDescriptor, ServiceRegistry
+
+
+def _fake_sha(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
+
+
+_ROUTE_CONTEXT_HASH = _fake_sha("test-route-context")
+_PROMPT_CONTRACT_HASH = _fake_sha("test-prompt-contract")
+_WAIVER_ROUTE_CONTEXT_HASH = _fake_sha("test-route-waiver-context")
+_WAIVER_PROMPT_CONTRACT_HASH = _fake_sha("test-waiver-prompt-contract")
+_VISIBLE_MANIFEST_HASH = _fake_sha("test-visible-manifest")
 
 
 def _contract(service_routes=None, event_routes=None, **extra):
@@ -56,9 +68,9 @@ def _route_token(
     if task_id:
         scope["task_id"] = task_id
     return {
-        "route_context_hash": "sha256:test-route-context",
+        "route_context_hash": _ROUTE_CONTEXT_HASH,
         "prompt_contract_id": "rprompt-test-service-route",
-        "prompt_contract_hash": "sha256:test-prompt-contract",
+        "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
         "caller_role": "mf_sub",
         "allowed_action": action,
         "scope": scope,
@@ -84,9 +96,9 @@ def _route_waiver(
     return {
         "accepted": True,
         "waiver_type": "manual_fix",
-        "route_context_hash": "sha256:test-route-waiver-context",
+        "route_context_hash": _WAIVER_ROUTE_CONTEXT_HASH,
         "prompt_contract_id": "rprompt-test-service-route-waiver",
-        "prompt_contract_hash": "sha256:test-waiver-prompt-contract",
+        "prompt_contract_hash": _WAIVER_PROMPT_CONTRACT_HASH,
         "caller_role": "observer",
         "allowed_action": action,
         "scope": scope,
@@ -144,12 +156,12 @@ def test_preview_route_allows_and_runs_default_handler():
     assert result["routes"][0]["side_effect_class"] == "read"
     assert result["routes"][0]["side_effect"] == "read"
     assert result["routes"][0]["result"]["service_id"] == "test_governance.preview"
-    assert result["routes"][0]["evidence"]["route_context_hash"] == "sha256:test-route-context"
+    assert result["routes"][0]["evidence"]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert result["routes"][0]["evidence"]["prompt_contract_id"] == (
         "rprompt-test-service-route"
     )
     assert result["routes"][0]["evidence"]["prompt_contract_hash"] == (
-        "sha256:test-prompt-contract"
+        _PROMPT_CONTRACT_HASH
     )
     assert result["routes"][0]["requirement_ids"] == []
     assert result["routes"][0]["contract_evidence"] == []
@@ -323,7 +335,7 @@ def test_non_route_service_with_accepted_route_waiver_allows():
     assert result["decision"] == "allow"
     assert route["status"] == "allowed"
     assert route["result"]["route_context_gate"]["decision"] == "route_waiver"
-    assert route["evidence"]["route_context_hash"] == "sha256:test-route-waiver-context"
+    assert route["evidence"]["route_context_hash"] == _WAIVER_ROUTE_CONTEXT_HASH
 
 
 def test_apply_route_without_permission_blocks():
@@ -844,6 +856,7 @@ def test_low_risk_bundle_still_blocks_observer_direct_implementation():
             "payload": {
                 "caller_role": "observer",
                 "action": "apply_patch",
+                "route_token_ref": "rtok-test-route-action",
                 "route_context_hash": bundle["route_context_hash"],
                 "prompt_contract_id": bundle["prompt_contract"]["prompt_contract_id"],
                 "prompt_contract_hash": bundle["prompt_contract_hash"],
@@ -944,6 +957,7 @@ def test_route_action_precheck_blocks_observer_action_from_generated_bundle_shap
             "payload": {
                 "caller_role": "observer",
                 "action": "apply_patch",
+                "route_token_ref": "rtok-test-route-action",
                 "route_prompt_bundle": bundle,
                 "version_check": {
                     "status": "passed",
@@ -1039,6 +1053,7 @@ def test_route_action_precheck_blocks_observer_action_from_nested_bundle_role():
             "event_kind": "route.action.requested",
             "payload": {
                 "action": "apply_patch",
+                "route_token_ref": "rtok-test-route-action",
                 "route_prompt_bundle": bundle,
                 "version_check": {
                     "status": "passed",
@@ -1241,10 +1256,11 @@ def test_route_action_precheck_route_allows_bounded_worker_action():
             "payload": {
                 "caller_role": "implementation_worker",
                 "action": "apply_patch",
-                "route_context_hash": "sha256:route-context",
+                "route_token_ref": "rtok-test-route-action",
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
                 "prompt_contract_id": "rprompt-1",
-                "prompt_contract_hash": "sha256:prompt-contract",
-                "visible_injection_manifest_hash": "sha256:visible-manifest",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
+                "visible_injection_manifest_hash": _VISIBLE_MANIFEST_HASH,
                 "route_alerts": [{"code": "observer_judger_must_not_implement"}],
                 "version_check": {
                     "status": "passed",
@@ -1263,16 +1279,16 @@ def test_route_action_precheck_route_allows_bounded_worker_action():
     gate = result["routes"][0]["result"]["route_action_gate"]
     assert result["decision"] == "allow"
     assert gate["allowed"] is True
-    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert gate["prompt_contract_id"] == "rprompt-1"
-    assert gate["prompt_contract_hash"] == "sha256:prompt-contract"
-    assert route["evidence"]["route_context_hash"] == "sha256:route-context"
+    assert gate["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
+    assert route["evidence"]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["evidence"]["prompt_contract_id"] == "rprompt-1"
-    assert route["evidence"]["prompt_contract_hash"] == "sha256:prompt-contract"
-    assert route["contract_evidence"][0]["route_context_hash"] == "sha256:route-context"
+    assert route["evidence"]["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
+    assert route["contract_evidence"][0]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["contract_evidence"][0]["prompt_contract_id"] == "rprompt-1"
     assert route["contract_evidence"][0]["prompt_contract_hash"] == (
-        "sha256:prompt-contract"
+        _PROMPT_CONTRACT_HASH
     )
 
 
@@ -1304,9 +1320,10 @@ def test_route_action_precheck_blocks_provider_unavailable_before_write():
             "payload": {
                 "caller_role": "implementation_worker",
                 "action": "apply_patch",
-                "route_context_hash": "sha256:route-context",
+                "route_token_ref": "rtok-test-route-action",
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
                 "prompt_contract_id": "rprompt-1",
-                "prompt_contract_hash": "sha256:prompt-contract",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
                 "route_provider_error": "Transport closed",
                 "version_check": {
                     "status": "passed",
@@ -1357,9 +1374,10 @@ def test_route_action_precheck_blocks_observer_action_with_visible_identity():
             "payload": {
                 "caller_role": "observer",
                 "action": "apply_patch",
-                "route_context_hash": "sha256:route-context",
+                "route_token_ref": "rtok-test-route-action",
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
                 "prompt_contract_id": "rprompt-1",
-                "prompt_contract_hash": "sha256:prompt-contract",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
                 "route_alerts": [{"code": "observer_judger_must_not_implement"}],
                 "version_check": {
                     "status": "passed",
@@ -1385,17 +1403,17 @@ def test_route_action_precheck_blocks_observer_action_with_visible_identity():
     assert route["status"] == "route_action_policy_blocked"
     assert gate["allowed"] is False
     assert gate["status"] == "route_action_policy_blocked"
-    assert gate["route_context_hash"] == "sha256:route-context"
+    assert gate["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert gate["prompt_contract_id"] == "rprompt-1"
-    assert gate["prompt_contract_hash"] == "sha256:prompt-contract"
-    assert route["evidence"]["route_context_hash"] == "sha256:route-context"
+    assert gate["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
+    assert route["evidence"]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["evidence"]["prompt_contract_id"] == "rprompt-1"
-    assert route["evidence"]["prompt_contract_hash"] == "sha256:prompt-contract"
+    assert route["evidence"]["prompt_contract_hash"] == _PROMPT_CONTRACT_HASH
     assert route["evidence"]["route_status"] == "route_action_policy_blocked"
-    assert route["contract_evidence"][0]["route_context_hash"] == "sha256:route-context"
+    assert route["contract_evidence"][0]["route_context_hash"] == _ROUTE_CONTEXT_HASH
     assert route["contract_evidence"][0]["prompt_contract_id"] == "rprompt-1"
     assert route["contract_evidence"][0]["prompt_contract_hash"] == (
-        "sha256:prompt-contract"
+        _PROMPT_CONTRACT_HASH
     )
     assert "do not leak this prompt" not in route_json
     assert "do not leak this context" not in route_json

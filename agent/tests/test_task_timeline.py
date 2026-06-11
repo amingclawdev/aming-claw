@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -714,6 +715,26 @@ def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", 
     }
 
 
+def _bound_route_token_gate(action="service_route", bug_id="BUG-ROUTE", task_id="", project_id="proj"):
+    token = _route_token(action, bug_id=bug_id, task_id=task_id, project_id=project_id)
+    return {
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "status": "accepted",
+        "action": action,
+        "decision": "route_token",
+        "route_token_ref": f"rtok-test-{bug_id}",
+        "server_issued_binding": True,
+        "binding_source": "observer_route_token_refs",
+        "route_context_hash": token["route_context_hash"],
+        "prompt_contract_id": token["prompt_contract_id"],
+        "prompt_contract_hash": token["prompt_contract_hash"],
+        "caller_role": token["caller_role"],
+        "route_token_hash": _fake_sha(f"test-route-token-body-{bug_id}-{task_id}"),
+        "scope": token["scope"],
+    }
+
+
 def _route_token_gate_event(
     event_id=0,
     action="task_timeline_append",
@@ -760,6 +781,32 @@ class TestTaskTimeline(unittest.TestCase):
         self.conn.close()
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
+
+    def _issue_route_token(
+        self,
+        bug_id,
+        *,
+        task_id="",
+        allowed_actions=None,
+    ):
+        from agent.governance import observer_route_context
+
+        token = observer_route_context.build_observer_write_route_token(
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=task_id or bug_id,
+            target_files=["agent/governance/task_timeline.py"],
+            allowed_actions=allowed_actions or ["task_timeline_append"],
+            now=datetime(2099, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        ref = observer_route_context.derive_route_token_ref(token)
+        observer_route_context.persist_route_token_ref(
+            self.conn,
+            project_id="proj",
+            route_token_ref=ref,
+            token=token,
+        )
+        return {"route_token": token, "route_token_ref": ref}
 
     def _insert_router_backlog(self, bug_id="BUG-SERVICE-ROUTER", contract=None):
         contract = contract or {
@@ -1053,6 +1100,7 @@ class TestTaskTimeline(unittest.TestCase):
     def test_timeline_append_accepts_valid_route_token(self):
         from agent.governance import server
 
+        issued = self._issue_route_token("BUG-TL-TOKEN")
         result = server.handle_task_timeline_append(
             _ctx(
                 body={
@@ -1060,18 +1108,86 @@ class TestTaskTimeline(unittest.TestCase):
                     "event_type": "mf.close_ready",
                     "event_kind": "close_ready",
                     "status": "accepted",
-                    "route_token": _route_token("task_timeline_append", "BUG-TL-TOKEN"),
+                    "route_token": issued["route_token"],
                 },
                 method="POST",
             )
         )
 
         self.assertEqual(result["route_token_gate"]["decision"], "route_token")
+        self.assertTrue(result["route_token_gate"]["server_issued_binding"])
+        self.assertEqual(
+            result["route_token_gate"]["route_token_ref"],
+            issued["route_token_ref"],
+        )
         count = self.conn.execute(
             "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
             ("BUG-TL-TOKEN",),
         ).fetchone()["c"]
         self.assertEqual(count, 2)
+
+    def test_timeline_append_rejects_full_route_token_with_allowed_actions_superset(self):
+        from agent.governance import server
+        from agent.governance.errors import GovernanceError
+
+        issued = self._issue_route_token(
+            "BUG-TL-TOKEN-SUPERSET",
+            allowed_actions=["task_timeline_append"],
+        )
+        token = dict(issued["route_token"])
+        token["allowed_actions"] = [
+            *token["allowed_actions"],
+            "backlog_close",
+        ]
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_task_timeline_append(
+                _ctx(
+                    body={
+                        "backlog_id": "BUG-TL-TOKEN-SUPERSET",
+                        "event_type": "mf.close_ready",
+                        "event_kind": "close_ready",
+                        "status": "accepted",
+                        "route_token": token,
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "route_token_required")
+        self.assertIn("allowed_actions exceed", str(raised.exception))
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-TL-TOKEN-SUPERSET",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
+    def test_timeline_append_accepts_server_minted_ref_only_route_token(self):
+        from agent.governance import server
+
+        issued = self._issue_route_token("BUG-TL-REF-TOKEN")
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": "BUG-TL-REF-TOKEN",
+                    "event_type": "mf.close_ready",
+                    "event_kind": "close_ready",
+                    "status": "accepted",
+                    "route_token_ref": issued["route_token_ref"],
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(
+            result["route_token_gate"]["decision"],
+            "route_token_ref_resolved",
+        )
+        self.assertTrue(result["route_token_gate"]["server_issued_binding"])
+        self.assertEqual(
+            result["route_token_gate"]["route_token_ref"],
+            issued["route_token_ref"],
+        )
 
     def test_timeline_append_accepts_route_context_waiver(self):
         from agent.governance import server
@@ -1762,6 +1878,7 @@ class TestTaskTimeline(unittest.TestCase):
         from agent.governance import server
 
         self._insert_router_backlog("BUG-TL-MF-PARALLEL-TOKEN")
+        issued = self._issue_route_token("BUG-TL-MF-PARALLEL-TOKEN")
         result = server.handle_task_timeline_append(
             _ctx(
                 body={
@@ -1769,16 +1886,14 @@ class TestTaskTimeline(unittest.TestCase):
                     "event_type": "mf.implementation",
                     "event_kind": "implementation",
                     "status": "accepted",
-                    "route_token": _route_token(
-                        "task_timeline_append",
-                        "BUG-TL-MF-PARALLEL-TOKEN",
-                    ),
+                    "route_token": issued["route_token"],
                 },
                 method="POST",
             )
         )
 
         self.assertEqual(result["route_token_gate"]["decision"], "route_token")
+        self.assertTrue(result["route_token_gate"]["server_issued_binding"])
         count = self.conn.execute(
             "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
             ("BUG-TL-MF-PARALLEL-TOKEN",),
@@ -1791,6 +1906,7 @@ class TestTaskTimeline(unittest.TestCase):
         bug_id = "BUG-TL-MF-PARALLEL-TOKEN-DISPATCH"
         worker_task_id = "worker-token-dispatch"
         self._insert_router_backlog(bug_id)
+        issued = self._issue_route_token(bug_id)
 
         result = server.handle_task_timeline_append(
             _ctx(
@@ -1801,17 +1917,15 @@ class TestTaskTimeline(unittest.TestCase):
                         task_id=worker_task_id,
                         parent_task_id=bug_id,
                     ),
-                    "route_token": _route_token(
-                        "task_timeline_append",
-                        bug_id,
-                        task_id=worker_task_id,
-                    ),
+                    "route_token": issued["route_token"],
                 },
                 method="POST",
             )
         )
 
         self.assertEqual(result["route_token_gate"]["decision"], "route_token")
+        self.assertTrue(result["route_token_gate"]["server_issued_binding"])
+        self.assertEqual(result["route_token_gate"]["scope"]["task_id"], bug_id)
         self.assertEqual(
             result["event_kind"],
             "bounded_implementation_worker_dispatch",
@@ -2323,8 +2437,9 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertTrue(gate["route_token_hash"].startswith("sha256:"))
         self.assertNotIn("expires_at", source["payload"].get("route_token_gate", {}))
 
-    def test_project_bootstrap_without_prior_route_token_returns_public_safe_handoff(self):
+    def test_project_bootstrap_with_route_handoff_requires_bound_route_token(self):
         from agent.governance import server
+        from agent.governance.errors import GovernanceError
 
         workspace_path = os.path.join(self.tmp.name, "bootstrap-project")
         os.makedirs(workspace_path, exist_ok=True)
@@ -2339,29 +2454,21 @@ class TestTaskTimeline(unittest.TestCase):
             server.project_service,
             "bootstrap_project",
             return_value={"project_id": "bootstrap-project", "graph_stats": {}},
-        ):
-            code, result = server.handle_project_bootstrap(
-                _ctx(
-                    method="POST",
-                    body={
-                        "workspace_path": workspace_path,
-                        "project_id": "bootstrap-project",
-                        "route_identity": route_identity,
-                    },
+        ) as bootstrap_project:
+            with self.assertRaises(GovernanceError) as raised:
+                server.handle_project_bootstrap(
+                    _ctx(
+                        method="POST",
+                        body={
+                            "workspace_path": workspace_path,
+                            "project_id": "bootstrap-project",
+                            "route_identity": route_identity,
+                        },
+                    )
                 )
-            )
 
-        self.assertEqual(code, 200)
-        self.assertIsNone(result["route_token_gate"])
-        handoff = result["route_bootstrap_handoff"]
-        self.assertFalse(handoff["route_token_required_before_bootstrap"])
-        self.assertEqual(
-            handoff["route_identity"]["route_id"],
-            "route-bootstrap-test",
-        )
-        handoff_json = json.dumps(handoff, sort_keys=True)
-        self.assertNotIn("do-not-persist", handoff_json)
-        self.assertNotIn("raw_prompt", handoff["route_identity"])
+        self.assertEqual(raised.exception.code, "route_token_required")
+        bootstrap_project.assert_not_called()
 
     def test_observer_repair_route_evidence_records_service_route_gate_inputs(self):
         from agent.governance import server, task_timeline
@@ -2693,7 +2800,7 @@ class TestTaskTimeline(unittest.TestCase):
             payload={
                 "producer": "fixture",
                 "validated": True,
-                "route_token": _route_token(
+                "route_token_gate": _bound_route_token_gate(
                     "service_route",
                     bug_id=bug_id,
                     task_id="task-ai-route",
@@ -2760,7 +2867,7 @@ class TestTaskTimeline(unittest.TestCase):
                     "command_type": "analyze_requirements",
                     "command_id": "cmd-1",
                 },
-                "route_token": _route_token(
+                "route_token_gate": _bound_route_token_gate(
                     "service_route",
                     bug_id=bug_id,
                     task_id="task-reminder-echo",
@@ -2808,7 +2915,8 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(received_reminder, echo)
         result_json = json.dumps(result, sort_keys=True)
         self.assertNotIn("raw_id", result_json)
-        self.assertNotIn("source", result_json)
+        self.assertNotIn("source", json.dumps(received_reminder, sort_keys=True))
+        self.assertNotIn("source", json.dumps(echo, sort_keys=True))
         self.assertNotIn("nested-business-field", result_json)
         self.assertNotIn("command_type", result_json)
         self.assertNotIn("command_id", result_json)

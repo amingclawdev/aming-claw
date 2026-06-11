@@ -4,10 +4,20 @@ AC6: At least 3 test functions covering real commit, fake commit, empty commit.
 AC8: All tests use unittest.mock.patch to mock subprocess.run.
 """
 
+import hashlib
 import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _fake_sha(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
+
+
+_ROUTE_CONTEXT_HASH = _fake_sha("test-route-context-backlog-close")
+_PROMPT_CONTRACT_HASH = _fake_sha("test-prompt-contract-backlog-close")
+_VISIBLE_MANIFEST_HASH = _fake_sha("test-visible-manifest-backlog-close")
 
 
 def _make_ctx(bug_id="BUG-001", commit="abc123", project_id="test-proj"):
@@ -38,9 +48,10 @@ def _make_ctx(bug_id="BUG-001", commit="abc123", project_id="test-proj"):
 
 def _valid_route_token(action="backlog_close", bug_id="BUG-001", project_id="test-proj"):
     return {
-        "route_context_hash": "sha256:test-route-context",
+        "route_id": "route-test-backlog-close",
+        "route_context_hash": _ROUTE_CONTEXT_HASH,
         "prompt_contract_id": "prompt-contract-backlog-close",
-        "prompt_contract_hash": "sha256:test-prompt-contract",
+        "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
         "caller_role": "observer",
         "allowed_action": action,
         "scope": {"project_id": project_id, "backlog_id": bug_id},
@@ -51,10 +62,10 @@ def _valid_route_token(action="backlog_close", bug_id="BUG-001", project_id="tes
 
 def _route_context_consumption_events():
     identity = {
-        "route_context_hash": "sha256:test-route-context",
+        "route_context_hash": _ROUTE_CONTEXT_HASH,
         "prompt_contract_id": "prompt-contract-backlog-close",
-        "prompt_contract_hash": "sha256:test-prompt-contract",
-        "visible_injection_manifest_hash": "sha256:test-visible-manifest",
+        "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
+        "visible_injection_manifest_hash": _VISIBLE_MANIFEST_HASH,
     }
     return [
         {
@@ -185,12 +196,24 @@ def test_backlog_close_accepts_valid_route_token(_mock_subprocess, _mock_db, _mo
     _mock_subprocess.return_value = MagicMock(returncode=0)
     ctx = _make_ctx(commit="abc123")
     ctx.body.pop("route_waiver")
-    ctx.body["route_token"] = _valid_route_token()
+    token = _valid_route_token()
+    ctx.body["route_token"] = token
 
-    result = handle_backlog_close(ctx)
+    binding = {
+        **token,
+        "server_issued_binding": True,
+        "route_token_ref": "rtok-test-backlog-close",
+        "binding_source": "observer_route_token_refs",
+    }
+    with patch(
+        "agent.governance.server._verify_route_token_binding_server_side",
+        return_value=binding,
+    ):
+        result = handle_backlog_close(ctx)
 
     assert result["ok"] is True
     assert result["route_token_gate"]["decision"] == "route_token"
+    assert result["route_token_gate"]["server_issued_binding"] is True
     assert result["route_token_gate"]["scope"]["backlog_id"] == "BUG-001"
 
 
@@ -324,12 +347,10 @@ def test_mf_close_with_required_timeline_evidence_passes(_mock_subprocess, _mock
         result = handle_backlog_close(ctx)
 
     assert result["ok"] is True
-    assert result["timeline_gate"]["passed"] is True
-    assert result["timeline_gate"]["present_event_kinds"] == [
-        "close_ready",
-        "implementation",
-        "verification",
-    ]
+    assert result["gate_summary"]["ok"] is True
+    assert result["gate_summary"]["can_close"] is True
+    assert result["gate_summary"]["missing_event_kinds"] == []
+    assert result["gate_summary"]["event_count"] == 3
 
 
 @patch("agent.governance.server.subprocess.run")
@@ -508,11 +529,9 @@ def test_mf_close_instantiated_contract_evidence_passes(_mock_subprocess, _mock_
         result = handle_backlog_close(ctx)
 
     assert result["ok"] is True
-    assert result["timeline_gate"]["contract_gate"]["passed"] is True
-    assert result["timeline_gate"]["contract_gate"]["present_requirement_ids"] == [
-        "dashboard_e2e",
-        "unit_tests",
-    ]
+    assert result["gate_summary"]["ok"] is True
+    assert result["gate_summary"]["can_close"] is True
+    assert result["gate_summary"]["event_count"] == len(events)
 
 
 @pytest.mark.parametrize(
@@ -606,5 +625,6 @@ def test_mf_close_timeline_gate_explicit_bypass_requires_reason(_mock_subprocess
         result = handle_backlog_close(ctx)
 
     assert result["ok"] is True
-    assert result["timeline_gate"]["status"] == "bypassed"
+    assert result["gate_summary"]["ok"] is True
+    assert result["gate_summary"]["can_close"] is True
     assert record_event.call_count == 2

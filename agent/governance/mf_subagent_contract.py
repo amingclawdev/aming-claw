@@ -3669,6 +3669,8 @@ def validate_route_token_mutation_gate(
     backlog_id: str = "",
     task_id: str = "",
     now: datetime | None = None,
+    require_server_binding: bool = False,
+    server_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate route-token or explicit waiver evidence for protected mutations."""
 
@@ -3691,6 +3693,8 @@ def validate_route_token_mutation_gate(
             action=action_name,
             request_scope=request_scope,
             now=now,
+            require_server_binding=require_server_binding,
+            server_binding=server_binding or _route_token_server_binding(payload),
         )
 
     waiver = _route_token_waiver(payload)
@@ -3797,12 +3801,97 @@ def _route_token_waiver(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _route_token_server_binding(payload: Mapping[str, Any]) -> dict[str, Any]:
+    binding = (
+        payload.get("server_binding")
+        or payload.get("route_token_binding")
+        or payload.get("route_token_server_binding")
+    )
+    if isinstance(binding, Mapping):
+        return dict(binding)
+    return {}
+
+
+def _validate_route_token_server_binding(
+    token: Mapping[str, Any],
+    *,
+    require_server_binding: bool,
+    server_binding: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not server_binding:
+        if require_server_binding:
+            raise MfSubagentContractError("route_token server binding is required")
+        return {}
+    if not isinstance(server_binding, Mapping):
+        raise MfSubagentContractError("route_token server binding must be a mapping")
+
+    route_token_ref = _string(server_binding.get("route_token_ref"))
+    if not route_token_ref:
+        raise MfSubagentContractError("route_token server binding missing route_token_ref")
+
+    stored_allowed_actions = _route_allowed_actions(server_binding)
+    token_allowed_actions = _route_allowed_actions(token)
+    if not set(token_allowed_actions).issubset(set(stored_allowed_actions)):
+        raise MfSubagentContractError(
+            "route_token allowed_actions exceed server-issued binding grant"
+        )
+
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "caller_role",
+        "expires_at",
+    ):
+        expected = _string(server_binding.get(field))
+        if not expected:
+            continue
+        if field == "caller_role":
+            presented = _string(token.get("caller_role") or token.get("role")).lower()
+            expected = expected.lower()
+        else:
+            presented = _string(token.get(field))
+        if presented != expected:
+            raise MfSubagentContractError(
+                f"route_token {field} does not match server-issued binding"
+            )
+
+    binding_scope = (
+        server_binding.get("scope")
+        if isinstance(server_binding.get("scope"), Mapping)
+        else {}
+    )
+    for field in ("project_id", "backlog_id", "task_id"):
+        expected = _string(binding_scope.get(field) or server_binding.get(field))
+        if not expected:
+            continue
+        if field == "backlog_id":
+            presented = _route_scope_value(token, "backlog_id", "bug_id")
+        else:
+            presented = _route_scope_value(token, field)
+        if presented != expected:
+            raise MfSubagentContractError(
+                f"route_token {field} scope does not match server-issued binding"
+            )
+
+    return {
+        "server_issued_binding": True,
+        "route_token_ref": route_token_ref,
+        "binding_source": _string(server_binding.get("binding_source"))
+        or "observer_route_token_refs",
+    }
+
+
 def _validate_route_token(
     token: Mapping[str, Any],
     *,
     action: str,
     request_scope: Mapping[str, str],
     now: datetime | None,
+    require_server_binding: bool = False,
+    server_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     route_context_hash = _string(token.get("route_context_hash"))
     prompt_contract_id = _string(token.get("prompt_contract_id"))
@@ -3883,6 +3972,12 @@ def _validate_route_token(
         if not rv["ok"]:
             raise MfSubagentContractError(rv["reason"])
 
+    server_binding_result = _validate_route_token_server_binding(
+        token,
+        require_server_binding=require_server_binding,
+        server_binding=server_binding,
+    )
+
     return {
         "schema_version": ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION,
         "allowed": True,
@@ -3899,6 +3994,7 @@ def _validate_route_token(
         "scope": _route_scope_summary(token, request_scope),
         "required_fields": list(_ROUTE_TOKEN_REQUIRED_FIELDS),
         "hash_verification": hash_verification,
+        **server_binding_result,
     }
 
 

@@ -1033,7 +1033,7 @@ def handle_project_bootstrap(ctx: RequestContext):
         route_handoff.get("route_identity") if isinstance(route_handoff, Mapping) else {}
     )
     if isinstance(handoff_identity, Mapping) and handoff_identity:
-        route_gate = _optional_route_token_mutation_gate(
+        route_gate = _require_route_token_mutation_gate(
             ctx,
             action="project_bootstrap",
             project_id=project_id,
@@ -18559,6 +18559,9 @@ def _route_gate_public_summary(gate: Mapping[str, Any] | None) -> dict[str, Any]
         "evidence_refs",
         "timeline_evidence",
         "source_event_refs",
+        "server_issued_binding",
+        "route_token_ref",
+        "binding_source",
         "scope",
         "required_fields",
         "protected_lane",
@@ -18698,6 +18701,65 @@ def _resolve_route_token_ref_server_side(
     return resolved
 
 
+def _verify_route_token_binding_server_side(
+    body: dict,
+    *,
+    pid: str,
+    backlog_id: str = "",
+    task_id: str = "",
+    route_id: str = "",
+    route_context_hash: str = "",
+    prompt_contract_id: str = "",
+) -> dict | None:
+    """Verify a full route_token against active server-side registry rows."""
+    from . import observer_route_context as _orc
+
+    raw_token = body.get("route_token") if isinstance(body, dict) else None
+    if not raw_token:
+        return None
+    token = raw_token
+    if isinstance(raw_token, str):
+        try:
+            token = json.loads(raw_token)
+        except json.JSONDecodeError as exc:
+            raise _orc.RouteTokenRefError(
+                "route_token binding requires a JSON object token"
+            ) from exc
+    if not isinstance(token, dict):
+        raise _orc.RouteTokenRefError(
+            "route_token binding requires a full token mapping"
+        )
+
+    explicit_ref = str(
+        token.get("route_token_ref") or body.get("route_token_ref") or ""
+    ).strip()
+    try:
+        from .db import get_connection as _get_conn
+        conn = _get_conn(pid)
+    except Exception as exc:
+        raise _orc.RouteTokenRefError(
+            "route_token_ref registry unavailable; server-issued binding refused"
+        ) from exc
+
+    try:
+        return _orc.verify_route_token_binding(
+            conn,
+            project_id=pid,
+            token=token,
+            route_token_ref=explicit_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_id=route_id,
+            route_context_hash=route_context_hash,
+            prompt_contract_id=prompt_contract_id,
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _require_route_token_mutation_gate(
     ctx: RequestContext,
     *,
@@ -18733,27 +18795,47 @@ def _require_route_token_mutation_gate(
     # (fail closed) instead of silently skipping the check.
     _req_route_id = str(body.get("route_id") or "").strip()
     _req_route_context_hash = str(body.get("route_context_hash") or "").strip()
+    _req_prompt_contract_id = str(body.get("prompt_contract_id") or "").strip()
     # Also check nested route_token / route_waiver structures for the fields.
     _rt_scope = body.get("route_token") if isinstance(body.get("route_token"), dict) else {}
     if not _req_route_id:
         _req_route_id = str(_rt_scope.get("route_id") or "").strip()
     if not _req_route_context_hash:
         _req_route_context_hash = str(_rt_scope.get("route_context_hash") or "").strip()
+    if not _req_prompt_contract_id:
+        _req_prompt_contract_id = str(_rt_scope.get("prompt_contract_id") or "").strip()
     resolved_from_ref: bool = False
+    server_binding: dict | None = None
     try:
-        resolved = _resolve_route_token_ref_server_side(
-            body,
-            pid=pid,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            route_id=_req_route_id,
-            route_context_hash=_req_route_context_hash,
-        )
-        if resolved is not None:
-            resolved_from_ref = True
-            # Inject the resolved public surface as route_token; gate validates it.
-            body = dict(body)
-            body["route_token"] = resolved
+        if body.get("route_token"):
+            server_binding = _verify_route_token_binding_server_side(
+                body,
+                pid=pid,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_id=_req_route_id,
+                route_context_hash=_req_route_context_hash,
+                prompt_contract_id=_req_prompt_contract_id,
+            )
+        else:
+            resolved = _resolve_route_token_ref_server_side(
+                body,
+                pid=pid,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_id=_req_route_id,
+                route_context_hash=_req_route_context_hash,
+            )
+            if resolved is not None:
+                resolved_from_ref = True
+                server_binding = {
+                    **dict(resolved),
+                    "server_issued_binding": True,
+                    "binding_source": "observer_route_token_refs",
+                }
+                # Inject the resolved public surface as route_token; gate validates it.
+                body = dict(body)
+                body["route_token"] = resolved
     except _orc.RouteTokenRefError as exc:
         raise GovernanceError(
             "route_token_required",
@@ -18769,6 +18851,8 @@ def _require_route_token_mutation_gate(
             project_id=pid,
             backlog_id=backlog_id,
             task_id=task_id,
+            require_server_binding=bool(server_binding),
+            server_binding=server_binding,
         )
     except MfSubagentContractError as exc:
         raise GovernanceError(
@@ -18782,6 +18866,14 @@ def _require_route_token_mutation_gate(
         result = dict(result)
         result["decision"] = "route_token_ref_resolved"
         result["resolved_from_ref"] = True
+    if server_binding:
+        result = dict(result)
+        result["route_token_ref"] = str(server_binding.get("route_token_ref") or "")
+        result["server_issued_binding"] = True
+        result["binding_source"] = (
+            str(server_binding.get("binding_source") or "")
+            or "observer_route_token_refs"
+        )
 
     return result
 
@@ -18851,11 +18943,11 @@ def _route_bootstrap_handoff(
         "action": action,
         "project_id": project_id,
         "route_identity": identity,
-        "route_token_required_before_bootstrap": False,
+        "route_token_required_before_bootstrap": True,
         "raw_prompt_persisted": False,
         "raw_route_token_persisted": False,
         "next_legal_action": (
-            "run_route_action_precheck_after_bootstrap_or_reuse_recorded_public_route_identity"
+            "supply_a_bound_route_token_before_project_bootstrap"
         ),
     }
 
@@ -20969,7 +21061,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     ctx,
                     action="task_timeline_append",
                     backlog_id=ctx.body.get("backlog_id", ""),
-                    task_id=ctx.body.get("task_id", ""),
+                    task_id="",
                 )
         if route_gate:
             _record_route_token_gate_event(

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+import hmac
 import hashlib
 import json
 import os
@@ -455,9 +456,11 @@ def derive_route_token_ref(token: Mapping[str, Any]) -> str:
 
     The reference is a stable handle the observer can pass to downstream
     consumers (e.g. an ``execute_backlog_row`` command payload). It is derived
-    from the token's PUBLIC route identity only — it never embeds the raw token
-    body in clear, so persisting the ref leaks no secret. Two mints of the same
-    identity yield the same ref.
+    from the token's PUBLIC route identity and public issue/expiry timestamps —
+    it never embeds the raw token body in clear, so persisting the ref leaks no
+    secret. Two mints of the same identity at the same timestamp yield the same
+    ref; same-identity reissues at a later timestamp yield a fresh ref so the
+    new full token remains digest-bindable.
     """
     if not isinstance(token, Mapping):
         raise ValueError("token must be a mapping")
@@ -468,11 +471,24 @@ def derive_route_token_ref(token: Mapping[str, Any]) -> str:
         "visible_injection_manifest_hash": _string(
             token.get("visible_injection_manifest_hash")
         ),
+        "issued_at": _string(token.get("issued_at")),
+        "expires_at": _string(token.get("expires_at") or token.get("expiry")),
         "scope": dict(token.get("scope") or {}),
     }
     if not identity["route_context_hash"] or not identity["prompt_contract_id"]:
         raise ValueError("token is missing route identity required to derive a ref")
     return "rtok-" + _stable_digest(identity, length=32)
+
+
+def _normalized_action_list(value: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in _string_list(value):
+        normalized = _gate_normalized_action(item)
+        if normalized and normalized not in seen:
+            out.append(normalized)
+            seen.add(normalized)
+    return out
 
 
 def derive_merge_queue_id(token: Mapping[str, Any]) -> str:
@@ -892,6 +908,243 @@ def resolve_route_token_ref(
         "status": status,
         "resolved_from_ref": True,
     }
+
+
+def verify_route_token_binding(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    token: Mapping[str, Any],
+    route_token_ref: str = "",
+    route_id: str = "",
+    route_context_hash: str = "",
+    prompt_contract_id: str = "",
+    task_id: str = "",
+    backlog_id: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Verify a presented full token against active server-issued rows.
+
+    Full route-token objects returned by ``/issue`` intentionally do not embed a
+    ``route_token_ref``. Binding therefore starts from the token's route
+    identity (``route_id`` + ``route_context_hash`` + ``prompt_contract_id``),
+    finds active registry rows with that identity, and then requires an exact
+    salted digest match for the full canonical token object.
+    """
+
+    project_id = _string(project_id)
+    if not project_id:
+        raise RouteTokenRefError("project_id is required for route_token binding")
+    if not isinstance(token, Mapping):
+        raise RouteTokenRefError("route_token binding requires a full token mapping")
+
+    token_route_id = _string(token.get("route_id"))
+    token_route_context_hash = _string(token.get("route_context_hash"))
+    token_prompt_contract_id = _string(token.get("prompt_contract_id"))
+    if not token_route_id or not token_route_context_hash or not token_prompt_contract_id:
+        raise RouteTokenRefError(
+            "route_token binding requires route_id, route_context_hash, and prompt_contract_id"
+        )
+    if route_id and _string(route_id) != token_route_id:
+        raise RouteTokenRefError("route_token request route_id does not match token identity")
+    if route_context_hash and _string(route_context_hash) != token_route_context_hash:
+        raise RouteTokenRefError(
+            "route_token request route_context_hash does not match token identity"
+        )
+    if prompt_contract_id and _string(prompt_contract_id) != token_prompt_contract_id:
+        raise RouteTokenRefError(
+            "route_token request prompt_contract_id does not match token identity"
+        )
+
+    explicit_ref = _string(route_token_ref or token.get("route_token_ref"))
+    try:
+        _ensure_ref_registry_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT * FROM observer_route_token_refs
+            WHERE project_id=?
+              AND route_id=?
+              AND route_context_hash=?
+              AND prompt_contract_id=?
+            ORDER BY created_at DESC, issued_at DESC, route_token_ref DESC
+            """,
+            (
+                project_id,
+                token_route_id,
+                token_route_context_hash,
+                token_prompt_contract_id,
+            ),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise RouteTokenRefError(
+            "route_token_ref registry unavailable; server-issued binding refused"
+        ) from exc
+
+    if not rows:
+        raise RouteTokenRefError(
+            "no active observer_route_token_refs row matches the presented route token identity"
+        )
+
+    active_rows: list[dict[str, Any]] = []
+    inactive_statuses: list[str] = []
+    for row in rows:
+        row_dict = dict(row)
+        status = _string(row_dict.get("status"))
+        if status == REF_STATUS_ACTIVE:
+            active_rows.append(row_dict)
+        else:
+            inactive_statuses.append(status or "inactive")
+    if not active_rows:
+        statuses = ", ".join(sorted(set(inactive_statuses))) or "inactive"
+        raise RouteTokenRefError(
+            "route_token identity has no active observer_route_token_refs row "
+            f"(status={statuses}); server-issued binding refused"
+        )
+
+    token_scope = token.get("scope") if isinstance(token.get("scope"), Mapping) else {}
+
+    def _scope_value(source: Mapping[str, Any], *names: str) -> str:
+        for name in names:
+            value = _string(source.get(name))
+            if value:
+                return value
+        return ""
+
+    def _loads_mapping(raw: Any) -> dict[str, Any]:
+        try:
+            parsed = json.loads(raw or "{}")
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+    def _loads_list(raw: Any) -> list[str]:
+        try:
+            parsed = json.loads(raw or "[]")
+        except (json.JSONDecodeError, TypeError):
+            parsed = []
+        return _string_list(parsed)
+
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    now_dt = now_dt.astimezone(timezone.utc)
+
+    saw_expired = False
+    saw_scope_mismatch = False
+    saw_explicit_ref_mismatch = False
+    saw_allowed_superset = False
+    saw_digest_mismatch = False
+
+    for row_dict in active_rows:
+        stored_ref = _string(row_dict.get("route_token_ref"))
+        if explicit_ref and explicit_ref != stored_ref:
+            saw_explicit_ref_mismatch = True
+            continue
+
+        stored_scope = _loads_mapping(row_dict.get("scope_json"))
+        stored_project = _scope_value(stored_scope, "project_id") or project_id
+        token_project = _scope_value(token_scope, "project_id") or _string(
+            token.get("project_id")
+        )
+        stored_backlog = _string(row_dict.get("backlog_id")) or _scope_value(
+            stored_scope, "backlog_id", "bug_id"
+        )
+        token_backlog = _scope_value(token_scope, "backlog_id", "bug_id") or _string(
+            token.get("backlog_id") or token.get("bug_id")
+        )
+        stored_task = _string(row_dict.get("task_id")) or _scope_value(
+            stored_scope, "task_id"
+        )
+        token_task = _scope_value(token_scope, "task_id") or _string(token.get("task_id"))
+        scope_ok = (
+            token_project == stored_project
+            and project_id == stored_project
+            and (not stored_backlog or token_backlog == stored_backlog)
+            and (not backlog_id or not stored_backlog or _string(backlog_id) == stored_backlog)
+            and (not stored_task or token_task == stored_task)
+        )
+        if not scope_ok:
+            saw_scope_mismatch = True
+            continue
+
+        stored_expires_at = _string(row_dict.get("expires_at"))
+        if not stored_expires_at:
+            saw_expired = True
+            continue
+        try:
+            expires_dt = datetime.fromisoformat(stored_expires_at.replace("Z", "+00:00"))
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+            if now_dt >= expires_dt.astimezone(timezone.utc):
+                saw_expired = True
+                continue
+        except (TypeError, ValueError):
+            saw_expired = True
+            continue
+
+        stored_allowed_actions = _normalized_action_list(
+            _loads_list(row_dict.get("allowed_actions_json"))
+        )
+        token_allowed_actions = _normalized_action_list(token.get("allowed_actions"))
+        token_set = set(token_allowed_actions)
+        stored_set = set(stored_allowed_actions)
+        if not token_set.issubset(stored_set):
+            saw_allowed_superset = True
+            continue
+
+        expected_digest = _string(row_dict.get("token_digest"))
+        actual_digest = _token_digest(token, _string(row_dict.get("salt")))
+        if not expected_digest or not hmac.compare_digest(actual_digest, expected_digest):
+            saw_digest_mismatch = True
+            continue
+
+        try:
+            evidence_refs = json.loads(row_dict.get("evidence_refs_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            evidence_refs = []
+        return {
+            "schema_version": REF_REGISTRY_SCHEMA_VERSION,
+            "server_issued_binding": True,
+            "binding_source": "observer_route_token_refs",
+            "route_token_ref": stored_ref,
+            "route_id": token_route_id,
+            "route_context_hash": token_route_context_hash,
+            "prompt_contract_id": token_prompt_contract_id,
+            "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
+            "visible_injection_manifest_hash": _string(
+                row_dict.get("visible_injection_manifest_hash")
+            ),
+            "caller_role": _string(row_dict.get("caller_role")),
+            "allowed_actions": stored_allowed_actions,
+            "evidence_refs": _string_list(evidence_refs),
+            "expires_at": stored_expires_at,
+            "scope": stored_scope,
+            "status": REF_STATUS_ACTIVE,
+        }
+
+    if saw_allowed_superset:
+        raise RouteTokenRefError(
+            "route_token allowed_actions exceed registered server-issued grant"
+        )
+    if saw_digest_mismatch:
+        raise RouteTokenRefError(
+            "route_token digest mismatch for registered server-issued binding"
+        )
+    if saw_scope_mismatch:
+        raise RouteTokenRefError(
+            "route_token scope does not match registered server-issued binding"
+        )
+    if saw_expired:
+        raise RouteTokenRefError(
+            "route_token identity only matched expired/invalid observer_route_token_refs rows"
+        )
+    if saw_explicit_ref_mismatch:
+        raise RouteTokenRefError(
+            "route_token_ref does not match any active row for the presented route token identity"
+        )
+    raise RouteTokenRefError(
+        "route_token identity did not match an active server-issued binding"
+    )
 
 
 def supersede_route_token_ref(

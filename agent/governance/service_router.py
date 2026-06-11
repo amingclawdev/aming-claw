@@ -35,6 +35,7 @@ ROUTE_CONTEXT_GATE_EXEMPT_SERVICE_IDS = {
 }
 _ROUTE_CONTEXT_GATE_KEYS = (
     "route_token",
+    "route_token_gate",
     "route_waiver",
     "route_token_waiver",
     "protected_route_waiver",
@@ -394,6 +395,28 @@ def _validate_service_route_context_gate(
     if service_id in ROUTE_CONTEXT_GATE_EXEMPT_SERVICE_IDS:
         return {"allowed": True, "status": "exempt", "action": SERVICE_ROUTE_CONTEXT_GATE_ACTION}
     payload = _route_context_gate_payload(event)
+    recorded_gate = _mapping(payload.get("route_token_gate"))
+    if recorded_gate:
+        status = _string(recorded_gate.get("status")).lower()
+        action = _string(recorded_gate.get("action"))
+        if (
+            recorded_gate.get("server_issued_binding") is True
+            and (recorded_gate.get("allowed") is True or status in {"accepted", "passed"})
+            and action == SERVICE_ROUTE_CONTEXT_GATE_ACTION
+        ):
+            gate = dict(recorded_gate)
+            gate.setdefault("allowed", True)
+            gate.setdefault("status", "accepted")
+            gate.setdefault("action", SERVICE_ROUTE_CONTEXT_GATE_ACTION)
+            return _with_route_context_identity(gate, payload)
+        return {
+            "allowed": False,
+            "status": "route_context_token_required",
+            "action": SERVICE_ROUTE_CONTEXT_GATE_ACTION,
+            "decision": "block",
+            "reason": "server-issued route_token_gate binding is required",
+            "required_route_token": True,
+        }
     try:
         gate = validate_route_token_mutation_gate(
             payload,
