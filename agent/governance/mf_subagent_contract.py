@@ -2856,11 +2856,21 @@ _SURROGATE_JOIN_LINEAGE_FIELDS = (
 def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     """True when startup identity came from a host-adapter token surrogate only.
 
-    A startup is a true surrogate when the session token is absent and a
-    surrogate string (or host_adapter marker without a real token) was used.
-    A startup that went through the host-adapter path *but* carries a real
-    session-token hash that was server-verified is NOT a surrogate — the worker
-    had a real token and the server confirmed it.
+    TOFU mutual-exclusion rule (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610):
+    When ``agent_id_match_mode == 'host_adapter_startup_token_surrogate'``, the
+    startup MUST be classified as surrogate regardless of
+    ``session_token_evidence_type``.  Even if the startup presents a fresh token
+    that earns ``'hash'`` (first-sight) or ``'server_verified'`` evidence, the
+    host-adapter match mode means the presenter was the HOST, not a verified
+    bounded worker.  Token continuity ONLY confers trust when the startup mode is
+    ``same_as_allocation_owner`` — where the allocation owner is the direct worker
+    executor.
+
+    Rationale for ``server_verified`` on host-adapter mode: the server verified
+    that the re-presented token matches the hash committed at first sight, but on
+    host-adapter mode the first presenter was also the host.  Hash continuity
+    proves continuity with the first-sight host presenter, not with a bounded
+    worker.  It should NOT auto-exempt from surrogate classification.
 
     The live startup gate stamps ``agent_id_match_mode`` /
     ``session_token_evidence_type`` so a surrogate startup is distinguishable
@@ -2869,14 +2879,23 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     Evidence-type semantics (set by ``_startup_token_evidence`` in
     ``parallel_branch_runtime.py``):
     - ``'server_verified'``: server confirmed hash against allocation-time record.
-      NOT a surrogate.
-    - ``'hash'``: first-sight commitment — server recorded the hash.  NOT a
-      surrogate.
+      NOT a surrogate when ``same_as_allocation_owner``.
+      SURROGATE when ``host_adapter_startup_token_surrogate`` (host is presenter).
+    - ``'hash'``: first-sight commitment — server recorded the hash.
+      NOT a surrogate when ``same_as_allocation_owner``.
+      SURROGATE when ``host_adapter_startup_token_surrogate`` (first-sight TOFU
+      bypass — closes the QA-#3581 TOFU-HOST-ADAPTER-FIRST-SIGHT finding).
     - ``'claimed_unverified'``: worker presented a token but its hash did NOT
       match the server-recorded allocation hash.  Classified as a SURROGATE
       (token claim is unverified — treat same as no real token).
     - ``'surrogate'``: no session token; surrogate string supplied.  Surrogate.
     - ``''`` (empty): no token.  May be surrogate depending on match_mode.
+
+    Backward compatibility: existing recorded startup events with
+    ``agent_id_match_mode != 'host_adapter_startup_token_surrogate'`` and
+    ``session_token_evidence_type in ('hash', 'server_verified')`` are NOT
+    retroactively classified as surrogates — this change only tightens the
+    host-adapter path.
     """
 
     if not isinstance(evidence, Mapping):
@@ -2889,7 +2908,20 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     # mismatch — the claim is not trustworthy; treat as surrogate.
     if token_type == "claimed_unverified":
         return True
-    # Server-verified or first-sight hash: NOT a surrogate.
+    # Resolve match_mode early — needed for TOFU mutual-exclusion check below.
+    match_mode = _string(
+        evidence.get("agent_id_match_mode")
+        or _nested_mapping(evidence, "identity_join").get("agent_id_match_mode")
+    ).lower()
+    # TOFU mutual-exclusion gate (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610):
+    # host_adapter_startup_token_surrogate mode is ALWAYS a surrogate regardless of
+    # session_token_evidence_type.  A first-sight ('hash') or re-presentation
+    # ('server_verified') token on host-adapter mode earns no trust because the
+    # presenter is the host, not a verified bounded worker.
+    if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
+        return True
+    # Server-verified or first-sight hash on same_as_allocation_owner (or other
+    # non-host-adapter) mode: NOT a surrogate.
     if token_type in ("server_verified", "hash"):
         if _string(evidence.get("session_token_hash")) and _bool(
             evidence.get("session_token_present")
@@ -2901,17 +2933,6 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
         evidence.get("session_token_present")
     ):
         return False
-    match_mode = _string(
-        evidence.get("agent_id_match_mode")
-        or _nested_mapping(evidence, "identity_join").get("agent_id_match_mode")
-    ).lower()
-    if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
-        # Only a surrogate if no real session token is present.
-        has_real_token = bool(
-            _string(evidence.get("session_token_hash"))
-            or _bool(evidence.get("session_token_present"))
-        )
-        return not has_real_token
     return bool(
         _bool(evidence.get("host_adapter_startup_token_accepted"))
         and not _string(evidence.get("session_token_hash"))

@@ -3022,19 +3022,25 @@ def _surrogate_startup_with_lineage() -> dict:
 
 
 def _real_worker_startup_matching_lineage(event_id: str = "evt-real-001") -> dict:
-    """A real worker startup event that matches the surrogate lineage."""
+    """A real worker startup event that matches the surrogate lineage.
+
+    Uses same_as_allocation_owner mode so it is NOT classified as a surrogate
+    after the TOFU mutual-exclusion fix.  (host_adapter_startup_token_surrogate
+    mode startups are always surrogate, even with a real token — those are
+    exactly the events the join gate must skip.)
+    """
     return {
         "id": event_id,
         "schema_version": "mf_subagent_startup_gate.v1",
         "gate_kind": "mf_subagent.startup",
         "bounded": True,
         "close_satisfying": True,
-        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
-        # Real session token present — NOT a true surrogate.
+        # same_as_allocation_owner: trusted real-worker startup (not host-adapter mode)
+        "agent_id_match_mode": "same_as_allocation_owner",
         "session_token_evidence_type": "hash",
         "session_token_hash": "sha256:real-token-hash-abc",
         "session_token_present": True,
-        "host_adapter_startup_token_accepted": True,
+        "host_adapter_startup_token_accepted": False,
         "task_id": "task-sg-test-01",
         "worker_slot_id": "wslot-sg-01",
         "runtime_context_id": "mfrctx-sgtest01",
@@ -3056,9 +3062,16 @@ def _real_worker_startup_mismatched_lineage() -> dict:
     return startup
 
 
-def test_host_adapter_real_token_is_not_surrogate() -> None:
-    """A startup that used host-adapter path but has a real session token is NOT a surrogate."""
+def test_same_as_allocation_owner_real_token_is_not_surrogate() -> None:
+    """A startup with same_as_allocation_owner mode and a real session token is NOT a surrogate.
+
+    Post TOFU fix: host_adapter mode + real token IS surrogate (see TOFU tests below).
+    This test confirms that same_as_allocation_owner mode (the trusted path) is
+    unaffected by the mutual-exclusion change.
+    """
     real_token_startup = _real_worker_startup_matching_lineage()
+    # _real_worker_startup_matching_lineage now uses same_as_allocation_owner mode
+    assert real_token_startup["agent_id_match_mode"] == "same_as_allocation_owner"
     assert _startup_is_host_adapter_surrogate(real_token_startup) is False
 
 
@@ -3468,19 +3481,21 @@ def test_hash_evidence_type_legacy_is_not_surrogate() -> None:
 # AC-STARTUP-TOKEN-EVIDENCE-SERVER-VERIFICATION-20260610
 # ---------------------------------------------------------------------------
 
-def test_info01_fence_token_mismatch_documented() -> None:
-    """INFO-01: documents that task_id/fence mismatch is caught at the server layer.
+def test_info01_fence_token_unconditional_check_documented() -> None:
+    """INFO-01 (unconditional): server.py finish-gate enforces fence_token on every request.
 
-    The server.py finish-gate handler now cross-checks body fence_token against
-    the server-resolved context's fence_token before calling validate_mf_subagent_finish_gate.
-    This test verifies the logic independently by simulating the cross-check.
+    After AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610 hardening:
+    - Body fence_token OMISSION is now refused (not silently tolerated).
+    - Body fence_token MISMATCH is refused.
+    - Matching fence tokens pass.
+    - Context-lookup failure is refused (already handled by KeyError above the check).
+    - Missing context fence_token is refused (misconfigured lane).
     """
-    # Simulate a context with a known fence_token
     ctx_fence = "fence-correct-abc"
     body_fence_wrong = "fence-WRONG-xyz"
     body_fence_correct = ctx_fence
 
-    # Cross-check: mismatch should be detected
+    # Cross-check: mismatch must be detected
     mismatch_detected = (
         body_fence_wrong
         and ctx_fence
@@ -3488,7 +3503,7 @@ def test_info01_fence_token_mismatch_documented() -> None:
     )
     assert mismatch_detected, "Fence mismatch must be caught before finish gate runs"
 
-    # Cross-check: match should pass
+    # Cross-check: match must pass
     match_ok = not (
         body_fence_correct
         and ctx_fence
@@ -3496,14 +3511,31 @@ def test_info01_fence_token_mismatch_documented() -> None:
     )
     assert match_ok, "Matching fence tokens must pass the cross-check"
 
-    # Cross-check: empty body fence should pass (not enforced if not supplied)
+    # INFO-01 unconditional: empty body fence is now REFUSED (not tolerated)
     empty_body_fence = ""
-    empty_passes = not (
-        empty_body_fence
-        and ctx_fence
-        and empty_body_fence != ctx_fence
+    empty_now_refused = not bool(empty_body_fence)
+    assert empty_now_refused, (
+        "Empty body fence_token must be refused under INFO-01 unconditional check; "
+        "omission is no longer tolerated"
     )
-    assert empty_passes, "Empty body fence_token must not trigger mismatch"
+
+    # Context with no fence_token must be refused
+    ctx_fence_missing = ""
+    missing_ctx_fence_refused = not bool(ctx_fence_missing)
+    assert missing_ctx_fence_refused, (
+        "Missing context fence_token must be refused (misconfigured lane)"
+    )
+
+    # Verify the INFO-01 unconditional logic is present in server.py
+    import inspect
+    from agent.governance import server as server_module
+    server_source = inspect.getsource(server_module.handle_graph_governance_parallel_branch_finish_gate)
+    assert "fence_token is required" in server_source, (
+        "server.py finish-gate must refuse when body fence_token is missing"
+    )
+    assert "fence_token not found on server-side" in server_source, (
+        "server.py finish-gate must refuse when context has no fence_token"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3536,4 +3568,229 @@ def test_f4_close_gate_does_not_evaluate_surrogate_policy() -> None:
     finish_source = inspect.getsource(validate_mf_subagent_finish_gate)
     assert "surrogate_startup_evidence_gate" in finish_source, (
         "validate_mf_subagent_finish_gate must call surrogate_startup_evidence_gate"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TOFU mutual-exclusion tests (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610)
+# ---------------------------------------------------------------------------
+
+
+def _host_adapter_first_sight_startup() -> dict:
+    """Host-adapter mode startup with a FRESH first-sight session token.
+
+    This is the QA-#3581 TOFU-HOST-ADAPTER-FIRST-SIGHT probe scenario:
+    agent_id_match_mode = host_adapter_startup_token_surrogate, but the startup
+    presents a real session_token that earns evidence_type='hash' (first-sight).
+    The TOFU bypass: pre-fix this was NOT classified as surrogate; post-fix it MUST be.
+    """
+    return {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,  # claimed; gate should override
+        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+        # Fresh session token: evidence_type='hash' (first-sight commitment)
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:fabricated-first-sight-token",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": True,
+        "task_id": "task-tofu-test-01",
+        "worker_slot_id": "wslot-tofu-01",
+        "runtime_context_id": "mfrctx-tofu01",
+        "fence_token": "fence-tofu-01",
+        "worktree": "/repo/.worktrees/tofu-test",
+        "worktree_path": "/repo/.worktrees/tofu-test",
+        "actual_cwd": "/repo/.worktrees/tofu-test",
+        "actual_git_root": "/repo/.worktrees/tofu-test",
+        "branch": "refs/heads/task-tofu-test",
+        "head_commit": "head-tofu-test",
+    }
+
+
+def _host_adapter_re_presentation_startup() -> dict:
+    """Host-adapter mode startup with a RE-PRESENTED (server-verified) session token.
+
+    Design decision (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610):
+    On host_adapter_startup_token_surrogate mode, server_verified evidence proves
+    continuity with the FIRST presenter — but the first presenter was the HOST,
+    not a verified bounded worker.  This startup MUST also be classified as surrogate.
+    """
+    return {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,  # claimed; gate should override
+        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+        # Re-presented token: evidence_type='server_verified' (hash matched stored)
+        "session_token_evidence_type": "server_verified",
+        "session_token_hash": "sha256:re-presented-verified-token",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": True,
+        "task_id": "task-tofu-test-02",
+        "worker_slot_id": "wslot-tofu-02",
+        "runtime_context_id": "mfrctx-tofu02",
+        "fence_token": "fence-tofu-02",
+        "worktree": "/repo/.worktrees/tofu-test-02",
+        "worktree_path": "/repo/.worktrees/tofu-test-02",
+        "actual_cwd": "/repo/.worktrees/tofu-test-02",
+        "actual_git_root": "/repo/.worktrees/tofu-test-02",
+        "branch": "refs/heads/task-tofu-test-02",
+        "head_commit": "head-tofu-test-02",
+    }
+
+
+def test_host_adapter_first_sight_fresh_token_is_surrogate() -> None:
+    """TOFU fix (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610): host_adapter +
+    first-sight fresh token (evidence_type='hash') MUST be classified as surrogate.
+
+    This closes the QA-#3581 TOFU-HOST-ADAPTER-FIRST-SIGHT bypass where a host-adapter
+    startup with a fresh fabricated session_token earned evidence_type='hash' and
+    bypassed surrogate classification entirely.
+    """
+    startup = _host_adapter_first_sight_startup()
+    assert startup["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert startup["session_token_evidence_type"] == "hash"
+    assert startup["session_token_present"] is True
+    # Post-fix: MUST be surrogate regardless of evidence_type
+    assert _startup_is_host_adapter_surrogate(startup) is True, (
+        "host_adapter_startup_token_surrogate mode with first-sight token must be "
+        "classified as surrogate (TOFU mutual-exclusion)"
+    )
+    # surrogate_startup_evidence_gate must also demote it
+    gate = surrogate_startup_evidence_gate(startup)
+    assert gate["is_host_adapter_surrogate"] is True
+    assert gate["close_satisfying"] is False, (
+        "host_adapter first-sight startup must NOT be close-satisfying"
+    )
+
+
+def test_host_adapter_re_presentation_match_is_still_surrogate() -> None:
+    """TOFU design decision: host_adapter + server_verified re-presentation MUST be surrogate.
+
+    Matching a stored hash proves continuity with the first presenter, but on host-adapter
+    mode the first presenter was the HOST, not a verified bounded worker.  Token hash
+    continuity in host-adapter mode does NOT earn trust for a bounded worker claim.
+    Only same_as_allocation_owner mode startups earn trust from token continuity.
+    """
+    startup = _host_adapter_re_presentation_startup()
+    assert startup["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert startup["session_token_evidence_type"] == "server_verified"
+    assert startup["session_token_present"] is True
+    # MUST be surrogate: server_verified on host-adapter mode proves host continuity, not worker
+    assert _startup_is_host_adapter_surrogate(startup) is True, (
+        "host_adapter_startup_token_surrogate mode with server_verified token must be "
+        "classified as surrogate — hash continuity on host-adapter proves host identity only"
+    )
+
+
+def test_same_as_allocation_owner_first_sight_unchanged() -> None:
+    """TOFU fix must NOT affect same_as_allocation_owner startups.
+
+    same_as_allocation_owner + hash evidence is the trusted path: the allocation owner
+    IS the direct executor, so token continuity confers trust.  This is unchanged.
+    """
+    trusted_startup = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "close_satisfying": True,
+        "agent_id_match_mode": "same_as_allocation_owner",
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:trusted-alloc-owner-token",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": False,
+        "task_id": "task-trusted-01",
+        "fence_token": "fence-trusted-01",
+    }
+    # Must NOT be surrogate: same_as_allocation_owner is the trusted path
+    assert _startup_is_host_adapter_surrogate(trusted_startup) is False, (
+        "same_as_allocation_owner + hash must NOT be classified as surrogate"
+    )
+    gate = surrogate_startup_evidence_gate(trusted_startup)
+    assert gate["is_host_adapter_surrogate"] is False
+    assert gate["close_satisfying"] is True
+
+
+def test_surrogate_with_matching_lineage_real_startup_still_joins() -> None:
+    """Recovery path: surrogate + real same_as_allocation_owner startup with matching
+    lineage still joins and becomes close-satisfying.
+
+    The fix changes host_adapter+hash to surrogate but leaves the join path intact.
+    The real startup that joins must be a non-host-adapter (trusted) startup.
+    """
+    surrogate = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+        "session_token_evidence_type": "surrogate",
+        "session_token_hash": "",
+        "session_token_present": False,
+        "host_adapter_startup_token_accepted": True,
+        "task_id": "task-recovery-01",
+        "worker_slot_id": "wslot-recovery-01",
+        "runtime_context_id": "mfrctx-recovery01",
+        "fence_token": "fence-recovery-01",
+    }
+    # Real startup with same lineage and same_as_allocation_owner mode
+    real_startup = {
+        "id": "evt-recovery-real-001",
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "bounded": True,
+        "agent_id_match_mode": "same_as_allocation_owner",
+        "session_token_evidence_type": "hash",
+        "session_token_hash": "sha256:recovery-real-token",
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": False,
+        "task_id": "task-recovery-01",
+        "worker_slot_id": "wslot-recovery-01",
+        "runtime_context_id": "mfrctx-recovery01",
+        "fence_token": "fence-recovery-01",
+    }
+    # Surrogate alone is blocked
+    assert _startup_is_host_adapter_surrogate(surrogate) is True
+    gate_no_join = surrogate_startup_evidence_gate(surrogate)
+    assert gate_no_join["close_satisfying"] is False
+    # With real startup join, becomes close-satisfying
+    gate_joined = surrogate_startup_evidence_gate(
+        surrogate, real_startup_events=[real_startup]
+    )
+    assert gate_joined["is_host_adapter_surrogate"] is True
+    assert gate_joined["close_satisfying"] is True
+    assert gate_joined["real_worker_join"]["joined"] is True
+    assert gate_joined["real_worker_join"]["join_event_id"] == "evt-recovery-real-001"
+
+
+def test_fence_omission_in_body_is_refused_by_server_gate() -> None:
+    """INFO-01 unconditional: finish-gate handler in server.py must refuse when
+    fence_token is absent from the request body.
+
+    This confirms the server.py source enforces the unconditional check.
+    """
+    import inspect
+    from agent.governance import server as server_module
+    source = inspect.getsource(server_module.handle_graph_governance_parallel_branch_finish_gate)
+    assert "fence_token is required" in source, (
+        "server.py finish-gate must refuse when body fence_token is missing"
+    )
+
+
+def test_context_lookup_failure_check_exists_in_server_gate() -> None:
+    """INFO-01: finish-gate handler must refuse when context lookup fails.
+
+    Server resolves context server-side via get_branch_context; if context is None,
+    it raises before the fence check.  This test confirms the pattern is present.
+    """
+    import inspect
+    from agent.governance import server as server_module
+    source = inspect.getsource(server_module.handle_graph_governance_parallel_branch_finish_gate)
+    # The handler raises KeyError when context is None
+    assert "branch runtime context not found" in source, (
+        "server.py finish-gate must raise when context lookup fails"
+    )
+    # The handler also refuses if context.fence_token is missing
+    assert "fence_token not found on server-side" in source, (
+        "server.py finish-gate must refuse when context has no fence_token"
     )
