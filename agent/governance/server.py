@@ -23589,6 +23589,89 @@ def _current_task_timeline_candidate(
     return {}
 
 
+# TTL for aging out zero-event candidates with no live heartbeat.
+# Candidates whose only timestamp is a backlog-row updated_at older than
+# this threshold AND whose timeline event count is 0 are excluded from the
+# current-bindable pool.  They remain in backlog; this only prevents them
+# from claiming the "current" binding.
+_CURRENT_TASK_ZERO_EVENT_STALE_TTL_SECS: int = int(
+    os.environ.get("AMING_CURRENT_TASK_ZERO_EVENT_STALE_TTL_SECS", "1800")  # 30 min default
+)
+
+
+def _current_task_timeline_event_counts(conn, project_id: str, backlog_ids: list[str]) -> dict[str, int]:
+    """Return {backlog_id: event_count} for the given backlog_ids using task_timeline_events."""
+    if not backlog_ids:
+        return {}
+    from . import task_timeline as _tl
+    _tl.ensure_schema(conn)
+    placeholders = ",".join("?" for _ in backlog_ids)
+    rows = conn.execute(
+        f"""SELECT backlog_id, COUNT(*) AS cnt
+            FROM task_timeline_events
+            WHERE project_id = ?
+              AND COALESCE(backlog_id, '') != ''
+              AND backlog_id IN ({placeholders})
+            GROUP BY backlog_id""",
+        [project_id, *backlog_ids],
+    ).fetchall()
+    return {str(row["backlog_id"]): int(row["cnt"]) for row in rows}
+
+
+def _current_task_candidate_is_aged_out(candidate: Mapping[str, Any], event_count: int) -> bool:
+    """Return True when a zero-event candidate's timestamp is beyond the stale TTL.
+
+    A candidate is aged-out only when ALL of:
+    - Its governed timeline event count is 0.
+    - Its evidence_at timestamp is parseable and older than the TTL.
+    The TTL can be overridden via AMING_CURRENT_TASK_ZERO_EVENT_STALE_TTL_SECS.
+    """
+    if event_count > 0:
+        return False
+    evidence_at = str(candidate.get("evidence_at") or "").strip()
+    if not evidence_at:
+        return False
+    try:
+        from datetime import datetime, timezone as _tz
+        ts = datetime.fromisoformat(evidence_at.replace("Z", "+00:00"))
+        now = datetime.now(_tz.utc)
+        age_secs = (now - ts).total_seconds()
+        return age_secs > _CURRENT_TASK_ZERO_EVENT_STALE_TTL_SECS
+    except Exception:
+        return False
+
+
+def _current_task_competing_candidates_metadata(
+    candidates: list[dict],
+    event_counts: dict[str, int],
+) -> list[dict]:
+    """Build the competing-candidates list exposed in the API response.
+
+    Each entry exposes: bug_id, task_id, last_evidence_at, event_count.
+    Ordered by event_count DESC then evidence_at DESC so the best candidate
+    is first (matches the new selection rule).
+    """
+    entries = []
+    seen: set[str] = set()
+    for c in candidates:
+        bug = c.get("bug")
+        if bug is None:
+            continue
+        bug_id = str(_row_get(bug, "bug_id", "") or "")
+        if not bug_id or bug_id in seen:
+            continue
+        seen.add(bug_id)
+        ec = event_counts.get(bug_id, 0)
+        entries.append({
+            "bug_id": bug_id,
+            "task_id": str(c.get("task_id") or ""),
+            "last_evidence_at": str(c.get("evidence_at") or ""),
+            "event_count": ec,
+        })
+    entries.sort(key=lambda e: (e["event_count"], e["last_evidence_at"]), reverse=True)
+    return entries
+
+
 def _current_task_runtime_candidates(rows: list[sqlite3.Row]) -> list[dict]:
     candidates: list[dict] = []
     for row in rows:
@@ -23610,18 +23693,49 @@ def _current_task_runtime_candidates(rows: list[sqlite3.Row]) -> list[dict]:
     return candidates
 
 
-def _current_task_candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[str, int, int]:
+def _current_task_candidate_sort_key(
+    candidate: Mapping[str, Any],
+    event_counts: dict[str, int] | None = None,
+) -> tuple[int, str, int, int]:
+    """Sort key for candidate selection.
+
+    Priority (highest first):
+    1. has_evidence: 1 if the candidate has any governed timeline events, else 0.
+       An event-less candidate must NEVER hold the binding while an evidencing
+       candidate exists (AC-CURRENT-STREAM-BINDING-ACTIVE-LANE-SELECTION-20260610).
+    2. evidence_at: ISO timestamp string — later is better.
+    3. event_id: numeric timeline event id — higher is more recent.
+    4. rowid: DB rowid tiebreaker.
+
+    event_counts may be supplied externally for O(1) lookup; when omitted the
+    candidate's own event_id field is used as a proxy (non-zero implies at least
+    one event for timeline-sourced candidates).
+    """
+    bug = candidate.get("bug")
+    bug_id = str(_row_get(bug, "bug_id", "") or "") if bug is not None else ""
+    if event_counts is not None:
+        ec = event_counts.get(bug_id, 0)
+    else:
+        # Fallback: timeline-sourced candidates carry a non-zero event_id.
+        ec = int(candidate.get("event_id") or 0)
+    has_evidence = 1 if ec > 0 else 0
     return (
+        has_evidence,
         str(candidate.get("evidence_at") or ""),
         int(candidate.get("event_id") or 0),
         int(candidate.get("rowid") or 0),
     )
 
 
-def _current_task_active_backlog(candidates: list[dict], primary: Mapping[str, Any]) -> list[dict]:
+def _current_task_active_backlog(
+    candidates: list[dict],
+    primary: Mapping[str, Any],
+    event_counts: dict[str, int] | None = None,
+) -> list[dict]:
+    sort_key = lambda c: _current_task_candidate_sort_key(c, event_counts)  # noqa: E731
     ordered = [
         dict(primary),
-        *sorted(candidates, key=_current_task_candidate_sort_key, reverse=True),
+        *sorted(candidates, key=sort_key, reverse=True),
     ]
     seen: set[str] = set()
     active: list[dict] = []
@@ -23639,48 +23753,87 @@ def _current_task_active_backlog(candidates: list[dict], primary: Mapping[str, A
 
 @route("GET", "/api/backlog/{project_id}/current-task")
 def handle_backlog_current_task(ctx: RequestContext):
-    """Return the current backlog task from the newest active evidence."""
+    """Return the current backlog task from the newest active evidence.
+
+    Selection rule (AC-CURRENT-STREAM-BINDING-ACTIVE-LANE-SELECTION-20260610):
+    1. Among active candidates, bind to the lane with MOST RECENT governed
+       timeline evidence (event_count > 0 beats event_count == 0 regardless
+       of updated_at timestamp).
+    2. Tie-break: most recent evidence_at, then event_id, then rowid.
+    3. Aging: zero-event candidates older than _CURRENT_TASK_ZERO_EVENT_STALE_TTL_SECS
+       are dropped from the bindable pool (they are NOT deleted from backlog).
+    4. Exposes competing_candidates list so the frontend can render a selector.
+    """
     pid = ctx.path_params["project_id"]
     limit = max(1, min(_query_int(ctx.query, "limit", 10), 50))
     conn = get_connection(pid)
     try:
         policy = _current_task_policy_payload(pid)
         runtime_rows = _current_task_runtime_rows(conn, limit)
-        candidates = _current_task_runtime_candidates(runtime_rows)
+        all_candidates = _current_task_runtime_candidates(runtime_rows)
         timeline_candidate = _current_task_timeline_candidate(conn, pid, limit)
         if timeline_candidate:
-            candidates.append(timeline_candidate)
-        if candidates:
-            primary = max(candidates, key=_current_task_candidate_sort_key)
-            primary_bug = primary["bug"]
-            active_rows = _current_task_active_backlog(candidates, primary)
+            all_candidates.append(timeline_candidate)
+
+        if not all_candidates:
             return {
                 "ok": True,
                 "project_id": pid,
-                "active": True,
-                "source": primary["source"],
-                "backlog_id": _row_get(primary_bug, "bug_id", ""),
-                "task_id": str(primary.get("task_id") or ""),
-                "bug": _backlog_compact_bug(primary_bug),
-                "active_backlog": active_rows,
-                "active_count": len(active_rows),
-                "latest_event": _current_task_event_summary(primary.get("latest_event")),
+                "active": False,
+                "source": "none",
+                "backlog_id": "",
+                "task_id": "",
+                "bug": None,
+                "active_backlog": [],
+                "active_count": 0,
+                "latest_event": {},
                 "governance_policy": policy,
-                "single_active_task": _single_active_task_summary(policy, len(active_rows)),
+                "single_active_task": _single_active_task_summary(policy, 0),
+                "competing_candidates": [],
             }
+
+        # Fetch governed timeline event counts for all active candidates.
+        all_bug_ids = list({
+            str(_row_get(c["bug"], "bug_id", "") or "")
+            for c in all_candidates
+            if c.get("bug") is not None
+        })
+        event_counts = _current_task_timeline_event_counts(conn, pid, all_bug_ids)
+
+        # Apply aging: drop zero-event candidates whose timestamp is stale.
+        bindable = [
+            c for c in all_candidates
+            if not _current_task_candidate_is_aged_out(
+                c, event_counts.get(
+                    str(_row_get(c.get("bug"), "bug_id", "") or "") if c.get("bug") is not None else "",
+                    0,
+                )
+            )
+        ]
+        if not bindable:
+            # All candidates aged out — fall back to full set so we still have
+            # a binding rather than silently showing nothing.
+            bindable = all_candidates
+
+        sort_key = lambda c: _current_task_candidate_sort_key(c, event_counts)  # noqa: E731
+        primary = max(bindable, key=sort_key)
+        primary_bug = primary["bug"]
+        active_rows = _current_task_active_backlog(bindable, primary, event_counts)
+        competing = _current_task_competing_candidates_metadata(bindable, event_counts)
         return {
             "ok": True,
             "project_id": pid,
-            "active": False,
-            "source": "none",
-            "backlog_id": "",
-            "task_id": "",
-            "bug": None,
-            "active_backlog": [],
-            "active_count": 0,
-            "latest_event": {},
+            "active": True,
+            "source": primary["source"],
+            "backlog_id": _row_get(primary_bug, "bug_id", ""),
+            "task_id": str(primary.get("task_id") or ""),
+            "bug": _backlog_compact_bug(primary_bug),
+            "active_backlog": active_rows,
+            "active_count": len(active_rows),
+            "latest_event": _current_task_event_summary(primary.get("latest_event")),
             "governance_policy": policy,
-            "single_active_task": _single_active_task_summary(policy, 0),
+            "single_active_task": _single_active_task_summary(policy, len(active_rows)),
+            "competing_candidates": competing,
         }
     finally:
         conn.close()

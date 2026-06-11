@@ -43,6 +43,13 @@ interface PlaybackLoadState {
   gate?: BacklogTimelineGateResponse | null;
 }
 
+interface CompetingCandidate {
+  bug_id: string;
+  task_id: string;
+  last_evidence_at: string;
+  event_count: number;
+}
+
 interface CurrentTaskHint {
   ok?: boolean;
   active: boolean;
@@ -56,6 +63,7 @@ interface CurrentTaskHint {
   latest_event?: Record<string, unknown>;
   single_active_task?: Record<string, unknown>;
   governance_policy?: Record<string, unknown>;
+  competing_candidates?: CompetingCandidate[];
 }
 
 interface ActivityLoadState extends PlaybackLoadState {
@@ -74,6 +82,10 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>({});
   const [activityByBug, setActivityByBug] = useState<Record<string, ActivityLoadState>>({});
   const [currentTaskHint, setCurrentTaskHint] = useState<CurrentTaskHint | null>(null);
+  // Frontend-local override: when multiple candidates compete and the user
+  // clicks a competing-candidates selector entry, we rebind the activity view
+  // to that bug_id locally (no server mutation).
+  const [localActivityBugId, setLocalActivityBugId] = useState<string>("");
   const [activityRefreshSeq, setActivityRefreshSeq] = useState(0);
   const [selectedFrameId, setSelectedFrameId] = useState<string>("");
   const [selectedActivityFrameId, setSelectedActivityFrameId] = useState<string>("");
@@ -109,6 +121,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setPlaybackByBug({});
     setActivityByBug({});
     setCurrentTaskHint(null);
+    setLocalActivityBugId("");
     setActivityRefreshSeq(0);
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
@@ -160,7 +173,16 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const hintedCurrentBug = currentTaskHint?.active && currentTaskHint.bug && !isPrivatePlaybackBacklog(currentTaskHint.bug)
     ? currentTaskHint.bug
     : null;
-  const activityBug = selectedBug ?? hintedCurrentBug;
+  // Resolve the locally-overridden bug when the user clicked a competing-candidate switch.
+  const localOverrideBug = useMemo(() => {
+    if (!localActivityBugId) return null;
+    // Search in active_backlog from the hint first, then publicBugs.
+    const fromHint = currentTaskHint?.active_backlog?.find((b) => b.bug_id === localActivityBugId);
+    if (fromHint) return isPrivatePlaybackBacklog(fromHint) ? null : fromHint;
+    const fromPublic = publicBugs.find((b) => b.bug_id === localActivityBugId);
+    return fromPublic && !isPrivatePlaybackBacklog(fromPublic) ? fromPublic : null;
+  }, [localActivityBugId, currentTaskHint, publicBugs]);
+  const activityBug = selectedBug ?? localOverrideBug ?? hintedCurrentBug;
   const activityState = activityBug ? activityByBug[activityBug.bug_id] : undefined;
   const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
   // Current tab is newest-first: default selection is the newest (last) frame.
@@ -343,7 +365,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     if (!state?.loaded || state.loading) return;
     const currentFrameExists = Boolean(selectedActivityFrameId && state.trace.frames.some((frame) => frame.id === selectedActivityFrameId));
     if (!selectedActivityFrameId || currentFrameExists) return;
-    setSelectedActivityFrameId(state.trace.frames[0]?.id || "");
+    // QA #3636 F2: use newest frame (last in newest-first array) for stale-frame fallback.
+    setSelectedActivityFrameId(state.trace.frames[state.trace.frames.length - 1]?.id || "");
   }, [activityBug, activityByBug, selectedActivityFrameId]);
 
   useEffect(() => {
@@ -502,6 +525,14 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               <div className="timeline-empty">No actively running observer task or command is recorded for this project.</div>
             )}
             <ActivityStreamSummary hint={currentTaskHint} trace={activityTrace} />
+            <CompetingCandidatesSelector
+              hint={currentTaskHint}
+              currentBugId={activityBug?.bug_id || ""}
+              onSelect={(bugId) => {
+                setLocalActivityBugId(bugId);
+                setSelectedActivityFrameId("");
+              }}
+            />
             <div className="task-playback-controls">
               <button
                 type="button"
@@ -861,6 +892,46 @@ function statusClass(status: string): string {
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return `${error.message} ${error.body}`.trim();
   return String(error);
+}
+
+// ---------------------------------------------------------------------------
+// Competing-candidates selector (AC-CURRENT-STREAM-BINDING-ACTIVE-LANE-SELECTION-20260610)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compact "N active — switch" selector shown when multiple candidates compete.
+ * Selection is frontend-local; no server mutation is performed.
+ */
+function CompetingCandidatesSelector({
+  hint,
+  currentBugId,
+  onSelect,
+}: {
+  hint: CurrentTaskHint | null;
+  currentBugId: string;
+  onSelect: (bugId: string) => void;
+}) {
+  const candidates = hint?.competing_candidates;
+  if (!candidates || candidates.length <= 1) return null;
+  return (
+    <div className="task-playback-chip-section competing-candidates-selector" aria-label="Competing active candidates">
+      <strong>{candidates.length} active — switch</strong>
+      <div className="competing-candidates-list">
+        {candidates.map((c) => (
+          <button
+            key={c.bug_id}
+            type="button"
+            className={`competing-candidate-btn${c.bug_id === currentBugId ? " active" : ""}`}
+            title={`${c.bug_id} | ${c.event_count} event${c.event_count === 1 ? "" : "s"} | last: ${c.last_evidence_at || "unknown"}`}
+            onClick={() => onSelect(c.bug_id)}
+          >
+            <span className="mono">{c.bug_id}</span>
+            <em>{c.event_count} evt</em>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
