@@ -6,8 +6,14 @@ import {
   latestPlaybackFrameId,
   pushPlaybackNavStack,
   popPlaybackNavStack,
+  projectEventToCard,
+  sliceEventPage,
+  truncateHash,
+  categorizeEvidenceRef,
+  groupEvidenceRefsByCategory,
   type PlaybackNavEntry,
   type TaskPlaybackFrame,
+  type TaskPlaybackEvidenceRef,
 } from "./taskPlayback";
 import { projectTaskTimelineEvent } from "./taskTimelineSemantics";
 
@@ -2204,4 +2210,226 @@ function taskPlaybackSegmentTextAssertions(): string[] {
 export const taskPlaybackStatusWordEmphasisSummary: string[] = [
   ...taskPlaybackStatusWordClassifyAssertions(),
   ...taskPlaybackSegmentTextAssertions(),
+];
+
+// ---------------------------------------------------------------------------
+// AC-ACTIVITY-PLAYBACK-IA-EVENT-CARDS-REFERENCES-20260611 tests
+// ---------------------------------------------------------------------------
+
+function assertIa(condition: boolean, label: string): void {
+  if (!condition) throw new Error(`[IA assertion] FAILED: ${label}`);
+}
+
+/**
+ * Test projectEventToCard — verify card fields are projected correctly from
+ * a TaskTimelineEvent.
+ */
+function taskPlaybackProjectEventToCardAssertions(): string[] {
+  const event: TaskTimelineEvent = {
+    id: 9001,
+    event_type: "mf_subagent.startup",
+    event_kind: "mf_subagent_startup",
+    phase: "startup_gate",
+    actor: "mf_sub",
+    status: "passed",
+    backlog_id: "AC-TEST-CARD-20260611",
+    task_id: "task-card-fixture",
+    created_at: "2026-06-11T08:00:00Z",
+    payload: {},
+  };
+
+  const card = projectEventToCard(event);
+
+  assertIa(card.id === 9001, `card.id should be 9001, got ${card.id}`);
+  assertIa(card.at === "2026-06-11T08:00:00Z", `card.at should be created_at, got ${card.at}`);
+  assertIa(card.event_kind === "mf_subagent_startup", `card.event_kind, got ${card.event_kind}`);
+  assertIa(card.event_type === "mf_subagent.startup", `card.event_type, got ${card.event_type}`);
+  assertIa(card.status === "passed", `card.status, got ${card.status}`);
+  assertIa(card.actor === "mf_sub", `card.actor, got ${card.actor}`);
+  assertIa(card.backlog_id === "AC-TEST-CARD-20260611", `card.backlog_id, got ${card.backlog_id}`);
+  assertIa(card.task_id === "task-card-fixture", `card.task_id, got ${card.task_id}`);
+  assertIa(typeof card.headline === "string" && card.headline.length > 0, `card.headline should be non-empty string`);
+  assertIa(typeof card.evidence_count === "number", `card.evidence_count should be a number`);
+  assertIa(Array.isArray(card.evidence_types), `card.evidence_types should be an array`);
+
+  // String id coercion: id field as string
+  const strEvent: TaskTimelineEvent = { ...event, id: "str-id-9002" as unknown as number };
+  const strCard = projectEventToCard(strEvent);
+  assertIa(strCard.id === "str-id-9002", `string id coerced correctly, got ${strCard.id}`);
+
+  // Missing fields: graceful fallback
+  const minimal: TaskTimelineEvent = { id: 0, event_type: "", event_kind: "", phase: "", actor: "", status: "", backlog_id: "", task_id: "", created_at: "", payload: {} };
+  const minCard = projectEventToCard(minimal);
+  assertIa(typeof minCard.headline === "string", "minimal event: headline is string");
+  assertIa(minCard.evidence_count === 0, "minimal event: evidence_count is 0");
+
+  return [
+    "projectEventToCard: id field projected correctly (number)",
+    "projectEventToCard: id field projected correctly (string coercion)",
+    "projectEventToCard: at = created_at",
+    "projectEventToCard: event_kind, event_type, status, actor, backlog_id, task_id",
+    "projectEventToCard: headline is non-empty string",
+    "projectEventToCard: evidence_count is number, evidence_types is array",
+    "projectEventToCard: minimal event: graceful fallback for all fields",
+  ];
+}
+
+/**
+ * Test truncateHash — various inputs: non-hash, short hash, long sha256, sha512, raw hex.
+ */
+function taskPlaybackTruncateHashAssertions(): string[] {
+  // Non-hash strings pass through unchanged
+  assertIa(truncateHash("") === "", "truncateHash('') → ''");
+  assertIa(truncateHash("not-a-hash") === "not-a-hash", "truncateHash non-hash → unchanged");
+  assertIa(truncateHash("AC-CLOSE-GATE-20260611") === "AC-CLOSE-GATE-20260611", "truncateHash backlog id → unchanged");
+
+  // Short hex (<= 12 chars): unchanged
+  assertIa(truncateHash("sha256:abcd1234") === "sha256:abcd1234", "truncateHash short hex with prefix → unchanged");
+  assertIa(truncateHash("abcdef1234") === "abcdef1234", "truncateHash short hex no prefix → unchanged");
+
+  // Long sha256 hex: truncated to prefix+4…4
+  const long256 = "sha256:d36f5c4b2e7a8f91c0d3e6b4a5f2c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3";
+  const truncated256 = truncateHash(long256);
+  assertIa(truncated256.startsWith("sha256:"), `truncated sha256 starts with 'sha256:', got: ${truncated256}`);
+  assertIa(truncated256.includes("…"), `truncated sha256 has ellipsis, got: ${truncated256}`);
+  assertIa(truncated256.length < long256.length, `truncated sha256 shorter than input`);
+
+  // Raw hex without prefix: defaults to sha256: prefix
+  const rawHex = "d36f5c4b2e7a8f91c0d3e6b4a5f2c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c";
+  const truncatedRaw = truncateHash(rawHex);
+  assertIa(truncatedRaw.startsWith("sha256:"), `raw hex truncated to sha256:prefix, got: ${truncatedRaw}`);
+
+  // sha512 prefix preserved
+  const long512 = "sha512:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2";
+  const truncated512 = truncateHash(long512);
+  assertIa(truncated512.startsWith("sha512:"), `sha512 prefix preserved, got: ${truncated512}`);
+  assertIa(truncated512.includes("…"), "sha512 long hash has ellipsis");
+
+  return [
+    "truncateHash: empty string → ''",
+    "truncateHash: non-hash strings pass through unchanged",
+    "truncateHash: short hex (<= 12 chars) → unchanged",
+    "truncateHash: long sha256 → prefix+4…4 format",
+    "truncateHash: raw hex without prefix → sha256: prefix added",
+    "truncateHash: sha512: prefix preserved",
+  ];
+}
+
+/**
+ * Test categorizeEvidenceRef and groupEvidenceRefsByCategory — all 6 categories.
+ */
+function taskPlaybackCategorizeEvidenceRefAssertions(): string[] {
+  // timeline_events
+  assertIa(categorizeEvidenceRef("timeline_event") === "timeline_events", "timeline_event → timeline_events");
+  assertIa(categorizeEvidenceRef("source_event") === "timeline_events", "source_event → timeline_events");
+
+  // gate_and_verification
+  assertIa(categorizeEvidenceRef("gate") === "gate_and_verification", "gate → gate_and_verification");
+  assertIa(categorizeEvidenceRef("precheck") === "gate_and_verification", "precheck → gate_and_verification");
+
+  // route_and_prompt
+  assertIa(categorizeEvidenceRef("route_context") === "route_and_prompt", "route_context → route_and_prompt");
+  assertIa(categorizeEvidenceRef("read_receipt") === "route_and_prompt", "read_receipt → route_and_prompt");
+  assertIa(categorizeEvidenceRef("prompt_contract") === "route_and_prompt", "prompt_contract → route_and_prompt");
+
+  // commit_and_artifact
+  assertIa(categorizeEvidenceRef("commit") === "commit_and_artifact", "commit → commit_and_artifact");
+  assertIa(categorizeEvidenceRef("file") === "commit_and_artifact", "file → commit_and_artifact");
+  assertIa(categorizeEvidenceRef("test") === "commit_and_artifact", "test → commit_and_artifact");
+  assertIa(categorizeEvidenceRef("artifact") === "commit_and_artifact", "artifact → commit_and_artifact");
+
+  // graph_and_trace
+  assertIa(categorizeEvidenceRef("graph_trace") === "graph_and_trace", "graph_trace → graph_and_trace");
+  assertIa(categorizeEvidenceRef("node") === "graph_and_trace", "node → graph_and_trace");
+
+  // Default → backlog_and_task
+  assertIa(categorizeEvidenceRef("content_sys" as TaskPlaybackEvidenceRef["kind"]) === "backlog_and_task", "content_sys → backlog_and_task");
+
+  // groupEvidenceRefsByCategory — value pattern overrides kind
+  const refs: TaskPlaybackEvidenceRef[] = [
+    { kind: "timeline_event", label: "ev", value: "3799" },               // → timeline_events (not AC-/task-)
+    { kind: "timeline_event", label: "backlog", value: "AC-TEST-20260611" }, // → backlog_and_task (AC- override)
+    { kind: "graph_trace", label: "trace", value: "task-abc-123" },         // → backlog_and_task (task- override)
+    { kind: "commit", label: "sha", value: "sha256:abcdef1234567890abcdef1234567890ab" }, // → commit_and_artifact
+    { kind: "route_context", label: "rc", value: "route-fixture-01" },      // → route_and_prompt
+  ];
+  const grouped = groupEvidenceRefsByCategory(refs);
+  assertIa(grouped.timeline_events.length === 1, `timeline_events should have 1 item, got ${grouped.timeline_events.length}`);
+  assertIa(grouped.backlog_and_task.length === 2, `backlog_and_task should have 2 (AC- + task- overrides), got ${grouped.backlog_and_task.length}`);
+  assertIa(grouped.commit_and_artifact.length === 1, `commit_and_artifact should have 1, got ${grouped.commit_and_artifact.length}`);
+  assertIa(grouped.route_and_prompt.length === 1, `route_and_prompt should have 1, got ${grouped.route_and_prompt.length}`);
+  assertIa(grouped.gate_and_verification.length === 0, `gate_and_verification should be empty`);
+  assertIa(grouped.graph_and_trace.length === 0, `graph_and_trace should be 0 (task- overrode it), got ${grouped.graph_and_trace.length}`);
+
+  return [
+    "categorizeEvidenceRef: timeline_event / source_event → timeline_events",
+    "categorizeEvidenceRef: gate / precheck → gate_and_verification",
+    "categorizeEvidenceRef: route_context / read_receipt / prompt_contract → route_and_prompt",
+    "categorizeEvidenceRef: commit / file / test / artifact → commit_and_artifact",
+    "categorizeEvidenceRef: graph_trace / node → graph_and_trace",
+    "categorizeEvidenceRef: content_sys (default) → backlog_and_task",
+    "groupEvidenceRefsByCategory: AC-/task- patterns override kind for backlog_and_task",
+    "groupEvidenceRefsByCategory: correct bucket counts for all 6 categories",
+  ];
+}
+
+/**
+ * Test sliceEventPage — page 0/1/last, edge cases.
+ */
+function taskPlaybackSliceEventPageAssertions(): string[] {
+  const items = Array.from({ length: 25 }, (_, i) => `item-${i}`);
+
+  // Page 0
+  const p0 = sliceEventPage(items, 0, 10);
+  assertIa(p0.page === 0, `page 0: page is 0, got ${p0.page}`);
+  assertIa(p0.totalPages === 3, `page 0: totalPages should be 3, got ${p0.totalPages}`);
+  assertIa(p0.items.length === 10, `page 0: 10 items, got ${p0.items.length}`);
+  assertIa(p0.items[0] === "item-0", `page 0: first item is item-0`);
+
+  // Page 1
+  const p1 = sliceEventPage(items, 1, 10);
+  assertIa(p1.page === 1, `page 1: page is 1, got ${p1.page}`);
+  assertIa(p1.items.length === 10, `page 1: 10 items, got ${p1.items.length}`);
+  assertIa(p1.items[0] === "item-10", `page 1: first item is item-10`);
+
+  // Last page (page 2, 5 items)
+  const p2 = sliceEventPage(items, 2, 10);
+  assertIa(p2.page === 2, `page 2: page is 2, got ${p2.page}`);
+  assertIa(p2.items.length === 5, `last page: 5 items, got ${p2.items.length}`);
+
+  // Out-of-bounds page clamped to last
+  const pOver = sliceEventPage(items, 100, 10);
+  assertIa(pOver.page === 2, `over-page clamped to last (2), got ${pOver.page}`);
+
+  // Negative page clamped to 0
+  const pNeg = sliceEventPage(items, -1, 10);
+  assertIa(pNeg.page === 0, `negative page clamped to 0, got ${pNeg.page}`);
+
+  // Empty array: totalPages = 1, page = 0, items = []
+  const empty = sliceEventPage([], 0, 10);
+  assertIa(empty.totalPages === 1, `empty: totalPages = 1, got ${empty.totalPages}`);
+  assertIa(empty.items.length === 0, `empty: items is empty`);
+
+  // Exact fit: 10 items, pageSize 10 → 1 page
+  const exact = sliceEventPage(Array.from({ length: 10 }, (_, i) => i), 0, 10);
+  assertIa(exact.totalPages === 1, `exact fit: 1 page, got ${exact.totalPages}`);
+  assertIa(exact.items.length === 10, `exact fit: 10 items`);
+
+  return [
+    "sliceEventPage: page 0 returns first 10 items",
+    "sliceEventPage: page 1 returns items 10-19",
+    "sliceEventPage: last page returns remaining items",
+    "sliceEventPage: totalPages computed correctly (25 items, size 10 → 3 pages)",
+    "sliceEventPage: out-of-bounds page clamped to last",
+    "sliceEventPage: negative page clamped to 0",
+    "sliceEventPage: empty array → totalPages=1, items=[]",
+    "sliceEventPage: exact-fit array → 1 page",
+  ];
+}
+
+export const taskPlaybackIaEventCardsReferencesSummary: string[] = [
+  ...taskPlaybackProjectEventToCardAssertions(),
+  ...taskPlaybackTruncateHashAssertions(),
+  ...taskPlaybackCategorizeEvidenceRefAssertions(),
+  ...taskPlaybackSliceEventPageAssertions(),
 ];
