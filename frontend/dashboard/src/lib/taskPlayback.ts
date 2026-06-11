@@ -1,8 +1,10 @@
 import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
 import {
+  projectGateMatrix,
   isPrivateTimelineText,
   projectTaskTimelineEvent,
   timelineStatusFromEvent,
+  type GateMatrixProjection,
   type TaskTimelineEvidenceInspector,
   type TaskTimelineSemanticChip,
   type TaskTimelineSemanticNarrative,
@@ -85,6 +87,9 @@ export interface TaskPlaybackLane {
   status: TaskPlaybackFrameStatus;
   frame_count: number;
   latest_at: string;
+  driving_frame_id: string;
+  reason_sentence: string;
+  next_expected_action: string;
 }
 
 export interface TaskPlaybackCloseGateSummary {
@@ -131,6 +136,7 @@ export interface TaskPlaybackTrace {
   artifact_refs: TaskPlaybackArtifactRef[];
   privacy_boundary: TaskPlaybackPrivacyBoundary;
   close_gate_summary: TaskPlaybackCloseGateSummary;
+  close_gate_matrix: GateMatrixProjection;
 }
 
 export interface NormalizeTaskPlaybackInput {
@@ -173,8 +179,9 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
   const gateEvents = input.gateResponse?.events ?? [];
   const events = mergeTimelineEvents(timelineEvents, gateEvents);
   const frames = events.map((event, index) => frameFromEvent(event, index));
-  const lanes = lanesFromFrames(frames);
   const closeGateSummary = closeGateSummaryFrom(input.gateResponse);
+  const lanes = lanesFromFrames(frames, input.backlog, closeGateSummary);
+  const closeGateMatrix = projectGateMatrix(input.gateResponse?.timeline_gate, closeGateSummary.applicable);
   const source = input.source ?? (input.taskTimeline || input.gateResponse ? "governed" : "fallback_sample");
   const evidenceRefs = stableEvidence(frames.flatMap((frame) => frame.evidence_refs));
   const artifactRefs = stableArtifacts(frames.flatMap((frame) => frame.artifact_refs));
@@ -199,6 +206,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
       evidence_scope: "aming_claw_content_sys_public",
     },
     close_gate_summary: closeGateSummary,
+    close_gate_matrix: closeGateMatrix,
   };
 }
 
@@ -1208,22 +1216,114 @@ function eventSummaryFromEvent(
   return semantic.detail;
 }
 
-function lanesFromFrames(frames: TaskPlaybackFrame[]): TaskPlaybackLane[] {
+function lanesFromFrames(
+  frames: TaskPlaybackFrame[],
+  backlog: BacklogBug,
+  closeGateSummary: TaskPlaybackCloseGateSummary,
+): TaskPlaybackLane[] {
   const grouped = new Map<string, TaskPlaybackFrame[]>();
   for (const frame of frames) grouped.set(frame.lane_id, [...(grouped.get(frame.lane_id) ?? []), frame]);
   return Array.from(grouped.entries())
     .map(([id, laneFrames]) => {
       const latest = laneFrames[laneFrames.length - 1];
+      const status = normalizeLaneSummaryStatus(
+        id,
+        laneCurrentStatus(laneFrames),
+        backlog,
+        closeGateSummary,
+      );
+      const drivingFrame = drivingFrameForLane(laneFrames, status) ?? latest;
       return {
         id,
         label: laneLabel(id),
         family: laneFamily(id),
-        status: aggregateStatus(laneFrames.map((frame) => frame.status)),
+        status,
         frame_count: laneFrames.length,
         latest_at: latest?.at || "",
+        driving_frame_id: drivingFrame?.id || "",
+        reason_sentence: laneReasonSentence(drivingFrame, status),
+        next_expected_action: laneNextExpectedAction(drivingFrame, status),
       };
     })
     .sort((a, b) => laneSort(a.id) - laneSort(b.id) || a.id.localeCompare(b.id));
+}
+
+function laneCurrentStatus(frames: TaskPlaybackFrame[]): TaskPlaybackFrameStatus {
+  const latestTerminalIndex = findLastFrameIndex(frames, (frame) => isTerminalFrameStatus(frame.status));
+  const latestBlockerIndex = findLastFrameIndex(frames, (frame) => isBlockingFrameStatus(frame.status));
+  if (latestBlockerIndex >= 0 && latestBlockerIndex > latestTerminalIndex) return frames[latestBlockerIndex].status;
+  const latestMeaningful = findLastFrame(frames, (frame) => frame.status !== "unknown");
+  return latestMeaningful?.status ?? aggregateStatus(frames.map((frame) => frame.status));
+}
+
+function normalizeLaneSummaryStatus(
+  laneId: string,
+  status: TaskPlaybackFrameStatus,
+  backlog: BacklogBug,
+  closeGateSummary: TaskPlaybackCloseGateSummary,
+): TaskPlaybackFrameStatus {
+  if (laneId === "gate" && closeGateSummary.applicable === false) return "recorded";
+  if (isTerminalBacklogStatus(backlog.status) && (status === "running" || status === "waiting")) return "recorded";
+  return status;
+}
+
+function drivingFrameForLane(frames: TaskPlaybackFrame[], status: TaskPlaybackFrameStatus): TaskPlaybackFrame | undefined {
+  if (isBlockingFrameStatus(status)) {
+    return findLastFrame(frames, (frame) => frame.status === status && hasDrivingReason(frame))
+      ?? findLastFrame(frames, (frame) => isBlockingFrameStatus(frame.status) && hasDrivingReason(frame))
+      ?? findLastFrame(frames, (frame) => frame.status === status)
+      ?? findLastFrame(frames, (frame) => isBlockingFrameStatus(frame.status));
+  }
+  return findLastFrame(frames, (frame) => frame.status === status)
+    ?? findLastFrame(frames, (frame) => frame.status !== "unknown")
+    ?? frames[frames.length - 1];
+}
+
+function laneReasonSentence(frame: TaskPlaybackFrame | undefined, status: TaskPlaybackFrameStatus): string {
+  if (!frame || !["blocked", "failed", "missing"].includes(status)) return "";
+  const diagnosis =
+    factValue(frame.failure_diagnosis, "stale_timeout_reason")
+    || factValue(frame.failure_diagnosis, "missing_required_evidence")
+    || factValue(frame.failure_diagnosis, "missing_event_kinds")
+    || factValue(frame.failure_diagnosis, "blocker_ids")
+    || factValue(frame.failure_diagnosis, "mismatched_route_identity")
+    || factValue(frame.failure_diagnosis, "remaining_acceptance")
+    || factValue(frame.failure_diagnosis, "remaining_open");
+  if (diagnosis) return diagnosis;
+  return frame.summary || `${frame.title} recorded ${status}.`;
+}
+
+function laneNextExpectedAction(frame: TaskPlaybackFrame | undefined, status: TaskPlaybackFrameStatus): string {
+  if (!frame || !["blocked", "failed", "missing"].includes(status)) return "";
+  return factValue(frame.failure_diagnosis, "next_legal_action") || frame.narrative.outcome || "";
+}
+
+function hasDrivingReason(frame: TaskPlaybackFrame): boolean {
+  return Boolean(laneReasonSentence(frame, frame.status) || laneNextExpectedAction(frame, frame.status));
+}
+
+function isBlockingFrameStatus(status: TaskPlaybackFrameStatus): boolean {
+  return status === "blocked" || status === "failed" || status === "missing";
+}
+
+function isTerminalFrameStatus(status: TaskPlaybackFrameStatus): boolean {
+  return status === "passed" || status === "recorded";
+}
+
+function isTerminalBacklogStatus(status?: string): boolean {
+  return /^(closed|fixed|done|complete|completed|resolved|merged)$/i.test(safeText(status ?? ""));
+}
+
+function findLastFrame(frames: TaskPlaybackFrame[], predicate: (frame: TaskPlaybackFrame) => boolean): TaskPlaybackFrame | undefined {
+  const index = findLastFrameIndex(frames, predicate);
+  return index >= 0 ? frames[index] : undefined;
+}
+
+function findLastFrameIndex(frames: TaskPlaybackFrame[], predicate: (frame: TaskPlaybackFrame) => boolean): number {
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    if (predicate(frames[index])) return index;
+  }
+  return -1;
 }
 
 function closeGateSummaryFrom(response?: BacklogTimelineGateResponse | null): TaskPlaybackCloseGateSummary {
@@ -1249,10 +1349,11 @@ function closeGateSummaryFrom(response?: BacklogTimelineGateResponse | null): Ta
   const missingRequirementCount = missingRequirementIds.length;
   const blocked = response.applicable && (!response.can_close || gate.passed === false || missingEventKinds.length > 0 || missingRequirementCount > 0);
   const nextExpectedEvidence = stable([...missingEventKinds, ...missingRequirementIds]).slice(0, 8);
+  const notApplicable = response.applicable === false;
   return {
     applicable: Boolean(response.applicable),
     can_close: Boolean(response.can_close),
-    status: blocked ? "blocked" : gate.passed || response.can_close ? "passed" : "recorded",
+    status: notApplicable ? "recorded" : blocked ? "blocked" : gate.passed || response.can_close ? "passed" : "recorded",
     label: response.applicable ? (blocked ? "Close gate blocked" : "Close gate ready") : "Close gate not applicable",
     missing_event_kinds: missingEventKinds,
     missing_requirement_ids: missingRequirementIds,

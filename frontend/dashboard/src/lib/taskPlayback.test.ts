@@ -1,4 +1,4 @@
-import type { BacklogBug, TaskTimelineEvent } from "../types";
+import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent } from "../types";
 import {
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
@@ -2645,6 +2645,106 @@ function projectGateMatrixQuadrantAssertions(): string[] {
 
 export const taskPlaybackGateMatrixQuadrantSummary: string[] = [
   ...projectGateMatrixQuadrantAssertions(),
+];
+
+function taskPlaybackLaneLegibilityAssertions(): string[] {
+  const backlog: BacklogBug = {
+    bug_id: "AC-TASK-PLAYBACK-LANE-TERMINAL-STATUS-20260607",
+    title: "Playback lane terminal status regression",
+    status: "CLOSED",
+    priority: "P1",
+  };
+  const events: TaskTimelineEvent[] = [
+    {
+      id: 1,
+      event_type: "mf_subagent.implementation",
+      event_kind: "implementation",
+      phase: "implementation",
+      actor: "bounded worker",
+      status: "running",
+      payload: { lane: "worker" },
+      created_at: "2026-06-07T10:00:00Z",
+    },
+    {
+      id: 2,
+      event_type: "independent_verification_lane",
+      event_kind: "verification",
+      phase: "verification",
+      actor: "qa",
+      status: "blocked",
+      payload: {
+        lane: "verification",
+        reason: "QA blocked by missing mobile evidence",
+        next_legal_action: "Run the 390px playback layout check",
+      },
+      created_at: "2026-06-07T10:01:00Z",
+    },
+    {
+      id: 3,
+      event_type: "route_token_gate.backlog_close",
+      event_kind: "route_token_gate",
+      phase: "close gate",
+      actor: "governance",
+      status: "passed",
+      payload: { lane: "gate" },
+      created_at: "2026-06-07T10:02:00Z",
+    },
+  ];
+  const gateResponse: BacklogTimelineGateResponse = {
+    project_id: "aming-claw",
+    bug_id: backlog.bug_id,
+    applicable: false,
+    reason: "Backlog row is not subject to the MF close gate.",
+    can_close: true,
+    timeline_gate: {
+      passed: true,
+      status: "passed",
+      required_event_kinds: ["implementation", "verification", "close_ready"],
+      present_event_kinds: ["implementation", "verification", "close_ready"],
+      missing_event_kinds: [],
+      event_count: events.length,
+    },
+    event_count: events.length,
+    events,
+  };
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events, count: events.length },
+    gateResponse,
+    generatedAt: "2026-06-07T10:03:00Z",
+  });
+
+  const workerLane = trace.lanes.find((lane) => lane.id === "worker");
+  const verificationLane = trace.lanes.find((lane) => lane.id === "verification");
+  const gateLane = trace.lanes.find((lane) => lane.id === "gate");
+  assertFixture(workerLane?.status === "recorded", `closed backlog worker lane should normalize running to recorded, got ${workerLane?.status}`);
+  assertFixture(verificationLane?.status === "blocked", `blocked verification lane should remain blocked, got ${verificationLane?.status}`);
+  assertFixture(verificationLane?.driving_frame_id === "2", `blocked verification lane should select event 2 as driving frame, got ${verificationLane?.driving_frame_id}`);
+  assertFixture(
+    verificationLane?.reason_sentence.includes("missing mobile evidence") === true,
+    `blocked verification lane reason should include driving frame reason, got ${verificationLane?.reason_sentence}`,
+  );
+  assertFixture(
+    verificationLane?.next_expected_action.includes("390px playback layout") === true,
+    `blocked verification lane next action should include driving frame next_legal_action, got ${verificationLane?.next_expected_action}`,
+  );
+  assertFixture(trace.close_gate_summary.status !== "passed", `not-applicable close gate summary must not report passed, got ${trace.close_gate_summary.status}`);
+  assertFixture(gateLane?.status !== "passed", `not-applicable close gate lane must not report passed, got ${gateLane?.status}`);
+  assertFixture(!trace.close_gate_matrix.applicable, "not-applicable close gate matrix should project applicable=false");
+  assertFixture(trace.close_gate_matrix.rows.length === 0, "not-applicable close gate matrix should not render requirement rows");
+
+  return [
+    "closed backlog lane summaries normalize running/waiting without mutating frames",
+    "blocked lane reason and next legal action come from the driving frame",
+    "blocked lane driving_frame_id targets the blocker frame",
+    "not-applicable close gate summary/lane do not show passed",
+    "playback trace carries GateMatrixProjection with applicable=false rows=[]",
+  ];
+}
+
+export const taskPlaybackLaneLegibilitySummary: string[] = [
+  ...taskPlaybackLaneLegibilityAssertions(),
 ];
 
 // ── AC-3: Worker lane attribution — worker_slot_id priority fix ───────────────
