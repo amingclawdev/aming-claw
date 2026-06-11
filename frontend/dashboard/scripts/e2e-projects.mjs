@@ -955,7 +955,7 @@ function verifyBacklogEvidenceContract() {
   });
   assert(semanticCatalogSource.includes("System timeline event"), "Unknown timeline events should use the clearer System timeline event fallback");
   assert(playbackPanelSource.includes("Event summary"), "Task playback panel should lead selected events with a concrete event summary");
-  assert(playbackPanelSource.includes("Specific facts"), "Task playback panel should promote structured facts above auxiliary narrative");
+  assert(playbackPanelSource.includes("Key facts"), "Task playback panel should promote structured facts above auxiliary narrative");
   assert(playbackPanelSource.includes("Failure/blocker diagnosis"), "Task playback panel should promote blocker diagnosis above raw JSON");
   assert(playbackPanelSource.includes("formatFrameDateTime"), "Task playback rows and headers should use full absolute date plus time");
   assert(playbackPanelSource.includes("groupFramesByDay") && playbackPanelSource.includes("task-playback-day"), "Task playback should group long event lists by day");
@@ -1007,7 +1007,8 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("open={open}") && playbackPanelSource.includes("onToggle={(event) => onOpenChange(event.currentTarget.open)}"), "Task playback raw evidence details should be controlled by explicit user toggle state");
   assert(!playbackPanelSource.includes("<details open"), "Task playback raw evidence details must not render open by default");
   assert(playbackPanelSource.includes("Missing event kinds:"), "Task playback blocked panel should show missing event kinds before raw evidence");
-  assert(playbackPanelSource.includes("Explain/query this event"), "Task playback panel should expose an event-id query affordance without model calls");
+  // IA row D (removed-by-design): "Explain/query this event" block was removed; Copy event refs lives in ReferencesAndEvidenceSection
+  assert(!playbackPanelSource.includes("Explain/query this event"), "Explain/query block stays removed (IA row D decision)");
   assert(playbackSource.includes("reason_sentence"), "Task playback close-gate summary should expose a human-readable blocked reason");
   assert(playbackSource.includes("next_expected_action"), "Task playback close-gate summary should expose next expected evidence/action");
   assert(playbackPanelSource.includes("raw_sections"), "Task playback panel should show sanitized/redacted raw evidence sections");
