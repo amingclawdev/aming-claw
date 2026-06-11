@@ -3346,12 +3346,21 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-controls {
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  justify-content: stretch;
   min-height: 42px;
   padding: 8px 10px;
   border: 1px solid var(--ink-200);
   border-radius: 6px;
   background: #fff;
+}
+
+.task-playback-controls .action-btn,
+.task-playback-controls select,
+.task-playback-controls input {
+  width: 100%;
+  min-width: 0;
 }
 
 .task-playback-controls label {
@@ -3480,11 +3489,38 @@ a:hover { text-decoration: underline; }
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  width: 100%;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
 }
 
 .task-playback-lane strong {
   color: var(--ink-800);
   font-size: 12px;
+}
+
+.task-playback-lane.active,
+.task-playback-lane:hover {
+  border-color: #93c5fd;
+  box-shadow: inset 0 0 0 1px #bfdbfe;
+}
+
+.task-playback-lane-reason,
+.task-playback-lane-next {
+  display: block;
+  max-width: 100%;
+  margin-top: 4px;
+  color: var(--ink-700);
+  font-size: 10.5px;
+  font-style: normal;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.task-playback-lane-next {
+  color: var(--ink-500);
 }
 
 .task-playback-lane.lane-worker {
@@ -3853,6 +3889,29 @@ a:hover { text-decoration: underline; }
 
 .task-playback-blocked strong {
   color: #7c2d12;
+}
+
+.task-playback-gate-matrix {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--ink-100);
+  border-radius: 6px;
+  background: #fff;
+  overflow-x: auto;
+}
+
+.task-playback-gate-matrix-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-playback-gate-matrix-head strong {
+  color: var(--ink-800);
+  font-size: 12px;
 }
 
 .backlog-implementation-steps {
@@ -7979,6 +8038,10 @@ svg.graph-svg path.ghit:hover {
     overflow-y: visible;
   }
 
+  .task-playback-gate-matrix .gate-matrix {
+    min-width: 680px;
+  }
+
   .task-playback-evidence-modal-backdrop {
     padding: 18px 10px;
   }
@@ -8026,6 +8089,10 @@ svg.graph-svg path.ghit:hover {
   .task-playback-current-head {
     align-items: flex-start;
     justify-content: flex-start;
+  }
+
+  .task-playback-controls {
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
   }
 
   .task-playback-row-list {
@@ -8111,6 +8178,11 @@ svg.graph-svg path.ghit:hover {
   .task-playback-main {
     height: auto;
     overflow-y: visible;
+  }
+
+  .task-playback-controls,
+  .task-playback-lanes {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   /* Prevent horizontal scroll from wide helper tables/grids. */
@@ -9888,6 +9960,7 @@ details[open] .task-playback-narrative-summary::before {
   line-height: 1.45;
   color: var(--ink-700, #334155);
   margin: 4px 0 0;
+}
 
 /* ── Gate verification matrix ───────────────────────────────────────────────
  * 4-column table: Requirement | Required? | Status | Evidence / next action
@@ -10028,8 +10101,10 @@ details[open] .task-playback-narrative-summary::before {
   text-decoration: underline;
   cursor: pointer;
   padding: 1px 4px;
+  border: 0;
   background: var(--blue-bg, #dbeafe);
   border-radius: 3px;
+  font: inherit;
 }
 
 .gate-matrix-evidence-link:hover {
