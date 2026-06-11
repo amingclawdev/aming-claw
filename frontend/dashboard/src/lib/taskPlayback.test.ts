@@ -11,6 +11,8 @@ import {
   truncateHash,
   categorizeEvidenceRef,
   groupEvidenceRefsByCategory,
+  isPlaybackBacklogRefValue,
+  isPlaybackEventEvidenceRef,
   buildPlaybackUrl,
   findFrameIdByEventParam,
   resolveSelectedFrameIdForEventParam,
@@ -2387,6 +2389,15 @@ function taskPlaybackCategorizeEvidenceRefAssertions(): string[] {
   assertIa(grouped.gate_and_verification.length === 0, `gate_and_verification should be empty`);
   assertIa(grouped.graph_and_trace.length === 0, `graph_and_trace should be 0 (task- overrode it), got ${grouped.graph_and_trace.length}`);
 
+  assertIa(isPlaybackBacklogRefValue("AC-TEST-20260611"), "AC-* values navigate as backlog refs");
+  assertIa(isPlaybackBacklogRefValue("task-bridge-01"), "task-* values navigate as task/backlog refs");
+  assertIa(!isPlaybackBacklogRefValue("ckpt-relx-001"), "checkpoint values do not navigate as backlog refs");
+  assertIa(isPlaybackEventEvidenceRef({ kind: "timeline_event", label: "event", value: "3799" }), "timeline_event refs navigate as event refs");
+  assertIa(isPlaybackEventEvidenceRef({ kind: "source_event", label: "startup", value: "evt-startup-123" }), "source_event refs navigate as event refs");
+  assertIa(isPlaybackEventEvidenceRef({ kind: "read_receipt", label: "read receipt", value: "3740" }), "numeric read receipt refs navigate as event refs");
+  assertIa(!isPlaybackEventEvidenceRef({ kind: "graph_trace", label: "trace", value: "gqt-20260611-abc" }), "graph trace refs stay inspectable");
+  assertIa(!isPlaybackEventEvidenceRef({ kind: "read_receipt", label: "read receipt hash", value: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" }), "read receipt hashes stay inspectable");
+
   return [
     "categorizeEvidenceRef: timeline_event / source_event → timeline_events",
     "categorizeEvidenceRef: gate / precheck → gate_and_verification",
@@ -2396,6 +2407,7 @@ function taskPlaybackCategorizeEvidenceRefAssertions(): string[] {
     "categorizeEvidenceRef: content_sys (default) → backlog_and_task",
     "groupEvidenceRefsByCategory: AC-/task- patterns override kind for backlog_and_task",
     "groupEvidenceRefsByCategory: correct bucket counts for all 6 categories",
+    "reference navigation classification: event refs navigate, backlog/task refs navigate, graph/hash refs inspect",
   ];
 }
 

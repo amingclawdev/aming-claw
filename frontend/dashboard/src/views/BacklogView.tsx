@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { buildPlaybackUrl } from "../lib/taskPlayback";
 import {
   projectTaskTimelineEvent,
   projectGateMatrix,
@@ -47,8 +48,23 @@ function playbackHref(projectId: string): string {
   return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history`;
 }
 
-function playbackDetailHref(projectId: string, backlogId: string): string {
-  return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=activity&playback_backlog=${encodeURIComponent(backlogId)}`;
+function dashboardBaseHref(): string {
+  if (typeof window === "undefined") return "http://localhost/dashboard";
+  return `${window.location.origin}${window.location.pathname}`;
+}
+
+function playbackDetailHref(projectId: string, backlogId: string, eventId?: string | number | null): string {
+  return buildPlaybackUrl(projectId, backlogId, eventId, dashboardBaseHref());
+}
+
+function pushPlaybackDetailHref(projectId: string, backlogId: string, eventId?: string | number | null): void {
+  if (typeof window === "undefined") return;
+  const nextUrl = playbackDetailHref(projectId, backlogId, eventId);
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextUrl !== currentUrl) {
+    window.history.pushState({ backlogId, eventId: eventId ?? null }, "", nextUrl);
+  }
+  window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
 export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
@@ -777,7 +793,7 @@ function BacklogDetailModal({
               ) : null}
             </div>
 
-            <EvidenceInspector node={selectedNode} projectId={projectId} onJumpToBacklog={onSelectRelated} />
+            <EvidenceInspector node={selectedNode} projectId={projectId} currentBacklogId={fallbackBugId} onJumpToBacklog={onSelectRelated} />
           </div>
         ) : (
           <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} matrix={gateMatrix} backlogId={fallbackBugId} projectId={projectId} acceptanceCriteria={listFrom(bug?.acceptance_criteria)} />
@@ -947,10 +963,12 @@ function ArtifactPills({ summary, compact = false }: { summary: EventArtifactSum
 function EvidenceInspector({
   node,
   projectId,
+  currentBacklogId,
   onJumpToBacklog,
 }: {
   node: TimelineDagNode | null;
   projectId?: string;
+  currentBacklogId?: string;
   onJumpToBacklog?: (backlogId: string) => void;
 }) {
   const event = node?.event;
@@ -967,6 +985,7 @@ function EvidenceInspector({
   ];
   const redactionCount = semantic?.inspector.redaction_count
     ?? fallbackVerification.redaction_count + fallbackArtifacts.redaction_count + fallbackPayload.redaction_count;
+  const eventBacklogId = event?.backlog_id || currentBacklogId || "";
 
   // Build a minimal frame-compatible shim so EventSemanticDetail can render the
   // shared L1/L2/L3 layered detail (AC-4: same component in both surfaces).
@@ -1011,34 +1030,14 @@ function EvidenceInspector({
             <ReferencesAndEvidenceSection
               relations={(semantic?.relations ?? []) as TaskTimelineSemanticRelation[]}
               links={[]}
-              frames={[]}
-              onJump={(frameId) => {
-                // Jump to the backlog row whose id matches (cross-backlog navigation)
-                if (onJumpToBacklog) {
-                  onJumpToBacklog(frameId);
-                } else if (projectId) {
-                  // Navigate to the playback deep-link for this backlog id
-                  window.history.pushState(
-                    {},
-                    "",
-                    playbackDetailHref(projectId, frameId),
-                  );
-                  window.dispatchEvent(new PopStateEvent("popstate"));
-                }
-              }}
-              onInspect={(ref) => {
-                // Navigate to the playback deep-link for the backlog row referenced.
-                // ref.kind is a narrow literal union; cast to string for future-proof comparison.
-                const refKind = ref.kind as string;
-                if (projectId && ref.value && (refKind === "backlog_row" || refKind === "backlog")) {
-                  window.history.pushState(
-                    {},
-                    "",
-                    playbackDetailHref(projectId, ref.value),
-                  );
-                  window.dispatchEvent(new PopStateEvent("popstate"));
-                } else if (onJumpToBacklog && ref.value) {
-                  onJumpToBacklog(ref.value);
+              projectId={projectId}
+              currentBacklogId={eventBacklogId}
+              onInspect={() => undefined}
+              onNavigateToPlayback={(backlogId, eventId) => {
+                if (projectId) {
+                  pushPlaybackDetailHref(projectId, backlogId, eventId);
+                } else if (onJumpToBacklog && !eventId) {
+                  onJumpToBacklog(backlogId);
                 }
               }}
               frameId={String(event?.event_id ?? event?.id ?? "")}

@@ -54,6 +54,8 @@ export interface TaskTimelineSemanticRelation {
   label: string;
   /** The id/value to jump to, e.g. "#3568" or "AC-TIMELINE-..." */
   value: string;
+  /** Optional backlog row id when an event reference is known to target another backlog. */
+  backlog_id?: string;
   /** One-line semantic summary shown next to the link. */
   summary: string;
 }
