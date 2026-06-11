@@ -333,27 +333,12 @@ export default function TaskPlaybackPanel({
                 </div>
               ) : null}
 
-              {/* 1. ROLE-ACTION HEADLINE — leads the detail pane */}
-              {selectedFrame.headline ? (
-                <div className="task-playback-headline">
-                  <span className="task-playback-headline-text">{selectedFrame.headline}</span>
-                  <span className={`task-playback-headline-lane lane-pill-${selectedFrame.lane_id}`}>{selectedFrame.actor}</span>
-                </div>
-              ) : null}
-
-              {/* 2. BUSINESS-RELEVANT SUMMARY BLOCK: status, decision, key refs */}
-              <div className="task-playback-current-meta">
-                <span className="mono ref-tint">{selectedFrame.event_type}</span>
-                <span className="mono ref-tint">{selectedFrame.phase}</span>
-                <TruncatedHashSpan value={selectedFrame.source_event_id} mono refTint />
+              {/* 1-3. LAYERED SEMANTIC DETAIL (shared EventSemanticDetail: L1 headline, L2 summary, L3 facts/blockers) */}
+              <EventSemanticDetail frame={selectedFrame} />
+              {/* Timestamp — kept here since it belongs to the per-frame context, not the shared piece */}
+              <div className="task-playback-current-meta task-playback-current-meta--ts">
                 <span className="mono">{formatFrameDateTime(selectedFrame)}</span>
               </div>
-              <div className="task-playback-chip-section">
-                <strong>Event summary</strong>
-                <p><StatusWordText text={selectedFrame.summary} /></p>
-              </div>
-              <StructuredFactSection title="Key facts" facts={selectedFrame.specific_facts} />
-              <StructuredFactSection title="Failure/blocker diagnosis" facts={selectedFrame.failure_diagnosis} />
 
               {/* 3. MERGED REFERENCES & EVIDENCE — replaces separate Relations + Evidence sections */}
               <ReferencesAndEvidenceSection
@@ -719,6 +704,50 @@ export function ReferencesAndEvidenceSection({
         );
       })}
     </div>
+  );
+}
+
+/**
+ * EventSemanticDetail — shared layered detail component (AC-4).
+ *
+ * Renders the L1 role-action headline, L2 business-summary block (event type /
+ * phase / status / key facts), and L3 blocker diagnosis so the same piece can
+ * be consumed both in the activity-frame detail pane (TaskPlaybackPanel) and in
+ * the backlog evidence inspector (BacklogView's EvidenceInspector).
+ *
+ * Hashes / raw payload stay in the caller-owned collapsed section (not here).
+ */
+export function EventSemanticDetail({
+  frame,
+}: {
+  frame: Pick<
+    TaskPlaybackFrame,
+    "headline" | "actor" | "lane_id" | "event_type" | "phase" | "source_event_id" | "summary" | "specific_facts" | "failure_diagnosis"
+  >;
+}) {
+  return (
+    <>
+      {/* L1: Role-action headline */}
+      {frame.headline ? (
+        <div className="task-playback-headline">
+          <span className="task-playback-headline-text">{frame.headline}</span>
+          <span className={`task-playback-headline-lane lane-pill-${frame.lane_id}`}>{frame.actor}</span>
+        </div>
+      ) : null}
+      {/* L2: Business-relevant summary block */}
+      <div className="task-playback-current-meta">
+        <span className="mono ref-tint">{frame.event_type}</span>
+        <span className="mono ref-tint">{frame.phase}</span>
+        <TruncatedHashSpan value={frame.source_event_id} mono refTint />
+      </div>
+      <div className="task-playback-chip-section">
+        <strong>Event summary</strong>
+        <p><StatusWordText text={frame.summary} /></p>
+      </div>
+      {/* L3: Key facts + blockers */}
+      <StructuredFactSection title="Key facts" facts={frame.specific_facts} />
+      <StructuredFactSection title="Failure/blocker diagnosis" facts={frame.failure_diagnosis} />
+    </>
   );
 }
 
