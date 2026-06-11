@@ -395,11 +395,60 @@ function buildHeadline(
   return `${actorLabel} acted in the ${lane} lane${statusLabel && statusLabel !== "unknown" ? ` (${statusLabel})` : ""}.`;
 }
 
+/**
+ * Known gate/evidence envelope keys whose contents hold the real relation fields.
+ *
+ * Envelope rule: when a payload top-level key is in this list AND its value is
+ * an object (not an array), buildRelations unwraps it one level and merges it
+ * with the outer payload for field extraction purposes.  This covers startup
+ * events that nest all fields under mf_subagent_startup_gate, finish-gate events
+ * that wrap worker_contract/evidence, and the identity_join sub-object inside the
+ * startup gate.  Only one level is unwrapped (depth-1); nested arrays like
+ * findings[] or per-item sub-objects are NOT traversed to avoid extracting ids
+ * from unrelated noise structures.
+ */
+const KNOWN_ENVELOPE_KEYS = new Set([
+  "mf_subagent_startup_gate",
+  "worker_contract",
+  "evidence",
+  "identity_join",
+  "route_token_gate",
+  "mf_subagent_finish_gate",
+  "parallel_branch_finish_gate",
+]);
+
+/**
+ * Unwrap one level of known gate/evidence envelopes from a record so that
+ * relation-field extraction sees the actual fields regardless of whether they
+ * are at the top level or nested under a named envelope.  Only scalar/object
+ * envelope values are merged; array envelope values are left in place because
+ * they have their own extraction logic.
+ */
+function unwrapEnvelopes(record: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...record };
+  for (const key of KNOWN_ENVELOPE_KEYS) {
+    const val = record[key];
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      // Merge envelope fields WITHOUT overwriting already-present top-level keys.
+      for (const [envKey, envVal] of Object.entries(val as Record<string, unknown>)) {
+        if (!(envKey in out)) {
+          out[envKey] = envVal;
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[] {
   const relations: TaskTimelineSemanticRelation[] = [];
-  const payload = asRecord(event.payload);
-  const verification = asRecord(event.verification);
-  const artifactRefs = asRecord(event.artifact_refs);
+  // Unwrap known gate/evidence envelopes (e.g. mf_subagent_startup_gate) so that
+  // relation fields nested one level deep are visible to the extraction logic.
+  // Depth is bounded to 1 — only the named envelope objects are merged, not their
+  // nested arrays (e.g. findings[], bridged_identities[]) which have dedicated logic.
+  const payload = unwrapEnvelopes(asRecord(event.payload));
+  const verification = unwrapEnvelopes(asRecord(event.verification));
+  const artifactRefs = unwrapEnvelopes(asRecord(event.artifact_refs));
 
   // Helper: push a relation if value is non-empty.
   const pushRel = (kind: TaskTimelineSemanticRelation["kind"], label: string, rawValue: unknown, summary: string) => {
@@ -459,20 +508,31 @@ function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[
     for (const item of laneEvidenceRefs.slice(0, 6)) pushRel("event_ref", "lane evidence", normalizeEventId(item), "Referenced lane evidence event");
   }
 
-  // --- checkpoint_id: string fact entry (not clickable, kind="fact") ---
+  // --- checkpoint_id: rendered as non-navigable "backlog_row" kind.
+  // The panel only makes event_ref entries clickable when a matching frame is
+  // found by source_event_id — checkpoint ids are never frame ids, so event_ref
+  // would silently fall back to non-nav anyway. Using "backlog_row" here is the
+  // simpler, guaranteed-non-nav in-fence solution; it avoids any future frame-id
+  // collision and does not require a new "fact" kind in the type union (which
+  // would require changes in TaskPlaybackPanel outside the fence).
   const checkpointId = payload.checkpoint_id ?? verification.checkpoint_id ?? artifactRefs.checkpoint_id;
   if (checkpointId != null) {
     const v = stringFrom(checkpointId);
     if (v) {
       const safe = sanitizePublicTimelineText(v);
       if (safe && safe !== "[private detail redacted]") {
-        relations.push({ kind: "event_ref", label: "checkpoint", value: safe, summary: "Checkpoint id for this branch task" });
+        relations.push({ kind: "backlog_row", label: "checkpoint", value: safe, summary: "Checkpoint id for this branch task (non-navigable)" });
       }
     }
   }
 
   // --- bridged_identities[].task_id from cross_ref_lineage_bridge ---
-  const bridgedIdentities = payload.bridged_identities ?? verification.bridged_identities ?? artifactRefs.bridged_identities;
+  // Use the original (non-unwrapped) raw payload for array fields to avoid
+  // double-extraction when the envelope merged an array into the flat record.
+  const rawPayload = asRecord(event.payload);
+  const rawVerification = asRecord(event.verification);
+  const rawArtifactRefs = asRecord(event.artifact_refs);
+  const bridgedIdentities = rawPayload.bridged_identities ?? rawVerification.bridged_identities ?? rawArtifactRefs.bridged_identities;
   if (Array.isArray(bridgedIdentities)) {
     for (const identity of bridgedIdentities.slice(0, 8)) {
       const rec = asRecord(identity);
@@ -486,7 +546,8 @@ function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[
     }
   }
 
-  // De-duplicate by kind+value
+  // De-duplicate by kind+value, keeping the first occurrence (which preserves the
+  // richer label when qa_refs and qa_verdict_refs produce the same event id).
   const seen = new Set<string>();
   return relations.filter((rel) => {
     const key = `${rel.kind}:${rel.value}`;
