@@ -845,3 +845,378 @@ export function segmentTextWithStatusChips(text: string): TextSegment[] {
   }
   return segments;
 }
+
+// ── Contract × Gate verification matrix projection ───────────────────────────
+
+/**
+ * A single row in the contract × gate verification matrix.
+ *
+ * Each row represents one requirement/gate check.
+ * The matrix groups rows by gate family (timeline / route-context / receipt /
+ * cross-ref / contract / impact) so the operator can scan gate families at a
+ * glance and see whether each item passed.
+ */
+export interface GateMatrixRow {
+  /** Raw requirement id from the gate (e.g. "implementation", "route_context"). */
+  id: string;
+  /** Plain-English label (operator-readable). */
+  label: string;
+  /** Gate family group. */
+  family: "timeline" | "route_context" | "contract" | "receipt_projection" | "cross_ref" | "impact" | "other";
+  /** Human-readable family label. */
+  familyLabel: string;
+  /** Whether this gate item is mandatory for close. */
+  required: boolean;
+  /** Derived pass/fail/missing/not_applicable status. */
+  status: "passed" | "failed" | "missing" | "not_applicable" | "unknown";
+  /** Short next-action or missing-reason text (from gate's own fields). */
+  nextAction: string;
+  /** Event ids that count as evidence for this row (for deep-link to playback). */
+  evidenceEventIds: string[];
+  /**
+   * AC1: enriched labels for evidence events.
+   * Each entry corresponds 1-to-1 with evidenceEventIds.
+   * Format: "event_kind · status" (e.g. "route_action_precheck · allowed").
+   * Empty string when kind/status are not available.
+   */
+  evidenceLabels: string[];
+}
+
+/** The full matrix projection consumed by the ContractGateMatrix component. */
+export interface GateMatrixProjection {
+  schema_version: "gate_matrix_projection.v1";
+  rows: GateMatrixRow[];
+  /** Whether the overall close gate passed. */
+  overallPassed: boolean;
+  /** Whether the gate response was present at all. */
+  gatePresent: boolean;
+  /** Whether this backlog is subject to the close gate. */
+  applicable: boolean;
+}
+
+// ── Plain-English labels for well-known gate requirement ids ─────────────────
+
+const GATE_ROW_LABELS: Record<string, string> = {
+  // Timeline gate
+  implementation:                          "Implementation evidence recorded",
+  verification:                            "Verification evidence recorded",
+  close_ready:                             "Close-ready evidence recorded",
+  // Route-context gate
+  route_context:                           "Route context bundle obtained",
+  route_action_precheck:                   "Route action precheck passed",
+  bounded_implementation_worker_dispatch:  "Bounded worker dispatched",
+  mf_subagent_startup:                     "Bounded worker started",
+  independent_verification_lane:           "Independent QA verified",
+  architecture_review_lane:               "Architecture review completed",
+  route_identity_mismatch:                "Route identity mismatch resolved",
+  same_route_identity:                    "Route identity consistent",
+  route_identity_cleanup:                 "Stale route identity cleaned up",
+  // Contract gate
+  contract_gate:                           "Contract requirements met",
+  // Receipt / projection
+  mf_subagent_read_receipt:               "Worker read-receipt recorded before counted evidence",
+  read_receipt:                           "Read receipt ordered before counted evidence",
+  // Cross-ref gate
+  cross_ref_gate:                         "Cross-ref foreign-row evidence verified",
+  // Worker graph trace
+  worker_graph_trace:                     "Worker graph trace recorded",
+  independent_qa:                         "Independent QA gate passed",
+  // Post-verification
+  post_verification_actions:              "Post-verification actions completed",
+  // Approval
+  approval_scope:                         "Approval scope valid for close",
+  // Command disposition
+  command_disposition:                    "Originating command terminal",
+};
+
+function gateRowLabel(id: string): string {
+  return GATE_ROW_LABELS[id] ?? id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function gateFamily(id: string): GateMatrixRow["family"] {
+  if (["implementation", "verification", "close_ready"].includes(id)) return "timeline";
+  if ([
+    "route_context", "route_action_precheck", "bounded_implementation_worker_dispatch",
+    "mf_subagent_startup", "independent_verification_lane", "architecture_review_lane",
+    "route_identity_mismatch", "same_route_identity", "route_identity_cleanup",
+  ].includes(id)) return "route_context";
+  if (id === "cross_ref_gate" || id.startsWith("cross_ref")) return "cross_ref";
+  if (id.includes("read_receipt") || id === "contract_projection") return "receipt_projection";
+  if (id === "contract_gate" || id.includes("contract")) return "contract";
+  return "other";
+}
+
+const FAMILY_LABELS: Record<GateMatrixRow["family"], string> = {
+  timeline:          "Timeline evidence",
+  route_context:     "Route context & worker lanes",
+  contract:          "Contract requirements",
+  receipt_projection:"Receipt / projection",
+  cross_ref:         "Cross-ref gate",
+  impact:            "Impact",
+  other:             "Other checks",
+};
+
+function eventIdsFromGateEvents(gateEvents: unknown): { ids: string[]; labels: string[] } {
+  const ids: string[] = [];
+  const labels: string[] = [];
+  if (!Array.isArray(gateEvents)) return { ids, labels };
+  for (const item of gateEvents) {
+    if (item && typeof item === "object") {
+      const rec = item as Record<string, unknown>;
+      const id = rec.id ?? rec.event_id ?? rec.timeline_event_id;
+      if (id != null) {
+        ids.push(String(id));
+        // AC1: build "event_kind · status" label for each evidence event
+        const kind = typeof rec.event_kind === "string" ? rec.event_kind : (typeof rec.phase === "string" ? rec.phase : "");
+        const status = typeof rec.status === "string" ? rec.status : "";
+        const label = [kind, status].filter(Boolean).join(" · ");
+        labels.push(label);
+      }
+    }
+  }
+  return { ids, labels };
+}
+
+/**
+ * Pure projection: MfCloseTimelineGate (from BacklogTimelineGateResponse) →
+ * GateMatrixProjection.
+ *
+ * No side effects. Safe to call from tests directly without DOM or React.
+ * Unknown/extra gate fields fall back to a generic row — never throws.
+ */
+export function projectGateMatrix(
+  gate: {
+    passed?: boolean;
+    status?: string;
+    required_event_kinds?: string[];
+    present_event_kinds?: string[];
+    missing_event_kinds?: string[];
+    contract_gate?: {
+      passed?: boolean;
+      required_requirement_ids?: string[];
+      present_requirement_ids?: string[];
+      missing_requirement_ids?: string[];
+      evidence_events?: unknown[];
+    };
+    route_context_gate?: {
+      passed?: boolean;
+      required?: boolean;
+      required_requirement_ids?: string[];
+      present_requirement_ids?: string[];
+      missing_requirement_ids?: string[];
+      evidence_events?: Record<string, unknown>;
+    };
+    contract_projection?: { status?: string; stale?: boolean; divergent?: boolean; read_receipt_gate?: { passed?: boolean; status?: string; read_receipt_event_id?: number | string } };
+    cross_ref_gate?: { passed?: boolean; status?: string };
+    worker_graph_trace_gate?: { required?: boolean; passed?: boolean; status?: string; trace_ids?: string[] };
+    independent_qa_gate?: { required?: boolean; passed?: boolean; status?: string };
+    contract_projection_gate?: { passed?: boolean; status?: string };
+    checks?: Record<string, boolean | number | string>;
+  } | undefined,
+  applicable: boolean,
+): GateMatrixProjection {
+  if (!gate || !applicable) {
+    return {
+      schema_version: "gate_matrix_projection.v1",
+      rows: [],
+      overallPassed: applicable ? (gate?.passed ?? false) : true,
+      gatePresent: Boolean(gate),
+      applicable,
+    };
+  }
+
+  const rows: GateMatrixRow[] = [];
+
+  // ── 1. Timeline gate rows (required_event_kinds) ─────────────────────────
+  const required = gate.required_event_kinds ?? ["implementation", "verification", "close_ready"];
+  const present = new Set(gate.present_event_kinds ?? []);
+  const missing = new Set(gate.missing_event_kinds ?? []);
+  for (const id of required) {
+    const isPassed = present.has(id);
+    const isMissing = missing.has(id);
+    rows.push({
+      id,
+      label: gateRowLabel(id),
+      family: gateFamily(id),
+      familyLabel: FAMILY_LABELS[gateFamily(id)],
+      required: true,
+      status: isPassed ? "passed" : isMissing ? "missing" : "unknown",
+      nextAction: isMissing ? `Append ${id.replace(/_/g, " ")} event to the task timeline` : "",
+      evidenceEventIds: [],
+      evidenceLabels: [],
+    });
+  }
+
+  // ── 2. Route-context gate rows ────────────────────────────────────────────
+  const rg = gate.route_context_gate;
+  if (rg) {
+    const rgRequired = new Set(rg.required_requirement_ids ?? []);
+    const rgPresent = new Set(rg.present_requirement_ids ?? []);
+    const rgMissing = new Set(rg.missing_requirement_ids ?? []);
+    const evidenceMap = rg.evidence_events ?? {};
+    for (const id of Array.from(rgRequired)) {
+      const eventsForId = (evidenceMap as Record<string, unknown>)[id];
+      const { ids: evidenceIds, labels: evidenceLabels } = eventIdsFromGateEvents(eventsForId);
+      rows.push({
+        id,
+        label: gateRowLabel(id),
+        family: gateFamily(id),
+        familyLabel: FAMILY_LABELS[gateFamily(id)],
+        required: rg.required !== false,
+        status: rgPresent.has(id) ? "passed" : rgMissing.has(id) ? "missing" : "unknown",
+        nextAction: rgMissing.has(id) ? `Record ${gateRowLabel(id).toLowerCase()}` : "",
+        evidenceEventIds: evidenceIds,
+        evidenceLabels,
+      });
+    }
+    // Add any present-but-not-required items as informational
+    for (const id of Array.from(rgPresent)) {
+      if (!rgRequired.has(id)) {
+        const { ids: evidenceIds, labels: evidenceLabels } = eventIdsFromGateEvents((evidenceMap as Record<string, unknown>)[id]);
+        rows.push({
+          id,
+          label: gateRowLabel(id),
+          family: gateFamily(id),
+          familyLabel: FAMILY_LABELS[gateFamily(id)],
+          required: false,
+          status: "passed",
+          nextAction: "",
+          evidenceEventIds: evidenceIds,
+          evidenceLabels,
+        });
+      }
+    }
+  }
+
+  // ── 3. Contract gate rows ─────────────────────────────────────────────────
+  const cg = gate.contract_gate;
+  if (cg) {
+    const cgRequired = new Set(cg.required_requirement_ids ?? []);
+    const cgPresent = new Set(cg.present_requirement_ids ?? []);
+    const cgMissing = new Set(cg.missing_requirement_ids ?? []);
+    const cgEvents = cg.evidence_events ?? [];
+    const { ids: cgEventIds, labels: cgEventLabels } = eventIdsFromGateEvents(cgEvents);
+    if (cgRequired.size > 0) {
+      for (const id of Array.from(cgRequired)) {
+        rows.push({
+          id,
+          label: gateRowLabel(id),
+          family: "contract",
+          familyLabel: FAMILY_LABELS["contract"],
+          required: true,
+          status: cgPresent.has(id) ? "passed" : cgMissing.has(id) ? "missing" : "unknown",
+          nextAction: cgMissing.has(id) ? `Record contract evidence for ${id}` : "",
+          evidenceEventIds: cgPresent.has(id) ? cgEventIds : [],
+          evidenceLabels: cgPresent.has(id) ? cgEventLabels : [],
+        });
+      }
+    } else if (cg.passed !== undefined) {
+      // Contract gate present but no explicit requirement ids: show summary row
+      rows.push({
+        id: "contract_gate",
+        label: "Contract requirements met",
+        family: "contract",
+        familyLabel: FAMILY_LABELS["contract"],
+        required: true,
+        status: cg.passed ? "passed" : "failed",
+        nextAction: cg.passed ? "" : "Check contract requirement ids",
+        evidenceEventIds: cg.passed ? cgEventIds : [],
+        evidenceLabels: cg.passed ? cgEventLabels : [],
+      });
+    }
+  }
+
+  // ── 4. Receipt / projection row ───────────────────────────────────────────
+  const cp = gate.contract_projection;
+  if (cp) {
+    const rrGate = cp.read_receipt_gate;
+    if (rrGate) {
+      const rrId = rrGate.read_receipt_event_id;
+      rows.push({
+        id: "mf_subagent_read_receipt",
+        label: gateRowLabel("mf_subagent_read_receipt"),
+        family: "receipt_projection",
+        familyLabel: FAMILY_LABELS["receipt_projection"],
+        required: false,
+        status: rrGate.passed ? "passed" : rrGate.status === "not_required" ? "not_applicable" : "missing",
+        nextAction: rrGate.passed ? "" : "Record mf_subagent_read_receipt before counted evidence events",
+        evidenceEventIds: rrId != null ? [String(rrId)] : [],
+        evidenceLabels: [],
+      });
+    }
+    rows.push({
+      id: "contract_projection",
+      label: "Contract projection current",
+      family: "receipt_projection",
+      familyLabel: FAMILY_LABELS["receipt_projection"],
+      required: false,
+      status: cp.status === "current" ? "passed" : cp.divergent ? "failed" : cp.stale ? "failed" : "unknown",
+      nextAction: cp.stale || cp.divergent ? "Re-run the route service to refresh the contract projection" : "",
+      evidenceEventIds: [],
+      evidenceLabels: [],
+    });
+  }
+
+  // ── 5. Cross-ref gate row ─────────────────────────────────────────────────
+  if (gate.cross_ref_gate) {
+    rows.push({
+      id: "cross_ref_gate",
+      label: gateRowLabel("cross_ref_gate"),
+      family: "cross_ref",
+      familyLabel: FAMILY_LABELS["cross_ref"],
+      required: false,
+      status: gate.cross_ref_gate.passed ? "passed" : "failed",
+      nextAction: gate.cross_ref_gate.passed ? "" : "Check cross-ref gate: foreign-row identity mismatch",
+      evidenceEventIds: [],
+      evidenceLabels: [],
+    });
+  }
+
+  // ── 6. Worker graph trace gate row ────────────────────────────────────────
+  if (gate.worker_graph_trace_gate?.required) {
+    const wg = gate.worker_graph_trace_gate;
+    rows.push({
+      id: "worker_graph_trace",
+      label: gateRowLabel("worker_graph_trace"),
+      family: "other",
+      familyLabel: FAMILY_LABELS["other"],
+      required: true,
+      status: wg.passed ? "passed" : "missing",
+      nextAction: wg.passed ? "" : "Run graph_query with query_source=mf_subagent and record trace evidence",
+      evidenceEventIds: wg.trace_ids ?? [],
+      evidenceLabels: (wg.trace_ids ?? []).map(() => ""),
+    });
+  }
+
+  // ── 7. Independent QA gate row ────────────────────────────────────────────
+  if (gate.independent_qa_gate?.required) {
+    const qa = gate.independent_qa_gate;
+    rows.push({
+      id: "independent_qa",
+      label: gateRowLabel("independent_qa"),
+      family: "other",
+      familyLabel: FAMILY_LABELS["other"],
+      required: true,
+      status: qa.passed ? "passed" : "missing",
+      nextAction: qa.passed ? "" : "Run the independent QA verification lane",
+      evidenceEventIds: [],
+      evidenceLabels: [],
+    });
+  }
+
+  // Deduplicate by id (first occurrence wins)
+  const seen = new Set<string>();
+  const deduped = rows.filter((r) => {
+    if (seen.has(r.id)) return false;
+    seen.add(r.id);
+    return true;
+  });
+
+  return {
+    schema_version: "gate_matrix_projection.v1",
+    rows: deduped,
+    overallPassed: gate.passed ?? false,
+    gatePresent: true,
+    applicable,
+  };
+}
