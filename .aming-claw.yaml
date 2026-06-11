@@ -25,10 +25,12 @@ testing:
       dashboard.semantic.safe:
         label: "Dashboard semantic trunk safe path"
         # bootstrap_auth: the --reset path calls POST /api/project/bootstrap which is protected by
-        # the project_bootstrap route-token gate. The script mints a write-authorizing token via
-        # POST /api/projects/{isolation_project}/observer/route-context/issue (caller_role=observer,
-        # scope=E2E-FIXTURE-BOOTSTRAP-{suite_id}) before each bootstrap call. The gate remains
-        # enforced; no waiver is used. See AC-E2E-TRUNK-BOOTSTRAP-ROUTE-TOKEN-20260611.
+        # the project_bootstrap route-token gate. The script uses a clean mint-with-allowed_actions
+        # handshake: POST /api/projects/{isolation_project}/observer/route-context/issue with
+        # body {caller_role:"observer", allowed_actions:["project_bootstrap"], ...}, then passes
+        # the returned token UNMODIFIED as route_token in the bootstrap call. No client-side token
+        # field assembly. The gate remains enforced; no waiver is used.
+        # See AC-E2E-TRUNK-BOOTSTRAP-ROUTE-TOKEN-20260611.
         command: "node frontend/dashboard/scripts/e2e-trunk.mjs --reset --skip-dashboard"
         auto_run: false
         live_ai: false

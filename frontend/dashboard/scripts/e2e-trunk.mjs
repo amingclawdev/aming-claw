@@ -828,21 +828,18 @@ async function stepFixtureProject() {
 }
 
 async function mintBootstrapRouteToken(suiteId) {
-  // The /api/project/bootstrap endpoint is protected by the project_bootstrap gate
-  // and requires a write-authorizing route_token with allowed_action=project_bootstrap.
+  // Clean mint handshake for the project_bootstrap gate:
   //
-  // Design: mint via POST /api/projects/{project_id}/observer/route-context/issue
-  // (empirically verified 2026-06-11: works for not-yet-registered project ids),
-  // then assemble a correctly-scoped token that explicitly declares
-  // allowed_action="project_bootstrap". The gate validate_route_token_mutation_gate
-  // checks token.allowed_action || token.allowed_actions for the normalized action
-  // name; the token gate stays fully enforced for all non-e2e callers.
+  // 1. POST /api/projects/{project_id}/observer/route-context/issue with
+  //    allowed_actions: ["project_bootstrap"] in the request body.
+  //    The /issue endpoint accepts an `allowed_actions` field and bakes it into
+  //    the returned token via _sanitize_allowed_actions on the server side.
   //
-  // Why mint over waiver: the issue endpoint is available and produces a real
-  // route_context_hash + prompt_contract_id pair from the governance routing layer,
-  // which satisfies the token's required identity fields. A route_waiver would be
-  // acceptable as a fallback but requires timeline_evidence refs that are not
-  // available in this stateless script context (no backlog task timeline here).
+  // 2. Use the returned token object UNMODIFIED as the route_token in the
+  //    /api/project/bootstrap call. No client-side token field assembly.
+  //
+  // project_bootstrap is not a blocked action; /issue accepts it in allowed_actions.
+  // If the mint endpoint rejects it, the assertion below will capture the error.
   const taskId = `task-e2e-fixture-bootstrap-${suiteId.replace(/[^a-zA-Z0-9]/g, "-")}`;
   const backlogId = `E2E-FIXTURE-BOOTSTRAP-${suiteId}`;
   const tokenResp = await http(
@@ -853,33 +850,19 @@ async function mintBootstrapRouteToken(suiteId) {
       backlog_id: backlogId,
       task_id: taskId,
       target_files: [".aming-claw.yaml"],
+      allowed_actions: ["project_bootstrap"],
     },
   );
   assert(tokenResp.ok === true, "route-context/issue returned ok=false for bootstrap token mint");
-  const baseToken = tokenResp.route_token;
-  assert(baseToken, "route-context/issue did not return a route_token");
-  assert(baseToken.route_context_hash, "minted token missing route_context_hash");
-  assert(baseToken.prompt_contract_id, "minted token missing prompt_contract_id");
-  assert(baseToken.expires_at, "minted token missing expires_at");
+  const mintedToken = tokenResp.route_token;
+  assert(mintedToken, "route-context/issue did not return a route_token");
+  assert(mintedToken.route_context_hash, "minted token missing route_context_hash");
+  assert(mintedToken.prompt_contract_id, "minted token missing prompt_contract_id");
+  assert(mintedToken.expires_at, "minted token missing expires_at");
 
-  // Assemble the bootstrap-scoped token: take identity fields from the minted token,
-  // but declare allowed_action=project_bootstrap explicitly. The gate reads
-  // allowed_action (singular) or allowed_actions (plural); both are checked.
-  return {
-    route_context_hash: baseToken.route_context_hash,
-    prompt_contract_id: baseToken.prompt_contract_id,
-    prompt_contract_hash: baseToken.prompt_contract_hash || "",
-    caller_role: "observer",
-    allowed_action: "project_bootstrap",
-    allowed_actions: ["project_bootstrap"],
-    expires_at: baseToken.expires_at,
-    evidence_refs: [tokenResp.route_token_ref || tokenResp.merge_queue_id || backlogId],
-    scope: {
-      project_id: PROJECT,
-      backlog_id: backlogId,
-      task_id: taskId,
-    },
-  };
+  // Return the server-minted token UNMODIFIED. Do not add, remove, or mutate
+  // any fields client-side — the gate trusts only tokens signed by the server.
+  return mintedToken;
 }
 
 async function stepBootstrapProject() {
@@ -907,7 +890,7 @@ async function stepBootstrapProject() {
     node_count: bootstrap.graph_stats?.node_count,
     edge_count: bootstrap.graph_stats?.edge_count,
     register_status: registered.ok ? "registered" : "already_registered",
-    bootstrap_route_token_ref: bootstrapRouteToken.route_id || "",
+    bootstrap_route_token_ref: bootstrapRouteToken.route_token_ref || bootstrapRouteToken.route_context_hash || "",
   };
 }
 
