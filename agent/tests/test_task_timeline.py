@@ -1,5 +1,6 @@
 """Tests for task implementation timeline evidence."""
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -8,6 +9,17 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+
+
+def _fake_sha(label: str) -> str:
+    """Valid-format sha256:<64hex> digest derived from a label.
+
+    The content-hash format floor (AC-ROUTE-CONTEXT-CONTENT-HASH-VERIFY-GATE)
+    rejects non-digest hash strings, so test fixtures must use real digests.
+    These tokens carry only the hash (no embedded object), so any valid-format
+    digest satisfies the format-floor-only path; the label keeps them unique.
+    """
+    return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -369,7 +381,7 @@ def test_precheck_startup_projection_requirements_name_missing_field():
             "base_commit": "base-precheck",
             "target_head_commit": "target-precheck",
             "merge_queue_id": "mq-precheck",
-            "route_context_hash": "sha256:route",
+            "route_context_hash": _fake_sha("route"),
             "prompt_contract_id": "rprompt-precheck",
             "graph_query_identity": {
                 "query_source": "mf_subagent",
@@ -691,9 +703,9 @@ def _route_token(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="", 
     if task_id:
         scope["task_id"] = task_id
     return {
-        "route_context_hash": f"sha256:test-route-context-{action}",
+        "route_context_hash": _fake_sha(f"test-route-context-{action}"),
         "prompt_contract_id": f"prompt-contract-{action}",
-        "prompt_contract_hash": f"sha256:test-prompt-contract-{action}",
+        "prompt_contract_hash": _fake_sha(f"test-prompt-contract-{action}"),
         "caller_role": "observer",
         "allowed_action": action,
         "scope": scope,
@@ -729,7 +741,7 @@ def _route_waiver(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="",
     return {
         "accepted": True,
         "waiver_type": "manual_fix",
-        "route_context_hash": f"sha256:test-route-context-{action}",
+        "route_context_hash": _fake_sha(f"test-route-context-{action}"),
         "prompt_contract_id": f"prompt-contract-{action}",
         "caller_role": "observer",
         "allowed_action": action,
@@ -2306,7 +2318,7 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(gate["decision"], "route_token_input_redacted")
         self.assertEqual(
             gate["route_context_hash"],
-            "sha256:test-route-context-service_route",
+            _fake_sha("test-route-context-service_route"),
         )
         self.assertTrue(gate["route_token_hash"].startswith("sha256:"))
         self.assertNotIn("expires_at", source["payload"].get("route_token_gate", {}))
