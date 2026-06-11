@@ -395,11 +395,60 @@ function buildHeadline(
   return `${actorLabel} acted in the ${lane} lane${statusLabel && statusLabel !== "unknown" ? ` (${statusLabel})` : ""}.`;
 }
 
+/**
+ * Known gate/evidence envelope keys whose contents hold the real relation fields.
+ *
+ * Envelope rule: when a payload top-level key is in this list AND its value is
+ * an object (not an array), buildRelations unwraps it one level and merges it
+ * with the outer payload for field extraction purposes.  This covers startup
+ * events that nest all fields under mf_subagent_startup_gate, finish-gate events
+ * that wrap worker_contract/evidence, and the identity_join sub-object inside the
+ * startup gate.  Only one level is unwrapped (depth-1); nested arrays like
+ * findings[] or per-item sub-objects are NOT traversed to avoid extracting ids
+ * from unrelated noise structures.
+ */
+const KNOWN_ENVELOPE_KEYS = new Set([
+  "mf_subagent_startup_gate",
+  "worker_contract",
+  "evidence",
+  "identity_join",
+  "route_token_gate",
+  "mf_subagent_finish_gate",
+  "parallel_branch_finish_gate",
+]);
+
+/**
+ * Unwrap one level of known gate/evidence envelopes from a record so that
+ * relation-field extraction sees the actual fields regardless of whether they
+ * are at the top level or nested under a named envelope.  Only scalar/object
+ * envelope values are merged; array envelope values are left in place because
+ * they have their own extraction logic.
+ */
+function unwrapEnvelopes(record: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...record };
+  for (const key of KNOWN_ENVELOPE_KEYS) {
+    const val = record[key];
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      // Merge envelope fields WITHOUT overwriting already-present top-level keys.
+      for (const [envKey, envVal] of Object.entries(val as Record<string, unknown>)) {
+        if (!(envKey in out)) {
+          out[envKey] = envVal;
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[] {
   const relations: TaskTimelineSemanticRelation[] = [];
-  const payload = asRecord(event.payload);
-  const verification = asRecord(event.verification);
-  const artifactRefs = asRecord(event.artifact_refs);
+  // Unwrap known gate/evidence envelopes (e.g. mf_subagent_startup_gate) so that
+  // relation fields nested one level deep are visible to the extraction logic.
+  // Depth is bounded to 1 — only the named envelope objects are merged, not their
+  // nested arrays (e.g. findings[], bridged_identities[]) which have dedicated logic.
+  const payload = unwrapEnvelopes(asRecord(event.payload));
+  const verification = unwrapEnvelopes(asRecord(event.verification));
+  const artifactRefs = unwrapEnvelopes(asRecord(event.artifact_refs));
 
   // Helper: push a relation if value is non-empty.
   const pushRel = (kind: TaskTimelineSemanticRelation["kind"], label: string, rawValue: unknown, summary: string) => {
@@ -424,38 +473,81 @@ function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[
   const eventRefPaths: Array<[string, string]> = [
     ["read_receipt_event_id", "read receipt"],
     ["startup_event_id", "worker startup"],
+    ["startup_timeline_event_id", "startup timeline event"],
+    ["continuation_startup_event_id", "continuation startup event"],
     ["source_event_id", "source event"],
     ["parent_event_id", "parent event"],
     ["dispatch_event_id", "dispatch event"],
+    ["dispatch_ref", "dispatch ref"],
     ["precheck_id", "route precheck"],
     ["route_action_precheck_id", "route action precheck"],
+    ["reversal_of_event", "reversal of event"],
   ];
   for (const [field, label] of eventRefPaths) {
     const v = payload[field] ?? verification[field] ?? artifactRefs[field];
-    if (v != null) pushRel("event_ref", label, v, `Referenced ${label}`);
+    if (v != null) pushRel("event_ref", label, normalizeEventId(v), `Referenced ${label}`);
   }
 
   // Multi-value event id arrays
-  for (const [field, label] of [["read_receipt_event_ids", "read receipt"], ["source_event_ids", "source event"], ["startup_event_ids", "worker startup"]] as Array<[string, string]>) {
-    const arr = payload[field] ?? verification[field];
+  for (const [field, label] of [["read_receipt_event_ids", "read receipt"], ["source_event_ids", "source event"], ["startup_event_ids", "worker startup"], ["worker_progress_refs", "worker progress"], ["qa_refs", "QA ref"]] as Array<[string, string]>) {
+    const arr = payload[field] ?? verification[field] ?? artifactRefs[field];
     if (Array.isArray(arr)) {
-      for (const item of arr.slice(0, 6)) pushRel("event_ref", label, item, `Referenced ${label}`);
+      for (const item of arr.slice(0, 6)) pushRel("event_ref", label, normalizeEventId(item), `Referenced ${label}`);
     }
   }
 
   // --- QA/verification lane references ---
-  const qaVerdictRefs = payload.qa_verdict_refs ?? payload.qa_evidence_refs ?? verification.qa_verdict_refs;
+  const qaVerdictRefs = payload.qa_verdict_refs ?? payload.qa_evidence_refs ?? verification.qa_verdict_refs ?? artifactRefs.qa_verdict_refs;
   if (Array.isArray(qaVerdictRefs)) {
-    for (const item of qaVerdictRefs.slice(0, 6)) pushRel("event_ref", "QA verdict", item, "Referenced QA verdict event");
+    for (const item of qaVerdictRefs.slice(0, 6)) pushRel("event_ref", "QA verdict", normalizeEventId(item), "Referenced QA verdict event");
   }
 
   // Lane evidence references
   const laneEvidenceRefs = payload.lane_evidence_refs ?? payload.route_lane_refs ?? verification.lane_evidence_refs;
   if (Array.isArray(laneEvidenceRefs)) {
-    for (const item of laneEvidenceRefs.slice(0, 6)) pushRel("event_ref", "lane evidence", item, "Referenced lane evidence event");
+    for (const item of laneEvidenceRefs.slice(0, 6)) pushRel("event_ref", "lane evidence", normalizeEventId(item), "Referenced lane evidence event");
   }
 
-  // De-duplicate by kind+value
+  // --- checkpoint_id: rendered as non-navigable "backlog_row" kind.
+  // The panel only makes event_ref entries clickable when a matching frame is
+  // found by source_event_id — checkpoint ids are never frame ids, so event_ref
+  // would silently fall back to non-nav anyway. Using "backlog_row" here is the
+  // simpler, guaranteed-non-nav in-fence solution; it avoids any future frame-id
+  // collision and does not require a new "fact" kind in the type union (which
+  // would require changes in TaskPlaybackPanel outside the fence).
+  const checkpointId = payload.checkpoint_id ?? verification.checkpoint_id ?? artifactRefs.checkpoint_id;
+  if (checkpointId != null) {
+    const v = stringFrom(checkpointId);
+    if (v) {
+      const safe = sanitizePublicTimelineText(v);
+      if (safe && safe !== "[private detail redacted]") {
+        relations.push({ kind: "backlog_row", label: "checkpoint", value: safe, summary: "Checkpoint id for this branch task (non-navigable)" });
+      }
+    }
+  }
+
+  // --- bridged_identities[].task_id from cross_ref_lineage_bridge ---
+  // Use the original (non-unwrapped) raw payload for array fields to avoid
+  // double-extraction when the envelope merged an array into the flat record.
+  const rawPayload = asRecord(event.payload);
+  const rawVerification = asRecord(event.verification);
+  const rawArtifactRefs = asRecord(event.artifact_refs);
+  const bridgedIdentities = rawPayload.bridged_identities ?? rawVerification.bridged_identities ?? rawArtifactRefs.bridged_identities;
+  if (Array.isArray(bridgedIdentities)) {
+    for (const identity of bridgedIdentities.slice(0, 8)) {
+      const rec = asRecord(identity);
+      const taskIdVal = stringFrom(rec.task_id);
+      if (taskIdVal) {
+        const safe = sanitizePublicTimelineText(taskIdVal);
+        if (safe && safe !== "[private detail redacted]") {
+          relations.push({ kind: "backlog_row", label: "bridged task", value: safe, summary: "Task id from cross-ref lineage bridge" });
+        }
+      }
+    }
+  }
+
+  // De-duplicate by kind+value, keeping the first occurrence (which preserves the
+  // richer label when qa_refs and qa_verdict_refs produce the same event id).
   const seen = new Set<string>();
   return relations.filter((rel) => {
     const key = `${rel.kind}:${rel.value}`;
@@ -665,6 +757,13 @@ function stringFrom(value: unknown): string {
   if (typeof value === "string") return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
+}
+
+/** Normalize int or numeric-string event ids to string form. */
+function normalizeEventId(value: unknown): string {
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return value.trim();
+  return stringFrom(value);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

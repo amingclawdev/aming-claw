@@ -1737,10 +1737,373 @@ function taskPlaybackNavStackAssertions(): string[] {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// AC-RELATIONS-EXTRACTION-COVERAGE-20260611
+// New relation field coverage: startup-event refs, finish-gate/observer evidence
+// refs, reversal_of_event, bridged_identities task ids, checkpoint_id,
+// int-vs-string id normalization, empty payload → [].
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// F3: Real-data fixture — DB event #3741 envelope shape
+//
+// Event #3741 is the actual mf_subagent.startup event for this very lane
+// (task-relations-cov-20260611-01).  The real DB payload nests ALL fields
+// under the "mf_subagent_startup_gate" envelope key.  This fixture copies the
+// exact envelope structure so that the F1 unwrap fix can be verified against
+// the real payload shape, not a synthetic flat event.
+//
+// read_receipt_event_id in DB event #3741: "3740" (string)
+// read_receipt_hash in DB event #3741: "sha256:mf_subagent_read_receipt_event_3740"
+// observer_command_id in DB event #3741: "cmd-b344f65f3c9a"
+// ---------------------------------------------------------------------------
+
+// Real payload from DB event #3741 (mf_subagent.startup with mf_subagent_startup_gate envelope).
+// Sensitive host paths are replaced with "[redacted]"; all public relation fields preserved.
+export const REAL_DB_EVENT_3741_FIXTURE: TaskTimelineEvent = {
+  id: 3741,
+  event_type: "mf_subagent.startup",
+  event_kind: "mf_subagent_startup",
+  phase: "startup_gate",
+  status: "passed",
+  payload: {
+    mf_subagent_startup_gate: {
+      read_receipt_event_id: "3740",
+      read_receipt_hash: "sha256:mf_subagent_read_receipt_event_3740",
+      identity_join: {
+        agent_id_match_mode: "same_as_allocation_owner",
+        expected_runtime_context_id: "mfrctx-4cd901bd23f8ed73",
+        runtime_context_id: "mfrctx-4cd901bd23f8ed73",
+        runtime_context_id_matches: true,
+        schema_version: "mf_subagent_startup_identity_join.v1",
+      },
+      agent_id_match_mode: "same_as_allocation_owner",
+      allowed: true,
+      backlog_id: "AC-RELATIONS-EXTRACTION-COVERAGE-20260611",
+      base_commit: "6112158e63942a528f219cd2c2738d4582d6f0db",
+      bounded: true,
+      branch_ref: "refs/heads/codex/task-relations-cov-20260611-01",
+      close_satisfying: true,
+      fence_token: "fence-b6749fd1e734",
+      gate_kind: "mf_subagent.startup",
+      governance_project_id: "aming-claw",
+      merge_queue_id: "mq-6887264390b636e64abaa0d8",
+      observer_command_id: "cmd-b344f65f3c9a",
+      ok: true,
+      owned_files: [
+        "frontend/dashboard/src/lib/taskTimelineSemantics.ts",
+        "frontend/dashboard/src/lib/taskPlayback.ts",
+        "frontend/dashboard/src/lib/taskPlayback.test.ts",
+      ],
+      parent_task_id: "task-relations-cov-20260611-01",
+      prompt_contract_hash: "sha256:3a2b355508159ac96e38ec7bd2b7a67599cca94fa2d4208a1a10a6cb07d7014b",
+      prompt_contract_id: "rprompt-aming-3a2b355508159ac9",
+      route_context_hash: "sha256:deb92e12c5adaad6403f30006501fa8bf9101edddd6871e22bb45898ff14ce88",
+      route_id: "route-20260611-deb92e12c5adaad6",
+      runtime_context_id: "mfrctx-4cd901bd23f8ed73",
+      schema_version: "mf_subagent_startup_gate.v1",
+      session_token_evidence_type: "hash",
+      started: true,
+      startup_complete: true,
+      startup_source: "claude_code_mf_sub",
+      status: "passed",
+      task_id: "task-relations-cov-20260611-01",
+      visible_injection_manifest_hash: "sha256:f213443c14285204764224a1f378fc1aaff50de1822747493b6256284033c498",
+      worker_id: "claude-mfsub-rlx-01",
+      worker_role: "mf_sub",
+      // Host-local paths omitted (actual_cwd / worktree_path are redacted public-safety fields)
+      actual_startup_recorded: true,
+    },
+  },
+  created_at: "2026-06-11T01:25:00Z",
+};
+
+function taskPlaybackRealDataFixtureAssertions(): string[] {
+  // Assert that the F1 envelope-unwrap fix produces the read-receipt relation
+  // from the real DB event #3741 payload shape.
+  const proj3741 = projectTaskTimelineEvent(REAL_DB_EVENT_3741_FIXTURE);
+  assertFixture(
+    proj3741.relations.some((r) => r.kind === "event_ref" && r.label === "read receipt" && r.value === "3740"),
+    `real DB #3741: expected event_ref "read receipt" with value "3740" (envelope unwrap), got ${JSON.stringify(proj3741.relations.map((r) => r.label + ":" + r.value))}`,
+  );
+  assertFixture(
+    proj3741.relations.some((r) => r.kind === "backlog_row" && r.value === "AC-RELATIONS-EXTRACTION-COVERAGE-20260611"),
+    `real DB #3741: expected backlog_row for AC-RELATIONS-EXTRACTION-COVERAGE-20260611`,
+  );
+  // The startup gate envelope must NOT cause route_id / prompt_contract_id / hash fields
+  // to be extracted as relations (they are not relation ids, only the read_receipt_event_id
+  // and backlog_id should produce relation entries from this specific event shape).
+  const unwantedRouteRel = proj3741.relations.find((r) => r.value === "route-20260611-deb92e12c5adaad6");
+  assertFixture(
+    !unwantedRouteRel,
+    `real DB #3741: route_id should not appear as a relation entry (only read_receipt_event_id and backlog_id are relation fields)`,
+  );
+  return [
+    `real DB #3741 envelope unwrap: read receipt relation found (value=3740)`,
+    `real DB #3741: backlog_row for AC-RELATIONS-EXTRACTION-COVERAGE-20260611 present`,
+    `real DB #3741: no spurious route_id relation (route_id is not a relation field): ok`,
+  ];
+}
+
+function taskPlaybackRelationsExtractionCoverageAssertions(): string[] {
+  // Helper: project a single event and return its relation_links.
+  function relations(event: Partial<TaskTimelineEvent>): ReturnType<typeof projectTaskTimelineEvent>["relations"] {
+    return projectTaskTimelineEvent({
+      id: 6000,
+      event_type: "test_event",
+      event_kind: "test_kind",
+      phase: "test",
+      actor: "test",
+      status: "recorded",
+      created_at: "2026-06-11T00:00:00Z",
+      ...event,
+    }).relations;
+  }
+
+  // 1. startup event with read_receipt_event_id shows read-receipt relation
+  const startupRels = relations({
+    event_kind: "mf_subagent_startup",
+    payload: {
+      read_receipt_event_id: 3740,
+      worker_id: "mfsub-test-01",
+    },
+  });
+  assertFixture(
+    startupRels.some((r) => r.kind === "event_ref" && r.label === "read receipt" && r.value === "3740"),
+    `startup read_receipt_event_id: expected event_ref for "3740", got ${JSON.stringify(startupRels.map((r) => r.value))}`,
+  );
+
+  // 2. int vs string normalization: int 3740 and string "3740" both produce the same value
+  const intRels = relations({ payload: { read_receipt_event_id: 3740 } });
+  const strRels = relations({ payload: { read_receipt_event_id: "3740" } });
+  assertFixture(
+    intRels.some((r) => r.value === "3740"),
+    `int normalization: int 3740 should produce value "3740", got ${JSON.stringify(intRels.map((r) => r.value))}`,
+  );
+  assertFixture(
+    strRels.some((r) => r.value === "3740"),
+    `string normalization: string "3740" should produce value "3740", got ${JSON.stringify(strRels.map((r) => r.value))}`,
+  );
+  assertFixture(
+    intRels.filter((r) => r.value === "3740").length === strRels.filter((r) => r.value === "3740").length,
+    "int vs string normalization: both int and string event ids must produce the same relation entry",
+  );
+
+  // 3. finish-gate/observer evidence: startup_timeline_event_id and continuation_startup_event_id
+  const finishGateRels = relations({
+    event_kind: "close_ready",
+    payload: {
+      startup_timeline_event_id: "evt-startup-123",
+      continuation_startup_event_id: "evt-cont-456",
+    },
+  });
+  assertFixture(
+    finishGateRels.some((r) => r.kind === "event_ref" && r.label === "startup timeline event" && r.value === "evt-startup-123"),
+    `finish-gate startup_timeline_event_id: expected event_ref for "evt-startup-123"`,
+  );
+  assertFixture(
+    finishGateRels.some((r) => r.kind === "event_ref" && r.label === "continuation startup event" && r.value === "evt-cont-456"),
+    `finish-gate continuation_startup_event_id: expected event_ref for "evt-cont-456"`,
+  );
+
+  // 4. route_identity_supersede event: reversal_of_event shows reversal relation
+  const supersederRels = relations({
+    event_kind: "route_identity_supersede",
+    payload: {
+      reversal_of_event: "evt-stale-789",
+    },
+  });
+  assertFixture(
+    supersederRels.some((r) => r.kind === "event_ref" && r.label === "reversal of event" && r.value === "evt-stale-789"),
+    `reversal_of_event: expected event_ref for "evt-stale-789", got ${JSON.stringify(supersederRels.map((r) => r.value))}`,
+  );
+
+  // 5. cross_ref_lineage_bridge with bridged_identities: each task_id becomes a backlog_row
+  const bridgeRels = relations({
+    event_kind: "cross_ref_lineage_bridge",
+    payload: {
+      bridged_identities: [
+        { task_id: "task-bridge-a", route_id: "route-bridge-a" },
+        { task_id: "task-bridge-b", worker_id: "mfsub-bridge-b" },
+      ],
+    },
+  });
+  assertFixture(
+    bridgeRels.some((r) => r.kind === "backlog_row" && r.label === "bridged task" && r.value === "task-bridge-a"),
+    `bridged_identities task_id: expected backlog_row for "task-bridge-a"`,
+  );
+  assertFixture(
+    bridgeRels.some((r) => r.kind === "backlog_row" && r.label === "bridged task" && r.value === "task-bridge-b"),
+    `bridged_identities task_id: expected backlog_row for "task-bridge-b"`,
+  );
+
+  // 6. checkpoint_id: non-navigable fact entry — kind="backlog_row" (guaranteed
+  //    non-nav in the panel since backlog_row entries never trigger the frame-jump
+  //    button; this avoids needing a new "fact" kind in the type union, and
+  //    checkpoint ids can never match a timeline frame id anyway).
+  const checkpointRels = relations({
+    payload: {
+      checkpoint_id: "ckpt-abc123",
+    },
+  });
+  assertFixture(
+    checkpointRels.some((r) => r.kind === "backlog_row" && r.label === "checkpoint" && r.value === "ckpt-abc123"),
+    `checkpoint_id: expected backlog_row with label "checkpoint" and value "ckpt-abc123", got ${JSON.stringify(checkpointRels.map((r) => r.kind + ":" + r.label + ":" + r.value))}`,
+  );
+
+  // 7. worker_progress_refs in payload → event_ref relations
+  const progressRels = relations({
+    payload: {
+      worker_progress_refs: ["evt-prog-1", "evt-prog-2"],
+    },
+  });
+  assertFixture(
+    progressRels.some((r) => r.kind === "event_ref" && r.label === "worker progress" && r.value === "evt-prog-1"),
+    `worker_progress_refs: expected event_ref for "evt-prog-1"`,
+  );
+  assertFixture(
+    progressRels.some((r) => r.kind === "event_ref" && r.label === "worker progress" && r.value === "evt-prog-2"),
+    `worker_progress_refs: expected event_ref for "evt-prog-2"`,
+  );
+
+  // 8. dispatch_ref in payload → event_ref relation
+  const dispatchRels = relations({
+    payload: {
+      dispatch_ref: "evt-dispatch-001",
+    },
+  });
+  assertFixture(
+    dispatchRels.some((r) => r.kind === "event_ref" && r.label === "dispatch ref" && r.value === "evt-dispatch-001"),
+    `dispatch_ref: expected event_ref for "evt-dispatch-001"`,
+  );
+
+  // 9. qa_refs array in payload → event_ref relations
+  const qaRefsRels = relations({
+    payload: {
+      qa_refs: ["qa-evt-10", "qa-evt-11"],
+    },
+  });
+  assertFixture(
+    qaRefsRels.some((r) => r.kind === "event_ref" && r.label === "QA ref" && r.value === "qa-evt-10"),
+    `qa_refs: expected event_ref for "qa-evt-10"`,
+  );
+
+  // 10. Empty payload → [] (no relations)
+  const emptyRels = relations({ payload: {} });
+  assertFixture(
+    Array.isArray(emptyRels) && emptyRels.length === 0,
+    `empty payload: expected empty array, got ${emptyRels.length} items`,
+  );
+
+  // 11. No payload at all → [] (no relations, no throw)
+  const noPayloadRels = relations({});
+  assertFixture(
+    Array.isArray(noPayloadRels) && noPayloadRels.length === 0,
+    `no payload: expected empty array, got ${noPayloadRels.length} items`,
+  );
+
+  // 12. Full trace via normalizeTaskPlaybackTrace: startup frame surfaces read_receipt_event_id relation_link
+  const backlog: BacklogBug = {
+    bug_id: "AC-RELATIONS-EXTRACTION-COVERAGE-20260611",
+    title: "Relations extraction coverage",
+    status: "OPEN",
+    priority: "P1",
+  };
+  const traceEvents: TaskTimelineEvent[] = [
+    {
+      id: 6001,
+      event_type: "mf_subagent.startup",
+      event_kind: "mf_subagent_startup",
+      phase: "startup_gate",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: "AC-RELATIONS-EXTRACTION-COVERAGE-20260611",
+      payload: {
+        read_receipt_event_id: 3740,
+        worker_id: "mfsub-rlx-01",
+        startup_timeline_event_id: "evt-startup-6001",
+      },
+      created_at: "2026-06-11T01:25:00Z",
+    },
+    {
+      id: 6002,
+      event_type: "mf_subagent.close_ready",
+      event_kind: "close_ready",
+      phase: "close_ready",
+      actor: "observer",
+      status: "passed",
+      backlog_id: "AC-RELATIONS-EXTRACTION-COVERAGE-20260611",
+      payload: {
+        startup_timeline_event_id: "6001",
+        continuation_startup_event_id: "6001",
+        bridged_identities: [{ task_id: "task-bridge-prior-01" }],
+        checkpoint_id: "ckpt-relx-001",
+      },
+      created_at: "2026-06-11T01:26:00Z",
+    },
+  ];
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events: traceEvents, count: traceEvents.length },
+    gateResponse: null,
+    source: "governed",
+  });
+  const startupFrame = trace.frames.find((f) => f.source_event_id === "#6001");
+  const closeReadyFrame = trace.frames.find((f) => f.source_event_id === "#6002");
+  assertFixture(Boolean(startupFrame), "trace: startup frame #6001 should exist");
+  assertFixture(Boolean(closeReadyFrame), "trace: close_ready frame #6002 should exist");
+  if (!startupFrame || !closeReadyFrame) throw new Error("missing relx coverage trace frames");
+  assertFixture(
+    startupFrame.relation_links.some((r) => r.kind === "event_ref" && r.label === "read receipt" && r.value === "3740"),
+    "trace: startup frame relation_links should contain read_receipt_event_id (int normalized to string)",
+  );
+  assertFixture(
+    startupFrame.relation_links.some((r) => r.kind === "event_ref" && r.label === "startup timeline event"),
+    "trace: startup frame relation_links should contain startup_timeline_event_id",
+  );
+  assertFixture(
+    closeReadyFrame.relation_links.some((r) => r.kind === "event_ref" && r.label === "startup timeline event" && r.value === "6001"),
+    "trace: close_ready frame relation_links should contain startup_timeline_event_id",
+  );
+  assertFixture(
+    closeReadyFrame.relation_links.some((r) => r.kind === "backlog_row" && r.label === "bridged task" && r.value === "task-bridge-prior-01"),
+    "trace: close_ready frame relation_links should contain bridged_identities task_id",
+  );
+  assertFixture(
+    closeReadyFrame.relation_links.some((r) => r.kind === "backlog_row" && r.label === "checkpoint" && r.value === "ckpt-relx-001"),
+    "trace: close_ready frame relation_links should contain checkpoint_id as backlog_row (non-nav)",
+  );
+
+  return [
+    "relx: startup read_receipt_event_id → event_ref (read receipt): ok",
+    "relx: int 3740 normalized to string \"3740\": ok",
+    "relx: string \"3740\" normalization: ok",
+    "relx: int vs string produces same relation: ok",
+    "relx: finish-gate startup_timeline_event_id → event_ref: ok",
+    "relx: finish-gate continuation_startup_event_id → event_ref: ok",
+    "relx: reversal_of_event → event_ref (reversal of event): ok",
+    "relx: bridged_identities task_id → backlog_row (bridged task): ok",
+    "relx: checkpoint_id → backlog_row (non-nav, guaranteed non-clickable): ok",
+    "relx: worker_progress_refs → event_ref array: ok",
+    "relx: dispatch_ref → event_ref: ok",
+    "relx: qa_refs → event_ref array: ok",
+    "relx: empty payload → []: ok",
+    "relx: no payload → []: ok",
+    `relx: trace startup frame read_receipt relation present (count=${startupFrame.relation_links.length}): ok`,
+    `relx: trace close_ready bridged task relation present (count=${closeReadyFrame.relation_links.length}): ok`,
+  ];
+}
+
 export const taskPlaybackSemanticsCoverageFixtureSummary: string[] = [
   ...taskPlaybackHeadlineCoverageAssertions(),
   ...taskPlaybackRelationsCoverageAssertions(),
   ...taskPlaybackFrameProjectionAssertions(),
   ...taskPlaybackNewestFirstAssertions(),
   ...taskPlaybackNavStackAssertions(),
+];
+
+export const taskPlaybackRelationsExtractionCoverageSummary: string[] = [
+  ...taskPlaybackRealDataFixtureAssertions(),
+  ...taskPlaybackRelationsExtractionCoverageAssertions(),
 ];
