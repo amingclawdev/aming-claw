@@ -11,6 +11,9 @@ import {
   truncateHash,
   categorizeEvidenceRef,
   groupEvidenceRefsByCategory,
+  buildPlaybackUrl,
+  findFrameIdByEventParam,
+  PLAYBACK_URL_PARAMS,
   type PlaybackNavEntry,
   type TaskPlaybackFrame,
   type TaskPlaybackEvidenceRef,
@@ -2730,3 +2733,100 @@ function workerLaneAttributionAssertions(): string[] {
 export const taskPlaybackWorkerLaneAttributionSummary: string[] = [
   ...workerLaneAttributionAssertions(),
 ];
+
+// ──────────────────────────────────────────────────────────────────────────────
+// B1 / B2 UE-blocker canonical URL helpers
+// (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611)
+// ──────────────────────────────────────────────────────────────────────────────
+
+function ueBlockerUrlAssertions(): string[] {
+  const results: string[] = [];
+
+  // ── PLAYBACK_URL_PARAMS completeness ────────────────────────────────────
+  assertFixture(PLAYBACK_URL_PARAMS.view === "view", "PLAYBACK_URL_PARAMS.view must be 'view'");
+  assertFixture(PLAYBACK_URL_PARAMS.activity_tab === "activity_tab", "PLAYBACK_URL_PARAMS.activity_tab must be 'activity_tab'");
+  assertFixture(PLAYBACK_URL_PARAMS.playback_backlog === "playback_backlog", "PLAYBACK_URL_PARAMS.playback_backlog must be 'playback_backlog'");
+  assertFixture(PLAYBACK_URL_PARAMS.playback_event === "playback_event", "PLAYBACK_URL_PARAMS.playback_event must be 'playback_event'");
+  results.push("PLAYBACK_URL_PARAMS covers view, activity_tab, playback_backlog, playback_event");
+
+  // ── buildPlaybackUrl — canonical view=activity&activity_tab=history ──────
+  const base = "http://localhost/dashboard";
+  const url1 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", undefined, base);
+  assertFixture(url1.includes("view=activity"), `buildPlaybackUrl must emit view=activity (got: ${url1})`);
+  assertFixture(url1.includes("activity_tab=history"), `buildPlaybackUrl must emit activity_tab=history (got: ${url1})`);
+  assertFixture(url1.includes("playback_backlog=AC-SOME-BLOCKER-20260611"), `buildPlaybackUrl must emit playback_backlog param (got: ${url1})`);
+  assertFixture(!url1.includes("playback_event="), `buildPlaybackUrl with no eventId must not emit playback_event param (got: ${url1})`);
+  results.push(`buildPlaybackUrl canonical form OK: ${url1}`);
+
+  // ── buildPlaybackUrl — with string event id ──────────────────────────────
+  const url2 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", "my-event-id", base);
+  assertFixture(url2.includes("playback_event=my-event-id"), `buildPlaybackUrl must emit playback_event param with string id (got: ${url2})`);
+  results.push(`buildPlaybackUrl with string eventId OK: ${url2}`);
+
+  // ── buildPlaybackUrl — with numeric event id ─────────────────────────────
+  const url3 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", 1234, base);
+  assertFixture(url3.includes("playback_event=1234"), `buildPlaybackUrl must emit numeric event id as string (got: ${url3})`);
+  results.push(`buildPlaybackUrl with numeric eventId OK: ${url3}`);
+
+  // ── buildPlaybackUrl — null/empty event id must not emit param ───────────
+  const url4 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", null, base);
+  assertFixture(!url4.includes("playback_event"), `buildPlaybackUrl with null eventId must not emit playback_event (got: ${url4})`);
+  const url5 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", "", base);
+  assertFixture(!url5.includes("playback_event"), `buildPlaybackUrl with empty string eventId must not emit playback_event (got: ${url5})`);
+  results.push("buildPlaybackUrl null/empty eventId suppresses param");
+
+  // ── buildPlaybackUrl — B2 canonical equivalence: view=activity + activity_tab=history
+  //    is the canonical route that avoids App.tsx normalizeViewName dropping params ──────
+  assertFixture(!url1.includes("view=playback"), `buildPlaybackUrl must never emit view=playback (B2 canonical form) (got: ${url1})`);
+  results.push("buildPlaybackUrl emits view=activity, never view=playback (B2 canonical route)");
+
+  // ── findFrameIdByEventParam — exact frame id match ───────────────────────
+  const sampleFrames: TaskPlaybackFrame[] = [
+    { id: "abc-def", source_event_id: "src-001", sequence: 1, title: "T1", event_kind: "route_context", status: "passed", structured_facts: [], failure_diagnosis: [], evidence_links: [], raw_sections: [], specific_facts: [], auxiliary_narrative: [] } as unknown as TaskPlaybackFrame,
+    { id: "#42", source_event_id: "42", sequence: 2, title: "T2", event_kind: "verification", status: "blocked", structured_facts: [], failure_diagnosis: [], evidence_links: [], raw_sections: [], specific_facts: [], auxiliary_narrative: [] } as unknown as TaskPlaybackFrame,
+    { id: "some-long-event-id", source_event_id: "3100", sequence: 3, title: "T3", event_kind: "implementation", status: "recorded", structured_facts: [], failure_diagnosis: [], evidence_links: [], raw_sections: [], specific_facts: [], auxiliary_narrative: [] } as unknown as TaskPlaybackFrame,
+  ];
+
+  const r1 = findFrameIdByEventParam(sampleFrames, "abc-def");
+  assertFixture(r1 === "abc-def", `findFrameIdByEventParam exact id match: expected 'abc-def', got '${r1}'`);
+  results.push("findFrameIdByEventParam exact id match OK");
+
+  // ── findFrameIdByEventParam — source_event_id match ──────────────────────
+  const r2 = findFrameIdByEventParam(sampleFrames, "src-001");
+  assertFixture(r2 === "abc-def", `findFrameIdByEventParam source_event_id match: expected 'abc-def', got '${r2}'`);
+  results.push("findFrameIdByEventParam source_event_id match OK");
+
+  // ── findFrameIdByEventParam — numeric string → #N form ───────────────────
+  const r3 = findFrameIdByEventParam(sampleFrames, "42");
+  assertFixture(r3 === "#42", `findFrameIdByEventParam numeric string → #42 frame: expected '#42', got '${r3}'`);
+  results.push("findFrameIdByEventParam numeric string → #N form OK");
+
+  // ── findFrameIdByEventParam — #N string → strips hash ────────────────────
+  const r4 = findFrameIdByEventParam(sampleFrames, "#42");
+  assertFixture(r4 === "#42", `findFrameIdByEventParam #N pass-through: expected '#42', got '${r4}'`);
+  results.push("findFrameIdByEventParam #N string match OK");
+
+  // ── findFrameIdByEventParam — source_event_id numeric match for long id ──
+  const r5 = findFrameIdByEventParam(sampleFrames, "3100");
+  assertFixture(r5 === "some-long-event-id", `findFrameIdByEventParam source_event_id numeric '3100' → 'some-long-event-id', got '${r5}'`);
+  results.push("findFrameIdByEventParam numeric source_event_id match OK");
+
+  // ── findFrameIdByEventParam — missing frame returns empty string ──────────
+  const r6 = findFrameIdByEventParam(sampleFrames, "does-not-exist");
+  assertFixture(r6 === "", `findFrameIdByEventParam missing frame: expected '', got '${r6}'`);
+  results.push("findFrameIdByEventParam missing-frame fallback returns empty string");
+
+  // ── findFrameIdByEventParam — empty param returns empty string ───────────
+  const r7 = findFrameIdByEventParam(sampleFrames, "");
+  assertFixture(r7 === "", `findFrameIdByEventParam empty param: expected '', got '${r7}'`);
+  results.push("findFrameIdByEventParam empty param returns empty string");
+
+  // ── findFrameIdByEventParam — empty frames returns empty string ───────────
+  const r8 = findFrameIdByEventParam([], "abc-def");
+  assertFixture(r8 === "", `findFrameIdByEventParam empty frames: expected '', got '${r8}'`);
+  results.push("findFrameIdByEventParam empty frames returns empty string");
+
+  return results;
+}
+
+export const taskPlaybackUeBlockerUrlSummary: string[] = ueBlockerUrlAssertions();

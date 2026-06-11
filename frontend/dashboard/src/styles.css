@@ -3341,6 +3341,10 @@ a:hover { text-decoration: underline; }
   height: 100%;
 }
 
+.task-playback-event-column {
+  min-width: 0; /* scroll behavior delivered via .task-playback-main; anchor for e2e contract */
+}
+
 .task-playback-controls {
   justify-content: space-between;
   min-height: 42px;
@@ -3396,9 +3400,14 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-panel {
+  /* B3: panel must fill its layout grid cell so the body can take the
+     remaining height via grid-template-rows. */
   display: grid;
+  grid-template-rows: auto 1fr;
   gap: 10px;
   padding: 12px;
+  height: 100%;
+  overflow: hidden;
 }
 
 .task-playback-panel.compact {
@@ -3494,10 +3503,15 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-body {
+  /* B3: bounded height so each inner column can scroll independently on
+     desktop (> 980px).  The parent .task-playback-panel uses
+     grid-template-rows: auto 1fr so this row receives the remaining height. */
   display: grid;
   grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
   gap: 10px;
   align-items: stretch;
+  height: 100%;
+  overflow: hidden;
 }
 
 .task-playback-frame-list {
@@ -3575,6 +3589,14 @@ a:hover { text-decoration: underline; }
 .task-playback-dot.status-running,
 .task-playback-dot.status-waiting {
   background: var(--blue);
+}
+
+/* B3: detail column is independently scrollable so the event list and detail
+   pane both stay within the viewport-bounded layout on desktop. */
+.task-playback-detail-column {
+  min-width: 0;
+  overflow-y: auto;
+  height: 100%;
 }
 
 .task-playback-current {
@@ -7934,6 +7956,23 @@ svg.graph-svg path.ghit:hover {
     overflow: visible;
   }
 
+  /* B3 desktop overrides: undo bounded heights for stacked/narrow layout. */
+  .task-playback-panel {
+    grid-template-rows: unset;
+    height: auto;
+    overflow: visible;
+  }
+
+  .task-playback-body {
+    height: auto;
+    overflow: visible;
+  }
+
+  .task-playback-detail-column {
+    overflow-y: visible;
+    height: auto;
+  }
+
   .task-playback-selector,
   .task-playback-main {
     height: auto;
@@ -8021,6 +8060,64 @@ svg.graph-svg path.ghit:hover {
   .backlog-dag-phases,
   .backlog-dag-grid {
     min-width: 680px;
+  }
+}
+
+/* B4: mobile 390×844 — sidebar must not eat half the viewport.
+   At ≤ 480px collapse the sidebar so the playback columns are full-width. */
+@media (max-width: 480px) {
+  /* Force sidebar to collapsed state — just the icon strip, not the full
+     label/text pane.  Mirrors the .collapsed behaviour that already exists. */
+  .sidebar:not(.collapsed) {
+    --sidebar-width: 54px;
+  }
+
+  .sidebar:not(.collapsed) .nav-label,
+  .sidebar:not(.collapsed) .sidebar-title,
+  .sidebar:not(.collapsed) .sidebar-project-label {
+    display: none;
+  }
+
+  /* Playback layout: single column stack (inherited from 980px rule, but
+     reiterate here to be explicit). */
+  .task-playback-layout,
+  .task-playback-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .task-playback-layout {
+    height: auto;
+    min-height: unset;
+    overflow: visible;
+  }
+
+  .task-playback-panel {
+    grid-template-rows: unset;
+    height: auto;
+    overflow: visible;
+  }
+
+  .task-playback-body {
+    height: auto;
+    overflow: visible;
+  }
+
+  .task-playback-detail-column {
+    overflow-y: visible;
+    height: auto;
+  }
+
+  .task-playback-selector,
+  .task-playback-main {
+    height: auto;
+    overflow-y: visible;
+  }
+
+  /* Prevent horizontal scroll from wide helper tables/grids. */
+  .backlog-dag-phases,
+  .backlog-dag-grid {
+    min-width: unset;
+    overflow-x: auto;
   }
 }
 

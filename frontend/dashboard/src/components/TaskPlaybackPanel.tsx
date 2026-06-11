@@ -315,7 +315,7 @@ export default function TaskPlaybackPanel({
           </div>
 
           {selectedFrame ? (
-            <article className={`task-playback-current status-${selectedFrame.status}`}>
+            <article className={`task-playback-detail-column task-playback-current status-${selectedFrame.status}`}>
               <div className="task-playback-current-head">
                 <div>
                   <span className="mono">frame {selectedFrame.sequence}</span>
