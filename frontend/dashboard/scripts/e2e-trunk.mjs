@@ -827,14 +827,59 @@ async function stepFixtureProject() {
   return { workspace: WORKSPACE, project: PROJECT, baseline_commit: commit, reset: RESET, wrote_fixture: shouldWrite };
 }
 
+async function mintBootstrapRouteToken(suiteId) {
+  // Clean mint handshake for the project_bootstrap gate:
+  //
+  // 1. POST /api/projects/{project_id}/observer/route-context/issue with
+  //    allowed_actions: ["project_bootstrap"] in the request body.
+  //    The /issue endpoint accepts an `allowed_actions` field and bakes it into
+  //    the returned token via _sanitize_allowed_actions on the server side.
+  //
+  // 2. Use the returned token object UNMODIFIED as the route_token in the
+  //    /api/project/bootstrap call. No client-side token field assembly.
+  //
+  // project_bootstrap is not a blocked action; /issue accepts it in allowed_actions.
+  // If the mint endpoint rejects it, the assertion below will capture the error.
+  const taskId = `task-e2e-fixture-bootstrap-${suiteId.replace(/[^a-zA-Z0-9]/g, "-")}`;
+  const backlogId = `E2E-FIXTURE-BOOTSTRAP-${suiteId}`;
+  const tokenResp = await http(
+    "POST",
+    `/api/projects/${pid(PROJECT)}/observer/route-context/issue`,
+    {
+      caller_role: "observer",
+      backlog_id: backlogId,
+      task_id: taskId,
+      target_files: [".aming-claw.yaml"],
+      allowed_actions: ["project_bootstrap"],
+    },
+  );
+  assert(tokenResp.ok === true, "route-context/issue returned ok=false for bootstrap token mint");
+  const mintedToken = tokenResp.route_token;
+  assert(mintedToken, "route-context/issue did not return a route_token");
+  assert(mintedToken.route_context_hash, "minted token missing route_context_hash");
+  assert(mintedToken.prompt_contract_id, "minted token missing prompt_contract_id");
+  assert(mintedToken.expires_at, "minted token missing expires_at");
+
+  // Return the server-minted token UNMODIFIED. Do not add, remove, or mutate
+  // any fields client-side — the gate trusts only tokens signed by the server.
+  return mintedToken;
+}
+
 async function stepBootstrapProject() {
   const registered = await httpMaybe("POST", "/api/projects/register", { workspace_path: WORKSPACE });
   if (!registered.ok && registered.error.status !== 409) throw registered.error;
+
+  // Mint a write-authorizing route_token for the protected project_bootstrap gate.
+  // The gate requires this token as of the route_token_required enforcement rollout.
+  // See: AC-E2E-TRUNK-BOOTSTRAP-ROUTE-TOKEN-20260611 and .aming-claw.yaml suite notes.
+  const bootstrapRouteToken = await mintBootstrapRouteToken(e2eSuiteId());
+
   const bootstrap = await http("POST", "/api/project/bootstrap", {
     workspace_path: WORKSPACE,
     project_name: PROJECT,
     scan_depth: 3,
     exclude_patterns: ["node_modules", "dist", "coverage", ".aming-claw/e2e-artifacts"],
+    route_token: bootstrapRouteToken,
   });
   assert(bootstrap.project_id === PROJECT, `bootstrap returned project ${bootstrap.project_id}, expected ${PROJECT}`);
   assert(bootstrap.snapshot_id, "bootstrap did not return snapshot_id");
@@ -845,6 +890,7 @@ async function stepBootstrapProject() {
     node_count: bootstrap.graph_stats?.node_count,
     edge_count: bootstrap.graph_stats?.edge_count,
     register_status: registered.ok ? "registered" : "already_registered",
+    bootstrap_route_token_ref: bootstrapRouteToken.route_token_ref || bootstrapRouteToken.route_context_hash || "",
   };
 }
 
