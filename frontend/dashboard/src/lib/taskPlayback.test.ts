@@ -2107,3 +2107,101 @@ export const taskPlaybackRelationsExtractionCoverageSummary: string[] = [
   ...taskPlaybackRealDataFixtureAssertions(),
   ...taskPlaybackRelationsExtractionCoverageAssertions(),
 ];
+
+// ── classifyStatusWord + segmentTextWithStatusChips tests ─────────────────
+// AC-EVENT-SUMMARY-SEMANTIC-EMPHASIS-20260611
+
+import { classifyStatusWord, segmentTextWithStatusChips } from "./taskTimelineSemantics";
+
+function taskPlaybackStatusWordClassifyAssertions(): string[] {
+  // Positive words
+  for (const word of ["passed", "accepted", "ok", "validated", "close_satisfying", "succeeded"]) {
+    assertFixture(classifyStatusWord(word) === "positive", `classify '${word}': expected positive`);
+  }
+  // Negative words
+  for (const word of ["blocked", "failed", "refused", "rejected", "denied"]) {
+    assertFixture(classifyStatusWord(word) === "negative", `classify '${word}': expected negative`);
+  }
+  // Neutral words
+  for (const word of ["allowed", "requested", "pending", "running"]) {
+    assertFixture(classifyStatusWord(word) === "neutral", `classify '${word}': expected neutral`);
+  }
+  // Case-insensitive
+  assertFixture(classifyStatusWord("PASSED") === "positive", "classify 'PASSED': case-insensitive positive");
+  assertFixture(classifyStatusWord("Failed") === "negative", "classify 'Failed': case-insensitive negative");
+  assertFixture(classifyStatusWord("Running") === "neutral", "classify 'Running': case-insensitive neutral");
+  // Null cases
+  assertFixture(classifyStatusWord("") === null, "classify '': empty string → null");
+  assertFixture(classifyStatusWord("unknown_word") === null, "classify 'unknown_word': → null");
+  assertFixture(classifyStatusWord("the") === null, "classify 'the': → null");
+  // Whole-word contract: 'surpassed' / 'unblocked' are NOT exact status words.
+  assertFixture(classifyStatusWord("surpassed") === null, "classify 'surpassed': not a status word → null");
+  assertFixture(classifyStatusWord("unblocked") === null, "classify 'unblocked': not a status word → null");
+
+  return [
+    "classify: positive words (passed/accepted/ok/validated/close_satisfying/succeeded)",
+    "classify: negative words (blocked/failed/refused/rejected/denied)",
+    "classify: neutral words (allowed/requested/pending/running)",
+    "classify: case-insensitive (PASSED/Failed/Running)",
+    "classify: empty string → null",
+    "classify: non-status word → null",
+    "classify: 'surpassed' → null (whole-word contract)",
+    "classify: 'unblocked' → null (whole-word contract)",
+  ];
+}
+
+function taskPlaybackSegmentTextAssertions(): string[] {
+  // Empty string → []
+  const emptySegs = segmentTextWithStatusChips("");
+  assertFixture(emptySegs.length === 0, "segment '': empty string → []");
+
+  // Plain text with no status words → only chipClass null segments
+  const plainSegs = segmentTextWithStatusChips("hello world");
+  assertFixture(plainSegs.every((s) => s.chipClass === null), "segment plain text: all chipClass null");
+  assertFixture(plainSegs.map((s) => s.text).join("") === "hello world", "segment plain text: round-trips correctly");
+
+  // Status word in context → correct chip
+  const passedSegs = segmentTextWithStatusChips("gate passed successfully");
+  const passedChip = passedSegs.find((s) => s.text === "passed");
+  assertFixture(passedChip !== undefined, "segment 'passed': chip present in output");
+  assertFixture(passedChip?.chipClass === "positive", "segment 'passed': chipClass = positive");
+
+  // Negative word
+  const blockedSegs = segmentTextWithStatusChips("worker blocked by gate");
+  const blockedChip = blockedSegs.find((s) => s.text === "blocked");
+  assertFixture(blockedChip?.chipClass === "negative", "segment 'blocked': chipClass = negative");
+
+  // Neutral word
+  const pendingSegs = segmentTextWithStatusChips("request is pending approval");
+  const pendingChip = pendingSegs.find((s) => s.text === "pending");
+  assertFixture(pendingChip?.chipClass === "neutral", "segment 'pending': chipClass = neutral");
+
+  // Whole-word boundary: 'surpassed' must NOT produce any chip.
+  const surpassedSegs = segmentTextWithStatusChips("surpassed expectations");
+  assertFixture(surpassedSegs.filter((s) => s.chipClass !== null).length === 0, "segment 'surpassed': no status chips (whole-word boundary)");
+
+  // Round-trip lossless
+  const complex = "gate passed but worker blocked; request pending";
+  const complexSegs = segmentTextWithStatusChips(complex);
+  assertFixture(complexSegs.map((s) => s.text).join("") === complex, "segment complex text: round-trips losslessly");
+
+  // Correct chip count
+  const multiChipCount = complexSegs.filter((s) => s.chipClass !== null).length;
+  assertFixture(multiChipCount === 3, `segment complex text: 3 chips (passed/blocked/pending), got ${multiChipCount}`);
+
+  return [
+    "segment: empty string → []",
+    "segment: plain text → all chipClass null, round-trips",
+    "segment: 'passed' in sentence → positive chip",
+    "segment: 'blocked' in sentence → negative chip",
+    "segment: 'pending' in sentence → neutral chip",
+    "segment: 'surpassed' → no status chips (whole-word boundary)",
+    "segment: complex text round-trips losslessly",
+    "segment: complex text yields 3 chips (passed/blocked/pending)",
+  ];
+}
+
+export const taskPlaybackStatusWordEmphasisSummary: string[] = [
+  ...taskPlaybackStatusWordClassifyAssertions(),
+  ...taskPlaybackSegmentTextAssertions(),
+];

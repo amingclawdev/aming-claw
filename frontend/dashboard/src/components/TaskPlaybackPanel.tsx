@@ -3,6 +3,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import type { TaskPlaybackFrame, TaskPlaybackTrace, PlaybackNavEntry } from "../lib/taskPlayback";
 import { displayPlaybackFrames, latestPlaybackFrameId, pushPlaybackNavStack, popPlaybackNavStack } from "../lib/taskPlayback";
 import type { TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
+import { segmentTextWithStatusChips } from "../lib/taskTimelineSemantics";
 
 type EvidenceRef = TaskPlaybackFrame["evidence_links"][number];
 type EvidenceInspectorRow = { label: string; value: string; source?: string };
@@ -342,14 +343,14 @@ export default function TaskPlaybackPanel({
 
               {/* 2. BUSINESS-RELEVANT SUMMARY BLOCK: status, decision, key refs */}
               <div className="task-playback-current-meta">
-                <span className="mono">{selectedFrame.event_type}</span>
-                <span className="mono">{selectedFrame.phase}</span>
-                <span className="mono">{selectedFrame.source_event_id}</span>
+                <span className="mono ref-tint">{selectedFrame.event_type}</span>
+                <span className="mono ref-tint">{selectedFrame.phase}</span>
+                <span className="mono ref-tint">{selectedFrame.source_event_id}</span>
                 <span className="mono">{formatFrameDateTime(selectedFrame)}</span>
               </div>
               <div className="task-playback-chip-section">
                 <strong>Event summary</strong>
-                <p>{selectedFrame.summary}</p>
+                <p><StatusWordText text={selectedFrame.summary} /></p>
               </div>
               <StructuredFactSection title="Key facts" facts={selectedFrame.specific_facts} />
               <StructuredFactSection title="Failure/blocker diagnosis" facts={selectedFrame.failure_diagnosis} />
@@ -363,7 +364,7 @@ export default function TaskPlaybackPanel({
               <EvidenceLinkSection links={selectedEvidenceLinks} onInspect={setSelectedEvidenceRef} />
 
               {/* 4. AUXILIARY EXPLANATION / NARRATIVE — demoted below relations */}
-              <ChipSection title="Auxiliary explanation / Actor-context narrative" values={narrativeValues(selectedFrame)} />
+              <ChipSection title="Auxiliary explanation / Actor-context narrative" values={narrativeValues(selectedFrame)} emphasize />
               <EventQueryHook frame={selectedFrame} />
 
               {/* 5. HASHES / IDS / RAW PAYLOAD — collapsed, IDs selectable but demoted */}
@@ -481,6 +482,27 @@ function laneLabel(id: string): string {
   return id.replace(/[_-]+/g, " ");
 }
 
+/**
+ * Renders a text string with governance status words highlighted as inline
+ * chips (positive/negative/neutral). Non-status text is emitted as plain text.
+ * Whole-word matching only — "surpassed" does not chip "passed".
+ */
+function StatusWordText({ text }: { text: string }) {
+  const segments = segmentTextWithStatusChips(text);
+  if (segments.length === 0) return null;
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.chipClass ? (
+          <span key={i} className={`status-word-chip status-word-chip--${seg.chipClass}`}>{seg.text}</span>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        )
+      )}
+    </>
+  );
+}
+
 function Metric({ label, value }: { label: string; value: string }) {
   return (
     <div className="task-playback-metric">
@@ -490,13 +512,13 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ChipSection({ title, values }: { title: string; values: string[] }) {
+function ChipSection({ title, values, emphasize = false }: { title: string; values: string[]; emphasize?: boolean }) {
   return (
     <div className="task-playback-chip-section">
       <strong>{title}</strong>
       <div>
         {values.slice(0, 10).map((value) => (
-          <span key={value}>{value}</span>
+          <span key={value}>{emphasize ? <StatusWordText text={value} /> : value}</span>
         ))}
         {values.length > 10 ? <em>+{values.length - 10}</em> : null}
       </div>
@@ -506,7 +528,19 @@ function ChipSection({ title, values }: { title: string; values: string[] }) {
 
 function StructuredFactSection({ title, facts }: { title: string; facts: TaskPlaybackFrame["specific_facts"] }) {
   if (facts.length === 0) return null;
-  return <ChipSection title={title} values={facts.map((fact) => `${fact.label}: ${fact.value}`)} />;
+  return (
+    <div className="task-playback-chip-section">
+      <strong>{title}</strong>
+      <div>
+        {facts.slice(0, 10).map((fact) => (
+          <span key={`${fact.label}:${fact.value}`}>
+            {fact.label}: <StatusWordText text={fact.value} />
+          </span>
+        ))}
+        {facts.length > 10 ? <em>+{facts.length - 10}</em> : null}
+      </div>
+    </div>
+  );
 }
 
 function EvidenceLinkSection({ links, onInspect }: { links: TaskPlaybackFrame["evidence_links"]; onInspect: (ref: EvidenceRef) => void }) {
