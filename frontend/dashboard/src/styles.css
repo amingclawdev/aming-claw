@@ -3335,25 +3335,34 @@ a:hover { text-decoration: underline; }
   display: grid;
   align-content: start;
   gap: 10px;
-  /* Right column: independently scrollable so it stays in view when the
-     left selector column is scrolled. */
-  overflow-y: auto;
+  /* Right column: independently bounded so controls stay above the list and
+     the list/detail pane scrolls inside the viewport. */
+  overflow: hidden;
   height: 100%;
+  min-height: 0;
 }
 
 .task-playback-event-column {
   min-width: 0; /* scroll behavior delivered via .task-playback-main; anchor for e2e contract */
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .task-playback-controls {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   justify-content: stretch;
-  min-height: 42px;
   padding: 8px 10px;
   border: 1px solid var(--ink-200);
   border-radius: 6px;
   background: #fff;
+  gap: 8px;
+}
+
+.task-playback-event-column .task-playback-controls {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  padding: 6px;
+  gap: 6px;
 }
 
 .task-playback-controls .action-btn,
@@ -3361,6 +3370,21 @@ a:hover { text-decoration: underline; }
 .task-playback-controls input {
   width: 100%;
   min-width: 0;
+  min-height: 30px;
+  margin: 0;
+}
+
+.task-playback-event-column .task-playback-controls .action-btn,
+.task-playback-event-column .task-playback-controls select,
+.task-playback-event-column .task-playback-controls input {
+  min-height: 28px;
+  padding-right: 6px;
+  padding-left: 6px;
+  overflow: hidden;
+  font-size: 10.5px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .task-playback-controls label {
@@ -3409,14 +3433,16 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-panel {
-  /* B3: panel must fill its layout grid cell so the body can take the
-     remaining height via grid-template-rows. */
-  display: grid;
-  grid-template-rows: auto 1fr;
+  /* Natural-height summary sections come before the bounded timeline/detail
+     body. Flex keeps checklist, metrics, and lane summaries from collapsing
+     into the old two-row grid. */
+  display: flex;
+  flex-direction: column;
   gap: 10px;
   padding: 12px;
   height: 100%;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .task-playback-panel.compact {
@@ -3509,13 +3535,16 @@ a:hover { text-decoration: underline; }
 
 .task-playback-lane-reason,
 .task-playback-lane-next {
-  display: block;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   max-width: 100%;
   margin-top: 4px;
   color: var(--ink-700);
   font-size: 10.5px;
   font-style: normal;
   line-height: 1.25;
+  overflow: hidden;
   overflow-wrap: anywhere;
 }
 
@@ -3540,13 +3569,14 @@ a:hover { text-decoration: underline; }
 
 .task-playback-body {
   /* B3: bounded height so each inner column can scroll independently on
-     desktop (> 980px).  The parent .task-playback-panel uses
-     grid-template-rows: auto 1fr so this row receives the remaining height. */
+     desktop (> 980px). The parent panel is a flex column, so this row receives
+     the remaining height after header/checklist/metrics/lane summaries. */
   display: grid;
   grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
   gap: 10px;
   align-items: stretch;
-  height: 100%;
+  flex: 1 0 260px;
+  min-height: 260px;
   overflow: hidden;
 }
 
@@ -3557,6 +3587,8 @@ a:hover { text-decoration: underline; }
   margin: 0;
   padding: 0;
   list-style: none;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .task-playback-frame-list button {
@@ -3899,7 +3931,8 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--ink-100);
   border-radius: 6px;
   background: #fff;
-  overflow-x: auto;
+  max-height: 260px;
+  overflow: auto;
 }
 
 .task-playback-gate-matrix-head {
@@ -8023,7 +8056,9 @@ svg.graph-svg path.ghit:hover {
   }
 
   .task-playback-body {
+    flex: initial;
     height: auto;
+    min-height: 0;
     overflow: visible;
   }
 
@@ -8036,6 +8071,15 @@ svg.graph-svg path.ghit:hover {
   .task-playback-main {
     height: auto;
     overflow-y: visible;
+  }
+
+  .task-playback-event-column {
+    grid-template-rows: auto minmax(180px, 46vh);
+    min-height: 300px;
+  }
+
+  .task-playback-event-column .task-playback-frame-list {
+    overflow-y: auto;
   }
 
   .task-playback-gate-matrix .gate-matrix {
@@ -8165,7 +8209,9 @@ svg.graph-svg path.ghit:hover {
   }
 
   .task-playback-body {
+    flex: initial;
     height: auto;
+    min-height: 0;
     overflow: visible;
   }
 
@@ -8178,6 +8224,15 @@ svg.graph-svg path.ghit:hover {
   .task-playback-main {
     height: auto;
     overflow-y: visible;
+  }
+
+  .task-playback-event-column {
+    grid-template-rows: auto minmax(180px, 42vh);
+    min-height: 300px;
+  }
+
+  .task-playback-event-column .task-playback-frame-list {
+    overflow-y: auto;
   }
 
   .task-playback-controls,
