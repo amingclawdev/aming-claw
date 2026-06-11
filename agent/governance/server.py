@@ -21098,6 +21098,50 @@ def handle_task_timeline_list(ctx: RequestContext):
     }
 
 
+@route("GET", "/api/task/{project_id}/timeline/recent")
+def handle_task_timeline_recent(ctx: RequestContext):
+    """Project-wide recent timeline events, newest-first, cross-row.
+
+    Returns the N most-recently appended events across ALL backlog rows for this
+    project so the dashboard Current tab can show a live project-wide stream.
+
+    Query params:
+      limit  – max events to return (default 100, max 500)
+
+    Each event includes its backlog_id and task_id so the frontend can show
+    a per-row tag and navigate to that row's playback.
+
+    Payload boundary: identical to handle_task_timeline_list — raw events as
+    stored (no additional redaction invented here).
+    """
+    project_id = ctx.get_project_id()
+    try:
+        limit = int(_first_query_value(ctx.query, "limit", "100") or "100")
+        limit = max(1, min(limit, 500))
+    except (TypeError, ValueError):
+        limit = 100
+    from . import task_timeline
+
+    with DBContext(project_id) as conn:
+        task_timeline.ensure_schema(conn)
+        rows = conn.execute(
+            """SELECT * FROM task_timeline_events
+               WHERE project_id = ?
+               ORDER BY id DESC
+               LIMIT ?""",
+            (project_id, limit),
+        ).fetchall()
+        events = [task_timeline._row_to_dict(row) for row in rows]
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "events": events,
+        "count": len(events),
+        "order": "newest_first",
+        "cross_row": True,
+    }
+
+
 @route("GET", "/api/task/{project_id}/{task_id}/timeline")
 def handle_task_timeline_get(ctx: RequestContext):
     """List append-only task implementation timeline events."""

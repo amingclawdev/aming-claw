@@ -14,7 +14,7 @@ import {
   type TaskPlaybackTrace,
 } from "../lib/taskPlayback";
 import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
-import type { BacklogBug, BacklogResponse, BacklogTimelineGateResponse, TaskTimelineResponse } from "../types";
+import type { BacklogBug, BacklogResponse, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
 
 interface Props {
   backlog: BacklogResponse;
@@ -30,6 +30,8 @@ const ACTIVITY_TAB_PARAM = "activity_tab";
 const PLAYBACK_TIMELINE_LIMIT = 250;
 const ACTIVITY_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_REFRESH_MS = 5000;
+/** Initial + max limit for the project-wide recent events stream in the Current tab. */
+const RECENT_EVENTS_LIMIT = 100;
 const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "MERGED", "SUPERSEDED"]);
@@ -82,6 +84,11 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>({});
   const [activityByBug, setActivityByBug] = useState<Record<string, ActivityLoadState>>({});
   const [currentTaskHint, setCurrentTaskHint] = useState<CurrentTaskHint | null>(null);
+  // Project-wide recent events for the Current tab event list (newest-first, cross-row).
+  // These are plain TaskTimelineEvents; each carries its own backlog_id/task_id.
+  const [recentEvents, setRecentEvents] = useState<TaskTimelineEvent[]>([]);
+  const [recentEventsLoaded, setRecentEventsLoaded] = useState(false);
+  const recentEventIdsRef = useRef<Set<number>>(new Set());
   // Frontend-local override: when multiple candidates compete and the user
   // clicks a competing-candidates selector entry, we rebind the activity view
   // to that bug_id locally (no server mutation).
@@ -127,6 +134,9 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedFrameId("");
     setSelectedActivityFrameId("");
     setPlaying(false);
+    setRecentEvents([]);
+    setRecentEventsLoaded(false);
+    recentEventIdsRef.current = new Set();
   }, [projectId]);
 
   useEffect(() => {
@@ -295,6 +305,46 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     });
   }, [projectId]);
 
+  /**
+   * Refresh the project-wide recent events list.
+   * Initial load fetches RECENT_EVENTS_LIMIT newest events from the /recent endpoint.
+   * On SSE-triggered refresh, we re-fetch and merge new events at the front
+   * (deduplicate by event id so the list stays append-only from the top).
+   */
+  const refreshRecentEvents = useCallback((signal: AbortSignal) => {
+    return api.recentTimelineFor(projectId, RECENT_EVENTS_LIMIT, signal)
+      .then((response) => {
+        if (signal.aborted || activeProjectIdRef.current !== projectId) return;
+        const incoming = response.events ?? [];
+        setRecentEvents((prev) => {
+          // Merge: keep existing items, prepend any new ones (by id) at the front.
+          // The /recent endpoint returns newest-first; we maintain that order.
+          const knownIds = recentEventIdsRef.current;
+          const newItems: TaskTimelineEvent[] = [];
+          for (const ev of incoming) {
+            const evId = typeof ev.id === "number" ? ev.id : 0;
+            if (!knownIds.has(evId)) {
+              knownIds.add(evId);
+              newItems.push(ev);
+            }
+          }
+          if (newItems.length === 0) return prev;
+          // Prepend new items (they are newest-first from endpoint) then existing.
+          // Then re-sort by id descending to ensure stable newest-first order.
+          const merged = [...newItems, ...prev];
+          merged.sort((a, b) => (typeof b.id === "number" ? b.id : 0) - (typeof a.id === "number" ? a.id : 0));
+          // Cap at RECENT_EVENTS_LIMIT * 2 to avoid unbounded growth.
+          return merged.slice(0, RECENT_EVENTS_LIMIT * 2);
+        });
+        setRecentEventsLoaded(true);
+      })
+      .catch(() => {
+        if (!signal.aborted && activeProjectIdRef.current === projectId) {
+          setRecentEventsLoaded(true); // mark loaded even on error so we don't spin
+        }
+      });
+  }, [projectId]);
+
   // SSE with freshness metadata. onStale triggers fallback-polling mode.
   const [sseStaleTrigger, setSseStaleTrigger] = useState(0);
   const { freshness, recordPoll } = useEventStreamWithFreshness(projectId, {
@@ -316,6 +366,13 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     refreshCurrentTaskHint(controller.signal);
     return () => controller.abort();
   }, [activityRefreshSeq, refreshCurrentTaskHint]);
+
+  // Load/refresh project-wide recent events whenever SSE fires or initial mount.
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshRecentEvents(controller.signal);
+    return () => controller.abort();
+  }, [activityRefreshSeq, sseStaleTrigger, refreshRecentEvents]);
 
   useEffect(() => {
     if (!activityBug) return undefined;
@@ -506,24 +563,13 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
 
       {mode === "activity" ? (
         <div className="task-playback-layout">
-          <aside className="task-playback-selector" aria-label="Current activity task selector">
+          {/* Left panel: project-wide recent events list (newest-first, cross-row, holds when idle) */}
+          <aside className="task-playback-selector" aria-label="Project-wide recent events stream">
             <div className="task-playback-selector-head">
-              <strong>Current/runtime stream</strong>
-              <span className="mono">{activityBug?.bug_id || "no task"}</span>
+              <strong>Project-wide recent events</strong>
+              <span className="mono">{recentEventsLoaded ? `${recentEvents.length} event${recentEvents.length === 1 ? "" : "s"}` : "loading…"}</span>
             </div>
             <SseFreshnessDetail freshness={freshness} />
-            {activityBug ? (
-              <button type="button" className="active" onClick={() => setActivityRefreshSeq((seq) => seq + 1)}>
-                <div>
-                  <strong>{activityBug.title || activityBug.bug_id}</strong>
-                  <span className="mono">{activityBug.bug_id}</span>
-                </div>
-                <span className={`status-badge ${statusClass(activityBug.status)}`}>{normalizeStatus(activityBug.status)}</span>
-                <em>{activityState?.loading ? "loading events" : `${activityTrace.frames.length} event${activityTrace.frames.length === 1 ? "" : "s"}`}</em>
-              </button>
-            ) : (
-              <div className="timeline-empty">No actively running observer task or command is recorded for this project.</div>
-            )}
             <ActivityStreamSummary hint={currentTaskHint} trace={activityTrace} />
             <CompetingCandidatesSelector
               hint={currentTaskHint}
@@ -537,25 +583,11 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               <button
                 type="button"
                 className="action-btn"
-                title="Force a fresh fetch of the selected backlog and latest timeline, independent of cache or SSE state"
+                title="Force a fresh fetch of project-wide recent events"
                 onClick={() => {
-                  // Manual refresh: clear loaded state to force a fresh API fetch,
-                  // then bump activityRefreshSeq which re-runs the refresh effect.
-                  if (activityBug) {
-                    const bugId = activityBug.bug_id;
-                    setActivityByBug((states) => ({
-                      ...states,
-                      [bugId]: {
-                        ...(states[bugId] ?? {
-                          loading: false,
-                          loaded: false,
-                          error: "",
-                          trace: emptyTaskPlaybackTrace(projectId, activityBug),
-                        }),
-                        loaded: false,
-                      },
-                    }));
-                  }
+                  recentEventIdsRef.current = new Set();
+                  setRecentEvents([]);
+                  setRecentEventsLoaded(false);
                   setActivityRefreshSeq((seq) => seq + 1);
                 }}
               >
@@ -565,8 +597,20 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 Open playback history
               </button>
             </div>
+            {/* Project-wide recent event list */}
+            <ProjectRecentEventList
+              events={recentEvents}
+              loaded={recentEventsLoaded}
+              activeBugId={activityBug?.bug_id || ""}
+              onSelectBug={(bugId) => {
+                // Navigate to that row's playback history detail
+                selectBug(bugId);
+                changeMode("history");
+              }}
+            />
           </aside>
 
+          {/* Right panel: detail/context for the currently bound active lane (unchanged) */}
           <div className="task-playback-main">
             <TaskPlaybackPanel
               trace={activityTrace}
@@ -892,6 +936,72 @@ function statusClass(status: string): string {
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return `${error.message} ${error.body}`.trim();
   return String(error);
+}
+
+// ---------------------------------------------------------------------------
+// Project-wide recent events list (AC-ACTIVITY-PROJECT-RECENT-EVENTS-STREAM-20260611)
+// ---------------------------------------------------------------------------
+
+/**
+ * Project-wide recent events list for the Current tab.
+ *
+ * Sources from GET /api/task/{project_id}/timeline/recent (newest-first, cross-row).
+ * Each entry shows the backlog-row tag. Clicking the tag navigates to that row's
+ * playback history via onSelectBug.
+ *
+ * The list holds when idle (no new events); it does NOT clear when a lane closes.
+ * Row binding is demoted to context focus: this list is always project-wide.
+ */
+function ProjectRecentEventList({
+  events,
+  loaded,
+  activeBugId,
+  onSelectBug,
+}: {
+  events: TaskTimelineEvent[];
+  loaded: boolean;
+  activeBugId: string;
+  onSelectBug: (bugId: string) => void;
+}) {
+  if (!loaded && events.length === 0) {
+    return <div className="timeline-empty"><span className="spinner" /> Loading project events…</div>;
+  }
+  if (loaded && events.length === 0) {
+    return <div className="timeline-empty">No timeline events recorded for this project yet.</div>;
+  }
+  return (
+    <ol className="task-playback-frame-list project-recent-event-list" aria-label="Project-wide recent events">
+      {events.map((ev) => {
+        const evId = typeof ev.id === "number" ? ev.id : String(ev.id ?? "");
+        const backlogId = ev.backlog_id || "";
+        const eventKind = ev.event_kind || ev.event_type || "event";
+        const status = ev.status || "unknown";
+        const at = ev.created_at ? new Date(ev.created_at).toLocaleString([], {
+          month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
+        }) : "";
+        const isActive = backlogId && backlogId === activeBugId;
+        return (
+          <li key={evId} className={`project-recent-event-item${isActive ? " project-recent-event-item--active" : ""}`}>
+            <span className={`task-playback-dot status-${statusClass(status)}`} />
+            <div className="project-recent-event-body">
+              <strong className="mono">{eventKind}</strong>
+              {backlogId ? (
+                <button
+                  type="button"
+                  className="project-recent-event-tag"
+                  title={`Open playback history for ${backlogId}`}
+                  onClick={() => onSelectBug(backlogId)}
+                >
+                  {backlogId}
+                </button>
+              ) : null}
+            </div>
+            <em className="project-recent-event-time">{at}</em>
+          </li>
+        );
+      })}
+    </ol>
+  );
 }
 
 // ---------------------------------------------------------------------------

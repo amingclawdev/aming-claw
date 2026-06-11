@@ -418,6 +418,13 @@ export const api = {
     const q = backlogTimelineQuery(backlogId, limit);
     return getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
   },
+  /** Project-wide recent timeline events, newest-first, cross-row.
+   *  Each event carries backlog_id and task_id for row-tag rendering.
+   */
+  recentTimelineFor(projectId: string, limit = 100, signal?: AbortSignal) {
+    const q = new URLSearchParams({ limit: String(limit) }).toString();
+    return getJSON<RecentTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline/recent?${q}`, signal);
+  },
   backlogTimelineGateFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineGateQuery(limit);
     return getJSON<BacklogTimelineGateResponse>(
@@ -1214,3 +1221,13 @@ export interface FeedbackSubmitResponse {
 }
 
 export type Api = typeof api;
+
+/** Response from GET /api/task/{project_id}/timeline/recent */
+export interface RecentTimelineResponse {
+  ok?: boolean;
+  project_id: string;
+  events: import("../types").TaskTimelineEvent[];
+  count: number;
+  order?: string;
+  cross_row?: boolean;
+}
