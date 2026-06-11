@@ -1035,40 +1035,207 @@ def _worker_graph_trace_gate(
     }
 
 
+def _independent_qa_reviewer_identity(event: dict[str, Any]) -> str:
+    """Derive the effective reviewer identity for independence checking.
+
+    For direct evidence (qa_reviewer, qa_verification, independent_verification),
+    the reviewer is the actor.  For observer-on-behalf transport events the
+    transport actor is "observer-on-behalf-of:<reviewer>" or the payload carries
+    a "reviewer" field; in both cases the *reviewer* identity is what matters for
+    the independence test, not the transport actor.
+
+    Returns the reviewer identity string (non-empty) or "" if none can be derived.
+    """
+    actor = _text(event.get("actor")).strip()
+    # Observer-on-behalf transport: "observer-on-behalf-of:<reviewer-id>"
+    on_behalf_prefix = "observer-on-behalf-of:"
+    if actor.lower().startswith(on_behalf_prefix):
+        reviewer = actor[len(on_behalf_prefix):].strip()
+        if reviewer:
+            return reviewer
+    # payload.reviewer or verification.reviewer set explicitly
+    for container_key in ("payload", "verification", "artifact_refs"):
+        container = _mapping(event.get(container_key))
+        reviewer = _text(container.get("reviewer")).strip()
+        if reviewer:
+            return reviewer
+    # Direct case: the actor IS the reviewer (non-observer, non-worker transport)
+    return actor
+
+
 def _independent_qa_gate(
     rows: list[dict[str, Any]],
     policy: Mapping[str, Any],
+    contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    required = _policy_requires(policy, "independent_qa")
+    """Gate that requires passing independent QA verification evidence.
+
+    Required when:
+    - The governance policy profile flags independent_qa=true (e.g. aming-claw
+      profile), OR
+    - The row's topology policy declares independent_verification_required=true
+      or includes an independent_verification/qa lane in required_lanes.
+
+    Independence-by-identity rule (AC BUG-ROUTE-CONTEXT-CLOSE-GATE-QA-20260531):
+    - Evidence whose *reviewer identity* is the same as any known worker_slot_id
+      in the timeline does NOT count (live incidents #3750/#3811: workers
+      self-appended IV lane events).
+    - Plain observer verification events (actor="observer" or similar) without an
+      independent reviewer identity (no on-behalf suffix, no payload.reviewer, no
+      qa_verdict_refs pointing at real qa_review events) do NOT count.
+    - Observer-on-behalf transport DOES count when the reviewer identity
+      (derived from the actor suffix or payload.reviewer) is independent of the
+      known workers.  This is the established daily pattern for observer-recorded
+      verdicts and must not be broken.
+    - Direct qa_review / qa_verification / independent_verification events with a
+      non-worker, non-plain-observer actor count normally.
+    """
+    # Determine required from both governance policy and topology policy.
+    policy_required = _policy_requires(policy, "independent_qa")
+    topology_required = False
+    if contract is not None:
+        topology_policy = _route_topology_policy(contract)
+        topology_required = _route_independent_verification_required(topology_policy)
+    required = policy_required or topology_required
+
+    # Collect worker identities from startup events in this timeline so we can
+    # apply the independence-by-identity test.
+    worker_slot_ids: set[str] = set()
+    for raw in rows:
+        ev = _mapping(raw)
+        startup_marker = _route_marker(ev.get("event_kind") or ev.get("event_type") or "")
+        if startup_marker in {
+            "mf_subagent_startup",
+            "mf_subagent_startup_gate",
+            "mf_subagent_startup_adoption",
+            "mf_subagent_startup_adoption_gate",
+        }:
+            for key in ("actor", "worker_slot_id", "worker_id", "agent_id", "allocation_owner"):
+                wid = _text(ev.get(key)).strip()
+                if wid:
+                    worker_slot_ids.add(wid)
+            # Also look inside the payload for startup gate fields.
+            for container_key in ("payload", "verification", "artifact_refs"):
+                container = _mapping(ev.get(container_key))
+                for key in ("worker_slot_id", "worker_id", "agent_id", "allocation_owner"):
+                    wid = _text(container.get(key)).strip()
+                    if wid:
+                        worker_slot_ids.add(wid)
+                startup_gate = _mapping(container.get("mf_subagent_startup_gate"))
+                for key in ("worker_slot_id", "worker_id", "agent_id", "allocation_owner"):
+                    wid = _text(startup_gate.get(key)).strip()
+                    if wid:
+                        worker_slot_ids.add(wid)
+
+    # Plain-observer identity tokens that, without an independent reviewer, do
+    # not constitute independent verification.
+    _PLAIN_OBSERVER_TOKENS = {"observer", "mf_observer", "route_observer"}
+
     evidence_events: list[dict[str, Any]] = []
-    for event in rows:
-        event = _mapping(event)
+    rejected_events: list[dict[str, Any]] = []
+
+    for raw_event in rows:
+        event = _mapping(raw_event)
         status = _text(event.get("status") or event.get("decision")).lower()
-        marker = " ".join([
-            _text(event.get("event_kind")),
-            _text(event.get("event_type")),
-            _text(event.get("phase")),
-            _text(event.get("actor")),
-        ]).lower()
+        kind_lower = _text(event.get("event_kind")).lower()
+        type_lower = _text(event.get("event_type")).lower()
+        phase_lower = _text(event.get("phase")).lower()
+        actor_lower = _text(event.get("actor")).lower()
+
         if status not in MF_CLOSE_PASS_STATUSES:
             continue
-        if "qa" not in marker and "independent_verification" not in marker:
+
+        # Only consider QA/independent-verification event kinds.
+        marker_tokens = {kind_lower, type_lower, phase_lower, actor_lower}
+        if not any(
+            tok
+            for tok in marker_tokens
+            if "qa" in tok or "independent_verification" in tok
+        ):
             continue
+
+        # Derive the effective reviewer identity.
+        reviewer_identity = _independent_qa_reviewer_identity(event)
+        reviewer_lower = reviewer_identity.lower()
+
+        # REJECT: reviewer is a known worker (self-appended IV — incidents #3750/#3811).
+        if reviewer_identity and reviewer_identity in worker_slot_ids:
+            rejected_events.append({
+                "id": event.get("id"),
+                "event_kind": event.get("event_kind"),
+                "actor": event.get("actor"),
+                "status": event.get("status"),
+                "reason": "reviewer_is_known_worker",
+                "reviewer_identity": reviewer_identity,
+            })
+            continue
+
+        # REJECT: plain observer token without an independent reviewer identity.
+        # This catches raw "observer" verification events that are NOT on-behalf
+        # transports (no on-behalf suffix, no payload.reviewer, no verdict refs).
+        if reviewer_lower in _PLAIN_OBSERVER_TOKENS:
+            # Check for qa_verdict_refs pointing at real qa_review events — that
+            # elevates a plain-observer transport to a legitimate verdict relay.
+            has_verdict_refs = False
+            for container_key in ("payload", "verification", "artifact_refs"):
+                container = _mapping(event.get(container_key))
+                refs = container.get("qa_verdict_refs") or container.get("verdict_refs")
+                if refs:
+                    has_verdict_refs = True
+                    break
+            if not has_verdict_refs:
+                rejected_events.append({
+                    "id": event.get("id"),
+                    "event_kind": event.get("event_kind"),
+                    "actor": event.get("actor"),
+                    "status": event.get("status"),
+                    "reason": "plain_observer_no_independent_reviewer",
+                })
+                continue
+
         evidence_events.append({
             "id": event.get("id"),
             "event_kind": event.get("event_kind"),
             "phase": event.get("phase"),
             "actor": event.get("actor"),
+            "reviewer_identity": reviewer_identity,
             "status": event.get("status"),
         })
+
     passed = bool(evidence_events) or not required
+    missing_ids = [] if passed else ["independent_qa"]
+    reason = (
+        ""
+        if passed
+        else (
+            "independent_qa_required_but_all_evidence_rejected_or_missing"
+            if rejected_events
+            else "independent_qa_required_but_no_evidence_found"
+        )
+    )
     return {
         "schema_version": "independent_qa_gate.v1",
         "required": required,
+        "topology_required": topology_required,
+        "policy_required": policy_required,
         "passed": passed,
         "status": "passed" if passed else "failed",
-        "missing_requirement_ids": [] if passed else ["independent_qa"],
+        "missing_requirement_ids": missing_ids,
+        "reason": reason,
+        "next_action": (
+            ""
+            if passed
+            else (
+                "Record a passing qa_review/qa_verification/independent_verification event "
+                "from an independent reviewer (not the implementation worker). "
+                "Observer-on-behalf transport is accepted when actor contains "
+                "'observer-on-behalf-of:<reviewer-id>' or payload.reviewer is set "
+                "to an independent reviewer identity."
+            )
+        ),
         "evidence_events": evidence_events,
+        "rejected_evidence_events": rejected_events,
+        "known_worker_slot_ids": sorted(worker_slot_ids),
     }
 
 
@@ -4780,7 +4947,7 @@ def mf_close_gate_verification(
     route_context_gate = mf_route_context_gate_verification(rows, contract)
     lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
     worker_graph_trace_gate = _worker_graph_trace_gate(rows, governance_policy)
-    independent_qa_gate = _independent_qa_gate(rows, governance_policy)
+    independent_qa_gate = _independent_qa_gate(rows, governance_policy, contract=contract)
     contract_projection = mf_contract_projection(
         rows,
         contract,
@@ -4829,7 +4996,12 @@ def mf_close_gate_verification(
         groups["independent_qa"] = {
             "label": "independent QA",
             "missing": independent_qa_gate.get("missing_requirement_ids", []),
-            "next_action": "record a passing independent QA verification timeline event",
+            "reason": independent_qa_gate.get("reason", ""),
+            "rejected_evidence_events": independent_qa_gate.get("rejected_evidence_events", []),
+            "next_action": independent_qa_gate.get(
+                "next_action",
+                "record a passing independent QA verification timeline event",
+            ),
         }
     if not blocker_resolution_gate.get("passed"):
         groups["judge_blocker_resolution"] = {
