@@ -12918,6 +12918,7 @@ def _record_close_timeline(
     task_id: str,
     suffix: str,
     same_owner_startup: bool,
+    startup_overrides: dict | None = None,
 ) -> dict:
     route_identity = _close_timeline_route_identity(suffix)
     fence_token = f"fence-close-{suffix}"
@@ -12978,6 +12979,16 @@ def _record_close_timeline(
         status="passed",
         payload={**common_payload, "read_receipt_hash": f"sha256:rr-{task_id}"},
     )
+    startup_gate = _close_timeline_startup_gate(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        route_identity=route_identity,
+        same_owner=same_owner_startup,
+    )
+    if startup_overrides:
+        startup_gate.update(startup_overrides)
     startup = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -12987,16 +12998,7 @@ def _record_close_timeline(
         event_kind="mf_subagent_startup",
         phase="startup_gate",
         status="passed",
-        payload={
-            "mf_subagent_startup_gate": _close_timeline_startup_gate(
-                task_id=task_id,
-                fence_token=fence_token,
-                worktree_path=worktree_path,
-                branch_ref=branch_ref,
-                route_identity=route_identity,
-                same_owner=same_owner_startup,
-            )
-        },
+        payload={"mf_subagent_startup_gate": startup_gate},
     )
     task_timeline.record_event(
         conn,
@@ -13129,7 +13131,7 @@ def test_timeline_gate_blocks_event_4178_surrogate_startup_without_real_join(con
     assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is False
 
 
-def test_timeline_gate_allows_same_as_allocation_owner_startup(conn):
+def test_worker_transcript_timeline_gate_allows_same_owner_passed_attestation(conn):
     backlog_id = "AC-CLOSE-TIMELINE-SAME-OWNER-STARTUP"
     task_id = "close-same-owner-task"
     _insert_close_timeline_backlog(conn, backlog_id=backlog_id, suffix="same-owner")
@@ -13149,6 +13151,56 @@ def test_timeline_gate_allows_same_as_allocation_owner_startup(conn):
     gate = result["timeline_gate"]
     assert gate.get("close_timeline_startup_gate", {}).get("demoted_startup_events", []) == []
     assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is True
+
+
+def test_worker_transcript_timeline_gate_blocks_same_owner_failed_attestation(conn):
+    backlog_id = "AC-CLOSE-TIMELINE-WORKER-TRANSCRIPT-BLOCKED"
+    task_id = "close-worker-transcript-blocked-task"
+    _insert_close_timeline_backlog(
+        conn,
+        backlog_id=backlog_id,
+        suffix="worker-transcript-blocked",
+    )
+    recorded = _record_close_timeline(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        suffix="worker-transcript-blocked",
+        same_owner_startup=True,
+        startup_overrides={
+            "close_satisfying": False,
+            "worker_self_attesting": False,
+            "self_attesting": False,
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "status": "blocked",
+                "worker_self_attesting": False,
+                "worker_session_id": f"session-{task_id}",
+                "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+                "harness_type": "codex",
+                "blockers": ["worker_transcript_attestation_failed"],
+            },
+        },
+    )
+
+    result = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    assert result["can_close"] is False
+    gate = result["timeline_gate"]
+    startup_gate = gate["close_timeline_startup_gate"]
+    assert startup_gate["demoted_startup_events"][0]["id"] == str(
+        recorded["startup_event"]["id"]
+    )
+    assert startup_gate["demoted_startup_events"][0]["reason"] == (
+        "worker_self_attestation_not_close_satisfying"
+    )
+    assert startup_gate["demoted_startup_events"][0][
+        "worker_self_attestation_blockers"
+    ] == ["worker_self_attestation_not_passed"]
+    assert "mf_subagent_startup" in gate["route_context_gate"]["missing_requirement_ids"]
+    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is False
 
 
 def test_finish_gate_server_ignores_caller_supplied_real_startup_events(conn):

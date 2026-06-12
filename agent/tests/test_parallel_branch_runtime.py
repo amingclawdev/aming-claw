@@ -446,7 +446,9 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         )
 
 
-def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) -> None:
+def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token_hash(
+    tmp_path,
+) -> None:
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup"
     worktree.mkdir(parents=True)
@@ -537,7 +539,9 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
     assert accepted.task_id == "mf-sub-startup"
 
 
-def test_mf_sub_startup_marks_missing_transcript_not_self_attesting(tmp_path) -> None:
+def test_worker_transcript_mf_sub_startup_marks_missing_transcript_not_self_attesting(
+    tmp_path,
+) -> None:
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-missing-transcript"
     worktree.mkdir(parents=True)
@@ -603,7 +607,7 @@ def test_mf_sub_startup_marks_missing_transcript_not_self_attesting(tmp_path) ->
     )
 
 
-def test_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_attesting(
+def test_worker_transcript_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_attesting(
     tmp_path,
 ) -> None:
     conn = _runtime_conn()

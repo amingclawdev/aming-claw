@@ -3321,12 +3321,13 @@ def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any
 
 
 def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
-    """Evaluate close-timeline startup events for surrogate-only evidence.
+    """Evaluate close-timeline startup events for close-satisfying evidence.
 
     The shared timeline verifier works from event categories.  This gate is the
-    close-path adapter that removes explicitly surrogate startup events from
-    consideration unless they are joined by a real same_as_allocation_owner
-    startup for the same lane lineage.
+    close-path adapter that removes startup events that are not actual,
+    self-attesting worker evidence.  Surrogate startup events only count when
+    joined by a real same_as_allocation_owner startup for the same lane lineage;
+    same-owner startups still need passed worker transcript attestation.
     """
 
     if isinstance(events, Mapping):
@@ -3347,11 +3348,18 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
     accepted: list[dict[str, Any]] = []
     for index, event in enumerate(rows):
         gate = _timeline_startup_gate_from_event(event)
-        if not gate or not _startup_is_host_adapter_surrogate(gate):
+        if not gate:
             continue
         surrogate_gate = surrogate_startup_evidence_gate(
             gate,
             real_startup_events=passing_rows,
+        )
+        close_satisfying_startup = _close_satisfying_startup_evidence(
+            gate,
+            surrogate_join_gate=surrogate_gate,
+        )
+        worker_self_attestation_gate = _worker_self_attestation_close_gate(
+            close_satisfying_startup
         )
         event_ref = {
             "index": index,
@@ -3361,10 +3369,16 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
             "status": _string(event.get("status") or event.get("decision")),
             "reason": surrogate_gate.get("reason", ""),
             "real_worker_join": surrogate_gate.get("real_worker_join", {}),
+            "worker_self_attestation_gate": worker_self_attestation_gate,
         }
-        if surrogate_gate.get("close_satisfying"):
+        if surrogate_gate.get("close_satisfying") and worker_self_attestation_gate.get("passed"):
             accepted.append(event_ref)
         else:
+            if not worker_self_attestation_gate.get("passed"):
+                event_ref["reason"] = "worker_self_attestation_not_close_satisfying"
+                event_ref["worker_self_attestation_blockers"] = (
+                    worker_self_attestation_gate.get("blockers") or []
+                )
             demoted.append(event_ref)
     return {
         "schema_version": CLOSE_TIMELINE_STARTUP_GATE_SCHEMA_VERSION,
