@@ -3417,6 +3417,10 @@ function playbackLayoutFrameAreaAssertions(): string[] {
     "PlaybackGateMatrix should receive persistent expanded state and a toggle",
   );
   assertFixture(
+    /task-playback-panel[\s\S]*closeGateMatrixExpanded\s*\?\s*" close-gate-expanded"/.test(componentSource),
+    "task playback panel should expose a close-gate-expanded layout state",
+  );
+  assertFixture(
     /function summarizeGateMatrix\([\s\S]*row\.required && row\.status !== "not_applicable"[\s\S]*Close gate - \$\{verdict\} - \$\{satisfied\}\/\$\{total\} evidence/.test(componentSource),
     "close gate summary should include verdict plus required satisfied/total evidence count",
   );
@@ -3458,12 +3462,18 @@ function playbackLayoutFrameAreaAssertions(): string[] {
     "frame detail should own an independent vertical scroll area",
   );
   assertFixture(
+    /\.task-playback-panel\.close-gate-expanded\s*\{[\s\S]*overflow-y:\s*auto;[\s\S]*\}/.test(stylesSource)
+      && /\.task-playback-panel\.close-gate-expanded\s+\.task-playback-body\s*\{[\s\S]*flex-basis:\s*320px;[\s\S]*min-height:\s*260px;/.test(stylesSource),
+    "expanded close gate layout should preserve a reachable frame body area",
+  );
+  assertFixture(
     !/max-height:\s*260px/.test(gateMatrixRule),
     "close gate matrix should not keep the old expanded-by-default 260px height reservation",
   );
   assertFixture(
-    /\.task-playback-gate-matrix-body\s*\{[\s\S]*max-height:\s*min\(42vh,\s*360px\);[\s\S]*overflow:\s*auto;/.test(stylesSource),
-    "expanded close gate details should scroll inside their own body",
+    /\.task-playback-gate-matrix-body\s*\{[\s\S]*min-height:\s*0;[\s\S]*display:\s*block;[\s\S]*max-height:\s*clamp\(120px,\s*18vh,\s*220px\);[\s\S]*overflow-y:\s*auto;[\s\S]*scrollbar-gutter:\s*stable;/.test(stylesSource)
+      && /\.task-playback-gate-matrix-body\s*>\s*\.gate-matrix\s*\{[\s\S]*min-height:\s*max-content;/.test(stylesSource),
+    "expanded close gate details should own body scrolling instead of clipping the gate table",
   );
 
   return [

@@ -3449,6 +3449,15 @@ a:hover { text-decoration: underline; }
   background: #f8fafc;
 }
 
+.task-playback-panel.close-gate-expanded {
+  overflow-y: auto;
+}
+
+.task-playback-panel.close-gate-expanded .task-playback-body {
+  flex-basis: 320px;
+  min-height: 260px;
+}
+
 .task-playback-eyebrow {
   display: block;
   color: var(--ink-500);
@@ -3990,15 +3999,22 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-gate-matrix-body {
-  display: grid;
-  gap: 8px;
-  max-height: min(42vh, 360px);
+  min-height: 0;
+  display: block;
+  max-height: clamp(120px, 18vh, 220px);
   padding: 8px;
   border: 1px solid var(--ink-100);
   border-top: 0;
   border-radius: 0 0 6px 6px;
   background: #fff;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.task-playback-gate-matrix-body > .gate-matrix {
+  min-height: max-content;
 }
 
 .backlog-implementation-steps {

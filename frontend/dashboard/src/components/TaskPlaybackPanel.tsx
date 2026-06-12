@@ -209,7 +209,10 @@ export default function TaskPlaybackPanel({
   }, [selectedEvidenceRef]);
 
   return (
-    <section className={`task-playback-panel${compact ? " compact" : ""}`} aria-label="Task playback trace">
+    <section
+      className={`task-playback-panel${compact ? " compact" : ""}${closeGateMatrixExpanded ? " close-gate-expanded" : ""}`}
+      aria-label="Task playback trace"
+    >
       <div className="task-playback-panel-head">
         <div>
           <span className="task-playback-eyebrow">Aming Claw / content-sys playback</span>
