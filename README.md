@@ -119,7 +119,10 @@ Steps 1–2 only copy the skill files; pip install adds the Python runtime,
 launches the dashboard. After reloading, phrases like "install and start
 aming-claw" or "one-shot install" trigger the launcher skill's one-shot
 mode for re-bootstrap in future sessions. First-run troubleshooting and
-raw installer scripts are in [Install Details](#install-details).
+raw installer scripts are in [Install Details](#install-details). The compact
+onboarding state machine is `/aming-claw:aming-claw-launcher`; the full
+first-run schema and route-gate notes are in
+[`docs/onboarding.md`](docs/onboarding.md).
 
 ### After installation: restart or open a new host session
 
@@ -1075,7 +1078,7 @@ https://github.com/amingclawdev/aming-claw/issues
 - [Architecture](docs/architecture.md)
 - [Deployment](docs/deployment.md)
 - [Governance Overview](docs/governance/README.md)
-- [Onboarding Guide](docs/onboarding.md)
+- [Onboarding Guide and first-run schema](docs/onboarding.md)
 - [Configuration Reference](docs/config/README.md)
 - [API Overview](docs/api/README.md)
 - [Plugin Packaging Notes](skills/aming-claw/references/plugin-packaging.md)
