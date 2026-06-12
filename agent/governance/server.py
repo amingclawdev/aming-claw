@@ -6639,7 +6639,14 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                     event_kind=str(event.get("event_kind") or "mf_subagent_startup"),
                     correlation_id=str(event.get("correlation_id") or ""),
                     schema_version=int(event.get("schema_version") or 2),
-                    actor=str(event.get("actor") or "mf_sub"),
+                    actor=str(
+                        event.get("actor")
+                        or ctx.body.get("filer_principal")
+                        or ctx.body.get("worker_session_id")
+                        or ctx.body.get("agent_id")
+                        or ctx.body.get("worker_id")
+                        or "mf_sub"
+                    ),
                     status=str(event.get("status") or "passed"),
                     payload=event.get("payload")
                     if isinstance(event.get("payload"), dict)

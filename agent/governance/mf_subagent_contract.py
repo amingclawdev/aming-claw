@@ -3160,6 +3160,7 @@ def _startup_real_worker_join(
             "joined": True,
             "join_event_id": join_event_id,
             "reason": "real_worker_startup_lineage_match",
+            "matched_startup_gate": dict(gate),
             "matched_lineage_fields": [
                 f for f in _SURROGATE_JOIN_LINEAGE_FIELDS
                 if lineage.get(f)
@@ -3482,6 +3483,92 @@ def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         if gate:
             return gate
     return {}
+
+
+def _close_satisfying_startup_evidence(
+    startup_evidence: Mapping[str, Any],
+    *,
+    surrogate_join_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the real startup gate that close evidence actually depends on."""
+
+    evidence = dict(startup_evidence) if isinstance(startup_evidence, Mapping) else {}
+    if not _startup_is_host_adapter_surrogate(evidence):
+        return evidence
+    real_worker_join = _nested_mapping(surrogate_join_gate, "real_worker_join")
+    if not _bool(real_worker_join.get("joined")):
+        return evidence
+    matched_gate = real_worker_join.get("matched_startup_gate")
+    if isinstance(matched_gate, Mapping):
+        return dict(matched_gate)
+    return evidence
+
+
+def _worker_self_attestation_close_gate(
+    startup_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    attestation = _nested_mapping(startup_evidence, "worker_self_attestation")
+    worker_session_id = _string(
+        startup_evidence.get("worker_session_id")
+        or attestation.get("worker_session_id")
+    )
+    worker_transcript_path = _string(
+        startup_evidence.get("worker_transcript_path")
+        or attestation.get("worker_transcript_path")
+    )
+    harness_type = _string(
+        startup_evidence.get("harness_type") or attestation.get("harness_type")
+    )
+    blockers: list[str] = []
+    if _startup_is_host_adapter_surrogate(startup_evidence):
+        blockers.append("startup_is_host_adapter_surrogate")
+    filer_principal = _string(
+        startup_evidence.get("filer_principal") or startup_evidence.get("actor")
+    )
+    if filer_principal in {"mf_sub", "observer"}:
+        blockers.append("startup_filer_is_generic_or_observer")
+    if _string(startup_evidence.get("filed_on_behalf_by")) or _bool(
+        startup_evidence.get("filed_on_behalf")
+    ):
+        blockers.append("startup_filed_on_behalf")
+    known_bad = (
+        _bool(startup_evidence.get("known_bad_playback_4178"))
+        or _bool(attestation.get("known_bad_playback_4178"))
+        or "4178" in _string(startup_evidence.get("agent_id")).lower()
+        or "4178" in _string(startup_evidence.get("startup_source")).lower()
+    )
+    if known_bad:
+        blockers.append("known_bad_playback_4178_shape")
+    if not attestation:
+        blockers.append("missing_worker_self_attestation")
+    else:
+        status = _string(attestation.get("status")).lower()
+        self_attesting = _bool(
+            attestation.get("worker_self_attesting")
+            or attestation.get("self_attesting")
+            or startup_evidence.get("worker_self_attesting")
+            or startup_evidence.get("self_attesting")
+        )
+        if status not in _PASS_STATUSES or not self_attesting:
+            blockers.append("worker_self_attestation_not_passed")
+    if not worker_session_id:
+        blockers.append("missing_worker_session_id")
+    if not worker_transcript_path:
+        blockers.append("missing_worker_transcript_path")
+    if harness_type not in {"claude", "codex"}:
+        blockers.append("missing_or_unsupported_harness_type")
+    passed = not blockers
+    return {
+        "schema_version": "mf_subagent_worker_self_attestation_close_gate.v1",
+        "status": "passed" if passed else "blocked",
+        "passed": passed,
+        "worker_self_attesting": passed,
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": worker_transcript_path,
+        "harness_type": harness_type,
+        "blockers": blockers,
+        "attestation": dict(attestation),
+    }
 
 
 def _bounded_worker_evidence_matches(
@@ -5458,6 +5545,13 @@ def validate_mf_subagent_finish_gate(
         events=real_startup_events,
         real_startup_events=real_startup_events,
     )
+    close_satisfying_startup_evidence = _close_satisfying_startup_evidence(
+        startup_evidence,
+        surrogate_join_gate=surrogate_join_gate,
+    )
+    worker_self_attestation_gate = _worker_self_attestation_close_gate(
+        close_satisfying_startup_evidence
+    )
     observer_command_id = _dispatch_string(
         payload,
         names=("observer_command_id",),
@@ -5467,7 +5561,10 @@ def validate_mf_subagent_finish_gate(
             ("startup_evidence", ("observer_command_id",)),
             ("mf_subagent_startup_gate", ("observer_command_id",)),
         ),
-    ) or _string(startup_evidence.get("observer_command_id"))
+    ) or _string(
+        close_satisfying_startup_evidence.get("observer_command_id")
+        or startup_evidence.get("observer_command_id")
+    )
     read_receipt_event_id = _dispatch_string(
         payload,
         names=("read_receipt_event_id", "read_receipt_timeline_id"),
@@ -5478,7 +5575,10 @@ def validate_mf_subagent_finish_gate(
             ("startup_evidence", ("read_receipt_event_id",)),
             ("mf_subagent_startup_gate", ("read_receipt_event_id",)),
         ),
-    ) or _string(startup_evidence.get("read_receipt_event_id"))
+    ) or _string(
+        close_satisfying_startup_evidence.get("read_receipt_event_id")
+        or startup_evidence.get("read_receipt_event_id")
+    )
     if not startup_present:
         # Produce a structured reason for the refusal to aid debugging.
         is_surrogate = _startup_is_host_adapter_surrogate(startup_evidence)
@@ -5492,6 +5592,12 @@ def validate_mf_subagent_finish_gate(
         raise MfSubagentContractError(
             "MF subagent finish gate requires actual mf_subagent_startup evidence "
             "before close-ready"
+        )
+    if not worker_self_attestation_gate["passed"]:
+        blockers = ", ".join(worker_self_attestation_gate.get("blockers") or [])
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires worker_self_attestation before "
+            f"close-ready ({blockers})"
         )
     if not observer_command_id:
         raise MfSubagentContractError(
@@ -5538,6 +5644,8 @@ def validate_mf_subagent_finish_gate(
         "governed_evidence_required": governed_evidence_required,
         "startup_evidence": startup_evidence,
         "surrogate_join_gate": surrogate_join_gate,
+        "worker_self_attestation_gate": worker_self_attestation_gate,
+        "worker_self_attestation": worker_self_attestation_gate.get("attestation", {}),
         "read_receipt_hash": read_receipt_hash,
         "read_receipt_event_id": read_receipt_event_id,
         "gate_receipt_hash": gate_receipt_hash,

@@ -30,7 +30,10 @@ from agent.governance import task_timeline
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
-from agent.governance.mf_subagent_contract import MfSubagentContractError
+from agent.governance.mf_subagent_contract import (
+    MfSubagentContractError,
+    validate_mf_subagent_finish_gate,
+)
 from agent.observer_runtime import (
     ObserverRuntimeTextPrepareRequest,
     build_observer_runtime_text_context,
@@ -251,6 +254,20 @@ def _finish_gate_evidence(
             "route_token_ref": f"rtok-{fence_token}",
             "observer_command_id": f"cmd-{fence_token}",
             "read_receipt_event_id": f"rr-{fence_token}",
+            "worker_session_id": f"session-{fence_token}",
+            "worker_transcript_path": f"/tmp/transcript-{fence_token}.jsonl",
+            "harness_type": "codex",
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "status": "passed",
+                "worker_self_attesting": True,
+                "worker_session_id": f"session-{fence_token}",
+                "worker_transcript_path": f"/tmp/transcript-{fence_token}.jsonl",
+                "harness_type": "codex",
+                "blockers": [],
+            },
         },
         "read_receipt_hash": f"sha256:read-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
@@ -2550,7 +2567,40 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
         event_kind="mf_subagent_startup",
         phase="startup_gate",
         status="passed",
-        payload={"runtime_context_id": context.runtime_context_id},
+        payload={
+            "mf_subagent_startup_gate": {
+                "schema_version": "mf_subagent_startup_gate.v1",
+                "gate_kind": "mf_subagent.startup",
+                "status": "passed",
+                "bounded": True,
+                "close_satisfying": True,
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": "runtime-a4-task",
+                "worker_slot_id": "worker-runtime-a4",
+                "fence_token": "fence-a4",
+                "observer_command_id": "cmd-runtime-a4",
+                "agent_id": "agent-runtime-a4",
+                "allocation_owner": "agent-runtime-a4",
+                "agent_id_match_mode": "same_as_allocation_owner",
+                "session_token_evidence_type": "hash",
+                "session_token_hash": "sha256:runtime-a4-session",
+                "session_token_present": True,
+                "worker_session_id": "codex-session-runtime-a4",
+                "worker_transcript_path": "/tmp/runtime-a4-transcript.jsonl",
+                "harness_type": "codex",
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "worker_self_attestation": {
+                    "schema_version": "worker_transcript_self_attestation.v1",
+                    "status": "passed",
+                    "worker_self_attesting": True,
+                    "worker_session_id": "codex-session-runtime-a4",
+                    "worker_transcript_path": "/tmp/runtime-a4-transcript.jsonl",
+                    "harness_type": "codex",
+                    "blockers": [],
+                },
+            }
+        },
     )
     task_timeline.record_event(
         conn,
@@ -2650,7 +2700,7 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
         "gqt-close-ready",
         "gqt-from-db",
     ]
-    assert close_gate["ready"] is True
+    assert close_gate["ready"] is True, close_gate
     assert close_gate["graph_trace_ids"] == current["graph_trace_refs"]["trace_ids"]
     assert close_gate["evidence_refs"]["route_identity"]["route_id"] == "route-a4"
     assert close_gate["evidence_refs"]["close_evidence"]["payload"]["event_id"] == (
@@ -12707,6 +12757,20 @@ def _make_real_startup_timeline_event(
         "head_commit": f"head-{task_id}",
         "observer_command_id": f"cmd-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
+        "worker_session_id": f"session-{task_id}",
+        "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+        "harness_type": "codex",
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "status": "passed",
+            "worker_self_attesting": True,
+            "worker_session_id": f"session-{task_id}",
+            "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+            "harness_type": "codex",
+            "blockers": [],
+        },
     }
 
 
@@ -12792,6 +12856,9 @@ def _close_timeline_startup_gate(
         "observer_command_id": f"cmd-{task_id}",
         "read_receipt_event_id": f"rr-{task_id}",
         "close_satisfying": True,
+        "worker_session_id": f"session-{task_id}",
+        "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+        "harness_type": "codex",
     }
     if same_owner:
         startup.update(
@@ -12803,6 +12870,17 @@ def _close_timeline_startup_gate(
                 "session_token_hash": f"sha256:real-{task_id}",
                 "session_token_present": True,
                 "host_adapter_startup_token_accepted": False,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "worker_self_attestation": {
+                    "schema_version": "worker_transcript_self_attestation.v1",
+                    "status": "passed",
+                    "worker_self_attesting": True,
+                    "worker_session_id": f"session-{task_id}",
+                    "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+                    "harness_type": "codex",
+                    "blockers": [],
+                },
             }
         )
     else:
@@ -12815,6 +12893,19 @@ def _close_timeline_startup_gate(
                 "session_token_hash": f"sha256:host-{task_id}",
                 "session_token_present": True,
                 "host_adapter_startup_token_accepted": True,
+                "known_bad_playback_4178": True,
+                "worker_self_attesting": False,
+                "self_attesting": False,
+                "worker_self_attestation": {
+                    "schema_version": "worker_transcript_self_attestation.v1",
+                    "status": "blocked",
+                    "worker_self_attesting": False,
+                    "worker_session_id": f"session-{task_id}",
+                    "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+                    "harness_type": "codex",
+                    "known_bad_playback_4178": True,
+                    "blockers": ["known_bad_playback_4178_shape"],
+                },
             }
         )
     return startup
@@ -12943,6 +13034,73 @@ def _record_close_timeline(
     )
     conn.commit()
     return {"startup_event": startup, "route_identity": route_identity}
+
+
+def test_finish_gate_flags_known_bad_4178_startup_non_self_attesting():
+    task_id = "finish-event-4178-task"
+    suffix = "finish-event-4178"
+    fence_token = f"fence-close-{suffix}"
+    worktree_path = f"/tmp/close-{suffix}"
+    branch_ref = f"refs/heads/close/{suffix}"
+    startup = _close_timeline_startup_gate(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        route_identity=_close_timeline_route_identity(suffix),
+        same_owner=True,
+    )
+    startup.update(
+        {
+            "agent_id": "codex-cli-thread:event-4178",
+            "known_bad_playback_4178": True,
+            "worker_self_attesting": False,
+            "self_attesting": False,
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "status": "blocked",
+                "worker_self_attesting": False,
+                "worker_session_id": f"session-{task_id}",
+                "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+                "harness_type": "codex",
+                "known_bad_playback_4178": True,
+                "blockers": ["known_bad_playback_4178_shape"],
+            },
+        }
+    )
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id=task_id,
+        backlog_id="AC-WORKER-SELF-ATTESTATION-VERIFIABLE-TRANSCRIPT-20260612",
+        branch_ref=branch_ref,
+        status=STATE_WORKTREE_READY,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        base_commit="base-4178",
+        head_commit=f"head-{task_id}",
+        target_head_commit="target-4178",
+        merge_queue_id="mq-4178",
+    )
+    with pytest.raises(
+        MfSubagentContractError,
+        match="known_bad_playback_4178_shape",
+    ):
+        validate_mf_subagent_finish_gate(
+            {
+                "task_id": task_id,
+                "status": "review_ready",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-4178",
+                "fence_token": fence_token,
+                "head_commit": f"head-{task_id}",
+                "startup_evidence": startup,
+                "read_receipt_hash": f"sha256:rr-{task_id}",
+                "read_receipt_event_id": f"rr-{task_id}",
+                "observer_command_id": f"cmd-{task_id}",
+            },
+            context=context,
+        )
 
 
 def test_timeline_gate_blocks_event_4178_surrogate_startup_without_real_join(conn):

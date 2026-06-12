@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sqlite3
 import subprocess
 
@@ -154,6 +155,11 @@ def _runtime_conn() -> sqlite3.Connection:
 
 
 def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
+    worker_session_id = str(overrides.get("worker_session_id") or "codex-session-startup")
+    auto_transcript_path = "worker_transcript_path" not in overrides
+    transcript_dir = Path(worktree) / ".worker-transcripts"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_dir / f"{worker_session_id}.jsonl"
     payload: dict[str, object] = {
         "task_id": "mf-sub-startup",
         "parent_task_id": "parent-startup",
@@ -180,9 +186,71 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
         "observer_command_id": "cmd-startup",
         "read_receipt_hash": "sha256:read-startup",
         "read_receipt_event_id": "2873",
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": str(transcript_path),
+        "harness_type": "codex",
+        "changed_files": ["agent/governance/parallel_branch_runtime.py"],
+        "graph_trace_ids": ["gqt-startup"],
     }
     payload.update(overrides)
+    transcript_record = {
+        "session_id": payload.get("worker_session_id"),
+        "harness_type": payload.get("harness_type"),
+        "event": "mf_subagent graph_query implementation",
+        "query_source": "mf_subagent",
+        "trace_ids": payload.get("graph_trace_ids"),
+        "task_id": payload.get("task_id"),
+        "runtime_context_id": payload.get("runtime_context_id"),
+        "fence_token": payload.get("fence_token"),
+        "worktree_path": worktree,
+        "branch": payload.get("branch"),
+        "changed_files": payload.get("changed_files"),
+        "observer_command_id": payload.get("observer_command_id"),
+        "read_receipt_hash": payload.get("read_receipt_hash"),
+        "read_receipt_event_id": payload.get("read_receipt_event_id"),
+        "route_token_ref": payload.get("route_token_ref"),
+    }
+    if auto_transcript_path and str(payload.get("worker_transcript_path") or "").strip():
+        Path(str(payload["worker_transcript_path"])).write_text(
+            json.dumps(transcript_record) + "\n",
+            encoding="utf-8",
+        )
     return payload
+
+
+def _insert_startup_context(conn: sqlite3.Connection, worktree: str) -> None:
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="agent-startup",
+        allocation_owner="agent-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=worktree,
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
 
 
 def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext:
@@ -296,6 +364,18 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "task_id": "mf-sub-runtime-context",
             "parent_task_id": "parent-runtime-context",
             "trace_ids": ["gqt-runtime-context"],
+        },
+        startup_gate={
+            "worker_self_attesting": True,
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "status": "passed",
+                "worker_self_attesting": True,
+                "worker_session_id": "session-runtime-context",
+                "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "harness_type": "codex",
+                "blockers": [],
+            },
         },
         finish_gate={
             "checkpoint_id": "ckpt-runtime-context",
@@ -435,10 +515,15 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
     assert gate["visible_injection_manifest_hash"] == "sha256:visible-startup"
     assert gate["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert gate["read_receipt_hash"] == "sha256:read-startup"
+    assert gate["worker_self_attesting"] is True
+    assert gate["worker_self_attestation"]["status"] == "passed"
+    assert gate["close_satisfying"] is True
+    assert gate["worker_self_attestation"]["worker_session_id"] == "codex-session-startup"
     assert gate["identity_join"]["runtime_context_id_matches"] is True
     assert gate["identity_join"]["route_identity_matches_latest_contract"] is True
     assert "secret-worker-session-token" not in str(result)
     assert result["timeline_event"]["event_kind"] == "mf_subagent_startup"
+    assert result["timeline_event"]["actor"] == "codex-session-startup"
     assert result["timeline_event"]["payload"]["mf_subagent_startup_gate"] == gate
 
     accepted = validate_mf_subagent_graph_query_identity(
@@ -450,6 +535,104 @@ def test_mf_sub_startup_records_real_worker_identity_and_token_hash(tmp_path) ->
         fence_token="fence-startup",
     )
     assert accepted.task_id == "mf-sub-startup"
+
+
+def test_mf_sub_startup_marks_missing_transcript_not_self_attesting(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-missing-transcript"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            worker_session_id="fabricated-session",
+            worker_transcript_path=str(worktree / "missing.jsonl"),
+        ),
+        now_iso=NOW,
+    )
+
+    gate = result["startup_gate"]
+    assert result["ok"] is True
+    assert gate["worker_self_attesting"] is False
+    assert gate["close_satisfying"] is False
+    assert "worker_transcript_path_unresolvable" in gate["worker_self_attestation"]["blockers"]
+
+    mismatched_path = worktree / "mismatched.jsonl"
+    mismatched_path.write_text(
+        json.dumps(
+            {
+                "session_id": "different-session",
+                "event": "mf_subagent graph_query implementation",
+                "task_id": "mf-sub-startup",
+                "runtime_context_id": branch_runtime_context_id(
+                    PROJECT_ID, "mf-sub-startup"
+                ),
+                "fence_token": "fence-startup",
+                "worktree_path": str(worktree),
+                "branch": "refs/heads/codex/mf-sub-startup",
+                "changed_files": ["agent/governance/parallel_branch_runtime.py"],
+                "trace_ids": ["gqt-startup"],
+                "observer_command_id": "cmd-startup",
+                "read_receipt_hash": "sha256:read-startup",
+                "read_receipt_event_id": "2873",
+                "route_token_ref": "rtok-startup",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    mismatched = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            worker_session_id="fabricated-session",
+            worker_transcript_path=str(mismatched_path),
+        ),
+        now_iso=NOW,
+    )
+    assert mismatched["startup_gate"]["worker_self_attesting"] is False
+    assert (
+        "worker_session_id_not_in_transcript"
+        in mismatched["startup_gate"]["worker_self_attestation"]["blockers"]
+    )
+
+
+def test_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_attesting(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-idle"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    idle = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), changed_files=[]),
+        now_iso=NOW,
+    )
+    assert idle["startup_gate"]["worker_self_attesting"] is False
+    assert "no_owned_files_diff" in idle["startup_gate"]["worker_self_attestation"]["blockers"]
+
+    no_graph = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), graph_trace_ids=[]),
+        now_iso=NOW,
+    )
+    assert no_graph["startup_gate"]["worker_self_attesting"] is False
+    assert (
+        "missing_mf_subagent_graph_trace_ids"
+        in no_graph["startup_gate"]["worker_self_attestation"]["blockers"]
+    )
 
 
 def test_mf_sub_startup_blocks_route_identity_mismatch_with_contract_revision(tmp_path) -> None:

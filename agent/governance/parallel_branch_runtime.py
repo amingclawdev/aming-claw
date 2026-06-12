@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .worker_transcript_verify import verify_worker_transcript
+
 
 PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
@@ -1193,6 +1195,25 @@ def _runtime_context_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _runtime_context_startup_gate_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = public_contract_revision_payload(value or {})
+    event_payload = payload.get("payload")
+    if isinstance(event_payload, Mapping):
+        event_payload = public_contract_revision_payload(event_payload)
+        nested = event_payload.get("mf_subagent_startup_gate")
+        if isinstance(nested, Mapping):
+            return {
+                **payload,
+                **event_payload,
+                **public_contract_revision_payload(nested),
+            }
+        return {**payload, **event_payload}
+    nested = payload.get("mf_subagent_startup_gate")
+    if isinstance(nested, Mapping):
+        return {**payload, **public_contract_revision_payload(nested)}
+    return payload
+
+
 def _runtime_context_string_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1475,6 +1496,22 @@ def _runtime_context_current_values(
     verification_event_refs = _runtime_context_string_list(
         timeline_refs.get("verification_event_refs")
     )
+    worker_self_attestation = public_contract_revision_payload(
+        startup_gate.get("worker_self_attestation")
+        or finish_gate.get("worker_self_attestation")
+        or {}
+    )
+    worker_self_attesting = bool(worker_self_attestation) and bool(
+        startup_gate.get("worker_self_attesting")
+        or startup_gate.get("self_attesting")
+        or worker_self_attestation.get("worker_self_attesting")
+        or worker_self_attestation.get("self_attesting")
+    )
+    worker_self_attesting = worker_self_attesting and _runtime_context_text(
+        worker_self_attestation.get("status")
+        or startup_gate.get("worker_self_attestation_status")
+        or "passed"
+    ).lower() in {"passed", "ok", "success", "succeeded"}
     return {
         "project_id": context.project_id,
         "governance_project_id": context.governance_project_id or context.project_id,
@@ -1552,6 +1589,8 @@ def _runtime_context_current_values(
             or finish_gate.get("source_ref")
             or timeline_refs.get("finish_event_ref")
         ),
+        "worker_self_attesting": worker_self_attesting,
+        "worker_self_attestation": worker_self_attestation,
         "checkpoint_id": checkpoint_id,
         "test_results": public_contract_revision_payload(finish_gate.get("test_results")),
     }
@@ -1785,6 +1824,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "consumer": "record_mf_subagent_startup",
             "evidence_ref": "contract_revision",
         },
+        {
+            "field": "worker_self_attesting",
+            "expected_source": "worker_transcript_verify.worker_self_attestation",
+            "producer": "worker_transcript_verify",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "timeline",
+        },
     ),
     "graph_query": (
         {
@@ -1902,6 +1948,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "evidence_ref": "timeline",
         },
         {
+            "field": "worker_self_attesting",
+            "expected_source": "worker_transcript_verify.worker_self_attestation",
+            "producer": "worker_transcript_verify",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "finish_gate",
+        },
+        {
             "field": "graph_trace_ids",
             "expected_source": "graph_query_trace.trace_ids",
             "producer": "graph_query_trace",
@@ -1951,6 +2004,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "producer": "graph_query_trace",
             "consumer": "close_gate",
             "evidence_ref": "graph_trace",
+        },
+        {
+            "field": "worker_self_attesting",
+            "expected_source": "worker_transcript_verify.worker_self_attestation",
+            "producer": "worker_transcript_verify",
+            "consumer": "close_gate",
+            "evidence_ref": "finish_gate",
         },
         {
             "field": "route_context_hash",
@@ -2146,7 +2206,7 @@ def build_runtime_context_current_view(
             "required_evidence_ids",
         )
     )
-    startup = public_contract_revision_payload(startup_gate or {})
+    startup = _runtime_context_startup_gate_payload(startup_gate or {})
     finish = public_contract_revision_payload(finish_gate or {})
     close = public_contract_revision_payload(close_evidence or {})
     observer_command_id = _runtime_context_text(
@@ -2274,6 +2334,7 @@ def build_runtime_context_close_gate_view(
         ("observer_command", "observer_command_id"),
         ("startup_evidence", "startup_event_ref"),
         ("read_receipt", "read_receipt_event_ref"),
+        ("worker_self_attestation", "worker_self_attesting"),
         ("finish_gate", "finish_gate_ref"),
         ("close_ready", "close_ready_event_ref"),
         ("checkpoint", "checkpoint_id"),
@@ -4063,6 +4124,31 @@ def _startup_refusal_timeline_event(
     agent_id_match_mode = str(details.get("agent_id_match_mode") or "")
     if not agent_id_match_mode and str(result.get("blocker_id") or "") == "agent_id_mismatch":
         agent_id_match_mode = "blocked_without_host_adapter_surrogate"
+    worker_session_id = str(
+        payload.get("worker_session_id")
+        or payload.get("session_id")
+        or payload.get("host_session_id")
+        or ""
+    ).strip()
+    worker_transcript_path = str(
+        payload.get("worker_transcript_path") or payload.get("transcript_path") or ""
+    ).strip()
+    harness_type = str(
+        payload.get("harness_type") or payload.get("worker_harness_type") or ""
+    ).strip()
+    filer_principal = str(
+        payload.get("filer_principal")
+        or payload.get("actor")
+        or agent_id
+        or worker_session_id
+        or actual_host_worker_id
+        or "mf_sub"
+    ).strip()
+    filed_on_behalf_by = str(
+        payload.get("filed_on_behalf_by")
+        or payload.get("on_behalf_of")
+        or ""
+    ).strip()
     refusal = {
         "schema_version": MF_SUBAGENT_STARTUP_REFUSAL_SCHEMA_VERSION,
         "gate_kind": "mf_subagent.startup",
@@ -4120,6 +4206,12 @@ def _startup_refusal_timeline_event(
         ).strip(),
         "host_startup_id": str(payload.get("host_startup_id") or "").strip(),
         "startup_source": str(payload.get("startup_source") or "").strip(),
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": worker_transcript_path,
+        "harness_type": harness_type,
+        "filer_principal": filer_principal,
+        "filed_on_behalf_by": filed_on_behalf_by,
+        "self_filed": bool(filer_principal and not filed_on_behalf_by),
         "session_token_present": bool(str(payload.get("session_token") or "").strip()),
         "session_token_surrogate_present": bool(
             str(
@@ -4145,7 +4237,7 @@ def _startup_refusal_timeline_event(
         "status": "blocked",
         "decision": "refused",
         "severity": "warning",
-        "actor": "mf_sub",
+        "actor": filer_principal or "mf_sub",
         "project_id": project_id,
         "backlog_id": refusal["backlog_id"],
         "task_id": refusal["task_id"],
@@ -4167,6 +4259,11 @@ def _startup_refusal_timeline_event(
             "prompt_contract_hash": route_identity.get("prompt_contract_hash", ""),
             "host_startup_id": refusal["host_startup_id"],
             "startup_source": refusal["startup_source"],
+            "worker_session_id": worker_session_id,
+            "worker_transcript_path": worker_transcript_path,
+            "harness_type": harness_type,
+            "filer_principal": filer_principal,
+            "filed_on_behalf_by": filed_on_behalf_by,
         },
         "commit_sha": str(payload.get("head_commit") or ""),
     }
@@ -4357,6 +4454,31 @@ def record_mf_subagent_startup(
         payload.get("host_session_id")
         or payload.get("session_id")
         or token_evidence["session_token_surrogate"]
+        or ""
+    ).strip()
+    worker_session_id = str(
+        payload.get("worker_session_id")
+        or payload.get("session_id")
+        or ""
+    ).strip()
+    worker_transcript_path = str(
+        payload.get("worker_transcript_path") or payload.get("transcript_path") or ""
+    ).strip()
+    harness_type = str(
+        payload.get("harness_type") or payload.get("worker_harness_type") or ""
+    ).strip()
+    filer_principal = str(
+        payload.get("filer_principal")
+        or payload.get("actor")
+        or worker_session_id
+        or agent_id
+        or actual_host_worker_id
+        or worker_slot_id
+        or "mf_sub"
+    ).strip()
+    filed_on_behalf_by = str(
+        payload.get("filed_on_behalf_by")
+        or payload.get("on_behalf_of")
         or ""
     ).strip()
     governance_project_id = str(
@@ -4640,6 +4762,38 @@ def record_mf_subagent_startup(
             },
         ))
 
+    worker_self_attestation_payload = {
+        **dict(payload),
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": worker_transcript_path,
+        "harness_type": harness_type,
+        "task_id": task,
+        "runtime_context_id": runtime_context_id,
+        "fence_token": fence_token,
+        "worktree_path": context.worktree_path,
+        "actual_cwd": actual_cwd,
+        "actual_git_root": actual_git_root,
+        "branch_ref": context.branch_ref,
+        "branch": branch or context.branch_ref,
+        "base_commit": base_commit or context.base_commit,
+        "target_head_commit": target_head_commit or context.target_head_commit,
+        "head_commit": head_commit,
+        "owned_files": list(owned_files),
+        "observer_command_id": observer_command_id,
+        "read_receipt_hash": read_receipt_hash,
+        "read_receipt_event_id": read_receipt_event_id,
+        "route_token_ref": route_token_ref,
+        "filer_principal": filer_principal,
+        "filed_on_behalf_by": filed_on_behalf_by,
+        "actor": filer_principal,
+        "agent_id_match_mode": agent_id_match_mode,
+        "session_token_evidence_type": token_evidence["session_token_evidence_type"],
+        "session_token_present": token_evidence["session_token_present"],
+        "host_adapter_startup_token_accepted": host_adapter_startup,
+    }
+    worker_self_attestation = verify_worker_transcript(worker_self_attestation_payload)
+    worker_self_attesting = bool(worker_self_attestation.get("worker_self_attesting"))
+
     # For first-sight ('hash') startups, persist the server-computed token hash
     # so subsequent startups can be server-verified.  For 'claimed_unverified'
     # startups the stored hash is already set and we pass '' to preserve it via
@@ -4681,7 +4835,11 @@ def record_mf_subagent_startup(
         "actual_startup_required": False,
         "same_as_expected_worker": bool(actual_host_worker_id == worker_slot_id),
         "fence_token_matches": True,
-        "close_satisfying": True,
+        "close_satisfying": worker_self_attesting,
+        "worker_self_attesting": worker_self_attesting,
+        "self_attesting": worker_self_attesting,
+        "worker_self_attestation_required": True,
+        "worker_self_attestation": worker_self_attestation,
         "raw_launch_text_persisted": False,
         "project_id": project_id,
         "governance_project_id": saved.governance_project_id or project_id,
@@ -4728,6 +4886,12 @@ def record_mf_subagent_startup(
         "session_token_persisted": False,
         "startup_source": startup_source,
         "startup_timing": "actual_worker_started",
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": worker_transcript_path,
+        "harness_type": harness_type,
+        "filer_principal": filer_principal,
+        "filed_on_behalf_by": filed_on_behalf_by,
+        "self_filed": bool(filer_principal and not filed_on_behalf_by),
         "observer_command_id": observer_command_id,
         "read_receipt_hash": read_receipt_hash,
         "read_receipt_event_id": read_receipt_event_id,
@@ -4757,7 +4921,7 @@ def record_mf_subagent_startup(
         "event_kind": "mf_subagent_startup",
         "phase": "startup_gate",
         "status": "passed",
-        "actor": "mf_sub",
+        "actor": filer_principal or worker_session_id or agent_id or "mf_sub",
         "project_id": project_id,
         "backlog_id": saved.backlog_id,
         "task_id": saved.task_id,
@@ -4771,6 +4935,12 @@ def record_mf_subagent_startup(
             "observer_command_id": observer_command_id,
             "read_receipt_event_id": read_receipt_event_id,
             "session_token_evidence_type": token_evidence["session_token_evidence_type"],
+            "worker_session_id": worker_session_id,
+            "worker_transcript_path": worker_transcript_path,
+            "harness_type": harness_type,
+            "worker_self_attesting": worker_self_attesting,
+            "filer_principal": filer_principal,
+            "filed_on_behalf_by": filed_on_behalf_by,
         },
         "commit_sha": saved.head_commit,
     }
