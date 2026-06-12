@@ -376,6 +376,7 @@ export default function TaskPlaybackPanel({
 
               {/* 1-3. LAYERED SEMANTIC DETAIL (shared EventSemanticDetail: L1 headline, L2 summary, L3 facts/blockers) */}
               <EventSemanticDetail frame={selectedFrame} />
+              <EventChecklistSection checklist={selectedFrame.event_checklist} />
               {/* Timestamp — kept here since it belongs to the per-frame context, not the shared piece */}
               <div className="task-playback-current-meta task-playback-current-meta--ts">
                 <span className="mono">{formatFrameDateTime(selectedFrame)}</span>
@@ -1019,6 +1020,56 @@ function StructuredFactSection({ title, facts }: { title: string; facts: TaskPla
       </div>
     </div>
   );
+}
+
+function EventChecklistSection({ checklist }: { checklist: TaskPlaybackFrame["event_checklist"] }) {
+  if (!checklist || checklist.item_count === 0 || checklist.categories.length === 0) return null;
+  return (
+    <section className="task-playback-event-checklist" aria-label="Event checklist">
+      <div className="task-playback-event-checklist-head">
+        <strong>Event checklist</strong>
+        <span>
+          {checklist.blocked_count > 0 ? `${checklist.blocked_count} unmet` : ""}
+          {checklist.blocked_count > 0 && checklist.passed_count > 0 ? " / " : ""}
+          {checklist.passed_count > 0 ? `${checklist.passed_count} satisfied` : ""}
+          {checklist.blocked_count === 0 && checklist.passed_count === 0 ? `${checklist.item_count} recorded` : ""}
+        </span>
+      </div>
+      <div className="task-playback-event-checklist-groups">
+        {checklist.categories.map((category) => (
+          <div key={category.id} className={`task-playback-event-checklist-group checklist-${category.id}`}>
+            <div className="task-playback-event-checklist-group-label">
+              <span className={`status-badge ${eventChecklistStatusClass(category.status)}`}>{category.label}</span>
+            </div>
+            <div className="task-playback-event-checklist-rows">
+              {category.items.map((item) => (
+                <div key={item.id} className={`task-playback-event-checklist-row checklist-status-${item.status}`}>
+                  <span className={`task-playback-event-checklist-state ${eventChecklistStatusClass(item.status)}`}>
+                    {item.status}
+                  </span>
+                  <span className="task-playback-event-checklist-label">{item.label}</span>
+                  <span className="task-playback-event-checklist-value">
+                    {isHashValue(item.value)
+                      ? <TruncatedHashSpan value={item.value} mono />
+                      : <StatusWordText text={item.value} />}
+                  </span>
+                  <span className="task-playback-event-checklist-source">{item.source}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {checklist.hidden_count > 0 ? <em className="task-playback-event-checklist-overflow">+{checklist.hidden_count} more checklist rows in Advanced raw data</em> : null}
+    </section>
+  );
+}
+
+function eventChecklistStatusClass(status: TaskPlaybackFrame["event_checklist"]["categories"][number]["status"] | TaskPlaybackFrame["event_checklist"]["categories"][number]["items"][number]["status"]): string {
+  if (status === "passed" || status === "satisfied" || status === "present") return "status-complete";
+  if (status === "missing" || status === "blocked" || status === "failed") return "status-failed";
+  if (status === "required") return "status-running";
+  return "status-unknown";
 }
 
 function EvidenceInspectorModal({

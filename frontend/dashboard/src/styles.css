@@ -10017,6 +10017,153 @@ details[open] .task-playback-narrative-summary::before {
   margin: 4px 0 0;
 }
 
+.task-playback-event-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--ink-200, #e2e8f0);
+  border-radius: 6px;
+  background: var(--surface, #ffffff);
+  padding: 10px;
+}
+
+.task-playback-event-checklist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-playback-event-checklist-head strong {
+  color: var(--ink-800, #1e293b);
+}
+
+.task-playback-event-checklist-head span {
+  color: var(--ink-500, #64748b);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.task-playback-event-checklist-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-playback-event-checklist-group {
+  display: grid;
+  grid-template-columns: minmax(104px, 0.32fr) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-playback-event-checklist-group-label {
+  min-width: 0;
+}
+
+.task-playback-event-checklist-group-label .status-badge {
+  display: inline-flex;
+  max-width: 100%;
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.task-playback-event-checklist-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.task-playback-event-checklist-row {
+  display: grid;
+  grid-template-columns: 74px minmax(90px, 0.35fr) minmax(0, 1fr) 72px;
+  gap: 6px;
+  align-items: start;
+  min-width: 0;
+  border: 1px solid var(--ink-100, #f1f5f9);
+  border-radius: 5px;
+  padding: 5px 6px;
+  background: var(--ink-50, #f8fafc);
+}
+
+.task-playback-event-checklist-row.checklist-status-passed,
+.task-playback-event-checklist-row.checklist-status-satisfied,
+.task-playback-event-checklist-row.checklist-status-present {
+  background: var(--green-tint, #f0fdf4);
+  border-color: var(--green-border, #bbf7d0);
+}
+
+.task-playback-event-checklist-row.checklist-status-missing,
+.task-playback-event-checklist-row.checklist-status-blocked,
+.task-playback-event-checklist-row.checklist-status-failed {
+  background: var(--red-tint, #fff1f2);
+  border-color: var(--red-border, #fecdd3);
+}
+
+.task-playback-event-checklist-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.2;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.task-playback-event-checklist-label,
+.task-playback-event-checklist-value,
+.task-playback-event-checklist-source {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
+.task-playback-event-checklist-label {
+  color: var(--ink-700, #334155);
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+
+.task-playback-event-checklist-value {
+  color: var(--ink-800, #1e293b);
+  font-size: 0.8rem;
+}
+
+.task-playback-event-checklist-source {
+  color: var(--ink-400, #94a3b8);
+  font-size: 0.72rem;
+  text-align: right;
+}
+
+.task-playback-event-checklist-overflow {
+  color: var(--ink-500, #64748b);
+  font-size: 0.76rem;
+}
+
+@media (max-width: 860px) {
+  .task-playback-event-checklist-group,
+  .task-playback-event-checklist-row {
+    grid-template-columns: 1fr;
+  }
+
+  .task-playback-event-checklist-state {
+    justify-content: flex-start;
+    width: fit-content;
+  }
+
+  .task-playback-event-checklist-source {
+    text-align: left;
+  }
+}
+
 /* ── Gate verification matrix ───────────────────────────────────────────────
  * 4-column table: Requirement | Required? | Status | Evidence / next action
  * Grouped by gate family (timeline / route_context / contract / ...). */

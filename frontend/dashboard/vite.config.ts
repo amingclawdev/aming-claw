@@ -2,26 +2,16 @@ import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
 
 const dashboardDir = path.dirname(fileURLToPath(import.meta.url));
 const defaultWorkspaceRoot = path.resolve(dashboardDir, "../..").replace(/\\/g, "/");
 
-// Build stamp: git short HEAD of the repo at build time.
-// Falls back to "dev" for the Vite dev server so the banner is never shown in
-// development (App.tsx checks for the literal string "dev").
-function getBuildStamp(command: string): string {
+// Build stamp: stable by default for source-controlled dashboard_dist builds.
+// Release/deploy callers may pass VITE_DASHBOARD_BUILD to enable the stale
+// bundle banner without making normal npm builds dirty a clean checkout.
+function getBuildStamp(command: string, env: Record<string, string>): string {
   if (command === "serve") return "dev";
-  try {
-    return execSync("git rev-parse --short HEAD", {
-      cwd: defaultWorkspaceRoot,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5000,
-    }).trim() || "dev";
-  } catch {
-    return "dev";
-  }
+  return env.VITE_DASHBOARD_BUILD?.trim() || "dev";
 }
 
 export default defineConfig(({ mode, command }) => {
@@ -29,7 +19,7 @@ export default defineConfig(({ mode, command }) => {
   const backend = env.VITE_BACKEND_URL || "http://localhost:40000";
   const base = env.VITE_DASHBOARD_BASE || (command === "build" ? "/dashboard/" : "/");
   const workspaceRoot = (env.VITE_WORKSPACE_ROOT || defaultWorkspaceRoot).replace(/\\/g, "/");
-  const buildStamp = getBuildStamp(command);
+  const buildStamp = getBuildStamp(command, env);
   const defaultWorkspaceRootPlugin = {
     name: "dashboard-default-workspace-root",
     enforce: "pre" as const,
@@ -47,8 +37,8 @@ export default defineConfig(({ mode, command }) => {
     plugins: [defaultWorkspaceRootPlugin, react()],
     define: {
       __DEFAULT_WORKSPACE_ROOT__: JSON.stringify(workspaceRoot),
-      // Build identity stamp. "dev" in Vite serve mode; git short HEAD in
-      // production builds. App.tsx uses this to detect bundle staleness.
+      // Build identity stamp. "dev" disables the stale-bundle banner; release
+      // builds can opt in with VITE_DASHBOARD_BUILD.
       __DASHBOARD_BUILD__: JSON.stringify(buildStamp),
     },
     server: {
@@ -70,7 +60,9 @@ export default defineConfig(({ mode, command }) => {
     },
     build: {
       outDir: "dist",
-      sourcemap: true,
+      // Keep packaged dashboard builds reproducible: hashed JS sourcemaps can
+      // self-reference the emitted asset name and churn on repeated builds.
+      sourcemap: false,
     },
   };
 });
