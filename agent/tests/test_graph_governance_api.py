@@ -2166,6 +2166,12 @@ def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_po
         )
     assert missing_gate.value.code == "route_token_required"
 
+    route_token = _server_issued_route_token(
+        conn,
+        "append_contract_revision",
+        task_id="runtime-contract-revision-task",
+        backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
+    )
     status, appended = (
         server.handle_graph_governance_parallel_branch_runtime_contract_revision_append(
             _ctx_with_role(
@@ -2187,12 +2193,7 @@ def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_po
                             "hidden_context": "must not persist",
                         },
                     },
-                    "route_token": _server_issued_route_token(
-                        conn,
-                        "append_contract_revision",
-                        task_id="runtime-contract-revision-task",
-                        backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
-                    ),
+                    "route_token": route_token,
                     "raw_private_context": "must-not-leak",
                     "now_iso": "2026-06-03T10:01:00Z",
                 },
@@ -2208,9 +2209,7 @@ def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_po
     assert "raw_private_context" not in revision["payload"]
     assert "hidden_context" not in revision["payload"]["nested"]
     assert revision["route_identity"]["route_context_hash"].startswith("sha256:")
-    assert revision["route_identity"]["prompt_contract_id"] == (
-        "prompt-contract-append_contract_revision"
-    )
+    assert revision["route_identity"]["prompt_contract_id"] == route_token["prompt_contract_id"]
     assert revision["route_identity"]["raw_private_context_exposed"] is False
     serialized_revision = json.dumps(revision, sort_keys=True)
     assert "must-not-leak" not in serialized_revision
@@ -12692,8 +12691,10 @@ def _make_real_startup_timeline_event(
         "session_token_evidence_type": "hash",
         "session_token_hash": "sha256:real-token-abc",
         "session_token_present": True,
-        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
-        "host_adapter_startup_token_accepted": True,
+        "agent_id_match_mode": "same_as_allocation_owner",
+        "agent_id": "allocated-mf-sub-worker",
+        "allocation_owner": "allocated-mf-sub-worker",
+        "host_adapter_startup_token_accepted": False,
         "worker_role": "mf_sub",
         "task_id": task_id,
         "worker_slot_id": f"wslot-{task_id}",
@@ -12707,6 +12708,289 @@ def _make_real_startup_timeline_event(
         "observer_command_id": f"cmd-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
     }
+
+
+def _close_timeline_route_identity(suffix: str) -> dict:
+    return {
+        "route_id": f"route-close-{suffix}",
+        "route_context_hash": f"sha256:route-close-{suffix}",
+        "prompt_contract_id": f"rprompt-close-{suffix}",
+        "prompt_contract_hash": f"sha256:prompt-close-{suffix}",
+        "visible_injection_manifest_hash": f"sha256:visible-close-{suffix}",
+        "route_token_ref": f"rtok-close-{suffix}",
+    }
+
+
+def _insert_close_timeline_backlog(conn, *, backlog_id: str, suffix: str) -> None:
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "project_id": PID,
+        "target_files": ["agent/governance/server.py"],
+        "acceptance_criteria": ["close timeline startup evidence is truthful"],
+        "governance_policy": {
+            "profile": "third-party-public",
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": False,
+            },
+        },
+        "route_topology_policy": {
+            "selected_topology": "observer_led_parallel_lanes",
+            "recommended_topology": "mf_parallel.v1",
+        },
+    }
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, chain_trigger_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            backlog_id,
+            "Close timeline startup gate",
+            "MF_IN_PROGRESS",
+            "chain_rescue",
+            '{"mf_type":"chain_rescue"}',
+            json.dumps(contract),
+            "2026-06-12T00:00:00Z",
+            "2026-06-12T00:00:00Z",
+        ),
+    )
+
+
+def _close_timeline_startup_gate(
+    *,
+    task_id: str,
+    fence_token: str,
+    worktree_path: str,
+    branch_ref: str,
+    route_identity: dict,
+    same_owner: bool,
+) -> dict:
+    owner = "allocated-mf-sub-worker"
+    startup = {
+        **route_identity,
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "started": True,
+        "startup_complete": True,
+        "actual_startup_recorded": True,
+        "worker_role": "mf_sub",
+        "task_id": task_id,
+        "worker_slot_id": f"wslot-{task_id}",
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "fence_token": fence_token,
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "branch": branch_ref,
+        "head_commit": f"head-{task_id}",
+        "observer_command_id": f"cmd-{task_id}",
+        "read_receipt_event_id": f"rr-{task_id}",
+        "close_satisfying": True,
+    }
+    if same_owner:
+        startup.update(
+            {
+                "agent_id": owner,
+                "allocation_owner": owner,
+                "agent_id_match_mode": "same_as_allocation_owner",
+                "session_token_evidence_type": "server_verified",
+                "session_token_hash": f"sha256:real-{task_id}",
+                "session_token_present": True,
+                "host_adapter_startup_token_accepted": False,
+            }
+        )
+    else:
+        startup.update(
+            {
+                "agent_id": "codex-cli-thread:event-4178",
+                "allocation_owner": owner,
+                "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+                "session_token_evidence_type": "server_verified",
+                "session_token_hash": f"sha256:host-{task_id}",
+                "session_token_present": True,
+                "host_adapter_startup_token_accepted": True,
+            }
+        )
+    return startup
+
+
+def _record_close_timeline(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    suffix: str,
+    same_owner_startup: bool,
+) -> dict:
+    route_identity = _close_timeline_route_identity(suffix)
+    fence_token = f"fence-close-{suffix}"
+    worktree_path = f"/tmp/close-{suffix}"
+    branch_ref = f"refs/heads/close/{suffix}"
+    common_payload = {
+        **route_identity,
+        "task_id": task_id,
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "worker_slot_id": f"wslot-{task_id}",
+        "fence_token": fence_token,
+        "worktree_path": worktree_path,
+        "branch": branch_ref,
+        "head_commit": f"head-{task_id}",
+    }
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="route.context",
+        event_kind="route_context",
+        phase="route_context",
+        status="passed",
+        payload=common_payload,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="route.action_precheck",
+        event_kind="route_action_precheck",
+        phase="route_action_precheck",
+        status="passed",
+        payload=common_payload,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.dispatch",
+        event_kind="bounded_implementation_worker_dispatch",
+        phase="dispatch",
+        status="passed",
+        payload=common_payload,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="startup_read_receipt",
+        status="passed",
+        payload={**common_payload, "read_receipt_hash": f"sha256:rr-{task_id}"},
+    )
+    startup = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        payload={
+            "mf_subagent_startup_gate": _close_timeline_startup_gate(
+                task_id=task_id,
+                fence_token=fence_token,
+                worktree_path=worktree_path,
+                branch_ref=branch_ref,
+                route_identity=route_identity,
+                same_owner=same_owner_startup,
+            )
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="implementation",
+        event_kind="implementation",
+        phase="implementation",
+        status="passed",
+        payload={"graph_trace_ids": [f"gqt-close-{suffix}"]},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="independent_verification",
+        event_kind="independent_verification",
+        phase="verification",
+        status="passed",
+        actor="qa-reviewer",
+        payload={**route_identity, "reviewer": "qa-reviewer"},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="close_ready",
+        event_kind="close_ready",
+        phase="close_ready",
+        status="passed",
+        payload=route_identity,
+    )
+    conn.commit()
+    return {"startup_event": startup, "route_identity": route_identity}
+
+
+def test_timeline_gate_blocks_event_4178_surrogate_startup_without_real_join(conn):
+    backlog_id = "AC-CLOSE-TIMELINE-EVENT-4178-SURROGATE"
+    task_id = "close-event-4178-task"
+    _insert_close_timeline_backlog(conn, backlog_id=backlog_id, suffix="event-4178")
+    recorded = _record_close_timeline(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        suffix="event-4178",
+        same_owner_startup=False,
+    )
+
+    result = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    assert result["can_close"] is False
+    gate = result["timeline_gate"]
+    startup_gate = gate["close_timeline_startup_gate"]
+    assert startup_gate["demoted_startup_events"][0]["id"] == str(
+        recorded["startup_event"]["id"]
+    )
+    assert "mf_subagent_startup" in gate["route_context_gate"]["missing_requirement_ids"]
+    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is False
+
+
+def test_timeline_gate_allows_same_as_allocation_owner_startup(conn):
+    backlog_id = "AC-CLOSE-TIMELINE-SAME-OWNER-STARTUP"
+    task_id = "close-same-owner-task"
+    _insert_close_timeline_backlog(conn, backlog_id=backlog_id, suffix="same-owner")
+    _record_close_timeline(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        suffix="same-owner",
+        same_owner_startup=True,
+    )
+
+    result = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    assert result["can_close"] is True
+    gate = result["timeline_gate"]
+    assert gate.get("close_timeline_startup_gate", {}).get("demoted_startup_events", []) == []
+    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is True
 
 
 def test_finish_gate_server_ignores_caller_supplied_real_startup_events(conn):

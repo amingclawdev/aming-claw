@@ -50,6 +50,8 @@ from agent.governance.mf_subagent_contract import (
     route_token_required_failure_details,
     validate_route_token_mutation_gate,
     surrogate_startup_evidence_gate,
+    close_timeline_startup_event_gate,
+    close_timeline_events_for_verification,
     _bounded_startup_evidence_present,
     _startup_is_host_adapter_surrogate,
     _startup_real_worker_join,
@@ -3078,10 +3080,82 @@ def test_same_as_allocation_owner_real_token_is_not_surrogate() -> None:
     assert _startup_is_host_adapter_surrogate(real_token_startup) is False
 
 
+def test_close_timeline_counts_same_as_allocation_owner_startup() -> None:
+    real_token_startup = _real_worker_startup_matching_lineage("evt-same-owner-close")
+    event = {
+        "id": "evt-same-owner-close",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": real_token_startup},
+    }
+
+    gate = close_timeline_startup_event_gate([event])
+    assert gate["passed"] is True
+    assert gate["demoted_startup_events"] == []
+    normalized = close_timeline_events_for_verification([event])
+    assert normalized["events"][0]["status"] == "passed"
+
+
 def test_surrogate_only_startup_is_surrogate() -> None:
     """A startup with session_token_evidence_type==surrogate and no real token IS a surrogate."""
     assert _startup_is_host_adapter_surrogate(_surrogate_startup()) is True
     assert _startup_is_host_adapter_surrogate(_surrogate_startup_with_lineage()) is True
+
+
+def test_close_timeline_demotes_event_4178_like_surrogate_without_real_join() -> None:
+    startup = _surrogate_startup_with_lineage()
+    startup.update(
+        {
+            "agent_id": "codex-cli-thread:event-4178",
+            "allocation_owner": "allocated-mf-sub-worker",
+            "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+            "session_token_evidence_type": "server_verified",
+            "session_token_hash": "sha256:host-adapter-token",
+            "session_token_present": True,
+            "close_satisfying": True,
+        }
+    )
+    event = {
+        "id": "evt-4178-surrogate",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": startup},
+    }
+
+    gate = close_timeline_startup_event_gate([event])
+    assert gate["passed"] is False
+    assert gate["demoted_startup_events"][0]["id"] == "evt-4178-surrogate"
+    assert (
+        gate["demoted_startup_events"][0]["real_worker_join"]["reason"]
+        == "surrogate_only_no_matching_real_startup_in_events"
+    )
+    normalized = close_timeline_events_for_verification([event])
+    assert normalized["events"][0]["status"] == "demoted"
+
+
+def test_close_timeline_demotes_agent_id_mismatch_without_registered_adapter() -> None:
+    startup = _real_worker_startup_matching_lineage("evt-agent-mismatch")
+    startup.update(
+        {
+            "agent_id": "host-adapter-thread",
+            "allocation_owner": "allocated-mf-sub-worker",
+            "agent_id_match_mode": "actual_host_worker_bound",
+        }
+    )
+    event = {
+        "id": "evt-agent-mismatch",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": startup},
+    }
+
+    assert _startup_is_host_adapter_surrogate(startup) is True
+    gate = close_timeline_startup_event_gate([event])
+    assert gate["passed"] is False
+    assert gate["demoted_startup_events"][0]["id"] == "evt-agent-mismatch"
 
 
 def test_surrogate_only_still_refused_without_real_startup_events() -> None:
@@ -3546,16 +3620,15 @@ def test_info01_fence_token_unconditional_check_documented() -> None:
 # AC-STARTUP-TOKEN-EVIDENCE-SERVER-VERIFICATION-20260610
 # ---------------------------------------------------------------------------
 
-def test_f4_close_gate_does_not_evaluate_surrogate_policy() -> None:
-    """F4: mf_close_gate_verification does NOT call surrogate-join functions.
+def test_f4_task_timeline_core_stays_generic_while_server_applies_startup_policy() -> None:
+    """F4: task_timeline stays generic; server close paths apply startup policy.
 
-    This is intentional: by the time close is reached, the finish gate has
-    already validated the startup evidence.  The close gate only checks event
-    kinds (contract, route-context, etc.).  This test documents the asymmetry
-    and confirms it is preserved.
+    The shared verifier only checks event categories.  The server close path
+    filters explicit surrogate/non-owner startup events before invoking it.
     """
     import inspect
     from agent.governance import task_timeline
+    from agent.governance import server as server_module
 
     source = inspect.getsource(task_timeline.mf_close_gate_verification)
     # The close gate must NOT reference surrogate-join or startup_is_host_adapter_surrogate
@@ -3565,8 +3638,10 @@ def test_f4_close_gate_does_not_evaluate_surrogate_policy() -> None:
     )
     assert "surrogate_startup_evidence_gate" not in source, (
         "mf_close_gate_verification must not call surrogate_startup_evidence_gate; "
-        "the finish gate is the enforcement boundary"
+        "server close-gate wiring applies close_timeline_events_for_verification"
     )
+    server_source = inspect.getsource(server_module._mf_close_gate_verification)
+    assert "close_timeline_events_for_verification" in server_source
     # The finish gate DOES reference surrogate logic — confirm it is the boundary
     finish_source = inspect.getsource(validate_mf_subagent_finish_gate)
     assert "surrogate_startup_evidence_gate" in finish_source, (

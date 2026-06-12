@@ -1798,7 +1798,7 @@ def _build_observer_repair_run_plan_from_body(
                     _row_get(row, "chain_trigger_json", "{}")
                 )
                 contract = _mf_close_contract_with_route_context(contract, row, {})
-                verification = task_timeline.mf_close_gate_verification(events, contract=contract)
+                verification = _mf_close_gate_verification(events, contract=contract)
             else:
                 verification = {"passed": True, "missing_event_kinds": []}
             timeline_prechecks.append(
@@ -6447,6 +6447,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
     from .db import sqlite_write_lock
     from .mf_subagent_contract import (
         FINISH_GATE_REPLAY_SOURCE,
+        MfSubagentContractError,
         validate_mf_subagent_finish_gate,
     )
     from .parallel_branch_runtime import (
@@ -6488,8 +6489,8 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     "resolved lane; lane may be misconfigured — contact the observer"
                 )
             if body_fence_token != context.fence_token:
-                raise ValidationError(
-                    "fence_token mismatch: body fence_token does not match "
+                raise MfSubagentContractError(
+                    "stale fence_token mismatch: body fence_token does not match "
                     "server-side runtime context for the resolved lane; "
                     "ensure task_id and fence_token identify the same lane "
                     "(next legal action: verify task_id and fence_token match "
@@ -21050,7 +21051,7 @@ def _observer_root_route_context_state(
     if _is_plausible_graph_trace_id(caller_graph_query_schema_trace_id):
         graph_trace_id = str(caller_graph_query_schema_trace_id).strip()
     else:
-        close_gate = task_timeline.mf_close_gate_verification(events, contract=contract)
+        close_gate = _mf_close_gate_verification(events, contract=contract)
         worker_graph_trace_gate = close_gate.get("worker_graph_trace_gate") or {}
         trace_ids = worker_graph_trace_gate.get("trace_ids") or []
         if isinstance(trace_ids, list) and trace_ids:
@@ -22077,11 +22078,16 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "launch_text_hash": str(prepared.get("launch_text_hash") or ""),
         "runtime_context_id": str(prepared.get("runtime_context_id") or ""),
         "observer_command_id": str(prepared.get("observer_command_id") or ""),
+        "runtime_context": dict(resolved_context),
+        "branch_runtime_evidence": branch_runtime_evidence,
+        "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
         "full_payload_path": full_payload_path,
         "full_payload_sha256": full_payload_sha256,
         "request_id": str(ctx.request_id),
     }
+    if revision:
+        compact["runtime_contract_revision"] = revision
     return compact
 
 
@@ -24463,7 +24469,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         if applicable["is_mf"]:
             contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
             contract = _mf_close_contract_with_route_context(contract, row, ctx.query)
-            verification = task_timeline.mf_close_gate_verification(events, contract=contract)
+            verification = _mf_close_gate_verification(events, contract=contract)
         else:
             verification = {
                 "schema_version": "mf_close_timeline_gate.v1",
@@ -25289,7 +25295,7 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
     contract = _mf_close_contract_with_route_context(contract, row, body)
-    verification = task_timeline.mf_close_gate_verification(events, contract=contract)
+    verification = _mf_close_gate_verification(events, contract=contract)
     if not verification.get("passed"):
         missing_event_kinds = verification.get("missing_event_kinds") or []
         contract_gate = verification.get("contract_gate") if isinstance(verification.get("contract_gate"), dict) else {}
@@ -25319,6 +25325,30 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
             f"MF backlog close requires task timeline evidence before FIXED; missing: {missing}",
             422,
         )
+    return verification
+
+
+def _mf_close_gate_verification(events: list[dict] | None, contract: dict | None = None) -> dict:
+    from . import task_timeline
+    from .mf_subagent_contract import close_timeline_events_for_verification
+
+    normalized = close_timeline_events_for_verification(events or [])
+    verification = task_timeline.mf_close_gate_verification(
+        normalized.get("events") or [],
+        contract=contract,
+    )
+    startup_gate = normalized.get("startup_gate")
+    if isinstance(startup_gate, dict) and (
+        startup_gate.get("demoted_startup_events")
+        or startup_gate.get("accepted_startup_events")
+    ):
+        verification = dict(verification)
+        verification["close_timeline_startup_gate"] = startup_gate
+        checks = dict(verification.get("checks") or {})
+        checks["mf_subagent_startup_close_satisfying"] = bool(
+            not startup_gate.get("demoted_startup_events")
+        )
+        verification["checks"] = checks
     return verification
 
 

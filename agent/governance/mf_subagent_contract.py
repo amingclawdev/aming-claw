@@ -2927,6 +2927,7 @@ SESSION_TOKEN_SURROGATE_EVIDENCE_TYPE = "surrogate"
 OBSERVER_HOTFIX_EXCEPTION_MODE = "observer_hotfix_exception"
 SURROGATE_STARTUP_GATE_SCHEMA_VERSION = "mf_surrogate_startup_evidence_gate.v1"
 REAL_WORKER_JOIN_SCHEMA_VERSION = "mf_surrogate_real_worker_join.v1"
+CLOSE_TIMELINE_STARTUP_GATE_SCHEMA_VERSION = "mf_close_timeline_startup_gate.v1"
 
 # Lineage fields used to match a surrogate startup against a real worker startup.
 _SURROGATE_JOIN_LINEAGE_FIELDS = (
@@ -3003,6 +3004,26 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     # ('server_verified') token on host-adapter mode earns no trust because the
     # presenter is the host, not a verified bounded worker.
     if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
+        return True
+    agent_id = _string(evidence.get("agent_id"))
+    allocation_owner = _string(
+        evidence.get("allocation_owner")
+        or evidence.get("observer_allocation_owner")
+        or evidence.get("expected_agent_id")
+    )
+    registered_host_adapter = bool(
+        _bool(evidence.get("registered_host_adapter_spawn_present"))
+        or _nested_mapping(evidence, "registered_host_adapter_spawn")
+        or _nested_mapping(evidence, "host_adapter_spawn_identity")
+        or _nested_mapping(evidence, "host_adapter_startup_identity")
+    )
+    if (
+        agent_id
+        and allocation_owner
+        and agent_id != allocation_owner
+        and match_mode != "same_as_allocation_owner"
+        and not registered_host_adapter
+    ):
         return True
     # Server-verified or first-sight hash on same_as_allocation_owner (or other
     # non-host-adapter) mode: NOT a surrogate.
@@ -3091,6 +3112,12 @@ def _startup_real_worker_join(
                 gate = nested_gate
         # A real startup must NOT itself be a surrogate.
         if _startup_is_host_adapter_surrogate(gate):
+            continue
+        match_mode = _string(
+            gate.get("agent_id_match_mode")
+            or _nested_mapping(gate, "identity_join").get("agent_id_match_mode")
+        ).lower()
+        if match_mode != "same_as_allocation_owner":
             continue
         # It must carry a real session token.
         if not _string(gate.get("session_token_hash")) and not _bool(
@@ -3263,6 +3290,115 @@ def surrogate_startup_evidence_gate(
         "status": "close_satisfying" if close_satisfying else "demoted",
         "reason": reason,
         "real_worker_join": join_result,
+    }
+
+
+def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    for container in (
+        _nested_mapping(event, "payload"),
+        _nested_mapping(event, "verification"),
+        _nested_mapping(event, "artifact_refs"),
+        event,
+    ):
+        if not container:
+            continue
+        for key in (
+            "mf_subagent_startup_gate",
+            "startup_evidence",
+            "bounded_startup_evidence",
+        ):
+            gate = _nested_mapping(container, key)
+            if gate:
+                return gate
+    if (
+        _string(event.get("schema_version")) == "mf_subagent_startup_gate.v1"
+        or _string(event.get("gate_kind") or event.get("kind")).lower()
+        == "mf_subagent.startup"
+    ):
+        return dict(event)
+    return {}
+
+
+def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
+    """Evaluate close-timeline startup events for surrogate-only evidence.
+
+    The shared timeline verifier works from event categories.  This gate is the
+    close-path adapter that removes explicitly surrogate startup events from
+    consideration unless they are joined by a real same_as_allocation_owner
+    startup for the same lane lineage.
+    """
+
+    if isinstance(events, Mapping):
+        rows: list[Mapping[str, Any]] = [events]
+    elif isinstance(events, Sequence) and not isinstance(
+        events, (str, bytes, bytearray)
+    ):
+        rows = [item for item in events if isinstance(item, Mapping)]
+    else:
+        rows = []
+    passing_rows = [
+        row
+        for row in rows
+        if _string(row.get("status") or row.get("decision")).lower()
+        in (*_PASS_STATUSES, "accepted", "approved", "allowed", "allow")
+    ]
+    demoted: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+    for index, event in enumerate(rows):
+        gate = _timeline_startup_gate_from_event(event)
+        if not gate or not _startup_is_host_adapter_surrogate(gate):
+            continue
+        surrogate_gate = surrogate_startup_evidence_gate(
+            gate,
+            real_startup_events=passing_rows,
+        )
+        event_ref = {
+            "index": index,
+            "id": _string(event.get("id") or event.get("event_id")),
+            "event_kind": _string(event.get("event_kind")),
+            "phase": _string(event.get("phase")),
+            "status": _string(event.get("status") or event.get("decision")),
+            "reason": surrogate_gate.get("reason", ""),
+            "real_worker_join": surrogate_gate.get("real_worker_join", {}),
+        }
+        if surrogate_gate.get("close_satisfying"):
+            accepted.append(event_ref)
+        else:
+            demoted.append(event_ref)
+    return {
+        "schema_version": CLOSE_TIMELINE_STARTUP_GATE_SCHEMA_VERSION,
+        "passed": not demoted,
+        "status": "passed" if not demoted else "failed",
+        "accepted_startup_events": accepted,
+        "demoted_startup_events": demoted,
+        "demoted_startup_event_indexes": [item["index"] for item in demoted],
+    }
+
+
+def close_timeline_events_for_verification(events: Any) -> dict[str, Any]:
+    gate = close_timeline_startup_event_gate(events)
+    if isinstance(events, Mapping):
+        rows: list[Mapping[str, Any]] = [events]
+    elif isinstance(events, Sequence) and not isinstance(
+        events, (str, bytes, bytearray)
+    ):
+        rows = [item for item in events if isinstance(item, Mapping)]
+    else:
+        rows = []
+    demoted_indexes = set(gate.get("demoted_startup_event_indexes") or [])
+    normalized: list[dict[str, Any]] = []
+    for index, event in enumerate(rows):
+        row = dict(event)
+        if index in demoted_indexes:
+            row["status"] = "demoted"
+            verification = dict(_mapping(row.get("verification"), field_name="verification"))
+            verification["mf_close_timeline_startup_gate"] = gate
+            row["verification"] = verification
+        normalized.append(row)
+    return {
+        "schema_version": "mf_close_timeline_events_for_verification.v1",
+        "events": normalized,
+        "startup_gate": gate,
     }
 
 
