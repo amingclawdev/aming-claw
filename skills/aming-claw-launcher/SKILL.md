@@ -57,10 +57,11 @@ When health/current-context is missing, refused, or stale enough to be unsafe:
 When governance is healthy but `GET /api/projects` does not include the active
 target workspace:
 
-1. Refuse to bootstrap the Aming Claw plugin checkout itself. Stop if the
-   target root contains `.codex-plugin/`, `.claude-plugin/`,
+1. Refuse to bootstrap the Aming Claw plugin checkout itself. Stop bootstrapping
+   that root if it contains `.codex-plugin/`, `.claude-plugin/`,
    `shared-volume/codex-tasks/`, or `.mcp.json` that points to
-   `--project aming-claw`. Ask for the real project root or cleanup first.
+   `--project aming-claw`. Ask for the real project root or cleanup first. If a
+   selected/registered project exists, still run Fixed First-Value Steps.
 2. Inspect or ask the user to confirm excludes before graph build. Start with
    `node_modules`, `dist`, `build`, `.expo`, `.next`, and `coverage`, then add
    project-local generated, vendored, nested, fixture, scratch, or downloaded

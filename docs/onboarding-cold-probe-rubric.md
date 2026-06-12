@@ -40,7 +40,7 @@ Expected behavior:
 - If governance is running and the checkout is detected, it refuses bootstrap
   because plugin/runtime artifacts such as `.claude-plugin/`, `.codex-plugin/`,
   `.mcp.json --project aming-claw`, or `shared-volume/codex-tasks/` indicate the
-  plugin checkout, not a target project.
+  plugin checkout, not a target project. Stop bootstrapping that root only.
 - It points to the dashboard for the selected project when one exists.
 - It runs or asks for one graph query and reports the real audit `trace_id`.
 - It files or asks to file the first backlog row only after graph evidence.
