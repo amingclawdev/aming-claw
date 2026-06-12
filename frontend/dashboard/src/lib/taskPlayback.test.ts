@@ -3264,6 +3264,16 @@ function eventChecklistAssertions(): string[] {
   assertFixture(routeGateRows.some((item) => item.label === "Route token hash"), "route_token_gate should include route token hash evidence");
   assertFixture(routeGateRows.some((item) => item.label === "Prompt contract hash"), "route_token_gate should include prompt contract hash");
   assertFixture(routeGateRows.some((item) => item.label === "Server binding"), "route_token_gate should include server binding facts");
+  const routeGateChecklistText = routeGateRows.map((item) => `${item.label} ${item.value}`).join(" ");
+  assertFixture(!routeGateChecklistText.includes("PRIVATE CONTEXT SHOULD NOT LEAK"), `route_token_gate checklist leaked private_context: ${routeGateChecklistText}`);
+  const routeGateRawVisible = JSON.stringify(routeGateFrame!.detail_inspector.raw_sections.map((section) => section.value));
+  assertFixture(!routeGateRawVisible.includes("PRIVATE CONTEXT SHOULD NOT LEAK"), `route_token_gate raw inspector leaked private_context: ${routeGateRawVisible}`);
+  assertFixture(routeGateRawVisible.includes("[private detail redacted]"), `route_token_gate raw inspector should include redacted marker, got ${routeGateRawVisible}`);
+  assertFixture(routeGateFrame!.detail_inspector.redaction_count >= 2, `route_token_gate raw inspector should redact raw token and private_context, got ${routeGateFrame!.detail_inspector.redaction_count}`);
+  assertFixture(
+    routeGateRawVisible.includes("allowed") && routeGateRawVisible.includes("rtok-fixture-public-ref") && routeGateRawVisible.includes("sha256:fixture-route-token-hash"),
+    `route_token_gate raw inspector should preserve public decision/ref/hash fields, got ${routeGateRawVisible}`,
+  );
 
   const startupRowsA = rowsFor(startupFrameA!);
   const startupRowsB = rowsFor(startupFrameB!);
