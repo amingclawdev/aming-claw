@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent } from "../types";
 import {
   isBacklogRowPrivate,
@@ -2992,7 +2993,54 @@ function eventChecklistAssertions(): string[] {
   ];
 }
 
-export const taskPlaybackEventChecklistSummary: string[] = eventChecklistAssertions();
+function eventChecklistLayoutAssertions(): string[] {
+  const componentSource = readFileSync(new URL("../components/TaskPlaybackPanel.tsx", import.meta.url), "utf8");
+  const stylesSource = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  const checklistIndex = componentSource.indexOf("<EventChecklistSection");
+  const referencesIndex = componentSource.indexOf("<ReferencesAndEvidenceSection");
+  const rawDataIndex = componentSource.indexOf("<AdvancedRawDataDetails");
+  assertFixture(checklistIndex >= 0, "event checklist component should render in the playback detail pane");
+  assertFixture(referencesIndex >= 0, "references section should render in the playback detail pane");
+  assertFixture(rawDataIndex >= 0, "advanced raw data details should render in the playback detail pane");
+  assertFixture(
+    checklistIndex < referencesIndex && referencesIndex < rawDataIndex,
+    "event checklist should render above references and Advanced raw data",
+  );
+  assertFixture(
+    !stylesSource.includes("grid-template-columns: minmax(104px, 0.32fr) minmax(0, 1fr)"),
+    "event checklist group should not reserve the old narrow label rail",
+  );
+  assertFixture(
+    !stylesSource.includes("grid-template-columns: 74px minmax(90px, 0.35fr) minmax(0, 1fr) 72px"),
+    "event checklist row should not use the old fixed four-column layout",
+  );
+  assertFixture(
+    /\.task-playback-event-checklist-group\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\);/.test(stylesSource),
+    "event checklist groups should span the full detail pane width",
+  );
+  assertFixture(
+    /\.task-playback-event-checklist\s*\{[\s\S]*?container-type:\s*inline-size;/.test(stylesSource),
+    "event checklist should use container width for responsive row layout",
+  );
+  assertFixture(
+    /\.task-playback-event-checklist-row\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\);[\s\S]*?grid-template-areas:[\s\S]*?"state"\s*"label"\s*"value"\s*"source";[\s\S]*?width:\s*100%;/.test(stylesSource),
+    "event checklist rows should default to full-width single-column named areas",
+  );
+  assertFixture(
+    /@container \(min-width:\s*560px\)[\s\S]*?\.task-playback-event-checklist-row\s*\{[\s\S]*?grid-template-areas:[\s\S]*?"state label value"[\s\S]*?"state source source";/.test(stylesSource),
+    "event checklist rows should use dense columns only when the checklist container is wide enough",
+  );
+
+  return [
+    "event checklist renders above references/raw data",
+    "event checklist CSS uses full-width groups and container-aware row areas",
+  ];
+}
+
+export const taskPlaybackEventChecklistSummary: string[] = [
+  ...eventChecklistAssertions(),
+  ...eventChecklistLayoutAssertions(),
+];
 
 // ──────────────────────────────────────────────────────────────────────────────
 // B1 / B2 UE-blocker canonical URL helpers

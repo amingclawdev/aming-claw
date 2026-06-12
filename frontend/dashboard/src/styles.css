@@ -10021,10 +10021,14 @@ details[open] .task-playback-narrative-summary::before {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
+  min-width: 0;
   border: 1px solid var(--ink-200, #e2e8f0);
   border-radius: 6px;
   background: var(--surface, #ffffff);
   padding: 10px;
+  box-sizing: border-box;
+  container-type: inline-size;
 }
 
 .task-playback-event-checklist-head {
@@ -10054,8 +10058,9 @@ details[open] .task-playback-narrative-summary::before {
 
 .task-playback-event-checklist-group {
   display: grid;
-  grid-template-columns: minmax(104px, 0.32fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
+  width: 100%;
   min-width: 0;
 }
 
@@ -10079,14 +10084,22 @@ details[open] .task-playback-narrative-summary::before {
 
 .task-playback-event-checklist-row {
   display: grid;
-  grid-template-columns: 74px minmax(90px, 0.35fr) minmax(0, 1fr) 72px;
-  gap: 6px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "state"
+    "label"
+    "value"
+    "source";
+  gap: 4px 10px;
   align-items: start;
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
   border: 1px solid var(--ink-100, #f1f5f9);
   border-radius: 5px;
   padding: 5px 6px;
   background: var(--ink-50, #f8fafc);
+  box-sizing: border-box;
 }
 
 .task-playback-event-checklist-row.checklist-status-passed,
@@ -10107,6 +10120,8 @@ details[open] .task-playback-narrative-summary::before {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  grid-area: state;
+  justify-self: start;
   min-width: 0;
   border-radius: 4px;
   padding: 2px 4px;
@@ -10114,7 +10129,8 @@ details[open] .task-playback-narrative-summary::before {
   font-weight: 700;
   line-height: 1.2;
   text-transform: uppercase;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow-wrap: normal;
 }
 
 .task-playback-event-checklist-label,
@@ -10127,20 +10143,23 @@ details[open] .task-playback-narrative-summary::before {
 }
 
 .task-playback-event-checklist-label {
+  grid-area: label;
   color: var(--ink-700, #334155);
   font-weight: 600;
   font-size: 0.78rem;
 }
 
 .task-playback-event-checklist-value {
+  grid-area: value;
   color: var(--ink-800, #1e293b);
   font-size: 0.8rem;
 }
 
 .task-playback-event-checklist-source {
+  grid-area: source;
   color: var(--ink-400, #94a3b8);
   font-size: 0.72rem;
-  text-align: right;
+  text-align: left;
 }
 
 .task-playback-event-checklist-overflow {
@@ -10148,10 +10167,27 @@ details[open] .task-playback-narrative-summary::before {
   font-size: 0.76rem;
 }
 
+@container (min-width: 560px) {
+  .task-playback-event-checklist-row {
+    grid-template-columns: auto minmax(8rem, 0.34fr) minmax(0, 1fr);
+    grid-template-areas:
+      "state label value"
+      "state source source";
+  }
+}
+
 @media (max-width: 860px) {
   .task-playback-event-checklist-group,
   .task-playback-event-checklist-row {
     grid-template-columns: 1fr;
+  }
+
+  .task-playback-event-checklist-row {
+    grid-template-areas:
+      "state"
+      "label"
+      "value"
+      "source";
   }
 
   .task-playback-event-checklist-state {
