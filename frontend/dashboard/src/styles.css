@@ -3334,7 +3334,7 @@ a:hover { text-decoration: underline; }
   min-width: 0;
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: 8px;
   /* Right column: independently bounded so controls stay above the list and
      the list/detail pane scrolls inside the viewport. */
   overflow: hidden;
@@ -3433,15 +3433,13 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-panel {
-  /* Natural-height summary sections come before the bounded timeline/detail
-     body. Flex keeps checklist, metrics, and lane summaries from collapsing
-     into the old two-row grid. */
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   padding: 12px;
   height: 100%;
-  overflow-y: auto;
+  min-height: 0;
+  overflow: hidden;
   overflow-x: hidden;
 }
 
@@ -3479,35 +3477,59 @@ a:hover { text-decoration: underline; }
   gap: 7px;
 }
 
+.task-playback-summary-strip {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .task-playback-metrics,
 .task-playback-lanes {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-  gap: 8px;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.task-playback-summary-strip .task-playback-metrics {
+  flex: 0 0 auto;
+}
+
+.task-playback-summary-strip .task-playback-lanes {
+  flex: 1 1 320px;
 }
 
 .task-playback-metric,
 .task-playback-lane {
   min-width: 0;
-  padding: 8px;
+  padding: 6px 7px;
   border: 1px solid var(--ink-100);
   border-radius: 6px;
   background: #fff;
 }
 
+.task-playback-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-height: 30px;
+}
+
 .task-playback-metric span,
 .task-playback-lane .mono {
-  display: block;
   color: var(--ink-500);
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 800;
   text-transform: uppercase;
 }
 
 .task-playback-metric strong {
-  display: block;
   color: var(--ink-900);
-  font-size: 18px;
+  font-size: 14px;
 }
 
 .task-playback-lane {
@@ -3515,7 +3537,8 @@ a:hover { text-decoration: underline; }
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  width: 100%;
+  flex: 1 1 150px;
+  min-height: 34px;
   color: inherit;
   text-align: left;
   font: inherit;
@@ -3537,9 +3560,9 @@ a:hover { text-decoration: underline; }
 .task-playback-lane-next {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 1;
   max-width: 100%;
-  margin-top: 4px;
+  margin-top: 2px;
   color: var(--ink-700);
   font-size: 10.5px;
   font-style: normal;
@@ -3568,26 +3591,24 @@ a:hover { text-decoration: underline; }
 }
 
 .task-playback-body {
-  /* B3: bounded height so each inner column can scroll independently on
-     desktop (> 980px). The parent panel is a flex column, so this row receives
-     the remaining height after header/checklist/metrics/lane summaries. */
   display: grid;
-  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  gap: 8px;
   align-items: stretch;
-  flex: 1 0 260px;
-  min-height: 260px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
 .task-playback-frame-list {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   align-content: start;
   margin: 0;
   padding: 0;
   list-style: none;
   min-height: 0;
+  height: 100%;
   overflow-y: auto;
 }
 
@@ -3595,10 +3616,10 @@ a:hover { text-decoration: underline; }
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
-  min-height: 38px;
-  padding: 7px 8px;
+  min-height: 34px;
+  padding: 5px 7px;
   border: 1px solid var(--ink-100);
   border-radius: 6px;
   background: #fff;
@@ -3663,6 +3684,7 @@ a:hover { text-decoration: underline; }
    pane both stay within the viewport-bounded layout on desktop. */
 .task-playback-detail-column {
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   height: 100%;
 }
@@ -3926,25 +3948,57 @@ a:hover { text-decoration: underline; }
 .task-playback-gate-matrix {
   min-width: 0;
   display: grid;
-  gap: 8px;
-  padding: 8px;
-  border: 1px solid var(--ink-100);
+  gap: 0;
   border-radius: 6px;
-  background: #fff;
-  max-height: 260px;
-  overflow: auto;
+  background: transparent;
+  overflow: visible;
 }
 
-.task-playback-gate-matrix-head {
+.task-playback-gate-matrix-summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid var(--ink-100);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink-800);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
 }
 
-.task-playback-gate-matrix-head strong {
+.task-playback-gate-matrix-summary > span:first-child {
+  min-width: 0;
+  overflow: hidden;
   color: var(--ink-800);
   font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-playback-gate-matrix-summary .status-badge {
+  flex-shrink: 0;
+}
+
+.task-playback-gate-matrix.expanded .task-playback-gate-matrix-summary {
+  border-radius: 6px 6px 0 0;
+}
+
+.task-playback-gate-matrix-body {
+  display: grid;
+  gap: 8px;
+  max-height: min(42vh, 360px);
+  padding: 8px;
+  border: 1px solid var(--ink-100);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  background: #fff;
+  overflow: auto;
 }
 
 .backlog-implementation-steps {

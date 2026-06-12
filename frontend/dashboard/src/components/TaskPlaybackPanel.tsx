@@ -58,6 +58,7 @@ export default function TaskPlaybackPanel({
   const [eventKindFilter, setEventKindFilter] = useState("all");
   const [eventIdFilter, setEventIdFilter] = useState("");
   const [dateFilter, setDateFilter] = useState<FrameDateFilter>("all");
+  const [closeGateMatrixExpanded, setCloseGateMatrixExpanded] = useState(false);
   // Navigation stack: records the sequence of frame visits so Back works across cross-refs.
   const [navStack, setNavStack] = useState<NavStackEntry[]>([]);
 
@@ -172,6 +173,7 @@ export default function TaskPlaybackPanel({
     setEventKindFilter("all");
     setEventIdFilter("");
     setDateFilter("all");
+    setCloseGateMatrixExpanded(false);
     setNavStack([]);
     // Reset follow state when backlog changes.
     if (newestFirst) {
@@ -236,41 +238,45 @@ export default function TaskPlaybackPanel({
         <PlaybackGateMatrix
           matrix={trace.close_gate_matrix}
           frames={allFrames}
+          expanded={closeGateMatrixExpanded}
+          onToggle={() => setCloseGateMatrixExpanded((expanded) => !expanded)}
           onJump={(frameId) => selectFrame(frameId, undefined, true)}
         />
       ) : null}
 
-      <div className="task-playback-metrics">
-        <Metric label="Frames" value={String(trace.statuses.total_frames)} />
-        <Metric label="Lanes" value={String(trace.lanes.length)} />
-        <Metric label="Evidence" value={String(trace.evidence_refs.length)} />
-        <Metric label="Artifacts" value={String(trace.artifact_refs.length)} />
-      </div>
-
-      {trace.lanes.length > 0 ? (
-        <div className="task-playback-lanes" aria-label="Playback lanes">
-          {trace.lanes.map((lane) => (
-            <button
-              type="button"
-              className={`task-playback-lane lane-${lane.family}${lane.driving_frame_id === selectedFrame?.id ? " active" : ""}`}
-              key={lane.id}
-              onClick={() => selectLane(lane)}
-              title={[
-                lane.reason_sentence ? `Reason: ${lane.reason_sentence}` : "",
-                lane.next_expected_action ? `Next: ${lane.next_expected_action}` : "",
-              ].filter(Boolean).join("\n") || `Jump to ${lane.label} lane`}
-            >
-              <div>
-                <strong>{lane.label}</strong>
-                <span className="mono">{lane.frame_count} frame{lane.frame_count === 1 ? "" : "s"}</span>
-                {lane.reason_sentence ? <em className="task-playback-lane-reason">{lane.reason_sentence}</em> : null}
-                {lane.next_expected_action ? <em className="task-playback-lane-next">{lane.next_expected_action}</em> : null}
-              </div>
-              <span className={`status-badge ${statusClass(lane.status)}`}>{lane.status}</span>
-            </button>
-          ))}
+      <div className="task-playback-summary-strip" aria-label="Playback summary">
+        <div className="task-playback-metrics" aria-label="Playback counts">
+          <Metric label="Frames" value={String(trace.statuses.total_frames)} />
+          <Metric label="Lanes" value={String(trace.lanes.length)} />
+          <Metric label="Evidence" value={String(trace.evidence_refs.length)} />
+          <Metric label="Artifacts" value={String(trace.artifact_refs.length)} />
         </div>
-      ) : null}
+
+        {trace.lanes.length > 0 ? (
+          <div className="task-playback-lanes" aria-label="Playback lanes">
+            {trace.lanes.map((lane) => (
+              <button
+                type="button"
+                className={`task-playback-lane lane-${lane.family}${lane.driving_frame_id === selectedFrame?.id ? " active" : ""}`}
+                key={lane.id}
+                onClick={() => selectLane(lane)}
+                title={[
+                  lane.reason_sentence ? `Reason: ${lane.reason_sentence}` : "",
+                  lane.next_expected_action ? `Next: ${lane.next_expected_action}` : "",
+                ].filter(Boolean).join("\n") || `Jump to ${lane.label} lane`}
+              >
+                <div>
+                  <strong>{lane.label}</strong>
+                  <span className="mono">{lane.frame_count} frame{lane.frame_count === 1 ? "" : "s"}</span>
+                  {lane.reason_sentence ? <em className="task-playback-lane-reason">{lane.reason_sentence}</em> : null}
+                  {lane.next_expected_action ? <em className="task-playback-lane-next">{lane.next_expected_action}</em> : null}
+                </div>
+                <span className={`status-badge ${statusClass(lane.status)}`}>{lane.status}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
 
       {trace.frames.length > 0 ? (
         <div className="task-playback-body">
@@ -429,12 +435,18 @@ export default function TaskPlaybackPanel({
 function PlaybackGateMatrix({
   matrix,
   frames,
+  expanded,
+  onToggle,
   onJump,
 }: {
   matrix: GateMatrixProjection;
   frames: TaskPlaybackFrame[];
+  expanded: boolean;
+  onToggle: () => void;
   onJump: (frameId: string) => void;
 }) {
+  const summary = summarizeGateMatrix(matrix);
+  const bodyId = "task-playback-close-gate-matrix-body";
   const familyOrder: GateMatrixRow["family"][] = [];
   const byFamily = new Map<GateMatrixRow["family"], GateMatrixRow[]>();
   for (const row of matrix.rows) {
@@ -445,43 +457,63 @@ function PlaybackGateMatrix({
     byFamily.get(row.family)!.push(row);
   }
   return (
-    <section className="task-playback-gate-matrix" aria-label="Close gate verification checklist">
-      <div className="task-playback-gate-matrix-head">
-        <strong>Close gate checklist</strong>
-        <span className={`status-badge ${matrix.gatePresent && matrix.applicable ? matrixStatusClass(matrix.overallPassed ? "passed" : "failed") : "status-unknown"}`}>
-          {!matrix.gatePresent ? "gate not loaded" : !matrix.applicable ? "not applicable" : matrix.overallPassed ? "passed" : "blocked"}
-        </span>
-      </div>
-      {!matrix.applicable ? (
-        <div className="timeline-empty">This backlog row is not subject to the MF close gate.</div>
-      ) : matrix.rows.length === 0 ? (
-        <div className="timeline-empty">No gate requirement rows were found in the loaded gate response.</div>
-      ) : (
-        <div className="gate-matrix" role="table" aria-label="Close gate requirements">
-          <div className="gate-matrix-header" role="row">
-            <span role="columnheader">Requirement</span>
-            <span role="columnheader">Required?</span>
-            <span role="columnheader">Status</span>
-            <span role="columnheader">Evidence / next action</span>
-          </div>
-          {familyOrder.map((family) => {
-            const rows = byFamily.get(family) ?? [];
-            const label = rows[0]?.familyLabel ?? family;
-            return (
-              <div key={family} className="gate-matrix-family" role="rowgroup">
-                <div className="gate-matrix-family-head" role="row">
-                  <span role="cell" className="mono">{label}</span>
-                </div>
-                {rows.map((row) => (
-                  <PlaybackGateMatrixRow key={row.id} row={row} frames={frames} onJump={onJump} />
-                ))}
+    <section className={`task-playback-gate-matrix${expanded ? " expanded" : " collapsed"}`} aria-label="Close gate verification checklist">
+      <button
+        type="button"
+        className="task-playback-gate-matrix-summary"
+        aria-expanded={expanded}
+        aria-controls={bodyId}
+        onClick={onToggle}
+      >
+        <span>{summary.label}</span>
+        <span className={`status-badge ${summary.statusClass}`}>{expanded ? "hide requirements" : "show requirements"}</span>
+      </button>
+      {expanded ? (
+        <div id={bodyId} className="task-playback-gate-matrix-body">
+          {!matrix.applicable ? (
+            <div className="timeline-empty">This backlog row is not subject to the MF close gate.</div>
+          ) : matrix.rows.length === 0 ? (
+            <div className="timeline-empty">No gate requirement rows were found in the loaded gate response.</div>
+          ) : (
+            <div className="gate-matrix" role="table" aria-label="Close gate requirements">
+              <div className="gate-matrix-header" role="row">
+                <span role="columnheader">Requirement</span>
+                <span role="columnheader">Required?</span>
+                <span role="columnheader">Status</span>
+                <span role="columnheader">Evidence / next action</span>
               </div>
-            );
-          })}
+              {familyOrder.map((family) => {
+                const rows = byFamily.get(family) ?? [];
+                const label = rows[0]?.familyLabel ?? family;
+                return (
+                  <div key={family} className="gate-matrix-family" role="rowgroup">
+                    <div className="gate-matrix-family-head" role="row">
+                      <span role="cell" className="mono">{label}</span>
+                    </div>
+                    {rows.map((row) => (
+                      <PlaybackGateMatrixRow key={row.id} row={row} frames={frames} onJump={onJump} />
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
-      )}
+      ) : null}
     </section>
   );
+}
+
+function summarizeGateMatrix(matrix: GateMatrixProjection): { label: string; statusClass: string } {
+  const evidenceRows = matrix.rows.filter((row) => row.required && row.status !== "not_applicable");
+  const total = evidenceRows.length;
+  const satisfied = evidenceRows.filter((row) => row.status === "passed").length;
+  const verdict = !matrix.gatePresent ? "not loaded" : !matrix.applicable ? "not applicable" : matrix.overallPassed ? "passed" : "blocked";
+  const statusClass = matrix.gatePresent && matrix.applicable ? matrixStatusClass(matrix.overallPassed ? "passed" : "failed") : "status-unknown";
+  return {
+    label: `Close gate - ${verdict} - ${satisfied}/${total} evidence`,
+    statusClass,
+  };
 }
 
 function PlaybackGateMatrixRow({

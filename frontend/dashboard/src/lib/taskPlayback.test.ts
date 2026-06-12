@@ -3399,6 +3399,85 @@ export const taskPlaybackEventChecklistSummary: string[] = [
   ...eventChecklistLayoutAssertions(),
 ];
 
+function playbackLayoutFrameAreaAssertions(): string[] {
+  const componentSource = readFileSync(new URL("../components/TaskPlaybackPanel.tsx", import.meta.url), "utf8");
+  const stylesSource = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  const gateMatrixRule = stylesSource.match(/\.task-playback-gate-matrix\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
+
+  assertFixture(
+    /const \[closeGateMatrixExpanded,\s*setCloseGateMatrixExpanded\]\s*=\s*useState\(false\);/.test(componentSource),
+    "close gate matrix should have default-collapsed local state",
+  );
+  assertFixture(
+    /setCloseGateMatrixExpanded\(false\);[\s\S]*setNavStack\(\[\]\);/.test(componentSource),
+    "close gate expansion should reset only on backlog-level trace reset, not frame selection",
+  );
+  assertFixture(
+    /<PlaybackGateMatrix[\s\S]*expanded=\{closeGateMatrixExpanded\}[\s\S]*onToggle=\{\(\) => setCloseGateMatrixExpanded/.test(componentSource),
+    "PlaybackGateMatrix should receive persistent expanded state and a toggle",
+  );
+  assertFixture(
+    /function summarizeGateMatrix\([\s\S]*row\.required && row\.status !== "not_applicable"[\s\S]*Close gate - \$\{verdict\} - \$\{satisfied\}\/\$\{total\} evidence/.test(componentSource),
+    "close gate summary should include verdict plus required satisfied/total evidence count",
+  );
+  assertFixture(
+    /className="task-playback-gate-matrix-summary"[\s\S]*aria-expanded=\{expanded\}[\s\S]*aria-controls=\{bodyId\}/.test(componentSource),
+    "close gate summary should be an accessible expandable control",
+  );
+  assertFixture(
+    /expanded \? \([\s\S]*className="task-playback-gate-matrix-body"[\s\S]*<div className="gate-matrix" role="table"/.test(componentSource),
+    "full close gate requirement table should remain reachable only when expanded",
+  );
+  assertFixture(
+    /<div className="task-playback-summary-strip"[\s\S]*<Metric label="Frames"[\s\S]*<Metric label="Artifacts"[\s\S]*<div className="task-playback-lanes"/.test(componentSource),
+    "playback metrics and lane chips should render in one summary strip",
+  );
+
+  assertFixture(
+    /\.task-playback-summary-strip\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-wrap:\s*wrap;/.test(stylesSource),
+    "summary strip should compact metrics and lanes into one wrapping row",
+  );
+  assertFixture(
+    /\.task-playback-panel\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*height:\s*100%;[\s\S]*min-height:\s*0;[\s\S]*overflow:\s*hidden;/.test(stylesSource),
+    "task playback panel should be a real bounded flex column",
+  );
+  assertFixture(
+    /\.task-playback-body\s*\{[\s\S]*flex:\s*1 1 auto;[\s\S]*min-height:\s*0;[\s\S]*overflow:\s*hidden;/.test(stylesSource),
+    "task playback body should be governed by the parent flex column and remain shrinkable",
+  );
+  assertFixture(
+    !/\.task-playback-body\s*\{[\s\S]*flex:\s*1 1 50vh;/.test(stylesSource),
+    "task playback body should not rely on the old inert 50vh flex shorthand",
+  );
+  assertFixture(
+    /\.task-playback-frame-list\s*\{[\s\S]*height:\s*100%;[\s\S]*overflow-y:\s*auto;/.test(stylesSource),
+    "frame list should own an independent vertical scroll area",
+  );
+  assertFixture(
+    /\.task-playback-detail-column\s*\{[\s\S]*overflow-y:\s*auto;[\s\S]*height:\s*100%;/.test(stylesSource),
+    "frame detail should own an independent vertical scroll area",
+  );
+  assertFixture(
+    !/max-height:\s*260px/.test(gateMatrixRule),
+    "close gate matrix should not keep the old expanded-by-default 260px height reservation",
+  );
+  assertFixture(
+    /\.task-playback-gate-matrix-body\s*\{[\s\S]*max-height:\s*min\(42vh,\s*360px\);[\s\S]*overflow:\s*auto;/.test(stylesSource),
+    "expanded close gate details should scroll inside their own body",
+  );
+
+  return [
+    "close gate matrix defaults collapsed with accessible expansion",
+    "close gate full requirement table remains reachable when expanded",
+    "metrics and lane chips share one compact summary strip",
+    "frame list/detail use independent desktop scroll regions inside a bounded flex body",
+  ];
+}
+
+export const taskPlaybackLayoutFrameAreaSummary: string[] = [
+  ...playbackLayoutFrameAreaAssertions(),
+];
+
 // ──────────────────────────────────────────────────────────────────────────────
 // B1 / B2 UE-blocker canonical URL helpers
 // (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611)
