@@ -50,7 +50,17 @@ export interface TaskPlaybackStructuredFact {
   source: "event" | "payload" | "verification" | "artifact_refs" | "semantic";
 }
 
-export type TaskPlaybackChecklistItemStatus = "passed" | "satisfied" | "present" | "missing" | "blocked" | "failed" | "required" | "recorded" | "unknown";
+export type TaskPlaybackChecklistItemStatus =
+  | "passed"
+  | "satisfied"
+  | "present"
+  | "missing"
+  | "blocked"
+  | "failed"
+  | "required"
+  | "pending"
+  | "recorded"
+  | "unknown";
 
 export interface TaskPlaybackChecklistItem {
   id: string;
@@ -1093,7 +1103,7 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
 }
 
 const EVENT_CHECKLIST_MAX_ITEMS = 24;
-const EVENT_CHECKLIST_MAX_ITEMS_PER_CATEGORY = 8;
+const EVENT_CHECKLIST_MAX_ITEMS_PER_CATEGORY = 12;
 
 function eventChecklistFromEvent(
   event: TaskTimelineEvent,
@@ -1102,20 +1112,23 @@ function eventChecklistFromEvent(
   failureDiagnosis: TaskPlaybackStructuredFact[],
 ): TaskPlaybackEventChecklist {
   const items: TaskPlaybackChecklistItem[] = [];
+  const typedPaths = new Set<string>();
+  const finalBlockingVerdict = isFinalBlockingChecklistVerdict(event, frameStatus);
 
   for (const fact of failureDiagnosis) {
     const status = checklistStatusFromFact(fact, frameStatus);
     pushChecklistItem(items, fact.kind, fact.label, fact.value, status, fact.source);
   }
 
+  const unmetStatus: TaskPlaybackChecklistItemStatus = finalBlockingVerdict ? "missing" : "pending";
   pushChecklistPathItems(items, event, "missing_event_kinds", "Missing event kind", "missing", [
     "payload.missing_event_kinds",
     "payload.blocked_event_kinds",
     "payload.blocked_protected_event_kinds",
     "verification.missing_event_kinds",
     "verification.blocked_event_kinds",
-  ]);
-  pushChecklistPathItems(items, event, "missing_requirements", "Missing requirement", "missing", [
+  ], typedPaths, unmetStatus);
+  pushChecklistPathItems(items, event, "missing_requirements", finalBlockingVerdict ? "Missing requirement" : "Pending requirement", unmetStatus, [
     "payload.missing_required_evidence",
     "payload.missing_requirement_ids",
     "payload.missing_protected_lanes",
@@ -1131,7 +1144,7 @@ function eventChecklistFromEvent(
     "verification.route_context_gate.missing_required_evidence",
     "verification.contract_gate.missing_requirement_ids",
     "verification.contract_gate.missing_required_evidence",
-  ]);
+  ], typedPaths);
   pushChecklistPathItems(items, event, "present_event_kinds", "Present event kind", "present", [
     "payload.present_event_kinds",
     "payload.recorded_event_kinds",
@@ -1151,13 +1164,13 @@ function eventChecklistFromEvent(
     "verification.passed_requirement_ids",
     "verification.present_required_evidence",
     "verification.satisfied_required_evidence",
-  ]);
+  ], typedPaths);
   pushChecklistPathItems(items, event, "required_event_kinds", "Required event kind", "required", [
     "payload.required_event_kinds",
     "payload.required_before_protected_evidence",
     "verification.required_event_kinds",
     "verification.required_before_protected_evidence",
-  ]);
+  ], typedPaths);
   pushChecklistPathItems(items, event, "required_requirements", "Required requirement", "required", [
     "payload.required_evidence",
     "payload.evidence_required",
@@ -1167,7 +1180,7 @@ function eventChecklistFromEvent(
     "verification.required_evidence",
     "verification.evidence_required",
     "verification.required_requirement_ids",
-  ]);
+  ], typedPaths);
 
   const verificationPassed = firstPublicValueAtPaths(event, ["verification.passed", "payload.verification.passed", "payload.passed"]);
   if (verificationPassed) {
@@ -1176,9 +1189,10 @@ function eventChecklistFromEvent(
       "verification_passed",
       "Verification result",
       verificationPassed.value,
-      checklistStatusFromValue(verificationPassed.value, "passed"),
+      checklistStatusFromPathValue(verificationPassed.path, verificationPassed.value, finalBlockingVerdict ? "failed" : "recorded", finalBlockingVerdict),
       verificationPassed.source,
     );
+    typedPaths.add(verificationPassed.path);
   }
 
   const factAllowList = new Set([
@@ -1196,8 +1210,13 @@ function eventChecklistFromEvent(
     pushChecklistItem(items, fact.kind, fact.label, fact.value, checklistStatusFromFact(fact, frameStatus), fact.source);
   }
 
+  pushRouteTokenGateChecklistItems(items, typedPaths, event, finalBlockingVerdict);
+  pushMfSubagentStartupGateChecklistItems(items, typedPaths, event, finalBlockingVerdict);
+  pushReadReceiptChecklistItems(items, typedPaths, event, finalBlockingVerdict);
+  pushImplementationEvidenceChecklistItems(items, typedPaths, event);
+
   for (const root of CHECKLIST_STRUCTURED_ROOTS) {
-    collectChecklistLikeItems(items, valueAtPath(event as unknown as Record<string, unknown>, root.path), root.path, root.label, root.status);
+    collectChecklistLikeItems(items, valueAtPath(event as unknown as Record<string, unknown>, root.path), root.path, root.label, root.status, finalBlockingVerdict, typedPaths);
   }
 
   return buildEventChecklist(items);
@@ -1224,6 +1243,277 @@ const CHECKLIST_STRUCTURED_ROOTS: Array<{ path: string; label: string; status?: 
   { path: "artifact_refs.contract_evidence", label: "Contract evidence" },
 ];
 
+function pushRouteTokenGateChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  finalBlockingVerdict: boolean,
+): void {
+  pushFirstChecklistValue(items, typedPaths, event, "route_gate_decision", "Route gate decision", [
+    "payload.route_token_gate.decision",
+    "verification.route_token_gate.decision",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "route_gate_action", "Route gate action", [
+    "payload.route_token_gate.action",
+    "verification.route_token_gate.action",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "route_gate_status", "Route gate status", [
+    "payload.route_token_gate.status",
+    "payload.route_token_gate.result",
+    "verification.route_token_gate.status",
+    "verification.route_token_gate.result",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "route_gate_binding_source", "Binding source", [
+    "payload.route_token_gate.binding_source",
+    "payload.route_token_gate.binding.source",
+    "verification.route_token_gate.binding_source",
+    "verification.route_token_gate.binding.source",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "route_token_ref", "Route token ref", [
+    "payload.route_token_gate.route_token_ref",
+    "payload.route_token_gate.binding.route_token_ref",
+    "payload.route_token_gate.server_binding.route_token_ref",
+    "verification.route_token_gate.route_token_ref",
+  ], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "route_token_hash", "Route token hash", [
+    "payload.route_token_gate.route_token_hash",
+    "payload.route_token_gate.binding.route_token_hash",
+    "verification.route_token_gate.route_token_hash",
+  ], "present", finalBlockingVerdict);
+  pushRoutePromptHashChecklistItems(items, typedPaths, event, "payload.route_token_gate", finalBlockingVerdict);
+  pushRoutePromptHashChecklistItems(items, typedPaths, event, "verification.route_token_gate", finalBlockingVerdict);
+  pushChecklistValues(items, typedPaths, event, "route_gate_server_binding", "Server binding", [
+    "payload.route_token_gate.server_binding_ref",
+    "payload.route_token_gate.server_binding_id",
+    "payload.route_token_gate.server_binding.ref",
+    "payload.route_token_gate.server_binding.id",
+    "verification.route_token_gate.server_binding_ref",
+    "verification.route_token_gate.server_binding_id",
+  ], "present", finalBlockingVerdict);
+  pushChecklistValues(items, typedPaths, event, "route_gate_hash_verification", "Hash verification", [
+    "payload.route_token_gate.route_context_hash_verified",
+    "payload.route_token_gate.prompt_contract_hash_verified",
+    "payload.route_token_gate.visible_injection_manifest_hash_verified",
+    "payload.route_token_gate.route_context_hash_matches",
+    "payload.route_token_gate.prompt_contract_hash_matches",
+    "payload.route_token_gate.visible_injection_manifest_hash_matches",
+    "verification.route_token_gate.route_context_hash_verified",
+    "verification.route_token_gate.prompt_contract_hash_verified",
+  ], "passed", finalBlockingVerdict);
+}
+
+function pushMfSubagentStartupGateChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  finalBlockingVerdict: boolean,
+): void {
+  pushChecklistValues(items, typedPaths, event, "startup_gate_state", "Startup gate state", [
+    "payload.mf_subagent_startup_gate.startup_complete",
+    "payload.mf_subagent_startup_gate.actual_startup_recorded",
+    "payload.mf_subagent_startup_gate.passed",
+    "verification.mf_subagent_startup_gate.startup_complete",
+    "verification.mf_subagent_startup_gate.actual_startup_recorded",
+  ], "passed", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "startup_source", "Startup source", [
+    "payload.mf_subagent_startup_gate.startup_source",
+    "payload.mf_subagent_startup_gate.source",
+    "verification.mf_subagent_startup_gate.startup_source",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "worker_role", "Worker role", [
+    "payload.mf_subagent_startup_gate.worker_role",
+    "payload.worker_role",
+    "verification.mf_subagent_startup_gate.worker_role",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "worker_id", "Worker id", [
+    "payload.mf_subagent_startup_gate.worker_id",
+    "payload.worker_id",
+    "verification.mf_subagent_startup_gate.worker_id",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "agent_id_match_mode", "Agent-id match mode", [
+    "payload.mf_subagent_startup_gate.agent_id_match_mode",
+    "payload.identity_join.agent_id_match_mode",
+    "verification.mf_subagent_startup_gate.agent_id_match_mode",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "session_token_evidence_type", "Session token evidence type", [
+    "payload.mf_subagent_startup_gate.session_token_evidence_type",
+    "payload.session_token_evidence_type",
+    "verification.mf_subagent_startup_gate.session_token_evidence_type",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "close_satisfying", "Close satisfying", [
+    "payload.mf_subagent_startup_gate.close_satisfying",
+    "payload.close_satisfying",
+    "verification.mf_subagent_startup_gate.close_satisfying",
+  ], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "branch_ref", "Branch ref", [
+    "payload.mf_subagent_startup_gate.branch_ref",
+    "payload.branch_ref",
+    "verification.mf_subagent_startup_gate.branch_ref",
+  ], "present", finalBlockingVerdict);
+  pushRoutePromptHashChecklistItems(items, typedPaths, event, "payload.mf_subagent_startup_gate", finalBlockingVerdict);
+  pushRoutePromptHashChecklistItems(items, typedPaths, event, "verification.mf_subagent_startup_gate", finalBlockingVerdict);
+  pushReadReceiptBindingChecklistItems(items, typedPaths, event, "payload.mf_subagent_startup_gate", finalBlockingVerdict);
+  pushReadReceiptBindingChecklistItems(items, typedPaths, event, "verification.mf_subagent_startup_gate", finalBlockingVerdict);
+  pushWorkerScopeChecklistItems(items, typedPaths, event, "payload.mf_subagent_startup_gate", finalBlockingVerdict);
+  pushWorkerScopeChecklistItems(items, typedPaths, event, "verification.mf_subagent_startup_gate", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "startup_server_binding", "Server binding", [
+    "payload.mf_subagent_startup_gate.server_binding_ref",
+    "payload.mf_subagent_startup_gate.server_binding_id",
+    "payload.mf_subagent_startup_gate.server_binding.ref",
+    "payload.mf_subagent_startup_gate.server_binding.id",
+  ], "present", finalBlockingVerdict);
+}
+
+function pushReadReceiptChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  finalBlockingVerdict: boolean,
+): void {
+  pushRoutePromptHashChecklistItems(items, typedPaths, event, "payload", finalBlockingVerdict);
+  pushRoutePromptHashChecklistItems(items, typedPaths, event, "verification", finalBlockingVerdict);
+  pushReadReceiptBindingChecklistItems(items, typedPaths, event, "payload", finalBlockingVerdict);
+  pushReadReceiptBindingChecklistItems(items, typedPaths, event, "verification", finalBlockingVerdict);
+  pushWorkerScopeChecklistItems(items, typedPaths, event, "payload", finalBlockingVerdict);
+  pushWorkerScopeChecklistItems(items, typedPaths, event, "verification", finalBlockingVerdict);
+  pushChecklistValues(items, typedPaths, event, "read_receipt_ordering", "Read ordering", [
+    "payload.read_before",
+    "payload.read_before_startup",
+    "payload.read_before_dispatch",
+    "payload.read_before_implementation",
+    "payload.read_ordering",
+    "payload.read_receipt_ordering",
+    "verification.read_before",
+    "verification.read_before_startup",
+    "verification.read_ordering",
+  ], "recorded", finalBlockingVerdict);
+  pushChecklistValues(items, typedPaths, event, "read_receipt_ack", "Read receipt acknowledgement", [
+    "payload.acknowledged_stop_state",
+    "payload.acknowledged_forbidden_actions",
+    "payload.acknowledged_owned_files",
+    "verification.acknowledged_stop_state",
+    "verification.acknowledged_forbidden_actions",
+  ], "recorded", finalBlockingVerdict);
+}
+
+function pushImplementationEvidenceChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+): void {
+  pushChecklistValues(items, typedPaths, event, "changed_file", "Changed file", [
+    "payload.changed_files",
+    "payload.modified_files",
+    "payload.updated_files",
+    "verification.changed_files",
+    "artifact_refs.changed_files",
+  ], "present", false);
+  pushFirstChecklistValue(items, typedPaths, event, "commit_sha", "Commit SHA", [
+    "commit_sha",
+    "payload.commit_sha",
+    "payload.commit",
+    "verification.commit_sha",
+    "artifact_refs.commit_sha",
+  ], "present", false);
+  pushFirstChecklistValue(items, typedPaths, event, "worker_precommit_trace", "Worker precommit trace", [
+    "payload.worker_reported_precommit_trace",
+    "payload.worker_reported_precommit_trace_id",
+    "payload.worker_precommit_trace",
+    "payload.worker_precommit_trace_id",
+    "payload.precommit_trace_id",
+    "verification.worker_reported_precommit_trace",
+    "artifact_refs.worker_reported_precommit_trace",
+  ], "present", false);
+}
+
+function pushRoutePromptHashChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  root: string,
+  finalBlockingVerdict: boolean,
+): void {
+  pushFirstChecklistValue(items, typedPaths, event, "route_id", "Route id", [`${root}.route_id`, `${root}.route_identity.route_id`], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "route_context_hash", "Route context hash", [`${root}.route_context_hash`, `${root}.route_identity.route_context_hash`], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "prompt_contract_id", "Prompt contract id", [`${root}.prompt_contract_id`, `${root}.route_identity.prompt_contract_id`], "recorded", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "prompt_contract_hash", "Prompt contract hash", [`${root}.prompt_contract_hash`, `${root}.route_identity.prompt_contract_hash`], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "visible_injection_manifest_hash", "Visible injection manifest", [`${root}.visible_injection_manifest_hash`, `${root}.route_identity.visible_injection_manifest_hash`], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "launch_text_hash", "Launch text hash", [`${root}.launch_text_hash`, `${root}.route_identity.launch_text_hash`], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "canonical_visible_contract_text_hash", "Visible contract text hash", [`${root}.canonical_visible_contract_text_hash`, `${root}.visible_contract_text_hash`], "present", finalBlockingVerdict);
+}
+
+function pushReadReceiptBindingChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  root: string,
+  finalBlockingVerdict: boolean,
+): void {
+  pushFirstChecklistValue(items, typedPaths, event, "read_receipt_event_id", "Read receipt event", [
+    `${root}.read_receipt_event_id`,
+    `${root}.read_receipt_event_ref`,
+  ], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "read_receipt_hash", "Read receipt hash", [`${root}.read_receipt_hash`], "present", finalBlockingVerdict);
+}
+
+function pushWorkerScopeChecklistItems(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  root: string,
+  finalBlockingVerdict: boolean,
+): void {
+  pushChecklistValues(items, typedPaths, event, "owned_file", "Owned file", [`${root}.owned_files`, `${root}.target_files`], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "base_commit", "Base commit", [`${root}.base_commit`, `${root}.target_head_commit`], "present", finalBlockingVerdict);
+  pushFirstChecklistValue(items, typedPaths, event, "head_commit", "Head commit", [`${root}.head_commit`, `${root}.branch_head`], "present", finalBlockingVerdict);
+}
+
+function pushFirstChecklistValue(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  kind: string,
+  label: string,
+  paths: string[],
+  fallbackStatus: TaskPlaybackChecklistItemStatus,
+  finalBlockingVerdict: boolean,
+): void {
+  const value = firstPublicValueAtPaths(event, paths);
+  if (!value) return;
+  pushChecklistItem(
+    items,
+    kind,
+    label,
+    value.value,
+    checklistStatusFromPathValue(value.path, value.value, fallbackStatus, finalBlockingVerdict),
+    value.source,
+  );
+  typedPaths.add(value.path);
+}
+
+function pushChecklistValues(
+  items: TaskPlaybackChecklistItem[],
+  typedPaths: Set<string>,
+  event: TaskTimelineEvent,
+  kind: string,
+  label: string,
+  paths: string[],
+  fallbackStatus: TaskPlaybackChecklistItemStatus,
+  finalBlockingVerdict: boolean,
+): void {
+  for (const value of publicValuesAtPaths(event, paths).slice(0, 12)) {
+    pushChecklistItem(
+      items,
+      kind,
+      label,
+      value.value,
+      checklistStatusFromPathValue(value.path, value.value, fallbackStatus, finalBlockingVerdict),
+      value.source,
+    );
+    typedPaths.add(value.path);
+  }
+}
+
 function pushChecklistPathItems(
   items: TaskPlaybackChecklistItem[],
   event: TaskTimelineEvent,
@@ -1231,9 +1521,12 @@ function pushChecklistPathItems(
   label: string,
   status: TaskPlaybackChecklistItemStatus,
   paths: string[],
+  typedPaths?: Set<string>,
+  overrideStatus?: TaskPlaybackChecklistItemStatus,
 ): void {
   for (const item of publicValuesAtPaths(event, paths)) {
-    pushChecklistItem(items, kind, label, item.value, status, item.source);
+    pushChecklistItem(items, kind, label, item.value, overrideStatus ?? status, item.source);
+    typedPaths?.add(item.path);
   }
 }
 
@@ -1243,51 +1536,55 @@ function collectChecklistLikeItems(
   path: string,
   fallbackLabel: string,
   inheritedStatus: TaskPlaybackChecklistItemStatus = "recorded",
+  finalBlockingVerdict = false,
+  skipPaths: Set<string> = new Set(),
   depth = 0,
 ): void {
   if (items.length >= EVENT_CHECKLIST_MAX_ITEMS * 2 || depth > 4 || value == null || value === "") return;
+  if (shouldSkipChecklistPath(path, skipPaths)) return;
   if (isSensitiveEvidencePath(path)) return;
   const pathStatus = checklistStatusFromPath(path, inheritedStatus);
   if (Array.isArray(value)) {
     value.slice(0, 12).forEach((item, index) => {
-      collectChecklistLikeItems(items, item, `${path}.${index}`, fallbackLabel, pathStatus, depth + 1);
+      collectChecklistLikeItems(items, item, `${path}.${index}`, fallbackLabel, pathStatus, finalBlockingVerdict, skipPaths, depth + 1);
     });
     return;
   }
   if (typeof value !== "object") {
     const text = safeText(String(value));
-    if (text) pushChecklistItem(items, path, fallbackLabel, text, checklistStatusFromValue(text, pathStatus), sourceForPath(path));
+    if (text) pushChecklistItem(items, path, fallbackLabel, text, checklistStatusFromPathValue(path, text, pathStatus, finalBlockingVerdict), sourceForPath(path));
     return;
   }
 
   const record = value as Record<string, unknown>;
-  const recordItem = checklistItemFromRecord(record, path, fallbackLabel, pathStatus);
+  const recordItem = checklistItemFromRecord(record, path, fallbackLabel, pathStatus, finalBlockingVerdict);
   if (recordItem) items.push(recordItem);
 
   for (const [key, item] of Object.entries(record).slice(0, 32)) {
     const childPath = `${path}.${key}`;
+    if (shouldSkipChecklistPath(childPath, skipPaths)) continue;
     if (isSensitiveEvidencePath(childPath)) continue;
     const childStatus = checklistStatusFromPath(childPath, pathStatus);
     if (Array.isArray(item)) {
       if (isChecklistSignalKey(key)) {
         for (const valueItem of item.slice(0, 10)) {
           if (valueItem && typeof valueItem === "object") {
-            collectChecklistLikeItems(items, valueItem, childPath, titleize(key), childStatus, depth + 1);
+            collectChecklistLikeItems(items, valueItem, childPath, titleize(key), childStatus, finalBlockingVerdict, skipPaths, depth + 1);
           } else {
             const text = safeText(String(valueItem ?? ""));
-            if (text) pushChecklistItem(items, childPath, titleize(key), text, childStatus, sourceForPath(childPath));
+            if (text) pushChecklistItem(items, childPath, titleize(key), text, checklistStatusFromPathValue(childPath, text, childStatus, finalBlockingVerdict), sourceForPath(childPath));
           }
         }
       }
       continue;
     }
     if (item && typeof item === "object") {
-      if (isChecklistSignalKey(key)) collectChecklistLikeItems(items, item, childPath, titleize(key), childStatus, depth + 1);
+      if (isChecklistSignalKey(key)) collectChecklistLikeItems(items, item, childPath, titleize(key), childStatus, finalBlockingVerdict, skipPaths, depth + 1);
       continue;
     }
     if (!isChecklistSignalKey(key)) continue;
     const text = safeText(String(item ?? ""));
-    if (text) pushChecklistItem(items, childPath, titleize(key), text, checklistStatusFromValue(text, childStatus), sourceForPath(childPath));
+    if (text) pushChecklistItem(items, childPath, titleize(key), text, checklistStatusFromPathValue(childPath, text, childStatus, finalBlockingVerdict), sourceForPath(childPath));
   }
 }
 
@@ -1296,6 +1593,7 @@ function checklistItemFromRecord(
   path: string,
   fallbackLabel: string,
   fallbackStatus: TaskPlaybackChecklistItemStatus,
+  finalBlockingVerdict: boolean,
 ): TaskPlaybackChecklistItem | null {
   const label =
     firstStringField(record, ["label", "name", "title", "requirement_id", "requirement", "event_kind", "kind", "check", "test", "id"])
@@ -1316,9 +1614,14 @@ function checklistItemFromRecord(
     id: checklistItemId(path, safeLabel, safeDetail),
     label: safeLabel,
     value: safeDetail,
-    status: checklistStatusFromValue(statusValue || safeDetail, checklistStatusFromPath(path, fallbackStatus)),
+    status: checklistStatusFromPathValue(path, statusValue || safeDetail, checklistStatusFromPath(path, fallbackStatus), finalBlockingVerdict),
     source: sourceForPath(path),
   };
+}
+
+function shouldSkipChecklistPath(path: string, skipPaths: Set<string>): boolean {
+  if (skipPaths.size === 0) return false;
+  return Array.from(skipPaths).some((skipPath) => path === skipPath || path.startsWith(`${skipPath}.`));
 }
 
 function isChecklistSignalKey(key: string): boolean {
@@ -1326,6 +1629,7 @@ function isChecklistSignalKey(key: string): boolean {
 }
 
 function checklistStatusFromFact(fact: TaskPlaybackStructuredFact, frameStatus: TaskPlaybackFrameStatus): TaskPlaybackChecklistItemStatus {
+  if (isNeutralChecklistDeclarationKey(fact.kind) || isNeutralChecklistDeclarationKey(fact.label)) return "recorded";
   return checklistStatusFromValue(`${fact.kind} ${fact.label} ${fact.value}`, checklistStatusFromFrameStatus(frameStatus));
 }
 
@@ -1338,24 +1642,74 @@ function checklistStatusFromFrameStatus(status: TaskPlaybackFrameStatus): TaskPl
 
 function checklistStatusFromPath(path: string, fallback: TaskPlaybackChecklistItemStatus): TaskPlaybackChecklistItemStatus {
   const text = path.toLowerCase();
+  if (isNeutralChecklistDeclarationPath(text)) return "recorded";
   if (/missing|required_missing|unmet/.test(text)) return "missing";
   if (/blocked|forbidden/.test(text)) return "blocked";
   if (/failed|failure|error/.test(text)) return "failed";
   if (/passed|satisfied|complete|completed|accepted|allowed/.test(text)) return "passed";
   if (/present|recorded/.test(text)) return "present";
+  if (/pending|not_yet|not-yet/.test(text)) return "pending";
   if (/required/.test(text)) return "required";
   return fallback;
 }
 
 function checklistStatusFromValue(value: string, fallback: TaskPlaybackChecklistItemStatus): TaskPlaybackChecklistItemStatus {
+  return checklistStatusFromPathValue("", value, fallback, false);
+}
+
+function checklistStatusFromPathValue(
+  path: string,
+  value: string,
+  fallback: TaskPlaybackChecklistItemStatus,
+  finalBlockingVerdict: boolean,
+): TaskPlaybackChecklistItemStatus {
+  const normalizedPath = path.toLowerCase();
+  if (isNeutralChecklistDeclarationPath(normalizedPath)) return "recorded";
   const text = safeText(value).toLowerCase();
-  if (/missing|required-but-unmet|required_but_unmet|unmet|not recorded|not been recorded|not present/.test(text)) return "missing";
-  if (/blocked|forbidden|not allowed|refused|rejected/.test(text)) return "blocked";
-  if (/failed|failure|error|false|no\b/.test(text)) return "failed";
+  if (/pending|not yet|not-yet|not_yet|not due|awaiting|queued/.test(text)) return "pending";
+  if (/missing|required-but-unmet|required_but_unmet|unmet|not recorded|not been recorded|not present/.test(text)) return finalBlockingVerdict ? "missing" : "pending";
+  if (/blocked|forbidden|not allowed|refused|rejected/.test(text)) return finalBlockingVerdict ? "blocked" : fallback;
+  if (/failed|failure|error/.test(text)) return finalBlockingVerdict ? "failed" : fallback;
   if (/passed|satisfied|accepted|allowed|complete|completed|success|true|yes\b|ok\b/.test(text)) return "passed";
   if (/present|recorded|exists/.test(text)) return "present";
+  if (!finalBlockingVerdict && isStageRelativeRequirementPath(normalizedPath) && ["missing", "blocked", "failed"].includes(fallback)) return "pending";
   if (/required|must|expected/.test(text)) return "required";
+  if (/\bfalse\b|\bno\b/.test(text)) return fallback === "passed" ? "recorded" : fallback;
   return fallback;
+}
+
+function isFinalBlockingChecklistVerdict(event: TaskTimelineEvent, frameStatus: TaskPlaybackFrameStatus): boolean {
+  if (!["blocked", "failed", "missing"].includes(frameStatus)) return false;
+  const text = [
+    event.status,
+    event.event_type,
+    event.event_kind,
+    event.phase,
+    stringFrom(valueAtPath(event as unknown as Record<string, unknown>, "payload.decision")),
+    stringFrom(valueAtPath(event as unknown as Record<string, unknown>, "payload.route_token_gate.decision")),
+    stringFrom(valueAtPath(event as unknown as Record<string, unknown>, "payload.route_action_gate.decision")),
+    stringFrom(valueAtPath(event as unknown as Record<string, unknown>, "payload.close_gate.status")),
+    stringFrom(valueAtPath(event as unknown as Record<string, unknown>, "verification.decision")),
+    stringFrom(valueAtPath(event as unknown as Record<string, unknown>, "verification.status")),
+  ].map((item) => safeText(String(item || "")).toLowerCase()).join(" ");
+  if (/blocked|failed|failure|missing|refused|rejected|denied|not allowed/.test(text)) return true;
+  return ["blocked", "failed", "missing"].includes(frameStatus);
+}
+
+function isNeutralChecklistDeclarationPath(path: string): boolean {
+  const leaf = path.split(".").pop() ?? path;
+  return isNeutralChecklistDeclarationKey(leaf)
+    || /(^|[._-])(allowed_actions|blocked_actions|forbidden_actions|acknowledged_forbidden_actions)([._-]|$)/.test(path);
+}
+
+function isNeutralChecklistDeclarationKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/\s+/g, "_");
+  return /(^|_)(counts_as_close_evidence|close_satisfying|surrogate_close_satisfying|session_token_evidence_type|session_token_type|session_token_surrogate|surrogate_startup|is_surrogate|agent_id_match_mode|allowed_actions|blocked_actions|forbidden_actions|acknowledged_forbidden_actions)$/.test(normalized)
+    || /(^|_)(surrogate|session)_/.test(normalized);
+}
+
+function isStageRelativeRequirementPath(path: string): boolean {
+  return /(missing|required_missing|unmet|required_before|blocked_event_kinds|missing_requirement_ids|missing_event_kinds|required_lanes|missing_protected_lanes)/.test(path);
 }
 
 function pushChecklistItem(
@@ -1393,7 +1747,7 @@ function buildEventChecklist(items: TaskPlaybackChecklistItem[]): TaskPlaybackEv
   const categorySpecs: Array<{ id: TaskPlaybackChecklistCategory["id"]; label: string; status: TaskPlaybackChecklistItemStatus }> = [
     { id: "unmet", label: "Missing / blocked / failed", status: "blocked" },
     { id: "passed", label: "Passed / satisfied", status: "passed" },
-    { id: "required", label: "Required", status: "required" },
+    { id: "required", label: "Required / pending", status: "required" },
     { id: "recorded", label: "Recorded checks", status: "recorded" },
   ];
   let visibleCount = 0;
@@ -1419,7 +1773,7 @@ function buildEventChecklist(items: TaskPlaybackChecklistItem[]): TaskPlaybackEv
 function checklistCategoryId(status: TaskPlaybackChecklistItemStatus): TaskPlaybackChecklistCategory["id"] {
   if (status === "missing" || status === "blocked" || status === "failed") return "unmet";
   if (status === "passed" || status === "satisfied" || status === "present") return "passed";
-  if (status === "required") return "required";
+  if (status === "required" || status === "pending") return "required";
   return "recorded";
 }
 
@@ -2199,6 +2553,8 @@ function isSensitiveEvidencePath(path: string): boolean {
   const normalized = path.trim().toLowerCase();
   if (!normalized) return false;
   const leaf = normalized.split(".").pop() ?? normalized;
+  if (leaf === "session_token_evidence_type") return false;
+  if (normalized.includes("route_token_gate.") && PUBLIC_ROUTE_TOKEN_GATE_LEAVES.has(leaf)) return false;
   if (
     leaf === "route_context"
     || leaf === "route_identity"
@@ -2219,6 +2575,25 @@ function isSensitiveEvidencePath(path: string): boolean {
   }
   return PRIVATE_EVIDENCE_KEY.test(normalized);
 }
+
+const PUBLIC_ROUTE_TOKEN_GATE_LEAVES = new Set([
+  "action",
+  "allowed",
+  "binding_source",
+  "decision",
+  "passed",
+  "prompt_contract_hash_matches",
+  "prompt_contract_hash_verified",
+  "result",
+  "route_context_hash_matches",
+  "route_context_hash_verified",
+  "route_token_ref",
+  "server_binding_id",
+  "server_binding_ref",
+  "status",
+  "visible_injection_manifest_hash_matches",
+  "visible_injection_manifest_hash_verified",
+]);
 
 function sanitizeEvidenceString(value: string, path = ""): string {
   const redacted = value
