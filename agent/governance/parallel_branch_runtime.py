@@ -272,6 +272,10 @@ ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
     STATE_RUNNING,
 }
 MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION = "mf_subagent_startup_gate.v1"
+MF_SUBAGENT_STARTUP_REFUSAL_SCHEMA_VERSION = "mf_subagent_startup_refusal.v1"
+MF_SUBAGENT_HOST_ADAPTER_IDENTITY_SCHEMA_VERSION = (
+    "mf_subagent_host_adapter_spawn_identity.v1"
+)
 RUNTIME_CONTEXT_PROJECTION_SCHEMA_VERSION = "runtime_context.projection.v1"
 RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION = "runtime_context.current.v1"
 RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION = "runtime_context.gate_inputs.v1"
@@ -3619,24 +3623,198 @@ def _startup_identity_text(value: str) -> str:
     return str(value or "").strip().lower().replace("-", "_")
 
 
-def _startup_host_identity_has_allowed_prefix(value: str) -> bool:
-    text = _startup_identity_text(value)
-    return bool(
-        text
-        and text.startswith(
-            (
-                "host_adapter:",
-                "codex_desktop_multi_agent_v1:",
-                "multi_agent_v1:",
-                "multi_agent_v1.spawn_agent:",
-                "codex_cli_thread:",
-                "codex_cli_exec:",
-                "codex_cli_host_adapter:",
-                "codex_exec:",
-                "codex_exec_pid:",
+def _startup_registered_identity_values(
+    registered_identity: Mapping[str, Any] | None,
+    keys: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not isinstance(registered_identity, Mapping):
+        return ()
+    values: list[str] = []
+    for key in keys:
+        value = str(registered_identity.get(key) or "").strip()
+        if value:
+            values.append(_startup_identity_text(value))
+    return tuple(value for value in values if value)
+
+
+def _startup_registered_host_startup_texts(
+    registered_identity: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    return _startup_registered_identity_values(
+        registered_identity,
+        ("host_startup_id", "host_session_id"),
+    )
+
+
+def _startup_registered_session_texts(
+    registered_identity: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    return _startup_registered_identity_values(
+        registered_identity,
+        (
+            "session_token_surrogate",
+            "session_surrogate",
+            "startup_token_surrogate",
+            "host_session_id",
+        ),
+    )
+
+
+def _startup_registered_identity_texts(
+    registered_identity: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    return (
+        _startup_registered_host_startup_texts(registered_identity)
+        + _startup_registered_session_texts(registered_identity)
+    )
+
+
+def _startup_public_registered_host_adapter_identity(
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    allowed_keys = (
+        "schema_version",
+        "source",
+        "registration_source",
+        "startup_source",
+        "runtime_context_id",
+        "observer_command_id",
+        "launch_text_hash",
+        "project_id",
+        "task_id",
+        "worker_slot_id",
+        "agent_id",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "host_session_id",
+        "session_token_surrogate",
+        "session_surrogate",
+        "startup_token_surrogate",
+    )
+    identity = {
+        key: str(value.get(key) or "").strip()
+        for key in allowed_keys
+        if str(value.get(key) or "").strip()
+    }
+    if not _startup_registered_identity_texts(identity):
+        return {}
+    identity.setdefault("schema_version", MF_SUBAGENT_HOST_ADAPTER_IDENTITY_SCHEMA_VERSION)
+    identity.setdefault("source", "runtime_contract_revision")
+    return identity
+
+
+def _startup_registered_host_adapter_identity(
+    *,
+    context: BranchTaskRuntimeContext,
+    latest_revision: BranchRuntimeContractRevision | None,
+) -> dict[str, Any]:
+    if latest_revision is not None and isinstance(latest_revision.payload, Mapping):
+        for key in (
+            "host_adapter_spawn_identity",
+            "registered_host_adapter_spawn",
+            "host_adapter_startup_identity",
+        ):
+            identity = _startup_public_registered_host_adapter_identity(
+                latest_revision.payload.get(key)
             )
+            if identity:
+                identity.setdefault("revision_id", latest_revision.revision_id)
+                return identity
+
+    # Allocation-time host identity is accepted only when it predates startup.
+    # Observed startup fields written by mf_subagent.startup must not become a
+    # new self-asserted exemption for a later mismatched agent.
+    if (
+        context.host_startup_id
+        and context.last_recovery_action != "mf_subagent_startup_recorded"
+    ):
+        return _startup_public_registered_host_adapter_identity(
+            {
+                "schema_version": MF_SUBAGENT_HOST_ADAPTER_IDENTITY_SCHEMA_VERSION,
+                "source": "branch_runtime_allocation",
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "host_startup_id": context.host_startup_id,
+                "host_session_id": context.host_session_id,
+            }
+        )
+    return {}
+
+
+def build_registered_host_adapter_spawn_identity(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    observer_command_id: str,
+    launch_text_hash: str,
+    backend_mode: str = "",
+    startup_source: str = "",
+    task_id: str = "",
+    worker_slot_id: str = "",
+    agent_id: str = "",
+    actual_host_worker_id: str = "",
+    host_startup_id: str = "",
+    host_session_id: str = "",
+    session_token_surrogate: str = "",
+) -> dict[str, Any]:
+    """Build a server-registered host-adapter spawn identity.
+
+    The identity is public audit material: it binds the startup surrogate to the
+    prepared runtime context and launch text hash without persisting raw launch
+    text or session tokens.
+    """
+
+    backend = _startup_identity_text(
+        backend_mode or startup_source or "host_adapter"
+    ).replace(".", "_")
+    backend = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in backend)
+    backend = backend.strip("_") or "host_adapter"
+    seed = "|".join(
+        str(value or "").strip()
+        for value in (
+            project_id,
+            runtime_context_id,
+            observer_command_id,
+            launch_text_hash,
+            backend,
+            task_id,
+            worker_slot_id,
         )
     )
+    suffix = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+    registered_host_startup_id = (
+        str(host_startup_id or "").strip()
+        or f"host_adapter:{backend}:{suffix}"
+    )
+    registered_session_surrogate = (
+        str(session_token_surrogate or "").strip()
+        or f"host-adapter:{suffix}"
+    )
+    registered_agent_id = str(agent_id or "").strip() or (
+        f"host_adapter_agent:{backend}:{suffix}"
+    )
+    registered_actual_host_worker_id = (
+        str(actual_host_worker_id or "").strip() or registered_agent_id
+    )
+    return {
+        "schema_version": MF_SUBAGENT_HOST_ADAPTER_IDENTITY_SCHEMA_VERSION,
+        "source": "observer_runtime_text_prepare",
+        "registration_source": "runtime_text_prepare",
+        "startup_source": startup_source or f"{backend}_host_adapter",
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "launch_text_hash": launch_text_hash,
+        "task_id": task_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": registered_agent_id,
+        "actual_host_worker_id": registered_actual_host_worker_id,
+        "host_startup_id": registered_host_startup_id,
+        "host_session_id": str(host_session_id or "").strip()
+        or registered_host_startup_id,
+        "session_token_surrogate": registered_session_surrogate,
+    }
 
 
 def _startup_host_adapter_identity(
@@ -3645,15 +3823,61 @@ def _startup_host_adapter_identity(
     session_token_surrogate: str,
     host_startup_id: str,
     payload: Mapping[str, Any],
+    registered_identity: Mapping[str, Any] | None,
 ) -> bool:
-    _ = (startup_source, payload)
+    _ = startup_source
     identity_present = bool(session_token_surrogate or host_startup_id)
     if not identity_present:
         return False
-    return any(
-        _startup_host_identity_has_allowed_prefix(value)
-        for value in (session_token_surrogate, host_startup_id)
+    registered_host_startup_values = _startup_registered_host_startup_texts(
+        registered_identity
     )
+    registered_session_values = _startup_registered_session_texts(
+        registered_identity
+    )
+    host_startup_match = bool(
+        host_startup_id
+        and _startup_identity_text(host_startup_id) in registered_host_startup_values
+    )
+    session_surrogate_match = bool(
+        session_token_surrogate
+        and _startup_identity_text(session_token_surrogate) in registered_session_values
+    )
+    if not (host_startup_match or session_surrogate_match):
+        return False
+
+    registered_agent_values = _startup_registered_identity_values(
+        registered_identity,
+        ("agent_id", "actual_host_worker_id"),
+    )
+    supplied_agent_id = str(payload.get("agent_id") or "").strip()
+    if not registered_agent_values or not supplied_agent_id:
+        return False
+    if _startup_identity_text(supplied_agent_id) not in registered_agent_values:
+        return False
+
+    registered_runtime_context_id = str(
+        (registered_identity or {}).get("runtime_context_id") or ""
+    ).strip()
+    supplied_runtime_context_id = str(payload.get("runtime_context_id") or "").strip()
+    if (
+        registered_runtime_context_id
+        and supplied_runtime_context_id
+        and registered_runtime_context_id != supplied_runtime_context_id
+    ):
+        return False
+
+    registered_launch_text_hash = str(
+        (registered_identity or {}).get("launch_text_hash") or ""
+    ).strip()
+    supplied_launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
+    if (
+        registered_launch_text_hash
+        and supplied_launch_text_hash
+        and registered_launch_text_hash != supplied_launch_text_hash
+    ):
+        return False
+    return True
 
 
 def _startup_token_evidence(
@@ -3798,6 +4022,180 @@ def _startup_blocker(
     return payload
 
 
+def _startup_refusal_timeline_event(
+    *,
+    project_id: str,
+    task_id: str,
+    result: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    context: BranchTaskRuntimeContext | None = None,
+    token_evidence: Mapping[str, Any] | None = None,
+    registered_host_adapter_identity: Mapping[str, Any] | None = None,
+    expected_runtime_context_id: str = "",
+) -> dict[str, Any]:
+    route_identity = _startup_route_identity(payload)
+    details = result.get("details") if isinstance(result.get("details"), Mapping) else {}
+    missing = list(result.get("missing") or result.get("missing_required_fields") or [])
+    runtime_context_id = str(
+        payload.get("runtime_context_id")
+        or expected_runtime_context_id
+        or (runtime_context_id_for_branch_context(context) if context is not None else "")
+        or ""
+    ).strip()
+    agent_id = str(
+        payload.get("agent_id")
+        or (context.agent_id if context is not None else "")
+        or ""
+    ).strip()
+    allocation_owner = str(
+        payload.get("allocation_owner")
+        or payload.get("observer_allocation_owner")
+        or (context.allocation_owner if context is not None else "")
+        or (context.agent_id if context is not None else "")
+        or ""
+    ).strip()
+    actual_host_worker_id = str(
+        payload.get("actual_host_worker_id")
+        or payload.get("host_worker_id")
+        or payload.get("worker_id")
+        or ""
+    ).strip()
+    agent_id_match_mode = str(details.get("agent_id_match_mode") or "")
+    if not agent_id_match_mode and str(result.get("blocker_id") or "") == "agent_id_mismatch":
+        agent_id_match_mode = "blocked_without_host_adapter_surrogate"
+    refusal = {
+        "schema_version": MF_SUBAGENT_STARTUP_REFUSAL_SCHEMA_VERSION,
+        "gate_kind": "mf_subagent.startup",
+        "status": "blocked",
+        "ok": False,
+        "decision": "refused",
+        "blocker_id": str(result.get("blocker_id") or result.get("blocker") or ""),
+        "message": str(result.get("message") or ""),
+        "missing": missing,
+        "missing_required_fields": missing,
+        "project_id": project_id,
+        "backlog_id": (
+            context.backlog_id if context is not None else str(payload.get("backlog_id") or "")
+        ),
+        "task_id": task_id or str(payload.get("task_id") or ""),
+        "parent_task_id": str(
+            payload.get("parent_task_id")
+            or (context.root_task_id if context is not None else "")
+            or (context.backlog_id if context is not None else "")
+            or ""
+        ),
+        "runtime_context_id": runtime_context_id,
+        "expected_runtime_context_id": expected_runtime_context_id
+        or (runtime_context_id_for_branch_context(context) if context is not None else ""),
+        "worker_role": str(payload.get("worker_role") or payload.get("role") or "").strip(),
+        "worker_id": str(payload.get("worker_id") or "").strip(),
+        "worker_slot_id": str(
+            payload.get("worker_slot_id")
+            or (context.worker_slot_id if context is not None else "")
+            or (context.worker_id if context is not None else "")
+            or ""
+        ).strip(),
+        "actual_host_worker_id": actual_host_worker_id,
+        "agent_id": agent_id,
+        "allocation_owner": allocation_owner,
+        "observer_allocation_owner": allocation_owner,
+        "agent_id_match_mode": agent_id_match_mode,
+        "fence_token": str(payload.get("fence_token") or "").strip(),
+        "branch": str(payload.get("branch") or payload.get("branch_ref") or "").strip(),
+        "base_commit": str(payload.get("base_commit") or "").strip(),
+        "target_head_commit": str(payload.get("target_head_commit") or "").strip(),
+        "merge_queue_id": str(payload.get("merge_queue_id") or "").strip(),
+        "route_identity": route_identity,
+        **route_identity,
+        "observer_command_id": str(payload.get("observer_command_id") or "").strip(),
+        "read_receipt_hash": str(
+            payload.get("read_receipt_hash")
+            or payload.get("worker_read_receipt_hash")
+            or ""
+        ).strip(),
+        "read_receipt_event_id": str(
+            payload.get("read_receipt_event_id")
+            or payload.get("read_receipt_timeline_id")
+            or ""
+        ).strip(),
+        "host_startup_id": str(payload.get("host_startup_id") or "").strip(),
+        "startup_source": str(payload.get("startup_source") or "").strip(),
+        "session_token_present": bool(str(payload.get("session_token") or "").strip()),
+        "session_token_surrogate_present": bool(
+            str(
+                payload.get("session_token_surrogate")
+                or payload.get("session_surrogate")
+                or ""
+            ).strip()
+        ),
+        "session_token_evidence_type": str(
+            (token_evidence or {}).get("session_token_evidence_type") or ""
+        ),
+        "registered_host_adapter_spawn_present": bool(registered_host_adapter_identity),
+        "registered_host_adapter_spawn": _startup_public_registered_host_adapter_identity(
+            registered_host_adapter_identity or {}
+        ),
+        "details": dict(details),
+    }
+    return {
+        "schema_version": 2,
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup_refusal",
+        "phase": "startup_gate",
+        "status": "blocked",
+        "decision": "refused",
+        "severity": "warning",
+        "actor": "mf_sub",
+        "project_id": project_id,
+        "backlog_id": refusal["backlog_id"],
+        "task_id": refusal["task_id"],
+        "attempt_num": int(context.attempt if context is not None else 0),
+        "correlation_id": refusal["observer_command_id"]
+        or refusal["host_startup_id"]
+        or refusal["task_id"],
+        "payload": {
+            "mf_subagent_startup_refusal": refusal,
+        },
+        "artifact_refs": {
+            "runtime_context_id": runtime_context_id,
+            "blocker_id": refusal["blocker_id"],
+            "observer_command_id": refusal["observer_command_id"],
+            "read_receipt_event_id": refusal["read_receipt_event_id"],
+            "route_id": route_identity.get("route_id", ""),
+            "route_context_hash": route_identity.get("route_context_hash", ""),
+            "prompt_contract_id": route_identity.get("prompt_contract_id", ""),
+            "prompt_contract_hash": route_identity.get("prompt_contract_hash", ""),
+            "host_startup_id": refusal["host_startup_id"],
+            "startup_source": refusal["startup_source"],
+        },
+        "commit_sha": str(payload.get("head_commit") or ""),
+    }
+
+
+def _startup_blocker_with_timeline(
+    result: dict[str, Any],
+    *,
+    project_id: str,
+    task_id: str,
+    payload: Mapping[str, Any],
+    context: BranchTaskRuntimeContext | None = None,
+    token_evidence: Mapping[str, Any] | None = None,
+    registered_host_adapter_identity: Mapping[str, Any] | None = None,
+    expected_runtime_context_id: str = "",
+) -> dict[str, Any]:
+    result["timeline_event"] = _startup_refusal_timeline_event(
+        project_id=project_id,
+        task_id=task_id,
+        result=result,
+        payload=payload,
+        context=context,
+        token_evidence=token_evidence,
+        registered_host_adapter_identity=registered_host_adapter_identity,
+        expected_runtime_context_id=expected_runtime_context_id,
+    )
+    return result
+
+
 def _startup_route_identity(payload: Mapping[str, Any]) -> dict[str, str]:
     return {
         "route_id": str(payload.get("route_id") or "").strip(),
@@ -3857,19 +4255,29 @@ def record_mf_subagent_startup(
     ensure_branch_runtime_schema(conn)
     task = str(task_id or payload.get("task_id") or "").strip()
     if not task:
-        return _startup_blocker(
-            blocker_id="missing_task_id",
-            message="mf_subagent startup requires task_id",
-            missing=("task_id",),
+        return _startup_blocker_with_timeline(
+            _startup_blocker(
+                blocker_id="missing_task_id",
+                message="mf_subagent startup requires task_id",
+                missing=("task_id",),
+            ),
+            project_id=project_id,
+            task_id=task,
+            payload=payload,
         )
 
     context = get_branch_context(conn, project_id, task)
     if context is None:
-        return _startup_blocker(
-            blocker_id="runtime_context_not_found",
-            message="branch runtime context must exist before mf_subagent startup",
-            missing=("branch_runtime_context",),
-            details={"task_id": task},
+        return _startup_blocker_with_timeline(
+            _startup_blocker(
+                blocker_id="runtime_context_not_found",
+                message="branch runtime context must exist before mf_subagent startup",
+                missing=("branch_runtime_context",),
+                details={"task_id": task},
+            ),
+            project_id=project_id,
+            task_id=task,
+            payload=payload,
         )
 
     parent_task_id = str(payload.get("parent_task_id") or "").strip()
@@ -3920,6 +4328,15 @@ def record_mf_subagent_startup(
     supplied_runtime_context_id = str(payload.get("runtime_context_id") or "").strip()
     expected_runtime_context_id = runtime_context_id_for_branch_context(context)
     runtime_context_id = supplied_runtime_context_id or expected_runtime_context_id
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        project_id,
+        expected_runtime_context_id,
+    )
+    registered_host_adapter_identity = _startup_registered_host_adapter_identity(
+        context=context,
+        latest_revision=latest_revision,
+    )
     launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
     observer_command_id = str(payload.get("observer_command_id") or "").strip()
     read_receipt_hash = str(
@@ -3967,6 +4384,7 @@ def record_mf_subagent_startup(
         session_token_surrogate=session_token_surrogate,
         host_startup_id=host_startup_id,
         payload=payload,
+        registered_identity=registered_host_adapter_identity,
     )
     if (
         host_adapter_startup
@@ -3976,6 +4394,18 @@ def record_mf_subagent_startup(
         and not explicit_actual_host_worker_id
     ):
         actual_host_worker_id = agent_id
+
+    def _blocked(result: dict[str, Any]) -> dict[str, Any]:
+        return _startup_blocker_with_timeline(
+            result,
+            project_id=project_id,
+            task_id=task,
+            payload=payload,
+            context=context,
+            token_evidence=token_evidence,
+            registered_host_adapter_identity=registered_host_adapter_identity,
+            expected_runtime_context_id=expected_runtime_context_id,
+        )
 
     missing: list[str] = []
     for field, value in (
@@ -4014,7 +4444,7 @@ def record_mf_subagent_startup(
     ):
         missing.append("session_token_surrogate_or_host_startup_id")
     if missing:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="no_truthful_bounded_mf_sub_startup_surface_available",
             message=(
                 "actual mf_sub startup evidence is incomplete; branch allocation "
@@ -4022,17 +4452,17 @@ def record_mf_subagent_startup(
             ),
             context=context,
             missing=tuple(missing),
-        )
+        ))
 
     if worker_role != "mf_sub":
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="worker_role_mismatch",
             message="mf_subagent startup requires worker_role=mf_sub",
             context=context,
             details={"worker_role": worker_role},
-        )
+        ))
     if supplied_runtime_context_id != expected_runtime_context_id:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="runtime_context_id_mismatch",
             message="mf_subagent startup runtime_context_id must match branch runtime context",
             context=context,
@@ -4040,13 +4470,13 @@ def record_mf_subagent_startup(
                 "runtime_context_id": supplied_runtime_context_id,
                 "expected_runtime_context_id": expected_runtime_context_id,
             },
-        )
+        ))
     if (
         payload.get("worker_slot_id") is not None
         and (context.worker_slot_id or context.worker_id)
         and worker_slot_id != (context.worker_slot_id or context.worker_id)
     ):
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="worker_slot_id_mismatch",
             message="mf_subagent startup worker_slot_id must match branch runtime context",
             context=context,
@@ -4054,14 +4484,14 @@ def record_mf_subagent_startup(
                 "worker_slot_id": worker_slot_id,
                 "expected_worker_slot_id": context.worker_slot_id or context.worker_id,
             },
-        )
+        ))
     agent_id_match_mode = "actual_host_worker_bound"
     if allocation_owner and agent_id == allocation_owner:
         agent_id_match_mode = "same_as_allocation_owner"
     elif host_adapter_startup:
         agent_id_match_mode = "host_adapter_startup_token_surrogate"
     elif allocation_owner:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="agent_id_mismatch",
             message=(
                 "mf_subagent startup agent_id must match allocation_owner unless "
@@ -4073,16 +4503,16 @@ def record_mf_subagent_startup(
                 "expected_agent_id": allocation_owner,
                 "agent_id_match_mode": "blocked_without_host_adapter_surrogate",
             },
-        )
+        ))
     try:
         _require_current_fence(context, fence_token)
     except BranchRuntimeFenceError:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="fence_invalidated_or_unknown",
             message="mf_subagent startup fence is invalidated or unknown",
             context=context,
             details={"task_id": task},
-        )
+        ))
     allowed_parent_ids = {
         value
         for value in (
@@ -4094,7 +4524,7 @@ def record_mf_subagent_startup(
         if value
     }
     if allowed_parent_ids and parent_task_id not in allowed_parent_ids:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="parent_task_id_mismatch",
             message="mf_subagent startup parent_task_id does not match branch context",
             context=context,
@@ -4102,11 +4532,11 @@ def record_mf_subagent_startup(
                 "parent_task_id": parent_task_id,
                 "allowed_parent_task_ids": sorted(allowed_parent_ids),
             },
-        )
+        ))
     expected_worktree = context.worktree_path
     if expected_worktree:
         if not _startup_path_matches(actual_git_root, expected_worktree):
-            return _startup_blocker(
+            return _blocked(_startup_blocker(
                 blocker_id="actual_git_root_mismatch",
                 message="mf_subagent startup actual_git_root must match assigned worktree",
                 context=context,
@@ -4114,9 +4544,9 @@ def record_mf_subagent_startup(
                     "actual_git_root": actual_git_root,
                     "expected_worktree": expected_worktree,
                 },
-            )
+            ))
         if not _startup_path_matches(actual_cwd, expected_worktree):
-            return _startup_blocker(
+            return _blocked(_startup_blocker(
                 blocker_id="actual_cwd_mismatch",
                 message="mf_subagent startup actual_cwd must match assigned worktree",
                 context=context,
@@ -4124,23 +4554,23 @@ def record_mf_subagent_startup(
                     "actual_cwd": actual_cwd,
                     "expected_worktree": expected_worktree,
                 },
-            )
+            ))
     if _startup_branch_name(branch) != _startup_branch_name(context.branch_ref):
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="branch_mismatch",
             message="mf_subagent startup branch must match branch runtime context",
             context=context,
             details={"branch": branch, "expected_branch": context.branch_ref},
-        )
+        ))
     if context.base_commit and base_commit and base_commit != context.base_commit:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="base_commit_mismatch",
             message="mf_subagent startup base_commit must match branch runtime context",
             context=context,
             details={"base_commit": base_commit, "expected_base_commit": context.base_commit},
-        )
+        ))
     if context.target_head_commit and target_head_commit and target_head_commit != context.target_head_commit:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="target_head_commit_mismatch",
             message="mf_subagent startup target_head_commit must match branch runtime context",
             context=context,
@@ -4148,9 +4578,9 @@ def record_mf_subagent_startup(
                 "target_head_commit": target_head_commit,
                 "expected_target_head_commit": context.target_head_commit,
             },
-        )
+        ))
     if context.merge_queue_id and merge_queue_id != context.merge_queue_id:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="merge_queue_id_mismatch",
             message="mf_subagent startup merge_queue_id must match branch runtime context",
             context=context,
@@ -4158,9 +4588,9 @@ def record_mf_subagent_startup(
                 "merge_queue_id": merge_queue_id,
                 "expected_merge_queue_id": context.merge_queue_id,
             },
-        )
+        ))
     if (context.governance_project_id or project_id) != governance_project_id:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="governance_project_id_mismatch",
             message="mf_subagent startup governance_project_id must match branch context",
             context=context,
@@ -4169,9 +4599,9 @@ def record_mf_subagent_startup(
                 "expected_governance_project_id": context.governance_project_id
                 or project_id,
             },
-        )
+        ))
     if (context.target_project_id or project_id) != target_project_id:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="target_project_id_mismatch",
             message="mf_subagent startup target_project_id must match branch context",
             context=context,
@@ -4179,7 +4609,7 @@ def record_mf_subagent_startup(
                 "target_project_id": target_project_id,
                 "expected_target_project_id": context.target_project_id or project_id,
             },
-        )
+        ))
 
     route_identity = _startup_route_identity(payload)
     latest_revision = get_latest_branch_contract_revision(
@@ -4197,7 +4627,7 @@ def record_mf_subagent_startup(
         actual=route_identity,
     )
     if route_mismatches:
-        return _startup_blocker(
+        return _blocked(_startup_blocker(
             blocker_id="route_identity_mismatch",
             message="mf_subagent startup route identity must match latest runtime contract",
             context=context,
@@ -4208,7 +4638,7 @@ def record_mf_subagent_startup(
                 if latest_revision is not None
                 else "",
             },
-        )
+        ))
 
     # For first-sight ('hash') startups, persist the server-computed token hash
     # so subsequent startups can be server-verified.  For 'claimed_unverified'

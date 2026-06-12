@@ -635,24 +635,55 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-host-adapter"
     worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        agent_id="fallback_observer_cli_takeover",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
     upsert_branch_context(
         conn,
-        BranchTaskRuntimeContext(
-            project_id=PROJECT_ID,
-            task_id="mf-sub-startup",
-            root_task_id="parent-startup",
-            stage_task_id="mf-sub-startup",
-            backlog_id="BUG-STARTUP",
-            worker_id="worker-startup",
-            agent_id="fallback_observer_cli_takeover",
-            branch_ref="refs/heads/codex/mf-sub-startup",
-            status=STATE_WORKTREE_READY,
-            fence_token="fence-startup",
-            worktree_path=str(worktree),
-            base_commit="base-startup",
-            target_head_commit="target-startup",
-            merge_queue_id="mq-startup",
-        ),
+        context,
+        now_iso=NOW,
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_registered_host_adapter_spawn",
+                "runtime_context_id": branch_runtime_context_id(
+                    PROJECT_ID,
+                    "mf-sub-startup",
+                ),
+                "task_id": "mf-sub-startup",
+                "worker_slot_id": "worker-startup",
+                "agent_id": "codex-exec-pid-19807",
+                "actual_host_worker_id": "codex-host-worker-19807",
+                "host_startup_id": "host-startup-19807",
+                "host_session_id": "host-startup-19807",
+                "session_token_surrogate": "host-adapter:codex-exec-pid-19807",
+            }
+        },
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
         now_iso=NOW,
     )
 
@@ -690,6 +721,212 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
     assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
     assert gate["host_adapter_startup_token_accepted"] is True
     assert gate["same_as_expected_worker"] is False
+
+
+def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-host-session"
+    worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        agent_id="allocation-owner",
+        allocation_owner="allocation-owner",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_registered_host_session_only",
+                "runtime_context_id": branch_runtime_context_id(
+                    PROJECT_ID,
+                    "mf-sub-startup",
+                ),
+                "task_id": "mf-sub-startup",
+                "worker_slot_id": "worker-startup",
+                "agent_id": "host-session-agent",
+                "actual_host_worker_id": "host-session-worker",
+                "host_session_id": "registered-host-session-only",
+            }
+        },
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            worker_slot_id="worker-startup",
+            actual_host_worker_id="host-session-worker",
+            agent_id="host-session-agent",
+            session_token="",
+            session_token_surrogate="",
+            startup_source="codex_cli_host_adapter",
+            host_startup_id="registered-host-session-only",
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is True
+    gate = result["startup_gate"]
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert gate["host_startup_id"] == "registered-host-session-only"
+
+
+def test_mf_sub_startup_rejects_multi_agent_prefix_replay_without_registration(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-event-4178"
+    worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        agent_id="agent-startup",
+        allocation_owner="agent-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+
+    base_payload = _startup_payload(
+        str(worktree),
+        agent_id="codex-multi-agent-4178",
+        session_token="same-event-4178-session-token",
+    )
+    attempts = (
+        base_payload | {"host_startup_id": "codex-multi-agent-4178-a"},
+        base_payload | {"host_startup_id": "codex-multi-agent-4178-b"},
+        base_payload | {"host_startup_id": "multi_agent_v1:4178-b"},
+    )
+
+    results = [
+        record_mf_subagent_startup(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="mf-sub-startup",
+            payload=payload,
+            now_iso=NOW,
+        )
+        for payload in attempts
+    ]
+
+    for result in results:
+        assert result["ok"] is False
+        assert result["blocker_id"] == "agent_id_mismatch"
+        event = result["timeline_event"]
+        assert event["event_kind"] == "mf_subagent_startup_refusal"
+        refusal = event["payload"]["mf_subagent_startup_refusal"]
+        assert refusal["blocker_id"] == "agent_id_mismatch"
+        assert refusal["agent_id"] == "codex-multi-agent-4178"
+        assert refusal["allocation_owner"] == "agent-startup"
+        assert refusal["runtime_context_id"] == branch_runtime_context_id(
+            PROJECT_ID,
+            "mf-sub-startup",
+        )
+        assert refusal["route_id"] == "route-startup"
+        assert refusal["route_context_hash"] == "sha256:route-startup"
+        assert refusal["prompt_contract_id"] == "rprompt-startup"
+        assert refusal["prompt_contract_hash"] == "sha256:prompt-startup"
+        assert "same-event-4178-session-token" not in json.dumps(
+            event,
+            sort_keys=True,
+        )
+
+
+def test_mf_sub_startup_rejects_agent_only_registered_identity_echoed_as_host_startup(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-agent-only-registration"
+    worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        agent_id="allocation-owner",
+        allocation_owner="allocation-owner",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_under_specified_host_adapter_spawn",
+                "agent_id": "codex-agent-only",
+            }
+        },
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            agent_id="codex-agent-only",
+            session_token="agent-only-session-token",
+            host_startup_id="codex-agent-only",
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == "agent_id_mismatch"
+    refusal = result["timeline_event"]["payload"]["mf_subagent_startup_refusal"]
+    assert refusal["host_startup_id"] == "codex-agent-only"
+    assert refusal["agent_id"] == "codex-agent-only"
+    assert refusal["allocation_owner"] == "allocation-owner"
+    assert refusal["registered_host_adapter_spawn_present"] is False
 
 
 def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(tmp_path) -> None:

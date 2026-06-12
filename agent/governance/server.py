@@ -6625,31 +6625,33 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                 payload=ctx.body or {},
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
+            event = result.get("timeline_event") if isinstance(result.get("timeline_event"), dict) else {}
+            if event:
+                recorded = task_timeline.record_event(
+                    conn,
+                    project_id=project_id,
+                    task_id=str(event.get("task_id") or task_id),
+                    backlog_id=str(event.get("backlog_id") or ""),
+                    attempt_num=int(event.get("attempt_num") or 0),
+                    event_type=str(event.get("event_type") or "mf_subagent.startup"),
+                    phase=str(event.get("phase") or "startup_gate"),
+                    event_kind=str(event.get("event_kind") or "mf_subagent_startup"),
+                    correlation_id=str(event.get("correlation_id") or ""),
+                    schema_version=int(event.get("schema_version") or 2),
+                    actor=str(event.get("actor") or "mf_sub"),
+                    status=str(event.get("status") or "passed"),
+                    payload=event.get("payload")
+                    if isinstance(event.get("payload"), dict)
+                    else {},
+                    artifact_refs=event.get("artifact_refs")
+                    if isinstance(event.get("artifact_refs"), dict)
+                    else {},
+                    commit_sha=str(event.get("commit_sha") or ""),
+                )
+                result["timeline_event_recorded"] = recorded
             if not result.get("ok"):
                 conn.commit()
                 return result
-
-            event = result.get("timeline_event") if isinstance(result.get("timeline_event"), dict) else {}
-            recorded = task_timeline.record_event(
-                conn,
-                project_id=project_id,
-                task_id=str(event.get("task_id") or task_id),
-                backlog_id=str(event.get("backlog_id") or ""),
-                attempt_num=int(event.get("attempt_num") or 0),
-                event_type=str(event.get("event_type") or "mf_subagent.startup"),
-                phase=str(event.get("phase") or "startup_gate"),
-                event_kind=str(event.get("event_kind") or "mf_subagent_startup"),
-                correlation_id=str(event.get("correlation_id") or ""),
-                schema_version=int(event.get("schema_version") or 2),
-                actor=str(event.get("actor") or "mf_sub"),
-                status=str(event.get("status") or "passed"),
-                payload=event.get("payload") if isinstance(event.get("payload"), dict) else {},
-                artifact_refs=event.get("artifact_refs")
-                if isinstance(event.get("artifact_refs"), dict)
-                else {},
-                commit_sha=str(event.get("commit_sha") or ""),
-            )
-            result["timeline_event_recorded"] = recorded
             conn.commit()
             return result
     finally:
@@ -21743,6 +21745,8 @@ def _observer_runtime_text_contract_revision_payload(
     body: Mapping[str, Any],
     prepared: Mapping[str, Any],
 ) -> dict[str, Any]:
+    from .parallel_branch_runtime import build_registered_host_adapter_spawn_identity
+
     owned_files = _runtime_context_service_query_values(
         body,
         "owned_files",
@@ -21752,6 +21756,112 @@ def _observer_runtime_text_contract_revision_payload(
         prepared.get("route_identity")
         if isinstance(prepared.get("route_identity"), Mapping)
         else _parallel_branch_runtime_contract_route_identity(body)
+    )
+    persistent_evidence = (
+        prepared.get("persistent_evidence")
+        if isinstance(prepared.get("persistent_evidence"), Mapping)
+        else {}
+    )
+    startup_recording = (
+        prepared.get("startup_recording")
+        if isinstance(prepared.get("startup_recording"), Mapping)
+        else persistent_evidence.get("startup_recording")
+        if isinstance(persistent_evidence.get("startup_recording"), Mapping)
+        else {}
+    )
+    runtime_context = (
+        prepared.get("runtime_context")
+        if isinstance(prepared.get("runtime_context"), Mapping)
+        else {}
+    )
+    branch_runtime_evidence = (
+        prepared.get("branch_runtime_evidence")
+        if isinstance(prepared.get("branch_runtime_evidence"), Mapping)
+        else {}
+    )
+    branch_context = (
+        branch_runtime_evidence.get("context")
+        if isinstance(branch_runtime_evidence.get("context"), Mapping)
+        else {}
+    )
+
+    def _first_text(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    registered_host_adapter_spawn = build_registered_host_adapter_spawn_identity(
+        project_id=_first_text(prepared.get("project_id"), body.get("project_id")),
+        runtime_context_id=_first_text(
+            prepared.get("runtime_context_id"),
+            runtime_context.get("runtime_context_id"),
+            body.get("runtime_context_id"),
+            branch_context.get("runtime_context_id"),
+        ),
+        observer_command_id=_first_text(
+            prepared.get("observer_command_id"),
+            body.get("observer_command_id"),
+            runtime_context.get("observer_command_id"),
+            branch_context.get("observer_command_id"),
+        ),
+        launch_text_hash=_first_text(prepared.get("launch_text_hash")),
+        backend_mode=_first_text(
+            body.get("backend_mode"),
+            prepared.get("backend_mode"),
+            body.get("worker_backend"),
+        ),
+        startup_source=_first_text(
+            startup_recording.get("startup_source"),
+            body.get("startup_source"),
+            prepared.get("startup_source"),
+        ),
+        task_id=_first_text(
+            startup_recording.get("task_id"),
+            body.get("task_id"),
+            runtime_context.get("task_id"),
+            branch_context.get("task_id"),
+        ),
+        worker_slot_id=_first_text(
+            startup_recording.get("worker_slot_id"),
+            startup_recording.get("worker_id"),
+            body.get("worker_slot_id"),
+            body.get("worker_id"),
+            runtime_context.get("worker_slot_id"),
+            runtime_context.get("worker_id"),
+            branch_context.get("worker_slot_id"),
+            branch_context.get("worker_id"),
+        ),
+        agent_id=_first_text(
+            startup_recording.get("agent_id"),
+            startup_recording.get("host_agent_id"),
+            prepared.get("host_adapter_agent_id"),
+            body.get("host_adapter_agent_id"),
+            body.get("agent_id"),
+        ),
+        actual_host_worker_id=_first_text(
+            startup_recording.get("actual_host_worker_id"),
+            startup_recording.get("host_worker_id"),
+            prepared.get("actual_host_worker_id"),
+            prepared.get("host_adapter_worker_id"),
+            body.get("actual_host_worker_id"),
+            body.get("host_worker_id"),
+        ),
+        host_startup_id=_first_text(
+            startup_recording.get("host_startup_id"),
+            body.get("host_startup_id"),
+        ),
+        host_session_id=_first_text(
+            startup_recording.get("host_session_id"),
+            body.get("host_session_id"),
+        ),
+        session_token_surrogate=_first_text(
+            startup_recording.get("session_token_surrogate"),
+            startup_recording.get("session_surrogate"),
+            body.get("session_token_surrogate"),
+            body.get("session_surrogate"),
+        ),
     )
     return {
         "schema_version": "observer_runtime_text_contract_revision.v1",
@@ -21778,6 +21888,7 @@ def _observer_runtime_text_contract_revision_payload(
             "test_command",
         ),
         "launch_text_hash": str(prepared.get("launch_text_hash") or ""),
+        "registered_host_adapter_spawn": registered_host_adapter_spawn,
         "raw_launch_text_persisted": False,
         "startup_intent_event_generated": bool(
             (prepared.get("persistent_evidence") or {}).get(

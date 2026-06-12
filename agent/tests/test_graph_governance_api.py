@@ -46,6 +46,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_WORKTREE_READY,
     append_branch_contract_revision,
     get_branch_context,
+    get_latest_branch_contract_revision,
     runtime_context_id_for_branch_context,
     upsert_batch_merge_runtime,
     upsert_branch_context,
@@ -1761,6 +1762,140 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert contract["target_files"] == ["agent/observer_runtime.py"]
 
 
+def test_observer_runtime_text_prepare_persists_registered_host_identity_for_startup(
+    conn,
+    tmp_path,
+):
+    worktree = tmp_path / "worker-prepare-startup"
+    worktree.mkdir()
+    main = tmp_path / "main"
+    main.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="prepare-startup-task",
+        runtime_context_id="mfrctx-prepare-startup",
+        root_task_id="AC-RUNTIME-PREPARE-STARTUP",
+        stage_task_id="prepare-startup-task",
+        backlog_id="AC-RUNTIME-PREPARE-STARTUP",
+        worker_id="prepare-worker-slot",
+        worker_slot_id="prepare-worker-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        branch_ref="refs/heads/codex/prepare-startup-task",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-prepare-startup",
+        worktree_path=str(worktree),
+        base_commit="base-prepare-startup",
+        target_head_commit="target-prepare-startup",
+        merge_queue_id="mq-prepare-startup",
+    )
+    upsert_branch_context(conn, runtime_context, now_iso="2026-06-12T10:00:00Z")
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-PREPARE-STARTUP",
+                "observer_command_id": "cmd-prepare-startup",
+                "task_id": "prepare-startup-task",
+                "parent_task_id": "AC-RUNTIME-PREPARE-STARTUP",
+                "runtime_context_id": "mfrctx-prepare-startup",
+                "branch_runtime_registration_ref": "mfrctx-prepare-startup",
+                "fence_token": "fence-prepare-startup",
+                "worktree_path": str(worktree),
+                "base_commit": "base-prepare-startup",
+                "target_head_commit": "target-prepare-startup",
+                "merge_queue_id": "mq-prepare-startup",
+                "route_id": "route-prepare-startup",
+                "route_context_hash": "sha256:route-prepare-startup",
+                "prompt_contract_id": "rprompt-prepare-startup",
+                "prompt_contract_hash": "sha256:prompt-prepare-startup",
+                "route_token_ref": "rtok-prepare-startup",
+                "visible_injection_manifest_hash": "sha256:visible-prepare-startup",
+                "main_worktree": str(main),
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                "graph_trace_ids": ["gqt-prepare-startup"],
+                "backend_mode": "codex_cli_exec",
+                "startup_source": "codex_cli_exec",
+                "host_adapter_agent_id": "prepare-host-agent",
+                "actual_host_worker_id": "prepare-host-worker",
+                "host_startup_id": "host-startup-prepare",
+                "host_session_id": "host-session-prepare",
+                "session_token_surrogate": "host-adapter:prepare",
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        "mfrctx-prepare-startup",
+    )
+    assert latest_revision is not None
+    registered = latest_revision.payload["registered_host_adapter_spawn"]
+    assert registered["runtime_context_id"] == "mfrctx-prepare-startup"
+    assert registered["observer_command_id"] == "cmd-prepare-startup"
+    assert registered["launch_text_hash"] == prepared["launch_text_hash"]
+    assert registered["task_id"] == "prepare-startup-task"
+    assert registered["worker_slot_id"] == "prepare-worker-slot"
+    assert registered["agent_id"] == "prepare-host-agent"
+    assert registered["actual_host_worker_id"] == "prepare-host-worker"
+    assert registered["host_startup_id"] == "host-startup-prepare"
+    assert registered["host_session_id"] == "host-session-prepare"
+    assert registered["session_token_surrogate"] == "host-adapter:prepare"
+
+    started = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "prepare-startup-task",
+                "parent_task_id": "AC-RUNTIME-PREPARE-STARTUP",
+                "worker_role": "mf_sub",
+                "worker_id": "prepare-worker-slot",
+                "agent_id": registered["agent_id"],
+                "actual_host_worker_id": registered["actual_host_worker_id"],
+                "runtime_context_id": registered["runtime_context_id"],
+                "launch_text_hash": registered["launch_text_hash"],
+                "host_startup_id": registered["host_startup_id"],
+                "host_session_id": registered["host_session_id"],
+                "session_token_surrogate": registered["session_token_surrogate"],
+                "startup_source": registered["startup_source"],
+                "fence_token": "fence-prepare-startup",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/prepare-startup-task",
+                "head_commit": "head-prepare-startup",
+                "base_commit": "base-prepare-startup",
+                "target_head_commit": "target-prepare-startup",
+                "merge_queue_id": "mq-prepare-startup",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                "route_id": "route-prepare-startup",
+                "route_context_hash": "sha256:route-prepare-startup",
+                "prompt_contract_id": "rprompt-prepare-startup",
+                "prompt_contract_hash": "sha256:prompt-prepare-startup",
+                "route_token_ref": "rtok-prepare-startup",
+                "visible_injection_manifest_hash": "sha256:visible-prepare-startup",
+                "observer_command_id": "cmd-prepare-startup",
+                "read_receipt_hash": "sha256:read-prepare-startup",
+                "read_receipt_event_id": "read-prepare-startup",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    gate = started["startup_gate"]
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert gate["agent_id"] == "prepare-host-agent"
+    assert gate["actual_host_worker_id"] == "prepare-host-worker"
+    assert gate["host_startup_id"] == "host-startup-prepare"
+    assert gate["session_token_surrogate"] == "host-adapter:prepare"
+
+
 def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(conn, tmp_path):
     main = tmp_path / "main"
     main.mkdir()
@@ -3238,7 +3373,7 @@ def test_parallel_branch_startup_blocks_missing_command_read_receipt_lineage(
         conn,
         PID,
         backlog_id="FEAT-STARTUP-LINEAGE-GATE",
-        event_kind="mf_subagent_startup",
+        event_kind="mf_subagent_startup_refusal",
     )
     assert blocked["ok"] is False
     assert blocked["blocker_id"] == (
@@ -3250,7 +3385,16 @@ def test_parallel_branch_startup_blocks_missing_command_read_receipt_lineage(
     assert blocked["next_legal_action"]["tool"] == (
         "observer_read_receipt_then_startup"
     )
-    assert events == []
+    assert len(events) == 1
+    refusal = events[0]["payload"]["mf_subagent_startup_refusal"]
+    assert refusal["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
+    assert refusal["missing_required_fields"] == [
+        "observer_command_id",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+    ]
 
 
 def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allocation(
@@ -3282,6 +3426,46 @@ def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allo
         conn,
         runtime_context,
         now_iso="2026-06-05T04:30:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_registered_host_adapter_spawn",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "task_id": "host-startup-mf-sub-task",
+                "worker_slot_id": "host-startup-worker-slot",
+                "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "actual_host_worker_id": (
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "host_startup_id": (
+                    "multi_agent_v1.spawn_agent:"
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "host_session_id": (
+                    "multi_agent_v1.spawn_agent:"
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "session_token_surrogate": (
+                    "codex_desktop_multi_agent_v1:"
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+            }
+        },
+        route_identity={
+            "route_id": "route-host-startup",
+            "route_context_hash": "sha256:route-host-startup",
+            "prompt_contract_id": "rprompt-host-startup",
+            "prompt_contract_hash": "sha256:prompt-host-startup",
+            "route_token_ref": "rtok-host-startup",
+            "visible_injection_manifest_hash": "sha256:visible-host-startup",
+        },
+        now_iso="2026-06-05T04:31:00Z",
     )
 
     started = server.handle_graph_governance_parallel_branch_startup(
@@ -3370,6 +3554,42 @@ def test_parallel_branch_startup_accepts_codex_cli_host_startup_id_for_observer_
         conn,
         runtime_context,
         now_iso="2026-06-05T20:45:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_registered_host_adapter_spawn",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "task_id": "codex-cli-startup-mf-sub-task",
+                "worker_slot_id": "codex-cli-worker-slot",
+                "agent_id": "codex-cli-mfsub-doc-bootstrap-progress-20260605-a2",
+                "actual_host_worker_id": (
+                    "codex-cli-mfsub-doc-bootstrap-progress-20260605-a2"
+                ),
+                "host_startup_id": (
+                    "codex-cli-thread:"
+                    "019e995e-d14d-79f2-8fcb-5af3ec083251"
+                ),
+                "host_session_id": (
+                    "codex-cli-thread:"
+                    "019e995e-d14d-79f2-8fcb-5af3ec083251"
+                ),
+            }
+        },
+        route_identity={
+            "route_id": "route-codex-cli-startup",
+            "route_context_hash": "sha256:route-codex-cli-startup",
+            "prompt_contract_id": "rprompt-codex-cli-startup",
+            "prompt_contract_hash": "sha256:prompt-codex-cli-startup",
+            "route_token_ref": "rtok-codex-cli-startup",
+            "visible_injection_manifest_hash": "sha256:visible-codex-cli-startup",
+        },
+        now_iso="2026-06-05T20:46:00Z",
     )
 
     started = server.handle_graph_governance_parallel_branch_startup(
@@ -3625,6 +3845,127 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
     )
 
 
+def test_parallel_branch_startup_rejects_event_4178_multi_agent_prefix_replay(
+    conn,
+    tmp_path,
+):
+    worktree = tmp_path / "worker-event-4178-startup"
+    worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="event-4178-startup-task",
+        root_task_id="event-4178-parent",
+        stage_task_id="event-4178-startup-task",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        branch_ref="refs/heads/codex/event-4178-startup-task",
+        status="worktree_ready",
+        worker_id="event-4178-worker-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        worker_slot_id="event-4178-worker-slot",
+        fence_token="fence-event-4178-startup",
+        worktree_path=str(worktree),
+        base_commit="base-event-4178",
+        target_head_commit="target-event-4178",
+        merge_queue_id="mergeq-event-4178",
+    )
+    upsert_branch_context(conn, runtime_context)
+
+    def _body(host_startup_id: str) -> dict:
+        return {
+            "task_id": "event-4178-startup-task",
+            "parent_task_id": "event-4178-parent",
+            "worker_role": "mf_sub",
+            "worker_id": "event-4178-worker-slot",
+            "agent_id": "codex-multi-agent-4178",
+            "session_token": "same-event-4178-session-token",
+            "runtime_context_id": runtime_context_id_for_branch_context(
+                runtime_context
+            ),
+            "host_startup_id": host_startup_id,
+            "fence_token": "fence-event-4178-startup",
+            "actual_cwd": str(worktree),
+            "actual_git_root": str(worktree),
+            "branch": "refs/heads/codex/event-4178-startup-task",
+            "head_commit": "head-event-4178",
+            "base_commit": "base-event-4178",
+            "target_head_commit": "target-event-4178",
+            "merge_queue_id": "mergeq-event-4178",
+            "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+            "route_id": "route-event-4178",
+            "route_context_hash": "sha256:route-event-4178",
+            "prompt_contract_id": "rprompt-event-4178",
+            "prompt_contract_hash": "sha256:prompt-event-4178",
+            "route_token_ref": "rtok-event-4178",
+            "visible_injection_manifest_hash": "sha256:visible-event-4178",
+            "observer_command_id": "cmd-event-4178",
+            "read_receipt_hash": "sha256:read-event-4178",
+            "read_receipt_event_id": "4178",
+        }
+
+    attempts = (
+        _body("codex-multi-agent-4178-a"),
+        _body("codex-multi-agent-4178-b"),
+        _body("multi_agent_v1:4178-b"),
+    )
+    results = [
+        server.handle_graph_governance_parallel_branch_startup(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+        for body in attempts
+    ]
+
+    for result in results:
+        assert result["ok"] is False
+        assert result["blocker_id"] == "agent_id_mismatch"
+        assert result["timeline_event_recorded"]["event_kind"] == (
+            "mf_subagent_startup_refusal"
+        )
+
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        event_kind="mf_subagent_startup_refusal",
+        limit=10,
+    )
+    event_4178_events = [
+        event
+        for event in events
+        if event["task_id"] == "event-4178-startup-task"
+    ]
+    assert len(event_4178_events) == 3
+    refusals = [
+        event["payload"]["mf_subagent_startup_refusal"]
+        for event in event_4178_events
+    ]
+    assert [refusal["host_startup_id"] for refusal in refusals] == [
+        "codex-multi-agent-4178-a",
+        "codex-multi-agent-4178-b",
+        "multi_agent_v1:4178-b",
+    ]
+    for refusal in refusals:
+        assert refusal["blocker_id"] == "agent_id_mismatch"
+        assert refusal["agent_id"] == "codex-multi-agent-4178"
+        assert refusal["allocation_owner"] == "observer-allocation-owner"
+        assert refusal["runtime_context_id"] == runtime_context_id_for_branch_context(
+            runtime_context
+        )
+        assert refusal["route_id"] == "route-event-4178"
+        assert refusal["route_context_hash"] == "sha256:route-event-4178"
+        assert refusal["prompt_contract_id"] == "rprompt-event-4178"
+        assert refusal["prompt_contract_hash"] == "sha256:prompt-event-4178"
+    assert "same-event-4178-session-token" not in json.dumps(
+        event_4178_events,
+        sort_keys=True,
+    )
+
+
 def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tmp_path):
     worktree = tmp_path / "worker-startup-blocked"
     worktree.mkdir()
@@ -3665,12 +4006,15 @@ def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tm
         conn,
         PID,
         backlog_id="FEAT-STARTUP-GATE",
-        event_kind="mf_subagent_startup",
+        event_kind="mf_subagent_startup_refusal",
     )
     assert blocked["ok"] is False
     assert blocked["blocker_id"] == "no_truthful_bounded_mf_sub_startup_surface_available"
     assert blocked["terminal_dispatch_blocker"] is True
-    assert events == []
+    assert len(events) == 1
+    assert events[0]["payload"]["mf_subagent_startup_refusal"]["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
 
 
 def test_parallel_branch_finish_gate_rejects_stale_fence(conn):
