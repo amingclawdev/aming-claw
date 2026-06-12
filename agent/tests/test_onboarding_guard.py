@@ -53,15 +53,39 @@ def test_allows_protected_tool_when_onboarded() -> None:
         {"tool_name": "parallel_branch_startup"},
         env={"AMING_CLAW_ONBOARDED": "1"},
     )
-    payload_code, payload_stdout, payload_stderr = _run_guard(
+
+    assert (env_code, env_stdout, env_stderr) == (0, "", "")
+
+
+def test_denies_protected_tool_when_payload_self_attests_onboarding() -> None:
+    code, stdout, stderr = _run_guard(
         {
             "tool_name": "project bootstrap",
+            "aming_claw_onboarded": True,
             "onboard_state": {"status": "complete"},
+            "tool_input": {
+                "nested_onboard_state": {"complete": True},
+            },
         }
     )
 
-    assert (env_code, env_stdout, env_stderr) == (0, "", "")
-    assert (payload_code, payload_stdout, payload_stderr) == (0, "", "")
+    assert code == 2
+    assert stderr == ""
+    response = json.loads(stdout)
+    assert response["permissionDecision"] == "deny"
+    assert "/aming-claw:onboard" in response["permissionDecisionReason"]
+
+
+def test_allows_protected_tool_with_host_state_file(tmp_path) -> None:
+    state_path = tmp_path / "onboard-state.json"
+    state_path.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+
+    code, stdout, stderr = _run_guard(
+        {"tool_name": "execute_backlog_row"},
+        env={"AMING_CLAW_ONBOARDING_GUARD_STATE": str(state_path)},
+    )
+
+    assert (code, stdout, stderr) == (0, "", "")
 
 
 def test_denied_attempt_writes_public_safe_audit_record(tmp_path) -> None:

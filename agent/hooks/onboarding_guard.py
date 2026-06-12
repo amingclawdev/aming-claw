@@ -13,6 +13,7 @@ from typing import Any, Mapping, TextIO
 ONBOARD_COMMAND = "/aming-claw:onboard"
 AUDIT_ENV = "AMING_CLAW_ONBOARDING_GUARD_AUDIT"
 ONBOARDED_ENV = "AMING_CLAW_ONBOARDED"
+STATE_ENV = "AMING_CLAW_ONBOARDING_GUARD_STATE"
 
 PROTECTED_ACTIONS = frozenset(
     {
@@ -130,27 +131,36 @@ def _walk_mappings(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:
     return []
 
 
-def payload_onboarding_complete(payload: Mapping[str, Any]) -> bool:
-    for mapping in _walk_mappings(payload):
-        for key, value in mapping.items():
-            normalized = canonical_name(key)
-            if "onboard" in normalized and _truthy_complete(value):
-                return True
-            if normalized in {"aming_claw_onboarding_complete", "aming_claw_onboarded"}:
-                return _truthy_complete(value)
-    return False
-
-
 def env_onboarding_complete(env: Mapping[str, str] | None = None) -> bool:
     effective_env = os.environ if env is None else env
     return _truthy_complete(effective_env.get(ONBOARDED_ENV))
 
 
+def state_file_onboarding_complete(env: Mapping[str, str] | None = None) -> bool:
+    effective_env = os.environ if env is None else env
+    state_path = str(effective_env.get(STATE_ENV, "")).strip()
+    if not state_path:
+        return False
+
+    try:
+        raw = Path(state_path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not raw:
+        return False
+
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        state = raw
+    return _truthy_complete(state)
+
+
 def onboarding_complete(
-    payload: Mapping[str, Any],
+    _payload: Mapping[str, Any],
     env: Mapping[str, str] | None = None,
 ) -> bool:
-    return env_onboarding_complete(env) or payload_onboarding_complete(payload)
+    return env_onboarding_complete(env) or state_file_onboarding_complete(env)
 
 
 def _candidate_action_values(payload: Mapping[str, Any]) -> list[str]:
