@@ -585,6 +585,10 @@ project root file.
 On the first Aming Claw skill load in a fresh session, show a short
 host-rendered launcher block before deep work. This is the MVP for onboarding
 buttons until the dashboard/plugin frontend owns native controls.
+For explicit onboarding, route the user to the single launcher entry
+`/aming-claw:aming-claw-launcher`; do not create a competing onboarding flow in
+this skill. The compact launcher state machine links to the full first-run
+schema source in [docs/onboarding.md](../../docs/onboarding.md).
 
 First read `aming-claw://current-context` when available. If that resource is
 missing or governance is offline, continue safely with the offline launcher
@@ -668,6 +672,7 @@ governance runtime is offline, offer the explicit launcher flow instead of
 auto-starting services:
 
 ```text
+/aming-claw:aming-claw-launcher
 aming-claw launcher
 aming-claw start
 ```
@@ -684,6 +689,8 @@ or an HTML/dashboard guide in later iterations. It may include:
 
 It must not execute local commands from a browser button; service startup
 remains an explicit MCP/CLI action.
+Full target-project registration schema and Lane 1 first-run route-gate
+behavior live in [docs/onboarding.md](../../docs/onboarding.md).
 
 ## Mutation Rules
 

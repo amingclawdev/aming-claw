@@ -5,6 +5,11 @@ project. V1 is local-first: start governance, open the dashboard, explicitly
 register a clean target project, build the graph, then use dashboard/MCP tools
 to inspect, file backlog, and plan PR work.
 
+The single user-invocable onboarding entry is
+`/aming-claw:aming-claw-launcher` in Claude Code or `aming-claw launcher` at
+the CLI. The launcher skill is the compact state machine; this document remains
+the full schema and first-run route-gate source.
+
 ## 1. Start Aming Claw
 
 Install from the repository or plugin flow in [README.md](../README.md), then
@@ -56,6 +61,10 @@ API fallback:
 ```http
 POST http://127.0.0.1:40000/api/project/bootstrap
 ```
+
+This is the Lane 1 first-run bootstrap path. Do not use old ungated CLI or DB
+side doors for first registration; the governance API/dashboard path records
+the project-bootstrap route binding and graph-build evidence.
 
 Request body schema:
 
