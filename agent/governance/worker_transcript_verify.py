@@ -230,6 +230,103 @@ def _contains_all(haystack: str, needles: Sequence[str]) -> list[str]:
     return [needle for needle in needles if needle and needle not in haystack]
 
 
+_KNOWN_BAD_4178_STRUCTURED_KEYS = {
+    "actor",
+    "agent_id",
+    "event_id",
+    "event_kind",
+    "event_ref",
+    "filer_principal",
+    "filed_on_behalf_by",
+    "host_session_id",
+    "host_startup_id",
+    "id",
+    "known_bad_playback_4178",
+    "on_behalf_of",
+    "parent_event_id",
+    "playback_source",
+    "read_receipt_event_id",
+    "scenario",
+    "scenario_id",
+    "source",
+    "source_event_id",
+    "startup_source",
+    "timeline_event_id",
+    "worker_session_id",
+}
+
+_KNOWN_BAD_4178_MARKERS = (
+    "codex-cli-thread:event-4178",
+    "codex-multi-agent-4178",
+    "event-4178",
+    "multi_agent_v1:4178",
+)
+
+
+def _structured_known_bad_values(value: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key in _KNOWN_BAD_4178_STRUCTURED_KEYS:
+                if isinstance(item, bool):
+                    if item and normalized_key == "known_bad_playback_4178":
+                        values.append("known_bad_playback_4178:true")
+                elif not isinstance(item, (Mapping, list, tuple, set)):
+                    token = _text(item)
+                    if token:
+                        values.append(f"{normalized_key}:{token}")
+                else:
+                    values.extend(_structured_known_bad_values(item))
+            elif isinstance(item, Mapping):
+                values.extend(_structured_known_bad_values(item))
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                for child in item:
+                    values.extend(_structured_known_bad_values(child))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            values.extend(_structured_known_bad_values(item))
+    return _dedupe(values)
+
+
+def _structured_known_bad_playback_4178(
+    payload: Mapping[str, Any],
+    transcript_events: Sequence[Mapping[str, Any]],
+) -> tuple[bool, list[str]]:
+    """Detect known-bad 4178 replay only from structured identity evidence.
+
+    Full transcript text may contain prompts, tests, or explanatory QA notes that
+    reference 4178 as a regression example. Those are not startup identity.
+    """
+
+    structured_values = [
+        *_structured_known_bad_values(payload),
+        *_structured_known_bad_values(list(transcript_events)),
+    ]
+    matches: list[str] = []
+    for value in structured_values:
+        lower_value = value.lower()
+        if lower_value == "known_bad_playback_4178:true":
+            matches.append(value)
+            continue
+        if lower_value.endswith(":4178") and any(
+            lower_value.startswith(prefix)
+            for prefix in (
+                "event_id:",
+                "event_ref:",
+                "parent_event_id:",
+                "read_receipt_event_id:",
+                "source_event_id:",
+                "timeline_event_id:",
+            )
+        ):
+            matches.append(value)
+            continue
+        if any(marker in lower_value for marker in _KNOWN_BAD_4178_MARKERS):
+            matches.append(value)
+    return bool(matches), _dedupe(matches)
+
+
 def _layer(layer_id: str, blockers: Sequence[str], **facts: Any) -> dict[str, Any]:
     return {
         "id": layer_id,
@@ -385,10 +482,10 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         or _text(payload.get("on_behalf_of"))
         or filer_principal in {"observer", "mf_sub", "host-adapter", "host_adapter"}
     )
-    playback_4178 = "4178" in " ".join(
-        _text(payload.get(key))
-        for key in ("agent_id", "startup_source", "worker_session_id", "host_session_id")
-    ).lower() or "event-4178" in transcript_text.lower()
+    playback_4178, playback_4178_evidence = _structured_known_bad_playback_4178(
+        payload,
+        list(loaded.get("events") or []),
+    )
     principal_blockers: list[str] = []
     if on_behalf:
         principal_blockers.append("observer_or_generic_on_behalf_filer")
@@ -410,6 +507,7 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
             filer_principal=filer_principal,
             filed_on_behalf=on_behalf,
             known_bad_playback_4178=playback_4178,
+            known_bad_playback_4178_evidence=playback_4178_evidence,
         )
     )
 

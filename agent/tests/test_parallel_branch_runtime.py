@@ -539,6 +539,71 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert accepted.task_id == "mf-sub-startup"
 
 
+def test_worker_transcript_allows_4178_prompt_text_without_structured_playback(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-4178-prompt-text"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+    payload = _startup_payload(str(worktree), worker_session_id="codex-session-prompt-note")
+    transcript_path = Path(str(payload["worker_transcript_path"]))
+    with transcript_path.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "type": "prompt_note",
+                    "content": (
+                        "QA text mentions event-4178 as a regression example, "
+                        "but this is not startup identity evidence."
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=payload,
+        now_iso=NOW,
+    )
+
+    gate = result["startup_gate"]
+    assert gate["worker_self_attesting"] is True
+    assert gate["worker_self_attestation"]["status"] == "passed"
+    assert gate["worker_self_attestation"]["known_bad_playback_4178"] is False
+    assert "known_bad_playback_4178_shape" not in gate["worker_self_attestation"]["blockers"]
+
+
+def test_worker_transcript_blocks_structured_4178_playback_identity(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-structured-4178"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            worker_session_id="codex-session-structured-replay",
+            host_startup_id="multi_agent_v1:4178-b",
+        ),
+        now_iso=NOW,
+    )
+
+    gate = result["startup_gate"]
+    assert gate["worker_self_attesting"] is False
+    assert gate["worker_self_attestation"]["known_bad_playback_4178"] is True
+    assert (
+        "known_bad_playback_4178_shape"
+        in gate["worker_self_attestation"]["blockers"]
+    )
+
+
 def test_worker_transcript_mf_sub_startup_marks_missing_transcript_not_self_attesting(
     tmp_path,
 ) -> None:
