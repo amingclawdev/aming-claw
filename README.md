@@ -940,7 +940,9 @@ Project bootstrap is explicit. Do not silently register a workspace just
 because the projects registry is empty. Bootstrap writes Aming Claw registry/DB
 state, scans the workspace, and builds a commit-bound graph snapshot through
 the governance project-bootstrap API; ServiceManager is not the bootstrap API.
-If the target workspace is a dirty git repo, commit/stash first.
+If the target workspace is a dirty git repo, commit/stash first. The full
+registration request schema and first-run route-gate behavior are documented in
+[`docs/onboarding.md`](docs/onboarding.md).
 
 Install/startup state belongs to the plugin/runtime checkout, not the target
 project. Bootstrap now refuses obvious Aming Claw self-artifacts in an external
@@ -1073,6 +1075,7 @@ https://github.com/amingclawdev/aming-claw/issues
 - [Architecture](docs/architecture.md)
 - [Deployment](docs/deployment.md)
 - [Governance Overview](docs/governance/README.md)
+- [Onboarding Guide](docs/onboarding.md)
 - [Configuration Reference](docs/config/README.md)
 - [API Overview](docs/api/README.md)
 - [Plugin Packaging Notes](skills/aming-claw/references/plugin-packaging.md)

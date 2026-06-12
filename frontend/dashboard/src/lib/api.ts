@@ -158,10 +158,19 @@ export const api = {
   bootstrapProject(
     payload: {
       workspace_path: string;
+      project_id?: string;
       project_name?: string;
+      language?: string;
       scan_depth?: number;
       exclude_patterns?: string[];
-      config_override?: { graph?: { exclude_paths?: string[]; ignore_globs?: string[] } };
+      config_override?: {
+        project_id?: string;
+        language?: string;
+        graph?: { exclude_paths?: string[]; ignore_globs?: string[] };
+      };
+      route_token?: Record<string, unknown>;
+      route_token_ref?: string;
+      route_waiver?: Record<string, unknown>;
     },
     signal?: AbortSignal,
   ) {
@@ -1032,6 +1041,8 @@ export interface BootstrapProjectResponse {
   graph_stats?: { node_count?: number; edge_count?: number };
   preflight?: { status?: string };
   activation?: { snapshot_id?: string; projection_status?: string };
+  route_token_gate?: Record<string, unknown>;
+  route_bootstrap_handoff?: Record<string, unknown>;
 }
 
 export interface LocalDirectoryPickerResponse {

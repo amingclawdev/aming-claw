@@ -1007,13 +1007,156 @@ def _bootstrap_route_gate_project_id(body: dict, workspace_path: str) -> str:
     return project_service._normalize_project_id(str(raw or ""))
 
 
+def _bootstrap_config_override(body: Mapping[str, Any]) -> dict | None:
+    """Fold top-level bootstrap API fields into project config overrides."""
+
+    payload = body if isinstance(body, Mapping) else {}
+    raw_override = payload.get("config_override")
+    override = dict(raw_override) if isinstance(raw_override, Mapping) else {}
+    project_id = str(payload.get("project_id") or "").strip()
+    language = str(payload.get("language") or "").strip()
+    if project_id and not override.get("project_id"):
+        override["project_id"] = project_id
+    if language and not override.get("language"):
+        override["language"] = language
+    return override or None
+
+
+def _bootstrap_has_route_gate_input(body: Mapping[str, Any] | None) -> bool:
+    payload = body if isinstance(body, Mapping) else {}
+    return bool(
+        _body_has_route_token_input(dict(payload))
+        or _body_has_route_waiver(dict(payload))
+        or str(payload.get("route_token_ref") or "").strip()
+    )
+
+
+def _project_bootstrap_first_run_allowed(project_id: str) -> bool:
+    """Return true only when the target project is not registered yet."""
+
+    if not project_id:
+        return False
+    try:
+        return not bool(project_service.project_exists(project_id))
+    except Exception:
+        log.debug("project bootstrap first-run check failed", exc_info=True)
+        return False
+
+
+def _mint_first_run_bootstrap_route_gate(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    workspace_path: str,
+) -> dict:
+    """Mint and validate a narrow server-side route binding for first bootstrap."""
+
+    from . import observer_route_context
+    from .mf_subagent_contract import route_token_required_failure_details
+
+    task_id = f"first-run-bootstrap-{project_id}"
+    backlog_id = task_id
+    try:
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            target_files=[workspace_path],
+            allowed_actions=["project_bootstrap"],
+            ttl_hours=1,
+            evidence_refs=[
+                f"first-run-bootstrap:{project_id}",
+                f"request:{ctx.request_id}",
+            ],
+            project_root=workspace_path,
+        )
+        conn = get_connection(project_id)
+        try:
+            observer_route_context.persist_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=issued["route_token_ref"],
+                token=issued["route_token"],
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise GovernanceError(
+            "route_token_required",
+            f"first-run bootstrap route binding failed: {exc}",
+            422,
+            route_token_required_failure_details(
+                action="project_bootstrap",
+                reason=str(exc),
+                extra={
+                    "first_run_bootstrap_binding_required": True,
+                    "project_id": project_id,
+                    "raw_route_token_persisted": False,
+                },
+            ),
+        ) from exc
+
+    gate = _require_route_token_mutation_gate(
+        ctx,
+        action="project_bootstrap",
+        project_id=project_id,
+        metadata={"route_token": issued["route_token"]},
+    )
+    gate = dict(gate)
+    gate.update({
+        "server_minted": True,
+        "bootstrap_gate_decision": "server_minted_first_run_binding",
+        "first_run_bootstrap": {
+            "schema_version": "project_bootstrap_first_run_route_binding.v1",
+            "project_id": project_id,
+            "workspace_path": workspace_path,
+            "route_token_ref": issued["route_token_ref"],
+            "binding_source": "observer_route_token_refs",
+            "reason": (
+                "project is not registered yet; governance minted a narrow "
+                "project_bootstrap binding before first registration"
+            ),
+            "raw_route_token_persisted": False,
+        },
+    })
+    return gate
+
+
+def _project_bootstrap_route_gate(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    workspace_path: str,
+    first_run: bool,
+) -> dict:
+    if _bootstrap_has_route_gate_input(ctx.body or {}):
+        return _require_route_token_mutation_gate(
+            ctx,
+            action="project_bootstrap",
+            project_id=project_id,
+        )
+    if first_run:
+        return _mint_first_run_bootstrap_route_gate(
+            ctx,
+            project_id=project_id,
+            workspace_path=workspace_path,
+        )
+    return _require_route_token_mutation_gate(
+        ctx,
+        action="project_bootstrap",
+        project_id=project_id,
+    )
+
+
 @route("POST", "/api/project/bootstrap")
 def handle_project_bootstrap(ctx: RequestContext):
     """Bootstrap a project from workspace (R1).
 
     Body: {
         "workspace_path": "/path/to/project" (required),
+        "project_id": "my-project" (optional),
         "project_name": "my-project" (optional),
+        "language": "python" (optional),
         "config_override": {"graph": {"exclude_paths": [], "ignore_globs": []}} (optional),
         "scan_depth": 3 (optional),
         "exclude_patterns": [] (optional),
@@ -1024,32 +1167,26 @@ def handle_project_bootstrap(ctx: RequestContext):
     if not workspace_path:
         return 400, {"error": "workspace_path is required"}
     project_id = _bootstrap_route_gate_project_id(ctx.body, workspace_path)
+    first_run = _project_bootstrap_first_run_allowed(project_id)
+    config_override = _bootstrap_config_override(ctx.body or {})
     route_handoff = _route_bootstrap_handoff(
         ctx.body or {},
         action="project_bootstrap",
         project_id=project_id,
+        first_run=first_run,
     )
-    handoff_identity = (
-        route_handoff.get("route_identity") if isinstance(route_handoff, Mapping) else {}
+    route_gate = _project_bootstrap_route_gate(
+        ctx,
+        project_id=project_id,
+        workspace_path=workspace_path,
+        first_run=first_run,
     )
-    if isinstance(handoff_identity, Mapping) and handoff_identity:
-        route_gate = _require_route_token_mutation_gate(
-            ctx,
-            action="project_bootstrap",
-            project_id=project_id,
-        )
-    else:
-        route_gate = _require_route_token_mutation_gate(
-            ctx,
-            action="project_bootstrap",
-            project_id=project_id,
-        )
 
     try:
         result = project_service.bootstrap_project(
             workspace_path=workspace_path,
             project_name=ctx.body.get("project_name", ""),
-            config_override=ctx.body.get("config_override"),
+            config_override=config_override,
             scan_depth=ctx.body.get("scan_depth", 3),
             exclude_patterns=ctx.body.get("exclude_patterns"),
         )
@@ -18567,6 +18704,9 @@ def _route_gate_public_summary(gate: Mapping[str, Any] | None) -> dict[str, Any]
         "protected_lane",
         "legal_next_action",
         "next_legal_action",
+        "server_minted",
+        "bootstrap_gate_decision",
+        "first_run_bootstrap",
     }
     summary = {key: gate.get(key) for key in allowed if gate.get(key) not in (None, "", [], {})}
     route_identity = gate.get("route_identity")
@@ -18909,6 +19049,7 @@ def _route_bootstrap_handoff(
     *,
     action: str,
     project_id: str,
+    first_run: bool = False,
 ) -> dict[str, Any]:
     payload = body if isinstance(body, Mapping) else {}
     route_identity = (
@@ -18943,10 +19084,15 @@ def _route_bootstrap_handoff(
         "action": action,
         "project_id": project_id,
         "route_identity": identity,
-        "route_token_required_before_bootstrap": True,
+        "first_run": bool(first_run),
+        "server_minted_first_run_binding_available": bool(first_run),
+        "route_token_required_before_bootstrap": not bool(first_run),
         "raw_prompt_persisted": False,
         "raw_route_token_persisted": False,
         "next_legal_action": (
+            "server_mint_first_run_bootstrap_binding"
+            if first_run and not identity
+            else
             "supply_a_bound_route_token_before_project_bootstrap"
         ),
     }

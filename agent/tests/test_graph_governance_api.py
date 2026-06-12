@@ -193,6 +193,33 @@ def _route_token(
     }
 
 
+def _server_issued_route_token(
+    conn,
+    action: str,
+    *,
+    project_id: str = PID,
+    task_id: str = "route-token-test-task",
+    backlog_id: str = "route-token-test-backlog",
+) -> dict:
+    from agent.governance import observer_route_context
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=[action],
+        evidence_refs=[f"timeline:test-route-token-{action}"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    return issued["route_token"]
+
+
 def _finish_gate_evidence(
     *,
     fence_token: str,
@@ -258,6 +285,7 @@ def conn(tmp_path, monkeypatch):
     _ensure_schema(c)
     store.ensure_schema(c)
     monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(c))
+    monkeypatch.setattr("agent.governance.db.get_connection", lambda _project_id: _NoCloseConn(c))
     yield c
     c.close()
 
@@ -337,10 +365,67 @@ def test_dashboard_dist_dir_explicit_override_wins_over_packaged_and_repo_dist(
     assert server._dashboard_dist_dir() == override_dist.resolve()
 
 
-def test_project_bootstrap_requires_route_token_or_waiver(conn, monkeypatch):
+def test_project_bootstrap_first_run_mints_server_binding_and_records_gate(conn, monkeypatch):
+    observed = {}
+
+    def fake_bootstrap_project(**kwargs):
+        observed.update(kwargs)
+        return {
+            "project_id": "bootstrap-demo",
+            "graph_stats": {"node_count": 1, "edge_count": 0, "layers": {}},
+        }
+
+    monkeypatch.setattr(server.project_service, "project_exists", lambda _project_id: False)
+    monkeypatch.setattr(server.project_service, "bootstrap_project", fake_bootstrap_project)
+
+    status, payload = server.handle_project_bootstrap(
+        _ctx(
+            {},
+            method="POST",
+            body={
+                "workspace_path": "/tmp/bootstrap-demo",
+                "project_id": "bootstrap-demo",
+                "language": "python",
+            },
+        )
+    )
+
+    assert status == 200
+    assert observed["workspace_path"] == "/tmp/bootstrap-demo"
+    assert observed["config_override"]["project_id"] == "bootstrap-demo"
+    assert observed["config_override"]["language"] == "python"
+    gate = payload["route_token_gate"]
+    assert gate["decision"] == "route_token"
+    assert gate["server_minted"] is True
+    assert gate["bootstrap_gate_decision"] == "server_minted_first_run_binding"
+    assert gate["server_issued_binding"] is True
+    assert gate["binding_source"] == "observer_route_token_refs"
+    assert gate["scope"]["project_id"] == "bootstrap-demo"
+    assert gate["first_run_bootstrap"]["raw_route_token_persisted"] is False
+    assert payload["route_bootstrap_handoff"]["first_run"] is True
+
+    ref_row = conn.execute(
+        "SELECT route_token_ref, status FROM observer_route_token_refs WHERE project_id = ?",
+        ("bootstrap-demo",),
+    ).fetchone()
+    assert ref_row is not None
+    assert ref_row["route_token_ref"] == gate["route_token_ref"]
+    assert ref_row["status"] == "active"
+
+    event = conn.execute(
+        "SELECT event_type, project_id, payload_json FROM task_timeline_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert event["event_type"] == "route_token_gate.project_bootstrap"
+    assert event["project_id"] == "bootstrap-demo"
+    event_payload = json.loads(event["payload_json"])
+    assert event_payload["route_token_gate"]["first_run_bootstrap"]["project_id"] == "bootstrap-demo"
+
+
+def test_project_bootstrap_tokenless_non_first_run_rejected(conn, monkeypatch):
     def fail_bootstrap(**_kwargs):
         raise AssertionError("bootstrap_project must not run without route gate evidence")
 
+    monkeypatch.setattr(server.project_service, "project_exists", lambda _project_id: True)
     monkeypatch.setattr(server.project_service, "bootstrap_project", fail_bootstrap)
 
     with pytest.raises(GovernanceError, match="route_token"):
@@ -407,7 +492,8 @@ def test_project_bootstrap_route_token_allows_project_scope(conn, monkeypatch):
             body={
                 "workspace_path": "/tmp/bootstrap-token-demo",
                 "project_id": "bootstrap-token-demo",
-                "route_token": _route_token(
+                "route_token": _server_issued_route_token(
+                    conn,
                     "project_bootstrap",
                     project_id="bootstrap-token-demo",
                 ),
@@ -1895,7 +1981,8 @@ def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_po
                             "hidden_context": "must not persist",
                         },
                     },
-                    "route_token": _route_token(
+                    "route_token": _server_issued_route_token(
+                        conn,
                         "append_contract_revision",
                         task_id="runtime-contract-revision-task",
                         backlog_id="AC-CONTRACT-RUNTIME-REVISION-POLLING-DOGFOOD-20260603",
