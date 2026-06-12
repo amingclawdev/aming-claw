@@ -1226,6 +1226,8 @@ const CHECKLIST_STRUCTURED_ROOTS: Array<{ path: string; label: string; status?: 
   { path: "payload.checklist", label: "Checklist" },
   { path: "payload.checks", label: "Checks" },
   { path: "payload.gate", label: "Gate" },
+  { path: "payload.route_token_gate", label: "Route token gate" },
+  { path: "payload.mf_subagent_startup_gate", label: "MF subagent startup gate" },
   { path: "payload.route_action_gate", label: "Route action gate" },
   { path: "payload.route_context_gate", label: "Route context gate" },
   { path: "payload.contract_gate", label: "Contract gate" },

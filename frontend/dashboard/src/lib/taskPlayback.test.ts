@@ -2874,6 +2874,16 @@ export const taskPlaybackWorkerLaneAttributionSummary: string[] = [
 // ──────────────────────────────────────────────────────────────────────────────
 
 function eventChecklistAssertions(): string[] {
+  const playbackSource = readFileSync(new URL("./taskPlayback.ts", import.meta.url), "utf8");
+  assertFixture(
+    playbackSource.includes('{ path: "payload.route_token_gate", label: "Route token gate" }'),
+    "CHECKLIST_STRUCTURED_ROOTS should register payload.route_token_gate",
+  );
+  assertFixture(
+    playbackSource.includes('{ path: "payload.mf_subagent_startup_gate", label: "MF subagent startup gate" }'),
+    "CHECKLIST_STRUCTURED_ROOTS should register payload.mf_subagent_startup_gate",
+  );
+
   const backlog: BacklogBug = {
     bug_id: "AC-PLAYBACK-CHECKLIST-VISUAL-COLLAPSED-20260611",
     title: "Playback event checklist projection",
@@ -3320,6 +3330,7 @@ function eventChecklistAssertions(): string[] {
   return [
     `event checklist blocked rows: ${blockedRows.length}`,
     `event checklist passed rows: ${passedRows.length}`,
+    "event checklist structured roots include route-token and startup gates",
     "event checklist private raw/token material redacted from structured rows",
     `event checklist route-token gate rows: ${routeGateRows.length}`,
     `event checklist startup gate rows: ${startupRowsA.length}`,
