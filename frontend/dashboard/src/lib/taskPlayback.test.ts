@@ -2874,6 +2874,16 @@ export const taskPlaybackWorkerLaneAttributionSummary: string[] = [
 // ──────────────────────────────────────────────────────────────────────────────
 
 function eventChecklistAssertions(): string[] {
+  const playbackSource = readFileSync(new URL("./taskPlayback.ts", import.meta.url), "utf8");
+  assertFixture(
+    playbackSource.includes('{ path: "payload.route_token_gate", label: "Route token gate" }'),
+    "CHECKLIST_STRUCTURED_ROOTS should register payload.route_token_gate",
+  );
+  assertFixture(
+    playbackSource.includes('{ path: "payload.mf_subagent_startup_gate", label: "MF subagent startup gate" }'),
+    "CHECKLIST_STRUCTURED_ROOTS should register payload.mf_subagent_startup_gate",
+  );
+
   const backlog: BacklogBug = {
     bug_id: "AC-PLAYBACK-CHECKLIST-VISUAL-COLLAPSED-20260611",
     title: "Playback event checklist projection",
@@ -2950,6 +2960,244 @@ function eventChecklistAssertions(): string[] {
       },
       created_at: "2026-06-11T12:02:00Z",
     },
+    {
+      id: 4104,
+      event_type: "route_token_gate.task_timeline_append",
+      event_kind: "route_token_gate",
+      phase: "startup_gate",
+      actor: "observer",
+      status: "accepted",
+      backlog_id: backlog.bug_id,
+      payload: {
+        route_token_gate: {
+          action: "task_timeline_append",
+          decision: "allowed",
+          status: "passed",
+          binding_source: "route_service",
+          route_token_ref: "rtok-fixture-public-ref",
+          route_token_hash: "sha256:fixture-route-token-hash",
+          route_context_hash: "sha256:fixture-route-context",
+          prompt_contract_id: "rprompt-fixture",
+          prompt_contract_hash: "sha256:fixture-prompt-contract",
+          visible_injection_manifest_hash: "sha256:fixture-visible-manifest",
+          route_context_hash_verified: true,
+          prompt_contract_hash_verified: true,
+          server_binding_ref: "srvbind-fixture-route",
+          route_token: "fixture-raw-route-token-should-not-render",
+          private_context: "PRIVATE CONTEXT SHOULD NOT LEAK",
+        },
+      },
+      created_at: "2026-06-11T12:03:00Z",
+    },
+    {
+      id: 4105,
+      event_type: "mf_subagent.startup",
+      event_kind: "mf_subagent_startup",
+      phase: "startup_gate",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: backlog.bug_id,
+      payload: {
+        mf_subagent_startup_gate: {
+          schema_version: "mf_subagent_startup_gate.v1",
+          worker_id: "mfsub-fixture-a",
+          worker_role: "mf_sub",
+          startup_complete: true,
+          actual_startup_recorded: true,
+          startup_source: "host_mf_sub",
+          agent_id_match_mode: "host_adapter_startup_token_surrogate",
+          session_token_evidence_type: "surrogate",
+          close_satisfying: false,
+          route_id: "route-20260612-fixture",
+          route_context_hash: "sha256:fixture-route-context",
+          prompt_contract_id: "rprompt-fixture",
+          prompt_contract_hash: "sha256:fixture-prompt-contract",
+          visible_injection_manifest_hash: "sha256:fixture-visible-manifest",
+          launch_text_hash: "sha256:fixture-launch-text",
+          read_receipt_event_id: "4107",
+          read_receipt_hash: "sha256:fixture-read-receipt",
+          owned_files: ["frontend/dashboard/src/lib/taskPlayback.ts", "frontend/dashboard/src/lib/taskPlayback.test.ts"],
+          base_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+          head_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+          branch_ref: "refs/heads/codex-playback-checklist/mfsub-playback-event-checklist-coverage-a",
+          binding_source: "startup_gate",
+          server_binding_ref: "srvbind-fixture-startup",
+          actual_cwd: "/Users/yingzhang/private/worktree/should/not/render",
+          session_token: "raw-session-token-should-not-render",
+        },
+      },
+      created_at: "2026-06-11T12:04:00Z",
+    },
+    {
+      id: 4106,
+      event_type: "mf_subagent.startup",
+      event_kind: "mf_subagent_startup",
+      phase: "startup_gate",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: backlog.bug_id,
+      payload: {
+        mf_subagent_startup_gate: {
+          schema_version: "mf_subagent_startup_gate.v1",
+          worker_id: "mfsub-fixture-a",
+          worker_role: "mf_sub",
+          startup_complete: true,
+          actual_startup_recorded: true,
+          startup_source: "host_mf_sub",
+          agent_id_match_mode: "host_adapter_startup_token_surrogate",
+          session_token_evidence_type: "surrogate",
+          close_satisfying: false,
+          route_id: "route-20260612-fixture",
+          route_context_hash: "sha256:fixture-route-context",
+          prompt_contract_id: "rprompt-fixture",
+          prompt_contract_hash: "sha256:fixture-prompt-contract",
+          visible_injection_manifest_hash: "sha256:fixture-visible-manifest",
+          launch_text_hash: "sha256:fixture-launch-text",
+          read_receipt_event_id: "4107",
+          read_receipt_hash: "sha256:fixture-read-receipt",
+          owned_files: ["frontend/dashboard/src/lib/taskPlayback.ts", "frontend/dashboard/src/lib/taskPlayback.test.ts"],
+          base_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+          head_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+          branch_ref: "refs/heads/codex-playback-checklist/mfsub-playback-event-checklist-coverage-a",
+          binding_source: "startup_gate",
+          server_binding_ref: "srvbind-fixture-startup",
+        },
+      },
+      created_at: "2026-06-11T12:05:00Z",
+    },
+    {
+      id: 4107,
+      event_type: "mf_subagent.read_receipt",
+      event_kind: "mf_subagent_read_receipt",
+      phase: "startup_gate",
+      actor: "mf_sub",
+      status: "accepted",
+      backlog_id: backlog.bug_id,
+      payload: {
+        route_token_gate: {
+          action: "mf_subagent_read_receipt",
+          decision: "allowed",
+          binding_source: "route_service",
+          route_token_ref: "rtok-fixture-public-ref",
+          route_context_hash_verified: true,
+          prompt_contract_hash_verified: true,
+        },
+        route_id: "route-20260612-fixture",
+        route_context_hash: "sha256:fixture-route-context",
+        prompt_contract_id: "rprompt-fixture",
+        prompt_contract_hash: "sha256:fixture-prompt-contract",
+        canonical_visible_contract_text_hash: "sha256:fixture-visible-contract-text",
+        launch_text_hash: "sha256:fixture-launch-text",
+        read_receipt_hash: "sha256:fixture-read-receipt",
+        read_before: "startup",
+        read_before_startup: true,
+        read_ordering: "read_receipt_recorded_before_startup",
+        owned_files: ["frontend/dashboard/src/lib/taskPlayback.ts", "frontend/dashboard/src/lib/taskPlayback.test.ts"],
+        base_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+        head_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+        acknowledged_stop_state: "review_ready",
+        acknowledged_forbidden_actions: ["merge", "push", "delete_worktree"],
+      },
+      created_at: "2026-06-11T12:06:00Z",
+    },
+    {
+      id: 4108,
+      event_type: "mf_subagent_read_receipt",
+      event_kind: "mf_subagent_read_receipt",
+      phase: "startup_gate",
+      actor: "mf_sub",
+      status: "accepted",
+      backlog_id: backlog.bug_id,
+      payload: {
+        route_id: "route-20260612-fixture",
+        route_context_hash: "sha256:fixture-route-context",
+        prompt_contract_id: "rprompt-fixture",
+        prompt_contract_hash: "sha256:fixture-prompt-contract",
+        canonical_visible_contract_text_hash: "sha256:fixture-visible-contract-text",
+        launch_text_hash: "sha256:fixture-launch-text",
+        read_receipt_hash: "sha256:fixture-read-receipt-alt",
+        read_before_dispatch: true,
+        owned_files: ["frontend/dashboard/src/lib/taskPlayback.ts"],
+        base_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+        head_commit: "b9d3639781f8cc19659d3fbcfd6dd7eef504132e",
+      },
+      created_at: "2026-06-11T12:07:00Z",
+    },
+    {
+      id: 4109,
+      event_type: "task_timeline_append",
+      event_kind: "implementation",
+      phase: "implementation",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: backlog.bug_id,
+      commit_sha: "4262d49bbc2d4665af6f5bac6b77de43f4c2faf3",
+      payload: {
+        changed_files: [
+          "frontend/dashboard/src/lib/taskPlayback.ts",
+          "frontend/dashboard/src/lib/taskPlayback.test.ts",
+          "frontend/dashboard/src/components/TaskPlaybackPanel.tsx",
+        ],
+        worker_reported_precommit_trace: "precommit-check passed",
+        graph_query_trace_ids: ["gqt-fixture-implementation"],
+      },
+      created_at: "2026-06-11T12:08:00Z",
+    },
+    {
+      id: 4110,
+      event_type: "observer_work_mode_transition",
+      event_kind: "observer_work_mode_transition",
+      phase: "dispatch",
+      actor: "observer",
+      status: "accepted",
+      backlog_id: backlog.bug_id,
+      verification: {
+        counts_as_close_evidence: false,
+        work_mode_transition_recorded: true,
+      },
+      created_at: "2026-06-11T12:09:00Z",
+    },
+    {
+      id: 4111,
+      event_type: "route_action_precheck",
+      event_kind: "route_action_precheck",
+      phase: "dispatch_gate",
+      actor: "observer",
+      status: "accepted",
+      backlog_id: backlog.bug_id,
+      payload: {
+        missing_requirement_ids: ["bounded_implementation_worker_dispatch", "mf_subagent_startup"],
+        route_action_gate: {
+          decision: "allowed",
+          checks: [
+            { id: "dispatch", label: "Dispatch present", status: "missing", reason: "not yet recorded at lane opening" },
+            { id: "fence", label: "Fence present", present: false, required: true, reason: "fence will be recorded by worker startup" },
+          ],
+        },
+      },
+      created_at: "2026-06-11T12:10:00Z",
+    },
+    {
+      id: 4112,
+      event_type: "route_token_gate.backlog_close",
+      event_kind: "route_token_gate",
+      phase: "close_gate",
+      actor: "observer",
+      status: "blocked",
+      backlog_id: backlog.bug_id,
+      payload: {
+        missing_requirement_ids: ["mf_subagent_startup"],
+        route_token_gate: {
+          action: "backlog_close",
+          decision: "refused",
+          status: "blocked",
+          binding_source: "route_service",
+          route_context_hash: "sha256:fixture-route-context",
+          prompt_contract_hash: "sha256:fixture-prompt-contract",
+        },
+      },
+      created_at: "2026-06-11T12:11:00Z",
+    },
   ];
   const trace = normalizeTaskPlaybackTrace({
     projectId: "aming-claw",
@@ -2962,9 +3210,27 @@ function eventChecklistAssertions(): string[] {
   const blocked = trace.frames.find((frame) => frame.source_event_id === "#4101");
   const passed = trace.frames.find((frame) => frame.source_event_id === "#4102");
   const privateFrame = trace.frames.find((frame) => frame.source_event_id === "#4103");
+  const routeGateFrame = trace.frames.find((frame) => frame.source_event_id === "#4104");
+  const startupFrameA = trace.frames.find((frame) => frame.source_event_id === "#4105");
+  const startupFrameB = trace.frames.find((frame) => frame.source_event_id === "#4106");
+  const readReceiptFrame = trace.frames.find((frame) => frame.source_event_id === "#4107");
+  const readReceiptAltFrame = trace.frames.find((frame) => frame.source_event_id === "#4108");
+  const implementationFrame = trace.frames.find((frame) => frame.source_event_id === "#4109");
+  const workModeFrame = trace.frames.find((frame) => frame.source_event_id === "#4110");
+  const laneOpeningPrecheckFrame = trace.frames.find((frame) => frame.source_event_id === "#4111");
+  const realBlockerFrame = trace.frames.find((frame) => frame.source_event_id === "#4112");
   assertFixture(Boolean(blocked), "blocked checklist fixture frame should exist");
   assertFixture(Boolean(passed), "passed checklist fixture frame should exist");
   assertFixture(Boolean(privateFrame), "privacy checklist fixture frame should exist");
+  assertFixture(Boolean(routeGateFrame), "route-token gate checklist fixture frame should exist");
+  assertFixture(Boolean(startupFrameA), "startup gate fixture frame A should exist");
+  assertFixture(Boolean(startupFrameB), "startup gate fixture frame B should exist");
+  assertFixture(Boolean(readReceiptFrame), "mf_subagent.read_receipt fixture frame should exist");
+  assertFixture(Boolean(readReceiptAltFrame), "mf_subagent_read_receipt fixture frame should exist");
+  assertFixture(Boolean(implementationFrame), "implementation evidence fixture frame should exist");
+  assertFixture(Boolean(workModeFrame), "observer work-mode transition fixture frame should exist");
+  assertFixture(Boolean(laneOpeningPrecheckFrame), "lane-opening precheck fixture frame should exist");
+  assertFixture(Boolean(realBlockerFrame), "real blocker fixture frame should exist");
 
   const blockedRows = blocked!.event_checklist.categories.flatMap((category) => category.items);
   assertFixture(blocked!.event_checklist.blocked_count >= 2, `blocked event checklist should surface unmet rows, got ${blocked!.event_checklist.blocked_count}`);
@@ -2986,10 +3252,101 @@ function eventChecklistAssertions(): string[] {
     .join(" ");
   assertFixture(!/PRIVATE PROMPT|sk-fixture|fixture-token-hash|access_token|raw_prompt/i.test(privateChecklistText), `event checklist leaked private raw material: ${privateChecklistText}`);
 
+  const rowsFor = (frame: TaskPlaybackFrame) => frame.event_checklist.categories.flatMap((category) => category.items);
+  const routeGateRows = rowsFor(routeGateFrame!);
+  assertFixture(routeGateRows.length > 0, "route_token_gate should render typed checklist rows");
+  assertFixture(
+    routeGateRows.some((item) => item.label === "Route gate decision" && item.value === "allowed"),
+    `route_token_gate should include route gate decision, got ${routeGateRows.map((item) => `${item.label}:${item.value}`).join(" | ")}`,
+  );
+  assertFixture(routeGateRows.some((item) => item.label === "Binding source" && item.value === "route_service"), "route_token_gate should include binding_source");
+  assertFixture(routeGateRows.some((item) => item.label === "Route token ref" && item.value === "rtok-fixture-public-ref"), "route_token_gate should include public route_token_ref");
+  assertFixture(routeGateRows.some((item) => item.label === "Route token hash"), "route_token_gate should include route token hash evidence");
+  assertFixture(routeGateRows.some((item) => item.label === "Prompt contract hash"), "route_token_gate should include prompt contract hash");
+  assertFixture(routeGateRows.some((item) => item.label === "Server binding"), "route_token_gate should include server binding facts");
+  const routeGateChecklistText = routeGateRows.map((item) => `${item.label} ${item.value}`).join(" ");
+  assertFixture(!routeGateChecklistText.includes("PRIVATE CONTEXT SHOULD NOT LEAK"), `route_token_gate checklist leaked private_context: ${routeGateChecklistText}`);
+  const routeGateRawVisible = JSON.stringify(routeGateFrame!.detail_inspector.raw_sections.map((section) => section.value));
+  assertFixture(!routeGateRawVisible.includes("PRIVATE CONTEXT SHOULD NOT LEAK"), `route_token_gate raw inspector leaked private_context: ${routeGateRawVisible}`);
+  assertFixture(routeGateRawVisible.includes("[private detail redacted]"), `route_token_gate raw inspector should include redacted marker, got ${routeGateRawVisible}`);
+  assertFixture(routeGateFrame!.detail_inspector.redaction_count >= 2, `route_token_gate raw inspector should redact raw token and private_context, got ${routeGateFrame!.detail_inspector.redaction_count}`);
+  assertFixture(
+    routeGateRawVisible.includes("allowed") && routeGateRawVisible.includes("rtok-fixture-public-ref") && routeGateRawVisible.includes("sha256:fixture-route-token-hash"),
+    `route_token_gate raw inspector should preserve public decision/ref/hash fields, got ${routeGateRawVisible}`,
+  );
+
+  const startupRowsA = rowsFor(startupFrameA!);
+  const startupRowsB = rowsFor(startupFrameB!);
+  assertFixture(startupRowsA.length > 0 && startupRowsB.length > 0, "same-shape startup gate events should render non-empty checklists");
+  const startupShape = (rows: typeof startupRowsA) => rows.map((item) => `${item.label}:${item.status}:${item.value}`).sort();
+  assertFixture(
+    JSON.stringify(startupShape(startupRowsA)) === JSON.stringify(startupShape(startupRowsB)),
+    `same-shape startup gate events should produce equivalent checklist structure, A=${JSON.stringify(startupShape(startupRowsA))}, B=${JSON.stringify(startupShape(startupRowsB))}`,
+  );
+  assertFixture(startupRowsA.some((item) => item.label === "Owned file" && item.value.includes("taskPlayback.ts")), "startup gate should include owned_files");
+  assertFixture(startupRowsA.some((item) => item.label === "Base commit"), "startup gate should include base commit");
+  assertFixture(startupRowsA.some((item) => item.label === "Head commit"), "startup gate should include head commit");
+  assertFixture(startupRowsA.some((item) => item.label === "Read receipt hash"), "startup gate should include read_receipt_hash");
+  assertFixture(startupRowsA.some((item) => item.label === "Close satisfying" && item.value === "false" && item.status === "recorded"), "startup close_satisfying=false should be recorded, not failed");
+
+  const readRows = rowsFor(readReceiptFrame!);
+  const readAltRows = rowsFor(readReceiptAltFrame!);
+  assertFixture(readRows.length > 0 && readAltRows.length > 0, "both read-receipt event shapes should render non-empty checklist rows");
+  assertFixture(readRows.some((item) => item.label === "Route context hash"), "read receipt should include route context hash binding");
+  assertFixture(readRows.some((item) => item.label === "Prompt contract hash"), "read receipt should include prompt contract hash binding");
+  assertFixture(readRows.some((item) => item.label === "Visible contract text hash"), "read receipt should include canonical visible contract text hash");
+  assertFixture(readRows.some((item) => item.label === "Read receipt hash"), "read receipt should include read_receipt_hash");
+  assertFixture(readRows.some((item) => item.label === "Read ordering" && item.value.includes("startup")), "read receipt should include read-before/read ordering");
+  assertFixture(readRows.some((item) => item.label === "Owned file" && item.value.includes("taskPlayback.test.ts")), "read receipt should include owned_files");
+  assertFixture(readAltRows.some((item) => item.label === "Read ordering" && item.value === "true"), "mf_subagent_read_receipt shape should include read_before ordering");
+
+  const implementationRows = rowsFor(implementationFrame!);
+  const changedFileRows = implementationRows.filter((item) => item.label === "Changed file");
+  assertFixture(changedFileRows.length === 3, `implementation evidence should render per-file changed_files rows, got ${changedFileRows.length}`);
+  assertFixture(implementationRows.some((item) => item.label === "Commit SHA"), "implementation evidence should render commit_sha presence");
+  assertFixture(implementationRows.some((item) => item.label === "Worker precommit trace"), "implementation evidence should render worker precommit trace presence");
+
+  const workModeRows = rowsFor(workModeFrame!);
+  const countsRows = workModeRows.filter((item) => item.label === "Counts As Close Evidence");
+  assertFixture(countsRows.length === 1, `counts_as_close_evidence should render once, got ${countsRows.length}`);
+  assertFixture(countsRows[0]?.status === "recorded" && countsRows[0]?.value === "false", `counts_as_close_evidence=false should be recorded literal false, got ${JSON.stringify(countsRows[0])}`);
+  assertFixture(workModeFrame!.event_checklist.blocked_count === 0, `observer_work_mode_transition false declaration should have zero red rows, got ${workModeFrame!.event_checklist.blocked_count}`);
+
+  const laneRows = rowsFor(laneOpeningPrecheckFrame!);
+  const pendingRows = laneRows.filter((item) => item.status === "pending");
+  assertFixture(pendingRows.length >= 2, `lane-opening route_action_precheck should show pending not-yet-due requirements, got ${laneRows.map((item) => `${item.status}:${item.label}:${item.value}`).join(" | ")}`);
+  assertFixture(
+    !laneRows.some((item) => ["missing", "blocked", "failed"].includes(item.status)),
+    `lane-opening route_action_precheck should not render not-yet-due rows as red, got ${laneRows.map((item) => `${item.status}:${item.label}:${item.value}`).join(" | ")}`,
+  );
+
+  const realBlockerRows = rowsFor(realBlockerFrame!);
+  assertFixture(
+    realBlockerRows.some((item) => ["missing", "blocked", "failed"].includes(item.status)),
+    "final blocking verdict should still render red checklist rows for real recorded blockers",
+  );
+  const greenFramesWithRedRows = trace.frames.filter((frame) => ["passed", "recorded"].includes(frame.status) && frame.event_checklist.blocked_count > 0);
+  assertFixture(
+    greenFramesWithRedRows.every((frame) => rowsFor(frame).some((item) => /blocker|blocked|refused|rejected|failed|missing/i.test(`${item.label} ${item.value}`))),
+    `green frames may only contain red rows for real recorded blockers, got ${greenFramesWithRedRows.map((frame) => frame.source_event_id).join(", ")}`,
+  );
+
+  const workerChecklistText = [routeGateFrame!, startupFrameA!, readReceiptFrame!, implementationFrame!, workModeFrame!, laneOpeningPrecheckFrame!]
+    .flatMap((frame) => rowsFor(frame))
+    .map((item) => `${item.label} ${item.value}`)
+    .join(" ");
+  assertFixture(!/raw-route-token|raw-session-token|PRIVATE CONTEXT|should\/not\/render|actual_cwd/i.test(workerChecklistText), `worker checklist leaked private or raw token material: ${workerChecklistText}`);
+
   return [
     `event checklist blocked rows: ${blockedRows.length}`,
     `event checklist passed rows: ${passedRows.length}`,
+    "event checklist structured roots include route-token and startup gates",
     "event checklist private raw/token material redacted from structured rows",
+    `event checklist route-token gate rows: ${routeGateRows.length}`,
+    `event checklist startup gate rows: ${startupRowsA.length}`,
+    `event checklist read-receipt rows: ${readRows.length}/${readAltRows.length}`,
+    `event checklist implementation changed-file rows: ${changedFileRows.length}`,
+    `event checklist pending precheck rows: ${pendingRows.length}`,
   ];
 }
 
