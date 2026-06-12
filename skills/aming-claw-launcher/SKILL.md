@@ -28,6 +28,17 @@ action, not a long tutorial.
   bootstrap, or one-shot setup.
 - After plugin install/update, ask for a new host session so skills and MCP load.
 
+## 治理边界：gate 是约束，不是对手
+
+- Gate denial is a governance signal: repair the identity, route evidence, or
+  missing precondition, or report the blocker with evidence.
+- Do not treat the gate as an opponent to outmaneuver by reading gate internals
+  or shaping inputs to satisfy implementation details.
+- Do not self-authorize a role, route identity, session, token, or worker
+  boundary that governance did not issue.
+- Keep client hook enforcement and the server-side route/identity gate layered;
+  document boundaries without adding reproducible bypass recipes.
+
 ## State Machine
 
 Start by reading current context when available:

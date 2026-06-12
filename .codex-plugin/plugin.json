@@ -12,6 +12,18 @@
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python agent/hooks/onboarding_guard.py"
+          }
+        ]
+      }
+    ]
+  },
   "interface": {
     "displayName": "Aming Claw",
     "shortDescription": "Graph-first governance workflow guard",
