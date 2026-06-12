@@ -57,6 +57,41 @@ API fallback:
 POST http://127.0.0.1:40000/api/project/bootstrap
 ```
 
+Request body schema:
+
+```json
+{
+  "workspace_path": "/absolute/path/to/project",
+  "project_id": "my-project",
+  "project_name": "My Project",
+  "language": "python",
+  "scan_depth": 3,
+  "exclude_patterns": ["node_modules", "dist", "build", "coverage"],
+  "config_override": {
+    "project_id": "my-project",
+    "language": "python",
+    "graph": {
+      "exclude_paths": ["node_modules", "dist", "build", "coverage"],
+      "ignore_globs": ["**/*.generated.*"]
+    }
+  },
+  "route_token": {},
+  "route_token_ref": "",
+  "route_waiver": {}
+}
+```
+
+`workspace_path` is required. `project_id` and `language` may be supplied at the
+top level or inside `config_override`; top-level values are folded into the
+override before graph build. For a first registration of an unregistered
+project, a dashboard/API/HN demo/CLI caller may omit `route_token`: governance
+mints a narrow server-side `project_bootstrap` route binding, persists only the
+opaque `route_token_ref`/digest, validates the normal protected mutation gate,
+and records `route_token_gate.project_bootstrap` timeline evidence. A tokenless
+bootstrap for an already registered project is still rejected; use a valid
+`route_token`, `route_token_ref`, or accepted `route_waiver` for non-first-run
+re-bootstrap or repair flows.
+
 Use common excludes for generated folders:
 
 ```text

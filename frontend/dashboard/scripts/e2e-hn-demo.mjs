@@ -478,7 +478,14 @@ async function ensureFixtureProject() {
 async function verifyFixtureBaseline(backlog) {
   assert(Number(backlog.count || backlog.bugs.length || 0) === 0, "fixture must start with an empty backlog");
   const timeline = await http("GET", `/api/task/${pid(PROJECT)}/timeline`);
-  assert(Number(timeline.count || 0) === 0, "fixture must start with an empty timeline");
+  const timelineEvents = Array.isArray(timeline.events) ? timeline.events : [];
+  const nonBootstrapEvents = timelineEvents.filter((event) => !isFirstRunBootstrapRouteGateEvent(event));
+  assert(
+    nonBootstrapEvents.length === 0,
+    `fixture timeline contains non-bootstrap evidence: ${nonBootstrapEvents
+      .map((event) => event?.event_type || event?.event_kind || event?.id || "unknown")
+      .join(", ")}`,
+  );
   const query = await http("POST", `/api/graph-governance/${pid(PROJECT)}/query`, {
     tool: "find_node_by_path",
     args: { path: "src/order-router.js" },
@@ -488,7 +495,20 @@ async function verifyFixtureBaseline(backlog) {
   });
   assert(Number(query.result?.count || 0) > 0, "fixture graph cannot resolve src/order-router.js");
   ok("fixture graph resolves src/order-router.js");
-  ok("fixture starts with empty backlog and timeline evidence");
+  ok(
+    timelineEvents.length
+      ? "fixture starts with empty backlog and only bootstrap route-gate evidence"
+      : "fixture starts with empty backlog and no timeline evidence",
+  );
+}
+
+function isFirstRunBootstrapRouteGateEvent(event) {
+  if (!event || event.event_type !== "route_token_gate.project_bootstrap") return false;
+  const gate = event.payload?.route_token_gate || event.verification || {};
+  return (
+    gate?.bootstrap_gate_decision === "server_minted_first_run_binding" &&
+    gate?.first_run_bootstrap?.raw_route_token_persisted === false
+  );
 }
 
 async function checkGovernance() {
@@ -1244,7 +1264,7 @@ function addSameObserverReview(audit) {
     (name) => check(name)?.passed,
   );
   audit.agent_behavior_audit = [
-    "The fixture only bootstrapped a project and active graph; backlog and timeline started empty.",
+    "The fixture only bootstrapped a project and active graph; backlog started empty and timeline contained at most bootstrap route-gate evidence.",
     "The observer path created backlog rows, timeline events, graph query traces, worker fences, and test evidence during this run.",
     "The during-work path recorded a failed worker attempt and a replay attempt instead of reporting only a happy-path parallel run.",
     "The same scripted observer that performed the run writes this evaluation, so the score cites operation artifacts instead of a second-hand review.",

@@ -160,6 +160,9 @@ Use governance on port `40000`, not the ServiceManager sidecar on `40101`:
 POST http://127.0.0.1:40000/api/project/bootstrap
 ```
 
+The full request body schema and first-run route-gate behavior live in
+`docs/onboarding.md`.
+
 For explicit bootstrap, infer the project id from the folder name and use common
 excludes such as `node_modules`, `dist`, `build`, `.expo`, `.next`, and
 `coverage`. Before calling bootstrap, inspect the target root or ask the user
@@ -186,7 +189,7 @@ claims are available.
 | Command | Purpose |
 | --- | --- |
 | `aming-claw init` | Write `.aming-claw.yaml` in the current directory. |
-| `aming-claw bootstrap --path <dir> --name <id>` | Register an external project under governance. |
+| `aming-claw bootstrap --path <dir> --name <id> --exclude-path node_modules --language python` | Register an external project through governance. |
 | `aming-claw scan --path <dir> --project-id <id>` | Scan an external project into a `.aming-claw` candidate workspace. |
 | `aming-claw start --port 40000 [--workspace <runtime-root>]` | Start governance in the foreground from a separate terminal/window. By default the runtime root is the plugin checkout/package root, not the current target project. |
 | `aming-claw status` | GET `/api/health` against the running governance service. |

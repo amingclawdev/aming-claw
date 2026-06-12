@@ -79,11 +79,70 @@ def init():
 @main.command()
 @click.option("--path", default=".", help="Workspace path to bootstrap")
 @click.option("--name", default="", help="Project name")
-def bootstrap(path, name):
-    """Bootstrap an external project into aming-claw governance."""
-    from agent.governance.project_service import bootstrap_project
-    result = bootstrap_project(workspace_path=path, project_name=name)
-    click.echo(f"Bootstrap result: {result}")
+@click.option("--project-id", default="", help="Explicit governance project id")
+@click.option("--language", default="", help="Project language override")
+@click.option(
+    "--exclude-path",
+    "exclude_paths",
+    multiple=True,
+    help="Graph exclude path prefix. May be repeated.",
+)
+@click.option(
+    "--ignore-glob",
+    "ignore_globs",
+    multiple=True,
+    help="Graph ignore glob. May be repeated.",
+)
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance base URL")
+def bootstrap(path, name, project_id, language, exclude_paths, ignore_globs, governance_url):
+    """Bootstrap an external project through the governance API."""
+    workspace_path = str(Path(path).expanduser().resolve())
+    graph_override: dict[str, Any] = {}
+    if exclude_paths:
+        graph_override["exclude_paths"] = list(exclude_paths)
+    if ignore_globs:
+        graph_override["ignore_globs"] = list(ignore_globs)
+
+    config_override: dict[str, Any] = {}
+    if project_id:
+        config_override["project_id"] = project_id
+    if language:
+        config_override["language"] = language
+    if graph_override:
+        config_override["graph"] = graph_override
+
+    payload: dict[str, Any] = {
+        "workspace_path": workspace_path,
+        "project_name": name,
+    }
+    if project_id:
+        payload["project_id"] = project_id
+    if language:
+        payload["language"] = language
+    if exclude_paths:
+        payload["exclude_patterns"] = list(exclude_paths)
+    if config_override:
+        payload["config_override"] = config_override
+
+    url = governance_url.rstrip("/") + "/api/project/bootstrap"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise click.ClickException(f"bootstrap failed ({exc.code}): {body}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(
+            f"bootstrap failed: governance API is unavailable at {governance_url}: {exc}"
+        ) from exc
+
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
 @main.command("scan")
