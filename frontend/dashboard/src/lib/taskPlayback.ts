@@ -50,6 +50,31 @@ export interface TaskPlaybackStructuredFact {
   source: "event" | "payload" | "verification" | "artifact_refs" | "semantic";
 }
 
+export type TaskPlaybackChecklistItemStatus = "passed" | "satisfied" | "present" | "missing" | "blocked" | "failed" | "required" | "recorded" | "unknown";
+
+export interface TaskPlaybackChecklistItem {
+  id: string;
+  label: string;
+  value: string;
+  status: TaskPlaybackChecklistItemStatus;
+  source: TaskPlaybackStructuredFact["source"];
+}
+
+export interface TaskPlaybackChecklistCategory {
+  id: "unmet" | "passed" | "required" | "recorded";
+  label: string;
+  status: TaskPlaybackChecklistItemStatus;
+  items: TaskPlaybackChecklistItem[];
+}
+
+export interface TaskPlaybackEventChecklist {
+  categories: TaskPlaybackChecklistCategory[];
+  item_count: number;
+  hidden_count: number;
+  blocked_count: number;
+  passed_count: number;
+}
+
 export interface TaskPlaybackFrame {
   id: string;
   sequence: number;
@@ -71,6 +96,7 @@ export interface TaskPlaybackFrame {
   semantic_chips: TaskTimelineSemanticChip[];
   specific_facts: TaskPlaybackStructuredFact[];
   failure_diagnosis: TaskPlaybackStructuredFact[];
+  event_checklist: TaskPlaybackEventChecklist;
   evidence_links: TaskPlaybackEvidenceRef[];
   /** Structured cross-reference links: related events + parent/child backlog rows, each clickable. */
   relation_links: TaskTimelineSemanticRelation[];
@@ -315,6 +341,7 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
   const artifactRefs = artifactsFromEvent(publicEvent, semantic);
   const specificFacts = specificFactsFromEvent(publicEvent, semantic);
   const failureDiagnosis = failureDiagnosisFromEvent(publicEvent, status);
+  const eventChecklist = eventChecklistFromEvent(publicEvent, status, specificFacts, failureDiagnosis);
   const evidenceRefs = evidenceFromEvent(publicEvent, semantic);
   const evidenceLinks = evidenceLinksFromEvent(publicEvent, semantic, evidenceRefs, artifactRefs);
   return {
@@ -337,12 +364,13 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
     semantic_chips: semantic.chips,
     specific_facts: specificFacts,
     failure_diagnosis: failureDiagnosis,
+    event_checklist: eventChecklist,
     evidence_links: evidenceLinks,
     relation_links: semantic.relations,
     detail_inspector: playbackInspectorFromEvent(publicEvent, semantic),
     evidence_refs: evidenceRefs,
     artifact_refs: artifactRefs,
-    has_structured_detail: specificFacts.length > 0 || failureDiagnosis.length > 0 || evidenceLinks.length > 1,
+    has_structured_detail: specificFacts.length > 0 || failureDiagnosis.length > 0 || eventChecklist.item_count > 0 || evidenceLinks.length > 1,
   };
 }
 
@@ -1064,6 +1092,351 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
   return stableFacts(diagnosis).slice(0, 12);
 }
 
+const EVENT_CHECKLIST_MAX_ITEMS = 24;
+const EVENT_CHECKLIST_MAX_ITEMS_PER_CATEGORY = 8;
+
+function eventChecklistFromEvent(
+  event: TaskTimelineEvent,
+  frameStatus: TaskPlaybackFrameStatus,
+  specificFacts: TaskPlaybackStructuredFact[],
+  failureDiagnosis: TaskPlaybackStructuredFact[],
+): TaskPlaybackEventChecklist {
+  const items: TaskPlaybackChecklistItem[] = [];
+
+  for (const fact of failureDiagnosis) {
+    const status = checklistStatusFromFact(fact, frameStatus);
+    pushChecklistItem(items, fact.kind, fact.label, fact.value, status, fact.source);
+  }
+
+  pushChecklistPathItems(items, event, "missing_event_kinds", "Missing event kind", "missing", [
+    "payload.missing_event_kinds",
+    "payload.blocked_event_kinds",
+    "payload.blocked_protected_event_kinds",
+    "verification.missing_event_kinds",
+    "verification.blocked_event_kinds",
+  ]);
+  pushChecklistPathItems(items, event, "missing_requirements", "Missing requirement", "missing", [
+    "payload.missing_required_evidence",
+    "payload.missing_requirement_ids",
+    "payload.missing_protected_lanes",
+    "payload.required_missing_evidence",
+    "payload.route_context_gate.missing_requirement_ids",
+    "payload.route_context_gate.missing_required_evidence",
+    "payload.contract_gate.missing_requirement_ids",
+    "payload.contract_gate.missing_required_evidence",
+    "verification.missing_required_evidence",
+    "verification.missing_requirement_ids",
+    "verification.required_missing_evidence",
+    "verification.route_context_gate.missing_requirement_ids",
+    "verification.route_context_gate.missing_required_evidence",
+    "verification.contract_gate.missing_requirement_ids",
+    "verification.contract_gate.missing_required_evidence",
+  ]);
+  pushChecklistPathItems(items, event, "present_event_kinds", "Present event kind", "present", [
+    "payload.present_event_kinds",
+    "payload.recorded_event_kinds",
+    "payload.satisfied_event_kinds",
+    "verification.present_event_kinds",
+    "verification.recorded_event_kinds",
+    "verification.satisfied_event_kinds",
+  ]);
+  pushChecklistPathItems(items, event, "satisfied_requirements", "Satisfied requirement", "satisfied", [
+    "payload.present_requirement_ids",
+    "payload.satisfied_requirement_ids",
+    "payload.passed_requirement_ids",
+    "payload.present_required_evidence",
+    "payload.satisfied_required_evidence",
+    "verification.present_requirement_ids",
+    "verification.satisfied_requirement_ids",
+    "verification.passed_requirement_ids",
+    "verification.present_required_evidence",
+    "verification.satisfied_required_evidence",
+  ]);
+  pushChecklistPathItems(items, event, "required_event_kinds", "Required event kind", "required", [
+    "payload.required_event_kinds",
+    "payload.required_before_protected_evidence",
+    "verification.required_event_kinds",
+    "verification.required_before_protected_evidence",
+  ]);
+  pushChecklistPathItems(items, event, "required_requirements", "Required requirement", "required", [
+    "payload.required_evidence",
+    "payload.evidence_required",
+    "payload.required_requirement_ids",
+    "payload.prompt_contract.required_evidence",
+    "payload.prompt_contract.evidence_required",
+    "verification.required_evidence",
+    "verification.evidence_required",
+    "verification.required_requirement_ids",
+  ]);
+
+  const verificationPassed = firstPublicValueAtPaths(event, ["verification.passed", "payload.verification.passed", "payload.passed"]);
+  if (verificationPassed) {
+    pushChecklistItem(
+      items,
+      "verification_passed",
+      "Verification result",
+      verificationPassed.value,
+      checklistStatusFromValue(verificationPassed.value, "passed"),
+      verificationPassed.source,
+    );
+  }
+
+  const factAllowList = new Set([
+    "required_evidence",
+    "required_lanes_evidence",
+    "allowed_actions",
+    "blocked_actions",
+    "blocker_resolution_gate",
+    "cross_ref_gate",
+    "stale_route_evidence_gate",
+    "surrogate_close_satisfying",
+  ]);
+  for (const fact of specificFacts) {
+    if (!factAllowList.has(fact.kind)) continue;
+    pushChecklistItem(items, fact.kind, fact.label, fact.value, checklistStatusFromFact(fact, frameStatus), fact.source);
+  }
+
+  for (const root of CHECKLIST_STRUCTURED_ROOTS) {
+    collectChecklistLikeItems(items, valueAtPath(event as unknown as Record<string, unknown>, root.path), root.path, root.label, root.status);
+  }
+
+  return buildEventChecklist(items);
+}
+
+const CHECKLIST_STRUCTURED_ROOTS: Array<{ path: string; label: string; status?: TaskPlaybackChecklistItemStatus }> = [
+  { path: "payload.checklist", label: "Checklist" },
+  { path: "payload.checks", label: "Checks" },
+  { path: "payload.gate", label: "Gate" },
+  { path: "payload.route_action_gate", label: "Route action gate" },
+  { path: "payload.route_context_gate", label: "Route context gate" },
+  { path: "payload.contract_gate", label: "Contract gate" },
+  { path: "payload.close_gate", label: "Close gate" },
+  { path: "payload.contract_evidence", label: "Contract evidence" },
+  { path: "payload.matrix", label: "Matrix row" },
+  { path: "payload.test_results", label: "Test result" },
+  { path: "verification", label: "Verification" },
+  { path: "verification.checklist", label: "Verification checklist" },
+  { path: "verification.checks", label: "Verification checks" },
+  { path: "verification.gate", label: "Verification gate" },
+  { path: "verification.contract_evidence", label: "Contract evidence" },
+  { path: "verification.matrix", label: "Verification matrix" },
+  { path: "verification.test_results", label: "Test result" },
+  { path: "artifact_refs.contract_evidence", label: "Contract evidence" },
+];
+
+function pushChecklistPathItems(
+  items: TaskPlaybackChecklistItem[],
+  event: TaskTimelineEvent,
+  kind: string,
+  label: string,
+  status: TaskPlaybackChecklistItemStatus,
+  paths: string[],
+): void {
+  for (const item of publicValuesAtPaths(event, paths)) {
+    pushChecklistItem(items, kind, label, item.value, status, item.source);
+  }
+}
+
+function collectChecklistLikeItems(
+  items: TaskPlaybackChecklistItem[],
+  value: unknown,
+  path: string,
+  fallbackLabel: string,
+  inheritedStatus: TaskPlaybackChecklistItemStatus = "recorded",
+  depth = 0,
+): void {
+  if (items.length >= EVENT_CHECKLIST_MAX_ITEMS * 2 || depth > 4 || value == null || value === "") return;
+  if (isSensitiveEvidencePath(path)) return;
+  const pathStatus = checklistStatusFromPath(path, inheritedStatus);
+  if (Array.isArray(value)) {
+    value.slice(0, 12).forEach((item, index) => {
+      collectChecklistLikeItems(items, item, `${path}.${index}`, fallbackLabel, pathStatus, depth + 1);
+    });
+    return;
+  }
+  if (typeof value !== "object") {
+    const text = safeText(String(value));
+    if (text) pushChecklistItem(items, path, fallbackLabel, text, checklistStatusFromValue(text, pathStatus), sourceForPath(path));
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const recordItem = checklistItemFromRecord(record, path, fallbackLabel, pathStatus);
+  if (recordItem) items.push(recordItem);
+
+  for (const [key, item] of Object.entries(record).slice(0, 32)) {
+    const childPath = `${path}.${key}`;
+    if (isSensitiveEvidencePath(childPath)) continue;
+    const childStatus = checklistStatusFromPath(childPath, pathStatus);
+    if (Array.isArray(item)) {
+      if (isChecklistSignalKey(key)) {
+        for (const valueItem of item.slice(0, 10)) {
+          if (valueItem && typeof valueItem === "object") {
+            collectChecklistLikeItems(items, valueItem, childPath, titleize(key), childStatus, depth + 1);
+          } else {
+            const text = safeText(String(valueItem ?? ""));
+            if (text) pushChecklistItem(items, childPath, titleize(key), text, childStatus, sourceForPath(childPath));
+          }
+        }
+      }
+      continue;
+    }
+    if (item && typeof item === "object") {
+      if (isChecklistSignalKey(key)) collectChecklistLikeItems(items, item, childPath, titleize(key), childStatus, depth + 1);
+      continue;
+    }
+    if (!isChecklistSignalKey(key)) continue;
+    const text = safeText(String(item ?? ""));
+    if (text) pushChecklistItem(items, childPath, titleize(key), text, checklistStatusFromValue(text, childStatus), sourceForPath(childPath));
+  }
+}
+
+function checklistItemFromRecord(
+  record: Record<string, unknown>,
+  path: string,
+  fallbackLabel: string,
+  fallbackStatus: TaskPlaybackChecklistItemStatus,
+): TaskPlaybackChecklistItem | null {
+  const label =
+    firstStringField(record, ["label", "name", "title", "requirement_id", "requirement", "event_kind", "kind", "check", "test", "id"])
+    || fallbackLabel;
+  const statusValue = firstStringField(record, ["status", "result", "decision", "state", "outcome"])
+    || stringFrom(record.passed)
+    || stringFrom(record.satisfied)
+    || stringFrom(record.present)
+    || stringFrom(record.required);
+  const detail =
+    firstStringField(record, ["value", "reason", "summary", "message", "next_action", "next_expected_action", "evidence", "event_id"])
+    || statusValue
+    || compactUnknown(record);
+  const safeLabel = safeText(label);
+  const safeDetail = safeText(detail);
+  if (!safeLabel || !safeDetail || safeDetail === "record") return null;
+  return {
+    id: checklistItemId(path, safeLabel, safeDetail),
+    label: safeLabel,
+    value: safeDetail,
+    status: checklistStatusFromValue(statusValue || safeDetail, checklistStatusFromPath(path, fallbackStatus)),
+    source: sourceForPath(path),
+  };
+}
+
+function isChecklistSignalKey(key: string): boolean {
+  return /(checklist|checks?|gate|verification|contract_evidence|evidence|requirements?|event_kinds?|missing|blocked|failed|passed|satisfied|present|required|status|decision|result|tests?|matrix|rows?)/i.test(key);
+}
+
+function checklistStatusFromFact(fact: TaskPlaybackStructuredFact, frameStatus: TaskPlaybackFrameStatus): TaskPlaybackChecklistItemStatus {
+  return checklistStatusFromValue(`${fact.kind} ${fact.label} ${fact.value}`, checklistStatusFromFrameStatus(frameStatus));
+}
+
+function checklistStatusFromFrameStatus(status: TaskPlaybackFrameStatus): TaskPlaybackChecklistItemStatus {
+  if (status === "passed") return "passed";
+  if (status === "blocked" || status === "failed" || status === "missing") return status;
+  if (status === "recorded" || status === "running" || status === "waiting") return "recorded";
+  return "unknown";
+}
+
+function checklistStatusFromPath(path: string, fallback: TaskPlaybackChecklistItemStatus): TaskPlaybackChecklistItemStatus {
+  const text = path.toLowerCase();
+  if (/missing|required_missing|unmet/.test(text)) return "missing";
+  if (/blocked|forbidden/.test(text)) return "blocked";
+  if (/failed|failure|error/.test(text)) return "failed";
+  if (/passed|satisfied|complete|completed|accepted|allowed/.test(text)) return "passed";
+  if (/present|recorded/.test(text)) return "present";
+  if (/required/.test(text)) return "required";
+  return fallback;
+}
+
+function checklistStatusFromValue(value: string, fallback: TaskPlaybackChecklistItemStatus): TaskPlaybackChecklistItemStatus {
+  const text = safeText(value).toLowerCase();
+  if (/missing|required-but-unmet|required_but_unmet|unmet|not recorded|not been recorded|not present/.test(text)) return "missing";
+  if (/blocked|forbidden|not allowed|refused|rejected/.test(text)) return "blocked";
+  if (/failed|failure|error|false|no\b/.test(text)) return "failed";
+  if (/passed|satisfied|accepted|allowed|complete|completed|success|true|yes\b|ok\b/.test(text)) return "passed";
+  if (/present|recorded|exists/.test(text)) return "present";
+  if (/required|must|expected/.test(text)) return "required";
+  return fallback;
+}
+
+function pushChecklistItem(
+  items: TaskPlaybackChecklistItem[],
+  kind: string,
+  label: string,
+  value: string,
+  status: TaskPlaybackChecklistItemStatus,
+  source: TaskPlaybackStructuredFact["source"],
+): void {
+  const safeLabel = safeText(label);
+  const safeValue = safeText(value);
+  if (!safeLabel || !safeValue || safeValue === "[private detail redacted]") return;
+  items.push({
+    id: checklistItemId(kind, safeLabel, safeValue),
+    label: safeLabel,
+    value: safeValue,
+    status,
+    source,
+  });
+}
+
+function buildEventChecklist(items: TaskPlaybackChecklistItem[]): TaskPlaybackEventChecklist {
+  const stableItems = stableChecklistItems(items);
+  const groups: Record<TaskPlaybackChecklistCategory["id"], TaskPlaybackChecklistItem[]> = {
+    unmet: [],
+    passed: [],
+    required: [],
+    recorded: [],
+  };
+  for (const item of stableItems) {
+    groups[checklistCategoryId(item.status)].push(item);
+  }
+
+  const categorySpecs: Array<{ id: TaskPlaybackChecklistCategory["id"]; label: string; status: TaskPlaybackChecklistItemStatus }> = [
+    { id: "unmet", label: "Missing / blocked / failed", status: "blocked" },
+    { id: "passed", label: "Passed / satisfied", status: "passed" },
+    { id: "required", label: "Required", status: "required" },
+    { id: "recorded", label: "Recorded checks", status: "recorded" },
+  ];
+  let visibleCount = 0;
+  const categories: TaskPlaybackChecklistCategory[] = [];
+  for (const spec of categorySpecs) {
+    const remainingBudget = Math.max(0, EVENT_CHECKLIST_MAX_ITEMS - visibleCount);
+    const categoryItems = groups[spec.id].slice(0, Math.min(EVENT_CHECKLIST_MAX_ITEMS_PER_CATEGORY, remainingBudget));
+    if (categoryItems.length === 0) continue;
+    visibleCount += categoryItems.length;
+    categories.push({ ...spec, items: categoryItems });
+  }
+  const blockedCount = stableItems.filter((item) => ["missing", "blocked", "failed"].includes(item.status)).length;
+  const passedCount = stableItems.filter((item) => ["passed", "satisfied", "present"].includes(item.status)).length;
+  return {
+    categories,
+    item_count: stableItems.length,
+    hidden_count: Math.max(0, stableItems.length - visibleCount),
+    blocked_count: blockedCount,
+    passed_count: passedCount,
+  };
+}
+
+function checklistCategoryId(status: TaskPlaybackChecklistItemStatus): TaskPlaybackChecklistCategory["id"] {
+  if (status === "missing" || status === "blocked" || status === "failed") return "unmet";
+  if (status === "passed" || status === "satisfied" || status === "present") return "passed";
+  if (status === "required") return "required";
+  return "recorded";
+}
+
+function stableChecklistItems(items: TaskPlaybackChecklistItem[]): TaskPlaybackChecklistItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = `${item.label}:${item.value}:${item.status}`;
+    if (!item.value || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function checklistItemId(kind: string, label: string, value: string): string {
+  return safeText(`${kind}:${label}:${value}`).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 96);
+}
+
 function evidenceLinksFromEvent(
   event: TaskTimelineEvent,
   _semantic: TaskTimelineSemanticProjection,
@@ -1673,6 +2046,9 @@ function pushEvidenceValues(
 }
 
 function sourceForPath(path: string): TaskPlaybackStructuredFact["source"] {
+  if (path === "payload") return "payload";
+  if (path === "verification") return "verification";
+  if (path === "artifact_refs") return "artifact_refs";
   if (path.startsWith("payload.")) return "payload";
   if (path.startsWith("verification.")) return "verification";
   if (path.startsWith("artifact_refs.")) return "artifact_refs";

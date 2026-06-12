@@ -1617,6 +1617,7 @@ function taskPlaybackNewestFirstAssertions(): string[] {
       semantic_chips: [],
       specific_facts: [],
       failure_diagnosis: [],
+      event_checklist: { categories: [], item_count: 0, hidden_count: 0, blocked_count: 0, passed_count: 0 },
       evidence_links: [],
       relation_links: [],
       detail_inspector: { rows: [], raw_sections: [], redaction_count: 0 },
@@ -2865,6 +2866,133 @@ function workerLaneAttributionAssertions(): string[] {
 export const taskPlaybackWorkerLaneAttributionSummary: string[] = [
   ...workerLaneAttributionAssertions(),
 ];
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Per-event checklist projection
+// (AC-PLAYBACK-CHECKLIST-VISUAL-COLLAPSED-20260611)
+// ──────────────────────────────────────────────────────────────────────────────
+
+function eventChecklistAssertions(): string[] {
+  const backlog: BacklogBug = {
+    bug_id: "AC-PLAYBACK-CHECKLIST-VISUAL-COLLAPSED-20260611",
+    title: "Playback event checklist projection",
+    status: "OPEN",
+    priority: "P1",
+  };
+  const events: TaskTimelineEvent[] = [
+    {
+      id: 4101,
+      event_type: "route_action_gate.blocked",
+      event_kind: "route_action_precheck",
+      phase: "dispatch_gate",
+      actor: "observer",
+      status: "blocked",
+      backlog_id: backlog.bug_id,
+      payload: {
+        missing_event_kinds: ["verification", "close_ready"],
+        missing_requirement_ids: ["independent_verification_lane"],
+        route_action_gate: {
+          status: "blocked",
+          checks: [
+            { id: "route_identity", label: "Route identity", status: "passed", reason: "canonical route matches" },
+            { id: "startup", label: "Startup evidence", status: "missing", reason: "startup event is required" },
+          ],
+        },
+      },
+      verification: {
+        passed: false,
+        required_event_kinds: ["implementation", "verification", "close_ready"],
+      },
+      created_at: "2026-06-11T12:00:00Z",
+    },
+    {
+      id: 4102,
+      event_type: "independent_verification.completed",
+      event_kind: "verification",
+      phase: "independent_verification",
+      actor: "qa",
+      status: "passed",
+      backlog_id: backlog.bug_id,
+      payload: {
+        present_event_kinds: ["implementation", "verification"],
+        satisfied_requirement_ids: ["bounded_implementation_worker_dispatch", "independent_verification_lane"],
+        contract_evidence: [
+          { requirement_id: "tests", status: "passed", evidence: "npx tsx frontend/dashboard/src/lib/taskPlayback.test.ts" },
+        ],
+      },
+      verification: {
+        passed: true,
+        checks: {
+          build: { label: "Dashboard build", status: "passed", evidence: "npm run build" },
+        },
+      },
+      created_at: "2026-06-11T12:01:00Z",
+    },
+    {
+      id: 4103,
+      event_type: "route.prompt_context.requested",
+      event_kind: "route_context",
+      phase: "dispatch",
+      actor: "observer",
+      status: "accepted",
+      backlog_id: backlog.bug_id,
+      payload: {
+        checklist: [
+          { label: "Public visible contract", status: "passed", evidence: "target files listed" },
+        ],
+        raw_prompt: "PRIVATE PROMPT SHOULD NOT LEAK",
+        route_token_hash: "sha256:fixture-token-hash",
+        route_action_gate: {
+          status: "passed",
+          access_token: "sk-fixture-secret-token",
+        },
+      },
+      created_at: "2026-06-11T12:02:00Z",
+    },
+  ];
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events, count: events.length },
+    gateResponse: null,
+    source: "governed",
+    generatedAt: "2026-06-11T12:03:00Z",
+  });
+  const blocked = trace.frames.find((frame) => frame.source_event_id === "#4101");
+  const passed = trace.frames.find((frame) => frame.source_event_id === "#4102");
+  const privateFrame = trace.frames.find((frame) => frame.source_event_id === "#4103");
+  assertFixture(Boolean(blocked), "blocked checklist fixture frame should exist");
+  assertFixture(Boolean(passed), "passed checklist fixture frame should exist");
+  assertFixture(Boolean(privateFrame), "privacy checklist fixture frame should exist");
+
+  const blockedRows = blocked!.event_checklist.categories.flatMap((category) => category.items);
+  assertFixture(blocked!.event_checklist.blocked_count >= 2, `blocked event checklist should surface unmet rows, got ${blocked!.event_checklist.blocked_count}`);
+  assertFixture(
+    blockedRows.some((item) => item.status === "missing" && /close_ready|startup event is required|independent_verification_lane/.test(item.value)),
+    `blocked event checklist should include missing/required-but-unmet evidence, got ${blockedRows.map((item) => `${item.status}:${item.value}`).join(" | ")}`,
+  );
+
+  const passedRows = passed!.event_checklist.categories.flatMap((category) => category.items);
+  assertFixture(passed!.event_checklist.passed_count >= 2, `passed event checklist should surface satisfied rows, got ${passed!.event_checklist.passed_count}`);
+  assertFixture(
+    passedRows.some((item) => ["passed", "satisfied", "present"].includes(item.status) && /independent_verification_lane|npm run build|taskPlayback\.test\.ts/.test(item.value)),
+    `passed event checklist should include satisfied evidence, got ${passedRows.map((item) => `${item.status}:${item.value}`).join(" | ")}`,
+  );
+
+  const privateChecklistText = privateFrame!.event_checklist.categories
+    .flatMap((category) => category.items)
+    .map((item) => `${item.label} ${item.value}`)
+    .join(" ");
+  assertFixture(!/PRIVATE PROMPT|sk-fixture|fixture-token-hash|access_token|raw_prompt/i.test(privateChecklistText), `event checklist leaked private raw material: ${privateChecklistText}`);
+
+  return [
+    `event checklist blocked rows: ${blockedRows.length}`,
+    `event checklist passed rows: ${passedRows.length}`,
+    "event checklist private raw/token material redacted from structured rows",
+  ];
+}
+
+export const taskPlaybackEventChecklistSummary: string[] = eventChecklistAssertions();
 
 // ──────────────────────────────────────────────────────────────────────────────
 // B1 / B2 UE-blocker canonical URL helpers
