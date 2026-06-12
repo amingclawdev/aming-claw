@@ -1148,6 +1148,139 @@ def _project_bootstrap_route_gate(
     )
 
 
+def _project_bootstrap_refusal_fault_domain(
+    *,
+    decision: str,
+    error: Exception,
+) -> str:
+    details = getattr(error, "details", {}) if isinstance(error, GovernanceError) else {}
+    if isinstance(details, Mapping) and details.get("fault_domain"):
+        return str(details.get("fault_domain") or "").strip()
+    message = str(getattr(error, "message", "") or error)
+    if "dirty git worktree" in message:
+        return "target_git_worktree_dirty"
+    if decision == "bootstrap_precondition_failed":
+        return "bootstrap_precondition_failed"
+    return "caller_missing_route_evidence"
+
+
+def _project_bootstrap_refusal_input_summary(body: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = body if isinstance(body, Mapping) else {}
+    route_token = payload.get("route_token")
+    return {
+        "has_route_token": bool(route_token),
+        "has_route_token_ref": bool(str(payload.get("route_token_ref") or "").strip()),
+        "has_route_waiver": _body_has_route_waiver(dict(payload)),
+        "route_token_shape": "mapping" if isinstance(route_token, Mapping) else type(route_token).__name__,
+    }
+
+
+def _record_project_bootstrap_refusal_event(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    workspace_path: str,
+    first_run: bool,
+    decision: str,
+    error: Exception,
+    route_handoff: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
+) -> bool:
+    """Record one durable bootstrap refusal event without changing gate behavior."""
+
+    pid = str(project_id or "").strip()
+    if not pid:
+        return False
+    body_summary = _project_bootstrap_refusal_input_summary(ctx.body or {})
+    details = getattr(error, "details", {}) if isinstance(error, GovernanceError) else {}
+    details = dict(details) if isinstance(details, Mapping) else {}
+    error_code = str(getattr(error, "code", "") or type(error).__name__).strip()
+    status_code = int(getattr(error, "status", 400) or 400)
+    message = str(getattr(error, "message", "") or error)
+    fault_domain = _project_bootstrap_refusal_fault_domain(
+        decision=decision,
+        error=error,
+    )
+    dedupe_payload = {
+        "schema_version": "project_bootstrap_refusal_dedupe.v1",
+        "project_id": pid,
+        "decision": decision,
+        "fault_domain": fault_domain,
+        "error_code": error_code,
+        "first_run": bool(first_run),
+        "route_input": body_summary,
+    }
+    dedupe_hash = hashlib.sha256(
+        json.dumps(dedupe_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    correlation_id = f"project_bootstrap_refusal:{dedupe_hash[:20]}"
+    refusal = {
+        "schema_version": "project_bootstrap_refusal.v1",
+        "action": "project_bootstrap",
+        "decision": decision,
+        "gate_decision": decision,
+        "fault_domain": fault_domain,
+        "status_code": status_code,
+        "error_code": error_code,
+        "message": message,
+        "project_id": pid,
+        "workspace_path": workspace_path,
+        "first_run": bool(first_run),
+        "request_id": ctx.request_id,
+        "route_input": body_summary,
+        "route_bootstrap_handoff": dict(route_handoff or {}),
+        "details": details,
+        "dedupe": {
+            "strategy": "one_event_per_project_decision_fault_domain_and_route_input",
+            "correlation_id": correlation_id,
+            "hash": f"sha256:{dedupe_hash}",
+        },
+    }
+    if route_gate:
+        refusal["route_token_gate"] = {
+            key: value
+            for key, value in dict(route_gate).items()
+            if key != "route_token"
+        }
+
+    try:
+        from . import task_timeline
+
+        conn = get_connection(pid)
+        try:
+            existing = task_timeline.list_events(
+                conn,
+                pid,
+                phase="route_gate",
+                event_kind="refusal",
+                correlation_id=correlation_id,
+                limit=1,
+            )
+            if existing:
+                return False
+            task_timeline.record_event(
+                conn,
+                project_id=pid,
+                event_type="route_token_gate.project_bootstrap_refusal",
+                phase="route_gate",
+                event_kind="refusal",
+                correlation_id=correlation_id,
+                severity="warning",
+                decision=decision,
+                actor=fault_domain,
+                status="rejected",
+                payload={"route_token_gate_refusal": refusal},
+                verification=refusal,
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("route_token_gate: failed to record bootstrap refusal evidence", exc_info=True)
+        return False
+
+
 @route("POST", "/api/project/bootstrap")
 def handle_project_bootstrap(ctx: RequestContext):
     """Bootstrap a project from workspace (R1).
@@ -1175,12 +1308,25 @@ def handle_project_bootstrap(ctx: RequestContext):
         project_id=project_id,
         first_run=first_run,
     )
-    route_gate = _project_bootstrap_route_gate(
-        ctx,
-        project_id=project_id,
-        workspace_path=workspace_path,
-        first_run=first_run,
-    )
+    try:
+        route_gate = _project_bootstrap_route_gate(
+            ctx,
+            project_id=project_id,
+            workspace_path=workspace_path,
+            first_run=first_run,
+        )
+    except GovernanceError as exc:
+        if exc.code == "route_token_required":
+            _record_project_bootstrap_refusal_event(
+                ctx,
+                project_id=project_id,
+                workspace_path=workspace_path,
+                first_run=first_run,
+                decision="route_token_required",
+                error=exc,
+                route_handoff=route_handoff,
+            )
+        raise
 
     try:
         result = project_service.bootstrap_project(
@@ -1203,6 +1349,17 @@ def handle_project_bootstrap(ctx: RequestContext):
         result["route_bootstrap_handoff"] = route_handoff
         return 200, result
     except Exception as e:
+        if route_gate and route_gate.get("server_minted"):
+            _record_project_bootstrap_refusal_event(
+                ctx,
+                project_id=project_id,
+                workspace_path=workspace_path,
+                first_run=first_run,
+                decision="bootstrap_precondition_failed",
+                error=e,
+                route_handoff=route_handoff,
+                route_gate=route_gate,
+            )
         return 400, {"error": str(e), "route_bootstrap_handoff": route_handoff}
 
 

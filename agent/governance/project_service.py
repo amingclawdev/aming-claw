@@ -563,6 +563,36 @@ def _copy_json_dict(raw: object) -> dict:
         return dict(raw)
 
 
+def _normalize_graph_path_values(values) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)):
+        iterable = [values]
+    else:
+        try:
+            iterable = list(values)
+        except TypeError:
+            iterable = [values]
+    out: list[str] = []
+    for value in iterable:
+        norm = str(value or "").replace("\\", "/").strip().strip("/")
+        if norm:
+            out.append(norm)
+    return out
+
+
+def _merge_graph_path_values(*groups) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in _normalize_graph_path_values(group):
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+    return out
+
+
 def project_config_to_metadata(config) -> dict:
     """Serialize a ProjectConfig-like object for central registry storage."""
     try:
@@ -884,11 +914,9 @@ def bootstrap_project(
         if "graph" in config_override and isinstance(config_override["graph"], dict):
             graph_override = config_override["graph"]
             if "exclude_paths" in graph_override:
-                config.graph.exclude_paths = [
-                    str(value).replace("\\", "/").strip().strip("/")
-                    for value in graph_override.get("exclude_paths") or []
-                    if str(value or "").strip()
-                ]
+                config.graph.exclude_paths = _normalize_graph_path_values(
+                    graph_override.get("exclude_paths")
+                )
             if "ignore_globs" in graph_override:
                 config.graph.ignore_globs = [
                     str(value).replace("\\", "/").strip().strip("/")
@@ -904,6 +932,13 @@ def bootstrap_project(
                             "provider": str(route.get("provider", "") or "").strip(),
                             "model": str(route.get("model", "") or "").strip(),
                         }
+
+    top_level_exclude_paths = _normalize_graph_path_values(exclude_patterns)
+    if top_level_exclude_paths:
+        config.graph.exclude_paths = _merge_graph_path_values(
+            getattr(config.graph, "exclude_paths", []) or [],
+            top_level_exclude_paths,
+        )
 
     pid = config.project_id or project_name or ws.name.lower().replace("_", "-")
     pid = _normalize_project_id(pid)
@@ -956,11 +991,9 @@ def bootstrap_project(
             for value in (getattr(getattr(config, "graph", None), "ignore_globs", []) or [])
             if str(value or "").strip()
         ]
-        effective_excludes = sorted({
-            str(value).replace("\\", "/").strip().strip("/")
-            for value in ((exclude_patterns or []) + configured_excludes)
-            if str(value or "").strip()
-        })
+        effective_excludes = sorted(
+            _merge_graph_path_values(configured_excludes, top_level_exclude_paths)
+        )
         conn = get_connection(pid)
         try:
             # Step 4: version seed remains for legacy gates and health checks.
@@ -1064,6 +1097,11 @@ def bootstrap_project(
     # Build response
     config_dict = project_config_to_metadata(config)
     config_dict["project_id"] = pid
+    graph_config = config_dict.setdefault("graph", {})
+    graph_config["exclude_paths"] = _normalize_graph_path_values(
+        getattr(config.graph, "exclude_paths", []) or []
+    )
+    graph_config["effective_exclude_roots"] = list(effective_excludes)
     set_project_config_metadata(
         pid,
         config_dict,
@@ -1083,6 +1121,7 @@ def bootstrap_project(
         "snapshot_id": reconcile_result.get("snapshot_id", ""),
         "activation": reconcile_result.get("activation") or {},
         "bootstrap_mode": "snapshot_full_reconcile",
+        "effective_exclude_roots": list(effective_excludes),
         "git_gate": git_gate,
     }
     update_project_operation_progress(

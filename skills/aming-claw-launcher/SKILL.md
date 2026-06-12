@@ -130,6 +130,10 @@ Every branch finishes with the same three steps:
 | `node_missing` / `edge_missing` drift counts | The current graph/projection is missing expected nodes or relations. Run Update Graph/reconcile or review the queue before trusting impact claims. |
 | Snapshot ids such as `scope-f17ca39-b610` | Opaque commit-bound graph snapshot pointers. They are audit ids, not branch names or files to edit. |
 | `recommended_actions` | Governance suggestions for the next operator step. They are not automatic permission to mutate state. |
+| Server-minted first-run route binding | A narrow one-hour bootstrap permission governance creates only when the project is not registered yet. It lets first setup proceed without pasting a route token. |
+| `route_token_ref` | An opaque handle to a server-stored route binding. It is safe to show; the raw route token is not persisted or displayed. |
+| Route binding | The audit record that says which protected action, project, route context, and prompt contract a mutation is allowed to use. |
+| `observer_route_token_refs` | The governance table that stores server-issued route-token references and digests for later validation. |
 
 ## One-Shot Install Mode
 
