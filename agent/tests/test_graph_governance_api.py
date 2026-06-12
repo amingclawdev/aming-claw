@@ -428,17 +428,41 @@ def test_project_bootstrap_tokenless_non_first_run_rejected(conn, monkeypatch):
     monkeypatch.setattr(server.project_service, "project_exists", lambda _project_id: True)
     monkeypatch.setattr(server.project_service, "bootstrap_project", fail_bootstrap)
 
-    with pytest.raises(GovernanceError, match="route_token"):
-        server.handle_project_bootstrap(
-            _ctx(
-                {},
-                method="POST",
-                body={
-                    "workspace_path": "/tmp/bootstrap-demo",
-                    "project_id": "bootstrap-demo",
-                },
+    for _ in range(2):
+        with pytest.raises(GovernanceError, match="route_token") as raised:
+            server.handle_project_bootstrap(
+                _ctx(
+                    {},
+                    method="POST",
+                    body={
+                        "workspace_path": "/tmp/bootstrap-demo",
+                        "project_id": "bootstrap-demo",
+                    },
+                )
             )
-        )
+        assert raised.value.code == "route_token_required"
+
+    rows = conn.execute(
+        """
+        SELECT event_type, event_kind, decision, status, payload_json, verification_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND event_type = ?
+        """,
+        ("bootstrap-demo", "route_token_gate.project_bootstrap_refusal"),
+    ).fetchall()
+    assert len(rows) == 1
+    event = rows[0]
+    assert event["event_kind"] == "refusal"
+    assert event["decision"] == "route_token_required"
+    assert event["status"] == "rejected"
+    event_payload = json.loads(event["payload_json"])
+    refusal = event_payload["route_token_gate_refusal"]
+    assert refusal["gate_decision"] == "route_token_required"
+    assert refusal["fault_domain"] == "caller_missing_route_evidence"
+    assert refusal["details"]["fault_domain"] == "caller_missing_route_evidence"
+    verification = json.loads(event["verification_json"])
+    assert verification["gate_decision"] == "route_token_required"
+    assert verification["fault_domain"] == "caller_missing_route_evidence"
 
 
 def test_project_bootstrap_route_waiver_allows_and_records_gate(conn, monkeypatch):
@@ -504,6 +528,53 @@ def test_project_bootstrap_route_token_allows_project_scope(conn, monkeypatch):
     assert status == 200
     assert payload["route_token_gate"]["decision"] == "route_token"
     assert payload["route_token_gate"]["scope"]["project_id"] == "bootstrap-token-demo"
+
+
+def test_bootstrap_project_persists_top_level_exclude_patterns(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "exclude-demo"
+    workspace.mkdir()
+    captured = {}
+
+    def fake_reconcile(_conn, pid, ws, **kwargs):
+        captured.update({"project_id": pid, "workspace": ws, **kwargs})
+        return {
+            "ok": True,
+            "snapshot_id": "snap-exclude-demo",
+            "activation": {"projection_status": "current"},
+            "graph_stats": {"node_count": 0, "edge_count": 0, "layers": {}},
+            "index_counts": {"nodes": 0, "edges": 0},
+        }
+
+    monkeypatch.setattr(server.project_service, "_governance_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(server.project_service, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    monkeypatch.setattr(
+        server.project_service,
+        "_ensure_clean_git_worktree_for_graph",
+        lambda _workspace: {"is_git_repo": False, "dirty": False},
+    )
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", fake_reconcile)
+
+    result = server.project_service.bootstrap_project(
+        workspace_path=str(workspace),
+        project_name="Exclude Demo",
+        config_override={
+            "project_id": "exclude-demo",
+            "graph": {"exclude_paths": ["dist"]},
+        },
+        exclude_patterns=["node_modules"],
+    )
+
+    persisted = server.project_service.get_project_config_metadata("exclude-demo")
+    assert persisted["graph"]["exclude_paths"] == ["dist", "node_modules"]
+    assert persisted["graph"]["effective_exclude_roots"] == ["dist", "node_modules"]
+    assert result["config"]["graph"]["exclude_paths"] == ["dist", "node_modules"]
+    assert result["config"]["graph"]["effective_exclude_roots"] == ["dist", "node_modules"]
+    assert result["effective_exclude_roots"] == ["dist", "node_modules"]
+    assert captured["graph_exclude_paths"] == ["dist", "node_modules"]
 
 
 def _activate_basic_graph(

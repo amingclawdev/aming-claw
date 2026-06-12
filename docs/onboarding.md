@@ -92,11 +92,17 @@ Request body schema:
 
 `workspace_path` is required. `project_id` and `language` may be supplied at the
 top level or inside `config_override`; top-level values are folded into the
-override before graph build. For a first registration of an unregistered
-project, a dashboard/API/HN demo/CLI caller may omit `route_token`: governance
-mints a narrow server-side `project_bootstrap` route binding, persists only the
-opaque `route_token_ref`/digest, validates the normal protected mutation gate,
-and records `route_token_gate.project_bootstrap` timeline evidence. A tokenless
+override before graph build. Top-level `exclude_patterns` is a compatibility
+alias for `config_override.graph.exclude_paths`: bootstrap stores the union in
+`graph.exclude_paths`, preserving existing `config_override.graph.exclude_paths`
+first and appending new top-level entries after dedupe. The response includes
+`effective_exclude_roots`, the exact roots passed into graph reconcile.
+
+For a first registration of an unregistered project, a dashboard/API/HN demo/CLI
+caller may omit `route_token`: governance mints a narrow server-side
+`project_bootstrap` route binding, persists only the opaque
+`route_token_ref`/digest, validates the normal protected mutation gate, and
+records `route_token_gate.project_bootstrap` timeline evidence. A tokenless
 bootstrap for an already registered project is still rejected; use a valid
 `route_token`, `route_token_ref`, or accepted `route_waiver` for non-first-run
 re-bootstrap or repair flows.
@@ -129,6 +135,12 @@ graph:
 
 If the target workspace is a dirty git repo, commit/stash first. Dirty
 worktree rejection is intentional because graph snapshots are commit-bound.
+Bootstrap refusals are evidence-bearing: tokenless non-first-run refusals and
+first-run precondition failures after a server-minted binding are deduped into
+`route_token_gate.project_bootstrap_refusal` timeline events on the requested
+project id. For a dirty first-run target that is not yet registered, this event
+lives in the requested project's governance timeline DB even though the project
+registry row is not created.
 
 ## 3. Project Config In V1
 
