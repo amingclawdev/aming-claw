@@ -308,6 +308,7 @@ RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_vie
 RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION = "runtime_context.role_filter_policy.v1"
 RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION = "runtime_context.content_address.v1"
 RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION = "runtime_context.access_audit.v1"
+RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION = "runtime_context.lane_fold.v1"
 RUNTIME_CONTEXT_WORKER_ROLE = "mf_sub"
 MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
@@ -323,6 +324,60 @@ MERGE_READY_INPUT_STATES = {
     STATE_QUEUED_FOR_MERGE,
     STATE_VALIDATED,
     STATE_MERGE_READY,
+}
+RUNTIME_CONTEXT_DEFAULT_LANE_CLAUSES = (
+    "route_context",
+    "route_action_precheck",
+    "bounded_implementation_worker_dispatch",
+    "mf_subagent_startup",
+    "runtime_context_read_receipt",
+    "independent_verification",
+    "close_ready",
+)
+_RUNTIME_CONTEXT_EVENT_KIND_CLAUSES: dict[str, tuple[str, ...]] = {
+    "route_context": ("route_context",),
+    "observer_root_route_context": ("route_context",),
+    "runtime_context_route_context": ("route_context",),
+    "route_action_precheck": ("route_action_precheck",),
+    "bounded_implementation_worker_dispatch": (
+        "bounded_implementation_worker_dispatch",
+    ),
+    "mf_subagent_dispatch": ("bounded_implementation_worker_dispatch",),
+    "worker_dispatch": ("bounded_implementation_worker_dispatch",),
+    "mf_subagent_startup": ("mf_subagent_startup",),
+    "mf_subagent_startup_gate": ("mf_subagent_startup",),
+    "worker_startup": ("mf_subagent_startup",),
+    "runtime_context_read_receipt": ("runtime_context_read_receipt",),
+    "worker_read_receipt": ("runtime_context_read_receipt",),
+    "read_receipt": ("runtime_context_read_receipt",),
+    "independent_verification": ("independent_verification",),
+    "verification": ("independent_verification",),
+    "qa_verification": ("independent_verification",),
+    "finish_gate": ("finish_gate",),
+    "close_ready": ("close_ready",),
+}
+_RUNTIME_CONTEXT_FULFILLING_STATUSES = {
+    "",
+    "accepted",
+    "complete",
+    "ok",
+    "pass",
+    "passed",
+    "ready",
+    "recorded",
+    "satisfied",
+    "success",
+    "succeeded",
+    "valid",
+    "verified",
+}
+_RUNTIME_CONTEXT_BLOCKING_STATUSES = {
+    "blocked",
+    "error",
+    "fail",
+    "failed",
+    "invalid",
+    "rejected",
 }
 BATCH_CLEANUP_ALLOWED_STATES = {
     BATCH_STATE_ACCEPTED,
@@ -1721,6 +1776,217 @@ def _runtime_context_string_list(value: Any) -> list[str]:
     return [str(value).strip()] if str(value or "").strip() else []
 
 
+def _runtime_context_lane_clause_id(value: Any) -> str:
+    normalized = _runtime_context_text(value).lower().replace("-", "_")
+    return normalized
+
+
+def _runtime_context_lane_clause_items(
+    required_clauses: Sequence[str | Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    raw_clauses: Sequence[str | Mapping[str, Any]] = (
+        required_clauses
+        if required_clauses is not None
+        else RUNTIME_CONTEXT_DEFAULT_LANE_CLAUSES
+    )
+    clauses: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_clauses:
+        if isinstance(raw, Mapping):
+            clause = _runtime_context_lane_clause_id(
+                raw.get("clause")
+                or raw.get("id")
+                or raw.get("field")
+                or raw.get("name")
+            )
+            if not clause or clause in seen:
+                continue
+            seen.add(clause)
+            item = {
+                "clause": clause,
+                "status": "missing",
+            }
+            for key in ("expected_source", "producer", "consumer", "description"):
+                if _runtime_context_text(raw.get(key)):
+                    item[key] = _runtime_context_text(raw.get(key))
+            clauses.append(item)
+            continue
+        clause = _runtime_context_lane_clause_id(raw)
+        if clause and clause not in seen:
+            seen.add(clause)
+            clauses.append({"clause": clause, "status": "missing"})
+    return clauses
+
+
+def _runtime_context_lane_event_mapping(event: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _runtime_context_mapping(event.get("payload"))
+    return {**payload, **dict(event)}
+
+
+def _runtime_context_lane_event_sort_key(
+    indexed_event: tuple[int, Mapping[str, Any]],
+) -> tuple[str, str, str, str]:
+    index, event = indexed_event
+    merged = _runtime_context_lane_event_mapping(event)
+    return (
+        _runtime_context_text(
+            merged.get("created_at")
+            or merged.get("timestamp")
+            or merged.get("time")
+            or merged.get("updated_at")
+        ),
+        _runtime_context_text(merged.get("event_id") or merged.get("id")),
+        _runtime_context_text(merged.get("seq") or merged.get("sequence")),
+        f"{index:08d}",
+    )
+
+
+def _runtime_context_lane_event_kind(event: Mapping[str, Any]) -> str:
+    merged = _runtime_context_lane_event_mapping(event)
+    return _runtime_context_lane_clause_id(
+        merged.get("event_kind")
+        or merged.get("kind")
+        or merged.get("type")
+        or merged.get("phase")
+    )
+
+
+def _runtime_context_lane_event_status(event: Mapping[str, Any]) -> str:
+    merged = _runtime_context_lane_event_mapping(event)
+    return _runtime_context_lane_clause_id(
+        merged.get("status")
+        or merged.get("decision")
+        or merged.get("result")
+        or merged.get("outcome")
+    )
+
+
+def _runtime_context_lane_event_ref(event: Mapping[str, Any]) -> str:
+    merged = _runtime_context_lane_event_mapping(event)
+    return _runtime_context_text(
+        merged.get("event_ref")
+        or merged.get("timeline_ref")
+        or merged.get("event_id")
+        or merged.get("id")
+        or merged.get("trace_id")
+    )
+
+
+def _runtime_context_lane_event_clauses(event: Mapping[str, Any]) -> list[str]:
+    merged = _runtime_context_lane_event_mapping(event)
+    explicit: list[str] = []
+    for key in (
+        "clause",
+        "clause_id",
+        "evidence_clause",
+        "evidence_kind",
+        "required_evidence",
+    ):
+        explicit.extend(
+            _runtime_context_lane_clause_id(item)
+            for item in _runtime_context_string_list(merged.get(key))
+        )
+    explicit = [item for item in explicit if item]
+    if explicit:
+        return _runtime_context_dedupe(explicit)
+    event_kind = _runtime_context_lane_event_kind(event)
+    return list(_RUNTIME_CONTEXT_EVENT_KIND_CLAUSES.get(event_kind, ()))
+
+
+def build_runtime_context_lane_plan_view(
+    events: Sequence[Mapping[str, Any]] | None,
+    *,
+    required_clauses: Sequence[str | Mapping[str, Any]] | None = None,
+    lane_id: str = "",
+    generated_at: str = "",
+) -> dict[str, Any]:
+    """Fold task-timeline-like events into a compact deterministic clause view."""
+
+    clause_items = _runtime_context_lane_clause_items(required_clauses)
+    clause_order = [item["clause"] for item in clause_items]
+    clause_by_id = {item["clause"]: dict(item) for item in clause_items}
+    fulfilled: dict[str, dict[str, Any]] = {}
+    blocking_events: list[dict[str, Any]] = []
+    last_event: dict[str, Any] = {}
+    lane = _runtime_context_text(lane_id)
+    for _, event in sorted(
+        [
+            (index, event)
+            for index, event in enumerate(events or ())
+            if isinstance(event, Mapping)
+        ],
+        key=_runtime_context_lane_event_sort_key,
+    ):
+        merged = _runtime_context_lane_event_mapping(event)
+        event_lane = _runtime_context_text(
+            merged.get("lane_id") or merged.get("task_id") or merged.get("worker_id")
+        )
+        if lane and event_lane and event_lane != lane:
+            continue
+        event_kind = _runtime_context_lane_event_kind(event)
+        status = _runtime_context_lane_event_status(event)
+        event_ref = _runtime_context_lane_event_ref(event)
+        occurred_at = _runtime_context_text(
+            merged.get("created_at")
+            or merged.get("timestamp")
+            or merged.get("time")
+            or merged.get("updated_at")
+        )
+        event_view = {
+            "event_kind": event_kind,
+            "event_ref": event_ref,
+            "status": status or "recorded",
+            "at": occurred_at,
+        }
+        last_event = event_view
+        clauses = [
+            clause
+            for clause in _runtime_context_lane_event_clauses(event)
+            if clause in clause_by_id
+        ]
+        if status in _RUNTIME_CONTEXT_BLOCKING_STATUSES:
+            blocking_events.append(event_view | {"clauses": clauses})
+            continue
+        if status not in _RUNTIME_CONTEXT_FULFILLING_STATUSES:
+            continue
+        for clause in clauses:
+            if clause in fulfilled:
+                continue
+            fulfilled[clause] = (
+                dict(clause_by_id[clause])
+                | event_view
+                | {"clause": clause, "status": "fulfilled"}
+            )
+    fulfilled_items = [fulfilled[clause] for clause in clause_order if clause in fulfilled]
+    missing_items = [
+        dict(clause_by_id[clause]) | {"status": "missing"}
+        for clause in clause_order
+        if clause not in fulfilled
+    ]
+    clause_plan = fulfilled_items + missing_items
+    status = "ready" if not missing_items else "missing_required_clauses"
+    if blocking_events:
+        status = "blocked"
+    return {
+        "schema_version": RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION,
+        "lane_id": lane,
+        "generated_at": generated_at or utc_now(),
+        "current_state": {
+            "status": status,
+            "fulfilled_count": len(fulfilled_items),
+            "missing_count": len(missing_items),
+            "blocking_count": len(blocking_events),
+            "next_missing_clause": missing_items[0]["clause"] if missing_items else "",
+            "last_event_kind": last_event.get("event_kind", ""),
+            "last_event_ref": last_event.get("event_ref", ""),
+        },
+        "fulfilled": fulfilled_items,
+        "missing": missing_items,
+        "clause_plan": clause_plan,
+        "blocking_events": blocking_events,
+    }
+
+
 def _runtime_context_dedupe(values: Sequence[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -2683,6 +2949,8 @@ def build_runtime_context_current_view(
     target_files: Sequence[str] | None = None,
     acceptance_criteria: Sequence[str] | None = None,
     required_evidence: Sequence[str] | None = None,
+    timeline_events: Sequence[Mapping[str, Any]] | None = None,
+    lane_required_clauses: Sequence[str | Mapping[str, Any]] | None = None,
     generated_at: str = "",
 ) -> dict[str, Any]:
     """Build the canonical current-state projection for runtime-context gates."""
@@ -2812,6 +3080,12 @@ def build_runtime_context_current_view(
         "graph_query_identity": current_values["graph_query_identity"],
         "timeline_refs": timeline,
         "graph_trace_refs": graph_trace,
+        "lane_plan": build_runtime_context_lane_plan_view(
+            timeline_events or (),
+            required_clauses=lane_required_clauses or required_evidence_values or None,
+            lane_id=context.task_id,
+            generated_at=generated_at,
+        ),
         "startup_gate": startup,
         "finish_gate": finish,
         "close_evidence": close,
@@ -3014,6 +3288,7 @@ def build_runtime_context_worker_view(
         | {"raw_private_context_exposed": False},
         "work": dict(_runtime_context_mapping(current_view.get("work"))),
         "graph_query_identity": values.get("graph_query_identity", {}),
+        "lane_plan": dict(_runtime_context_mapping(current_view.get("lane_plan"))),
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,
         "evidence_refs": {
@@ -3039,6 +3314,7 @@ def build_runtime_context_worker_view(
                 "branch",
                 "route_identity",
                 "work",
+                "lane_plan",
                 "graph_query_identity",
                 "gate_inputs",
                 "close_gate_view",
@@ -3076,6 +3352,8 @@ def build_runtime_context_projection(
     target_files: Sequence[str] | None = None,
     acceptance_criteria: Sequence[str] | None = None,
     required_evidence: Sequence[str] | None = None,
+    timeline_events: Sequence[Mapping[str, Any]] | None = None,
+    lane_required_clauses: Sequence[str | Mapping[str, Any]] | None = None,
     role: str = RUNTIME_CONTEXT_WORKER_ROLE,
     fence_token: str = "",
     generated_at: str = "",
@@ -3095,6 +3373,8 @@ def build_runtime_context_projection(
         target_files=target_files,
         acceptance_criteria=acceptance_criteria,
         required_evidence=required_evidence,
+        timeline_events=timeline_events,
+        lane_required_clauses=lane_required_clauses,
         generated_at=generated_at,
     )
     gate_inputs = build_runtime_context_gate_inputs_view(current)

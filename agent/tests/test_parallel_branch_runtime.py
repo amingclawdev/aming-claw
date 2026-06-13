@@ -33,6 +33,7 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_FAILED,
@@ -49,6 +50,7 @@ from agent.governance.parallel_branch_runtime import (
     branch_runtime_context_id,
     build_runtime_context_current_view,
     build_runtime_context_gate_inputs_view,
+    build_runtime_context_lane_plan_view,
     build_runtime_context_projection,
     decide_restart_recovery,
     ensure_branch_runtime_schema,
@@ -434,6 +436,176 @@ def test_runtime_context_current_view_and_gate_inputs_report_missing_fields() ->
         "mf_subagent_contract.validate_mf_subagent_dispatch_gate"
     )
     assert ("startup", "target_files") in missing
+
+
+def test_runtime_context_lane_plan_fold_is_deterministic_and_reports_missing() -> None:
+    events = [
+        {
+            "event_id": "evt-startup",
+            "event_kind": "mf_subagent_startup",
+            "task_id": "mf-sub-runtime-context",
+            "created_at": "2026-05-16T12:03:00Z",
+            "payload": {"status": "passed"},
+        },
+        {
+            "event_id": "evt-other",
+            "event_kind": "close_ready",
+            "task_id": "other-lane",
+            "created_at": "2026-05-16T12:04:00Z",
+        },
+        {
+            "event_id": "evt-route",
+            "event_kind": "route_context",
+            "task_id": "mf-sub-runtime-context",
+            "created_at": "2026-05-16T12:01:00Z",
+        },
+        {
+            "event_id": "evt-dispatch",
+            "event_kind": "mf_subagent_dispatch",
+            "task_id": "mf-sub-runtime-context",
+            "created_at": "2026-05-16T12:02:00Z",
+        },
+    ]
+
+    projection = build_runtime_context_lane_plan_view(
+        list(reversed(events)),
+        required_clauses=[
+            {"id": "route_context", "expected_source": "route_context"},
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "close_ready",
+        ],
+        lane_id="mf-sub-runtime-context",
+        generated_at=NOW,
+    )
+    reordered = build_runtime_context_lane_plan_view(
+        events,
+        required_clauses=[
+            {"id": "route_context", "expected_source": "route_context"},
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "close_ready",
+        ],
+        lane_id="mf-sub-runtime-context",
+        generated_at="2026-05-16T12:30:00Z",
+    )
+
+    assert projection["schema_version"] == RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION
+    assert projection["current_state"] == {
+        "status": "missing_required_clauses",
+        "fulfilled_count": 3,
+        "missing_count": 1,
+        "blocking_count": 0,
+        "next_missing_clause": "close_ready",
+        "last_event_kind": "mf_subagent_startup",
+        "last_event_ref": "evt-startup",
+    }
+    assert [item["clause"] for item in projection["fulfilled"]] == [
+        "route_context",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+    ]
+    assert projection["fulfilled"][0]["expected_source"] == "route_context"
+    assert projection["missing"] == [
+        {"clause": "close_ready", "status": "missing"}
+    ]
+    assert runtime_context_content_hash(projection) == runtime_context_content_hash(
+        reordered
+    )
+
+
+def test_runtime_context_projection_embeds_event_sourced_lane_plan() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        timeline_events=[
+            {
+                "event_id": "evt-route",
+                "event_kind": "route_context",
+                "task_id": "mf-sub-runtime-context",
+                "created_at": "2026-05-16T12:01:00Z",
+            },
+            {
+                "event_id": "evt-precheck",
+                "event_kind": "route_action_precheck",
+                "task_id": "mf-sub-runtime-context",
+                "created_at": "2026-05-16T12:02:00Z",
+            },
+            {
+                "event_id": "evt-dispatch",
+                "event_kind": "bounded_implementation_worker_dispatch",
+                "task_id": "mf-sub-runtime-context",
+                "created_at": "2026-05-16T12:03:00Z",
+            },
+            {
+                "event_id": "evt-startup",
+                "event_kind": "mf_subagent_startup",
+                "task_id": "mf-sub-runtime-context",
+                "created_at": "2026-05-16T12:04:00Z",
+            },
+        ],
+        lane_required_clauses=[
+            "route_context",
+            "route_action_precheck",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "runtime_context_read_receipt",
+        ],
+        generated_at=NOW,
+    ).to_dict()
+
+    current_lane_plan = projection["views"]["current"]["lane_plan"]
+    worker_lane_plan = projection["views"]["worker_view"]["lane_plan"]
+    assert current_lane_plan["schema_version"] == RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION
+    assert current_lane_plan["current_state"]["fulfilled_count"] == 4
+    assert current_lane_plan["current_state"]["next_missing_clause"] == (
+        "runtime_context_read_receipt"
+    )
+    assert current_lane_plan["missing"] == [
+        {"clause": "runtime_context_read_receipt", "status": "missing"}
+    ]
+    assert worker_lane_plan == current_lane_plan
+
+
+def test_runtime_context_lane_plan_blocking_event_does_not_fulfill_clause() -> None:
+    projection = build_runtime_context_lane_plan_view(
+        [
+            {
+                "event_id": "evt-startup-failed",
+                "event_kind": "mf_subagent_startup",
+                "task_id": "mf-sub-runtime-context",
+                "created_at": "2026-05-16T12:03:00Z",
+                "status": "failed",
+            }
+        ],
+        required_clauses=["mf_subagent_startup"],
+        lane_id="mf-sub-runtime-context",
+        generated_at=NOW,
+    )
+
+    assert projection["current_state"]["status"] == "blocked"
+    assert projection["current_state"]["blocking_count"] == 1
+    assert projection["fulfilled"] == []
+    assert projection["missing"] == [
+        {"clause": "mf_subagent_startup", "status": "missing"}
+    ]
+    assert projection["blocking_events"] == [
+        {
+            "event_kind": "mf_subagent_startup",
+            "event_ref": "evt-startup-failed",
+            "status": "failed",
+            "at": "2026-05-16T12:03:00Z",
+            "clauses": ["mf_subagent_startup"],
+        }
+    ]
 
 
 def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -> None:
