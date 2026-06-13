@@ -3518,10 +3518,13 @@ def _runtime_context_audit_archive_action(
     )
     return {
         "schema_version": "runtime_context.audit_archive_action.v1",
-        "status": "available_when_historical_evidence_non_reconstructable"
+        "status": "candidate_requires_observer_historical_classification"
         if has_close_blocker
         else "not_applicable",
-        "next_action": "backlog_audit_archive" if has_close_blocker else "none",
+        "next_action": "classify_historical_non_reconstructable"
+        if has_close_blocker
+        else "none",
+        "archive_action": "backlog_audit_archive" if has_close_blocker else "none",
         "ordinary_close_gate_claimed": False,
         "normal_close_gate_passed": False,
         "close_ready_emitted": False,
@@ -3551,9 +3554,10 @@ def _runtime_context_audit_archive_action(
             },
         },
         "operator_instruction": (
-            "Use only after timeline precheck shows the MF close blocker is "
-            "historical and cannot be legally reconstructed; this archives the "
-            "row as WAIVED and must not emit close_ready or can_close=true."
+            "Treat this as a candidate only. First classify the close blocker "
+            "as historical and non-reconstructable, then use audit archive with "
+            "timeline_precheck, verification, and graph_snapshot evidence. It "
+            "must not emit close_ready or can_close=true."
             if has_close_blocker
             else "Audit archive is not applicable while close gate is ready."
         ),

@@ -24968,6 +24968,32 @@ def _json_object_field(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _require_backlog_audit_archive_evidence(
+    *,
+    timeline_precheck: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    graph_snapshot: Mapping[str, Any],
+) -> None:
+    if not timeline_precheck:
+        raise ValidationError("audit archive requires timeline_precheck evidence")
+    if timeline_precheck.get("can_close") is not False:
+        raise ValidationError("audit archive timeline_precheck.can_close must be false")
+    missing_event_kinds = timeline_precheck.get("missing_event_kinds")
+    failed_gates = timeline_precheck.get("failed_gates")
+    if not missing_event_kinds and not failed_gates:
+        raise ValidationError(
+            "audit archive timeline_precheck requires missing_event_kinds or failed_gates"
+        )
+    if not verification:
+        raise ValidationError("audit archive requires verification evidence")
+    if not graph_snapshot:
+        raise ValidationError("audit archive requires graph_snapshot evidence")
+    if not str(graph_snapshot.get("snapshot_id") or graph_snapshot.get("commit_sha") or "").strip():
+        raise ValidationError(
+            "audit archive graph_snapshot requires snapshot_id or commit_sha"
+        )
+
+
 def _backlog_audit_archive_notes(payload: Mapping[str, Any]) -> str:
     reason = str(payload.get("reason") or "").strip()
     commit = str(payload.get("implementation_commit") or "").strip()
@@ -25016,6 +25042,12 @@ def _build_backlog_audit_archive_payload(
     graph_snapshot = _json_object_field(body.get("graph_snapshot"))
     if body.get("graph_snapshot_id") and not graph_snapshot.get("snapshot_id"):
         graph_snapshot["snapshot_id"] = str(body.get("graph_snapshot_id") or "")
+    verification = _json_object_field(body.get("verification"))
+    _require_backlog_audit_archive_evidence(
+        timeline_precheck=timeline_precheck,
+        verification=verification,
+        graph_snapshot=graph_snapshot,
+    )
     return {
         "schema_version": _BACKLOG_AUDIT_ARCHIVE_SCHEMA_VERSION,
         "status": "audit_archived",
@@ -25042,7 +25074,7 @@ def _build_backlog_audit_archive_payload(
             "observed_timeline_precheck_can_close": observed_can_close,
         },
         "evidence": {
-            "verification": _json_object_field(body.get("verification")),
+            "verification": verification,
             "graph_snapshot": graph_snapshot,
             "timeline_precheck_failure_summary": timeline_precheck,
             "runtime_context": _json_object_field(body.get("runtime_context")),
@@ -25079,18 +25111,18 @@ def handle_backlog_audit_archive(ctx: RequestContext):
                 422,
             )
 
-        route_gate = _require_route_token_mutation_gate(
-            ctx,
-            action="backlog_audit_archive",
-            project_id=pid,
-            backlog_id=bug_id,
-        )
         payload = _build_backlog_audit_archive_payload(
             project_id=pid,
             bug_id=bug_id,
             body=body,
             row=row,
             archived_at=now,
+        )
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="backlog_audit_archive",
+            project_id=pid,
+            backlog_id=bug_id,
         )
         takeover = backlog_runtime.parse_json_object(_row_get(row, "takeover_json", "{}"))
         takeover["audit_archive"] = payload

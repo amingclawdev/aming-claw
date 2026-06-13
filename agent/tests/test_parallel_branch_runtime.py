@@ -960,8 +960,9 @@ def test_runtime_context_action_plan_links_audit_archive_for_historical_close_bl
     audit_action = action_plan["audit_archive_action"]
 
     assert audit_action["schema_version"] == "runtime_context.audit_archive_action.v1"
-    assert audit_action["status"] == "available_when_historical_evidence_non_reconstructable"
-    assert audit_action["next_action"] == "backlog_audit_archive"
+    assert audit_action["status"] == "candidate_requires_observer_historical_classification"
+    assert audit_action["next_action"] == "classify_historical_non_reconstructable"
+    assert audit_action["archive_action"] == "backlog_audit_archive"
     assert audit_action["normal_close_gate_passed"] is False
     assert audit_action["close_ready_emitted"] is False
     assert audit_action["entrypoint"]["path"] == (

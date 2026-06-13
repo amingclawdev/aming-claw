@@ -831,6 +831,71 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         )
         self.assertNotIn(bug_id, {item["bug_id"] for item in active["bugs"]})
 
+    def test_audit_archive_rejects_missing_core_evidence(self):
+        from governance.errors import GovernanceError
+        from governance.server import handle_backlog_audit_archive, handle_backlog_upsert
+
+        bug_id = "BW-AUDIT-ARCHIVE-STRICT"
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Strict archive evidence",
+                    "status": "OPEN",
+                    "force_admit": True,
+                },
+            )
+        )
+        base = {
+            "commit": "abc123",
+            "reason": "Historical close evidence cannot be reconstructed.",
+        }
+        cases = [
+            ({}, "timeline_precheck"),
+            (
+                {
+                    "timeline_precheck": {"can_close": False, "missing_event_kinds": ["close_ready"]},
+                    "verification": {"tests": ["pytest"]},
+                },
+                "graph_snapshot",
+            ),
+            (
+                {
+                    "timeline_precheck": {"can_close": False, "missing_event_kinds": ["close_ready"]},
+                    "graph_snapshot": {"snapshot_id": "scope-test"},
+                },
+                "verification",
+            ),
+            (
+                {
+                    "timeline_precheck": {"can_close": True, "missing_event_kinds": ["close_ready"]},
+                    "verification": {"tests": ["pytest"]},
+                    "graph_snapshot": {"snapshot_id": "scope-test"},
+                },
+                "can_close must be false",
+            ),
+            (
+                {
+                    "timeline_precheck": {"can_close": False},
+                    "verification": {"tests": ["pytest"]},
+                    "graph_snapshot": {"snapshot_id": "scope-test"},
+                },
+                "missing_event_kinds or failed_gates",
+            ),
+        ]
+
+        for body, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaises(GovernanceError) as cm:
+                    handle_backlog_audit_archive(
+                        self._make_ctx(
+                            {"project_id": "test-project", "bug_id": bug_id},
+                            body={**base, **body},
+                        )
+                    )
+                self.assertEqual(cm.exception.code, "invalid_request")
+                self.assertIn(expected, cm.exception.message)
+
 
 class TestETLParsing(unittest.TestCase):
     """AC6: ETL dry-run vs apply parity."""
