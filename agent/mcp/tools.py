@@ -873,6 +873,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Required when query_source=mf_subagent: the worker's fence_token.",
                 },
+                "session_token": {
+                    "type": "string",
+                    "description": "Required for server-tokenized mf_subagent lanes: the scoped worker session_token issued at allocation.",
+                },
             },
             "required": ["project_id", "tool"],
         },
@@ -906,6 +910,10 @@ TOOLS: list[dict] = [
                 "target_head_commit": {"type": "string"},
                 "merge_queue_id": {"type": "string"},
                 "fence_token": {"type": "string"},
+                "issue_same_owner_session_token": {
+                    "type": "boolean",
+                    "description": "When agent_id == allocation_owner, issue a scoped worker session_token and persist only its hash.",
+                },
                 "create_worktree": {"type": "boolean"},
                 "now_iso": {"type": "string"},
                 "route_token": {"type": "object", "description": "Route-token evidence required when governance protects this mutation."},

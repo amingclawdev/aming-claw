@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import secrets
 import sqlite3
 import subprocess
 import uuid
@@ -311,6 +312,47 @@ BATCH_ROLLBACK_STATES = {
     BATCH_STATE_REPLAY_PENDING,
     BATCH_STATE_REPLAY_IN_PROGRESS,
 }
+
+
+def mf_subagent_session_token_hash(session_token: str) -> str:
+    token = str(session_token or "").strip()
+    if not token:
+        return ""
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_mf_subagent_session_token(
+    context: "BranchTaskRuntimeContext",
+) -> dict[str, Any]:
+    """Issue an opaque worker token scoped by the stored runtime context hash."""
+    token = secrets.token_urlsafe(32)
+    token_hash = mf_subagent_session_token_hash(token)
+    fence_hash = ""
+    if context.fence_token:
+        fence_hash = hashlib.sha256(
+            str(context.fence_token or "").encode("utf-8")
+        ).hexdigest()[:16]
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    return {
+        "schema_version": "mf_subagent_same_owner_session_token.v1",
+        "issued": True,
+        "token_type": "same_owner_scoped",
+        "session_token": token,
+        "session_token_hash": token_hash,
+        "session_token_persisted": False,
+        "scope": {
+            "project_id": context.project_id,
+            "task_id": context.task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token_hash": fence_hash,
+            "agent_id": context.agent_id,
+            "allocation_owner": context.allocation_owner or context.agent_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "backlog_id": context.backlog_id,
+        },
+        "delivery": "worker_host_envelope",
+        "raw_token_persistence": "not_persisted",
+    }
 
 
 class BranchRuntimeFenceError(ValueError):
@@ -3590,6 +3632,7 @@ def validate_mf_subagent_graph_query_identity(
     governance_project_id: str = "",
     target_project_id: str = "",
     target_project_root: str = "",
+    session_token: str = "",
 ) -> BranchTaskRuntimeContext:
     """Validate the task/fence identity an mf_sub worker presents for graph reads."""
     ensure_branch_runtime_schema(conn)
@@ -3615,6 +3658,10 @@ def validate_mf_subagent_graph_query_identity(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.lease_expires_at and context.lease_expires_at < utc_now():
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.session_token_hash:
+        supplied_token_hash = mf_subagent_session_token_hash(session_token)
+        if not supplied_token_hash or supplied_token_hash != context.session_token_hash:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     requested_target_project_id = str(target_project_id or query_project_id).strip()
     context_governance_project_id = context.governance_project_id or context.project_id
@@ -3977,9 +4024,7 @@ def _startup_token_evidence(
         or ""
     ).strip()
     if session_token:
-        computed_hash = (
-            "sha256:" + hashlib.sha256(session_token.encode("utf-8")).hexdigest()
-        )
+        computed_hash = mf_subagent_session_token_hash(session_token)
         stored = str(stored_token_hash or "").strip()
         if stored:
             # Server already holds the expected hash — verify presented token.
@@ -4762,6 +4807,40 @@ def record_mf_subagent_startup(
             },
         ))
 
+    if agent_id_match_mode == "same_as_allocation_owner":
+        if not context.session_token_hash:
+            return _blocked(_startup_blocker(
+                blocker_id="session_token_not_server_issued",
+                message=(
+                    "same-owner mf_subagent startup requires a server-issued "
+                    "scoped session_token recorded at allocation time"
+                ),
+                context=context,
+                details={
+                    "agent_id": agent_id,
+                    "allocation_owner": allocation_owner,
+                    "session_token_evidence_type": token_evidence[
+                        "session_token_evidence_type"
+                    ],
+                },
+            ))
+        if token_evidence["session_token_evidence_type"] != "server_verified":
+            return _blocked(_startup_blocker(
+                blocker_id="session_token_not_server_verified",
+                message=(
+                    "same-owner mf_subagent startup session_token must match "
+                    "the server-issued token hash for this task and fence"
+                ),
+                context=context,
+                details={
+                    "agent_id": agent_id,
+                    "allocation_owner": allocation_owner,
+                    "session_token_evidence_type": token_evidence[
+                        "session_token_evidence_type"
+                    ],
+                },
+            ))
+
     worker_self_attestation_payload = {
         **dict(payload),
         "worker_session_id": worker_session_id,
@@ -4884,6 +4963,10 @@ def record_mf_subagent_startup(
         "session_token_evidence_type": token_evidence["session_token_evidence_type"],
         "session_token_present": token_evidence["session_token_present"],
         "session_token_persisted": False,
+        "server_issued_session_token_required": agent_id_match_mode == "same_as_allocation_owner",
+        "server_issued_session_token_verified": (
+            token_evidence["session_token_evidence_type"] == "server_verified"
+        ),
         "startup_source": startup_source,
         "startup_timing": "actual_worker_started",
         "worker_session_id": worker_session_id,
@@ -4968,6 +5051,7 @@ def validate_mf_subagent_runtime_context_lookup(
     governance_project_id: str = "",
     target_project_id: str = "",
     target_project_root: str = "",
+    session_token: str = "",
 ) -> BranchTaskRuntimeContext:
     """Validate runtime_context_id + fence identity for worker contract polling."""
 
@@ -4994,6 +5078,10 @@ def validate_mf_subagent_runtime_context_lookup(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.lease_expires_at and context.lease_expires_at < utc_now():
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.session_token_hash:
+        supplied_token_hash = mf_subagent_session_token_hash(session_token)
+        if not supplied_token_hash or supplied_token_hash != context.session_token_hash:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     requested_target_project_id = str(target_project_id or query_project_id).strip()
     context_governance_project_id = context.governance_project_id or context.project_id

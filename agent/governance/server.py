@@ -4747,6 +4747,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     parent_task_id = str(body.get("parent_task_id") or "").strip()
     worker_role = str(body.get("worker_role") or "").strip().lower().replace("-", "_")
     fence_token = str(body.get("fence_token") or "").strip()
+    session_token = str(body.get("session_token") or "").strip()
     target_project_id = str(
         body.get("target_project_id")
         or body.get("graph_project_id")
@@ -4788,6 +4789,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             governance_project_id=governance_project_id,
             target_project_id=target_project_id,
             target_project_root=target_project_root,
+            session_token=session_token,
         )
     except BranchRuntimeFenceError as exc:
         raise GovernanceError(
@@ -5384,6 +5386,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         branch_context_to_dict,
         branch_runtime_allocation_evidence,
         get_branch_context,
+        issue_mf_subagent_session_token,
         materialize_branch_worktree,
         plan_branch_runtime_context,
         preserve_materialized_context_for_allocation,
@@ -5461,6 +5464,24 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ctx.body,
         worktree_root=worktree_root,
     )
+    same_owner_worker_session: dict[str, Any] = {}
+    requested_agent_id = str(ctx.body.get("agent_id") or "").strip()
+    issue_same_owner_session_token = _body_bool(
+        ctx.body,
+        "issue_same_owner_session_token",
+        True,
+    )
+    if (
+        issue_same_owner_session_token
+        and requested_agent_id
+        and allocation_owner
+        and requested_agent_id == allocation_owner
+    ):
+        same_owner_worker_session = issue_mf_subagent_session_token(context)
+        context = replace(
+            context,
+            session_token_hash=str(same_owner_worker_session["session_token_hash"]),
+        )
 
     conn = get_connection(project_id)
     try:
@@ -5489,7 +5510,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             conn.commit()
             saved = get_branch_context(conn, project_id, task_id) or saved
 
-        return 201, {
+        response = {
             "ok": True,
             "project_id": project_id,
             "context": branch_context_to_dict(saved),
@@ -5501,6 +5522,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
         }
+        if same_owner_worker_session:
+            response["same_owner_worker_session"] = same_owner_worker_session
+        return 201, response
     finally:
         conn.close()
 
@@ -6043,6 +6067,7 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
                         or ctx.query.get("target_graph_root")
                         or ""
                     ),
+                    session_token=str(ctx.query.get("session_token") or ""),
                 )
             except BranchRuntimeFenceError as exc:
                 raise GovernanceError(
@@ -6137,6 +6162,7 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
                         or ctx.query.get("target_graph_root")
                         or ""
                     ),
+                    session_token=str(ctx.query.get("session_token") or ""),
                 )
             except BranchRuntimeFenceError as exc:
                 raise GovernanceError(
@@ -6237,6 +6263,7 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
                         or ctx.query.get("target_graph_root")
                         or ""
                     ),
+                    session_token=str(ctx.query.get("session_token") or ""),
                 )
             except BranchRuntimeFenceError as exc:
                 raise GovernanceError(

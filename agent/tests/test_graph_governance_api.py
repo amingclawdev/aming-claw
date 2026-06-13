@@ -50,6 +50,7 @@ from agent.governance.parallel_branch_runtime import (
     append_branch_contract_revision,
     get_branch_context,
     get_latest_branch_contract_revision,
+    mf_subagent_session_token_hash,
     runtime_context_id_for_branch_context,
     upsert_batch_merge_runtime,
     upsert_branch_context,
@@ -1377,6 +1378,86 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["status"] == "worktree_ready"
     assert lanes[0]["worktree_path"] == context["worktree_path"]
     assert lanes[0]["graph_epoch"]["base_commit"]
+
+
+def test_parallel_branch_allocate_issues_same_owner_scoped_session_token(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "same-owner-token-task",
+                "batch_id": "PB-same-owner-token",
+                "backlog_id": "AC-SAME-OWNER-WORKER-SESSION-TOKEN-ISSUANCE-20260613",
+                "workspace_root": str(repo),
+                "worker_id": "same-owner-worker",
+                "agent_id": "same-owner-agent",
+                "allocation_owner": "same-owner-agent",
+                "merge_queue_id": "mergeq-same-owner-token",
+                "fence_token": "fence-same-owner-token",
+                "create_worktree": True,
+                "now_iso": "2026-06-13T03:40:00Z",
+            },
+        )
+    )
+
+    assert status == 201
+    session = created["same_owner_worker_session"]
+    raw_token = session["session_token"]
+    token_hash = mf_subagent_session_token_hash(raw_token)
+    context = created["context"]
+    assert session["issued"] is True
+    assert session["scope"]["task_id"] == "same-owner-token-task"
+    assert session["scope"]["runtime_context_id"] == context["runtime_context_id"]
+    assert session["session_token_hash"] == token_hash
+    assert context["session_token_hash"] == token_hash
+    assert raw_token not in str(context)
+    assert raw_token not in str(created["branch_runtime_evidence"])
+
+    started = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "same-owner-token-task",
+                "parent_task_id": "same-owner-token-task",
+                "worker_role": "mf_sub",
+                "worker_id": "same-owner-worker",
+                "worker_slot_id": "same-owner-worker",
+                "agent_id": "same-owner-agent",
+                "session_token": raw_token,
+                "runtime_context_id": context["runtime_context_id"],
+                "fence_token": "fence-same-owner-token",
+                "actual_cwd": context["worktree_path"],
+                "actual_git_root": context["worktree_path"],
+                "branch": context["branch_ref"],
+                "head_commit": "head-same-owner-token",
+                "base_commit": context["base_commit"],
+                "target_head_commit": context["target_head_commit"],
+                "merge_queue_id": "mergeq-same-owner-token",
+                "owned_files": ["agent/governance/server.py"],
+                "route_id": "route-same-owner-token",
+                "route_context_hash": "sha256:route-same-owner-token",
+                "prompt_contract_id": "rprompt-same-owner-token",
+                "prompt_contract_hash": "sha256:prompt-same-owner-token",
+                "route_token_ref": "rtok-same-owner-token",
+                "visible_injection_manifest_hash": "sha256:visible-same-owner-token",
+                "observer_command_id": "cmd-same-owner-token",
+                "read_receipt_hash": "sha256:read-same-owner-token",
+                "read_receipt_event_id": "4308",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    gate = started["startup_gate"]
+    assert gate["agent_id_match_mode"] == "same_as_allocation_owner"
+    assert gate["session_token_evidence_type"] == "server_verified"
+    assert gate["server_issued_session_token_verified"] is True
+    assert raw_token not in str(started)
 
 
 def test_runtime_text_prepare_accepts_parallel_branch_allocate_evidence(conn, tmp_path):
@@ -3296,6 +3377,7 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
         head_commit="base-startup",
         target_head_commit="target-startup",
         merge_queue_id="mergeq-api-startup",
+        session_token_hash=mf_subagent_session_token_hash("api-startup-token"),
     )
     upsert_branch_context(
         conn,
@@ -3317,7 +3399,7 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
-                "session_token_surrogate": "host-session:019-startup",
+                "session_token": "api-startup-token",
                 "fence_token": "fence-startup-mf-sub",
                 "actual_cwd": str(worktree),
                 "actual_git_root": str(worktree),
@@ -3349,7 +3431,8 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
     assert started["ok"] is True
     assert started["context"]["status"] == "running"
     assert started["startup_gate"]["actual_startup_recorded"] is True
-    assert started["startup_gate"]["session_token_surrogate"] == "host-session:019-startup"
+    assert started["startup_gate"]["session_token_evidence_type"] == "server_verified"
+    assert started["startup_gate"]["server_issued_session_token_verified"] is True
     assert started["timeline_event_recorded"]["event_kind"] == "mf_subagent_startup"
     assert len(events) == 1
     assert events[0]["payload"]["mf_subagent_startup_gate"]["worker_role"] == "mf_sub"

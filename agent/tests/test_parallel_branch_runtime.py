@@ -46,6 +46,7 @@ from agent.governance.parallel_branch_runtime import (
     get_branch_context,
     list_branch_contexts,
     materialize_branch_worktree,
+    mf_subagent_session_token_hash,
     plan_branch_runtime_context,
     queue_merge_item_for_branch_context,
     record_branch_finish_gate,
@@ -236,6 +237,7 @@ def _insert_startup_context(conn: sqlite3.Connection, worktree: str) -> None:
         base_commit="base-startup",
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
+        session_token_hash=mf_subagent_session_token_hash("secret-worker-session-token"),
     )
     upsert_branch_context(conn, context, now_iso=NOW)
     append_branch_contract_revision(
@@ -467,6 +469,7 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
         base_commit="base-startup",
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
+        session_token_hash=mf_subagent_session_token_hash("secret-worker-session-token"),
     )
     upsert_branch_context(
         conn,
@@ -535,8 +538,72 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
         parent_task_id="parent-startup",
         worker_role="mf_sub",
         fence_token="fence-startup",
+        session_token="secret-worker-session-token",
     )
     assert accepted.task_id == "mf-sub-startup"
+
+    for supplied_token in ("", "wrong-worker-session-token"):
+        with pytest.raises(BranchRuntimeFenceError):
+            validate_mf_subagent_graph_query_identity(
+                conn,
+                project_id=PROJECT_ID,
+                task_id="mf-sub-startup",
+                parent_task_id="parent-startup",
+                worker_role="mf_sub",
+                fence_token="fence-startup",
+                session_token=supplied_token,
+            )
+
+
+def test_mf_sub_startup_rejects_same_owner_self_filled_unissued_session_token(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-unissued-token"
+    worktree.mkdir(parents=True)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="agent-startup",
+        allocation_owner="agent-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit="base-startup",
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree)),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == "session_token_not_server_issued"
 
 
 def test_worker_transcript_allows_4178_prompt_text_without_structured_playback(
@@ -1756,7 +1823,11 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
     import os
     os.makedirs(assigned_worktree, exist_ok=True)
 
-    ready_context = _replace(context_planned, status=STATE_WORKTREE_READY)
+    ready_context = _replace(
+        context_planned,
+        status=STATE_WORKTREE_READY,
+        session_token_hash=mf_subagent_session_token_hash("session-mq-finish"),
+    )
     upsert_branch_context(conn_fresh, ready_context, now_iso=NOW)
     append_branch_contract_revision(
         conn_fresh,
