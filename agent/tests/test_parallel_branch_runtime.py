@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from pathlib import Path
 import sqlite3
@@ -15,6 +16,11 @@ from agent.tests.fixtures.parallel_project import (
     create_pb001_restart_fixture_project,
 )
 from agent.governance.db import SCHEMA_VERSION, _ensure_schema
+from agent.governance import graph_query_trace
+from agent.governance.mf_subagent_contract import (
+    MfSubagentContractError,
+    validate_mf_subagent_finish_gate,
+)
 from agent.governance.parallel_branch_runtime import (
     ACTION_LEAVE_MERGED,
     ACTION_OBSERVER_DECISION_REQUIRED,
@@ -155,7 +161,100 @@ def _runtime_conn() -> sqlite3.Connection:
     return conn
 
 
+def _git(worktree: Path, *args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(worktree), *args],
+        text=True,
+        stderr=subprocess.STDOUT,
+    ).strip()
+
+
+def _ensure_startup_git_worktree(worktree: Path) -> tuple[str, str]:
+    worktree.mkdir(parents=True, exist_ok=True)
+    if not (worktree / ".git").exists():
+        subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=worktree,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test Worker"],
+            cwd=worktree,
+            check=True,
+        )
+        source_path = worktree / "agent" / "governance" / "parallel_branch_runtime.py"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text("base runtime\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=worktree,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        source_path.write_text("base runtime\nhead runtime\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "head"],
+            cwd=worktree,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+    base_commit = _git(worktree, "rev-list", "--max-parents=0", "HEAD")
+    head_commit = _git(worktree, "rev-parse", "HEAD")
+    return base_commit, head_commit
+
+
+def _startup_runtime_context_id() -> str:
+    return branch_runtime_context_id(PROJECT_ID, "mf-sub-startup")
+
+
+def _insert_startup_graph_trace(
+    conn: sqlite3.Connection,
+    *,
+    trace_id: str = "gqt-startup",
+    task_id: str = "mf-sub-startup",
+    parent_task_id: str = "parent-startup",
+    runtime_context_id: str | None = None,
+    fence_token: str = "fence-startup",
+    query_purpose: str = "subagent_gate_validation",
+) -> None:
+    graph_query_trace.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO graph_query_traces
+          (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
+           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
+           fence_token, status, budget_json, usage_json, artifact_path,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_id,
+            PROJECT_ID,
+            "scope-test",
+            "codex-session-startup",
+            "mf_subagent",
+            query_purpose,
+            f"mf_subagent:{task_id}:fence:test",
+            parent_task_id,
+            runtime_context_id or _startup_runtime_context_id(),
+            task_id,
+            "mf_sub",
+            fence_token,
+            "complete",
+            "{}",
+            "{}",
+            "",
+            NOW,
+            NOW,
+        ),
+    )
+
+
 def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
+    base_commit, head_commit = _ensure_startup_git_worktree(Path(worktree))
     worker_session_id = str(overrides.get("worker_session_id") or "codex-session-startup")
     auto_transcript_path = "worker_transcript_path" not in overrides
     transcript_dir = Path(worktree) / ".worker-transcripts"
@@ -173,8 +272,8 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
         "actual_cwd": worktree,
         "actual_git_root": worktree,
         "branch": "refs/heads/codex/mf-sub-startup",
-        "head_commit": "head-startup",
-        "base_commit": "base-startup",
+        "head_commit": head_commit,
+        "base_commit": base_commit,
         "target_head_commit": "target-startup",
         "merge_queue_id": "mq-startup",
         "owned_files": ["agent/governance/parallel_branch_runtime.py"],
@@ -220,6 +319,7 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
 
 
 def _insert_startup_context(conn: sqlite3.Connection, worktree: str) -> None:
+    base_commit, head_commit = _ensure_startup_git_worktree(Path(worktree))
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -234,7 +334,8 @@ def _insert_startup_context(conn: sqlite3.Connection, worktree: str) -> None:
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=worktree,
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
         session_token_hash=mf_subagent_session_token_hash("secret-worker-session-token"),
@@ -253,6 +354,7 @@ def _insert_startup_context(conn: sqlite3.Connection, worktree: str) -> None:
         },
         now_iso=NOW,
     )
+    _insert_startup_graph_trace(conn)
 
 
 def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext:
@@ -368,6 +470,8 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "trace_ids": ["gqt-runtime-context"],
         },
         startup_gate={
+            "worker_session_id": "session-runtime-context",
+            "filer_principal": "session-runtime-context",
             "worker_self_attesting": True,
             "worker_self_attestation": {
                 "schema_version": "worker_transcript_self_attestation.v1",
@@ -454,6 +558,7 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -466,7 +571,8 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
         session_token_hash=mf_subagent_session_token_hash("secret-worker-session-token"),
@@ -489,6 +595,7 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
         },
         now_iso=NOW,
     )
+    _insert_startup_graph_trace(conn)
 
     result = record_mf_subagent_startup(
         conn,
@@ -503,7 +610,7 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert result["ok"] is True
     assert saved is not None
     assert saved.status == STATE_RUNNING
-    assert saved.head_commit == "head-startup"
+    assert saved.head_commit == head_commit
     assert saved.worker_slot_id == "worker-startup"
     assert saved.actual_host_worker_id == "worker-startup"
     assert saved.allocation_owner == "agent-startup"
@@ -561,6 +668,7 @@ def test_mf_sub_startup_rejects_same_owner_self_filled_unissued_session_token(
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-unissued-token"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -575,7 +683,8 @@ def test_mf_sub_startup_rejects_same_owner_self_filled_unissued_session_token(
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
     )
@@ -751,7 +860,11 @@ def test_worker_transcript_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_
         conn,
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
-        payload=_startup_payload(str(worktree), changed_files=[]),
+        payload=_startup_payload(
+            str(worktree),
+            changed_files=[],
+            head_commit=_git(worktree, "rev-list", "--max-parents=0", "HEAD"),
+        ),
         now_iso=NOW,
     )
     assert idle["startup_gate"]["worker_self_attesting"] is False
@@ -771,10 +884,230 @@ def test_worker_transcript_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_
     )
 
 
+def test_worker_transcript_forged_strings_missing_db_trace_and_diff_mismatch_rejects(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-forged"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            changed_files=["agent/governance/server.py"],
+            graph_trace_ids=["gqt-forged-transcript-only"],
+        ),
+        now_iso=NOW,
+    )
+
+    blockers = result["startup_gate"]["worker_self_attestation"]["blockers"]
+    assert result["ok"] is True
+    assert result["startup_gate"]["worker_self_attesting"] is False
+    assert any(
+        blocker.startswith("claimed_changed_files_do_not_match_git_diff")
+        for blocker in blockers
+    )
+    assert "graph_trace_ids_not_db_verified" in blockers
+    assert "graph_trace_missing_from_db:gqt-forged-transcript-only" in blockers
+
+
+def _finish_gate_context(task_id: str = "mf-sub-finish") -> BranchTaskRuntimeContext:
+    return BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        root_task_id=f"parent-{task_id}",
+        stage_task_id=task_id,
+        backlog_id="BUG-FINISH",
+        worker_id=f"worker-{task_id}",
+        worker_slot_id=f"worker-{task_id}",
+        agent_id=f"agent-{task_id}",
+        allocation_owner=f"agent-{task_id}",
+        branch_ref=f"refs/heads/codex/{task_id}",
+        status=STATE_WORKTREE_READY,
+        fence_token=f"fence-{task_id}",
+        worktree_path=f"/tmp/nonexistent-{task_id}",
+        base_commit=f"base-{task_id}",
+        head_commit=f"head-{task_id}",
+        target_head_commit=f"target-{task_id}",
+        merge_queue_id=f"mq-{task_id}",
+    )
+
+
+def _finish_gate_payload(
+    context: BranchTaskRuntimeContext,
+    **overrides: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "project_id": context.project_id,
+        "task_id": context.task_id,
+        "backlog_id": context.backlog_id,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "status": "review_ready",
+        "changed_files": ["agent/governance/parallel_branch_runtime.py"],
+        "test_results": {"status": "passed"},
+        "checkpoint_id": f"ckpt-{context.task_id}",
+        "fence_token": context.fence_token,
+        "head_commit": context.head_commit,
+        "observer_command_id": f"cmd-{context.task_id}",
+        "read_receipt_hash": f"sha256:rr-{context.task_id}",
+        "read_receipt_event_id": f"rr-{context.task_id}",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _finish_startup_gate(
+    context: BranchTaskRuntimeContext,
+    *,
+    include_worker_fields: bool = True,
+) -> dict[str, object]:
+    gate: dict[str, object] = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "close_satisfying": True,
+        "actual_startup_recorded": True,
+        "agent_id_match_mode": "same_as_allocation_owner",
+        "session_token_evidence_type": "server_verified",
+        "session_token_hash": "sha256:finish-token",
+        "session_token_present": True,
+        "agent_id": context.allocation_owner,
+        "allocation_owner": context.allocation_owner,
+        "worker_role": "mf_sub",
+        "task_id": context.task_id,
+        "worker_slot_id": context.worker_slot_id,
+        "runtime_context_id": branch_runtime_context_id(
+            context.project_id,
+            context.task_id,
+        ),
+        "fence_token": context.fence_token,
+        "actual_cwd": context.worktree_path,
+        "actual_git_root": context.worktree_path,
+        "worktree_path": context.worktree_path,
+        "branch_ref": context.branch_ref,
+        "head_commit": context.head_commit,
+        "observer_command_id": f"cmd-{context.task_id}",
+        "read_receipt_event_id": f"rr-{context.task_id}",
+    }
+    if include_worker_fields:
+        gate.update(
+            {
+                "worker_session_id": f"session-{context.task_id}",
+                "filer_principal": f"session-{context.task_id}",
+                "worker_transcript_path": f"/tmp/transcript-{context.task_id}.jsonl",
+                "harness_type": "codex",
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "worker_self_attestation": {
+                    "schema_version": "worker_transcript_self_attestation.v1",
+                    "status": "passed",
+                    "worker_self_attesting": True,
+                    "worker_session_id": f"session-{context.task_id}",
+                    "worker_transcript_path": f"/tmp/transcript-{context.task_id}.jsonl",
+                    "harness_type": "codex",
+                    "blockers": [],
+                },
+            }
+        )
+    else:
+        gate["worker_self_attestation"] = {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "status": "passed",
+            "worker_self_attesting": True,
+            "blockers": [],
+        }
+    return gate
+
+
+def _finish_startup_event(startup_gate: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "id": "startup-event-finish",
+        "event_kind": "mf_subagent_startup",
+        "event_type": "mf_subagent.startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": dict(startup_gate)},
+    }
+
+
+@pytest.mark.parametrize(
+    "startup_key",
+    ["bounded_startup_evidence", "startup_evidence", "mf_subagent_startup_gate"],
+)
+def test_finish_gate_ignores_caller_startup_evidence_injection(startup_key) -> None:
+    context = _finish_gate_context(f"finish-injection-{startup_key}")
+    payload = _finish_gate_payload(
+        context,
+        **{startup_key: _finish_startup_gate(context)},
+    )
+
+    with pytest.raises(
+        MfSubagentContractError,
+        match="actual mf_subagent_startup evidence",
+    ):
+        validate_mf_subagent_finish_gate(payload, context=context)
+
+
+def test_finish_gate_rejects_db_startup_event_missing_worker_transcript_fields() -> None:
+    context = _finish_gate_context("finish-missing-worker-fields")
+    startup_gate = _finish_startup_gate(context, include_worker_fields=False)
+    payload = _finish_gate_payload(
+        context,
+        real_startup_events=[_finish_startup_event(startup_gate)],
+    )
+
+    with pytest.raises(
+        MfSubagentContractError,
+        match="missing_worker_session_id",
+    ):
+        validate_mf_subagent_finish_gate(payload, context=context)
+
+
+@pytest.mark.parametrize(
+    ("principal", "expected_blocker"),
+    [
+        ("", "missing_filer_principal"),
+        ("mf_sub", "startup_filer_principal_not_worker_session"),
+    ],
+)
+def test_finish_gate_rejects_db_startup_event_without_worker_session_filer(
+    principal,
+    expected_blocker,
+) -> None:
+    context = _finish_gate_context(f"finish-principal-{principal or 'missing'}")
+    startup_gate = _finish_startup_gate(context)
+    if principal:
+        startup_gate["filer_principal"] = principal
+    else:
+        startup_gate.pop("filer_principal", None)
+    payload = _finish_gate_payload(
+        context,
+        real_startup_events=[_finish_startup_event(startup_gate)],
+    )
+
+    with pytest.raises(
+        MfSubagentContractError,
+        match=expected_blocker,
+    ):
+        validate_mf_subagent_finish_gate(payload, context=context)
+
+
 def test_mf_sub_startup_blocks_route_identity_mismatch_with_contract_revision(tmp_path) -> None:
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-route-mismatch"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -787,7 +1120,8 @@ def test_mf_sub_startup_blocks_route_identity_mismatch_with_contract_revision(tm
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
     )
@@ -830,6 +1164,7 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-blocked"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -844,7 +1179,8 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
             status=STATE_WORKTREE_READY,
             fence_token="fence-startup",
             worktree_path=str(worktree),
-            base_commit="base-startup",
+            base_commit=base_commit,
+            head_commit=head_commit,
             target_head_commit="target-startup",
             merge_queue_id="mq-startup",
         ),
@@ -954,6 +1290,7 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-host-adapter"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -966,7 +1303,8 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
     )
@@ -1048,6 +1386,7 @@ def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-host-session"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -1061,7 +1400,8 @@ def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
     )
@@ -1125,6 +1465,7 @@ def test_mf_sub_startup_rejects_multi_agent_prefix_replay_without_registration(
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-event-4178"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -1138,7 +1479,8 @@ def test_mf_sub_startup_rejects_multi_agent_prefix_replay_without_registration(
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
     )
@@ -1195,6 +1537,7 @@ def test_mf_sub_startup_rejects_agent_only_registered_identity_echoed_as_host_st
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-agent-only-registration"
     worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
     context = BranchTaskRuntimeContext(
         project_id=PROJECT_ID,
         task_id="mf-sub-startup",
@@ -1208,7 +1551,8 @@ def test_mf_sub_startup_rejects_agent_only_registered_identity_echoed_as_host_st
         status=STATE_WORKTREE_READY,
         fence_token="fence-startup",
         worktree_path=str(worktree),
-        base_commit="base-startup",
+        base_commit=base_commit,
+        head_commit=head_commit,
         target_head_commit="target-startup",
         merge_queue_id="mq-startup",
     )

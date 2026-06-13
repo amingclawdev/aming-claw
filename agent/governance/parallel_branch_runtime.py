@@ -4060,6 +4060,149 @@ def _startup_token_evidence(
     }
 
 
+def _startup_graph_trace_ids(payload: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in (
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+        "trace_ids",
+        "graph_trace_id",
+        "trace_id",
+    ):
+        values.extend(_startup_string_list(payload.get(key)))
+    evidence = payload.get("graph_trace_evidence")
+    if isinstance(evidence, Mapping):
+        for key in (
+            "trace_ids",
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+            "trace_id",
+            "graph_trace_id",
+        ):
+            values.extend(_startup_string_list(evidence.get(key)))
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _startup_graph_trace_db_evidence(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    trace_ids: Sequence[str],
+    task_id: str,
+    parent_task_id: str,
+    runtime_context_id: str,
+    fence_token: str,
+) -> dict[str, Any]:
+    requested = list(dict.fromkeys(str(item or "").strip() for item in trace_ids if str(item or "").strip()))
+    if not requested:
+        return {
+            "schema_version": "mf_subagent_graph_trace_db_evidence.v1",
+            "source": "graph_query_traces",
+            "db_verified": False,
+            "trace_ids": [],
+            "verified_trace_ids": [],
+            "missing_trace_ids": [],
+            "identity_mismatches": [],
+            "query_source": "",
+            "query_purpose": "",
+            "worker_role": "",
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": fence_token,
+        }
+    try:
+        from . import graph_query_trace
+
+        graph_query_trace.ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT trace_id, query_source, query_purpose, worker_role,
+                   parent_task_id, runtime_context_id, task_id, fence_token,
+                   status
+              FROM graph_query_traces
+             WHERE project_id = ?
+               AND trace_id IN ({})
+            """.format(",".join("?" for _ in requested)),
+            (project_id, *requested),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    by_trace: dict[str, sqlite3.Row] = {
+        str(row["trace_id"] if isinstance(row, sqlite3.Row) else row[0]): row
+        for row in rows
+    }
+    missing = [trace_id for trace_id in requested if trace_id not in by_trace]
+    verified: list[str] = []
+    mismatches: list[dict[str, str]] = []
+    for trace_id in requested:
+        row = by_trace.get(trace_id)
+        if row is None:
+            continue
+
+        def _row_text(key: str, index: int) -> str:
+            return str(row[key] if isinstance(row, sqlite3.Row) else row[index] or "").strip()
+
+        fields = {
+            "query_source": _row_text("query_source", 1),
+            "query_purpose": _row_text("query_purpose", 2),
+            "worker_role": _row_text("worker_role", 3),
+            "parent_task_id": _row_text("parent_task_id", 4),
+            "runtime_context_id": _row_text("runtime_context_id", 5),
+            "task_id": _row_text("task_id", 6),
+            "fence_token": _row_text("fence_token", 7),
+            "status": _row_text("status", 8),
+        }
+        expected = {
+            "query_source": "mf_subagent",
+            "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": fence_token,
+        }
+        trace_mismatches = [
+            {"trace_id": trace_id, "field": field, "expected": value, "actual": fields[field]}
+            for field, value in expected.items()
+            if value and fields[field] != value
+        ]
+        if fields["query_purpose"] not in {
+            "subagent_context_build",
+            "subagent_gate_validation",
+        }:
+            trace_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "query_purpose",
+                    "expected": "subagent_context_build|subagent_gate_validation",
+                    "actual": fields["query_purpose"],
+                }
+            )
+        if trace_mismatches:
+            mismatches.extend(trace_mismatches)
+            continue
+        verified.append(trace_id)
+
+    return {
+        "schema_version": "mf_subagent_graph_trace_db_evidence.v1",
+        "source": "graph_query_traces",
+        "db_verified": bool(requested) and not missing and not mismatches and set(verified) == set(requested),
+        "trace_ids": verified,
+        "verified_trace_ids": verified,
+        "requested_trace_ids": requested,
+        "missing_trace_ids": missing,
+        "identity_mismatches": mismatches,
+        "query_source": "mf_subagent" if verified else "",
+        "query_purpose": "subagent_gate_validation" if verified else "",
+        "worker_role": RUNTIME_CONTEXT_WORKER_ROLE if verified else "",
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "fence_token": fence_token,
+    }
+
+
 def _startup_blocker(
     *,
     blocker_id: str,
@@ -4513,13 +4656,11 @@ def record_mf_subagent_startup(
         payload.get("harness_type") or payload.get("worker_harness_type") or ""
     ).strip()
     filer_principal = str(
-        payload.get("filer_principal")
+        worker_session_id
+        or payload.get("filer_principal")
         or payload.get("actor")
-        or worker_session_id
         or agent_id
         or actual_host_worker_id
-        or worker_slot_id
-        or "mf_sub"
     ).strip()
     filed_on_behalf_by = str(
         payload.get("filed_on_behalf_by")
@@ -4841,6 +4982,15 @@ def record_mf_subagent_startup(
                 },
             ))
 
+    graph_trace_db_evidence = _startup_graph_trace_db_evidence(
+        conn,
+        project_id=project_id,
+        trace_ids=_startup_graph_trace_ids(payload),
+        task_id=task,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id,
+        fence_token=fence_token,
+    )
     worker_self_attestation_payload = {
         **dict(payload),
         "worker_session_id": worker_session_id,
@@ -4869,6 +5019,7 @@ def record_mf_subagent_startup(
         "session_token_evidence_type": token_evidence["session_token_evidence_type"],
         "session_token_present": token_evidence["session_token_present"],
         "host_adapter_startup_token_accepted": host_adapter_startup,
+        "graph_trace_db_evidence": graph_trace_db_evidence,
     }
     worker_self_attestation = verify_worker_transcript(worker_self_attestation_payload)
     worker_self_attesting = bool(worker_self_attestation.get("worker_self_attesting"))
@@ -4919,6 +5070,7 @@ def record_mf_subagent_startup(
         "self_attesting": worker_self_attesting,
         "worker_self_attestation_required": True,
         "worker_self_attestation": worker_self_attestation,
+        "graph_trace_db_evidence": graph_trace_db_evidence,
         "raw_launch_text_persisted": False,
         "project_id": project_id,
         "governance_project_id": saved.governance_project_id or project_id,

@@ -256,6 +256,7 @@ def _finish_gate_evidence(
             "observer_command_id": f"cmd-{fence_token}",
             "read_receipt_event_id": f"rr-{fence_token}",
             "worker_session_id": f"session-{fence_token}",
+            "filer_principal": f"session-{fence_token}",
             "worker_transcript_path": f"/tmp/transcript-{fence_token}.jsonl",
             "harness_type": "codex",
             "worker_self_attesting": True,
@@ -273,6 +274,41 @@ def _finish_gate_evidence(
         "read_receipt_hash": f"sha256:read-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
     }
+
+
+def _record_finish_startup_event(
+    conn,
+    *,
+    task_id: str,
+    backlog_id: str,
+    fence_token: str,
+    worktree_path: str,
+    branch_ref: str,
+    head_commit: str,
+    nested_key: str = "startup_evidence",
+) -> dict:
+    startup_gate = _finish_gate_evidence(
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit=head_commit,
+        nested_key=nested_key,
+    )[nested_key]
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor=str(startup_gate.get("worker_session_id") or "mf_sub"),
+        payload={"mf_subagent_startup_gate": startup_gate},
+    )
+    conn.commit()
+    return startup_gate
 
 
 def _bare_handler():
@@ -2521,6 +2557,17 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         status="ok",
         payload={"read_receipt_hash": "sha256:read-current"},
     )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-runtime-current",
+        parent_task_id="runtime-current-parent",
+        runtime_context_id=context.runtime_context_id,
+        task_id="runtime-current-task",
+        worker_role="mf_sub",
+        fence_token="fence-current",
+        run_id=_mf_sub_run_id("runtime-current-task", "fence-current"),
+    )
+    conn.commit()
 
     observer_result = (
         server.handle_graph_governance_parallel_branch_runtime_context_current_state(
@@ -2668,10 +2715,11 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
                 "allocation_owner": "agent-runtime-a4",
                 "agent_id_match_mode": "same_as_allocation_owner",
                 "session_token_evidence_type": "hash",
-                "session_token_hash": "sha256:runtime-a4-session",
-                "session_token_present": True,
-                "worker_session_id": "codex-session-runtime-a4",
-                "worker_transcript_path": "/tmp/runtime-a4-transcript.jsonl",
+                    "session_token_hash": "sha256:runtime-a4-session",
+                    "session_token_present": True,
+                    "worker_session_id": "codex-session-runtime-a4",
+                    "filer_principal": "codex-session-runtime-a4",
+                    "worker_transcript_path": "/tmp/runtime-a4-transcript.jsonl",
                 "harness_type": "codex",
                 "worker_self_attesting": True,
                 "self_attesting": True,
@@ -2720,37 +2768,24 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
         status="ready",
         payload={"graph_trace_ids": ["gqt-close-ready"]},
     )
-    graph_query_trace.ensure_schema(conn)
-    conn.execute(
-        """
-        INSERT INTO graph_query_traces
-          (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
-           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
-           fence_token, status, budget_json, usage_json, artifact_path,
-           created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "gqt-from-db",
-            PID,
-            "scope-a4",
-            "mcp",
-            "mf_subagent",
-            "subagent_context_build",
-            _mf_sub_run_id("runtime-a4-task", "fence-a4"),
-            "AC-RUNTIME-A4",
-            "",
-            "",
-            "",
-            "",
-            "complete",
-            "{}",
-            "{}",
-            "",
-            "2026-06-06T10:02:00Z",
-            "2026-06-06T10:02:00Z",
-        ),
-    )
+    for trace_id, created_at in (
+        ("gqt-finish-payload", "2026-06-06T10:05:00Z"),
+        ("gqt-verification", "2026-06-06T10:04:00Z"),
+        ("gqt-close-ready", "2026-06-06T10:03:00Z"),
+        ("gqt-from-db", "2026-06-06T10:02:00Z"),
+    ):
+        _insert_mf_sub_graph_query_trace(
+            conn,
+            trace_id=trace_id,
+            parent_task_id="AC-RUNTIME-A4",
+            snapshot_id="scope-a4",
+            runtime_context_id=context.runtime_context_id,
+            task_id="runtime-a4-task",
+            worker_role="mf_sub",
+            fence_token="fence-a4",
+            run_id=_mf_sub_run_id("runtime-a4-task", "fence-a4"),
+            created_at=created_at,
+        )
     conn.commit()
 
     result = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
@@ -2835,26 +2870,42 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
         trace_id="gqt-current-runtime",
         parent_task_id="AC-RUNTIME-SHARED",
         runtime_context_id=context.runtime_context_id,
+        task_id="runtime-task-a",
+        worker_role="mf_sub",
+        fence_token="fence-task-a",
+        run_id=_mf_sub_run_id("runtime-task-a", "fence-task-a"),
         created_at="2026-06-06T10:01:00Z",
     )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id="gqt-current-task",
         parent_task_id="AC-RUNTIME-SHARED",
+        runtime_context_id=context.runtime_context_id,
         task_id="runtime-task-a",
+        worker_role="mf_sub",
+        fence_token="fence-task-a",
+        run_id=_mf_sub_run_id("runtime-task-a", "fence-task-a"),
         created_at="2026-06-06T10:02:00Z",
     )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id="gqt-current-fence",
         parent_task_id="AC-RUNTIME-SHARED",
+        runtime_context_id=context.runtime_context_id,
+        task_id="runtime-task-a",
+        worker_role="mf_sub",
         fence_token="fence-task-a",
+        run_id=_mf_sub_run_id("runtime-task-a", "fence-task-a"),
         created_at="2026-06-06T10:03:00Z",
     )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id="gqt-current-run",
         parent_task_id="AC-RUNTIME-SHARED",
+        runtime_context_id=context.runtime_context_id,
+        task_id="runtime-task-a",
+        worker_role="mf_sub",
+        fence_token="fence-task-a",
         run_id=_mf_sub_run_id("runtime-task-a", "fence-task-a"),
         created_at="2026-06-06T10:04:00Z",
     )
@@ -2945,6 +2996,17 @@ def test_runtime_context_timeline_fallback_excludes_sibling_graph_trace_ids(conn
         status="passed",
         payload={"graph_trace_ids": ["gqt-backlog-unscoped"]},
     )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id="gqt-backlog-unscoped",
+        parent_task_id="AC-RUNTIME-SHARED",
+        runtime_context_id=context.runtime_context_id,
+        task_id="runtime-task-a",
+        worker_role="mf_sub",
+        fence_token="fence-task-a",
+        run_id=_mf_sub_run_id("runtime-task-a", "fence-task-a"),
+    )
+    conn.commit()
 
     result = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
@@ -3267,6 +3329,15 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
         ),
         now_iso="2026-05-17T07:30:00Z",
     )
+    _record_finish_startup_event(
+        conn,
+        task_id="finish-task",
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token="fence-finish-current",
+        worktree_path="/tmp/nonexistent-finish-task",
+        branch_ref="refs/heads/codex/finish-task",
+        head_commit="head-finish",
+    )
 
     finished = server.handle_graph_governance_parallel_branch_finish_gate(
         _ctx(
@@ -3327,6 +3398,16 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn, worker_status)
             merge_queue_id=f"mergeq-api-finish-mf-sub-{suffix}",
         ),
         now_iso="2026-05-17T07:30:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=f"finish-mf-sub-task-{suffix}",
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token=f"fence-finish-mf-sub-{suffix}",
+        worktree_path=f"/tmp/nonexistent-finish-mf-sub-task-{suffix}",
+        branch_ref=f"refs/heads/codex/finish-mf-sub-task-{suffix}",
+        head_commit=f"head-finish-mf-sub-{suffix}",
+        nested_key="bounded_startup_evidence",
     )
 
     finished = server.handle_graph_governance_parallel_branch_finish_gate(
@@ -4226,6 +4307,16 @@ def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_
         ),
         now_iso="2026-05-17T07:33:00Z",
     )
+    _record_finish_startup_event(
+        conn,
+        task_id="finish-diff-task",
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token="fence-finish-diff",
+        worktree_path=str(repo),
+        branch_ref="refs/heads/codex/finish-diff-task",
+        head_commit=head,
+        nested_key="mf_subagent_startup_gate",
+    )
 
     with pytest.raises(ValidationError, match="changed_files do not match assigned worktree diff"):
         server.handle_graph_governance_parallel_branch_finish_gate(
@@ -4297,6 +4388,15 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
             merge_queue_id=queue_id,
         ),
         now_iso="2026-05-17T07:32:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id="mf-sub-queue-task",
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token="fence-mf-sub",
+        worktree_path="/tmp/nonexistent-mf-sub-queue-task",
+        branch_ref="refs/heads/codex/mf-sub-queue-task",
+        head_commit="head",
     )
 
     with pytest.raises(ValueError, match="checkpoint_id is required"):
@@ -12845,6 +12945,7 @@ def _make_real_startup_timeline_event(
         "observer_command_id": f"cmd-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
         "worker_session_id": f"session-{task_id}",
+        "filer_principal": f"session-{task_id}",
         "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
         "harness_type": "codex",
         "worker_self_attesting": True,
@@ -12944,6 +13045,7 @@ def _close_timeline_startup_gate(
         "read_receipt_event_id": f"rr-{task_id}",
         "close_satisfying": True,
         "worker_session_id": f"session-{task_id}",
+        "filer_principal": f"session-{task_id}",
         "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
         "harness_type": "codex",
     }
@@ -13368,7 +13470,15 @@ def test_finish_gate_flags_known_bad_4178_startup_non_self_attesting():
                 "checkpoint_id": "ckpt-4178",
                 "fence_token": fence_token,
                 "head_commit": f"head-{task_id}",
-                "startup_evidence": startup,
+                "real_startup_events": [
+                    {
+                        "event_kind": "mf_subagent_startup",
+                        "event_type": "mf_subagent.startup",
+                        "phase": "startup_gate",
+                        "status": "passed",
+                        "payload": {"mf_subagent_startup_gate": startup},
+                    }
+                ],
                 "read_receipt_hash": f"sha256:rr-{task_id}",
                 "read_receipt_event_id": f"rr-{task_id}",
                 "observer_command_id": f"cmd-{task_id}",

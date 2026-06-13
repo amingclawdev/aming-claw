@@ -199,31 +199,93 @@ def _payload_changed_files(payload: Mapping[str, Any]) -> list[str]:
     return _dedupe(values)
 
 
-def _git_diff_files(worktree_path: str, base_commit: str) -> list[str]:
+def _git_diff_truth(
+    worktree_path: str,
+    base_commit: str,
+    head_commit: str = "",
+) -> dict[str, Any]:
     worktree = Path(worktree_path)
-    if not worktree.exists() or not (worktree / ".git").exists():
-        return []
-    commands: list[list[str]] = []
-    if base_commit:
-        commands.append(["git", "-C", str(worktree), "diff", "--name-only", base_commit])
-    commands.append(["git", "-C", str(worktree), "diff", "--name-only", "HEAD"])
-    commands.append(["git", "-C", str(worktree), "diff", "--cached", "--name-only"])
+    if not worktree.exists():
+        return {
+            "changed_files": [],
+            "blockers": ["worktree_path_unresolvable"],
+            "worktree_path": str(worktree),
+            "base_commit": base_commit,
+            "head_commit": head_commit,
+        }
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        proc = None
+    if proc is None or proc.returncode != 0:
+        return {
+            "changed_files": [],
+            "blockers": ["git_worktree_unavailable"],
+            "worktree_path": str(worktree),
+            "base_commit": base_commit,
+            "head_commit": head_commit,
+        }
+    base = _text(base_commit)
+    head = _text(head_commit) or "HEAD"
+    if not base:
+        return {
+            "changed_files": [],
+            "blockers": ["missing_base_commit_for_git_diff"],
+            "worktree_path": str(worktree),
+            "base_commit": base,
+            "head_commit": head,
+        }
+    command = ["git", "-C", str(worktree), "diff", "--name-only", f"{base}..{head}"]
     changed: list[str] = []
-    for command in commands:
-        try:
-            proc = subprocess.run(
-                command,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode == 0:
-            changed.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
-    return _dedupe(changed)
+    blockers: list[str] = []
+    try:
+        diff = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "changed_files": [],
+            "blockers": [f"git_diff_failed:{exc}"],
+            "worktree_path": str(worktree),
+            "base_commit": base,
+            "head_commit": head,
+        }
+    if diff.returncode == 0:
+        changed.extend(line.strip() for line in diff.stdout.splitlines() if line.strip())
+    else:
+        blockers.append("git_diff_failed")
+    return {
+        "changed_files": _dedupe(changed),
+        "blockers": blockers,
+        "worktree_path": str(worktree),
+        "base_commit": base,
+        "head_commit": head,
+    }
+
+
+def _graph_trace_db_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
+    for key in (
+        "graph_trace_db_evidence",
+        "db_graph_trace_evidence",
+        "verified_graph_trace_evidence",
+        "graph_trace_evidence",
+    ):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
 
 
 def _contains_all(haystack: str, needles: Sequence[str]) -> list[str]:
@@ -418,13 +480,24 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
     )
 
     owned_files = _string_list(payload.get("owned_files") or payload.get("target_files"))
-    changed_files = _payload_changed_files(payload) or _git_diff_files(
+    claimed_changed_files = _payload_changed_files(payload)
+    git_diff = _git_diff_truth(
         runtime_fields["worktree_path"],
         _text(payload.get("base_commit")),
+        _text(payload.get("head_commit") or payload.get("branch_head")),
     )
+    changed_files = _string_list(git_diff.get("changed_files"))
     diff_blockers: list[str] = []
+    diff_blockers.extend(str(item) for item in git_diff.get("blockers") or [])
     if not changed_files:
         diff_blockers.append("no_owned_files_diff")
+    if claimed_changed_files and set(claimed_changed_files) != set(changed_files):
+        missing = sorted(set(changed_files).difference(claimed_changed_files))
+        extra = sorted(set(claimed_changed_files).difference(changed_files))
+        diff_blockers.append(
+            "claimed_changed_files_do_not_match_git_diff"
+            f":missing={','.join(missing)};extra={','.join(extra)}"
+        )
     if owned_files:
         outside = sorted(set(changed_files).difference(owned_files))
         if outside:
@@ -437,19 +510,52 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
             diff_blockers,
             owned_files=owned_files,
             changed_files=changed_files,
+            claimed_changed_files=claimed_changed_files,
+            git_diff=git_diff,
         )
     )
 
-    graph_trace_ids = _payload_graph_trace_ids(payload)
+    graph_db_evidence = _graph_trace_db_evidence(payload)
+    graph_trace_ids = _string_list(
+        graph_db_evidence.get("verified_trace_ids")
+        or graph_db_evidence.get("trace_ids")
+    )
+    payload_graph_trace_ids = _payload_graph_trace_ids(payload)
     graph_blockers: list[str] = []
+    if not graph_db_evidence:
+        graph_blockers.append("missing_graph_trace_db_evidence")
+    elif not bool(graph_db_evidence.get("db_verified")):
+        graph_blockers.append("graph_trace_ids_not_db_verified")
+    missing_db_traces = _string_list(graph_db_evidence.get("missing_trace_ids"))
+    graph_blockers.extend(
+        f"graph_trace_missing_from_db:{trace_id}" for trace_id in missing_db_traces
+    )
+    mismatches = graph_db_evidence.get("identity_mismatches")
+    if isinstance(mismatches, Sequence) and not isinstance(mismatches, (str, bytes, bytearray)):
+        graph_blockers.extend("graph_trace_identity_mismatch" for _ in mismatches)
     if not graph_trace_ids:
         graph_blockers.append("missing_mf_subagent_graph_trace_ids")
+    if payload_graph_trace_ids and set(payload_graph_trace_ids) != set(graph_trace_ids):
+        missing = sorted(set(graph_trace_ids).difference(payload_graph_trace_ids))
+        extra = sorted(set(payload_graph_trace_ids).difference(graph_trace_ids))
+        graph_blockers.append(
+            "claimed_graph_trace_ids_do_not_match_db"
+            f":missing={','.join(missing)};extra={','.join(extra)}"
+        )
     graph_missing = _contains_all(transcript_text, graph_trace_ids) if transcript_text else graph_trace_ids
     graph_blockers.extend(f"graph_trace_missing_from_transcript:{trace_id}" for trace_id in graph_missing)
     graph_marker = transcript_text.lower()
     if graph_trace_ids and not ("mf_subagent" in graph_marker and ("graph_query" in graph_marker or "gqt-" in graph_marker)):
         graph_blockers.append("transcript_missing_mf_subagent_graph_query_marker")
-    layers.append(_layer("graph_query_trace", graph_blockers, graph_trace_ids=graph_trace_ids))
+    layers.append(
+        _layer(
+            "graph_query_trace",
+            graph_blockers,
+            graph_trace_ids=graph_trace_ids,
+            payload_graph_trace_ids=payload_graph_trace_ids,
+            graph_trace_db_evidence=graph_db_evidence,
+        )
+    )
 
     timeline_values = _dedupe(
         value

@@ -2034,6 +2034,44 @@ def _normalize_graph_trace_evidence(
             "graph trace evidence identity mismatch: " + ", ".join(sorted(mismatches))
         )
 
+    source_name = _string(source.get("source")).lower()
+    source_details = _mapping(
+        source.get("source_details"),
+        field_name="graph_trace_evidence.source_details",
+    )
+    db_verified = _bool(source.get("db_verified"))
+    missing_trace_ids = _string_list(
+        source.get("missing_trace_ids"),
+        field_name="graph_trace_evidence.missing_trace_ids",
+    )
+    identity_mismatches = source.get("identity_mismatches")
+    identity_mismatch_count = 0
+    if isinstance(identity_mismatches, Mapping):
+        identity_mismatch_count = 1
+    elif isinstance(identity_mismatches, Sequence) and not isinstance(
+        identity_mismatches, (str, bytes, bytearray)
+    ):
+        identity_mismatch_count = len(identity_mismatches)
+    if not db_verified and _bool(source_details.get("graph_query_traces")):
+        db_verified = bool(trace_ids) and not missing_trace_ids and not identity_mismatch_count
+    if required:
+        if source_name != "graph_query_traces":
+            raise MfSubagentContractError(
+                "graph trace evidence must be rederived from graph_query_traces"
+            )
+        if not db_verified:
+            raise MfSubagentContractError(
+                "graph trace evidence must be verified against governance DB"
+            )
+        if missing_trace_ids:
+            raise MfSubagentContractError(
+                "graph trace evidence references trace ids missing from governance DB"
+            )
+        if identity_mismatch_count:
+            raise MfSubagentContractError(
+                "graph trace evidence identity does not match mf_sub lane"
+            )
+
     missing_context = [
         field
         for field, value in observed.items()
@@ -2061,6 +2099,12 @@ def _normalize_graph_trace_evidence(
         "parent_task_id": observed["parent_task_id"],
         "worker_role": observed["worker_role"],
         "fence_token": observed["fence_token"],
+        "source": source_name,
+        "db_verified": db_verified,
+        "missing_trace_ids": missing_trace_ids,
+        "identity_mismatches": identity_mismatches
+        if isinstance(identity_mismatches, (Mapping, list, tuple))
+        else [],
     }
 
 
@@ -3468,34 +3512,42 @@ def _startup_evidence_matches(
     )
 
 
+def _trusted_startup_event_rows(events: Any) -> list[Mapping[str, Any]]:
+    if isinstance(events, Mapping):
+        return [events]
+    if isinstance(events, Sequence) and not isinstance(
+        events, (str, bytes, bytearray)
+    ):
+        return [item for item in events if isinstance(item, Mapping)]
+    return []
+
+
 def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
-    direct = _mapping(
-        payload.get("bounded_startup_evidence")
-        or payload.get("startup_evidence")
-        or payload.get("mf_subagent_startup_gate"),
-        field_name="bounded_startup_evidence",
+    """Resolve startup evidence only from server/DB-derived startup events."""
+
+    rows = _trusted_startup_event_rows(
+        payload.get("real_startup_events")
+        or payload.get("db_startup_events")
+        or payload.get("server_startup_events")
     )
-    if direct:
-        return direct
-    evidence = _mapping(payload.get("evidence"), field_name="evidence")
-    nested = _mapping(
-        evidence.get("bounded_startup_evidence")
-        or evidence.get("startup_evidence")
-        or evidence.get("mf_subagent_startup_gate"),
-        field_name="evidence.startup_evidence",
-    )
-    if nested:
-        return nested
-    for key in ("startup_timeline_event", "generated_startup_timeline_event"):
-        event = _mapping(payload.get(key), field_name=key)
-        if not event:
+    candidates: list[dict[str, Any]] = []
+    for event in rows:
+        event_kind = _string(event.get("event_kind") or event.get("event_type"))
+        if event_kind and "mf_subagent_startup" not in event_kind:
             continue
-        if _string(event.get("event_kind")) != "mf_subagent_startup":
-            continue
-        event_payload = _nested_mapping(event, "payload")
-        gate = _nested_mapping(event_payload, "mf_subagent_startup_gate")
+        gate = _timeline_startup_gate_from_event(event)
         if gate:
-            return gate
+            candidate = dict(gate)
+            event_actor = _string(event.get("actor"))
+            if event_actor and not _string(candidate.get("actor")):
+                candidate["actor"] = event_actor
+            candidates.append(candidate)
+    if not candidates:
+        return {}
+    for candidate in candidates:
+        if _worker_self_attestation_close_gate(candidate).get("passed"):
+            return candidate
+    return candidates[0]
     return {}
 
 
@@ -3539,6 +3591,10 @@ def _worker_self_attestation_close_gate(
     filer_principal = _string(
         startup_evidence.get("filer_principal") or startup_evidence.get("actor")
     )
+    if not filer_principal:
+        blockers.append("missing_filer_principal")
+    elif worker_session_id and filer_principal != worker_session_id:
+        blockers.append("startup_filer_principal_not_worker_session")
     if filer_principal in {"mf_sub", "observer"}:
         blockers.append("startup_filer_is_generic_or_observer")
     if _string(startup_evidence.get("filed_on_behalf_by")) or _bool(

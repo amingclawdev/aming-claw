@@ -5744,17 +5744,24 @@ def _runtime_context_service_graph_trace_refs(
     fence_token: str,
     explicit_trace_ids: list[str],
 ) -> dict[str, Any]:
-    trace_ids: list[str] = []
-    seen: set[str] = set()
+    requested_trace_ids: list[str] = []
+    seen_requested: set[str] = set()
     for trace_id in explicit_trace_ids:
         text = str(trace_id or "").strip()
-        if text and text not in seen:
-            seen.add(text)
-            trace_ids.append(text)
+        if text and text not in seen_requested:
+            seen_requested.add(text)
+            requested_trace_ids.append(text)
     current_run_id_like = ""
     if task_id and fence_token:
         fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
         current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
+    explicit_clause = ""
+    explicit_params: tuple[str, ...] = ()
+    if requested_trace_ids:
+        explicit_clause = "OR trace_id IN ({})".format(
+            ",".join("?" for _ in requested_trace_ids)
+        )
+        explicit_params = tuple(requested_trace_ids)
     try:
         rows = conn.execute(
             """
@@ -5764,7 +5771,9 @@ def _runtime_context_service_graph_trace_refs(
             FROM graph_query_traces
             WHERE project_id = ?
               AND (
-                (? != '' AND runtime_context_id = ?)
+                0
+                {explicit_clause}
+                OR (? != '' AND runtime_context_id = ?)
                 OR (? != '' AND task_id = ?)
                 OR (? != '' AND fence_token = ?)
                 OR (
@@ -5775,9 +5784,10 @@ def _runtime_context_service_graph_trace_refs(
               )
             ORDER BY created_at DESC, trace_id DESC
             LIMIT 20
-            """,
+            """.format(explicit_clause=explicit_clause),
             (
                 project_id,
+                *explicit_params,
                 runtime_context_id,
                 runtime_context_id,
                 task_id,
@@ -5790,24 +5800,92 @@ def _runtime_context_service_graph_trace_refs(
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
+    verified: list[str] = []
+    seen_verified: set[str] = set()
+    row_trace_ids: set[str] = set()
+    identity_mismatches: list[dict[str, str]] = []
     for row in rows:
         trace_id = str(row["trace_id"] if isinstance(row, sqlite3.Row) else row[0])
-        if trace_id and trace_id not in seen:
-            seen.add(trace_id)
-            trace_ids.append(trace_id)
+        if not trace_id:
+            continue
+        row_trace_ids.add(trace_id)
+
+        def _row_text(key: str, index: int) -> str:
+            if isinstance(row, sqlite3.Row):
+                return str(row[key] or "").strip()
+            return str(row[index] or "").strip()
+
+        fields = {
+            "query_source": _row_text("query_source", 1),
+            "query_purpose": _row_text("query_purpose", 2),
+            "worker_role": _row_text("worker_role", 3),
+            "parent_task_id": _row_text("parent_task_id", 4),
+            "task_id": _row_text("task_id", 5),
+            "runtime_context_id": _row_text("runtime_context_id", 6),
+            "fence_token": _row_text("fence_token", 8),
+        }
+        expected = {
+            "query_source": "mf_subagent",
+            "worker_role": "mf_sub",
+            "parent_task_id": parent_task_id,
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "fence_token": fence_token,
+        }
+        trace_mismatches = [
+            {
+                "trace_id": trace_id,
+                "field": field,
+                "expected": value,
+                "actual": fields[field],
+            }
+            for field, value in expected.items()
+            if value and fields[field] != value
+        ]
+        if fields["query_purpose"] not in {
+            "subagent_context_build",
+            "subagent_gate_validation",
+        }:
+            trace_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "query_purpose",
+                    "expected": "subagent_context_build|subagent_gate_validation",
+                    "actual": fields["query_purpose"],
+                }
+            )
+        if trace_mismatches:
+            identity_mismatches.extend(trace_mismatches)
+            continue
+        if trace_id not in seen_verified:
+            seen_verified.add(trace_id)
+            verified.append(trace_id)
+    missing_trace_ids = [
+        trace_id for trace_id in requested_trace_ids if trace_id not in row_trace_ids
+    ]
+    requested_set = set(requested_trace_ids)
+    db_verified = bool(verified) and not missing_trace_ids and not identity_mismatches
+    if requested_set and not requested_set.issubset(set(verified)):
+        db_verified = False
     return {
+        "schema_version": "mf_subagent_graph_trace_db_evidence.v1",
         "source": "graph_query_traces",
         "producer": "graph_query_trace",
-        "trace_ids": trace_ids,
+        "db_verified": db_verified,
+        "trace_ids": verified,
+        "verified_trace_ids": verified,
+        "requested_trace_ids": requested_trace_ids,
+        "missing_trace_ids": missing_trace_ids,
+        "identity_mismatches": identity_mismatches,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "backlog_id": backlog_id,
-        "query_source": "mf_subagent" if trace_ids else "",
-        "worker_role": "mf_sub" if trace_ids else "",
+        "query_source": "mf_subagent" if verified else "",
+        "worker_role": "mf_sub" if verified else "",
         "source_details": {
             "graph_query_traces": bool(rows),
-            "timeline_payload": bool(explicit_trace_ids),
+            "caller_requested_trace_ids": bool(requested_trace_ids),
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -6481,6 +6559,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
         branch_context_to_dict,
         get_branch_context,
         record_branch_finish_gate,
+        runtime_context_id_for_branch_context,
     )
 
     task_id = str(ctx.body.get("task_id") or "").strip()
@@ -6540,7 +6619,23 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 "timeline_events",
                 "events",
             )
+            _CALLER_STARTUP_EVIDENCE_KEYS = (
+                "bounded_startup_evidence",
+                "startup_evidence",
+                "mf_subagent_startup_gate",
+            )
             _caller_supplied = any(ctx.body.get(k) for k in _CALLER_STARTUP_EVENT_KEYS)
+            _caller_supplied_startup_evidence = any(
+                ctx.body.get(k) for k in _CALLER_STARTUP_EVIDENCE_KEYS
+            )
+            _caller_evidence = (
+                ctx.body.get("evidence") if isinstance(ctx.body.get("evidence"), Mapping) else {}
+            )
+            if _caller_evidence:
+                _caller_supplied_startup_evidence = (
+                    _caller_supplied_startup_evidence
+                    or any(_caller_evidence.get(k) for k in _CALLER_STARTUP_EVIDENCE_KEYS)
+                )
             _db_startup_events = _task_timeline.list_events(
                 conn,
                 project_id,
@@ -6551,11 +6646,55 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             _sanitized_body: dict[str, Any] = {
                 k: v for k, v in ctx.body.items()
                 if k not in _CALLER_STARTUP_EVENT_KEYS
+                and k not in _CALLER_STARTUP_EVIDENCE_KEYS
             }
+            if isinstance(_sanitized_body.get("evidence"), Mapping):
+                _sanitized_body["evidence"] = {
+                    k: v
+                    for k, v in dict(_sanitized_body["evidence"]).items()
+                    if k not in _CALLER_STARTUP_EVIDENCE_KEYS
+                }
             _sanitized_body["real_startup_events"] = _db_startup_events
+            _explicit_graph_trace_ids = _runtime_context_service_dedupe(
+                _runtime_context_service_query_values(
+                    ctx.body,
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "trace_ids",
+                    "graph_trace_id",
+                    "graph_query_trace_id",
+                )
+                + _runtime_context_service_query_values(
+                    _caller_evidence,
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "trace_ids",
+                    "graph_trace_id",
+                    "graph_query_trace_id",
+                )
+            )
+            _sanitized_body["graph_trace_evidence"] = (
+                _runtime_context_service_graph_trace_refs(
+                    conn,
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id_for_branch_context(context),
+                    task_id=task_id,
+                    parent_task_id=str(
+                        getattr(context, "root_task_id", "")
+                        or getattr(context, "chain_id", "")
+                        or getattr(context, "stage_task_id", "")
+                        or task_id
+                    ),
+                    backlog_id=str(getattr(context, "backlog_id", "") or ""),
+                    fence_token=str(getattr(context, "fence_token", "") or ""),
+                    explicit_trace_ids=_explicit_graph_trace_ids,
+                )
+            )
             gate = validate_mf_subagent_finish_gate(_sanitized_body, context=context)
             if _caller_supplied:
                 gate["caller_supplied_real_startup_events_ignored"] = True
+            if _caller_supplied_startup_evidence:
+                gate["caller_supplied_startup_evidence_ignored"] = True
             claimed_head = str(gate.get("head_commit") or "").strip()
             actual_head = ""
             worktree_path = str(context.worktree_path or "")
