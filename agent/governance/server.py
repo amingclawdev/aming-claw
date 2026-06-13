@@ -5685,22 +5685,15 @@ def _runtime_context_service_timeline_refs(
     project_id: str,
     task_id: str,
     backlog_id: str,
+    timeline_events: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    from . import task_timeline
-
-    events = task_timeline.list_events(
-        conn,
-        project_id,
-        task_id=task_id,
-        backlog_id=backlog_id,
-        limit=1000,
-    )
-    if not events and backlog_id:
-        events = task_timeline.list_events(
+    events = timeline_events
+    if events is None:
+        events = _runtime_context_service_timeline_events(
             conn,
-            project_id,
+            project_id=project_id,
+            task_id=task_id,
             backlog_id=backlog_id,
-            limit=1000,
         )
     refs: dict[str, Any] = {
         "source": "task_timeline.list_events",
@@ -5780,6 +5773,32 @@ def _runtime_context_service_timeline_refs(
         _runtime_context_event_payload(finish_event),
         _runtime_context_event_payload(close_event),
     )
+
+
+def _runtime_context_service_timeline_events(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+    backlog_id: str,
+) -> list[dict[str, Any]]:
+    from . import task_timeline
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    if not events and backlog_id:
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    return [dict(event) for event in events]
 
 
 def _runtime_context_service_graph_trace_refs(
@@ -6019,9 +6038,9 @@ def _runtime_context_projection_response(
     role: str,
     session: Mapping[str, Any],
 ) -> dict[str, Any]:
-    from .mf_subagent_contract import build_mf_subagent_runtime_context_projection
     from .parallel_branch_runtime import (
         branch_contract_revision_to_dict,
+        build_runtime_context_projection,
         get_latest_branch_contract_revision,
         record_runtime_context_access_audit,
         runtime_context_audit_nodes_for_views,
@@ -6044,12 +6063,19 @@ def _runtime_context_projection_response(
         if latest_revision_payload
         else _parallel_branch_runtime_contract_route_identity(ctx.query)
     )
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=context_project_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+        backlog_id=str(getattr(context, "backlog_id", "") or ""),
+    )
     timeline_refs, startup_gate, finish_gate, close_evidence = (
         _runtime_context_service_timeline_refs(
             conn,
             project_id=context_project_id,
             task_id=str(getattr(context, "task_id", "") or ""),
             backlog_id=str(getattr(context, "backlog_id", "") or ""),
+            timeline_events=timeline_events,
         )
     )
     explicit_trace_ids = _runtime_context_service_query_values(
@@ -6085,18 +6111,19 @@ def _runtime_context_projection_response(
         fence_token=str(getattr(context, "fence_token", "") or ""),
         explicit_trace_ids=explicit_trace_ids,
     )
-    projection = build_mf_subagent_runtime_context_projection(
+    projection = build_runtime_context_projection(
         context,
-        latest_revision=latest_revision,
+        contract_revision=latest_revision,
         route_identity=route_identity if isinstance(route_identity, Mapping) else {},
         timeline_refs=timeline_refs,
         graph_trace_refs=graph_trace_refs,
         startup_gate=startup_gate,
         finish_gate=finish_gate,
         close_evidence=close_evidence,
+        timeline_events=timeline_events,
         role="mf_sub",
         fence_token=str(getattr(context, "fence_token", "") or ""),
-    )
+    ).to_dict()
     views = projection.get("views") if isinstance(projection.get("views"), dict) else {}
     requested_view = str(ctx.query.get("view") or "auto").strip().lower()
     if role == "mf_sub":

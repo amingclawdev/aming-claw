@@ -2799,6 +2799,119 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert "must-not-leak" not in worker_audit_row["metadata_json"]
 
 
+def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_events(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-lane-plan-task",
+            root_task_id="AC-RUNTIME-LANE-PLAN",
+            backlog_id="AC-RUNTIME-LANE-PLAN",
+            worker_id="worker-runtime-lane-plan",
+            worker_slot_id="worker-runtime-lane-plan",
+            actual_host_worker_id="worker-runtime-lane-plan",
+            agent_id="agent-runtime-lane-plan",
+            allocation_owner="agent-runtime-lane-plan",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-lane-plan-task",
+            worktree_path="/repo/.worktrees/runtime-lane-plan-task",
+            base_commit="base-lane-plan",
+            head_commit="head-lane-plan",
+            target_head_commit="target-lane-plan",
+            snapshot_id="scope-lane-plan",
+            projection_id="semproj-lane-plan",
+            merge_queue_id="mq-lane-plan",
+            fence_token="fence-lane-plan",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-06T10:00:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-lane-plan",
+        contract_version="mf_parallel.v1",
+        payload={
+            "target_files": ["agent/governance/server.py"],
+            "acceptance_criteria": ["lane plan is folded from stored events"],
+        },
+        route_identity={
+            "route_id": "route-lane-plan",
+            "route_context_hash": "sha256:route-lane-plan",
+            "prompt_contract_id": "rprompt-lane-plan",
+            "prompt_contract_hash": "sha256:prompt-lane-plan",
+        },
+        now_iso="2026-06-06T10:01:00Z",
+    )
+    recorded_events = []
+    for event_kind in (
+        "route_context",
+        "route_action_precheck",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "mf_subagent_read_receipt",
+        "verification",
+    ):
+        payload = {"runtime_context_id": context.runtime_context_id}
+        if event_kind == "mf_subagent_read_receipt":
+            payload["required_evidence"] = ["runtime_context_read_receipt"]
+        recorded_events.append(
+            task_timeline.record_event(
+                conn,
+                project_id=PID,
+                task_id="runtime-lane-plan-task",
+                backlog_id="AC-RUNTIME-LANE-PLAN",
+                event_type=event_kind,
+                event_kind=event_kind,
+                phase=event_kind,
+                status="passed",
+                payload=payload,
+            )
+        )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-lane-plan-sibling",
+        backlog_id="AC-RUNTIME-LANE-PLAN",
+        event_type="close_ready",
+        event_kind="close_ready",
+        phase="close_ready",
+        status="ready",
+        payload={"runtime_context_id": "mfrctx-sibling"},
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "observer",
+            query={"view": "current"},
+        )
+    )
+
+    current = result["runtime_context_service"]["views"]["current"]
+    lane_plan = current["lane_plan"]
+    fulfilled = {item["clause"]: item for item in lane_plan["fulfilled"]}
+    missing = {item["clause"] for item in lane_plan["missing"]}
+
+    assert lane_plan["schema_version"] == "runtime_context.lane_fold.v1"
+    assert lane_plan["lane_id"] == "runtime-lane-plan-task"
+    assert lane_plan["current_state"]["fulfilled_count"] == 6
+    assert lane_plan["current_state"]["missing_count"] == 1
+    assert lane_plan["current_state"]["status"] == "missing_required_clauses"
+    assert missing == {"close_ready"}
+    assert fulfilled["route_context"]["event_ref"] == str(recorded_events[0]["id"])
+    assert fulfilled["independent_verification"]["event_ref"] == str(
+        recorded_events[-1]["id"]
+    )
+    assert "runtime-lane-plan-sibling" not in json.dumps(lane_plan, sort_keys=True)
+
+
 def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
     context = upsert_branch_context(
         conn,
