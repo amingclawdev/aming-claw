@@ -1132,6 +1132,12 @@ _RUNTIME_CONTEXT_CONTENT_ADDRESS_VOLATILE_KEYS = {
     "accessed_at",
 }
 
+_RUNTIME_CONTEXT_PUBLIC_PRIVACY_STATUS_KEYS = {
+    "raw_private_context_exposed",
+    "other_worker_contexts_exposed",
+    "raw_source_of_truth_copied",
+}
+
 
 def _runtime_context_redacted_key_name(key: str) -> str:
     safe_key = str(key or "").strip() or "value"
@@ -1141,6 +1147,8 @@ def _runtime_context_redacted_key_name(key: str) -> str:
 def _is_runtime_context_secret_key(key: str) -> bool:
     normalized = str(key or "").strip().lower().replace("-", "_")
     if not normalized:
+        return False
+    if normalized in _RUNTIME_CONTEXT_PUBLIC_PRIVACY_STATUS_KEYS:
         return False
     if normalized in _RUNTIME_CONTEXT_CONTENT_ADDRESS_SECRET_KEYS:
         return True
@@ -1177,6 +1185,58 @@ def runtime_context_public_content_value(value: Any) -> Any:
         return sanitized
     if isinstance(value, (list, tuple)):
         return [runtime_context_public_content_value(item) for item in value]
+    return value
+
+
+def _runtime_context_secret_hash_key(key: str) -> str:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if normalized.startswith("raw_"):
+        normalized = normalized[4:]
+    return f"{normalized or 'value'}_hash"
+
+
+def redact_runtime_context_payload(
+    value: Any,
+    *,
+    raw_secrets: Sequence[str] | None = None,
+) -> Any:
+    """Return a public runtime-context payload with raw capability material removed."""
+
+    secret_values = {
+        str(secret)
+        for secret in (raw_secrets or ())
+        if str(secret or "").strip()
+    }
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key or "")
+            if _is_runtime_context_secret_key(key_text):
+                child_text = str(child or "") if child is not None else ""
+                if child_text:
+                    redacted[_runtime_context_secret_hash_key(key_text)] = (
+                        runtime_context_secret_hash(child_text)
+                    )
+                redacted[key_text] = "redacted"
+                redacted[_runtime_context_redacted_key_name(key_text)] = True
+                continue
+            redacted[key_text] = redact_runtime_context_payload(
+                child,
+                raw_secrets=tuple(secret_values),
+            )
+        return redacted
+    if isinstance(value, list):
+        return [
+            redact_runtime_context_payload(item, raw_secrets=tuple(secret_values))
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            redact_runtime_context_payload(item, raw_secrets=tuple(secret_values))
+            for item in value
+        ]
+    if isinstance(value, str) and value in secret_values:
+        return "redacted"
     return value
 
 

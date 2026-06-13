@@ -63,6 +63,7 @@ from agent.governance.parallel_branch_runtime import (
     record_mf_subagent_startup,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
+    redact_runtime_context_payload,
     runtime_context_audit_nodes_for_views,
     runtime_context_content_hash,
     runtime_context_filter_content_address,
@@ -671,6 +672,52 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
     assert "do-not-hash-launch-text" not in serialized_content_address
     assert "do-not-hash-worker-nonce" not in serialized_content_address
     assert "do-not-hash-subtree" not in serialized_content_address
+
+
+def test_redact_runtime_context_payload_replaces_authorized_raw_capability_material() -> None:
+    raw_fence = "synthetic-raw-fence-runtime-contract-secret"
+    raw_session = "synthetic-raw-session-runtime-contract-secret"
+    raw_private = "synthetic-private-runtime-contract-secret"
+    payload = {
+        "runtime_context": {
+            "task_id": "mf-sub-redaction",
+            "fence_token": raw_fence,
+            "target_fences": [raw_fence],
+        },
+        "contract": {
+            "graph_query": {
+                "required_context_fields": ["task_id", "fence_token"],
+            },
+            "protected_timeline_append": {
+                "scope": {"fence_token": raw_fence},
+            },
+        },
+        "session_token": raw_session,
+        "nested": {"raw_private_token": raw_private},
+    }
+
+    redacted = redact_runtime_context_payload(
+        payload,
+        raw_secrets=[raw_fence, raw_session, raw_private],
+    )
+    serialized = json.dumps(redacted, sort_keys=True)
+
+    for secret in (raw_fence, raw_session, raw_private):
+        assert secret not in serialized
+    assert redacted["runtime_context"]["fence_token"] == "redacted"
+    assert redacted["runtime_context"]["fence_token_redacted"] is True
+    assert redacted["runtime_context"]["fence_token_hash"] == (
+        "sha256:" + hashlib.sha256(raw_fence.encode("utf-8")).hexdigest()
+    )
+    assert redacted["runtime_context"]["target_fences"] == ["redacted"]
+    assert redacted["contract"]["graph_query"]["required_context_fields"] == [
+        "task_id",
+        "fence_token",
+    ]
+    assert redacted["session_token"] == "redacted"
+    assert redacted["session_token_redacted"] is True
+    assert redacted["nested"]["raw_private_token"] == "redacted"
+    assert redacted["nested"]["raw_private_token_redacted"] is True
 
 
 def test_runtime_context_access_audit_persists_hashes_not_raw_tokens() -> None:

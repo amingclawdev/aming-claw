@@ -2204,6 +2204,9 @@ def test_observer_runtime_text_prepare_rejects_persisted_runtime_context_mismatc
 
 
 def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):
+    raw_fence = "synthetic-raw-fence-runtime-contract-secret"
+    raw_session = "synthetic-raw-session-runtime-contract-secret"
+    raw_private = "synthetic-private-runtime-contract-secret"
     upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -2222,10 +2225,8 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
             snapshot_id="scope-1",
             projection_id="semproj-1",
             merge_queue_id="mq-runtime",
-            fence_token="fence-runtime",
-            session_token_hash=mf_subagent_session_token_hash(
-                "runtime-contract-session"
-            ),
+            fence_token=raw_fence,
+            session_token_hash=mf_subagent_session_token_hash(raw_session),
             status="running",
             lease_expires_at="2999-01-01T00:00:00Z",
         ),
@@ -2242,7 +2243,7 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
                 "mf_sub",
                 query={
                     "parent_task_id": "runtime-contract-parent",
-                    "fence_token": "fence-runtime",
+                    "fence_token": raw_fence,
                     "session_token": "wrong-runtime-contract-session",
                 },
             )
@@ -2259,17 +2260,17 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
                 "project_id": PID,
                 "task_id": "runtime-contract-task",
             },
-            "mf_sub",
-            query={
-                "parent_task_id": "runtime-contract-parent",
-                "fence_token": "fence-runtime",
-                "session_token": "runtime-contract-session",
-                "route_context_hash": "sha256:route",
-                "prompt_contract_id": "rprompt-runtime",
-                "visible_injection_manifest_hash": "sha256:visible",
-                "raw_private_context": "must-not-leak",
-            },
-        )
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-contract-parent",
+                    "fence_token": raw_fence,
+                    "session_token": raw_session,
+                    "route_context_hash": "sha256:route",
+                    "prompt_contract_id": "rprompt-runtime",
+                    "visible_injection_manifest_hash": "sha256:visible",
+                    "raw_private_context": raw_private,
+                },
+            )
     )
 
     view = result["runtime_contract"]
@@ -2283,7 +2284,14 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
     assert view["poll_after_sec"] == 15
     assert view["runtime_context"]["task_id"] == "runtime-contract-task"
     assert view["runtime_context"]["parent_task_id"] == "runtime-contract-parent"
-    assert view["runtime_context"]["fence_token"] == "fence-runtime"
+    fence_hash = "sha256:" + hashlib.sha256(raw_fence.encode("utf-8")).hexdigest()
+    assert view["runtime_context"]["fence_token"] == "redacted"
+    assert view["runtime_context"]["fence_token_hash"] == fence_hash
+    assert view["runtime_context"]["fence_token_redacted"] is True
+    assert view["agent_task_contract"]["target_fences"] == ["redacted"]
+    assert view["contract"]["protected_timeline_append"]["task_scoped_route_waiver"][
+        "scope"
+    ]["fence_token"] == "redacted"
     assert view["contract"]["contract_change_policy"]["source_of_truth"] == "contract_service"
     assert view["route_identity"]["route_context_hash"] == "sha256:route"
     assert view["route_identity"]["prompt_contract_id"] == "rprompt-runtime"
@@ -2313,8 +2321,13 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
     assert json.loads(audit_row["metadata_json"])["endpoint"] == (
         "parallel-branches.runtime-contract"
     )
-    assert "runtime-contract-session" not in audit_row["metadata_json"]
-    assert "fence-runtime" not in audit_row["metadata_json"]
+    response_json = json.dumps(result, sort_keys=True)
+    audit_nodes_json = audit_row["nodes_read_json"]
+    audit_metadata_json = audit_row["metadata_json"]
+    for secret in (raw_fence, raw_session, raw_private):
+        assert secret not in response_json
+        assert secret not in audit_nodes_json
+        assert secret not in audit_metadata_json
 
 
 def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_poll(conn):

@@ -5560,6 +5560,7 @@ def _parallel_branch_runtime_contract_response(
         branch_contract_revision_to_dict,
         get_latest_branch_contract_revision,
         record_runtime_context_access_audit,
+        redact_runtime_context_payload,
         runtime_context_content_hash,
         runtime_context_id_for_branch_context,
         runtime_context_single_view_audit_node,
@@ -5586,7 +5587,7 @@ def _parallel_branch_runtime_contract_response(
         if latest_revision_payload
         else _parallel_branch_runtime_contract_route_identity(ctx.query)
     )
-    view = build_mf_subagent_runtime_contract_view(
+    raw_view = build_mf_subagent_runtime_contract_view(
         context,
         role=role,
         contract_version=str(
@@ -5599,6 +5600,14 @@ def _parallel_branch_runtime_contract_response(
         poll_after_sec=_query_int(ctx.query, "poll_after_sec", 15),
         latest_revision=latest_revision_payload or None,
         route_identity=route_identity if isinstance(route_identity, Mapping) else {},
+    )
+    view = redact_runtime_context_payload(
+        raw_view,
+        raw_secrets=[
+            str(getattr(context, "fence_token", "") or ""),
+            str(ctx.query.get("session_token") or ""),
+            str(ctx.query.get("token") or ""),
+        ],
     )
     audit_node = runtime_context_single_view_audit_node(
         runtime_context_id=runtime_context_id,
