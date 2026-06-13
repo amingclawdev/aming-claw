@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -507,7 +508,21 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     assert worker_view["task"]["task_id"] == "mf-sub-runtime-context"
     assert worker_view["observer_command_id"] == "cmd-runtime-context"
     assert worker_view["gate_inputs"]["observer_command_id"] == "cmd-runtime-context"
-    assert worker_view["task"]["fence_token"] == "fence-runtime-context"
+    fence_hash = "sha256:" + hashlib.sha256(
+        b"fence-runtime-context"
+    ).hexdigest()
+    assert "fence_token" not in worker_view["task"]
+    assert worker_view["task"]["fence_token_hash"] == fence_hash
+    assert worker_view["task"]["fence_token_redacted"] is True
+    assert worker_view["graph_query_identity"]["fence_token_hash"] == fence_hash
+    assert worker_view["graph_query_identity"]["fence_token_redacted"] is True
+    assert "fence_token" not in worker_view["graph_query_identity"]
+    dispatch_fence = worker_view["gate_inputs"]["gates"]["dispatch"]["fields"][
+        "fence_token"
+    ]
+    assert dispatch_fence["value"] == "redacted"
+    assert dispatch_fence["value_redacted"] is True
+    assert dispatch_fence["fence_token_hash"] == fence_hash
     assert worker_view["route_identity"]["prompt_contract_hash"] == (
         "sha256:prompt-runtime-context"
     )
@@ -542,6 +557,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     serialized = json.dumps(worker_view, sort_keys=True)
     assert private_secret not in serialized
     assert other_worker_secret not in serialized
+    assert "fence-runtime-context" not in serialized
 
     with pytest.raises(BranchRuntimeFenceError):
         build_runtime_context_projection(
@@ -584,6 +600,29 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
         },
         generated_at=NOW,
     ).to_dict()
+    later_projection = build_runtime_context_projection(
+        context,
+        contract_revision={
+            "revision_id": "crev-runtime-context",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "observer_command_id": "cmd-runtime-context",
+                "target_files": ["agent/governance/parallel_branch_runtime.py"],
+                "raw_private_memory": private_secret,
+                "launch_text": "do-not-hash-launch-text",
+                "worker_nonce": "do-not-hash-worker-nonce",
+                "subtree": "do-not-hash-subtree",
+            },
+        },
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at="2026-05-16T12:01:00Z",
+    ).to_dict()
 
     content_address = projection["content_address"]
     assert content_address["schema_version"] == RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION
@@ -599,6 +638,19 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
     assert worker_node["hash"] == worker_node["node_hash"]
     assert worker_node["view_hash"] == runtime_context_content_hash(
         projection["views"]["worker_view"]
+    )
+    assert projection["views"]["current"]["generated_at"] != (
+        later_projection["views"]["current"]["generated_at"]
+    )
+    assert projection["views"]["gate_inputs"]["generated_at"] != (
+        later_projection["views"]["gate_inputs"]["generated_at"]
+    )
+    assert content_address == later_projection["content_address"]
+    assert runtime_context_content_hash(projection["views"]["current"]) == (
+        runtime_context_content_hash(later_projection["views"]["current"])
+    )
+    assert runtime_context_content_hash(projection["views"]["gate_inputs"]) == (
+        runtime_context_content_hash(later_projection["views"]["gate_inputs"])
     )
     assert runtime_context_content_hash({"b": 2, "a": 1}) == runtime_context_content_hash(
         {"a": 1, "b": 2}

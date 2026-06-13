@@ -2638,6 +2638,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
 
     assert observer_result["ok"] is True
     assert observer_result["role_scope"] == "observer"
+    assert "fence-current" not in json.dumps(observer_result, sort_keys=True)
     observer_views = observer_result["runtime_context_service"]["views"]
     assert {"current", "gate_inputs", "worker_view", "close_gate_view"}.issubset(
         observer_views
@@ -2740,10 +2741,23 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     worker_view = worker_views["worker_view"]
     assert worker_view["schema_version"] == "runtime_context.worker_view.v1"
     assert worker_view["task"]["task_id"] == "runtime-current-task"
-    assert worker_view["task"]["fence_token"] == "fence-current"
+    fence_hash = "sha256:" + hashlib.sha256(b"fence-current").hexdigest()
+    assert "fence_token" not in worker_view["task"]
+    assert worker_view["task"]["fence_token_hash"] == fence_hash
+    assert worker_view["task"]["fence_token_redacted"] is True
+    assert "fence_token" not in worker_view["graph_query_identity"]
+    assert worker_view["graph_query_identity"]["fence_token_hash"] == fence_hash
+    assert worker_view["graph_query_identity"]["fence_token_redacted"] is True
+    assert worker_view["gate_inputs"]["gates"]["dispatch"]["fields"]["fence_token"][
+        "value"
+    ] == "redacted"
+    assert worker_view["gate_inputs"]["gates"]["dispatch"]["fields"]["fence_token"][
+        "fence_token_hash"
+    ] == fence_hash
     assert worker_view["role_filter_policy"]["raw_private_context_exposed"] is False
     assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
     assert "current_values" not in worker_view
+    assert "fence-current" not in json.dumps(worker_result, sort_keys=True)
     assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
     worker_content_address = worker_result["runtime_context_service"][
         "content_address"

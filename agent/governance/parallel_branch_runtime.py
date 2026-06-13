@@ -344,6 +344,13 @@ def mf_subagent_session_token_hash(session_token: str) -> str:
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def runtime_context_secret_hash(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def issue_mf_subagent_session_token(
     context: "BranchTaskRuntimeContext",
 ) -> dict[str, Any]:
@@ -981,20 +988,31 @@ def _json_object(value: Mapping[str, Any] | dict[str, Any] | None) -> str:
 
 
 _PRIVATE_CONTRACT_REVISION_KEYS = {
+    "fence_token",
     "hidden_context",
+    "launch_text",
     "observer_only_context",
     "private_founder",
     "private_memory",
     "private_context",
     "private_route_body",
     "raw_context_body",
+    "raw_fence_token",
+    "raw_launch_text",
     "raw_memory",
     "raw_private_memory",
     "raw_private_context",
     "raw_private_context_body",
     "raw_private_route_body",
     "raw_route_body",
+    "raw_session_token",
+    "raw_subtree",
+    "raw_worker_nonce",
+    "session_token",
+    "subtree",
     "unmanifested_prompt_text",
+    "worker_nonce",
+    "worker_session_token",
 }
 
 _PRIVATE_CONTRACT_REVISION_KEY_MARKERS = (
@@ -1106,6 +1124,14 @@ _RUNTIME_CONTEXT_CONTENT_ADDRESS_SECRET_MARKERS = (
     "launch_text",
 )
 
+_RUNTIME_CONTEXT_CONTENT_ADDRESS_VOLATILE_KEYS = {
+    "generated_at",
+    "read_at",
+    "read_timestamp",
+    "served_at",
+    "accessed_at",
+}
+
 
 def _runtime_context_redacted_key_name(key: str) -> str:
     safe_key = str(key or "").strip() or "value"
@@ -1127,6 +1153,13 @@ def _is_runtime_context_secret_key(key: str) -> bool:
     return _is_private_contract_revision_key(normalized)
 
 
+def _is_runtime_context_volatile_content_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if not normalized:
+        return False
+    return normalized in _RUNTIME_CONTEXT_CONTENT_ADDRESS_VOLATILE_KEYS
+
+
 def runtime_context_public_content_value(value: Any) -> Any:
     """Return deterministic public material for runtime-context hashes."""
 
@@ -1134,6 +1167,9 @@ def runtime_context_public_content_value(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
             key_text = str(key or "")
+            if _is_runtime_context_volatile_content_key(key_text):
+                sanitized[f"{key_text}_normalized"] = True
+                continue
             if _is_runtime_context_secret_key(key_text):
                 sanitized[_runtime_context_redacted_key_name(key_text)] = True
                 continue
@@ -1903,6 +1939,7 @@ def _runtime_context_current_values(
         or startup_gate.get("worker_self_attestation_status")
         or "passed"
     ).lower() in {"passed", "ok", "success", "succeeded"}
+    fence_token_hash = runtime_context_secret_hash(context.fence_token)
     return {
         "project_id": context.project_id,
         "governance_project_id": context.governance_project_id or context.project_id,
@@ -1920,7 +1957,9 @@ def _runtime_context_current_values(
         "agent_id": context.agent_id,
         "allocation_owner": context.allocation_owner or context.agent_id,
         "attempt": context.attempt,
-        "fence_token": context.fence_token,
+        "fence_token_present": bool(context.fence_token),
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(context.fence_token),
         "branch_ref": context.branch_ref,
         "ref_name": context.ref_name,
         "worktree_id": context.worktree_id,
@@ -1953,7 +1992,8 @@ def _runtime_context_current_values(
             "task_id": context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
-            "fence_token": context.fence_token,
+            "fence_token_hash": fence_token_hash,
+            "fence_token_redacted": bool(context.fence_token),
             "governance_project_id": context.governance_project_id
             or context.project_id,
             "target_project_id": context.target_project_id or context.project_id,
@@ -2443,6 +2483,30 @@ def _runtime_context_gate_field_view(
 ) -> tuple[str, dict[str, Any], RuntimeContextMissingField | None]:
     field_name = requirement["field"]
     value = values.get(field_name)
+    if field_name == "fence_token":
+        token_hash = _runtime_context_text(values.get("fence_token_hash"))
+        present = bool(values.get("fence_token_present")) or bool(token_hash)
+        field_view = {
+            "value": "redacted" if present else "",
+            "present": present,
+            "value_redacted": True,
+            "fence_token_hash": token_hash,
+            "expected_source": requirement["expected_source"],
+            "producer": requirement["producer"],
+            "consumer": requirement["consumer"],
+            "evidence_ref": requirement["evidence_ref"],
+        }
+        if present:
+            return field_name, field_view, None
+        missing = RuntimeContextMissingField(
+            gate=gate,
+            field=field_name,
+            expected_source=requirement["expected_source"],
+            producer=requirement["producer"],
+            consumer=requirement["consumer"],
+            evidence_ref=requirement["evidence_ref"],
+        )
+        return field_name, field_view, missing
     present = _runtime_context_value_present(value)
     field_view = {
         "value": value,
@@ -2658,7 +2722,9 @@ def build_runtime_context_current_view(
                 "actual_host_worker_id",
                 "agent_id",
                 "attempt",
-                "fence_token",
+                "fence_token_present",
+                "fence_token_hash",
+                "fence_token_redacted",
             )
         },
         "branch": {
@@ -2806,12 +2872,12 @@ def build_runtime_context_worker_view(
         raise BranchRuntimeFenceError("runtime_context_worker_view_role_not_allowed")
     values = _runtime_context_mapping(current_view.get("current_values"))
     expected_task_id = _runtime_context_text(values.get("task_id"))
-    expected_fence = _runtime_context_text(values.get("fence_token"))
+    expected_fence_hash = _runtime_context_text(values.get("fence_token_hash"))
     requested_task_id = _runtime_context_text(task_id)
     requested_fence = _runtime_context_text(fence_token)
     if requested_task_id and requested_task_id != expected_task_id:
         raise BranchRuntimeFenceError("runtime_context_worker_view_task_mismatch")
-    if requested_fence and requested_fence != expected_fence:
+    if requested_fence and runtime_context_secret_hash(requested_fence) != expected_fence_hash:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     gate_inputs = (
@@ -2856,7 +2922,9 @@ def build_runtime_context_worker_view(
                 "actual_host_worker_id",
                 "agent_id",
                 "attempt",
-                "fence_token",
+                "fence_token_present",
+                "fence_token_hash",
+                "fence_token_redacted",
             )
         },
         "branch": {
