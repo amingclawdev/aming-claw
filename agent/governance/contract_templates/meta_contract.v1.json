@@ -33,6 +33,7 @@
       "allowed_actions": [
         "route_context",
         "route_action_precheck",
+        "observer_work_mode_transition",
         "dispatch_bounded_worker",
         "merge_preview",
         "merge_queue_entry",

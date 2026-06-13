@@ -417,6 +417,7 @@ _META_ACTION_ALIASES = {
     "route": "route_context",
     "route_action_precheck": "route_action_precheck",
     "route_precheck": "route_action_precheck",
+    "observer_work_mode_transition": "observer_work_mode_transition",
     "bounded_implementation_worker_dispatch": "dispatch_bounded_worker",
     "mf_subagent_dispatch": "dispatch_bounded_worker",
     "dispatch_bounded_worker": "dispatch_bounded_worker",
@@ -480,6 +481,19 @@ _META_ACTION_ALIASES = {
     "graph_trace": "graph_trace",
     "graph_query_trace": "graph_trace",
 }
+_META_WORK_MODE_TRANSITION_ROUTE_IDENTITY_KEYS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+)
+_META_WORK_MODE_TRANSITION_PRECHECK_REF_KEYS = (
+    "route_action_precheck_event_id",
+    "route_action_precheck_event_ref",
+    "route_action_precheck_ref",
+    "route_action_precheck_timeline_id",
+    "bound_route_action_precheck_event_id",
+    "bound_route_action_precheck_ref",
+)
 _META_OBSERVER_ROLE_TOKENS = {"observer", "coordinator"}
 _META_JUDGE_ROLE_TOKENS = {"judger", "judge"}
 _META_QA_ROLE_TOKENS = {"qa", "verifier", "reviewer"}
@@ -4676,6 +4690,8 @@ def _meta_action_from_event(event: Mapping[str, Any]) -> str:
     for marker in _meta_event_markers(event):
         if marker in _META_ACTION_ALIASES:
             return _META_ACTION_ALIASES[marker]
+        if "work_mode_transition" in marker:
+            return ""
         if marker.startswith("hotfix_") and marker != "hotfix_entered":
             return "hotfix_under_action"
         if marker.startswith("route_token_gate"):
@@ -4812,6 +4828,80 @@ def _meta_allowed_actions(meta_contract: Mapping[str, Any], role: str) -> list[s
     ]
 
 
+def _meta_work_mode_transition_evidence_containers(
+    event: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = []
+    queue = list(_meta_contract_containers(event))
+    seen: set[int] = set()
+    nested_keys = (
+        "action_precheck",
+        "bound_route_action_precheck",
+        "canonical_route_identity",
+        "route_action_precheck",
+        "route_context",
+        "route_identity",
+        "work_mode_transition",
+    )
+    while queue:
+        container = queue.pop(0)
+        marker = id(container)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        containers.append(container)
+        for key in nested_keys:
+            child = container.get(key)
+            if isinstance(child, Mapping):
+                queue.append(child)
+    return containers
+
+
+def _meta_work_mode_transition_missing_evidence(
+    event: Mapping[str, Any],
+) -> list[str]:
+    containers = _meta_work_mode_transition_evidence_containers(event)
+    missing: list[str] = []
+    for key in _META_WORK_MODE_TRANSITION_ROUTE_IDENTITY_KEYS:
+        if not any(_string(container.get(key)) for container in containers):
+            missing.append(key)
+
+    has_precheck_ref = any(
+        _string(container.get(key))
+        for container in containers
+        for key in _META_WORK_MODE_TRANSITION_PRECHECK_REF_KEYS
+    )
+    if not has_precheck_ref:
+        for container in containers:
+            for key in (
+                "action_precheck",
+                "bound_route_action_precheck",
+                "route_action_precheck",
+            ):
+                child = container.get(key)
+                if _string(child):
+                    has_precheck_ref = True
+                    break
+                if isinstance(child, Mapping) and any(
+                    _string(child.get(ref_key))
+                    for ref_key in (
+                        "event_id",
+                        "event_ref",
+                        "id",
+                        "ref",
+                        "source_event_id",
+                        "timeline_id",
+                    )
+                ):
+                    has_precheck_ref = True
+                    break
+            if has_precheck_ref:
+                break
+    if not has_precheck_ref:
+        missing.append("route_action_precheck_ref")
+    return missing
+
+
 def validate_meta_contract_timeline_event(
     event: Mapping[str, Any],
     *,
@@ -4867,6 +4957,14 @@ def validate_meta_contract_timeline_event(
         raise MfSubagentContractError(
             "meta-contract forbidden_always rejected surrogate_startup"
         )
+    if action == "observer_work_mode_transition":
+        missing_transition_evidence = _meta_work_mode_transition_missing_evidence(event)
+        if missing_transition_evidence:
+            raise MfSubagentContractError(
+                "meta-contract observer_work_mode_transition missing required "
+                "evidence: "
+                + ", ".join(missing_transition_evidence)
+            )
 
     worker_evidence_actions = {
         _normalized_action(item)

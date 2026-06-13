@@ -602,6 +602,9 @@ def test_meta_contract_template_encodes_observer_whitelist_and_red_lines() -> No
     assert "dispatch_bounded_worker" in template["role_action_whitelist"]["observer"][
         "allowed_actions"
     ]
+    assert "observer_work_mode_transition" in template["role_action_whitelist"][
+        "observer"
+    ]["allowed_actions"]
     assert {"observer", "worker", "mf_sub", "qa", "judge", "system"}.issubset(
         template["role_action_whitelist"]
     )
@@ -642,6 +645,111 @@ def test_meta_contract_ignores_forged_payload_gate_for_action_derivation() -> No
                         "role": "observer",
                         "action": "record_blocker",
                     }
+                },
+            }
+        )
+
+
+def test_meta_contract_allows_observer_work_mode_transition_with_bound_precheck_ref() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "observer.work_mode_transition",
+            "event_kind": "observer_work_mode_transition",
+            "actor": "observer",
+            "phase": "routing",
+            "status": "accepted",
+            "payload": {
+                "from_work_mode": "observer_look_before_act",
+                "to_work_mode": "observer_execution_supervisor",
+                "route_identity": {
+                    "route_id": "route-1",
+                    "route_context_hash": "sha256:ctx",
+                    "prompt_contract_id": "rprompt-1",
+                },
+                "route_action_precheck_event_id": "timeline:4366",
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == OBSERVER_COORDINATOR_ROLE
+    assert gate["action"] == "observer_work_mode_transition"
+    assert gate["observer_event_validated"] is True
+    assert gate["observer_worker_transport"] is False
+
+
+def test_meta_contract_rejects_observer_work_mode_transition_without_bound_precheck_ref() -> None:
+    with pytest.raises(
+        MfSubagentContractError,
+        match="route_action_precheck_ref",
+    ):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "actor": "observer",
+                "phase": "routing",
+                "status": "accepted",
+                "payload": {
+                    "route_identity": {
+                        "route_id": "route-1",
+                        "route_context_hash": "sha256:ctx",
+                        "prompt_contract_id": "rprompt-1",
+                    },
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["route_id", "route_context_hash", "prompt_contract_id"],
+)
+def test_meta_contract_rejects_observer_work_mode_transition_missing_route_identity(
+    missing_field: str,
+) -> None:
+    route_identity = {
+        "route_id": "route-1",
+        "route_context_hash": "sha256:ctx",
+        "prompt_contract_id": "rprompt-1",
+    }
+    route_identity.pop(missing_field)
+
+    with pytest.raises(
+        MfSubagentContractError,
+        match=missing_field,
+    ):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "actor": "observer",
+                "phase": "routing",
+                "status": "accepted",
+                "payload": {
+                    "route_identity": route_identity,
+                    "route_action_precheck_event_id": "timeline:4366",
+                },
+            }
+        )
+
+
+def test_meta_contract_rejects_unknown_work_mode_transition_phase_bypass() -> None:
+    with pytest.raises(MfSubagentContractError, match="unknown timeline action"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "observer.work_mode_transition.unbound",
+                "event_kind": "",
+                "actor": "observer",
+                "phase": "route_context",
+                "status": "accepted",
+                "payload": {
+                    "route_identity": {
+                        "route_id": "route-1",
+                        "route_context_hash": "sha256:ctx",
+                        "prompt_contract_id": "rprompt-1",
+                    },
+                    "route_action_precheck_event_id": "timeline:4366",
                 },
             }
         )

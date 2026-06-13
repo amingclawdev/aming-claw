@@ -916,6 +916,100 @@ class TestTaskTimeline(unittest.TestCase):
         waiver.update(ROUTE_IDENTITY)
         return waiver
 
+    def test_record_event_accepts_observer_work_mode_transition(self):
+        from agent.governance import task_timeline
+
+        recorded = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-WORK-MODE-TRANSITION",
+            event_type="observer.work_mode_transition",
+            event_kind="observer_work_mode_transition",
+            phase="routing",
+            actor="observer",
+            status="accepted",
+            payload={
+                "from_work_mode": "observer_look_before_act",
+                "to_work_mode": "observer_execution_supervisor",
+                "route_identity": {
+                    "route_id": "route-1",
+                    "route_context_hash": "sha256:ctx",
+                    "prompt_contract_id": "rprompt-1",
+                },
+                "route_action_precheck_event_id": "timeline:4366",
+            },
+        )
+
+        gate = recorded["payload"]["meta_contract_gate"]
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["role"], "observer")
+        self.assertEqual(gate["action"], "observer_work_mode_transition")
+
+    def test_timeline_append_accepts_observer_work_mode_transition(self):
+        from agent.governance import server
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": "BUG-WORK-MODE-TRANSITION-APPEND",
+                    "event_type": "observer.work_mode_transition",
+                    "event_kind": "observer_work_mode_transition",
+                    "phase": "routing",
+                    "actor": "observer",
+                    "status": "accepted",
+                    "payload": {
+                        "from_work_mode": "observer_look_before_act",
+                        "to_work_mode": "observer_execution_supervisor",
+                        "route_identity": {
+                            "route_id": "route-1",
+                            "route_context_hash": "sha256:ctx",
+                            "prompt_contract_id": "rprompt-1",
+                        },
+                        "route_action_precheck_event_id": "timeline:4366",
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        gate = result["payload"]["meta_contract_gate"]
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["action"], "observer_work_mode_transition")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-WORK-MODE-TRANSITION-APPEND",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 1)
+
+    def test_record_event_rejects_observer_work_mode_transition_phase_bypass(self):
+        from agent.governance import task_timeline
+        from agent.governance.mf_subagent_contract import MfSubagentContractError
+
+        with self.assertRaisesRegex(MfSubagentContractError, "unknown timeline action"):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-WORK-MODE-TRANSITION-BYPASS",
+                event_type="observer.work_mode_transition.unbound",
+                event_kind="",
+                phase="route_context",
+                actor="observer",
+                status="accepted",
+                payload={
+                    "route_identity": {
+                        "route_id": "route-1",
+                        "route_context_hash": "sha256:ctx",
+                        "prompt_contract_id": "rprompt-1",
+                    },
+                    "route_action_precheck_event_id": "timeline:4366",
+                },
+            )
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-WORK-MODE-TRANSITION-BYPASS",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
     def test_record_event_publishes_timeline_and_current_task_events(self):
         from agent.governance import event_bus, task_timeline
 

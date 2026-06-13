@@ -224,7 +224,14 @@ def test_execution_supervisor_unlocks_coordination_but_not_implementation():
         assert gate["reason"] == "observer_must_never_perform_this_action"
 
 
-def test_work_mode_transition_requires_event_and_bound_precheck():
+@pytest.mark.parametrize(
+    "transition_marker",
+    [
+        {"event_kind": "observer_work_mode_transition"},
+        {"event_type": "observer.work_mode_transition"},
+    ],
+)
+def test_work_mode_transition_requires_event_and_bound_precheck(transition_marker):
     identity = {
         "route_id": "route-1",
         "route_context_hash": "sha256:ctx",
@@ -240,7 +247,7 @@ def test_work_mode_transition_requires_event_and_bound_precheck():
 
     # Transition event alone is still not enough.
     transition_event = {
-        "event_kind": "observer_work_mode_transition",
+        **transition_marker,
         "status": "accepted",
         "payload": {
             "from_work_mode": "observer_look_before_act",
