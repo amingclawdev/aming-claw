@@ -99,6 +99,30 @@ def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():
     assert "route_token_waiver" in properties
 
 
+def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = responses[0]["result"]["tools"]
+    audit_archive = next(tool for tool in tools if tool["name"] == "backlog_audit_archive")
+    properties = audit_archive["inputSchema"]["properties"]
+    assert {"commit", "reason", "timeline_precheck", "verification", "graph_snapshot"}.issubset(
+        properties
+    )
+    assert "route_token" in properties
+    assert "route_waiver" in properties
+    assert "route_token_waiver" in properties
+    assert audit_archive["inputSchema"]["required"] == [
+        "project_id",
+        "bug_id",
+        "commit",
+        "reason",
+    ]
+
+
 def test_mcp_stdio_protected_write_schemas_expose_route_gate_fields():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
@@ -254,6 +278,60 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
                 "commit": "abc123",
                 "actor": "observer",
                 "route_token": route_token,
+                "route_waiver": route_waiver,
+            },
+        )
+    ]
+
+
+def test_mcp_backlog_audit_archive_forwards_payload():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    route_waiver = {
+        "accepted": True,
+        "waiver_type": "manual_fix",
+        "route_context_hash": "sha256:test-route-waiver",
+        "prompt_contract_id": "prompt-contract",
+        "caller_role": "observer",
+        "allowed_action": "backlog_audit_archive",
+        "scope": {"project_id": "aming-claw", "backlog_id": "BUG-ARCHIVE"},
+        "reason": "Unit test supplies explicit route waiver evidence.",
+        "timeline_evidence": {"event_id": "event-archive"},
+    }
+
+    result = dispatcher.dispatch(
+        "backlog_audit_archive",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-ARCHIVE",
+            "commit": "abc123",
+            "reason": "Historical close evidence cannot be reconstructed.",
+            "timeline_precheck": {"can_close": False},
+            "verification": {"tests": ["pytest"]},
+            "route_waiver": route_waiver,
+        },
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            "POST",
+            "/api/backlog/aming-claw/BUG-ARCHIVE/audit-archive",
+            {
+                "commit": "abc123",
+                "reason": "Historical close evidence cannot be reconstructed.",
+                "timeline_precheck": {"can_close": False},
+                "verification": {"tests": ["pytest"]},
                 "route_waiver": route_waiver,
             },
         )

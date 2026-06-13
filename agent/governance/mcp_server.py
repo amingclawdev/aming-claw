@@ -268,6 +268,33 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "backlog_audit_archive",
+        "description": "Observer-owned audit archive for implemented backlog rows that cannot legally reconstruct MF close evidence. Sets status=WAIVED; does not claim can_close or emit close_ready.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "commit": {"type": "string", "description": "Implementation commit hash to preserve on the archived row."},
+                "reason": {"type": "string", "description": "Human-readable reason explaining why ordinary MF close cannot be satisfied."},
+                "non_reconstructable_evidence_reason": {"type": "string"},
+                "references": {"type": "array", "items": {"type": "string"}},
+                "verification": {"type": "object"},
+                "graph_snapshot": {"type": "object"},
+                "graph_snapshot_id": {"type": "string"},
+                "timeline_precheck": {"type": "object"},
+                "runtime_context": {"type": "object"},
+                "source_backlog_id": {"type": "string"},
+                "source_runtime_context_id": {"type": "string"},
+                "actor": {"type": "string"},
+                "route_token": {"type": "object", "description": "Route-token evidence required for protected audit archive."},
+                "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
+                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
+            },
+            "required": ["project_id", "bug_id", "commit", "reason"],
+        },
+    },
+    {
         "name": "task_timeline_append",
         "description": "Append observer/agent execution evidence to the task timeline. Use this during MF work before close.",
         "inputSchema": {
@@ -600,6 +627,16 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         pid = args["project_id"]
         bug_id = args["bug_id"]
         return _http("POST", f"/api/backlog/{pid}/{bug_id}/close", args)
+
+    if name == "backlog_audit_archive":
+        pid = args["project_id"]
+        bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
+        body = {
+            key: value
+            for key, value in args.items()
+            if key not in {"project_id", "bug_id"} and value is not None
+        }
+        return _http("POST", f"/api/backlog/{pid}/{bug_id}/audit-archive", body)
 
     if name == "task_timeline_append":
         pid = args["project_id"]

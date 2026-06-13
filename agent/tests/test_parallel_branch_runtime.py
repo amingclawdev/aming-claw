@@ -935,6 +935,44 @@ def test_runtime_context_action_plan_translates_close_blockers_for_operator() ->
     )
 
 
+def test_runtime_context_action_plan_links_audit_archive_for_historical_close_blocker() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    control_plane = projection["views"]["control_plane"]
+    audit_action = action_plan["audit_archive_action"]
+
+    assert audit_action["schema_version"] == "runtime_context.audit_archive_action.v1"
+    assert audit_action["status"] == "available_when_historical_evidence_non_reconstructable"
+    assert audit_action["next_action"] == "backlog_audit_archive"
+    assert audit_action["normal_close_gate_passed"] is False
+    assert audit_action["close_ready_emitted"] is False
+    assert audit_action["entrypoint"]["path"] == (
+        "/api/backlog/{project_id}/{bug_id}/audit-archive"
+    )
+    assert audit_action["entrypoint"]["mcp_tool"] == "backlog_audit_archive"
+    assert "BUG-RUNTIME-CONTEXT" == audit_action["entrypoint"]["request_template"]["bug_id"]
+    assert control_plane["audit_archive_action"] == audit_action
+    assert action_plan["next_legal_action"] != "backlog_audit_archive"
+
+
 def test_runtime_context_action_plan_defers_permission_tree_hardening() -> None:
     context = _runtime_projection_context()
     projection = build_runtime_context_projection(

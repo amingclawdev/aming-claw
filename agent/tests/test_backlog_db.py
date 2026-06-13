@@ -753,6 +753,84 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         }
         self.assertFalse(_current_task_row_is_active(waived_row))
 
+    def test_audit_archive_sets_waived_and_preserves_non_close_evidence(self):
+        from governance.server import (
+            handle_backlog_audit_archive,
+            handle_backlog_get,
+            handle_backlog_list,
+            handle_backlog_upsert,
+        )
+
+        bug_id = "BW-AUDIT-ARCHIVE"
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Historical close blocker",
+                    "status": "OPEN",
+                    "details_md": "Implemented before close-gate capture existed.",
+                    "force_admit": True,
+                },
+            )
+        )
+
+        result = handle_backlog_audit_archive(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "commit": "abc123",
+                    "reason": (
+                        "Implemented commit exists, but mf_subagent_startup and "
+                        "close_ready evidence cannot be backfilled without "
+                        "fabricating timeline facts; see #3104."
+                    ),
+                    "timeline_precheck": {
+                        "can_close": False,
+                        "failed_gates": ["mf_subagent_startup", "close_ready"],
+                    },
+                    "verification": {"tests": ["pytest agent/tests/test_backlog_db.py"]},
+                    "graph_snapshot_id": "scope-test-audit",
+                    "route_waiver": _route_waiver("backlog_audit_archive", bug_id),
+                    "actor": "observer",
+                },
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "WAIVED")
+        archive = result["audit_archive"]
+        self.assertEqual(archive["schema_version"], "backlog_audit_archive.v1")
+        self.assertEqual(archive["implementation_commit"], "abc123")
+        self.assertIn("#3104", archive["references"])
+        self.assertFalse(archive["normal_close_gate"]["can_close"])
+        self.assertFalse(archive["normal_close_gate"]["can_close_claimed"])
+        self.assertFalse(archive["normal_close_gate"]["close_ready_emitted"])
+        self.assertFalse(archive["normal_close_gate"]["normal_close_gate_passed"])
+        self.assertEqual(
+            archive["evidence"]["timeline_precheck_failure_summary"]["failed_gates"],
+            ["mf_subagent_startup", "close_ready"],
+        )
+        self.assertEqual(
+            archive["evidence"]["graph_snapshot"]["snapshot_id"],
+            "scope-test-audit",
+        )
+
+        row = handle_backlog_get(
+            self._make_ctx({"project_id": "test-project", "bug_id": bug_id})
+        )
+        self.assertEqual(row["status"], "WAIVED")
+        self.assertEqual(row["commit"], "abc123")
+        self.assertEqual(row["takeover"]["audit_archive"]["row_status"], "WAIVED")
+        self.assertIn("normal_close_gate_passed: false", row["details_md"])
+
+        active = handle_backlog_list(
+            self._make_ctx(
+                {"project_id": "test-project"},
+                query={"view": "compact", "include_closed": "false", "limit": "50"},
+            )
+        )
+        self.assertNotIn(bug_id, {item["bug_id"] for item in active["bugs"]})
+
 
 class TestETLParsing(unittest.TestCase):
     """AC6: ETL dry-run vs apply parity."""
@@ -1536,6 +1614,24 @@ class TestFixedCloseWaiverAlerts(unittest.TestCase):
             has_close_waiver_resolver=lambda _bug: False,
         )
         self.assertFalse(result["alert"])
+
+    def test_waived_audit_archive_row_does_not_silence_fixed_alert_semantics(self):
+        from governance import backlog_db
+
+        conn = self._get_conn()
+        self._insert(conn, "BUG-AUDIT-ARCHIVED", "WAIVED")
+        self._insert(conn, "BUG-FIXED-NO-CLOSE", "FIXED")
+
+        result = backlog_db.fixed_close_waiver_alerts(
+            conn,
+            "test-project",
+            can_close_resolver=lambda _bug: False,
+            has_close_waiver_resolver=lambda _bug: False,
+        )
+
+        self.assertTrue(result["alert"])
+        self.assertEqual(result["alert_count"], 1)
+        self.assertEqual(result["alerts"][0]["bug_id"], "BUG-FIXED-NO-CLOSE")
 
 
 if __name__ == "__main__":

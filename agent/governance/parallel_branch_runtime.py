@@ -3504,6 +3504,67 @@ def _runtime_context_close_blocker_explanation(
     }
 
 
+def _runtime_context_audit_archive_action(
+    *,
+    values: Mapping[str, Any],
+    close_blocker_explanation: Mapping[str, Any],
+) -> dict[str, Any]:
+    explanations = [
+        item for item in close_blocker_explanation.get("explanations") or []
+        if isinstance(item, Mapping)
+    ]
+    has_close_blocker = bool(explanations) and not bool(
+        close_blocker_explanation.get("ready")
+    )
+    return {
+        "schema_version": "runtime_context.audit_archive_action.v1",
+        "status": "available_when_historical_evidence_non_reconstructable"
+        if has_close_blocker
+        else "not_applicable",
+        "next_action": "backlog_audit_archive" if has_close_blocker else "none",
+        "ordinary_close_gate_claimed": False,
+        "normal_close_gate_passed": False,
+        "close_ready_emitted": False,
+        "entrypoint": {
+            "method": "POST",
+            "path": "/api/backlog/{project_id}/{bug_id}/audit-archive",
+            "mcp_tool": "backlog_audit_archive",
+            "required_public_fields": [
+                "bug_id",
+                "commit",
+                "reason",
+                "timeline_precheck",
+                "verification",
+                "graph_snapshot",
+                "route_token or route_waiver",
+            ],
+            "request_template": {
+                "bug_id": _runtime_context_text(values.get("backlog_id")),
+                "reason": (
+                    "Historical MF close evidence is non-reconstructable; "
+                    "archive with explicit audit evidence instead of claiming "
+                    "ordinary MF close success."
+                ),
+                "source_runtime_context_id": _runtime_context_text(
+                    values.get("runtime_context_id")
+                ),
+            },
+        },
+        "operator_instruction": (
+            "Use only after timeline precheck shows the MF close blocker is "
+            "historical and cannot be legally reconstructed; this archives the "
+            "row as WAIVED and must not emit close_ready or can_close=true."
+            if has_close_blocker
+            else "Audit archive is not applicable while close gate is ready."
+        ),
+        "blocker_codes": [
+            _runtime_context_text(item.get("code"))
+            for item in explanations
+            if item.get("code")
+        ],
+    }
+
+
 def _runtime_context_next_legal_action(
     *,
     route_token_action: Mapping[str, Any],
@@ -3574,6 +3635,10 @@ def build_runtime_context_action_plan_view(
         values=values,
         close_gate_view=close_gate,
     )
+    audit_archive_action = _runtime_context_audit_archive_action(
+        values={**values, "runtime_context_id": current_view.get("runtime_context_id", "")},
+        close_blocker_explanation=close_blocker_explanation,
+    )
     next_legal_action = _runtime_context_next_legal_action(
         route_token_action=route_token_action,
         read_receipt_hash_action=read_receipt_hash_action,
@@ -3631,6 +3696,7 @@ def build_runtime_context_action_plan_view(
         "blocking_reasons": blocking_reasons,
         "route_token_action": route_token_action,
         "read_receipt_hash_action": read_receipt_hash_action,
+        "audit_archive_action": audit_archive_action,
         "close_blocker_explanation": close_blocker_explanation,
         "deferred_hardening": {
             "permission_tree": "deferred_next_layer",
@@ -3665,6 +3731,7 @@ def build_runtime_context_control_plane_view(
         "read_receipt_hash_action": dict(
             action_plan.get("read_receipt_hash_action") or {}
         ),
+        "audit_archive_action": dict(action_plan.get("audit_archive_action") or {}),
         "close_blocker_explanation": dict(
             action_plan.get("close_blocker_explanation") or {}
         ),

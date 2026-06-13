@@ -23770,6 +23770,7 @@ _BACKLOG_CLOSED_STATUSES = {
 _BACKLOG_DEFAULT_LIST_LIMIT = 100
 _BACKLOG_HARD_LIST_LIMIT = 200
 _BACKLOG_COMPACT_PREVIEW_CHARS = 280
+_BACKLOG_AUDIT_ARCHIVE_SCHEMA_VERSION = "backlog_audit_archive.v1"
 
 
 def _first_query_value(query: dict, key: str, default: str = "") -> str:
@@ -24960,6 +24961,211 @@ def _build_backlog_close_impact_check(conn, project_id: str, body: dict) -> dict
             "error": str(exc),
             "messages": [f"Close impact check failed: {exc}"],
         }
+
+
+def _json_object_field(value: Any) -> dict[str, Any]:
+    parsed = backlog_runtime.parse_json_object(value)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _backlog_audit_archive_notes(payload: Mapping[str, Any]) -> str:
+    reason = str(payload.get("reason") or "").strip()
+    commit = str(payload.get("implementation_commit") or "").strip()
+    references = ", ".join(str(item) for item in payload.get("references") or [])
+    note = (
+        "\n\n---\n"
+        "### Audit Archive Close\n\n"
+        f"- schema: {payload.get('schema_version')}\n"
+        "- row_status: WAIVED\n"
+        f"- implementation_commit: {commit}\n"
+        "- normal_close_gate_passed: false\n"
+        "- can_close_claimed: false\n"
+        "- close_ready_emitted: false\n"
+        f"- reason: {reason}\n"
+        f"- non_reconstructable_evidence_reason: {payload.get('non_reconstructable_evidence_reason')}\n"
+    )
+    if references:
+        note += f"- references: {references}\n"
+    return note
+
+
+def _build_backlog_audit_archive_payload(
+    *,
+    project_id: str,
+    bug_id: str,
+    body: Mapping[str, Any],
+    row: Mapping[str, Any],
+    archived_at: str,
+) -> dict[str, Any]:
+    reason = str(body.get("reason") or body.get("human_reason") or "").strip()
+    if not reason:
+        raise ValidationError("audit archive requires a human-readable reason")
+    commit_sha = str(
+        body.get("commit")
+        or body.get("implementation_commit")
+        or _row_get(row, "commit", "")
+        or ""
+    ).strip()
+    if not commit_sha:
+        raise ValidationError("audit archive requires implementation commit evidence")
+    references = _string_list_field(body.get("references"))
+    if "#3104" in reason and "#3104" not in references:
+        references.append("#3104")
+    timeline_precheck = _json_object_field(body.get("timeline_precheck"))
+    observed_can_close = timeline_precheck.get("can_close")
+    graph_snapshot = _json_object_field(body.get("graph_snapshot"))
+    if body.get("graph_snapshot_id") and not graph_snapshot.get("snapshot_id"):
+        graph_snapshot["snapshot_id"] = str(body.get("graph_snapshot_id") or "")
+    return {
+        "schema_version": _BACKLOG_AUDIT_ARCHIVE_SCHEMA_VERSION,
+        "status": "audit_archived",
+        "row_status": "WAIVED",
+        "project_id": project_id,
+        "bug_id": bug_id,
+        "archived_at": archived_at,
+        "archived_by": str(body.get("actor") or "observer"),
+        "implementation_commit": commit_sha,
+        "reason": reason,
+        "non_reconstructable_evidence_reason": str(
+            body.get("non_reconstructable_evidence_reason")
+            or "Historical MF close evidence was not recorded at the time of execution; "
+               "real mf_subagent_startup/close_ready evidence cannot be backfilled "
+               "without fabricating append-only timeline facts."
+        ),
+        "references": references,
+        "normal_close_gate": {
+            "normal_close_gate_passed": False,
+            "can_close": False,
+            "can_close_claimed": False,
+            "close_ready_emitted": False,
+            "ordinary_mf_close_claimed": False,
+            "observed_timeline_precheck_can_close": observed_can_close,
+        },
+        "evidence": {
+            "verification": _json_object_field(body.get("verification")),
+            "graph_snapshot": graph_snapshot,
+            "timeline_precheck_failure_summary": timeline_precheck,
+            "runtime_context": _json_object_field(body.get("runtime_context")),
+            "source_backlog_id": str(body.get("source_backlog_id") or bug_id),
+            "source_runtime_context_id": str(body.get("source_runtime_context_id") or ""),
+        },
+        "runtime_context_entrypoint": {
+            "method": "POST",
+            "path": "/api/backlog/{project_id}/{bug_id}/audit-archive",
+            "mcp_tool": "backlog_audit_archive",
+        },
+    }
+
+
+@route("POST", "/api/backlog/{project_id}/{bug_id}/audit-archive")
+def handle_backlog_audit_archive(ctx: RequestContext):
+    """Audit-archive an implemented row that cannot legally pass MF close."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    body = ctx.body
+    now = _utc_now()
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+        if str(row["status"] or "").upper() in _BACKLOG_CLOSED_STATUSES:
+            raise GovernanceError(
+                "invalid_status",
+                f"Bug must be active before audit archive, currently: {row['status']}",
+                422,
+            )
+
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="backlog_audit_archive",
+            project_id=pid,
+            backlog_id=bug_id,
+        )
+        payload = _build_backlog_audit_archive_payload(
+            project_id=pid,
+            bug_id=bug_id,
+            body=body,
+            row=row,
+            archived_at=now,
+        )
+        takeover = backlog_runtime.parse_json_object(_row_get(row, "takeover_json", "{}"))
+        takeover["audit_archive"] = payload
+        new_details = str(_row_get(row, "details_md", "") or "") + _backlog_audit_archive_notes(payload)
+        _record_route_token_gate_event(
+            conn,
+            pid,
+            route_gate,
+            backlog_id=bug_id,
+            commit_sha=payload["implementation_commit"],
+        )
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status = 'WAIVED',
+                   "commit" = ?,
+                   fixed_at = ?,
+                   updated_at = ?,
+                   details_md = ?,
+                   takeover_json = ?
+               WHERE bug_id = ?""",
+            (
+                payload["implementation_commit"],
+                now,
+                now,
+                new_details,
+                backlog_runtime.policy_json(takeover),
+                bug_id,
+            ),
+        )
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            "audit_archive",
+            project_id=pid,
+            failure_reason=payload["reason"],
+            result={"commit": payload["implementation_commit"], "route_token_gate": route_gate},
+            runtime_state="audit_archived",
+            takeover=takeover,
+        )
+        _publish_current_task_changed(
+            pid,
+            backlog_id=bug_id,
+            task_id=str(_row_get(row, "current_task_id", "")),
+            source="backlog.audit_archive",
+            runtime_state="audit_archived",
+        )
+        conn.commit()
+        try:
+            audit_service.record(
+                conn,
+                pid,
+                "backlog_audit_archive",
+                actor=body.get("actor", "observer"),
+                bug_id=bug_id,
+                commit=payload["implementation_commit"],
+                details=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        archived_row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        return {
+            "ok": True,
+            "project_id": pid,
+            "bug_id": bug_id,
+            "status": "WAIVED",
+            "audit_archive": payload,
+            "route_token_gate": route_gate,
+            "bug": _backlog_full_bug(archived_row) if archived_row else {},
+        }
+    finally:
+        conn.close()
 
 
 @route("POST", "/api/backlog/{project_id}/{bug_id}")
