@@ -887,6 +887,13 @@ def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
     )
+    close_timeline = _record_close_timeline(
+        conn,
+        backlog_id="BUG-CLOSE-ASSET",
+        task_id="close-asset-task",
+        suffix="close-asset",
+        same_owner_startup=True,
+    )
 
     result = server.handle_backlog_close(
         _ctx(
@@ -895,19 +902,16 @@ def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_
             body={
                 "commit": "c-close",
                 "actor": "test",
-                "bypass_timeline_gate": True,
-                "timeline_bypass_reason": "Unit test focuses on close impact output contract.",
                 "route_waiver": {
                     "accepted": True,
                     "waiver_type": "manual_fix",
                     "allowed_action": "backlog_close",
                     "project_id": PID,
                     "backlog_id": "BUG-CLOSE-ASSET",
-                    "route_context_hash": "sha256:test-route-context-backlog-close",
-                    "prompt_contract_id": "prompt-contract-backlog-close",
                     "caller_role": "observer",
                     "reason": "Unit test supplies explicit route gate waiver evidence.",
                     "timeline_evidence": {"event_id": "test-route-gate"},
+                    **close_timeline["route_identity"],
                 },
                 "changed_files": [
                     "scripts/external_protocol_mcp.py",
@@ -13119,6 +13123,191 @@ def _record_close_timeline(
     )
     conn.commit()
     return {"startup_event": startup, "route_identity": route_identity}
+
+
+def _insert_simple_mf_close_backlog(conn, backlog_id: str) -> None:
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            backlog_id,
+            "Simple MF close backlog",
+            "MF_IN_PROGRESS",
+            "chain_rescue",
+            '{"mf_type":"chain_rescue"}',
+            "2026-06-12T00:00:00Z",
+            "2026-06-12T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize("role", [None, "observer", "coordinator"])
+def test_backlog_close_bypass_timeline_gate_is_rejected_for_ai_reachable_callers(
+    conn,
+    role,
+):
+    role_label = role or "anonymous"
+    backlog_id = f"AC-BYPASS-TIMELINE-REJECTED-{role_label}"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    body = {
+        "actor": role_label,
+        "bypass_timeline_gate": True,
+        "timeline_bypass_reason": "This long reason used to skip the entire close gate.",
+        "route_waiver": _route_waiver("backlog_close", backlog_id=backlog_id),
+    }
+    ctx = (
+        _ctx_with_role(
+            {"project_id": PID, "bug_id": backlog_id},
+            role,
+            method="POST",
+            body=body,
+        )
+        if role
+        else _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body=body,
+        )
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(ctx)
+
+    assert exc.value.code == "mf_timeline_bypass_forbidden"
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_timeline_gate_bypass_rejected",
+    )
+    assert len(events) == 1
+    assert events[0]["payload"]["bypass_timeline_gate"] is True
+
+
+def test_hotfix_enter_records_timeline_event(conn):
+    result = server.handle_project_hotfix_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved emergency repair for close gate exposure.",
+                "backlog_id": "AC-HOTFIX-ENTER",
+                "task_id": "hotfix-enter-task",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["profile"] == "HOTFIX"
+    assert result["event"]["event_type"] == "hotfix.entered"
+    assert result["event"]["event_kind"] == "hotfix_entered"
+    assert result["event"]["payload"]["reason"].startswith("Human approved")
+
+
+def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):
+    entered = server.handle_project_hotfix_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved emergency close path audit marker.",
+                "backlog_id": "AC-HOTFIX-USAGE",
+            },
+        )
+    )
+    backlog_id = "AC-HOTFIX-USAGE"
+    task_id = "hotfix-usage-task"
+    suffix = "hotfix-usage"
+    _insert_close_timeline_backlog(conn, backlog_id=backlog_id, suffix=suffix)
+    recorded = _record_close_timeline(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        suffix=suffix,
+        same_owner_startup=True,
+    )
+    route_identity = recorded["route_identity"]
+
+    close_result = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "operator",
+                "under_hotfix": True,
+                "hotfix_ref": entered["hotfix_ref"],
+                "task_id": task_id,
+                "route_waiver": {
+                    "accepted": True,
+                    "waiver_type": "manual_fix",
+                    "allowed_action": "backlog_close",
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "caller_role": "observer",
+                    "reason": "Unit test supplies explicit route gate waiver evidence.",
+                    "timeline_evidence": {"event_id": entered["hotfix_ref"]},
+                    **route_identity,
+                },
+            },
+        )
+    )
+
+    assert close_result["ok"] is True
+    usage = server.handle_project_hotfix_usage(_ctx({"project_id": PID}))
+    assert usage["ok"] is True
+    entered_ids = {event["id"] for event in usage["hotfix_entered"]}
+    under_hotfix_ids = {event["id"] for event in usage["under_hotfix_events"]}
+    assert entered["event"]["id"] in entered_ids
+    assert close_result["hotfix_audit_event"]["id"] in under_hotfix_ids
+    assert any(
+        event["payload"].get("under_hotfix") is True
+        for event in usage["under_hotfix_events"]
+    )
+
+
+def test_under_hotfix_close_tag_does_not_bypass_timeline_gate(conn):
+    backlog_id = "AC-HOTFIX-DOES-NOT-BYPASS-CLOSE-GATE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "under_hotfix": True,
+                    "hotfix_ref": "timeline:hotfix-entered-test",
+                    "route_waiver": _route_waiver(
+                        "backlog_close",
+                        backlog_id=backlog_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "mf_timeline_gate_failed"
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="hotfix_backlog_close",
+    )
+    assert len(events) == 1
+    assert events[0]["payload"]["under_hotfix"] is True
+    assert events[0]["artifact_refs"]["under_hotfix"] is True
 
 
 def test_finish_gate_flags_known_bad_4178_startup_non_self_attesting():

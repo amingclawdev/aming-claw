@@ -25137,6 +25137,183 @@ def handle_backlog_start_mf(ctx: RequestContext):
         conn.close()
 
 
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _hotfix_ref_from_body(body: Mapping[str, Any]) -> str:
+    return str(
+        body.get("hotfix_ref")
+        or body.get("hotfix_reference")
+        or body.get("hotfix_event_id")
+        or body.get("hotfix_id")
+        or ""
+    ).strip()
+
+
+def _record_hotfix_backlog_close_tag(
+    conn,
+    *,
+    project_id: str,
+    bug_id: str,
+    body: Mapping[str, Any],
+    commit_sha: str = "",
+) -> dict:
+    if not _truthy_flag(body.get("under_hotfix")):
+        return {}
+
+    from . import task_timeline
+
+    hotfix_ref = _hotfix_ref_from_body(body)
+    task_id = str(body.get("task_id") or body.get("worker_id") or "").strip()
+    payload = {
+        "schema_version": "hotfix_action.v1",
+        "under_hotfix": True,
+        "action": "backlog_close",
+        "profile": "HOTFIX",
+        "hotfix_ref": hotfix_ref,
+        "backlog_id": bug_id,
+        "task_id": task_id,
+        "reason": str(body.get("hotfix_reason") or body.get("reason") or "").strip(),
+    }
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=bug_id,
+        task_id=task_id,
+        event_type="hotfix.backlog_close",
+        phase="hotfix",
+        event_kind="hotfix_backlog_close",
+        actor=str(body.get("actor") or "api"),
+        status="accepted",
+        payload=payload,
+        artifact_refs={
+            "under_hotfix": True,
+            "hotfix_ref": hotfix_ref,
+            "backlog_id": bug_id,
+            "task_id": task_id,
+        },
+        commit_sha=commit_sha,
+    )
+    conn.commit()
+    return event
+
+
+def _contains_under_hotfix(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key == "under_hotfix" and _truthy_flag(child):
+                return True
+            if _contains_under_hotfix(child):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_under_hotfix(item) for item in value)
+    return False
+
+
+@route("POST", "/api/projects/{project_id}/hotfix/enter")
+def handle_project_hotfix_enter(ctx: RequestContext):
+    """Record audit-only entry into a HOTFIX profile."""
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    reason = str(
+        body.get("reason")
+        or body.get("human_reason")
+        or body.get("hotfix_reason")
+        or ""
+    ).strip()
+    if not reason:
+        raise ValidationError("hotfix entry requires a human reason")
+
+    from . import task_timeline
+
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    actor = str(body.get("actor") or "api").strip()
+    with DBContext(project_id) as conn:
+        event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_type="hotfix.entered",
+            phase="hotfix",
+            event_kind="hotfix_entered",
+            actor=actor,
+            status="accepted",
+            payload={
+                "schema_version": "hotfix_entered.v1",
+                "profile": "HOTFIX",
+                "reason": reason,
+                "actor": actor,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            artifact_refs={
+                "profile": "HOTFIX",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "profile": "HOTFIX",
+        "event": event,
+        "hotfix_ref": f"timeline:{event['id']}",
+    }
+
+
+@route("GET", "/api/projects/{project_id}/hotfix/usage")
+def handle_project_hotfix_usage(ctx: RequestContext):
+    """Return audit-only HOTFIX entry and under_hotfix timeline usage."""
+    project_id = ctx.get_project_id()
+    try:
+        limit = int(_first_query_value(ctx.query, "limit", "1000") or 1000)
+    except (TypeError, ValueError):
+        limit = 1000
+    from . import task_timeline
+
+    with DBContext(project_id) as conn:
+        events = task_timeline.list_events(conn, project_id, limit=limit)
+    hotfix_entered = [
+        event for event in events
+        if str(event.get("event_kind") or "") == "hotfix_entered"
+        or str(event.get("event_type") or "") == "hotfix.entered"
+    ]
+    under_hotfix_events = [
+        event for event in events
+        if any(
+            _contains_under_hotfix(event.get(key))
+            for key in ("payload", "verification", "artifact_refs")
+        )
+    ]
+    usage_events = []
+    seen: set[int] = set()
+    for event in [*hotfix_entered, *under_hotfix_events]:
+        event_id = int(event.get("id") or 0)
+        if event_id in seen:
+            continue
+        seen.add(event_id)
+        usage_events.append(event)
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "profile": "HOTFIX",
+        "hotfix_entered": hotfix_entered,
+        "under_hotfix_events": under_hotfix_events,
+        "events": usage_events,
+        "count": len(usage_events),
+    }
+
+
 @route("POST", "/api/backlog/{project_id}/{bug_id}/close")
 def handle_backlog_close(ctx: RequestContext):
     """Close a backlog bug: set status=FIXED, commit, fixed_at."""
@@ -25186,6 +25363,13 @@ def handle_backlog_close(ctx: RequestContext):
             ctx,
             action="backlog_close",
             backlog_id=bug_id,
+        )
+        hotfix_audit_event = _record_hotfix_backlog_close_tag(
+            conn,
+            project_id=pid,
+            bug_id=bug_id,
+            body=body,
+            commit_sha=commit_sha,
         )
         timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
         identity_block = _backlog_close_route_waiver_identity_block(
@@ -25280,6 +25464,8 @@ def handle_backlog_close(ctx: RequestContext):
                 request_id=str(ctx.request_id),
             )
         result["route_token_gate"] = route_gate
+        if hotfix_audit_event:
+            result["hotfix_audit_event"] = hotfix_audit_event
         if close_impact_check:
             result["close_impact_check"] = close_impact_check
         return result
@@ -25296,35 +25482,35 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
 
     from . import task_timeline
 
-    bypass = bool(body.get("bypass_timeline_gate"))
-    if bypass:
+    if bool(body.get("bypass_timeline_gate")):
         reason = str(body.get("timeline_bypass_reason") or "").strip()
-        if len(reason) < 20:
-            raise GovernanceError(
-                "mf_timeline_bypass_reason_required",
-                "bypass_timeline_gate requires timeline_bypass_reason with at least 20 characters",
-                422,
-            )
         verification = {
             "schema_version": "mf_close_timeline_gate.v1",
-            "passed": True,
-            "status": "bypassed",
+            "passed": False,
+            "status": "rejected",
+            "bypass_timeline_gate": True,
             "reason": reason,
         }
         task_timeline.record_event(
             conn,
             project_id=project_id,
             backlog_id=bug_id,
-            event_type="mf_timeline_gate_bypass",
+            event_type="mf_timeline_gate_bypass_rejected",
             phase="close",
-            event_kind="timeline_gate_bypass",
+            event_kind="mf_timeline_gate_bypass_rejected",
             actor=str(body.get("actor") or "observer"),
-            status="accepted",
-            payload={"reason": reason},
+            status="rejected",
+            payload={"bypass_timeline_gate": True, "reason": reason},
             verification=verification,
             commit_sha=str(body.get("commit") or ""),
         )
-        return verification
+        conn.commit()
+        raise GovernanceError(
+            "mf_timeline_bypass_forbidden",
+            "bypass_timeline_gate is forbidden; MF close timeline evidence cannot be skipped",
+            422,
+            verification,
+        )
 
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
