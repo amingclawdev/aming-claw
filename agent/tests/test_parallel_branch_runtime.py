@@ -30,6 +30,7 @@ from agent.governance.parallel_branch_runtime import (
     ACTION_WAIT_FOR_DEPENDENCY,
     RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION,
@@ -1118,6 +1119,42 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     assert worker_view["graph_query_identity"]["fence_token_hash"] == fence_hash
     assert worker_view["graph_query_identity"]["fence_token_redacted"] is True
     assert "fence_token" not in worker_view["graph_query_identity"]
+    boundary = payload["views"]["capability_boundary"]
+    assert boundary["schema_version"] == RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION
+    assert boundary["runtime_context_id"] == payload["runtime_context_id"]
+    assert boundary["task_id"] == "mf-sub-runtime-context"
+    assert boundary["role"] == "mf_sub"
+    assert boundary["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
+    assert boundary["target_files"] == ["agent/governance/parallel_branch_runtime.py"]
+    assert boundary["fence_token_present"] is True
+    assert boundary["fence_token_hash"] == fence_hash
+    assert boundary["fence_token_redacted"] is True
+    assert boundary["raw_session_token_exposed"] is False
+    assert boundary["raw_fence_token_exposed"] is False
+    assert boundary["graph_query_scope"] == {
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "allowed_query_purposes": [
+            "subagent_context_build",
+            "subagent_gate_validation",
+        ],
+        "worker_role": "mf_sub",
+        "runtime_context_id": payload["runtime_context_id"],
+        "task_id": "mf-sub-runtime-context",
+        "parent_task_id": "parent-runtime-context",
+        "governance_project_id": PROJECT_ID,
+        "target_project_id": PROJECT_ID,
+        "target_project_root": "/repo",
+    }
+    assert boundary["capability_boundary_hash"] == runtime_context_content_hash(
+        {key: value for key, value in boundary.items() if key != "capability_boundary_hash"}
+    )
+    assert worker_view["capability_boundary"] == boundary
+    assert worker_view["capability_boundary_hash"] == boundary["capability_boundary_hash"]
+    assert worker_view["control_plane"]["capability_boundary"] == boundary
+    assert worker_view["control_plane"]["capability_boundary_hash"] == (
+        boundary["capability_boundary_hash"]
+    )
     dispatch_fence = worker_view["gate_inputs"]["gates"]["dispatch"]["fields"][
         "fence_token"
     ]
@@ -1237,6 +1274,7 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
     assert content_address["root_hash"] == content_address["projection_hash"]
     assert set(content_address["nodes"]) == {
         "action_plan",
+        "capability_boundary",
         "control_plane",
         "current",
         "gate_inputs",
@@ -1271,8 +1309,14 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
         content_address,
         runtime_context_audit_nodes_for_views(projection, "worker_view"),
     )
-    assert set(scoped_content_address["nodes"]) == {"worker_view"}
-    assert set(scoped_content_address["view_hashes"]) == {"worker_view"}
+    assert set(scoped_content_address["nodes"]) == {
+        "capability_boundary",
+        "worker_view",
+    }
+    assert set(scoped_content_address["view_hashes"]) == {
+        "capability_boundary",
+        "worker_view",
+    }
 
     serialized_content_address = json.dumps(content_address, sort_keys=True)
     assert private_secret not in serialized_content_address
@@ -1371,6 +1415,15 @@ def test_runtime_context_access_audit_persists_hashes_not_raw_tokens() -> None:
     assert row["role"] == "mf_sub"
     assert row["view_name"] == "worker_view"
     assert row["projection_hash"] == projection["content_address"]["projection_hash"]
+    stored_nodes = json.loads(row["nodes_read_json"])
+    assert {node["view"] for node in stored_nodes} == {
+        "capability_boundary",
+        "worker_view",
+    }
+    assert {
+        projection["content_address"]["nodes"][node["view"]]["view_hash"]
+        for node in stored_nodes
+    } == {node["view_hash"] for node in stored_nodes}
     nodes_json = row["nodes_read_json"]
     metadata_json = row["metadata_json"]
     for secret in (

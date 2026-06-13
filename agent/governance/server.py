@@ -6136,6 +6136,7 @@ def _runtime_context_projection_response(
             "gate_inputs",
             "action_plan",
             "control_plane",
+            "capability_boundary",
             "worker_view",
             "close_gate_view",
         }

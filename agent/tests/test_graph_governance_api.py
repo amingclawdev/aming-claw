@@ -2660,6 +2660,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "gate_inputs",
         "action_plan",
         "control_plane",
+        "capability_boundary",
         "worker_view",
         "close_gate_view",
     }.issubset(observer_views)
@@ -2672,8 +2673,18 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     )
     assert current["graph_trace_refs"]["trace_ids"] == ["gqt-runtime-current"]
     control_plane = observer_views["control_plane"]
+    capability_boundary = observer_views["capability_boundary"]
     assert control_plane["schema_version"] == "runtime_context.control_plane.v1"
     assert control_plane["next_legal_action"] == "record_finish_gate"
+    assert capability_boundary["schema_version"] == "runtime_context.capability_boundary.v1"
+    assert capability_boundary["owned_files"] == ["agent/governance/server.py"]
+    assert capability_boundary["fence_token_hash"] == (
+        "sha256:" + hashlib.sha256(b"fence-current").hexdigest()
+    )
+    assert capability_boundary["raw_fence_token_exposed"] is False
+    assert control_plane["capability_boundary_hash"] == (
+        capability_boundary["capability_boundary_hash"]
+    )
     assert control_plane["route_token_action"]["status"] == "present"
     assert control_plane["route_token_action"]["next_action"] == "none"
     assert control_plane["route_token_action"]["entrypoint"]["path"] == (
@@ -2694,6 +2705,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert observer_content_address["projection_hash"].startswith("sha256:")
     assert set(observer_content_address["nodes"]) == {
         "action_plan",
+        "capability_boundary",
         "control_plane",
         "current",
         "gate_inputs",
@@ -2809,10 +2821,16 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "content_address"
     ]
     assert worker_content_address["projection_hash"].startswith("sha256:")
-    assert set(worker_content_address["nodes"]) == {"worker_view"}
+    assert set(worker_content_address["nodes"]) == {
+        "capability_boundary",
+        "worker_view",
+    }
     worker_audit = worker_result["access_audit"]
     assert worker_audit["projection_hash"].startswith("sha256:")
-    assert {node["view"] for node in worker_audit["nodes_read"]} == {"worker_view"}
+    assert {node["view"] for node in worker_audit["nodes_read"]} == {
+        "capability_boundary",
+        "worker_view",
+    }
     worker_audit_row = conn.execute(
         """
         SELECT principal_id, role, view_name, projection_hash, nodes_read_json,
@@ -2826,7 +2844,9 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert worker_audit_row["principal_id"] == "mf_sub-principal"
     assert worker_audit_row["role"] == "mf_sub"
     assert worker_audit_row["view_name"] == "worker_view"
-    assert json.loads(worker_audit_row["nodes_read_json"])[0]["view"] == "worker_view"
+    assert {
+        node["view"] for node in json.loads(worker_audit_row["nodes_read_json"])
+    } == {"capability_boundary", "worker_view"}
     assert "runtime-current-session" not in worker_audit_row["metadata_json"]
     assert "fence-current" not in worker_audit_row["metadata_json"]
     assert "must-not-leak" not in worker_audit_row["metadata_json"]

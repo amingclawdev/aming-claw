@@ -307,6 +307,9 @@ RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION = "runtime_context.worker_view.v1"
 RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_view.v1"
 RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION = "runtime_context.action_plan.v1"
 RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION = "runtime_context.control_plane.v1"
+RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION = (
+    "runtime_context.capability_boundary.v1"
+)
 RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION = "runtime_context.role_filter_policy.v1"
 RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION = "runtime_context.content_address.v1"
 RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION = "runtime_context.access_audit.v1"
@@ -566,6 +569,7 @@ class RuntimeContextProjection:
     gate_inputs: dict[str, Any]
     action_plan: dict[str, Any]
     control_plane: dict[str, Any]
+    capability_boundary: dict[str, Any]
     worker_view: dict[str, Any]
     close_gate_view: dict[str, Any]
 
@@ -575,6 +579,7 @@ class RuntimeContextProjection:
             "gate_inputs": self.gate_inputs,
             "action_plan": self.action_plan,
             "control_plane": self.control_plane,
+            "capability_boundary": self.capability_boundary,
             "worker_view": self.worker_view,
             "close_gate_view": self.close_gate_view,
         }
@@ -1405,6 +1410,7 @@ def runtime_context_audit_nodes_for_views(
     )
     requested = [view_names] if isinstance(view_names, str) else list(view_names)
     result: list[dict[str, Any]] = []
+    seen_views: set[str] = set()
     for requested_view in requested:
         view_name = str(requested_view or "")
         if view_name == "all" and isinstance(nodes, Mapping):
@@ -1417,6 +1423,16 @@ def runtime_context_audit_nodes_for_views(
         node = nodes.get(view_name) if isinstance(nodes, Mapping) else None
         if isinstance(node, Mapping):
             result.append(dict(node))
+            seen_views.add(view_name)
+        if view_name in {"worker_view", "control_plane"}:
+            boundary = (
+                nodes.get("capability_boundary")
+                if isinstance(nodes, Mapping)
+                else None
+            )
+            if isinstance(boundary, Mapping) and "capability_boundary" not in seen_views:
+                result.append(dict(boundary))
+                seen_views.add("capability_boundary")
     return result
 
 
@@ -3720,10 +3736,17 @@ def build_runtime_context_action_plan_view(
 
 def build_runtime_context_control_plane_view(
     action_plan_view: Mapping[str, Any],
+    *,
+    capability_boundary_view: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Expose the action plan under a stable Runtime Context control-plane view."""
 
     action_plan = dict(action_plan_view)
+    capability_boundary = (
+        dict(capability_boundary_view)
+        if isinstance(capability_boundary_view, Mapping)
+        else {}
+    )
     return {
         "schema_version": RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
         "runtime_context_id": action_plan.get("runtime_context_id", ""),
@@ -3739,9 +3762,85 @@ def build_runtime_context_control_plane_view(
         "close_blocker_explanation": dict(
             action_plan.get("close_blocker_explanation") or {}
         ),
+        "capability_boundary": capability_boundary,
+        "capability_boundary_hash": _runtime_context_text(
+            capability_boundary.get("capability_boundary_hash")
+        )
+        or (runtime_context_content_hash(capability_boundary) if capability_boundary else ""),
         "deferred_hardening": dict(action_plan.get("deferred_hardening") or {}),
         "action_plan": action_plan,
     }
+
+
+def build_runtime_context_capability_boundary_view(
+    current_view: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project public worker capability bounds from existing runtime fields."""
+
+    values = _runtime_context_mapping(current_view.get("current_values"))
+    graph_identity = _runtime_context_mapping(values.get("graph_query_identity"))
+    runtime_context_id = _runtime_context_text(
+        current_view.get("runtime_context_id") or values.get("runtime_context_id")
+    )
+    task_id = _runtime_context_text(values.get("task_id"))
+    role = _runtime_context_text(values.get("worker_role") or RUNTIME_CONTEXT_WORKER_ROLE)
+    target_files = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("target_files"))
+    )
+    owned_files = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("owned_files")) or target_files
+    )
+    graph_scope = {
+        "query_source": _runtime_context_text(
+            graph_identity.get("query_source") or "mf_subagent"
+        ),
+        "query_purpose": _runtime_context_text(
+            graph_identity.get("query_purpose")
+            or graph_identity.get("purpose")
+            or "subagent_context_build"
+        ),
+        "allowed_query_purposes": [
+            "subagent_context_build",
+            "subagent_gate_validation",
+        ],
+        "worker_role": _runtime_context_text(graph_identity.get("worker_role") or role),
+        "runtime_context_id": runtime_context_id,
+        "task_id": _runtime_context_text(graph_identity.get("task_id") or task_id),
+        "parent_task_id": _runtime_context_text(
+            graph_identity.get("parent_task_id") or values.get("parent_task_id")
+        ),
+        "governance_project_id": _runtime_context_text(
+            graph_identity.get("governance_project_id")
+            or values.get("governance_project_id")
+            or values.get("project_id")
+        ),
+        "target_project_id": _runtime_context_text(
+            graph_identity.get("target_project_id")
+            or values.get("target_project_id")
+            or values.get("project_id")
+        ),
+        "target_project_root": _runtime_context_text(
+            graph_identity.get("target_project_root")
+            or values.get("target_project_root")
+        ),
+    }
+    fence_token_present = bool(values.get("fence_token_present"))
+    boundary = {
+        "schema_version": RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "role": role,
+        "owned_files": owned_files,
+        "target_files": target_files,
+        "fence_token_present": fence_token_present,
+        "fence_token_hash": _runtime_context_text(values.get("fence_token_hash")),
+        "fence_token_redacted": fence_token_present,
+        "graph_query_scope": graph_scope,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+    }
+    boundary["capability_boundary_hash"] = runtime_context_content_hash(boundary)
+    return boundary
 
 
 def build_runtime_context_worker_view(
@@ -3754,6 +3853,7 @@ def build_runtime_context_worker_view(
     close_gate_view: Mapping[str, Any] | None = None,
     action_plan_view: Mapping[str, Any] | None = None,
     control_plane_view: Mapping[str, Any] | None = None,
+    capability_boundary_view: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the mf_sub-safe role-filtered view for one worker/fence/task."""
 
@@ -3789,10 +3889,18 @@ def build_runtime_context_worker_view(
             close_gate_view=close_gate,
         )
     )
+    capability_boundary = (
+        dict(capability_boundary_view)
+        if isinstance(capability_boundary_view, Mapping)
+        else build_runtime_context_capability_boundary_view(current_view)
+    )
     control_plane = (
         dict(control_plane_view)
         if isinstance(control_plane_view, Mapping)
-        else build_runtime_context_control_plane_view(action_plan)
+        else build_runtime_context_control_plane_view(
+            action_plan,
+            capability_boundary_view=capability_boundary,
+        )
     )
     return {
         "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
@@ -3858,6 +3966,11 @@ def build_runtime_context_worker_view(
         | {"raw_private_context_exposed": False},
         "work": dict(_runtime_context_mapping(current_view.get("work"))),
         "graph_query_identity": values.get("graph_query_identity", {}),
+        "capability_boundary": capability_boundary,
+        "capability_boundary_hash": _runtime_context_text(
+            capability_boundary.get("capability_boundary_hash")
+        )
+        or runtime_context_content_hash(capability_boundary),
         "lane_plan": dict(_runtime_context_mapping(current_view.get("lane_plan"))),
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,
@@ -3888,6 +4001,7 @@ def build_runtime_context_worker_view(
                 "work",
                 "lane_plan",
                 "graph_query_identity",
+                "capability_boundary",
                 "gate_inputs",
                 "close_gate_view",
                 "action_plan",
@@ -3958,7 +4072,11 @@ def build_runtime_context_projection(
         gate_inputs_view=gate_inputs,
         close_gate_view=close_gate,
     )
-    control_plane = build_runtime_context_control_plane_view(action_plan)
+    capability_boundary = build_runtime_context_capability_boundary_view(current)
+    control_plane = build_runtime_context_control_plane_view(
+        action_plan,
+        capability_boundary_view=capability_boundary,
+    )
     worker_view = build_runtime_context_worker_view(
         current,
         task_id=context.task_id,
@@ -3968,6 +4086,7 @@ def build_runtime_context_projection(
         close_gate_view=close_gate,
         action_plan_view=action_plan,
         control_plane_view=control_plane,
+        capability_boundary_view=capability_boundary,
     )
     return RuntimeContextProjection(
         project_id=context.project_id,
@@ -3976,6 +4095,7 @@ def build_runtime_context_projection(
         gate_inputs=gate_inputs,
         action_plan=action_plan,
         control_plane=control_plane,
+        capability_boundary=capability_boundary,
         worker_view=worker_view,
         close_gate_view=close_gate,
     )
