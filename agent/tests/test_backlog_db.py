@@ -22,15 +22,28 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _route_token(action="backlog_upsert", bug_id="BUG-ROUTE", project_id="test-project"):
-    return {
-        "route_context_hash": f"sha256:test-route-context-{action}",
-        "prompt_contract_id": f"prompt-contract-{action}",
-        "caller_role": "observer",
-        "allowed_action": action,
-        "scope": {"project_id": project_id, "backlog_id": bug_id},
-        "expires_at": "2999-01-01T00:00:00Z",
-        "evidence_refs": ["timeline:test-route-token"],
-    }
+    from governance import observer_route_context
+    from governance.db import get_connection
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id=bug_id,
+        task_id=f"test-route-token-{bug_id}",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=[action],
+        evidence_refs=[f"timeline:test-route-token-{action}"],
+    )
+    conn = get_connection(project_id)
+    try:
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=issued["route_token_ref"],
+            token=issued["route_token"],
+        )
+    finally:
+        conn.close()
+    return issued["route_token"]
 
 
 def _route_waiver(action="backlog_upsert", bug_id="BUG-ROUTE", project_id="test-project"):

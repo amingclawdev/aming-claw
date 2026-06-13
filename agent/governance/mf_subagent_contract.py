@@ -468,6 +468,8 @@ _META_ACTION_ALIASES = {
     "hotfix_under_action": "hotfix_under_action",
     "route_token_gate": "route_token_gate",
     "route_token_gate_project_bootstrap_refusal": "route_token_gate",
+    "route_identity_cleanup": "route_identity_cleanup",
+    "route_identity": "route_identity_cleanup",
     "service_route": "service_route",
     "service_route_completed": "service_route",
     "service_route_blocked": "service_route",
