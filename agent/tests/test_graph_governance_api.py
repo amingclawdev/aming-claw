@@ -2592,6 +2592,8 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
             "prompt_contract_id": "rprompt-current",
             "prompt_contract_hash": "sha256:prompt-current",
             "visible_injection_manifest_hash": "sha256:visible-current",
+            "route_token_ref": "rtok-current",
+            "route_token": "raw-route-token-current",
             "raw_private_context": "must-not-leak",
         },
         now_iso="2026-06-06T10:01:00Z",
@@ -2653,9 +2655,14 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert observer_result["role_scope"] == "observer"
     assert "fence-current" not in json.dumps(observer_result, sort_keys=True)
     observer_views = observer_result["runtime_context_service"]["views"]
-    assert {"current", "gate_inputs", "worker_view", "close_gate_view"}.issubset(
-        observer_views
-    )
+    assert {
+        "current",
+        "gate_inputs",
+        "action_plan",
+        "control_plane",
+        "worker_view",
+        "close_gate_view",
+    }.issubset(observer_views)
     current = observer_views["current"]
     assert current["route_identity"]["route_context_hash"] == "sha256:route-current"
     assert current["route_identity"]["prompt_contract_hash"] == "sha256:prompt-current"
@@ -2664,7 +2671,20 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         f"timeline:{read_receipt['id']}"
     )
     assert current["graph_trace_refs"]["trace_ids"] == ["gqt-runtime-current"]
+    control_plane = observer_views["control_plane"]
+    assert control_plane["schema_version"] == "runtime_context.control_plane.v1"
+    assert control_plane["next_legal_action"] == "record_finish_gate"
+    assert control_plane["route_token_action"]["status"] == "present"
+    assert control_plane["route_token_action"]["next_action"] == "none"
+    assert control_plane["route_token_action"]["entrypoint"]["path"] == (
+        "/api/projects/{project_id}/observer/route-context/issue"
+    )
+    assert control_plane["route_token_action"]["entrypoint"][
+        "required_public_fields"
+    ] == ["backlog_id", "task_id", "target_files", "caller_role"]
+    assert control_plane["read_receipt_hash_action"]["status"] == "present"
     assert "must-not-leak" not in json.dumps(observer_result, sort_keys=True)
+    assert "raw-route-token-current" not in json.dumps(observer_result, sort_keys=True)
     observer_content_address = observer_result["runtime_context_service"][
         "content_address"
     ]
@@ -2673,6 +2693,8 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     )
     assert observer_content_address["projection_hash"].startswith("sha256:")
     assert set(observer_content_address["nodes"]) == {
+        "action_plan",
+        "control_plane",
         "current",
         "gate_inputs",
         "worker_view",
@@ -2769,8 +2791,19 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     ] == fence_hash
     assert worker_view["role_filter_policy"]["raw_private_context_exposed"] is False
     assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
+    assert worker_view["action_plan"]["schema_version"] == "runtime_context.action_plan.v1"
+    assert worker_view["control_plane"]["schema_version"] == (
+        "runtime_context.control_plane.v1"
+    )
+    assert worker_view["control_plane"]["route_token_action"]["status"] == "present"
+    assert worker_view["control_plane"]["route_token_action"]["next_action"] == "none"
+    assert worker_view["control_plane"]["read_receipt_hash_action"]["status"] == (
+        "present"
+    )
     assert "current_values" not in worker_view
     assert "fence-current" not in json.dumps(worker_result, sort_keys=True)
+    assert "runtime-current-session" not in json.dumps(worker_result, sort_keys=True)
+    assert "raw-route-token-current" not in json.dumps(worker_result, sort_keys=True)
     assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
     worker_content_address = worker_result["runtime_context_service"][
         "content_address"

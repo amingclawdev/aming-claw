@@ -305,6 +305,8 @@ RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION = "runtime_context.current.v1"
 RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION = "runtime_context.gate_inputs.v1"
 RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION = "runtime_context.worker_view.v1"
 RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_view.v1"
+RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION = "runtime_context.action_plan.v1"
+RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION = "runtime_context.control_plane.v1"
 RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION = "runtime_context.role_filter_policy.v1"
 RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION = "runtime_context.content_address.v1"
 RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION = "runtime_context.access_audit.v1"
@@ -562,6 +564,8 @@ class RuntimeContextProjection:
     runtime_context_id: str
     current: dict[str, Any]
     gate_inputs: dict[str, Any]
+    action_plan: dict[str, Any]
+    control_plane: dict[str, Any]
     worker_view: dict[str, Any]
     close_gate_view: dict[str, Any]
 
@@ -569,6 +573,8 @@ class RuntimeContextProjection:
         views = {
             "current": self.current,
             "gate_inputs": self.gate_inputs,
+            "action_plan": self.action_plan,
+            "control_plane": self.control_plane,
             "worker_view": self.worker_view,
             "close_gate_view": self.close_gate_view,
         }
@@ -3218,6 +3224,455 @@ def build_runtime_context_close_gate_view(
     }
 
 
+def _runtime_context_control_route_identity(
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "route_id": _runtime_context_text(values.get("route_id")),
+        "route_context_hash": _runtime_context_text(
+            values.get("route_context_hash")
+        ),
+        "prompt_contract_id": _runtime_context_text(
+            values.get("prompt_contract_id")
+        ),
+        "prompt_contract_hash": _runtime_context_text(
+            values.get("prompt_contract_hash")
+        ),
+        "route_token_ref": _runtime_context_text(values.get("route_token_ref")),
+    }
+
+
+def _runtime_context_missing_evidence(
+    *,
+    gate_inputs_view: Mapping[str, Any],
+    lane_plan: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    missing: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in gate_inputs_view.get("missing") or []:
+        if not isinstance(item, Mapping):
+            continue
+        gate = _runtime_context_text(item.get("gate"))
+        field = _runtime_context_text(item.get("field"))
+        key = ("gate", gate, field)
+        if key in seen:
+            continue
+        seen.add(key)
+        missing.append(
+            {
+                "kind": "gate_input",
+                "gate": gate,
+                "field": field,
+                "expected_source": _runtime_context_text(
+                    item.get("expected_source")
+                ),
+                "producer": _runtime_context_text(item.get("producer")),
+                "consumer": _runtime_context_text(item.get("consumer")),
+                "evidence_ref": _runtime_context_text(item.get("evidence_ref")),
+                "message": _runtime_context_text(item.get("message")),
+            }
+        )
+    for item in lane_plan.get("missing") or []:
+        if not isinstance(item, Mapping):
+            continue
+        clause = _runtime_context_text(item.get("clause"))
+        key = ("lane", clause, "")
+        if not clause or key in seen:
+            continue
+        seen.add(key)
+        missing.append(
+            {
+                "kind": "lane_clause",
+                "clause": clause,
+                "status": _runtime_context_text(item.get("status") or "missing"),
+            }
+        )
+    return missing
+
+
+def _runtime_context_route_token_action(
+    *,
+    values: Mapping[str, Any],
+    gate_inputs_view: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    canonical = _runtime_context_control_route_identity(values)
+    route_token_ref = canonical.get("route_token_ref", "")
+    route_state = _runtime_context_text(
+        route_identity.get("status")
+        or route_identity.get("decision")
+        or route_identity.get("route_token_status")
+    ).lower()
+    missing_route_token = any(
+        isinstance(item, Mapping)
+        and item.get("field") == "route_token_ref"
+        for item in gate_inputs_view.get("missing") or []
+    )
+    stale_route_token = route_state in {
+        "expired",
+        "invalid",
+        "revoked",
+        "stale",
+        "superseded",
+    }
+    if missing_route_token or not route_token_ref:
+        status = "missing"
+        next_action = "refresh_route_token_ref"
+        issue = "canonical route identity is missing route_token_ref"
+    elif stale_route_token:
+        status = "stale"
+        next_action = "refresh_route_token_ref"
+        issue = f"canonical route token ref is {route_state}"
+    else:
+        status = "present"
+        next_action = "none"
+        issue = ""
+    return {
+        "schema_version": "runtime_context.route_token_action.v1",
+        "status": status,
+        "next_action": next_action,
+        "issue": issue,
+        "route_token_ref_present": bool(route_token_ref),
+        "entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "required_public_fields": [
+                "backlog_id",
+                "task_id",
+                "target_files",
+                "caller_role",
+            ],
+            "request_template": {
+                "backlog_id": _runtime_context_text(values.get("backlog_id")),
+                "task_id": _runtime_context_text(values.get("task_id")),
+                "target_files": list(values.get("target_files") or []),
+                "caller_role": "observer",
+            },
+            "runtime_context_persistence": (
+                "Persist route_token_ref/hash evidence only; raw route tokens "
+                "must not persist in runtime context output."
+            ),
+        },
+        "canonical_route_identity": canonical,
+        "expected_binding": {
+            "route_id": canonical.get("route_id", ""),
+            "route_context_hash": canonical.get("route_context_hash", ""),
+            "prompt_contract_id": canonical.get("prompt_contract_id", ""),
+            "prompt_contract_hash": canonical.get("prompt_contract_hash", ""),
+            "route_token_ref": route_token_ref,
+        },
+        "operator_instruction": (
+            "Refresh route-token evidence for this canonical route identity "
+            "and persist only route_token_ref/hash evidence; raw route tokens "
+            "must stay out of runtime-context projections."
+            if status in {"missing", "stale"}
+            else "Route-token reference is present for the canonical route identity."
+        ),
+    }
+
+
+def _runtime_context_read_receipt_hash_action(
+    *,
+    current_view: Mapping[str, Any],
+    gate_inputs_view: Mapping[str, Any],
+    close_gate_view: Mapping[str, Any],
+) -> dict[str, Any]:
+    values = _runtime_context_mapping(current_view.get("current_values"))
+    runtime_context_id = _runtime_context_text(current_view.get("runtime_context_id"))
+    read_receipt_ref = _runtime_context_text(values.get("read_receipt_event_ref"))
+    current_node = _runtime_context_projection_node(
+        runtime_context_id=runtime_context_id,
+        view_name="current",
+        payload=current_view,
+    )
+    gate_inputs_node = _runtime_context_projection_node(
+        runtime_context_id=runtime_context_id,
+        view_name="gate_inputs",
+        payload=gate_inputs_view,
+    )
+    close_gate_node = _runtime_context_projection_node(
+        runtime_context_id=runtime_context_id,
+        view_name="close_gate_view",
+        payload=close_gate_view,
+    )
+    status = "present" if read_receipt_ref else "missing"
+    return {
+        "schema_version": "runtime_context.read_receipt_hash_action.v1",
+        "status": status,
+        "next_action": "none"
+        if read_receipt_ref
+        else "submit_mf_subagent_read_receipt",
+        "read_receipt_event_ref": read_receipt_ref,
+        "content_address_nodes": {
+            "current": current_node,
+            "gate_inputs": gate_inputs_node,
+            "close_gate_view": close_gate_node,
+        },
+        "hash_material": {
+            "projection_hash_source": (
+                "runtime_context_service.content_address.projection_hash"
+            ),
+            "current_view_hash": current_node["view_hash"],
+            "gate_inputs_view_hash": gate_inputs_node["view_hash"],
+            "close_gate_view_hash": close_gate_node["view_hash"],
+        },
+        "entrypoint": {
+            "method": "POST",
+            "path": "/api/task/{project_id}/timeline",
+            "event_kind": "mf_subagent_read_receipt",
+            "required_payload_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "fence_token",
+                "worker_slot_id",
+                "read_receipt_hash or launch_text_hash",
+            ],
+        },
+        "operator_instruction": (
+            "Submit a worker-authored mf_subagent_read_receipt before counted "
+            "startup/finish evidence, using the runtime-context content-address "
+            "hashes above."
+            if not read_receipt_ref
+            else "Read receipt evidence is present in the task timeline."
+        ),
+    }
+
+
+def _runtime_context_close_blocker_explanation(
+    *,
+    values: Mapping[str, Any],
+    close_gate_view: Mapping[str, Any],
+) -> dict[str, Any]:
+    missing_fields = {
+        _runtime_context_text(item.get("field"))
+        for item in close_gate_view.get("missing") or []
+        if isinstance(item, Mapping)
+    }
+    startup_ref = _runtime_context_text(values.get("startup_event_ref"))
+    explanations: list[dict[str, Any]] = []
+    if startup_ref and missing_fields:
+        explanations.append(
+            {
+                "code": "startup_exists_but_not_close_satisfying",
+                "message": (
+                    "startup exists but is not close-satisfying; finish, "
+                    "verification, checkpoint, graph trace, self-attestation, "
+                    "or route-token evidence is still missing"
+                ),
+                "evidence_ref": startup_ref,
+            }
+        )
+    elif not startup_ref:
+        explanations.append(
+            {
+                "code": "startup_missing",
+                "message": "record real mf_subagent startup evidence for this fenced worker",
+                "evidence_ref": "",
+            }
+        )
+    field_messages = {
+        "checkpoint_id": "record a checkpoint id or finish-gate checkpoint for this branch",
+        "finish_gate_ref": "record the worker finish gate after implementation is complete",
+        "verification_event_refs": "record independent verification evidence for the focused tests/checks",
+        "graph_trace_ids": "run worker-scoped graph queries and attach trace ids",
+        "worker_self_attesting": "include worker self-attestation accepted by the finish gate",
+        "route_token_ref": "refresh route_token_ref under the canonical route identity",
+        "route_context_hash": "restore canonical route context hash evidence",
+        "prompt_contract_hash": "restore prompt contract hash evidence",
+        "merge_queue_id": "bind the worker lane to its merge queue identity",
+    }
+    for field in sorted(missing_fields):
+        explanations.append(
+            {
+                "code": f"missing_{field}",
+                "field": field,
+                "message": field_messages.get(
+                    field,
+                    f"record close-gate evidence for {field}",
+                ),
+            }
+        )
+    return {
+        "schema_version": "runtime_context.close_blocker_explanation.v1",
+        "ready": bool(close_gate_view.get("ready")),
+        "status": close_gate_view.get("status", ""),
+        "summary": "close gate ready"
+        if close_gate_view.get("ready")
+        else "close gate is blocked by missing worker handoff evidence",
+        "explanations": explanations,
+    }
+
+
+def _runtime_context_next_legal_action(
+    *,
+    route_token_action: Mapping[str, Any],
+    read_receipt_hash_action: Mapping[str, Any],
+    values: Mapping[str, Any],
+    close_gate_view: Mapping[str, Any],
+    lane_plan: Mapping[str, Any],
+) -> str:
+    if route_token_action.get("status") in {"missing", "stale"}:
+        return "refresh_route_token_ref"
+    if read_receipt_hash_action.get("status") == "missing":
+        return "submit_mf_subagent_read_receipt"
+    if not _runtime_context_text(values.get("startup_event_ref")):
+        return "record_mf_subagent_startup"
+    if lane_plan.get("blocking_events"):
+        return "resolve_blocking_timeline_event"
+    missing_fields = {
+        _runtime_context_text(item.get("field"))
+        for item in close_gate_view.get("missing") or []
+        if isinstance(item, Mapping)
+    }
+    for field, action in (
+        ("finish_gate_ref", "record_finish_gate"),
+        ("checkpoint_id", "record_checkpoint"),
+        ("verification_event_refs", "record_independent_verification"),
+        ("graph_trace_ids", "run_worker_graph_query"),
+        ("worker_self_attesting", "record_worker_self_attestation"),
+        ("close_ready_event_ref", "record_close_ready"),
+    ):
+        if field in missing_fields:
+            return action
+    if close_gate_view.get("ready"):
+        return "handoff_review_ready"
+    return "record_missing_evidence"
+
+
+def build_runtime_context_action_plan_view(
+    current_view: Mapping[str, Any],
+    gate_inputs_view: Mapping[str, Any] | None = None,
+    close_gate_view: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the operator action projection from existing runtime views."""
+
+    values = _runtime_context_mapping(current_view.get("current_values"))
+    route_identity = _runtime_context_mapping(current_view.get("route_identity"))
+    lane_plan = _runtime_context_mapping(current_view.get("lane_plan"))
+    gate_inputs = (
+        dict(gate_inputs_view)
+        if isinstance(gate_inputs_view, Mapping)
+        else build_runtime_context_gate_inputs_view(current_view)
+    )
+    close_gate = (
+        dict(close_gate_view)
+        if isinstance(close_gate_view, Mapping)
+        else build_runtime_context_close_gate_view(current_view, gate_inputs)
+    )
+    route_token_action = _runtime_context_route_token_action(
+        values=values,
+        gate_inputs_view=gate_inputs,
+        route_identity=route_identity,
+    )
+    read_receipt_hash_action = _runtime_context_read_receipt_hash_action(
+        current_view=current_view,
+        gate_inputs_view=gate_inputs,
+        close_gate_view=close_gate,
+    )
+    close_blocker_explanation = _runtime_context_close_blocker_explanation(
+        values=values,
+        close_gate_view=close_gate,
+    )
+    next_legal_action = _runtime_context_next_legal_action(
+        route_token_action=route_token_action,
+        read_receipt_hash_action=read_receipt_hash_action,
+        values=values,
+        close_gate_view=close_gate,
+        lane_plan=lane_plan,
+    )
+    missing_evidence = _runtime_context_missing_evidence(
+        gate_inputs_view=gate_inputs,
+        lane_plan=lane_plan,
+    )
+    blocking_reasons: list[dict[str, Any]] = []
+    if route_token_action.get("status") in {"missing", "stale"}:
+        blocking_reasons.append(
+            {
+                "code": f"route_token_{route_token_action.get('status')}",
+                "message": route_token_action.get("issue", ""),
+                "next_action": route_token_action.get("next_action", ""),
+            }
+        )
+    if read_receipt_hash_action.get("status") == "missing":
+        blocking_reasons.append(
+            {
+                "code": "read_receipt_missing",
+                "message": "runtime-context read receipt hash evidence is missing",
+                "next_action": read_receipt_hash_action.get("next_action", ""),
+            }
+        )
+    for event in lane_plan.get("blocking_events") or []:
+        if isinstance(event, Mapping):
+            blocking_reasons.append(
+                {
+                    "code": "lane_blocking_event",
+                    "message": _runtime_context_text(event.get("event_kind")),
+                    "event_ref": _runtime_context_text(event.get("event_ref")),
+                    "status": _runtime_context_text(event.get("status")),
+                }
+            )
+    for explanation in close_blocker_explanation.get("explanations") or []:
+        if isinstance(explanation, Mapping):
+            blocking_reasons.append(
+                {
+                    "code": _runtime_context_text(explanation.get("code")),
+                    "message": _runtime_context_text(explanation.get("message")),
+                    "field": _runtime_context_text(explanation.get("field")),
+                }
+            )
+    return {
+        "schema_version": RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION,
+        "runtime_context_id": current_view.get("runtime_context_id", ""),
+        "task_id": values.get("task_id", ""),
+        "parent_task_id": values.get("parent_task_id", ""),
+        "next_legal_action": next_legal_action,
+        "missing_evidence": missing_evidence,
+        "blocking_reasons": blocking_reasons,
+        "route_token_action": route_token_action,
+        "read_receipt_hash_action": read_receipt_hash_action,
+        "close_blocker_explanation": close_blocker_explanation,
+        "deferred_hardening": {
+            "permission_tree": "deferred_next_layer",
+            "capability_subtree": "deferred_next_layer",
+            "granted_subtree_root_hash": "deferred_next_layer",
+            "implemented_in_this_slice": False,
+        },
+        "source_views": [
+            "lane_plan",
+            "gate_inputs",
+            "route_identity",
+            "content_address",
+            "close_gate_view",
+        ],
+    }
+
+
+def build_runtime_context_control_plane_view(
+    action_plan_view: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Expose the action plan under a stable Runtime Context control-plane view."""
+
+    action_plan = dict(action_plan_view)
+    return {
+        "schema_version": RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
+        "runtime_context_id": action_plan.get("runtime_context_id", ""),
+        "task_id": action_plan.get("task_id", ""),
+        "next_legal_action": action_plan.get("next_legal_action", ""),
+        "missing_evidence": list(action_plan.get("missing_evidence") or []),
+        "blocking_reasons": list(action_plan.get("blocking_reasons") or []),
+        "route_token_action": dict(action_plan.get("route_token_action") or {}),
+        "read_receipt_hash_action": dict(
+            action_plan.get("read_receipt_hash_action") or {}
+        ),
+        "close_blocker_explanation": dict(
+            action_plan.get("close_blocker_explanation") or {}
+        ),
+        "deferred_hardening": dict(action_plan.get("deferred_hardening") or {}),
+        "action_plan": action_plan,
+    }
+
+
 def build_runtime_context_worker_view(
     current_view: Mapping[str, Any],
     *,
@@ -3226,6 +3681,8 @@ def build_runtime_context_worker_view(
     role: str = RUNTIME_CONTEXT_WORKER_ROLE,
     gate_inputs_view: Mapping[str, Any] | None = None,
     close_gate_view: Mapping[str, Any] | None = None,
+    action_plan_view: Mapping[str, Any] | None = None,
+    control_plane_view: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the mf_sub-safe role-filtered view for one worker/fence/task."""
 
@@ -3251,6 +3708,20 @@ def build_runtime_context_worker_view(
         dict(close_gate_view)
         if isinstance(close_gate_view, Mapping)
         else build_runtime_context_close_gate_view(current_view, gate_inputs)
+    )
+    action_plan = (
+        dict(action_plan_view)
+        if isinstance(action_plan_view, Mapping)
+        else build_runtime_context_action_plan_view(
+            current_view,
+            gate_inputs_view=gate_inputs,
+            close_gate_view=close_gate,
+        )
+    )
+    control_plane = (
+        dict(control_plane_view)
+        if isinstance(control_plane_view, Mapping)
+        else build_runtime_context_control_plane_view(action_plan)
     )
     return {
         "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
@@ -3319,6 +3790,8 @@ def build_runtime_context_worker_view(
         "lane_plan": dict(_runtime_context_mapping(current_view.get("lane_plan"))),
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,
+        "action_plan": action_plan,
+        "control_plane": control_plane,
         "evidence_refs": {
             key: _runtime_context_mapping(current_view.get("evidence_refs")).get(
                 key,
@@ -3346,6 +3819,8 @@ def build_runtime_context_worker_view(
                 "graph_query_identity",
                 "gate_inputs",
                 "close_gate_view",
+                "action_plan",
+                "control_plane",
                 "evidence_refs",
             ],
             "blocked_sections": [
@@ -3407,6 +3882,12 @@ def build_runtime_context_projection(
     )
     gate_inputs = build_runtime_context_gate_inputs_view(current)
     close_gate = build_runtime_context_close_gate_view(current, gate_inputs)
+    action_plan = build_runtime_context_action_plan_view(
+        current,
+        gate_inputs_view=gate_inputs,
+        close_gate_view=close_gate,
+    )
+    control_plane = build_runtime_context_control_plane_view(action_plan)
     worker_view = build_runtime_context_worker_view(
         current,
         task_id=context.task_id,
@@ -3414,12 +3895,16 @@ def build_runtime_context_projection(
         role=role,
         gate_inputs_view=gate_inputs,
         close_gate_view=close_gate,
+        action_plan_view=action_plan,
+        control_plane_view=control_plane,
     )
     return RuntimeContextProjection(
         project_id=context.project_id,
         runtime_context_id=runtime_context_id_for_branch_context(context),
         current=current,
         gate_inputs=gate_inputs,
+        action_plan=action_plan,
+        control_plane=control_plane,
         worker_view=worker_view,
         close_gate_view=close_gate,
     )

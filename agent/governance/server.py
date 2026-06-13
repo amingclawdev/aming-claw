@@ -6131,7 +6131,14 @@ def _runtime_context_projection_response(
         role_scope = "worker"
         view_name = "worker_view"
     else:
-        allowed_views = {"current", "gate_inputs", "worker_view", "close_gate_view"}
+        allowed_views = {
+            "current",
+            "gate_inputs",
+            "action_plan",
+            "control_plane",
+            "worker_view",
+            "close_gate_view",
+        }
         if requested_view in allowed_views:
             exposed_views = {requested_view: dict(views.get(requested_view) or {})}
             view_name = requested_view

@@ -29,7 +29,9 @@ from agent.governance.parallel_branch_runtime import (
     ACTION_RECLAIM_FROM_CHECKPOINT,
     ACTION_WAIT_FOR_DEPENDENCY,
     RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
@@ -733,6 +735,235 @@ def test_runtime_context_projection_embeds_event_sourced_lane_plan() -> None:
     assert worker_lane_plan == current_lane_plan
 
 
+def test_runtime_context_action_plan_makes_route_token_missing_actionable() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    control_plane = projection["views"]["control_plane"]
+    worker_view = projection["views"]["worker_view"]
+
+    assert action_plan["schema_version"] == RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION
+    assert control_plane["schema_version"] == RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION
+    assert action_plan["next_legal_action"] == "refresh_route_token_ref"
+    assert action_plan["route_token_action"]["status"] == "missing"
+    assert action_plan["route_token_action"]["next_action"] == "refresh_route_token_ref"
+    assert action_plan["route_token_action"]["entrypoint"] == {
+        "method": "POST",
+        "path": "/api/projects/{project_id}/observer/route-context/issue",
+        "required_public_fields": [
+            "backlog_id",
+            "task_id",
+            "target_files",
+            "caller_role",
+        ],
+        "request_template": {
+            "backlog_id": "BUG-RUNTIME-CONTEXT",
+            "task_id": "mf-sub-runtime-context",
+            "target_files": ["agent/governance/parallel_branch_runtime.py"],
+            "caller_role": "observer",
+        },
+        "runtime_context_persistence": (
+            "Persist route_token_ref/hash evidence only; raw route tokens "
+            "must not persist in runtime context output."
+        ),
+    }
+    assert action_plan["route_token_action"]["canonical_route_identity"] == {
+        "route_id": "route-runtime-context",
+        "route_context_hash": "sha256:route-runtime-context",
+        "prompt_contract_id": "rprompt-runtime-context",
+        "prompt_contract_hash": "sha256:prompt-runtime-context",
+        "route_token_ref": "",
+    }
+    assert any(
+        item["code"] == "route_token_missing"
+        for item in action_plan["blocking_reasons"]
+    )
+    assert control_plane["next_legal_action"] == action_plan["next_legal_action"]
+    assert worker_view["control_plane"]["route_token_action"]["status"] == "missing"
+
+
+def test_runtime_context_action_plan_reports_route_token_ref_present_from_revision() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        contract_revision={
+            "revision_id": "crev-runtime-context",
+            "contract_version": "mf_parallel.v1",
+            "route_identity": {
+                "route_id": "route-runtime-context",
+                "route_context_hash": "sha256:route-runtime-context",
+                "prompt_contract_id": "rprompt-runtime-context",
+                "prompt_contract_hash": "sha256:prompt-runtime-context",
+                "route_token_ref": "rtok-runtime-context",
+            },
+            "payload": {
+                "target_files": ["agent/governance/parallel_branch_runtime.py"],
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    route_action = action_plan["route_token_action"]
+    worker_route_action = projection["views"]["worker_view"]["control_plane"][
+        "route_token_action"
+    ]
+
+    assert route_action["status"] == "present"
+    assert route_action["next_action"] == "none"
+    assert route_action["route_token_ref_present"] is True
+    assert route_action["canonical_route_identity"]["route_token_ref"] == (
+        "rtok-runtime-context"
+    )
+    assert route_action["expected_binding"]["route_token_ref"] == (
+        "rtok-runtime-context"
+    )
+    assert worker_route_action["status"] == "present"
+    assert action_plan["next_legal_action"] != "refresh_route_token_ref"
+
+
+def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
+
+    assert read_action["status"] == "missing"
+    assert read_action["next_action"] == "submit_mf_subagent_read_receipt"
+    assert read_action["entrypoint"] == {
+        "method": "POST",
+        "path": "/api/task/{project_id}/timeline",
+        "event_kind": "mf_subagent_read_receipt",
+        "required_payload_fields": [
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "fence_token",
+            "worker_slot_id",
+            "read_receipt_hash or launch_text_hash",
+        ],
+    }
+    assert read_action["content_address_nodes"]["current"]["node_id"] == (
+        f"runtime_context/{projection['runtime_context_id']}/current"
+    )
+    assert read_action["hash_material"]["current_view_hash"].startswith("sha256:")
+
+    with_receipt = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={"read_receipt_event_ref": "timeline:read-runtime-context"},
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    present_action = with_receipt["views"]["action_plan"]["read_receipt_hash_action"]
+    assert present_action["status"] == "present"
+    assert present_action["next_action"] == "none"
+    assert present_action["read_receipt_event_ref"] == "timeline:read-runtime-context"
+
+
+def test_runtime_context_action_plan_translates_close_blockers_for_operator() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        startup_gate={
+            "worker_self_attesting": True,
+            "worker_self_attestation": {
+                "status": "passed",
+                "worker_self_attesting": True,
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    explanation = action_plan["close_blocker_explanation"]
+    codes = {
+        item["code"]
+        for item in explanation["explanations"]
+    }
+
+    assert explanation["ready"] is False
+    assert "startup_exists_but_not_close_satisfying" in codes
+    assert "missing_finish_gate_ref" in codes
+    assert "missing_verification_event_refs" in codes
+    assert "missing_checkpoint_id" in codes
+    assert any(
+        "startup exists but is not close-satisfying" in item["message"]
+        for item in explanation["explanations"]
+    )
+
+
+def test_runtime_context_action_plan_defers_permission_tree_hardening() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    missing_text = json.dumps(action_plan["missing_evidence"], sort_keys=True)
+
+    assert action_plan["deferred_hardening"] == {
+        "permission_tree": "deferred_next_layer",
+        "capability_subtree": "deferred_next_layer",
+        "granted_subtree_root_hash": "deferred_next_layer",
+        "implemented_in_this_slice": False,
+    }
+    assert "permission_tree" not in missing_text
+    assert "capability_subtree" not in missing_text
+    assert "granted_subtree_root_hash" not in missing_text
+
+
 def test_runtime_context_lane_plan_blocking_event_does_not_fulfill_clause() -> None:
     projection = build_runtime_context_lane_plan_view(
         [
@@ -858,6 +1089,12 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         "sha256:prompt-runtime-context"
     )
     assert worker_view["gate_inputs"]["status"] == "ready"
+    assert worker_view["action_plan"]["schema_version"] == (
+        RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION
+    )
+    assert worker_view["control_plane"]["schema_version"] == (
+        RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION
+    )
     assert worker_view["close_gate_view"]["schema_version"] == (
         RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION
     )
@@ -960,6 +1197,8 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
     assert content_address["projection_hash"].startswith("sha256:")
     assert content_address["root_hash"] == content_address["projection_hash"]
     assert set(content_address["nodes"]) == {
+        "action_plan",
+        "control_plane",
         "current",
         "gate_inputs",
         "worker_view",
