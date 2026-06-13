@@ -20504,7 +20504,7 @@ def _record_route_token_gate_event(
             backlog_id=backlog_id,
             event_type=f"route_token_gate.{gate.get('action', 'protected_mutation')}",
             phase="route_gate",
-            event_kind="verification",
+            event_kind="route_token_gate",
             actor=str(gate.get("caller_role") or gate.get("decision") or "route_gate"),
             status="accepted",
             payload={"route_token_gate": gate},
@@ -25333,6 +25333,54 @@ def _hotfix_ref_from_body(body: Mapping[str, Any]) -> str:
     ).strip()
 
 
+def _normalize_hotfix_ref(value: Any) -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("timeline:"):
+        raw = raw.split(":", 1)[1].strip()
+    return raw
+
+
+def _hotfix_reason_from_body(body: Mapping[str, Any]) -> str:
+    return str(
+        body.get("hotfix_reason")
+        or body.get("human_reason")
+        or body.get("reason")
+        or ""
+    ).strip()
+
+
+def _require_hotfix_entry_event(
+    conn,
+    project_id: str,
+    *,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import task_timeline
+
+    hotfix_ref = _hotfix_ref_from_body(body)
+    if not hotfix_ref:
+        raise ValidationError("under_hotfix action requires hotfix_ref")
+    reason = _hotfix_reason_from_body(body)
+    if not reason:
+        raise ValidationError("under_hotfix action requires a human reason")
+    ref_id = _normalize_hotfix_ref(hotfix_ref)
+    if not ref_id:
+        raise ValidationError("under_hotfix action requires a valid hotfix_ref")
+    events = task_timeline.list_events(conn, project_id, limit=2000)
+    for event in events:
+        if str(event.get("id") or "") != ref_id:
+            continue
+        if (
+            str(event.get("event_kind") or "") == "hotfix_entered"
+            or str(event.get("event_type") or "") == "hotfix.entered"
+        ):
+            return event
+        break
+    raise ValidationError(
+        f"under_hotfix action requires matching hotfix.entered event: {hotfix_ref}"
+    )
+
+
 def _record_hotfix_backlog_close_tag(
     conn,
     *,
@@ -25348,6 +25396,7 @@ def _record_hotfix_backlog_close_tag(
     from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     hotfix_ref = _hotfix_ref_from_body(body)
+    hotfix_entry = _require_hotfix_entry_event(conn, project_id, body=body)
     task_id = str(body.get("task_id") or body.get("worker_id") or "").strip()
     payload = {
         "schema_version": "hotfix_action.v1",
@@ -25355,9 +25404,10 @@ def _record_hotfix_backlog_close_tag(
         "action": "backlog_close",
         "profile": "HOTFIX",
         "hotfix_ref": hotfix_ref,
+        "hotfix_entry_event_id": hotfix_entry.get("id"),
         "backlog_id": bug_id,
         "task_id": task_id,
-        "reason": str(body.get("hotfix_reason") or body.get("reason") or "").strip(),
+        "reason": _hotfix_reason_from_body(body),
     }
     payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
         {
@@ -25385,6 +25435,7 @@ def _record_hotfix_backlog_close_tag(
         artifact_refs={
             "under_hotfix": True,
             "hotfix_ref": hotfix_ref,
+            "hotfix_entry_event_id": hotfix_entry.get("id"),
             "backlog_id": bug_id,
             "task_id": task_id,
         },

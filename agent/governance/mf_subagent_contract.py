@@ -389,8 +389,16 @@ _META_ROLE_ALIASES = {
     "route_observer": OBSERVER_COORDINATOR_ROLE,
     "coordinator": OBSERVER_COORDINATOR_ROLE,
     "observer_coordinator": OBSERVER_COORDINATOR_ROLE,
-    "judger": OBSERVER_COORDINATOR_ROLE,
-    "judge": OBSERVER_COORDINATOR_ROLE,
+    "judger": "judge",
+    "judge": "judge",
+    "system": "system",
+    "service_router": "system",
+    "service-router": "system",
+    "route_gate": "system",
+    "route-token-gate": "system",
+    "route_token_gate": "system",
+    "watchdog": "system",
+    "observer_command_watchdog": "system",
     "mf_sub": MF_SUB_ROLE,
     "worker": MF_SUB_ROLE,
     "implementation_worker": MF_SUB_ROLE,
@@ -415,6 +423,10 @@ _META_ACTION_ALIASES = {
     "dispatch": "dispatch_bounded_worker",
     "implementation": "implementation",
     "implement": "implementation",
+    "worker_progress": "worker_progress",
+    "progress": "worker_progress",
+    "patch": "patch",
+    "apply_patch": "patch",
     "mf_subagent_read_receipt": "read_receipt",
     "mf_subagent_read_receipt_v1": "read_receipt",
     "read_receipt": "read_receipt",
@@ -423,6 +435,8 @@ _META_ACTION_ALIASES = {
     "mf_subagent_startup_gate": "mf_subagent_startup",
     "mf_subagent_startup_adoption": "mf_subagent_startup",
     "startup_gate": "mf_subagent_startup",
+    "mf_subagent_finish_gate": "review_ready",
+    "finish_gate": "review_ready",
     "review_ready": "review_ready",
     "waiting_merge": "review_ready",
     "close_ready": "close_ready",
@@ -443,6 +457,7 @@ _META_ACTION_ALIASES = {
     "observer_command_complete": "observer_command",
     "observer_command_disposition": "observer_command",
     "independent_verification": "independent_verification",
+    "verification": "qa_verification",
     "qa_verification": "qa_verification",
     "qa_review": "qa_review",
     "hotfix_entered": "hotfix_entered",
@@ -451,12 +466,25 @@ _META_ACTION_ALIASES = {
     "hotfix_backlog_close": "hotfix_under_action",
     "hotfix_under_action": "hotfix_under_action",
     "route_token_gate": "route_token_gate",
+    "route_token_gate_project_bootstrap_refusal": "route_token_gate",
+    "service_route": "service_route",
+    "service_route_completed": "service_route",
+    "service_route_blocked": "service_route",
+    "no_progress_timeout": "no_progress_timeout",
+    "observer_command_no_progress_timeout": "no_progress_timeout",
+    "mf_timeline_gate_bypass_rejected": "forbidden_attempt_recorded",
+    "bypass_rejected": "forbidden_attempt_recorded",
+    "forbidden_attempt_recorded": "forbidden_attempt_recorded",
+    "stale_artifact_cleanup": "stale_artifact_cleanup",
+    "governance_stale_artifact_cleanup_apply": "stale_artifact_cleanup",
     "graph_trace": "graph_trace",
     "graph_query_trace": "graph_trace",
 }
-_META_OBSERVER_ROLE_TOKENS = {"observer", "coordinator", "judger", "judge"}
+_META_OBSERVER_ROLE_TOKENS = {"observer", "coordinator"}
+_META_JUDGE_ROLE_TOKENS = {"judger", "judge"}
 _META_QA_ROLE_TOKENS = {"qa", "verifier", "reviewer"}
 _META_WORKER_ROLE_TOKENS = {"mf_sub", "subagent", "worker"}
+_META_SYSTEM_ROLE_TOKENS = {"system", "service_router", "route_gate", "watchdog"}
 _META_ON_BEHALF_KEYS = (
     "on_behalf_of",
     "filed_on_behalf_by",
@@ -4597,6 +4625,10 @@ def _meta_contract_containers(event: Mapping[str, Any]) -> list[Mapping[str, Any
                 "bounded_startup_evidence",
                 "mf_subagent_finish_gate",
                 "meta_contract_gate",
+                "route_token_gate",
+                "route_token_gate_refusal",
+                "service_route",
+                "service_router",
             ):
                 child = nested.get(nested_key)
                 if isinstance(child, Mapping):
@@ -4647,8 +4679,16 @@ def _meta_action_from_event(event: Mapping[str, Any]) -> str:
             return _META_ACTION_ALIASES[marker]
         if marker.startswith("hotfix_") and marker != "hotfix_entered":
             return "hotfix_under_action"
+        if marker.startswith("route_token_gate"):
+            return "route_token_gate"
+        if marker.startswith("service_route"):
+            return "service_route"
         if marker.startswith("observer_command"):
             return "observer_command"
+        if "no_progress_timeout" in marker:
+            return "no_progress_timeout"
+        if "bypass_rejected" in marker:
+            return "forbidden_attempt_recorded"
         if "independent_verification" in marker:
             return "independent_verification"
         if marker.startswith("qa_"):
@@ -4672,6 +4712,10 @@ def _meta_normalize_role(value: Any) -> str:
         return ""
     if role in _META_ROLE_ALIASES:
         return _META_ROLE_ALIASES[role]
+    if any(token in role for token in _META_SYSTEM_ROLE_TOKENS):
+        return "system"
+    if any(token in role for token in _META_JUDGE_ROLE_TOKENS):
+        return "judge"
     if any(token in role for token in _META_OBSERVER_ROLE_TOKENS):
         return OBSERVER_COORDINATOR_ROLE
     if role.startswith("qa") or any(token in role for token in _META_QA_ROLE_TOKENS):
@@ -4688,7 +4732,7 @@ def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
     if actor.startswith("observer_on_behalf_of"):
         return OBSERVER_COORDINATOR_ROLE
     actor_role = _meta_normalize_role(actor)
-    if actor_role in {OBSERVER_COORDINATOR_ROLE, "qa", MF_SUB_ROLE, "operator"}:
+    if actor_role in {OBSERVER_COORDINATOR_ROLE, "qa", MF_SUB_ROLE, "operator", "judge", "system"}:
         return actor_role
 
     for key in ("caller_role", "role", "worker_role", "actor_role", "lane_role"):
@@ -4697,8 +4741,23 @@ def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
             return role
     if action in {"independent_verification", "qa_verification", "qa_review"}:
         return "qa"
-    if action in {"implementation", "mf_subagent_startup", "read_receipt", "review_ready"}:
+    if action in {
+        "implementation",
+        "mf_subagent_startup",
+        "read_receipt",
+        "review_ready",
+        "worker_progress",
+        "patch",
+    }:
         return MF_SUB_ROLE
+    if action == "forbidden_attempt_recorded" and actor_role not in {
+        OBSERVER_COORDINATOR_ROLE,
+        "judge",
+        "system",
+    }:
+        return "system"
+    if action in {"service_route", "route_token_gate", "stale_artifact_cleanup"}:
+        return "system"
     return actor_role or "observer"
 
 
@@ -4721,14 +4780,23 @@ def _meta_surrogate_startup_present(event: Mapping[str, Any], *, action: str) ->
     for container in _meta_contract_containers(event):
         token_type = _normalized_action(container.get("session_token_evidence_type"))
         match_mode = _normalized_action(container.get("agent_id_match_mode"))
+        claims_close_satisfying = (
+            _bool(container.get("close_satisfying"))
+            or _bool(container.get("worker_self_attesting"))
+            or _bool(container.get("self_attesting"))
+        )
         if token_type in {"surrogate", "claimed_unverified"}:
-            return True
-        if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
-            return True
+            return claims_close_satisfying
+        token_present = _bool(container.get("session_token_present"))
+        if (
+            match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE
+            and (token_type != "server_verified" or not token_present)
+        ):
+            return claims_close_satisfying
         if _bool(container.get("host_adapter_startup_token_accepted")) and not _bool(
             container.get("session_token_present")
         ):
-            return True
+            return claims_close_satisfying
     return False
 
 
@@ -4777,12 +4845,22 @@ def validate_meta_contract_timeline_event(
     markers = set(_meta_event_markers(event))
     marker_forbidden = sorted(forbidden_always.intersection(markers))
     forbidden_flag = _meta_truthy_key(event, _META_ALWAYS_FORBIDDEN_FLAG_KEYS)
-    if marker_forbidden:
+    forbidden_evidence_actions = {
+        _normalized_action(item)
+        for item in _string_list_forgiving(
+            meta.get("forbidden_evidence_recording_actions")
+        )
+    }
+    may_record_forbidden_evidence = (
+        action in forbidden_evidence_actions
+        and role in {OBSERVER_COORDINATOR_ROLE, "judge", "system"}
+    )
+    if marker_forbidden and not may_record_forbidden_evidence:
         raise MfSubagentContractError(
             "meta-contract forbidden_always rejected action: "
             + ", ".join(marker_forbidden)
         )
-    if forbidden_flag:
+    if forbidden_flag and not may_record_forbidden_evidence:
         raise MfSubagentContractError(
             f"meta-contract forbidden_always rejected flag: {forbidden_flag}"
         )

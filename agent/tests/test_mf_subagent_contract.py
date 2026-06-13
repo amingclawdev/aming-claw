@@ -602,8 +602,16 @@ def test_meta_contract_template_encodes_observer_whitelist_and_red_lines() -> No
     assert "dispatch_bounded_worker" in template["role_action_whitelist"]["observer"][
         "allowed_actions"
     ]
+    assert {"observer", "worker", "mf_sub", "qa", "judge", "system"}.issubset(
+        template["role_action_whitelist"]
+    )
+    assert "worker_progress" in template["worker_evidence_actions"]
+    assert "patch" in template["worker_evidence_actions"]
     assert template["hotfix_profile"]["silent_bypass_allowed"] is False
     assert template["hotfix_profile"]["entry_event_type"] == "hotfix.entered"
+    assert template["hotfix_profile"]["under_action_requires_entry"] is True
+    assert template["hotfix_profile"]["under_action_requires_ref"] is True
+    assert template["hotfix_profile"]["under_action_requires_reason"] is True
 
 
 def test_meta_contract_rejects_observer_forbidden_action_d2_boundary() -> None:
@@ -743,6 +751,82 @@ def test_meta_contract_validates_worker_and_qa_roles() -> None:
                 "status": "passed",
             }
         )
+
+
+@pytest.mark.parametrize("event_kind", ["worker_progress", "patch"])
+def test_meta_contract_allows_worker_progress_and_patch_for_worker_only(
+    event_kind: str,
+) -> None:
+    worker_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": event_kind,
+            "event_kind": event_kind,
+            "actor": "mf_sub",
+            "status": "passed",
+            "payload": {"changed_files": ["agent/governance/server.py"]},
+        }
+    )
+
+    assert worker_gate["role"] == MF_SUB_ROLE
+    assert worker_gate["action"] == event_kind
+
+    with pytest.raises(MfSubagentContractError, match="author_worker_evidence"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": event_kind,
+                "event_kind": event_kind,
+                "actor": "observer",
+                "status": "passed",
+            }
+        )
+
+    transport_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": event_kind,
+            "event_kind": event_kind,
+            "actor": "observer-on-behalf-of:mf-sub-worker-1",
+            "status": "passed",
+            "payload": {
+                "on_behalf_of": "mf-sub-worker-1",
+                "self_attesting": False,
+            },
+        }
+    )
+    assert transport_gate["observer_worker_transport"] is True
+
+
+def test_meta_contract_validates_explicit_judge_and_system_roles() -> None:
+    judge_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "record_blocker",
+            "event_kind": "record_blocker",
+            "actor": "judge",
+            "status": "passed",
+        }
+    )
+    system_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "service.route.completed",
+            "event_kind": "service_route",
+            "actor": "service-router",
+            "status": "allowed",
+            "payload": {"service_router_suppress": True},
+        }
+    )
+    forbidden_audit_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_timeline_gate_bypass_rejected",
+            "event_kind": "mf_timeline_gate_bypass_rejected",
+            "actor": "system",
+            "status": "rejected",
+            "payload": {"bypass_timeline_gate": True},
+        }
+    )
+
+    assert judge_gate["role"] == "judge"
+    assert system_gate["role"] == "system"
+    assert system_gate["action"] == "service_route"
+    assert forbidden_audit_gate["action"] == "forbidden_attempt_recorded"
 
 
 def _dispatch_payload(**overrides: object) -> dict[str, object]:

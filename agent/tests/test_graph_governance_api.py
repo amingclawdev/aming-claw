@@ -13275,6 +13275,44 @@ def test_timeline_append_meta_contract_rejects_observer_forbidden_action(conn):
     assert events == []
 
 
+def test_task_timeline_record_event_centrally_rejects_meta_contract_bypass(conn):
+    backlog_id = "AC-META-CONTRACT-CENTRAL-REJECT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(MfSubagentContractError, match="bypass_timeline_gate"):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            event_type="observer.blocker",
+            event_kind="record_blocker",
+            phase="blocker",
+            actor="observer",
+            status="passed",
+            payload={"bypass_timeline_gate": True},
+        )
+
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
+
+
+def test_task_timeline_record_event_meta_contract_allows_explicit_internal_system_event(conn):
+    event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        event_type="service.route.completed",
+        event_kind="service_route",
+        phase="service_router",
+        actor="service-router",
+        status="allowed",
+        payload={"service_router_suppress": True},
+    )
+
+    gate = event["payload"]["meta_contract_gate"]
+    assert gate["role"] == "system"
+    assert gate["action"] == "service_route"
+    assert gate["allowed"] is True
+
+
 def test_timeline_append_meta_contract_rejects_observer_authoring_worker_evidence(conn):
     backlog_id = "AC-META-CONTRACT-OBSERVER-WORKER-EVIDENCE"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -13501,6 +13539,7 @@ def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):
                 "actor": "operator",
                 "under_hotfix": True,
                 "hotfix_ref": entered["hotfix_ref"],
+                "hotfix_reason": "Human confirmed this close action is under the HOTFIX entry.",
                 "task_id": task_id,
                 "route_waiver": {
                     "accepted": True,
@@ -13536,6 +13575,17 @@ def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):
 def test_under_hotfix_close_tag_does_not_bypass_timeline_gate(conn):
     backlog_id = "AC-HOTFIX-DOES-NOT-BYPASS-CLOSE-GATE"
     _insert_simple_mf_close_backlog(conn, backlog_id)
+    entered = server.handle_project_hotfix_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved emergency close gate marker.",
+                "backlog_id": backlog_id,
+            },
+        )
+    )
 
     with pytest.raises(GovernanceError) as exc:
         server.handle_backlog_close(
@@ -13545,7 +13595,8 @@ def test_under_hotfix_close_tag_does_not_bypass_timeline_gate(conn):
                 body={
                     "actor": "operator",
                     "under_hotfix": True,
-                    "hotfix_ref": "timeline:hotfix-entered-test",
+                    "hotfix_ref": entered["hotfix_ref"],
+                    "hotfix_reason": "Human confirmed under-hotfix action reason.",
                     "route_waiver": _route_waiver(
                         "backlog_close",
                         backlog_id=backlog_id,
@@ -13571,6 +13622,54 @@ def test_under_hotfix_close_tag_does_not_bypass_timeline_gate(conn):
     assert events[0]["payload"]["meta_contract_gate"]["action"] == (
         "hotfix_under_action"
     )
+
+
+@pytest.mark.parametrize(
+    ("body_overrides", "message"),
+    [
+        ({"hotfix_reason": "Human reason but no ref."}, "hotfix_ref"),
+        (
+            {
+                "hotfix_ref": "timeline:999999",
+                "hotfix_reason": "Human reason with mismatched ref.",
+            },
+            "matching hotfix.entered",
+        ),
+        ({"hotfix_ref": "timeline:999999"}, "human reason"),
+    ],
+)
+def test_under_hotfix_close_requires_entry_ref_and_reason(
+    conn,
+    body_overrides,
+    message,
+):
+    backlog_id = "AC-HOTFIX-ENTRY-REF-REQUIRED"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(ValidationError, match=message):
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "under_hotfix": True,
+                    "route_waiver": _route_waiver(
+                        "backlog_close",
+                        backlog_id=backlog_id,
+                    ),
+                    **body_overrides,
+                },
+            )
+        )
+
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="hotfix_backlog_close",
+    )
+    assert events == []
 
 
 def test_finish_gate_flags_known_bad_4178_startup_non_self_attesting():
