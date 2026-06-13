@@ -478,6 +478,8 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
     payload = dict(payload) if isinstance(payload, Mapping) else {}
     verification = dict(verification) if isinstance(verification, Mapping) else {}
     artifact_refs = dict(artifact_refs) if isinstance(artifact_refs, Mapping) else {}
+    validation_payload = dict(payload)
+    validation_payload.pop("meta_contract_gate", None)
     from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     meta_contract_gate = validate_meta_contract_timeline_event(
@@ -488,7 +490,7 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
             "actor": event.get("actor", ""),
             "status": event.get("status", ""),
             "decision": event.get("decision", ""),
-            "payload": payload,
+            "payload": validation_payload,
             "verification": verification,
             "artifact_refs": artifact_refs,
             "backlog_id": event.get("backlog_id", ""),

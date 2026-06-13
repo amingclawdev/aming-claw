@@ -13261,7 +13261,14 @@ def test_timeline_append_meta_contract_rejects_observer_forbidden_action(conn):
                     "phase": "implementation",
                     "actor": "observer",
                     "status": "passed",
-                    "payload": {"bypass_timeline_gate": True},
+                    "payload": {
+                        "bypass_timeline_gate": True,
+                        "meta_contract_gate": {
+                            "allowed": True,
+                            "role": "observer",
+                            "action": "record_blocker",
+                        },
+                    },
                     "route_waiver": _route_waiver(
                         "task_timeline_append",
                         backlog_id=backlog_id,
@@ -13289,7 +13296,41 @@ def test_task_timeline_record_event_centrally_rejects_meta_contract_bypass(conn)
             phase="blocker",
             actor="observer",
             status="passed",
-            payload={"bypass_timeline_gate": True},
+            payload={
+                "bypass_timeline_gate": True,
+                "meta_contract_gate": {
+                    "allowed": True,
+                    "role": "observer",
+                    "action": "record_blocker",
+                },
+            },
+        )
+
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
+
+
+def test_task_timeline_record_event_rejects_forged_meta_contract_gate(conn):
+    backlog_id = "AC-META-CONTRACT-FORGED-GATE-DIRECT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(MfSubagentContractError, match="unknown timeline action"):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            event_type="observer.invented",
+            event_kind="invented_action",
+            phase="invented",
+            actor="observer",
+            status="passed",
+            payload={
+                "meta_contract_gate": {
+                    "schema_version": "meta_contract_timeline_gate.v1",
+                    "allowed": True,
+                    "role": "observer",
+                    "action": "record_blocker",
+                }
+            },
         )
 
     assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
@@ -13311,6 +13352,39 @@ def test_task_timeline_record_event_meta_contract_allows_explicit_internal_syste
     assert gate["role"] == "system"
     assert gate["action"] == "service_route"
     assert gate["allowed"] is True
+
+
+def test_timeline_append_rejects_forged_meta_contract_gate(conn):
+    backlog_id = "AC-META-CONTRACT-FORGED-GATE-API"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "event_type": "observer.invented",
+                    "event_kind": "invented_action",
+                    "phase": "invented",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "meta_contract_gate": {
+                            "schema_version": "meta_contract_timeline_gate.v1",
+                            "allowed": True,
+                            "role": "observer",
+                            "action": "record_blocker",
+                        }
+                    },
+                },
+            )
+        )
+
+    assert exc.value.code == "meta_contract_whitelist_rejected"
+    assert "unknown timeline action" in str(exc.value)
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
 
 
 def test_timeline_append_meta_contract_rejects_observer_authoring_worker_evidence(conn):

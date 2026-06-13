@@ -21566,6 +21566,10 @@ def handle_task_timeline_append(ctx: RequestContext):
                 422,
                 {"error": str(exc), "code": "mf_read_receipt_validation_failed"},
             )
+        validation_payload = (
+            dict(norm_payload) if isinstance(norm_payload, Mapping) else {}
+        )
+        validation_payload.pop("meta_contract_gate", None)
         try:
             meta_contract_gate = validate_meta_contract_timeline_event(
                 {
@@ -21574,7 +21578,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     "event_kind": norm_event_kind,
                     "actor": ctx.body.get("actor", ""),
                     "status": norm_status,
-                    "payload": norm_payload,
+                    "payload": validation_payload,
                     "verification": ctx.body.get("verification") or {},
                     "artifact_refs": ctx.body.get("artifact_refs") or {},
                     "backlog_id": ctx.body.get("backlog_id", ""),

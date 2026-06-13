@@ -4624,7 +4624,6 @@ def _meta_contract_containers(event: Mapping[str, Any]) -> list[Mapping[str, Any
                 "startup_evidence",
                 "bounded_startup_evidence",
                 "mf_subagent_finish_gate",
-                "meta_contract_gate",
                 "route_token_gate",
                 "route_token_gate_refusal",
                 "service_route",
