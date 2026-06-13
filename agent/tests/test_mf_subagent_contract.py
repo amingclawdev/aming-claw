@@ -36,13 +36,17 @@ from agent.governance.mf_subagent_contract import (
     SURROGATE_STARTUP_GATE_SCHEMA_VERSION,
     VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION,
     WORKTREE_POLICY_MODE,
+    META_CONTRACT_SCHEMA_VERSION,
+    META_CONTRACT_TIMELINE_GATE_SCHEMA_VERSION,
     MfSubagentContractError,
     build_mf_subagent_runtime_contract_view,
     build_mf_subagent_runtime_context_projection,
     build_mf_subagent_worker_runtime_context_view,
+    load_meta_contract_template,
     build_mf_subagent_input,
     normalize_mf_subagent_result,
     validate_mf_subagent_worker_runtime_context_view,
+    validate_meta_contract_timeline_event,
     validate_observer_direct_mutation_exception,
     validate_mf_subagent_dispatch_gate,
     validate_mf_subagent_finish_gate,
@@ -575,6 +579,170 @@ def test_mf_parallel_template_exposes_observer_no_direct_code_boundary() -> None
             "review_evidence",
         }
     )
+
+
+def test_meta_contract_template_encodes_observer_whitelist_and_red_lines() -> None:
+    template = load_meta_contract_template()
+
+    assert template["schema_version"] == META_CONTRACT_SCHEMA_VERSION
+    assert template["enforcement"]["observer_events_validated"] is True
+    assert template["enforcement"]["skip_paths"] == []
+    assert set(template["forbidden_always"]).issuperset(
+        {
+            "author_worker_evidence",
+            "self_fix_and_close",
+            "bypass_timeline_gate",
+            "self_waiver",
+            "self_clear_judge_blocker",
+            "surrogate_startup",
+            "fork_identity_to_launder",
+        }
+    )
+    assert "implementation" in template["worker_evidence_actions"]
+    assert "dispatch_bounded_worker" in template["role_action_whitelist"]["observer"][
+        "allowed_actions"
+    ]
+    assert template["hotfix_profile"]["silent_bypass_allowed"] is False
+    assert template["hotfix_profile"]["entry_event_type"] == "hotfix.entered"
+
+
+def test_meta_contract_rejects_observer_forbidden_action_d2_boundary() -> None:
+    with pytest.raises(MfSubagentContractError, match="bypass_timeline_gate"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "observer.bypass",
+                "event_kind": "record_blocker",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {"bypass_timeline_gate": True},
+            }
+        )
+
+
+def test_meta_contract_rejects_observer_direct_worker_evidence() -> None:
+    with pytest.raises(MfSubagentContractError, match="author_worker_evidence"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {"changed_files": ["agent/governance/server.py"]},
+            }
+        )
+
+
+def test_meta_contract_allows_observer_on_behalf_worker_evidence_only_when_not_self_attesting() -> None:
+    allowed = validate_meta_contract_timeline_event(
+        {
+            "event_type": "implementation",
+            "event_kind": "implementation",
+            "actor": "observer-on-behalf-of:mf-sub-worker-1",
+            "status": "passed",
+            "payload": {
+                "on_behalf_of": "mf-sub-worker-1",
+                "changed_files": ["agent/governance/server.py"],
+                "worker_self_attesting": False,
+            },
+        }
+    )
+
+    assert allowed["schema_version"] == META_CONTRACT_TIMELINE_GATE_SCHEMA_VERSION
+    assert allowed["role"] == OBSERVER_COORDINATOR_ROLE
+    assert allowed["action"] == "implementation"
+    assert allowed["observer_event_validated"] is True
+    assert allowed["on_behalf"] is True
+
+    with pytest.raises(MfSubagentContractError, match="self_attesting"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "actor": "observer-on-behalf-of:mf-sub-worker-1",
+                "status": "passed",
+                "payload": {
+                    "on_behalf_of": "mf-sub-worker-1",
+                    "worker_self_attesting": True,
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "event_kind",
+    [
+        "bounded_implementation_worker_dispatch",
+        "merge",
+        "merge_preview",
+        "merge_queue_entry",
+        "live_merge",
+        "reconcile",
+        "record_blocker",
+        "close_after_clauses",
+    ],
+)
+def test_meta_contract_allows_legal_observer_actions(event_kind: str) -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": event_kind.replace("_", "."),
+            "event_kind": event_kind,
+            "actor": "observer",
+            "status": "passed",
+            "payload": {"reason": "legal observer coordination evidence"},
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == OBSERVER_COORDINATOR_ROLE
+    assert gate["observer_event_validated"] is True
+
+
+def test_meta_contract_validates_worker_and_qa_roles() -> None:
+    worker_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "implementation",
+            "event_kind": "implementation",
+            "actor": "mf_sub",
+            "status": "passed",
+            "payload": {"changed_files": ["agent/governance/server.py"]},
+        }
+    )
+    qa_gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "independent_verification",
+            "event_kind": "independent_verification",
+            "actor": "qa-reviewer",
+            "status": "passed",
+            "payload": {"reviewer": "qa-reviewer"},
+        }
+    )
+
+    assert worker_gate["role"] == MF_SUB_ROLE
+    assert worker_gate["action"] == "implementation"
+    assert qa_gate["role"] == "qa"
+    assert qa_gate["action"] == "independent_verification"
+
+    with pytest.raises(MfSubagentContractError, match="role=mf_sub action=merge"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "merge",
+                "event_kind": "merge",
+                "actor": "mf_sub",
+                "status": "passed",
+            }
+        )
+    with pytest.raises(
+        MfSubagentContractError,
+        match="role=qa action=implementation",
+    ):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "actor": "qa",
+                "status": "passed",
+            }
+        )
 
 
 def _dispatch_payload(**overrides: object) -> dict[str, object]:

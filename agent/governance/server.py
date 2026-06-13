@@ -21502,6 +21502,10 @@ def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
     project_id = ctx.get_project_id()
     from . import task_timeline
+    from .mf_subagent_contract import (
+        MfSubagentContractError,
+        validate_meta_contract_timeline_event,
+    )
 
     event = {
         "event_type": ctx.body.get("event_type", ""),
@@ -21542,15 +21546,6 @@ def handle_task_timeline_append(ctx: RequestContext):
                     backlog_id=ctx.body.get("backlog_id", ""),
                     task_id="",
                 )
-        if route_gate:
-            _record_route_token_gate_event(
-                conn,
-                project_id,
-                route_gate,
-                backlog_id=ctx.body.get("backlog_id", ""),
-                task_id=ctx.body.get("task_id", ""),
-                commit_sha=ctx.body.get("commit_sha", ""),
-            )
         raw_event_kind = ctx.body.get("event_kind", "")
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
@@ -21570,6 +21565,47 @@ def handle_task_timeline_append(ctx: RequestContext):
                 str(exc),
                 422,
                 {"error": str(exc), "code": "mf_read_receipt_validation_failed"},
+            )
+        try:
+            meta_contract_gate = validate_meta_contract_timeline_event(
+                {
+                    "event_type": ctx.body.get("event_type", ""),
+                    "phase": ctx.body.get("phase", ""),
+                    "event_kind": norm_event_kind,
+                    "actor": ctx.body.get("actor", ""),
+                    "status": norm_status,
+                    "payload": norm_payload,
+                    "verification": ctx.body.get("verification") or {},
+                    "artifact_refs": ctx.body.get("artifact_refs") or {},
+                    "backlog_id": ctx.body.get("backlog_id", ""),
+                    "task_id": ctx.body.get("task_id", ""),
+                }
+            )
+        except MfSubagentContractError as exc:
+            raise GovernanceError(
+                "meta_contract_whitelist_rejected",
+                str(exc),
+                422,
+                {
+                    "error": str(exc),
+                    "code": "meta_contract_whitelist_rejected",
+                    "event_type": ctx.body.get("event_type", ""),
+                    "event_kind": norm_event_kind,
+                    "actor": ctx.body.get("actor", ""),
+                },
+            )
+        norm_payload = {
+            **(norm_payload if isinstance(norm_payload, dict) else {}),
+            "meta_contract_gate": meta_contract_gate,
+        }
+        if route_gate:
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                backlog_id=ctx.body.get("backlog_id", ""),
+                task_id=ctx.body.get("task_id", ""),
+                commit_sha=ctx.body.get("commit_sha", ""),
             )
         result = task_timeline.record_event(
             conn,
@@ -21609,6 +21645,7 @@ def handle_task_timeline_append(ctx: RequestContext):
         )
         if route_gate:
             result["route_token_gate"] = route_gate
+        result["meta_contract_gate"] = meta_contract_gate
         return result
 
 
@@ -25308,6 +25345,7 @@ def _record_hotfix_backlog_close_tag(
         return {}
 
     from . import task_timeline
+    from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     hotfix_ref = _hotfix_ref_from_body(body)
     task_id = str(body.get("task_id") or body.get("worker_id") or "").strip()
@@ -25321,6 +25359,18 @@ def _record_hotfix_backlog_close_tag(
         "task_id": task_id,
         "reason": str(body.get("hotfix_reason") or body.get("reason") or "").strip(),
     }
+    payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
+        {
+            "event_type": "hotfix.backlog_close",
+            "event_kind": "hotfix_backlog_close",
+            "phase": "hotfix",
+            "actor": str(body.get("actor") or "api"),
+            "status": "accepted",
+            "payload": payload,
+            "backlog_id": bug_id,
+            "task_id": task_id,
+        }
+    )
     event = task_timeline.record_event(
         conn,
         project_id=project_id,
@@ -25371,10 +25421,31 @@ def handle_project_hotfix_enter(ctx: RequestContext):
         raise ValidationError("hotfix entry requires a human reason")
 
     from . import task_timeline
+    from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     task_id = str(body.get("task_id") or "").strip()
     actor = str(body.get("actor") or "api").strip()
+    payload = {
+        "schema_version": "hotfix_entered.v1",
+        "profile": "HOTFIX",
+        "reason": reason,
+        "actor": actor,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
+        {
+            "event_type": "hotfix.entered",
+            "event_kind": "hotfix_entered",
+            "phase": "hotfix",
+            "actor": actor,
+            "status": "accepted",
+            "payload": payload,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        }
+    )
     with DBContext(project_id) as conn:
         event = task_timeline.record_event(
             conn,
@@ -25386,14 +25457,7 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             event_kind="hotfix_entered",
             actor=actor,
             status="accepted",
-            payload={
-                "schema_version": "hotfix_entered.v1",
-                "profile": "HOTFIX",
-                "reason": reason,
-                "actor": actor,
-                "backlog_id": backlog_id,
-                "task_id": task_id,
-            },
+            payload=payload,
             artifact_refs={
                 "profile": "HOTFIX",
                 "backlog_id": backlog_id,

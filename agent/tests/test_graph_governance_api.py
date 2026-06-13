@@ -13245,6 +13245,157 @@ def _insert_simple_mf_close_backlog(conn, backlog_id: str) -> None:
     conn.commit()
 
 
+def test_timeline_append_meta_contract_rejects_observer_forbidden_action(conn):
+    backlog_id = "AC-META-CONTRACT-OBSERVER-FORBIDDEN"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "event_type": "observer.blocker",
+                    "event_kind": "record_blocker",
+                    "phase": "implementation",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {"bypass_timeline_gate": True},
+                    "route_waiver": _route_waiver(
+                        "task_timeline_append",
+                        backlog_id=backlog_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "meta_contract_whitelist_rejected"
+    events = task_timeline.list_events(conn, PID, backlog_id=backlog_id)
+    assert events == []
+
+
+def test_timeline_append_meta_contract_rejects_observer_authoring_worker_evidence(conn):
+    backlog_id = "AC-META-CONTRACT-OBSERVER-WORKER-EVIDENCE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "event_type": "implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {"changed_files": ["agent/governance/server.py"]},
+                    "route_waiver": _route_waiver(
+                        "task_timeline_append",
+                        backlog_id=backlog_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "meta_contract_whitelist_rejected"
+    assert "author_worker_evidence" in exc.value.message
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="implementation",
+    ) == []
+
+
+def test_timeline_append_meta_contract_allows_observer_on_behalf_worker_evidence(conn):
+    backlog_id = "AC-META-CONTRACT-OBSERVER-ON-BEHALF"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "observer-on-behalf-of:mf-sub-worker-1",
+                "status": "passed",
+                "payload": {
+                    "on_behalf_of": "mf-sub-worker-1",
+                    "changed_files": ["agent/governance/server.py"],
+                    "worker_self_attesting": False,
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                ),
+            },
+        )
+    )
+
+    assert result["event_kind"] == "implementation"
+    gate = result["meta_contract_gate"]
+    assert gate["observer_event_validated"] is True
+    assert gate["observer_worker_transport"] is True
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="implementation",
+    )[0]
+    assert event["payload"]["meta_contract_gate"]["observer_worker_transport"] is True
+
+
+@pytest.mark.parametrize(
+    "event_kind",
+    [
+        "bounded_implementation_worker_dispatch",
+        "merge",
+        "merge_preview",
+        "merge_queue_entry",
+        "live_merge",
+        "reconcile",
+        "record_blocker",
+        "close_after_clauses",
+    ],
+)
+def test_timeline_append_meta_contract_allows_legal_observer_actions(
+    conn,
+    event_kind,
+):
+    backlog_id = f"AC-META-CONTRACT-LEGAL-{event_kind.upper()}"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "event_type": event_kind.replace("_", "."),
+                "event_kind": event_kind,
+                "phase": event_kind,
+                "actor": "observer",
+                "status": "passed",
+                "payload": {"reason": "legal observer coordination event"},
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                ),
+            },
+        )
+    )
+
+    assert result["meta_contract_gate"]["role"] == "observer"
+    assert result["meta_contract_gate"]["observer_event_validated"] is True
+    assert result["meta_contract_gate"]["allowed"] is True
+
+
 @pytest.mark.parametrize("role", [None, "observer", "coordinator"])
 def test_backlog_close_bypass_timeline_gate_is_rejected_for_ai_reachable_callers(
     conn,
@@ -13311,6 +13462,10 @@ def test_hotfix_enter_records_timeline_event(conn):
     assert result["event"]["event_type"] == "hotfix.entered"
     assert result["event"]["event_kind"] == "hotfix_entered"
     assert result["event"]["payload"]["reason"].startswith("Human approved")
+    assert result["event"]["payload"]["meta_contract_gate"]["action"] == (
+        "hotfix_entered"
+    )
+    assert result["event"]["payload"]["meta_contract_gate"]["allowed"] is True
 
 
 def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):
@@ -13373,6 +13528,9 @@ def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):
         event["payload"].get("under_hotfix") is True
         for event in usage["under_hotfix_events"]
     )
+    assert close_result["hotfix_audit_event"]["payload"]["meta_contract_gate"][
+        "action"
+    ] == "hotfix_under_action"
 
 
 def test_under_hotfix_close_tag_does_not_bypass_timeline_gate(conn):
@@ -13410,6 +13568,9 @@ def test_under_hotfix_close_tag_does_not_bypass_timeline_gate(conn):
     assert len(events) == 1
     assert events[0]["payload"]["under_hotfix"] is True
     assert events[0]["artifact_refs"]["under_hotfix"] is True
+    assert events[0]["payload"]["meta_contract_gate"]["action"] == (
+        "hotfix_under_action"
+    )
 
 
 def test_finish_gate_flags_known_bad_4178_startup_non_self_attesting():

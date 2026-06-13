@@ -42,6 +42,8 @@ OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1
 ROUTE_ACTION_GATE_SCHEMA_VERSION = "route_action_gate.v1"
 ROUTE_TOKEN_MUTATION_GATE_SCHEMA_VERSION = "route_token_mutation_gate.v1"
 ROUTE_TOKEN_REQUIRED_FAILURE_SCHEMA_VERSION = "route_token_required_failure.v1"
+META_CONTRACT_SCHEMA_VERSION = "meta_contract.v1"
+META_CONTRACT_TIMELINE_GATE_SCHEMA_VERSION = "meta_contract_timeline_event_gate.v1"
 FINISH_GATE_REPLAY_SOURCE = "mf_sub_finish_gate"
 BACKEND_CONTRACT = "parallel_branch_worker.v1"
 DISPATCH_DEFAULT = "non_blocking_after_gate"
@@ -379,6 +381,99 @@ _ROUTE_TOKEN_REQUIRED_FIELDS = (
     "allowed_action",
     "expires_at",
     "evidence_refs",
+)
+_META_CONTRACT_TEMPLATE = "meta_contract.v1.json"
+_META_ROLE_ALIASES = {
+    "observer": OBSERVER_COORDINATOR_ROLE,
+    "mf_observer": OBSERVER_COORDINATOR_ROLE,
+    "route_observer": OBSERVER_COORDINATOR_ROLE,
+    "coordinator": OBSERVER_COORDINATOR_ROLE,
+    "observer_coordinator": OBSERVER_COORDINATOR_ROLE,
+    "judger": OBSERVER_COORDINATOR_ROLE,
+    "judge": OBSERVER_COORDINATOR_ROLE,
+    "mf_sub": MF_SUB_ROLE,
+    "worker": MF_SUB_ROLE,
+    "implementation_worker": MF_SUB_ROLE,
+    "bounded_implementation_worker": MF_SUB_ROLE,
+    "bounded_worker": MF_SUB_ROLE,
+    "qa": "qa",
+    "qa_reviewer": "qa",
+    "qa_verifier": "qa",
+    "independent_verifier": "qa",
+    "independent_reviewer": "qa",
+    "operator": "operator",
+    "api": "operator",
+}
+_META_ACTION_ALIASES = {
+    "route_context": "route_context",
+    "route": "route_context",
+    "route_action_precheck": "route_action_precheck",
+    "route_precheck": "route_action_precheck",
+    "bounded_implementation_worker_dispatch": "dispatch_bounded_worker",
+    "mf_subagent_dispatch": "dispatch_bounded_worker",
+    "dispatch_bounded_worker": "dispatch_bounded_worker",
+    "dispatch": "dispatch_bounded_worker",
+    "implementation": "implementation",
+    "implement": "implementation",
+    "mf_subagent_read_receipt": "read_receipt",
+    "mf_subagent_read_receipt_v1": "read_receipt",
+    "read_receipt": "read_receipt",
+    "startup_read_receipt": "read_receipt",
+    "mf_subagent_startup": "mf_subagent_startup",
+    "mf_subagent_startup_gate": "mf_subagent_startup",
+    "mf_subagent_startup_adoption": "mf_subagent_startup",
+    "startup_gate": "mf_subagent_startup",
+    "review_ready": "review_ready",
+    "waiting_merge": "review_ready",
+    "close_ready": "close_ready",
+    "close_after_clauses": "close_after_clauses",
+    "close_after_clause": "close_after_clauses",
+    "backlog_close": "close_after_clauses",
+    "merge": "merge",
+    "merge_preview": "merge_preview",
+    "merge_queue_entry": "merge_queue_entry",
+    "live_merge": "live_merge",
+    "reconcile": "reconcile",
+    "scope_reconcile": "reconcile",
+    "graph_reconcile": "reconcile",
+    "record_blocker": "record_blocker",
+    "blocker": "record_blocker",
+    "blocker_recorded": "record_blocker",
+    "observer_command": "observer_command",
+    "observer_command_complete": "observer_command",
+    "observer_command_disposition": "observer_command",
+    "independent_verification": "independent_verification",
+    "qa_verification": "qa_verification",
+    "qa_review": "qa_review",
+    "hotfix_entered": "hotfix_entered",
+    "hotfix_enter": "hotfix_entered",
+    "hotfix": "hotfix_entered",
+    "hotfix_backlog_close": "hotfix_under_action",
+    "hotfix_under_action": "hotfix_under_action",
+    "route_token_gate": "route_token_gate",
+    "graph_trace": "graph_trace",
+    "graph_query_trace": "graph_trace",
+}
+_META_OBSERVER_ROLE_TOKENS = {"observer", "coordinator", "judger", "judge"}
+_META_QA_ROLE_TOKENS = {"qa", "verifier", "reviewer"}
+_META_WORKER_ROLE_TOKENS = {"mf_sub", "subagent", "worker"}
+_META_ON_BEHALF_KEYS = (
+    "on_behalf_of",
+    "filed_on_behalf_by",
+    "recorded_on_behalf_of",
+    "reviewer",
+)
+_META_SELF_ATTESTING_KEYS = (
+    "self_attesting",
+    "worker_self_attesting",
+    "self_filed",
+)
+_META_ALWAYS_FORBIDDEN_FLAG_KEYS = (
+    "bypass_timeline_gate",
+    "self_waiver",
+    "self_clear_judge_blocker",
+    "self_fix_and_close",
+    "fork_identity_to_launder",
 )
 
 
@@ -4459,6 +4554,289 @@ def _dedupe_strings(values: Sequence[str]) -> list[str]:
             out.append(token)
             seen.add(token)
     return out
+
+
+def load_meta_contract_template(path: Path | None = None) -> dict[str, Any]:
+    """Load the repo-owned meta-contract whitelist template."""
+
+    template_path = (
+        path
+        if path is not None
+        else Path(__file__).resolve().parent
+        / "contract_templates"
+        / _META_CONTRACT_TEMPLATE
+    )
+    try:
+        data = json.loads(template_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise MfSubagentContractError(
+            f"meta-contract template not found: {template_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise MfSubagentContractError(
+            f"meta-contract template is not valid JSON: {template_path}"
+        ) from exc
+    if not isinstance(data, Mapping):
+        raise MfSubagentContractError("meta-contract template must be a mapping")
+    if _string(data.get("schema_version")) != META_CONTRACT_SCHEMA_VERSION:
+        raise MfSubagentContractError(
+            f"meta-contract template schema_version must be {META_CONTRACT_SCHEMA_VERSION}"
+        )
+    return dict(data)
+
+
+def _meta_contract_containers(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = [event]
+    for key in ("payload", "verification", "artifact_refs"):
+        nested = event.get(key)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+            for nested_key in (
+                "mf_subagent_startup_gate",
+                "startup_evidence",
+                "bounded_startup_evidence",
+                "mf_subagent_finish_gate",
+                "meta_contract_gate",
+            ):
+                child = nested.get(nested_key)
+                if isinstance(child, Mapping):
+                    containers.append(child)
+    return containers
+
+
+def _meta_first_string(
+    event: Mapping[str, Any],
+    keys: Sequence[str],
+) -> str:
+    for container in _meta_contract_containers(event):
+        for key in keys:
+            token = _string(container.get(key))
+            if token:
+                return token
+    return ""
+
+
+def _meta_truthy_key(
+    event: Mapping[str, Any],
+    keys: Sequence[str],
+) -> str:
+    for container in _meta_contract_containers(event):
+        for key in keys:
+            if _bool(container.get(key)):
+                return key
+    return ""
+
+
+def _meta_event_markers(event: Mapping[str, Any]) -> list[str]:
+    markers: list[str] = []
+    for key in ("event_kind", "event_type", "phase", "decision", "status"):
+        marker = _normalized_action(event.get(key))
+        if marker:
+            markers.append(marker)
+    for container in _meta_contract_containers(event):
+        for key in ("action", "allowed_action", "requested_action", "gate_kind", "kind"):
+            marker = _normalized_action(container.get(key))
+            if marker:
+                markers.append(marker)
+    return _dedupe_strings(markers)
+
+
+def _meta_action_from_event(event: Mapping[str, Any]) -> str:
+    for marker in _meta_event_markers(event):
+        if marker in _META_ACTION_ALIASES:
+            return _META_ACTION_ALIASES[marker]
+        if marker.startswith("hotfix_") and marker != "hotfix_entered":
+            return "hotfix_under_action"
+        if marker.startswith("observer_command"):
+            return "observer_command"
+        if "independent_verification" in marker:
+            return "independent_verification"
+        if marker.startswith("qa_"):
+            return "qa_review" if "review" in marker else "qa_verification"
+        if marker.startswith("merge_preview"):
+            return "merge_preview"
+        if marker.startswith("merge_queue"):
+            return "merge_queue_entry"
+        if marker.startswith("live_merge"):
+            return "live_merge"
+        if "reconcile" in marker:
+            return "reconcile"
+        if "blocker" in marker:
+            return "record_blocker"
+    return ""
+
+
+def _meta_normalize_role(value: Any) -> str:
+    role = _normalized_action(value)
+    if not role:
+        return ""
+    if role in _META_ROLE_ALIASES:
+        return _META_ROLE_ALIASES[role]
+    if any(token in role for token in _META_OBSERVER_ROLE_TOKENS):
+        return OBSERVER_COORDINATOR_ROLE
+    if role.startswith("qa") or any(token in role for token in _META_QA_ROLE_TOKENS):
+        return "qa"
+    if any(token in role for token in _META_WORKER_ROLE_TOKENS):
+        return MF_SUB_ROLE
+    if "operator" in role:
+        return "operator"
+    return role
+
+
+def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
+    actor = _normalized_action(event.get("actor"))
+    if actor.startswith("observer_on_behalf_of"):
+        return OBSERVER_COORDINATOR_ROLE
+    actor_role = _meta_normalize_role(actor)
+    if actor_role in {OBSERVER_COORDINATOR_ROLE, "qa", MF_SUB_ROLE, "operator"}:
+        return actor_role
+
+    for key in ("caller_role", "role", "worker_role", "actor_role", "lane_role"):
+        role = _meta_normalize_role(_meta_first_string(event, (key,)))
+        if role:
+            return role
+    if action in {"independent_verification", "qa_verification", "qa_review"}:
+        return "qa"
+    if action in {"implementation", "mf_subagent_startup", "read_receipt", "review_ready"}:
+        return MF_SUB_ROLE
+    return actor_role or "observer"
+
+
+def _meta_on_behalf_present(event: Mapping[str, Any]) -> bool:
+    actor = _normalized_action(event.get("actor"))
+    if actor.startswith("observer_on_behalf_of"):
+        return True
+    if _bool(_meta_first_string(event, ("filed_on_behalf",))):
+        return True
+    return bool(_meta_first_string(event, _META_ON_BEHALF_KEYS))
+
+
+def _meta_self_attesting_present(event: Mapping[str, Any]) -> bool:
+    return bool(_meta_truthy_key(event, _META_SELF_ATTESTING_KEYS))
+
+
+def _meta_surrogate_startup_present(event: Mapping[str, Any], *, action: str) -> bool:
+    if action != "mf_subagent_startup":
+        return False
+    for container in _meta_contract_containers(event):
+        token_type = _normalized_action(container.get("session_token_evidence_type"))
+        match_mode = _normalized_action(container.get("agent_id_match_mode"))
+        if token_type in {"surrogate", "claimed_unverified"}:
+            return True
+        if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
+            return True
+        if _bool(container.get("host_adapter_startup_token_accepted")) and not _bool(
+            container.get("session_token_present")
+        ):
+            return True
+    return False
+
+
+def _meta_allowed_actions(meta_contract: Mapping[str, Any], role: str) -> list[str]:
+    whitelist = _mapping(
+        meta_contract.get("role_action_whitelist"),
+        field_name="role_action_whitelist",
+    )
+    role_policy = _mapping(whitelist.get(role), field_name=f"role_action_whitelist.{role}")
+    return [
+        _normalized_action(item)
+        for item in _string_list_forgiving(role_policy.get("allowed_actions"))
+        if _normalized_action(item)
+    ]
+
+
+def validate_meta_contract_timeline_event(
+    event: Mapping[str, Any],
+    *,
+    meta_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one timeline event against the meta-contract role/action whitelist.
+
+    This is intentionally event-model native: callers pass the same fields that
+    are stored in ``task_timeline_events``.  Observer-authored events are not
+    exempt; an observer can transport worker evidence only with explicit
+    on-behalf metadata and without self-attesting worker claims.
+    """
+
+    if not isinstance(event, Mapping):
+        raise MfSubagentContractError("meta-contract timeline event must be a mapping")
+    event = dict(event)
+    meta = dict(meta_contract or load_meta_contract_template())
+    action = _meta_action_from_event(event)
+    if not action:
+        markers = ", ".join(_meta_event_markers(event))
+        raise MfSubagentContractError(
+            "meta-contract whitelist rejected unknown timeline action"
+            + (f": {markers}" if markers else "")
+        )
+    role = _meta_role_from_event(event, action=action)
+    forbidden_always = {
+        _normalized_action(item)
+        for item in _string_list_forgiving(meta.get("forbidden_always"))
+    }
+    markers = set(_meta_event_markers(event))
+    marker_forbidden = sorted(forbidden_always.intersection(markers))
+    forbidden_flag = _meta_truthy_key(event, _META_ALWAYS_FORBIDDEN_FLAG_KEYS)
+    if marker_forbidden:
+        raise MfSubagentContractError(
+            "meta-contract forbidden_always rejected action: "
+            + ", ".join(marker_forbidden)
+        )
+    if forbidden_flag:
+        raise MfSubagentContractError(
+            f"meta-contract forbidden_always rejected flag: {forbidden_flag}"
+        )
+    if _meta_surrogate_startup_present(event, action=action):
+        raise MfSubagentContractError(
+            "meta-contract forbidden_always rejected surrogate_startup"
+        )
+
+    worker_evidence_actions = {
+        _normalized_action(item)
+        for item in _string_list_forgiving(meta.get("worker_evidence_actions"))
+    }
+    on_behalf = _meta_on_behalf_present(event)
+    self_attesting = _meta_self_attesting_present(event)
+    observer_worker_transport = False
+    if role == OBSERVER_COORDINATOR_ROLE and action in worker_evidence_actions:
+        if not on_behalf:
+            raise MfSubagentContractError(
+                "meta-contract forbidden_always rejected author_worker_evidence: "
+                "observer-authored worker evidence requires on_behalf_of"
+            )
+        if self_attesting:
+            raise MfSubagentContractError(
+                "meta-contract rejected observer on-behalf worker evidence with "
+                "self_attesting=true"
+            )
+        observer_worker_transport = True
+
+    allowed_actions = _meta_allowed_actions(meta, role)
+    if (
+        not observer_worker_transport
+        and "*" not in allowed_actions
+        and action not in allowed_actions
+    ):
+        raise MfSubagentContractError(
+            f"meta-contract whitelist rejected role={role} action={action}"
+        )
+
+    return {
+        "schema_version": META_CONTRACT_TIMELINE_GATE_SCHEMA_VERSION,
+        "meta_contract_schema_version": META_CONTRACT_SCHEMA_VERSION,
+        "meta_contract_id": _string(meta.get("id")) or META_CONTRACT_SCHEMA_VERSION,
+        "meta_contract_hash": canonical_contract_hash(meta),
+        "allowed": True,
+        "status": "passed",
+        "role": role,
+        "action": action,
+        "observer_event_validated": role == OBSERVER_COORDINATOR_ROLE,
+        "on_behalf": on_behalf,
+        "self_attesting": self_attesting,
+        "observer_worker_transport": observer_worker_transport,
+        "forbidden_always": sorted(forbidden_always),
+        "allowed_actions": allowed_actions,
+    }
 
 
 def _parse_route_expiry(value: str) -> datetime:

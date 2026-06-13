@@ -1,0 +1,87 @@
+{
+  "schema_version": "meta_contract.v1",
+  "id": "meta_contract.v1",
+  "description": "Role/action whitelist for governed timeline evidence. Observer identity is never a whitelist bypass.",
+  "enforcement": {
+    "surface": "task_timeline_append",
+    "storage_model": "existing_task_timeline_events",
+    "observer_events_validated": true,
+    "skip_paths": []
+  },
+  "forbidden_always": [
+    "author_worker_evidence",
+    "self_fix_and_close",
+    "bypass_timeline_gate",
+    "self_waiver",
+    "self_clear_judge_blocker",
+    "surrogate_startup",
+    "fork_identity_to_launder"
+  ],
+  "worker_evidence_actions": [
+    "implementation",
+    "mf_subagent_startup",
+    "read_receipt",
+    "review_ready"
+  ],
+  "role_action_whitelist": {
+    "observer": {
+      "allowed_actions": [
+        "route_context",
+        "route_action_precheck",
+        "dispatch_bounded_worker",
+        "merge_preview",
+        "merge_queue_entry",
+        "live_merge",
+        "merge",
+        "reconcile",
+        "record_blocker",
+        "close_ready",
+        "close_after_clauses",
+        "hotfix_entered",
+        "hotfix_under_action",
+        "observer_command",
+        "route_token_gate"
+      ],
+      "worker_evidence_requires": {
+        "on_behalf_of": true,
+        "self_attesting": false
+      }
+    },
+    "mf_sub": {
+      "allowed_actions": [
+        "read_receipt",
+        "mf_subagent_startup",
+        "implementation",
+        "review_ready",
+        "close_ready",
+        "record_blocker",
+        "graph_trace"
+      ]
+    },
+    "qa": {
+      "allowed_actions": [
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+        "record_blocker"
+      ]
+    },
+    "operator": {
+      "allowed_actions": [
+        "hotfix_entered",
+        "hotfix_under_action",
+        "record_blocker",
+        "close_after_clauses"
+      ]
+    }
+  },
+  "hotfix_profile": {
+    "profile": "HOTFIX",
+    "entry_event_type": "hotfix.entered",
+    "entry_event_kind": "hotfix_entered",
+    "requires_human_reason": true,
+    "subsequent_action_tag": "under_hotfix",
+    "query_view": "/api/projects/{project_id}/hotfix/usage",
+    "silent_bypass_allowed": false
+  }
+}
