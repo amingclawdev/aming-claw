@@ -2223,11 +2223,35 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
             projection_id="semproj-1",
             merge_queue_id="mq-runtime",
             fence_token="fence-runtime",
+            session_token_hash=mf_subagent_session_token_hash(
+                "runtime-contract-session"
+            ),
             status="running",
             lease_expires_at="2999-01-01T00:00:00Z",
         ),
         now_iso="2026-06-03T10:00:00Z",
     )
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_parallel_branch_runtime_contract(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "task_id": "runtime-contract-task",
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-contract-parent",
+                    "fence_token": "fence-runtime",
+                    "session_token": "wrong-runtime-contract-session",
+                },
+            )
+        )
+    assert exc_info.value.status == 403
+    audit_count = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_access_audit"
+    ).fetchone()[0]
+    assert audit_count == 0
 
     result = server.handle_graph_governance_parallel_branch_runtime_contract(
         _ctx_with_role(
@@ -2239,6 +2263,7 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
             query={
                 "parent_task_id": "runtime-contract-parent",
                 "fence_token": "fence-runtime",
+                "session_token": "runtime-contract-session",
                 "route_context_hash": "sha256:route",
                 "prompt_contract_id": "rprompt-runtime",
                 "visible_injection_manifest_hash": "sha256:visible",
@@ -2264,6 +2289,32 @@ def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn)
     assert view["route_identity"]["prompt_contract_id"] == "rprompt-runtime"
     assert view["route_identity"]["raw_private_context_exposed"] is False
     assert "raw_private_context" not in view["route_identity"]
+    audit = result["access_audit"]
+    assert audit["schema_version"] == "runtime_context.access_audit.v1"
+    assert audit["projection_hash"].startswith("sha256:")
+    assert audit["nodes_read"][0]["view"] == "runtime_contract"
+    assert audit["nodes_read"][0]["hash"].startswith("sha256:")
+    audit_row = conn.execute(
+        """
+        SELECT principal_id, role, view_name, projection_hash, nodes_read_json,
+               metadata_json, created_at
+        FROM parallel_branch_runtime_access_audit
+        WHERE audit_id = ?
+        """,
+        (audit["audit_id"],),
+    ).fetchone()
+    assert audit_row is not None
+    assert audit_row["principal_id"] == "mf_sub-principal"
+    assert audit_row["role"] == "mf_sub"
+    assert audit_row["view_name"] == "runtime_contract"
+    assert audit_row["projection_hash"] == audit["projection_hash"]
+    assert audit_row["created_at"]
+    assert json.loads(audit_row["nodes_read_json"])[0]["view"] == "runtime_contract"
+    assert json.loads(audit_row["metadata_json"])["endpoint"] == (
+        "parallel-branches.runtime-contract"
+    )
+    assert "runtime-contract-session" not in audit_row["metadata_json"]
+    assert "fence-runtime" not in audit_row["metadata_json"]
 
 
 def test_parallel_branch_runtime_contract_revision_append_and_runtime_context_poll(conn):
@@ -2504,6 +2555,9 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
             projection_id="semproj-current",
             merge_queue_id="mq-current",
             fence_token="fence-current",
+            session_token_hash=mf_subagent_session_token_hash(
+                "runtime-current-session"
+            ),
             status="running",
             lease_expires_at="2999-01-01T00:00:00Z",
         ),
@@ -2597,6 +2651,68 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     )
     assert current["graph_trace_refs"]["trace_ids"] == ["gqt-runtime-current"]
     assert "must-not-leak" not in json.dumps(observer_result, sort_keys=True)
+    observer_content_address = observer_result["runtime_context_service"][
+        "content_address"
+    ]
+    assert observer_content_address["schema_version"] == (
+        "runtime_context.content_address.v1"
+    )
+    assert observer_content_address["projection_hash"].startswith("sha256:")
+    assert set(observer_content_address["nodes"]) == {
+        "current",
+        "gate_inputs",
+        "worker_view",
+        "close_gate_view",
+    }
+    observer_audit = observer_result["access_audit"]
+    assert observer_audit["schema_version"] == "runtime_context.access_audit.v1"
+    assert observer_audit["projection_hash"] == observer_content_address[
+        "projection_hash"
+    ]
+    assert {node["view"] for node in observer_audit["nodes_read"]} == set(
+        observer_content_address["nodes"]
+    )
+    observer_audit_row = conn.execute(
+        """
+        SELECT principal_id, role, view_name, projection_hash, nodes_read_json,
+               metadata_json
+        FROM parallel_branch_runtime_access_audit
+        WHERE audit_id = ?
+        """,
+        (observer_audit["audit_id"],),
+    ).fetchone()
+    assert observer_audit_row is not None
+    assert observer_audit_row["principal_id"] == "observer-principal"
+    assert observer_audit_row["role"] == "observer"
+    assert observer_audit_row["view_name"] == "all"
+    assert observer_audit_row["projection_hash"] == observer_audit["projection_hash"]
+    assert "must-not-leak" not in observer_audit_row["nodes_read_json"]
+    assert "must-not-leak" not in observer_audit_row["metadata_json"]
+
+    audit_count_before_denied = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_access_audit"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-current-parent",
+                    "fence_token": "fence-current",
+                    "session_token": "wrong-runtime-current-session",
+                    "graph_trace_id": "gqt-runtime-current",
+                },
+            )
+        )
+    assert exc_info.value.status == 403
+    audit_count_after_denied = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_access_audit"
+    ).fetchone()[0]
+    assert audit_count_after_denied == audit_count_before_denied
 
     worker_result = (
         server.handle_graph_governance_parallel_branch_runtime_context_current_state(
@@ -2609,6 +2725,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 query={
                     "parent_task_id": "runtime-current-parent",
                     "fence_token": "fence-current",
+                    "session_token": "runtime-current-session",
                     "graph_trace_id": "gqt-runtime-current",
                     "view": "all",
                 },
@@ -2628,6 +2745,31 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert worker_view["privacy_boundary"]["other_worker_contexts_exposed"] is False
     assert "current_values" not in worker_view
     assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
+    worker_content_address = worker_result["runtime_context_service"][
+        "content_address"
+    ]
+    assert worker_content_address["projection_hash"].startswith("sha256:")
+    assert set(worker_content_address["nodes"]) == {"worker_view"}
+    worker_audit = worker_result["access_audit"]
+    assert worker_audit["projection_hash"].startswith("sha256:")
+    assert {node["view"] for node in worker_audit["nodes_read"]} == {"worker_view"}
+    worker_audit_row = conn.execute(
+        """
+        SELECT principal_id, role, view_name, projection_hash, nodes_read_json,
+               metadata_json
+        FROM parallel_branch_runtime_access_audit
+        WHERE audit_id = ?
+        """,
+        (worker_audit["audit_id"],),
+    ).fetchone()
+    assert worker_audit_row is not None
+    assert worker_audit_row["principal_id"] == "mf_sub-principal"
+    assert worker_audit_row["role"] == "mf_sub"
+    assert worker_audit_row["view_name"] == "worker_view"
+    assert json.loads(worker_audit_row["nodes_read_json"])[0]["view"] == "worker_view"
+    assert "runtime-current-session" not in worker_audit_row["metadata_json"]
+    assert "fence-current" not in worker_audit_row["metadata_json"]
+    assert "must-not-leak" not in worker_audit_row["metadata_json"]
 
 
 def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):

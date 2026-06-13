@@ -95,6 +95,27 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contract_revisions (
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_contract_revisions_context
   ON parallel_branch_runtime_contract_revisions(project_id, runtime_context_id, created_at);
 
+CREATE TABLE IF NOT EXISTS parallel_branch_runtime_access_audit (
+    audit_id          TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL,
+    runtime_context_id TEXT NOT NULL,
+    task_id           TEXT NOT NULL DEFAULT '',
+    principal_id      TEXT NOT NULL DEFAULT '',
+    session_id        TEXT NOT NULL DEFAULT '',
+    role              TEXT NOT NULL DEFAULT '',
+    view_name         TEXT NOT NULL DEFAULT '',
+    decision          TEXT NOT NULL DEFAULT '',
+    reason            TEXT NOT NULL DEFAULT '',
+    projection_hash   TEXT NOT NULL DEFAULT '',
+    nodes_read_json   TEXT NOT NULL DEFAULT '[]',
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_access_context
+  ON parallel_branch_runtime_access_audit(project_id, runtime_context_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_access_role
+  ON parallel_branch_runtime_access_audit(project_id, role, created_at);
+
 CREATE TABLE IF NOT EXISTS parallel_branch_merge_queue_items (
     project_id        TEXT NOT NULL,
     merge_queue_id    TEXT NOT NULL,
@@ -285,6 +306,8 @@ RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION = "runtime_context.gate_inputs.v1"
 RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION = "runtime_context.worker_view.v1"
 RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_view.v1"
 RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION = "runtime_context.role_filter_policy.v1"
+RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION = "runtime_context.content_address.v1"
+RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION = "runtime_context.access_audit.v1"
 RUNTIME_CONTEXT_WORKER_ROLE = "mf_sub"
 MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
@@ -481,21 +504,29 @@ class RuntimeContextProjection:
     close_gate_view: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
+        views = {
+            "current": self.current,
+            "gate_inputs": self.gate_inputs,
+            "worker_view": self.worker_view,
+            "close_gate_view": self.close_gate_view,
+        }
+        source_policy = {
+            "immutable_sources_remain_owner_owned": True,
+            "raw_private_context_exposed": False,
+            "worker_views_are_role_filtered": True,
+        }
         return {
             "schema_version": RUNTIME_CONTEXT_PROJECTION_SCHEMA_VERSION,
             "project_id": self.project_id,
             "runtime_context_id": self.runtime_context_id,
-            "views": {
-                "current": self.current,
-                "gate_inputs": self.gate_inputs,
-                "worker_view": self.worker_view,
-                "close_gate_view": self.close_gate_view,
-            },
-            "source_policy": {
-                "immutable_sources_remain_owner_owned": True,
-                "raw_private_context_exposed": False,
-                "worker_views_are_role_filtered": True,
-            },
+            "views": views,
+            "source_policy": source_policy,
+            "content_address": runtime_context_projection_content_address(
+                project_id=self.project_id,
+                runtime_context_id=self.runtime_context_id,
+                views=views,
+                source_policy=source_policy,
+            ),
         }
 
 
@@ -1052,6 +1083,324 @@ def public_contract_revision_route_identity(
         }
     safe["raw_private_context_exposed"] = False
     return safe
+
+
+_RUNTIME_CONTEXT_CONTENT_ADDRESS_SECRET_KEYS = {
+    "fence_token",
+    "raw_fence_token",
+    "raw_session_token",
+    "session_token",
+    "worker_session_token",
+    "worker_nonce",
+    "raw_worker_nonce",
+    "launch_text",
+    "raw_launch_text",
+    "subtree",
+    "raw_subtree",
+}
+
+_RUNTIME_CONTEXT_CONTENT_ADDRESS_SECRET_MARKERS = (
+    "fence_token",
+    "session_token",
+    "worker_nonce",
+    "launch_text",
+)
+
+
+def _runtime_context_redacted_key_name(key: str) -> str:
+    safe_key = str(key or "").strip() or "value"
+    return f"{safe_key}_redacted"
+
+
+def _is_runtime_context_secret_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if not normalized:
+        return False
+    if normalized in _RUNTIME_CONTEXT_CONTENT_ADDRESS_SECRET_KEYS:
+        return True
+    if any(marker in normalized for marker in _RUNTIME_CONTEXT_CONTENT_ADDRESS_SECRET_MARKERS):
+        return True
+    if normalized.startswith("raw_") and (
+        "token" in normalized or "nonce" in normalized
+    ):
+        return True
+    return _is_private_contract_revision_key(normalized)
+
+
+def runtime_context_public_content_value(value: Any) -> Any:
+    """Return deterministic public material for runtime-context hashes."""
+
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key or "")
+            if _is_runtime_context_secret_key(key_text):
+                sanitized[_runtime_context_redacted_key_name(key_text)] = True
+                continue
+            sanitized[key_text] = runtime_context_public_content_value(child)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [runtime_context_public_content_value(item) for item in value]
+    return value
+
+
+def _stable_content_json(value: Any) -> str:
+    return json.dumps(
+        runtime_context_public_content_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def runtime_context_content_hash(value: Any) -> str:
+    """Return a deterministic content hash over public runtime-context material."""
+
+    return "sha256:" + hashlib.sha256(
+        _stable_content_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def _runtime_context_projection_node(
+    *,
+    runtime_context_id: str,
+    view_name: str,
+    payload: Any,
+) -> dict[str, Any]:
+    view = str(view_name or "")
+    node_id = f"runtime_context/{runtime_context_id}/{view}"
+    view_hash = runtime_context_content_hash(payload)
+    node_hash = runtime_context_content_hash(
+        {
+            "node_id": node_id,
+            "view": view,
+            "view_hash": view_hash,
+        }
+    )
+    return {
+        "node_id": node_id,
+        "view": view,
+        "hash": node_hash,
+        "node_hash": node_hash,
+        "view_hash": view_hash,
+    }
+
+
+def runtime_context_projection_content_address(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    views: Mapping[str, Any],
+    source_policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Content-address the redacted runtime-context projection root and views."""
+
+    nodes: dict[str, dict[str, Any]] = {}
+    for view_name in sorted(str(key) for key in views.keys()):
+        view_payload = views.get(view_name) if isinstance(views, Mapping) else {}
+        nodes[view_name] = _runtime_context_projection_node(
+            runtime_context_id=str(runtime_context_id or ""),
+            view_name=view_name,
+            payload=view_payload,
+        )
+    node_hashes = {
+        view_name: nodes[view_name]["node_hash"]
+        for view_name in sorted(nodes)
+    }
+    view_hashes = {
+        view_name: nodes[view_name]["view_hash"]
+        for view_name in sorted(nodes)
+    }
+    root_material = {
+        "schema_version": RUNTIME_CONTEXT_PROJECTION_SCHEMA_VERSION,
+        "project_id": str(project_id or ""),
+        "runtime_context_id": str(runtime_context_id or ""),
+        "nodes": node_hashes,
+        "source_policy": dict(source_policy or {}),
+    }
+    root_hash = runtime_context_content_hash(root_material)
+    return {
+        "schema_version": RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION,
+        "project_id": str(project_id or ""),
+        "runtime_context_id": str(runtime_context_id or ""),
+        "projection_hash": root_hash,
+        "root_hash": root_hash,
+        "hash_algorithm": "sha256:json-stable-redacted-v1",
+        "view_hashes": view_hashes,
+        "nodes": nodes,
+    }
+
+
+def runtime_context_audit_nodes_for_views(
+    projection_payload: Mapping[str, Any],
+    view_names: Sequence[str] | str,
+) -> list[dict[str, Any]]:
+    content_address = (
+        projection_payload.get("content_address")
+        if isinstance(projection_payload, Mapping)
+        else {}
+    )
+    nodes = (
+        content_address.get("nodes")
+        if isinstance(content_address, Mapping)
+        else {}
+    )
+    requested = [view_names] if isinstance(view_names, str) else list(view_names)
+    result: list[dict[str, Any]] = []
+    for requested_view in requested:
+        view_name = str(requested_view or "")
+        if view_name == "all" and isinstance(nodes, Mapping):
+            result.extend(
+                dict(node)
+                for _, node in sorted(nodes.items())
+                if isinstance(node, Mapping)
+            )
+            continue
+        node = nodes.get(view_name) if isinstance(nodes, Mapping) else None
+        if isinstance(node, Mapping):
+            result.append(dict(node))
+    return result
+
+
+def runtime_context_filter_content_address(
+    content_address: Mapping[str, Any],
+    nodes_read: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return content-address metadata scoped to the nodes exposed to this read."""
+
+    if not isinstance(content_address, Mapping):
+        return {}
+    allowed_views = {
+        str(node.get("view") or "")
+        for node in nodes_read
+        if isinstance(node, Mapping) and str(node.get("view") or "")
+    }
+    nodes = content_address.get("nodes")
+    nodes = nodes if isinstance(nodes, Mapping) else {}
+    view_hashes = content_address.get("view_hashes")
+    view_hashes = view_hashes if isinstance(view_hashes, Mapping) else {}
+    scoped = {
+        key: value
+        for key, value in content_address.items()
+        if key not in {"nodes", "view_hashes"}
+    }
+    scoped["view_hashes"] = {
+        str(view): str(value or "")
+        for view, value in sorted(view_hashes.items())
+        if str(view) in allowed_views
+    }
+    scoped["nodes"] = {
+        str(view): dict(node)
+        for view, node in sorted(nodes.items())
+        if str(view) in allowed_views and isinstance(node, Mapping)
+    }
+    return scoped
+
+
+def runtime_context_single_view_audit_node(
+    *,
+    runtime_context_id: str,
+    view_name: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _runtime_context_projection_node(
+        runtime_context_id=str(runtime_context_id or ""),
+        view_name=str(view_name or "runtime_contract"),
+        payload=payload if isinstance(payload, Mapping) else {},
+    )
+
+
+def _redact_runtime_context_access_audit_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key or "")
+            if _is_runtime_context_secret_key(key_text):
+                redacted[_runtime_context_redacted_key_name(key_text)] = True
+                continue
+            redacted[key_text] = _redact_runtime_context_access_audit_metadata(item)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_runtime_context_access_audit_metadata(item) for item in value]
+    return value
+
+
+def record_runtime_context_access_audit(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str = "",
+    session: Mapping[str, Any] | None = None,
+    role: str = "",
+    view_name: str = "",
+    projection_hash: str = "",
+    nodes_read: Sequence[Mapping[str, Any]] | None = None,
+    decision: str = "allowed",
+    reason: str = "",
+    metadata: Mapping[str, Any] | None = None,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Persist a redacted audit row for a role-scoped runtime-context read."""
+
+    ensure_branch_runtime_schema(conn)
+    session_payload = session if isinstance(session, Mapping) else {}
+    safe_nodes = [
+        {
+            key: str(node.get(key) or "")
+            for key in ("node_id", "view", "hash", "node_hash", "view_hash")
+            if str(node.get(key) or "")
+        }
+        for node in (nodes_read or [])
+        if isinstance(node, Mapping)
+    ]
+    safe_metadata = public_contract_revision_payload(
+        _redact_runtime_context_access_audit_metadata(metadata or {})
+    )
+    audit = {
+        "schema_version": RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION,
+        "audit_id": f"rtca-{uuid.uuid4().hex[:16]}",
+        "project_id": str(project_id or ""),
+        "runtime_context_id": str(runtime_context_id or ""),
+        "task_id": str(task_id or ""),
+        "principal_id": str(session_payload.get("principal_id") or ""),
+        "session_id": str(session_payload.get("session_id") or ""),
+        "role": str(role or session_payload.get("role") or ""),
+        "view_name": str(view_name or ""),
+        "decision": str(decision or ""),
+        "reason": str(reason or ""),
+        "projection_hash": str(projection_hash or ""),
+        "nodes_read": safe_nodes,
+        "metadata": safe_metadata,
+        "created_at": now_iso or utc_now(),
+    }
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_runtime_access_audit (
+            audit_id, project_id, runtime_context_id, task_id, principal_id,
+            session_id, role, view_name, decision, reason, projection_hash,
+            nodes_read_json, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            audit["audit_id"],
+            audit["project_id"],
+            audit["runtime_context_id"],
+            audit["task_id"],
+            audit["principal_id"],
+            audit["session_id"],
+            audit["role"],
+            audit["view_name"],
+            audit["decision"],
+            audit["reason"],
+            audit["projection_hash"],
+            json.dumps(safe_nodes, ensure_ascii=False, sort_keys=True),
+            _json_object(safe_metadata),
+            audit["created_at"],
+        ),
+    )
+    return audit
 
 
 def _canonical_contract_hash(value: Any) -> str:

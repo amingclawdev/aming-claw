@@ -27,7 +27,9 @@ from agent.governance.parallel_branch_runtime import (
     ACTION_RECLAIM_AFTER_DEPENDENCY,
     ACTION_RECLAIM_FROM_CHECKPOINT,
     ACTION_WAIT_FOR_DEPENDENCY,
+    RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
@@ -55,10 +57,14 @@ from agent.governance.parallel_branch_runtime import (
     mf_subagent_session_token_hash,
     plan_branch_runtime_context,
     queue_merge_item_for_branch_context,
+    record_runtime_context_access_audit,
     record_branch_finish_gate,
     record_mf_subagent_startup,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
+    runtime_context_audit_nodes_for_views,
+    runtime_context_content_hash,
+    runtime_context_filter_content_address,
     runtime_tasks_from_contexts,
     upsert_branch_context,
     validate_mf_subagent_graph_query_identity,
@@ -550,6 +556,131 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             },
             fence_token="stale-fence",
         )
+
+
+def test_runtime_context_projection_content_address_is_stable_and_redacted() -> None:
+    context = _runtime_projection_context(checkpoint_id="ckpt-runtime-context")
+    private_secret = "raw-private-memory-secret"
+    projection = build_runtime_context_projection(
+        context,
+        contract_revision={
+            "revision_id": "crev-runtime-context",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "observer_command_id": "cmd-runtime-context",
+                "target_files": ["agent/governance/parallel_branch_runtime.py"],
+                "raw_private_memory": private_secret,
+                "launch_text": "do-not-hash-launch-text",
+                "worker_nonce": "do-not-hash-worker-nonce",
+                "subtree": "do-not-hash-subtree",
+            },
+        },
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    content_address = projection["content_address"]
+    assert content_address["schema_version"] == RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION
+    assert content_address["projection_hash"].startswith("sha256:")
+    assert content_address["root_hash"] == content_address["projection_hash"]
+    assert set(content_address["nodes"]) == {
+        "current",
+        "gate_inputs",
+        "worker_view",
+        "close_gate_view",
+    }
+    worker_node = content_address["nodes"]["worker_view"]
+    assert worker_node["hash"] == worker_node["node_hash"]
+    assert worker_node["view_hash"] == runtime_context_content_hash(
+        projection["views"]["worker_view"]
+    )
+    assert runtime_context_content_hash({"b": 2, "a": 1}) == runtime_context_content_hash(
+        {"a": 1, "b": 2}
+    )
+    assert runtime_context_content_hash({"fence_token": "one"}) == (
+        runtime_context_content_hash({"fence_token": "two"})
+    )
+    scoped_content_address = runtime_context_filter_content_address(
+        content_address,
+        runtime_context_audit_nodes_for_views(projection, "worker_view"),
+    )
+    assert set(scoped_content_address["nodes"]) == {"worker_view"}
+    assert set(scoped_content_address["view_hashes"]) == {"worker_view"}
+
+    serialized_content_address = json.dumps(content_address, sort_keys=True)
+    assert private_secret not in serialized_content_address
+    assert "fence-runtime-context" not in serialized_content_address
+    assert "do-not-hash-launch-text" not in serialized_content_address
+    assert "do-not-hash-worker-nonce" not in serialized_content_address
+    assert "do-not-hash-subtree" not in serialized_content_address
+
+
+def test_runtime_context_access_audit_persists_hashes_not_raw_tokens() -> None:
+    conn = _runtime_conn()
+    context = _runtime_projection_context(checkpoint_id="ckpt-runtime-context")
+    projection = build_runtime_context_projection(context, generated_at=NOW).to_dict()
+    nodes_read = runtime_context_audit_nodes_for_views(projection, "worker_view")
+
+    audit = record_runtime_context_access_audit(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=projection["runtime_context_id"],
+        task_id=context.task_id,
+        session={
+            "principal_id": "worker-principal",
+            "session_id": "worker-session",
+            "role": "mf_sub",
+        },
+        role="mf_sub",
+        view_name="worker_view",
+        projection_hash=projection["content_address"]["projection_hash"],
+        nodes_read=nodes_read,
+        metadata={
+            "endpoint": "runtime-context.current-state",
+            "session_token": "raw-worker-session-token",
+            "fence_token": "raw-fence-token",
+            "launch_text": "raw-launch-text",
+            "worker_nonce": "raw-worker-nonce",
+            "subtree": "raw-subtree",
+        },
+        now_iso=NOW,
+    )
+
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_runtime_access_audit
+        WHERE audit_id = ?
+        """,
+        (audit["audit_id"],),
+    ).fetchone()
+    assert row is not None
+    assert audit["schema_version"] == RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION
+    assert row["role"] == "mf_sub"
+    assert row["view_name"] == "worker_view"
+    assert row["projection_hash"] == projection["content_address"]["projection_hash"]
+    nodes_json = row["nodes_read_json"]
+    metadata_json = row["metadata_json"]
+    for secret in (
+        "raw-worker-session-token",
+        "raw-fence-token",
+        "raw-launch-text",
+        "raw-worker-nonce",
+        "raw-subtree",
+    ):
+        assert secret not in nodes_json
+        assert secret not in metadata_json
+    metadata = json.loads(metadata_json)
+    assert metadata["session_token_redacted"] is True
+    assert metadata["fence_token_redacted"] is True
+    assert metadata["launch_text_redacted"] is True
+    assert metadata["worker_nonce_redacted"] is True
+    assert metadata["subtree_redacted"] is True
 
 
 def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token_hash(

@@ -5553,12 +5553,16 @@ def _parallel_branch_runtime_contract_response(
     project_id: str,
     context,
     role: str,
+    session: Mapping[str, Any],
 ) -> dict:
     from .mf_subagent_contract import build_mf_subagent_runtime_contract_view
     from .parallel_branch_runtime import (
         branch_contract_revision_to_dict,
         get_latest_branch_contract_revision,
+        record_runtime_context_access_audit,
+        runtime_context_content_hash,
         runtime_context_id_for_branch_context,
+        runtime_context_single_view_audit_node,
     )
 
     runtime_context_id = runtime_context_id_for_branch_context(context)
@@ -5596,12 +5600,48 @@ def _parallel_branch_runtime_contract_response(
         latest_revision=latest_revision_payload or None,
         route_identity=route_identity if isinstance(route_identity, Mapping) else {},
     )
+    audit_node = runtime_context_single_view_audit_node(
+        runtime_context_id=runtime_context_id,
+        view_name="runtime_contract",
+        payload=view if isinstance(view, Mapping) else {},
+    )
+    projection_hash = runtime_context_content_hash(
+        {
+            "schema_version": "runtime_context.runtime_contract_access.v1",
+            "project_id": context_project_id,
+            "runtime_context_id": runtime_context_id,
+            "nodes": {"runtime_contract": audit_node["hash"]},
+        }
+    )
+    audit = record_runtime_context_access_audit(
+        conn,
+        project_id=context_project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+        session=session,
+        role=role,
+        view_name="runtime_contract",
+        projection_hash=projection_hash,
+        nodes_read=[audit_node],
+        metadata={
+            "endpoint": "parallel-branches.runtime-contract",
+            "role_scope": "worker" if role == "mf_sub" else "observer",
+            "target_project_id": getattr(context, "target_project_id", "") or project_id,
+        },
+    )
+    conn.commit()
     return {
         "ok": True,
         "project_id": project_id,
         "governance_project_id": context_project_id,
         "target_project_id": getattr(context, "target_project_id", "") or project_id,
         "runtime_contract": view,
+        "access_audit": {
+            "schema_version": audit["schema_version"],
+            "audit_id": audit["audit_id"],
+            "projection_hash": audit["projection_hash"],
+            "nodes_read": audit["nodes_read"],
+        },
     }
 
 
@@ -5968,11 +6008,15 @@ def _runtime_context_projection_response(
     project_id: str,
     context,
     role: str,
+    session: Mapping[str, Any],
 ) -> dict[str, Any]:
     from .mf_subagent_contract import build_mf_subagent_runtime_context_projection
     from .parallel_branch_runtime import (
         branch_contract_revision_to_dict,
         get_latest_branch_contract_revision,
+        record_runtime_context_access_audit,
+        runtime_context_audit_nodes_for_views,
+        runtime_context_filter_content_address,
         runtime_context_id_for_branch_context,
     )
 
@@ -6059,6 +6103,36 @@ def _runtime_context_projection_response(
             exposed_views = {key: dict(views.get(key) or {}) for key in allowed_views}
             view_name = "all"
         role_scope = "observer"
+    content_address = (
+        projection.get("content_address")
+        if isinstance(projection.get("content_address"), Mapping)
+        else {}
+    )
+    nodes_read = runtime_context_audit_nodes_for_views(
+        projection,
+        "all" if view_name == "all" else view_name,
+    )
+    scoped_content_address = runtime_context_filter_content_address(
+        content_address,
+        nodes_read,
+    )
+    audit = record_runtime_context_access_audit(
+        conn,
+        project_id=context_project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+        session=session,
+        role=role,
+        view_name=view_name,
+        projection_hash=str(content_address.get("projection_hash") or ""),
+        nodes_read=nodes_read,
+        metadata={
+            "endpoint": "parallel-branches.runtime-context.current-state",
+            "role_scope": role_scope,
+            "target_project_id": getattr(context, "target_project_id", "") or project_id,
+        },
+    )
+    conn.commit()
     return {
         "ok": True,
         "schema_version": "runtime_context.current_state_response.v1",
@@ -6075,6 +6149,13 @@ def _runtime_context_projection_response(
             "runtime_context_id": runtime_context_id,
             "views": exposed_views,
             "source_policy": projection.get("source_policy") or {},
+            "content_address": scoped_content_address,
+        },
+        "access_audit": {
+            "schema_version": audit["schema_version"],
+            "audit_id": audit["audit_id"],
+            "projection_hash": audit["projection_hash"],
+            "nodes_read": audit["nodes_read"],
         },
         "source_refs": {
             "branch_runtime": (
@@ -6183,6 +6264,7 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
             project_id=project_id,
             context=context,
             role=role,
+            session=session,
         )
     finally:
         conn.close()
@@ -6282,6 +6364,7 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
             project_id=project_id,
             context=context,
             role=role,
+            session=session,
         )
     finally:
         conn.close()
@@ -6383,6 +6466,7 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
             project_id=project_id,
             context=context,
             role=role,
+            session=session,
         )
     finally:
         conn.close()
