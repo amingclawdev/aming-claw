@@ -55,6 +55,7 @@ from agent.governance.parallel_branch_runtime import (
     decide_restart_recovery,
     ensure_branch_runtime_schema,
     get_branch_context,
+    get_latest_branch_contract_revision,
     list_branch_contexts,
     materialize_branch_worktree,
     mf_subagent_session_token_hash,
@@ -169,6 +170,57 @@ def _runtime_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     ensure_branch_runtime_schema(conn)
     return conn
+
+
+def _canonical_test_hash(value: object) -> str:
+    body = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _contract_revision_test_context(task_id: str = "T-revision") -> BranchTaskRuntimeContext:
+    return BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        root_task_id="parent-revision",
+        stage_task_id=task_id,
+        backlog_id="BUG-REVISION",
+        worker_id="worker-revision",
+        agent_id="agent-revision",
+        branch_ref=f"refs/heads/codex/{task_id}",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-revision",
+        worktree_path=f"/tmp/{task_id}",
+        base_commit="base-revision",
+        head_commit="head-revision",
+        target_head_commit="target-revision",
+        merge_queue_id="mq-revision",
+    )
+
+
+def _expected_contract_revision_hash(
+    context: BranchTaskRuntimeContext,
+    *,
+    runtime_context_id: str,
+    payload: Mapping[str, object],
+    route_identity: Mapping[str, object],
+    previous_revision_hash: str = "",
+    revision_id: str = "",
+) -> str:
+    material = {
+        "schema_version": "agent_task_contract_revision_visible_text.v1",
+        "project_id": context.project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+        "backlog_id": context.backlog_id,
+        "contract_version": "mf_parallel.v1",
+        "payload": dict(payload),
+        "route_identity": dict(route_identity) | {"raw_private_context_exposed": False},
+        "previous_revision_hash": previous_revision_hash,
+    }
+    if revision_id:
+        material["revision_id"] = revision_id
+    return _canonical_test_hash(material)
 
 
 def _git(worktree: Path, *args: str) -> str:
@@ -397,6 +449,112 @@ def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext
     }
     payload.update(overrides)
     return BranchTaskRuntimeContext(**payload)
+
+
+def test_append_branch_contract_revision_defaults_revision_id_to_visible_content_hash() -> None:
+    conn = _runtime_conn()
+    context = _contract_revision_test_context()
+    payload = {
+        "target_files": ["agent/governance/parallel_branch_runtime.py"],
+        "acceptance_criteria": ["revision_id is content addressed"],
+        "private_note": "redacted from visible content",
+    }
+    route_identity = {
+        "route_id": "route-revision",
+        "route_context_hash": "sha256:route-revision",
+        "prompt_contract_id": "rprompt-revision",
+        "prompt_contract_hash": "sha256:prompt-revision",
+        "route_token_ref": "rtok-revision",
+    }
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    visible_payload = {
+        "target_files": ["agent/governance/parallel_branch_runtime.py"],
+        "acceptance_criteria": ["revision_id is content addressed"],
+    }
+    expected_hash = _expected_contract_revision_hash(
+        context,
+        runtime_context_id=runtime_context_id,
+        payload=visible_payload,
+        route_identity=route_identity,
+    )
+
+    revision = append_branch_contract_revision(
+        conn,
+        context,
+        payload=payload,
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+
+    assert revision.revision_id == expected_hash
+    receipt = revision.payload["revision_receipt"]
+    assert receipt["canonical_visible_contract_text_hash"] == expected_hash
+    assert receipt["previous_revision_hash"] == ""
+    assert revision.payload["source_of_truth"] == "Contract/Revision/Event"
+    assert "private_note" not in revision.payload
+
+    other_conn = _runtime_conn()
+    same_content_context = _contract_revision_test_context()
+    same_content_revision = append_branch_contract_revision(
+        other_conn,
+        same_content_context,
+        payload=payload,
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+    assert same_content_revision.revision_id == revision.revision_id
+
+
+def test_append_branch_contract_revision_preserves_explicit_id_and_chains_hash() -> None:
+    conn = _runtime_conn()
+    context = _contract_revision_test_context("T-explicit-revision")
+    route_identity = {
+        "route_id": "route-explicit",
+        "route_context_hash": "sha256:route-explicit",
+        "prompt_contract_id": "rprompt-explicit",
+        "prompt_contract_hash": "sha256:prompt-explicit",
+    }
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+
+    first = append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-explicit-compat",
+        payload={"target_files": ["agent/tests/test_parallel_branch_runtime.py"]},
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+    expected_first_hash = _expected_contract_revision_hash(
+        context,
+        runtime_context_id=runtime_context_id,
+        payload={"target_files": ["agent/tests/test_parallel_branch_runtime.py"]},
+        route_identity=route_identity,
+        revision_id="crev-explicit-compat",
+    )
+    assert first.revision_id == "crev-explicit-compat"
+    assert first.payload["revision_receipt"]["canonical_visible_contract_text_hash"] == expected_first_hash
+
+    second_payload = {"target_files": ["agent/governance/parallel_branch_runtime.py"]}
+    second = append_branch_contract_revision(
+        conn,
+        context,
+        payload=second_payload,
+        route_identity=route_identity,
+        now_iso="2026-05-16T12:01:00Z",
+    )
+    expected_second_hash = _expected_contract_revision_hash(
+        context,
+        runtime_context_id=runtime_context_id,
+        payload=second_payload,
+        route_identity=route_identity,
+        previous_revision_hash=expected_first_hash,
+    )
+
+    assert second.revision_id == expected_second_hash
+    assert second.payload["revision_receipt"]["previous_revision_hash"] == expected_first_hash
+    latest = get_latest_branch_contract_revision(conn, PROJECT_ID, runtime_context_id)
+    assert latest is not None
+    assert latest.revision_id == second.revision_id
 
 
 def test_runtime_context_current_view_and_gate_inputs_report_missing_fields() -> None:
