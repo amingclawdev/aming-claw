@@ -17,6 +17,7 @@ from agent.governance.service_registry import (
 
 DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent / "contract_templates"
 FORBIDDEN_ROUTE_KEYS = {"ai_provider", "model", "prompt", "llm", "ai_call"}
+NON_TEMPLATE_CONTRACT_FILES = {"meta_contract.v1.json"}
 
 
 class ContractTemplateError(ValueError):
@@ -36,7 +37,12 @@ def _template_paths(template_dir: str | Path = DEFAULT_TEMPLATE_DIR) -> list[Pat
     if not root.exists():
         return []
     return sorted(
-        (path for path in root.glob("*.json") if not path.name.endswith(".schema.json")),
+        (
+            path
+            for path in root.glob("*.json")
+            if not path.name.endswith(".schema.json")
+            and path.name not in NON_TEMPLATE_CONTRACT_FILES
+        ),
         key=lambda item: item.name,
     )
 

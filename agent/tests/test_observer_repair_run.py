@@ -389,6 +389,9 @@ def test_external_route_action_precheck_materializes_public_source_event():
         version_check={"ok": True, "dirty": False, "dirty_files": []},
     )
 
+    assert plan["route_service_preview"]["available"] is True
+    assert plan["route_service_preview"]["template_id"] == "mf_workflow_runtime.v1"
+
     materialization = observer_repair_run.build_route_service_materialization(
         plan,
         action_precheck_id="external-dispatch-precheck",

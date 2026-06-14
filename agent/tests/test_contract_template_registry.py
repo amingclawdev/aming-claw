@@ -11,6 +11,7 @@ from agent.governance.contract_template_registry import (
     list_contract_templates,
     resolve_contract_template,
 )
+from agent.governance.mf_subagent_contract import load_meta_contract_template
 from agent.mcp.tools import TOOLS, ToolDispatcher
 
 
@@ -112,6 +113,25 @@ def test_mf_workflow_runtime_declares_route_prompt_contract_and_action_gate():
     )
 
 
+def test_mf_workflow_runtime_loads_while_meta_contract_is_present():
+    template = get_contract_template("mf_workflow_runtime.v1")
+    ids = {item["template_id"] for item in list_contract_templates()}
+
+    assert template["template_id"] == "mf_workflow_runtime.v1"
+    assert "mf_workflow_runtime.v1" in ids
+    assert "meta_contract.v1" not in ids
+
+
+def test_meta_contract_whitelist_loads_outside_public_template_registry():
+    meta_contract = load_meta_contract_template()
+
+    assert meta_contract["id"] == "meta_contract.v1"
+    assert "observer" in meta_contract["role_action_whitelist"]
+    assert "dispatch_bounded_worker" in (
+        meta_contract["role_action_whitelist"]["observer"]["allowed_actions"]
+    )
+
+
 def test_mf_parallel_template_declares_route_topology_and_worker_prompt_boundary():
     template = get_contract_template("mf_parallel.v1")
     policy = template["route_topology_policy"]
@@ -161,6 +181,35 @@ def test_malformed_template_raises_explicit_error(tmp_path):
 def test_schema_json_files_are_not_loaded_as_templates(tmp_path):
     (tmp_path / "review_pack.schema.json").write_text(
         json.dumps({"$schema": "https://json-schema.org/draft/2020-12/schema"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "valid.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "test_contract_template.v1",
+                "template_id": "valid.v1",
+                "version": "v1",
+                "task_types": ["task"],
+                "stages": ["review_ready"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    templates = list_contract_templates(template_dir=tmp_path)
+
+    assert [template["template_id"] for template in templates] == ["valid.v1"]
+
+
+def test_meta_contract_json_file_is_not_loaded_as_public_template(tmp_path):
+    (tmp_path / "meta_contract.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "meta_contract.v1",
+                "id": "meta_contract.v1",
+                "role_action_whitelist": {},
+            }
+        ),
         encoding="utf-8",
     )
     (tmp_path / "valid.v1.json").write_text(
