@@ -1007,6 +1007,53 @@ class TestTaskTimeline(unittest.TestCase):
         ).fetchone()["c"]
         self.assertEqual(count, 1)
 
+    def test_timeline_append_accepts_observer_cross_ref_lineage_bridge(self):
+        from agent.governance import server
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": "BUG-CROSS-REF-BRIDGE-APPEND",
+                    "task_id": "root-task",
+                    "event_type": "mf.cross_ref_lineage_bridge",
+                    "event_kind": "cross_ref_lineage_bridge",
+                    "phase": "lineage",
+                    "actor": "observer",
+                    "status": "accepted",
+                    "payload": {
+                        "route_id": "route-bridge",
+                        "route_context_hash": "rch-bridge",
+                        "prompt_contract_id": "pc-bridge",
+                        "observer_command_id": "cmd-bridge",
+                        "bridged_identities": [
+                            {
+                                "backlog_id": "BUG-CROSS-REF-BRIDGE-APPEND",
+                                "project_id": "proj",
+                                "task_id": "root-task",
+                            },
+                            {
+                                "backlog_id": "BUG-CROSS-REF-BRIDGE-APPEND",
+                                "project_id": "proj",
+                                "task_id": "worker-task",
+                            },
+                        ],
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        gate = result["payload"]["meta_contract_gate"]
+        self.assertTrue(gate["allowed"], gate)
+        self.assertEqual(gate["role"], "observer")
+        self.assertEqual(gate["action"], "cross_ref_lineage_bridge")
+        self.assertEqual(result["event_kind"], "cross_ref_lineage_bridge")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ? AND event_kind = ?",
+            ("BUG-CROSS-REF-BRIDGE-APPEND", "cross_ref_lineage_bridge"),
+        ).fetchone()["c"]
+        self.assertEqual(count, 1)
+
     def test_record_event_rejects_observer_work_mode_transition_phase_bypass(self):
         from agent.governance import task_timeline
         from agent.governance.mf_subagent_contract import MfSubagentContractError
@@ -7107,6 +7154,136 @@ def _multi_lane_close_evidence():
         "payload": dict(common_route),
     }
     return common_route, lane_canonical, lane_sibling, row_aggregate
+
+
+def _cross_ref_worker_bridge_fixture():
+    """Root task + worker task under one observer command and route."""
+
+    common_route = {
+        "route_id": "route-bridge",
+        "route_context_hash": "rch-bridge",
+        "prompt_contract_id": "pc-bridge",
+        "observer_command_id": "cmd-bridge",
+    }
+    row_identity = {
+        "backlog_id": "AC-BRIDGE",
+        "project_id": "aming-claw",
+        "route_id": "route-bridge",
+        "prompt_contract_id": "pc-bridge",
+    }
+    root_task = {
+        "id": 10,
+        "event_kind": "close_ready",
+        "phase": "close",
+        "status": "accepted",
+        "backlog_id": "AC-BRIDGE",
+        "project_id": "aming-claw",
+        "task_id": "root-task",
+        "payload": dict(common_route),
+    }
+    worker_implementation = {
+        "id": 11,
+        "event_type": "mf.implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "actor": "mf-sub",
+        "status": "accepted",
+        "backlog_id": "AC-BRIDGE",
+        "project_id": "aming-claw",
+        "task_id": "worker-task",
+        "payload": dict(common_route),
+    }
+    bridge = {
+        "id": 12,
+        "event_type": "mf.cross_ref_lineage_bridge",
+        "event_kind": "cross_ref_lineage_bridge",
+        "phase": "lineage",
+        "actor": "observer",
+        "status": "accepted",
+        "backlog_id": "AC-BRIDGE",
+        "project_id": "aming-claw",
+        "task_id": "root-task",
+        "payload": {
+            **common_route,
+            "bridged_identities": [
+                {
+                    "backlog_id": "AC-BRIDGE",
+                    "project_id": "aming-claw",
+                    "task_id": "root-task",
+                },
+                {
+                    "backlog_id": "AC-BRIDGE",
+                    "project_id": "aming-claw",
+                    "task_id": "worker-task",
+                },
+            ],
+        },
+    }
+    return row_identity, root_task, worker_implementation, bridge
+
+
+def test_close_gate_rejects_worker_scoped_implementation_without_cross_ref_bridge():
+    from agent.governance import task_timeline
+
+    row_identity, root_task, worker_implementation, _ = _cross_ref_worker_bridge_fixture()
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [root_task, worker_implementation],
+        row_identity,
+    )
+
+    assert gate["passed"] is False
+    rejected = gate["rejected_cross_ref_evidence"]
+    assert [item["id"] for item in rejected] == [11]
+    assert rejected[0]["event_kind"] == "implementation"
+    assert rejected[0]["reason"] == "cross_ref_identity_mismatch"
+
+
+def test_close_gate_accepts_worker_scoped_implementation_with_cross_ref_bridge():
+    from agent.governance import task_timeline
+
+    row_identity, root_task, worker_implementation, bridge = (
+        _cross_ref_worker_bridge_fixture()
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [root_task, worker_implementation, bridge],
+        row_identity,
+    )
+
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+    assert "AC-BRIDGE|aming-claw|root-task" in gate["bridged_lane_membership"]
+    assert "AC-BRIDGE|aming-claw|worker-task" in gate["bridged_lane_membership"]
+
+
+def test_cross_ref_lineage_bridge_does_not_count_as_close_evidence():
+    from agent.governance import task_timeline
+
+    _, _, _, bridge = _cross_ref_worker_bridge_fixture()
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": "AC-BRIDGE",
+        "required_lanes": [
+            {"id": "bounded_implementation_subagent", "role": "implementation_worker"}
+        ],
+    }
+
+    gate = task_timeline.mf_close_gate_verification([bridge], contract=contract)
+    lane_gate = task_timeline.mf_lane_ownership_gate_verification(
+        [bridge],
+        contract=contract,
+    )
+
+    assert gate["checks"]["has_implementation"] is False
+    assert gate["checks"]["has_verification"] is False
+    assert gate["checks"]["has_close_ready"] is False
+    assert gate["missing_event_kinds"] == [
+        "close_ready",
+        "implementation",
+        "verification",
+    ]
+    assert lane_gate["checks"]["has_subagent_review_ready"] is False
 
 
 def test_close_gate_multi_lane_bridge_consumes_bridged_identities():
