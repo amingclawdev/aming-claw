@@ -480,6 +480,7 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
     artifact_refs = dict(artifact_refs) if isinstance(artifact_refs, Mapping) else {}
     validation_payload = dict(payload)
     validation_payload.pop("meta_contract_gate", None)
+    _ensure_cross_ref_bridge_meta_contract_aliases()
     from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     meta_contract_gate = validate_meta_contract_timeline_event(
@@ -1419,6 +1420,7 @@ def validate_and_normalize_mf_read_receipt_append(
       present in the payload (lineage required by the close-gate projection).
     """
     p = dict(payload or {})
+    _ensure_cross_ref_bridge_meta_contract_aliases()
     # Build a synthetic event dict so we can reuse _is_mf_subagent_read_receipt_event.
     probe = {
         "event_type": event_type,
@@ -4338,6 +4340,29 @@ def _event_declares_accepted_bridge(event: dict[str, Any]) -> bool:
     return status in {"accepted", "passed", "ok", "approved", "succeeded", "reconciled"}
 
 
+def _ensure_cross_ref_bridge_meta_contract_aliases() -> None:
+    """Register bridge timeline actions with the meta-contract parser.
+
+    The meta-contract whitelist lives in ``mf_subagent_contract`` while bridge
+    evidence is timeline-native. Keep this compatibility shim here so the
+    storage event_kind remains ``cross_ref_lineage_bridge`` and the whitelist
+    gate records the bridge-specific action rather than laundering it through a
+    broader observer action.
+    """
+
+    try:
+        from . import mf_subagent_contract
+    except Exception:
+        return
+    aliases = getattr(mf_subagent_contract, "_META_ACTION_ALIASES", None)
+    if not isinstance(aliases, dict):
+        return
+    aliases.setdefault("cross_ref_lineage_bridge", "cross_ref_lineage_bridge")
+    aliases.setdefault("mf_cross_ref_lineage_bridge", "cross_ref_lineage_bridge")
+    aliases.setdefault("lineage_bridge", "lineage_bridge")
+    aliases.setdefault("mf_lineage_bridge", "lineage_bridge")
+
+
 # Fields that pin a single bounded-lane identity within one backlog row. A row
 # implemented by >=2 mf_sub lanes shares backlog_id + project_id but differs by
 # task_id; the row-level aggregate is task_id="".
@@ -4405,6 +4430,7 @@ def _cross_ref_row_anchor(
         "route_context_hash": "",
         "prompt_contract_id": "",
         "command": "",
+        "task_id": "",
     }
     # Trusted identity wins for the backlog/project floor BEFORE any event is
     # consulted; once set from the trusted source it is never overwritten below.
@@ -4424,6 +4450,18 @@ def _cross_ref_row_anchor(
                 anchor[field] = _first_deep_text(event, field)
         if not anchor["command"]:
             anchor["command"] = _cross_ref_bridge_command(event)
+        if (
+            not anchor["task_id"]
+            and _normalize_token(event.get("event_kind")) == "close_ready"
+        ):
+            anchor["task_id"] = _first_deep_text(event, "task_id")
+    if not anchor["task_id"]:
+        for raw in rows:
+            event = _mapping(raw)
+            if is_protected_close_evidence(event):
+                anchor["task_id"] = _first_deep_text(event, "task_id")
+                if anchor["task_id"]:
+                    break
     return anchor
 
 
@@ -4612,6 +4650,12 @@ def mf_close_cross_ref_gate_verification(
         if aggregate_key in lane_membership and lane_key[2] == "":
             continue
         mismatches: dict[str, dict[str, str]] = {}
+        anchor_task = str(anchor.get("task_id") or "").strip()
+        if lane_key[2] and anchor_task and lane_key[2] != anchor_task:
+            mismatches["task_id"] = {
+                "expected": anchor_task,
+                "actual": lane_key[2],
+            }
         for field, want in expected.items():
             got = identity.get(field, "")
             if got and got != want and f"{field}={got}" not in bridged:

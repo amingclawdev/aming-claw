@@ -47,6 +47,8 @@
         "hotfix_entered",
         "hotfix_under_action",
         "observer_command",
+        "cross_ref_lineage_bridge",
+        "lineage_bridge",
         "route_token_gate",
         "no_progress_timeout",
         "forbidden_attempt_recorded"
