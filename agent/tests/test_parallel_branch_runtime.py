@@ -1406,6 +1406,61 @@ def test_runtime_context_action_plan_translates_close_blockers_for_operator() ->
     )
 
 
+def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish_gate() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        startup_gate={
+            "worker_self_attesting": False,
+            "worker_self_attestation": {
+                "status": "blocked",
+                "worker_self_attesting": False,
+                "blockers": ["missing_mf_subagent_graph_trace_ids"],
+            },
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    control_plane = projection["views"]["control_plane"]
+    worker_view = projection["views"]["worker_view"]
+    next_required = action_plan["next_required_evidence"]
+    by_id = {item["id"]: item for item in next_required}
+
+    assert projection["next_required_evidence"] == next_required
+    assert control_plane["next_required_evidence"] == next_required
+    assert worker_view["next_required_evidence"] == next_required
+    assert worker_view["control_plane"]["next_required_evidence"] == next_required
+    assert ["worker_graph_trace", "worker_self_attestation", "finish_gate"] == [
+        item["id"] for item in next_required[:3]
+    ]
+    assert by_id["worker_graph_trace"]["next_action"] == "run_worker_graph_query"
+    assert by_id["worker_graph_trace"]["producer"] == "graph_query_trace"
+    assert by_id["worker_graph_trace"]["worker_owned"] is True
+    assert by_id["worker_self_attestation"]["next_action"] == (
+        "record_worker_self_attestation"
+    )
+    assert by_id["worker_self_attestation"]["close_satisfying_required"] is True
+    assert by_id["finish_gate"]["next_action"] == "record_finish_gate"
+    assert by_id["finish_gate"]["requires"] == [
+        "worker_graph_trace",
+        "worker_self_attestation",
+    ]
+    assert by_id["finish_gate"]["runtime_context_id"] == projection["runtime_context_id"]
+
+
 def test_runtime_context_action_plan_links_audit_archive_for_historical_close_blocker() -> None:
     context = _runtime_projection_context()
     projection = build_runtime_context_projection(
@@ -2200,9 +2255,12 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert gate["worker_self_attesting"] is True
     assert gate["worker_self_attestation"]["status"] == "passed"
     assert gate["close_satisfying"] is True
+    assert gate["graph_trace_db_evidence"]["db_verified"] is True
+    assert gate["graph_trace_db_evidence"]["trace_ids"] == ["gqt-startup"]
     assert gate["worker_self_attestation"]["worker_session_id"] == "codex-session-startup"
     assert gate["identity_join"]["runtime_context_id_matches"] is True
     assert gate["identity_join"]["route_identity_matches_latest_contract"] is True
+    assert gate["identity_join"]["read_receipt_lineage_present"] is True
     assert "secret-worker-session-token" not in str(result)
     assert result["timeline_event"]["event_kind"] == "mf_subagent_startup"
     assert result["timeline_event"]["actor"] == "codex-session-startup"
@@ -2744,6 +2802,7 @@ def test_mf_sub_startup_blocks_route_identity_mismatch_with_contract_revision(tm
         },
         now_iso=NOW,
     )
+    _insert_startup_graph_trace(conn)
 
     result = record_mf_subagent_startup(
         conn,
@@ -2948,6 +3007,7 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
         },
         now_iso=NOW,
     )
+    _insert_startup_graph_trace(conn)
 
     result = record_mf_subagent_startup(
         conn,
@@ -2983,6 +3043,12 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
     assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
     assert gate["host_adapter_startup_token_accepted"] is True
     assert gate["same_as_expected_worker"] is False
+    assert gate["worker_self_attesting"] is False
+    assert gate["close_satisfying"] is False
+    assert gate["worker_self_attestation"]["status"] == "blocked"
+    assert "host_adapter_startup_surrogate_not_close_satisfying" in gate[
+        "worker_self_attestation"
+    ]["blockers"]
 
 
 def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session(
@@ -3039,6 +3105,7 @@ def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session
         },
         now_iso=NOW,
     )
+    _insert_startup_graph_trace(conn)
 
     result = record_mf_subagent_startup(
         conn,
@@ -3062,6 +3129,11 @@ def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session
     assert gate["host_adapter_startup_token_accepted"] is True
     assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
     assert gate["host_startup_id"] == "registered-host-session-only"
+    assert gate["worker_self_attesting"] is False
+    assert gate["close_satisfying"] is False
+    assert "host_adapter_startup_surrogate_not_close_satisfying" in gate[
+        "worker_self_attestation"
+    ]["blockers"]
 
 
 def test_mf_sub_startup_accepts_runtime_text_prepare_placeholder_host_agent(

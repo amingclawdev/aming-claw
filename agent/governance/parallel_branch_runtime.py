@@ -605,6 +605,9 @@ class RuntimeContextProjection:
             "schema_version": RUNTIME_CONTEXT_PROJECTION_SCHEMA_VERSION,
             "project_id": self.project_id,
             "runtime_context_id": self.runtime_context_id,
+            "next_required_evidence": list(
+                self.action_plan.get("next_required_evidence") or []
+            ),
             "views": views,
             "source_policy": source_policy,
             "content_address": runtime_context_projection_content_address(
@@ -4274,6 +4277,206 @@ def _runtime_context_next_legal_action(
     return "record_missing_evidence"
 
 
+def _runtime_context_next_required_evidence(
+    *,
+    values: Mapping[str, Any],
+    route_token_action: Mapping[str, Any],
+    read_receipt_hash_action: Mapping[str, Any],
+    close_gate_view: Mapping[str, Any],
+    lane_plan: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Project the worker-owned evidence still needed before close."""
+
+    runtime_context_id = _runtime_context_text(values.get("runtime_context_id"))
+    task_id = _runtime_context_text(values.get("task_id"))
+    parent_task_id = _runtime_context_text(values.get("parent_task_id"))
+    missing_fields = {
+        _runtime_context_text(item.get("field"))
+        for item in close_gate_view.get("missing") or []
+        if isinstance(item, Mapping)
+    }
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(
+        *,
+        item_id: str,
+        field: str,
+        gate: str,
+        next_action: str,
+        producer: str,
+        consumer: str,
+        expected_source: str,
+        evidence_ref: str,
+        status: str = "missing",
+        worker_owned: bool = True,
+        close_satisfying_required: bool = False,
+        requires: Sequence[str] = (),
+    ) -> None:
+        if not item_id or item_id in seen:
+            return
+        seen.add(item_id)
+        items.append(
+            {
+                "schema_version": "runtime_context.next_required_evidence.item.v1",
+                "id": item_id,
+                "status": status,
+                "field": field,
+                "gate": gate,
+                "next_action": next_action,
+                "producer": producer,
+                "consumer": consumer,
+                "expected_source": expected_source,
+                "evidence_ref": evidence_ref,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_owned": worker_owned,
+                "close_satisfying_required": close_satisfying_required,
+                "requires": list(requires),
+            }
+        )
+
+    if route_token_action.get("status") in {"missing", "stale"}:
+        _add(
+            item_id="route_token_ref",
+            field="route_token_ref",
+            gate="dispatch",
+            next_action="refresh_route_token_ref",
+            producer="route_prompt_contract",
+            consumer="runtime_context_action_plan",
+            expected_source="route_prompt_contract.route_token_ref",
+            evidence_ref="route_identity",
+            status=_runtime_context_text(route_token_action.get("status") or "missing"),
+            worker_owned=False,
+        )
+    if read_receipt_hash_action.get("status") == "missing":
+        _add(
+            item_id="runtime_context_read_receipt",
+            field="read_receipt_event_ref",
+            gate="finish",
+            next_action="submit_mf_subagent_read_receipt",
+            producer="mf_subagent_worker",
+            consumer="task_timeline",
+            expected_source="task_timeline.mf_subagent_read_receipt",
+            evidence_ref="timeline",
+            close_satisfying_required=True,
+        )
+    startup_event_ref = _runtime_context_text(values.get("startup_event_ref"))
+    if not startup_event_ref:
+        requires: list[str] = []
+        if "runtime_context_read_receipt" in seen:
+            requires.append("runtime_context_read_receipt")
+        _add(
+            item_id="mf_subagent_startup",
+            field="startup_event_ref",
+            gate="finish",
+            next_action="record_mf_subagent_startup",
+            producer="mf_subagent_worker",
+            consumer="task_timeline",
+            expected_source="task_timeline.mf_subagent_startup",
+            evidence_ref="timeline",
+            close_satisfying_required=True,
+            requires=requires,
+        )
+    if "graph_trace_ids" in missing_fields:
+        _add(
+            item_id="worker_graph_trace",
+            field="graph_trace_ids",
+            gate="finish",
+            next_action="run_worker_graph_query",
+            producer="graph_query_trace",
+            consumer="mf_subagent_contract.validate_mf_subagent_finish_gate",
+            expected_source="graph_query_trace.trace_ids",
+            evidence_ref="graph_trace",
+            close_satisfying_required=True,
+        )
+    if "worker_self_attesting" in missing_fields:
+        requires = ["worker_graph_trace"] if "worker_graph_trace" in seen else []
+        _add(
+            item_id="worker_self_attestation",
+            field="worker_self_attesting",
+            gate="finish",
+            next_action="record_worker_self_attestation",
+            producer="worker_transcript_verify",
+            consumer="mf_subagent_contract.validate_mf_subagent_finish_gate",
+            expected_source="worker_transcript_verify.worker_self_attestation",
+            evidence_ref="finish_gate",
+            close_satisfying_required=True,
+            requires=requires,
+        )
+    if "finish_gate_ref" in missing_fields:
+        requires = [
+            evidence_id
+            for evidence_id in ("worker_graph_trace", "worker_self_attestation")
+            if evidence_id in seen
+        ]
+        _add(
+            item_id="finish_gate",
+            field="finish_gate_ref",
+            gate="close",
+            next_action="record_finish_gate",
+            producer="mf_subagent_worker",
+            consumer="close_gate",
+            expected_source="task_timeline.finish_gate",
+            evidence_ref="timeline",
+            close_satisfying_required=True,
+            requires=requires,
+        )
+    for field, item_id, action, producer, expected_source in (
+        (
+            "checkpoint_id",
+            "checkpoint",
+            "record_checkpoint",
+            "parallel_branch_runtime",
+            "branch_runtime.context.checkpoint_or_finish_gate",
+        ),
+        (
+            "verification_event_refs",
+            "independent_verification",
+            "record_independent_verification",
+            "verification_runner",
+            "task_timeline.verification",
+        ),
+        (
+            "close_ready_event_ref",
+            "close_ready",
+            "record_close_ready",
+            "observer_review",
+            "task_timeline.close_ready",
+        ),
+    ):
+        if field in missing_fields:
+            _add(
+                item_id=item_id,
+                field=field,
+                gate="close",
+                next_action=action,
+                producer=producer,
+                consumer="close_gate",
+                expected_source=expected_source,
+                evidence_ref="timeline",
+                worker_owned=item_id != "close_ready",
+                requires=["finish_gate"] if "finish_gate" in seen else [],
+            )
+    if lane_plan.get("blocking_events"):
+        _add(
+            item_id="lane_blocking_event",
+            field="blocking_events",
+            gate="lane_plan",
+            next_action="resolve_blocking_timeline_event",
+            producer="task_timeline",
+            consumer="runtime_context_lane_plan",
+            expected_source="task_timeline.blocking_event",
+            evidence_ref="timeline",
+            status="blocked",
+            worker_owned=False,
+        )
+    for index, item in enumerate(items):
+        item["is_next"] = index == 0
+    return items
+
+
 def build_runtime_context_action_plan_view(
     current_view: Mapping[str, Any],
     gate_inputs_view: Mapping[str, Any] | None = None,
@@ -4329,6 +4532,13 @@ def build_runtime_context_action_plan_view(
         gate_inputs_view=gate_inputs,
         lane_plan=lane_plan,
     )
+    next_required_evidence = _runtime_context_next_required_evidence(
+        values=values,
+        route_token_action=route_token_action,
+        read_receipt_hash_action=read_receipt_hash_action,
+        close_gate_view=close_gate,
+        lane_plan=lane_plan,
+    )
     blocking_reasons: list[dict[str, Any]] = []
     if route_token_action.get("status") in {"missing", "stale"}:
         blocking_reasons.append(
@@ -4380,6 +4590,7 @@ def build_runtime_context_action_plan_view(
         "task_id": values.get("task_id", ""),
         "parent_task_id": values.get("parent_task_id", ""),
         "next_legal_action": next_legal_action,
+        "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
         "route_token_action": route_token_action,
@@ -4429,6 +4640,9 @@ def build_runtime_context_control_plane_view(
         "runtime_context_id": action_plan.get("runtime_context_id", ""),
         "task_id": action_plan.get("task_id", ""),
         "next_legal_action": action_plan.get("next_legal_action", ""),
+        "next_required_evidence": list(
+            action_plan.get("next_required_evidence") or []
+        ),
         "missing_evidence": list(action_plan.get("missing_evidence") or []),
         "blocking_reasons": list(action_plan.get("blocking_reasons") or []),
         "route_token_action": dict(action_plan.get("route_token_action") or {}),
@@ -4656,6 +4870,9 @@ def build_runtime_context_worker_view(
         )
         or runtime_context_content_hash(capability_boundary),
         "lane_plan": dict(_runtime_context_mapping(current_view.get("lane_plan"))),
+        "next_required_evidence": list(
+            action_plan.get("next_required_evidence") or []
+        ),
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,
         "action_plan": action_plan,
@@ -4686,6 +4903,7 @@ def build_runtime_context_worker_view(
                 "lane_plan",
                 "graph_query_identity",
                 "capability_boundary",
+                "next_required_evidence",
                 "gate_inputs",
                 "close_gate_view",
                 "action_plan",
@@ -7316,7 +7534,28 @@ def record_mf_subagent_startup(
         "host_adapter_startup_token_accepted": host_adapter_startup,
         "graph_trace_db_evidence": graph_trace_db_evidence,
     }
-    worker_self_attestation = verify_worker_transcript(worker_self_attestation_payload)
+    worker_self_attestation = dict(
+        verify_worker_transcript(worker_self_attestation_payload)
+    )
+    surrogate_startup_not_close_satisfying = bool(
+        host_adapter_startup
+        or token_evidence["session_token_evidence_type"] == "surrogate"
+    )
+    if surrogate_startup_not_close_satisfying:
+        blockers = _runtime_context_dedupe(
+            list(worker_self_attestation.get("blockers") or [])
+            + ["host_adapter_startup_surrogate_not_close_satisfying"]
+        )
+        worker_self_attestation.update(
+            {
+                "status": "blocked",
+                "ok": False,
+                "worker_self_attesting": False,
+                "self_attesting": False,
+                "blockers": blockers,
+                "host_adapter_startup_surrogate_not_close_satisfying": True,
+            }
+        )
     worker_self_attesting = bool(worker_self_attestation.get("worker_self_attesting"))
 
     # For first-sight ('hash') startups, persist the server-computed token hash
@@ -7386,6 +7625,9 @@ def record_mf_subagent_startup(
         "expected_agent_id": allocation_owner,
         "agent_id_match_mode": agent_id_match_mode,
         "host_adapter_startup_token_accepted": host_adapter_startup,
+        "host_adapter_startup_surrogate_not_close_satisfying": (
+            surrogate_startup_not_close_satisfying
+        ),
         "fence_token": saved.fence_token,
         "branch": saved.branch_ref,
         "branch_ref": saved.branch_ref,

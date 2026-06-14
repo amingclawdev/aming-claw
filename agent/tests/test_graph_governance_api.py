@@ -2720,6 +2720,9 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "gate_inputs",
         "worker_view",
         "close_gate_view",
+        "observer_view",
+        "qa_view",
+        "judge_view",
     }
     observer_audit = observer_result["access_audit"]
     assert observer_audit["schema_version"] == "runtime_context.access_audit.v1"
@@ -2827,6 +2830,15 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert worker_view["control_plane"]["read_receipt_hash_action"]["status"] == (
         "present"
     )
+    next_required = worker_view["next_required_evidence"]
+    assert worker_view["action_plan"]["next_required_evidence"] == next_required
+    assert worker_view["control_plane"]["next_required_evidence"] == next_required
+    assert [item["id"] for item in next_required[:2]] == [
+        "worker_self_attestation",
+        "finish_gate",
+    ]
+    assert next_required[0]["next_action"] == "record_worker_self_attestation"
+    assert next_required[1]["runtime_context_id"] == context.runtime_context_id
     assert "current_values" not in worker_view
     assert "fence-current" not in json.dumps(worker_result, sort_keys=True)
     assert "runtime-current-session" not in json.dumps(worker_result, sort_keys=True)
