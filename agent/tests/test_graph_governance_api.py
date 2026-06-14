@@ -2687,6 +2687,15 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     )
     assert control_plane["route_token_action"]["status"] == "present"
     assert control_plane["route_token_action"]["next_action"] == "none"
+    assert control_plane["route_token_action"]["source_event_lineage"][
+        "route_token_ref"
+    ] == "rtok-current"
+    assert control_plane["route_token_action"]["source_event_lineage"][
+        "raw_route_token_required"
+    ] is False
+    assert control_plane["route_token_action"]["source_event_lineage"][
+        "next_action"
+    ] == "append_protected_evidence_with_route_token_ref_or_route_owned_source_event"
     assert control_plane["route_token_action"]["entrypoint"]["path"] == (
         "/api/projects/{project_id}/observer/route-context/issue"
     )
@@ -2809,6 +2818,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     )
     assert worker_view["control_plane"]["route_token_action"]["status"] == "present"
     assert worker_view["control_plane"]["route_token_action"]["next_action"] == "none"
+    assert worker_view["control_plane"]["route_token_action"]["source_event_lineage"][
+        "route_token_ref"
+    ] == "rtok-current"
+    assert worker_view["control_plane"]["route_token_action"]["source_event_lineage"][
+        "raw_route_token_required"
+    ] is False
     assert worker_view["control_plane"]["read_receipt_hash_action"]["status"] == (
         "present"
     )

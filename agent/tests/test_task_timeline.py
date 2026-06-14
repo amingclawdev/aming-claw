@@ -824,11 +824,14 @@ class TestTaskTimeline(unittest.TestCase):
         self.conn.commit()
         return contract
 
-    def _record_route_owned_source_lineage(self, bug_id, *, task_id=""):
+    def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline
 
         source_event_id = f"source-{bug_id}-{task_id or 'backlog'}"
-        source = _route_owned_source_event(source_event_id=source_event_id)
+        source = _route_owned_source_event(
+            identity=identity,
+            source_event_id=source_event_id,
+        )
         recorded_source = task_timeline.record_event(
             self.conn,
             project_id="proj",
@@ -843,6 +846,7 @@ class TestTaskTimeline(unittest.TestCase):
             correlation_id=source["correlation_id"],
         )
         service_event = _route_owned_source_service_event(
+            identity=identity,
             parent_event_id=recorded_source["id"],
             source_event_id=source_event_id,
         )
@@ -860,6 +864,28 @@ class TestTaskTimeline(unittest.TestCase):
             verification=service_event["verification"],
         )
         self.conn.commit()
+
+    def test_route_owned_source_event_gate_reports_route_token_ref_lineage(self):
+        from agent.governance import task_timeline
+
+        identity = {**ROUTE_IDENTITY, "route_token_ref": "rtok-worker-visible"}
+        source = _route_owned_source_event(identity=identity)
+        service = _route_owned_source_service_event(
+            identity=identity,
+            parent_event_id="route-source-1",
+        )
+
+        gate = task_timeline.route_owned_source_event_gate_verification(
+            [source, service],
+            route_identity=identity,
+            protected_lane="mf_subagent_startup",
+        )
+
+        self.assertTrue(gate["passed"], gate)
+        self.assertEqual(
+            gate["route_identity"]["route_token_ref"],
+            "rtok-worker-visible",
+        )
 
     def _record_route_context_consumption(
         self,
@@ -2058,6 +2084,55 @@ class TestTaskTimeline(unittest.TestCase):
             "bounded_implementation_worker_dispatch",
         )
         self.assertTrue(result["route_token_gate"]["source_event_refs"])
+
+    def test_mf_parallel_timeline_accepts_source_event_for_startup_lane_without_token(self):
+        from agent.governance import server
+
+        bug_id = "BUG-TL-MF-PARALLEL-SOURCE-STARTUP"
+        worker_task_id = "worker-source-startup"
+        identity = {**ROUTE_IDENTITY, "route_token_ref": "rtok-source-startup"}
+        self._insert_router_backlog(bug_id)
+        self._record_route_owned_source_lineage(
+            bug_id,
+            task_id=worker_task_id,
+            identity=identity,
+        )
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": worker_task_id,
+                    "event_type": "mf_subagent.startup",
+                    "event_kind": "mf_subagent_startup",
+                    "phase": "startup_gate",
+                    "status": "passed",
+                    "payload": {
+                        "mf_subagent_startup_gate": {
+                            **identity,
+                            "runtime_context_id": "mfrctx-source-startup",
+                            "task_id": worker_task_id,
+                            "parent_task_id": bug_id,
+                            "worker_role": "mf_sub",
+                            "worker_slot_id": "worker-source-startup",
+                            "fence_token": "fence-source-startup",
+                            "actual_cwd": "/repo/.worktrees/source-startup",
+                            "actual_git_root": "/repo/.worktrees/source-startup",
+                            "branch": "refs/heads/source-startup",
+                            "head_commit": "head-source-startup",
+                            "close_satisfying": True,
+                        }
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        gate = result["route_token_gate"]
+        self.assertEqual(gate["decision"], "route_owned_source_event")
+        self.assertEqual(gate["protected_lane"], "mf_subagent_startup")
+        self.assertEqual(gate["route_token_ref"], "rtok-source-startup")
+        self.assertNotIn("route_token", result["payload"])
 
     def test_mf_parallel_timeline_accepts_source_event_for_independent_verification_without_token(self):
         from agent.governance import server

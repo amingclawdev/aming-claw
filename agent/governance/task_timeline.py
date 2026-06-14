@@ -2960,6 +2960,7 @@ def route_owned_source_event_gate_verification(
             "route_context_hash",
             "prompt_contract_id",
             "prompt_contract_hash",
+            "route_token_ref",
             "visible_injection_manifest_hash",
         )
         if str(identity_filter.get(field) or "").strip()

@@ -19931,7 +19931,36 @@ def _timeline_claimed_route_identity(
             token = str(candidate.get(field) or "").strip()
             if token and not merged.get(field):
                 merged[field] = token
+    for field in (
+        "route_id",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        if not merged.get(field):
+            token = _timeline_first_deep_text(body, field) or _timeline_first_deep_text(
+                event,
+                field,
+            )
+            if token:
+                merged[field] = token
     return merged
+
+
+def _timeline_first_deep_text(value: Any, key: str) -> str:
+    if isinstance(value, Mapping):
+        token = str(value.get(key) or "").strip()
+        if token:
+            return token
+        for child in value.values():
+            found = _timeline_first_deep_text(child, key)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _timeline_first_deep_text(child, key)
+            if found:
+                return found
+    return ""
 
 
 def _timeline_supplied_route_categories(body: dict, event: dict) -> set[str]:
@@ -19986,6 +20015,8 @@ def _timeline_source_event_directly_authorizes_lane(body: dict, event: dict) -> 
     return any(
         token in marker
         for token in (
+            "mf_subagent_startup",
+            "startup_gate",
             "independent_verification",
             "independent_verification_lane",
             "qa_verification",
@@ -20183,6 +20214,7 @@ def _timeline_no_token_source_event_gate_or_block(
         if source_gate
         else {}
     )
+    route_identity = _timeline_claimed_route_identity(body, event, route_context_gate)
     reason = (
         "route_token or accepted route-owned source-event lineage is required "
         "before appending protected mf_parallel evidence"
@@ -20198,6 +20230,19 @@ def _timeline_no_token_source_event_gate_or_block(
             },
             "source_event_lineage_required": True,
             "route_owned_source_event_gate": source_event_gate,
+            "route_token_ref": route_identity.get("route_token_ref", ""),
+            "route_identity": _route_identity_public_summary(route_identity),
+            "source_event_lineage": {
+                "schema_version": "route_source_event_lineage_diagnostic.v1",
+                "status": "present" if source_event_gate.get("passed") else "missing",
+                "route_token_ref": route_identity.get("route_token_ref", ""),
+                "source_event_refs": source_event_gate.get("source_event_refs", []),
+                "next_action": (
+                    source_event_gate.get("next_legal_action")
+                    or "record_or_reuse_an_accepted_route_owned_source_event_for_the_claimed_route_identity"
+                ),
+                "raw_route_token_required": False,
+            },
             "missing_requirement_ids": route_context_gate.get(
                 "missing_requirement_ids",
                 [],

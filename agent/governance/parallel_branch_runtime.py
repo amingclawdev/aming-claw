@@ -3665,12 +3665,28 @@ def _runtime_context_route_token_action(
         status = "present"
         next_action = "none"
         issue = ""
+    source_event_lineage = {
+        "schema_version": "runtime_context.route_source_event_lineage.v1",
+        "status": "available" if route_token_ref else "missing_route_token_ref",
+        "route_token_ref": route_token_ref,
+        "route_identity": canonical,
+        "raw_route_token_required": False,
+        "next_action": (
+            "append_protected_evidence_with_route_token_ref_or_route_owned_source_event"
+            if route_token_ref
+            else "refresh_route_token_ref"
+        ),
+        "expected_source": "observer_route_token_ref_or_route_owned_source_event",
+        "producer": "observer_runtime_text_prepare",
+        "consumer": "task_timeline_append",
+    }
     return {
         "schema_version": "runtime_context.route_token_action.v1",
         "status": status,
         "next_action": next_action,
         "issue": issue,
         "route_token_ref_present": bool(route_token_ref),
+        "source_event_lineage": source_event_lineage,
         "entrypoint": {
             "method": "POST",
             "path": "/api/projects/{project_id}/observer/route-context/issue",
@@ -3829,6 +3845,24 @@ def _runtime_context_close_blocker_explanation(
                     field,
                     f"record close-gate evidence for {field}",
                 ),
+            }
+        )
+    route_token_ref = _runtime_context_text(values.get("route_token_ref"))
+    if route_token_ref and missing_fields:
+        explanations.append(
+            {
+                "code": "route_source_event_lineage_available",
+                "field": "route_token_ref",
+                "message": (
+                    "protected timeline evidence can use route_token_ref or an "
+                    "accepted route-owned source-event lineage; raw route tokens "
+                    "must not be exposed"
+                ),
+                "route_token_ref": route_token_ref,
+                "next_action": (
+                    "append_protected_evidence_with_route_token_ref_or_route_owned_source_event"
+                ),
+                "raw_route_token_required": False,
             }
         )
     return {
