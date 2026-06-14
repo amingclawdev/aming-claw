@@ -3567,6 +3567,46 @@ function ueBlockerUrlAssertions(): string[] {
   );
   results.push("current activity Open playback history binds playback_backlog and avoids sample trace");
 
+  // ── Stale backlog-cache deep link must fetch detail before timeline/gate ──
+  assertFixture(
+    viewSource.includes("const [selectedBacklogDetailById, setSelectedBacklogDetailById]")
+      && viewSource.includes("const selectedBacklogDetailByIdRef"),
+    "stale backlog-cache playback should keep a detail fallback map/ref for selected playback_backlog",
+  );
+  assertFixture(
+    viewSource.includes("const selectedBug = cachedSelectedBug ?? fetchedSelectedBug;"),
+    "selected playback bug should resolve from cached publicBugs or fetched backlog detail",
+  );
+  const staleCacheDetailEffect = viewSource.match(/Stale backlog-cache deep links need a detail row before timeline\/gate requests can be scoped\.[\s\S]*?api\.backlogBugFor\(projectId, bugId, controller\.signal\)[\s\S]*?\}, \[projectId, selectedBugId, cachedSelectedBug\?\.bug_id\]\);/)?.[0] ?? "";
+  assertFixture(
+    staleCacheDetailEffect.includes("if (!selectedBugId || cachedSelectedBug) return undefined;")
+      && staleCacheDetailEffect.includes("api.backlogBugFor(projectId, bugId, controller.signal)"),
+    "selected playback_backlog missing from cached publicBugs should fetch /api/backlog/{project_id}/{backlog_id}",
+  );
+  const historyTimelineLoader = viewSource.match(/const bug = selectedBugRef\.current;[\s\S]*?api\.taskTimelineFor\(projectId, bugId, PLAYBACK_TIMELINE_LIMIT, controller\.signal\)[\s\S]*?api\.backlogTimelineGateFor\(projectId, bugId, PLAYBACK_TIMELINE_LIMIT, controller\.signal\)/)?.[0] ?? "";
+  assertFixture(
+    historyTimelineLoader.includes("if (!selectedLoadBugId || !bug || bug.bug_id !== selectedLoadBugId) return;"),
+    "history timeline/gate loader should wait until the selected detail bug exists",
+  );
+  assertFixture(
+    viewSource.includes("const selectedPlaybackLoading = (selectedState?.loading ?? false) || (!selectedBug && (selectedBacklogDetail?.loading ?? false));")
+      && viewSource.includes("const selectedPlaybackError = selectedState?.error || (!selectedBug ? selectedBacklogDetail?.error ?? \"\" : \"\");")
+      && viewSource.includes("loading={selectedPlaybackLoading}")
+      && viewSource.includes("error={selectedPlaybackError}"),
+    "failed backlog-detail fallback should surface loading/error instead of presenting an empty no-evidence trace",
+  );
+  assertFixture(
+    viewSource.includes("selectedPlaceholderBug")
+      && viewSource.includes("selectedBacklogDetail?.loading ? \"Loading backlog detail\" : \"Backlog detail unavailable\""),
+    "detail fallback should render a selected backlog placeholder instead of the sample playback trace",
+  );
+  assertFixture(
+    viewSource.includes("resolveInitialPlaybackFrameId(")
+      && viewSource.includes("selectedEventParamRef.current || readPlaybackEventParam()"),
+    "playback_event should still resolve after fallback backlog-detail fetch unlocks the governed trace",
+  );
+  results.push("stale backlog-cache playback_backlog fetches detail before timeline/gate and preserves playback_event selection");
+
   // ── findFrameIdByEventParam — exact frame id match ───────────────────────
   const sampleFrames: TaskPlaybackFrame[] = [
     { id: "abc-def", source_event_id: "src-001", sequence: 1, title: "T1", event_kind: "route_context", status: "passed", structured_facts: [], failure_diagnosis: [], evidence_links: [], raw_sections: [], specific_facts: [], auxiliary_narrative: [] } as unknown as TaskPlaybackFrame,

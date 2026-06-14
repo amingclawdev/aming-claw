@@ -55,6 +55,13 @@ interface PlaybackLoadState {
   gate?: BacklogTimelineGateResponse | null;
 }
 
+interface BacklogDetailLoadState {
+  loading: boolean;
+  loaded: boolean;
+  error: string;
+  bug?: BacklogBug | null;
+}
+
 interface CompetingCandidate {
   bug_id: string;
   task_id: string;
@@ -91,6 +98,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("open");
   const [gateFilter, setGateFilter] = useState<GateFilter>("all");
   const [selectedBugId, setSelectedBugId] = useState(() => readSelectedBacklogId());
+  const [selectedBacklogDetailById, setSelectedBacklogDetailById] = useState<Record<string, BacklogDetailLoadState>>({});
   const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>({});
   const [activityByBug, setActivityByBug] = useState<Record<string, ActivityLoadState>>({});
   const [currentTaskHint, setCurrentTaskHint] = useState<CurrentTaskHint | null>(null);
@@ -127,6 +135,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [speed, setSpeed] = useState(1);
   const playbackByBugRef = useRef<Record<string, PlaybackLoadState>>({});
   const activityByBugRef = useRef<Record<string, ActivityLoadState>>({});
+  const selectedBacklogDetailByIdRef = useRef<Record<string, BacklogDetailLoadState>>({});
   const selectedBugRef = useRef<BacklogBug | null>(null);
   const activityMountedRef = useRef(true);
   const mountedRef = useRef(true);
@@ -146,14 +155,20 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   }, [activityByBug]);
 
   useEffect(() => {
+    selectedBacklogDetailByIdRef.current = selectedBacklogDetailById;
+  }, [selectedBacklogDetailById]);
+
+  useEffect(() => {
     activeProjectIdRef.current = projectId;
     playbackControllersRef.current.forEach((controller) => controller.abort());
     playbackControllersRef.current.clear();
     inFlightPlaybackKeysRef.current.clear();
     playbackByBugRef.current = {};
     activityByBugRef.current = {};
+    selectedBacklogDetailByIdRef.current = {};
     setPlaybackByBug({});
     setActivityByBug({});
+    setSelectedBacklogDetailById({});
     setCurrentTaskHint(null);
     setLocalActivityBugId("");
     setActivityRefreshSeq(0);
@@ -180,14 +195,84 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     };
   }, []);
 
-  const selectedBug = useMemo(() => {
+  const cachedSelectedBug = useMemo(() => {
     if (!selectedBugId) return null;
     return publicBugs.find((bug) => bug.bug_id === selectedBugId) ?? null;
   }, [publicBugs, selectedBugId]);
+  const selectedBacklogDetail = selectedBugId ? selectedBacklogDetailById[selectedBugId] : undefined;
+  const fetchedSelectedBug = selectedBacklogDetail?.bug && !isPrivatePlaybackBacklog(selectedBacklogDetail.bug)
+    ? selectedBacklogDetail.bug
+    : null;
+  const selectedBug = cachedSelectedBug ?? fetchedSelectedBug;
 
   useEffect(() => {
     selectedBugRef.current = selectedBug;
   }, [selectedBug]);
+
+  // Stale backlog-cache deep links need a detail row before timeline/gate requests can be scoped.
+  useEffect(() => {
+    if (!selectedBugId || cachedSelectedBug) return undefined;
+    const current = selectedBacklogDetailByIdRef.current[selectedBugId];
+    if (current?.loaded) return undefined;
+    const bugId = selectedBugId;
+    const controller = new AbortController();
+    setSelectedBacklogDetailById((states) => {
+      const next = {
+        ...states,
+        [bugId]: {
+          loading: true,
+          loaded: states[bugId]?.loaded ?? false,
+          error: "",
+          bug: states[bugId]?.bug ?? null,
+        },
+      };
+      selectedBacklogDetailByIdRef.current = next;
+      return next;
+    });
+
+    api.backlogBugFor(projectId, bugId, controller.signal)
+      .then((bug) => {
+        if (controller.signal.aborted || !mountedRef.current || activeProjectIdRef.current !== projectId) return;
+        setSelectedBacklogDetailById((states) => {
+          const next = {
+            ...states,
+            [bugId]: isPrivatePlaybackBacklog(bug)
+              ? {
+                loading: false,
+                loaded: true,
+                error: "Backlog detail is private and cannot be shown in playback history.",
+                bug: null,
+              }
+              : {
+                loading: false,
+                loaded: true,
+                error: "",
+                bug,
+              },
+          };
+          selectedBacklogDetailByIdRef.current = next;
+          return next;
+        });
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || !mountedRef.current || activeProjectIdRef.current !== projectId) return;
+        setSelectedBacklogDetailById((states) => {
+          const next = {
+            ...states,
+            [bugId]: {
+              loading: false,
+              loaded: true,
+              error: `Unable to load backlog detail: ${errorMessage(error)}`,
+              bug: states[bugId]?.bug ?? null,
+            },
+          };
+          selectedBacklogDetailByIdRef.current = next;
+          return next;
+        });
+      });
+
+    return () => controller.abort();
+  }, [projectId, selectedBugId, cachedSelectedBug?.bug_id]);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -208,9 +293,21 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     priority: "P3",
   }), []);
   const selectedState = selectedBugId ? playbackByBug[selectedBugId] : undefined;
-  const activeTrace = selectedState?.trace ?? (selectedBug ? emptyTaskPlaybackTrace(projectId, selectedBug) : fallbackTrace);
+  const selectedPlaceholderBug = useMemo<BacklogBug | null>(() => {
+    if (!selectedBugId || selectedBug) return null;
+    return {
+      bug_id: selectedBugId,
+      title: selectedBacklogDetail?.loading ? "Loading backlog detail" : "Backlog detail unavailable",
+      status: "UNKNOWN",
+      priority: "P3",
+    };
+  }, [selectedBacklogDetail?.loading, selectedBug, selectedBugId]);
+  const activeTrace = selectedState?.trace
+    ?? (selectedBug ? emptyTaskPlaybackTrace(projectId, selectedBug) : selectedPlaceholderBug ? emptyTaskPlaybackTrace(projectId, selectedPlaceholderBug) : fallbackTrace);
   const activeFrameId = selectedFrameId || activeTrace.frames[0]?.id || "";
   const selectedLoadBugId = selectedBug?.bug_id || "";
+  const selectedPlaybackLoading = (selectedState?.loading ?? false) || (!selectedBug && (selectedBacklogDetail?.loading ?? false));
+  const selectedPlaybackError = selectedState?.error || (!selectedBug ? selectedBacklogDetail?.error ?? "" : "");
   const hintedCurrentBug = currentTaskHint?.active && currentTaskHint.bug && !isPrivatePlaybackBacklog(currentTaskHint.bug)
     ? currentTaskHint.bug
     : null;
@@ -837,8 +934,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                   onChange={(event) => setSpeed(Number(event.target.value))}
                 />
               </label>
-              {selectedBug ? (
-                <span className="mono">{selectedBug.bug_id}</span>
+              {selectedBug || selectedBugId ? (
+                <span className="mono">{selectedBug?.bug_id || selectedBugId}</span>
               ) : (
                 <span className="mono">Select a backlog row to fetch governed timeline APIs</span>
               )}
@@ -846,8 +943,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             <TaskPlaybackPanel
               trace={activeTrace}
               selectedFrameId={activeFrameId}
-              loading={selectedState?.loading ?? false}
-              error={selectedState?.error ?? ""}
+              loading={selectedPlaybackLoading}
+              error={selectedPlaybackError}
               onSelectFrame={(frameId) => {
                 setSelectedFrameId(frameId);
                 setPlaying(false);
