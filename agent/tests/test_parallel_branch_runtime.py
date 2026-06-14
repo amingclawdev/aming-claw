@@ -3064,6 +3064,162 @@ def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session
     assert gate["host_startup_id"] == "registered-host-session-only"
 
 
+def test_mf_sub_startup_accepts_runtime_text_prepare_placeholder_host_agent(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-runtime-text-host"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="worker-startup",
+        allocation_owner="worker-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, "mf-sub-startup")
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "observer_runtime_text_prepare",
+                "registration_source": "runtime_text_prepare",
+                "runtime_context_id": runtime_context_id,
+                "observer_command_id": "cmd-startup",
+                "launch_text_hash": "sha256:launch-runtime-text",
+                "task_id": "mf-sub-startup",
+                "worker_slot_id": "worker-startup",
+                "agent_id": "host_adapter_agent:host_adapter:placeholder",
+                "actual_host_worker_id": "host_adapter_agent:host_adapter:placeholder",
+                "host_startup_id": "host_adapter:host_adapter:placeholder",
+                "host_session_id": "host_adapter:host_adapter:placeholder",
+                "session_token_surrogate": "host-adapter:placeholder",
+            }
+        },
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            worker_slot_id="worker-startup",
+            actual_host_worker_id="",
+            agent_id="019ec4d9-755a-75a1-9216-d4805655a685",
+            session_token="",
+            session_token_surrogate="host-adapter:placeholder",
+            startup_source="codex_host_spawn_agent",
+            host_startup_id="host_adapter:host_adapter:placeholder",
+            launch_text_hash="sha256:launch-runtime-text",
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is True
+    gate = result["startup_gate"]
+    saved = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert saved is not None
+    assert saved.actual_host_worker_id == "019ec4d9-755a-75a1-9216-d4805655a685"
+    assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["close_satisfying"] is False
+    assert gate["session_token_evidence_type"] == "surrogate"
+
+
+def test_mf_sub_graph_query_accepts_runtime_text_host_adapter_without_raw_token(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-graph-runtime-text",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-graph-runtime-text",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="worker-startup",
+        allocation_owner="worker-startup",
+        branch_ref="refs/heads/codex/mf-sub-graph-runtime-text",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(tmp_path / "worker"),
+        session_token_hash=mf_subagent_session_token_hash("server-issued-token"),
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "observer_runtime_text_prepare",
+                "registration_source": "runtime_text_prepare",
+                "runtime_context_id": branch_runtime_context_id(
+                    PROJECT_ID,
+                    "mf-sub-graph-runtime-text",
+                ),
+                "observer_command_id": "cmd-startup",
+                "launch_text_hash": "sha256:launch-runtime-text",
+                "task_id": "mf-sub-graph-runtime-text",
+                "worker_slot_id": "worker-startup",
+                "agent_id": "host_adapter_agent:host_adapter:placeholder",
+                "actual_host_worker_id": "host_adapter_agent:host_adapter:placeholder",
+                "host_startup_id": "host_adapter:host_adapter:placeholder",
+                "host_session_id": "host_adapter:host_adapter:placeholder",
+                "session_token_surrogate": "host-adapter:placeholder",
+            }
+        },
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+
+    accepted = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-graph-runtime-text",
+        parent_task_id="parent-startup",
+        worker_role="mf_sub",
+        fence_token="fence-startup",
+        session_token="",
+    )
+
+    assert accepted.task_id == "mf-sub-graph-runtime-text"
+
+
 def test_mf_sub_startup_rejects_multi_agent_prefix_replay_without_registration(
     tmp_path,
 ) -> None:

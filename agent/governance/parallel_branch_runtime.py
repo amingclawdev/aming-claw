@@ -5844,7 +5844,20 @@ def validate_mf_subagent_graph_query_identity(
     if context.session_token_hash:
         supplied_token_hash = mf_subagent_session_token_hash(session_token)
         if not supplied_token_hash or supplied_token_hash != context.session_token_hash:
-            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+            latest_revision = get_latest_branch_contract_revision(
+                conn,
+                context.project_id,
+                runtime_context_id_for_branch_context(context),
+            )
+            registered_identity = _startup_registered_host_adapter_identity(
+                context=context,
+                latest_revision=latest_revision,
+            )
+            if not _startup_registered_host_adapter_identity_matches_context(
+                registered_identity,
+                context,
+            ):
+                raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     requested_target_project_id = str(target_project_id or query_project_id).strip()
     context_governance_project_id = context.governance_project_id or context.project_id
@@ -5958,6 +5971,63 @@ def _startup_registered_identity_texts(
         _startup_registered_host_startup_texts(registered_identity)
         + _startup_registered_session_texts(registered_identity)
     )
+
+
+def _startup_registered_identity_is_runtime_text_prepare(
+    registered_identity: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(registered_identity, Mapping):
+        return False
+    source = _startup_identity_text(str(registered_identity.get("source") or ""))
+    registration_source = _startup_identity_text(
+        str(registered_identity.get("registration_source") or "")
+    )
+    return (
+        source == "observer_runtime_text_prepare"
+        or registration_source == "runtime_text_prepare"
+    )
+
+
+def _startup_registered_identity_uses_placeholder_agent(
+    registered_identity: Mapping[str, Any] | None,
+) -> bool:
+    agent_values = _startup_registered_identity_values(
+        registered_identity,
+        ("agent_id", "actual_host_worker_id"),
+    )
+    return bool(agent_values) and all(
+        value.startswith("host_adapter_agent:") for value in agent_values
+    )
+
+
+def _startup_registered_identity_allows_late_host_agent(
+    registered_identity: Mapping[str, Any] | None,
+) -> bool:
+    return (
+        _startup_registered_identity_is_runtime_text_prepare(registered_identity)
+        and _startup_registered_identity_uses_placeholder_agent(registered_identity)
+    )
+
+
+def _startup_registered_host_adapter_identity_matches_context(
+    registered_identity: Mapping[str, Any] | None,
+    context: BranchTaskRuntimeContext,
+) -> bool:
+    if not _startup_registered_identity_is_runtime_text_prepare(registered_identity):
+        return False
+    if not _startup_registered_identity_texts(registered_identity):
+        return False
+    expected = {
+        "project_id": context.project_id,
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "task_id": context.task_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
+    }
+    for field, expected_value in expected.items():
+        actual = str((registered_identity or {}).get(field) or "").strip()
+        if actual and expected_value and actual != expected_value:
+            return False
+    return True
 
 
 def _startup_public_registered_host_adapter_identity(
@@ -6144,7 +6214,10 @@ def _startup_host_adapter_identity(
     supplied_agent_id = str(payload.get("agent_id") or "").strip()
     if not registered_agent_values or not supplied_agent_id:
         return False
-    if _startup_identity_text(supplied_agent_id) not in registered_agent_values:
+    if (
+        _startup_identity_text(supplied_agent_id) not in registered_agent_values
+        and not _startup_registered_identity_allows_late_host_agent(registered_identity)
+    ):
         return False
 
     registered_runtime_context_id = str(
@@ -6168,6 +6241,17 @@ def _startup_host_adapter_identity(
         and registered_launch_text_hash != supplied_launch_text_hash
     ):
         return False
+    for registered_key, payload_key in (
+        ("observer_command_id", "observer_command_id"),
+        ("task_id", "task_id"),
+        ("worker_slot_id", "worker_slot_id"),
+    ):
+        registered_value = str(
+            (registered_identity or {}).get(registered_key) or ""
+        ).strip()
+        supplied_value = str(payload.get(payload_key) or "").strip()
+        if registered_value and supplied_value and registered_value != supplied_value:
+            return False
     return True
 
 
