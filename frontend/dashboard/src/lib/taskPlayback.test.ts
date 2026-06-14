@@ -3540,6 +3540,33 @@ function ueBlockerUrlAssertions(): string[] {
   assertFixture(!url1.includes("view=playback"), `buildPlaybackUrl must never emit view=playback (B2 canonical form) (got: ${url1})`);
   results.push("buildPlaybackUrl emits view=activity, never view=playback (B2 canonical route)");
 
+  // ── Current top-level Open playback history must bind the activity backlog ──
+  const viewSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
+  const openHistoryHandler = viewSource.match(/const openActivityPlaybackHistory = \(\) => \{[\s\S]*?\n  \};/)?.[0] ?? "";
+  assertFixture(
+    openHistoryHandler.includes('const backlogId = activityBug?.bug_id || "";'),
+    "AC-RUNTIME current activity history button should derive playback_backlog from activityBug.bug_id",
+  );
+  assertFixture(
+    /if \(!backlogId\) \{\s*changeMode\("history"\);\s*return;\s*\}/.test(openHistoryHandler),
+    "no current activity should preserve the existing empty-selection history behavior",
+  );
+  assertFixture(
+    openHistoryHandler.includes("navigateToPlayback(backlogId, eventId);")
+      && openHistoryHandler.includes("setSelectedBugId(backlogId);"),
+    "AC-RUNTIME current activity history button should not switch to sample trace without playback_backlog",
+  );
+  assertFixture(
+    openHistoryHandler.includes("frame?.source_event_id || frame?.id ||")
+      && openHistoryHandler.includes("resolveSelectedFrameIdForEventParam"),
+    "current activity history button should preserve selected/newest event when a frame id is available",
+  );
+  assertFixture(
+    /<button\s+type="button"\s+className="action-btn"\s+onClick=\{openActivityPlaybackHistory\}>/.test(viewSource),
+    "top-level Open playback history button should use the backlog-binding handler",
+  );
+  results.push("current activity Open playback history binds playback_backlog and avoids sample trace");
+
   // ── findFrameIdByEventParam — exact frame id match ───────────────────────
   const sampleFrames: TaskPlaybackFrame[] = [
     { id: "abc-def", source_event_id: "src-001", sequence: 1, title: "T1", event_kind: "route_context", status: "passed", structured_facts: [], failure_diagnosis: [], evidence_links: [], raw_sections: [], specific_facts: [], auxiliary_narrative: [] } as unknown as TaskPlaybackFrame,

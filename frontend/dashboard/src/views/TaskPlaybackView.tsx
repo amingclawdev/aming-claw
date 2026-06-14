@@ -633,6 +633,32 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     writeActivityMode(next);
   };
 
+  const openActivityPlaybackHistory = () => {
+    const backlogId = activityBug?.bug_id || "";
+    if (!backlogId) {
+      changeMode("history");
+      return;
+    }
+
+    const selectedActivityFrame = selectedActivityFrameId
+      ? activityTrace.frames.find((frame) => frame.id === selectedActivityFrameId)
+      : null;
+    const frame = selectedActivityFrame ?? activityTrace.frames[activityTrace.frames.length - 1] ?? null;
+    const eventId = frame?.source_event_id || frame?.id || "";
+    navigateToPlayback(backlogId, eventId);
+    setSelectedBugId(backlogId);
+    if (eventId) {
+      const warmFrames = playbackByBugRef.current[backlogId]?.trace.frames ?? [];
+      const resolution = resolveSelectedFrameIdForEventParam(warmFrames, eventId, "");
+      setSelectedFrameId(resolution.matched ? resolution.frameId : "");
+    } else {
+      setSelectedFrameId("");
+    }
+    setSelectedEventParam(eventId);
+    setPlaying(false);
+    setMode("history");
+  };
+
   return (
     <div className="view task-playback-view">
       <div className="view-header">
@@ -694,7 +720,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               >
                 Refresh
               </button>
-              <button type="button" className="action-btn" onClick={() => changeMode("history")}>
+              <button type="button" className="action-btn" onClick={openActivityPlaybackHistory}>
                 Open playback history
               </button>
               <span className="mono">{recentEventsLoaded ? `${recentEvents.length} event${recentEvents.length === 1 ? "" : "s"}` : "loading…"}</span>
