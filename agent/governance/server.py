@@ -19593,7 +19593,11 @@ def _body_has_usable_route_token(body: dict | None) -> bool:
 
 
 def _body_has_route_token_input(body: dict | None) -> bool:
-    return bool((body or {}).get("route_token"))
+    payload = body or {}
+    return bool(
+        payload.get("route_token")
+        or str(payload.get("route_token_ref") or "").strip()
+    )
 
 
 def _route_waiver_payload(body: dict | None) -> dict:

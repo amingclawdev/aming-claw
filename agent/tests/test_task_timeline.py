@@ -76,7 +76,8 @@ STRICT_GOVERNANCE_POLICY = {
 }
 
 
-def _route_context_consumption_events():
+def _route_context_consumption_events(identity=None):
+    route_identity = dict(identity or ROUTE_IDENTITY)
     return [
         {
             "event_kind": "route_context",
@@ -85,7 +86,7 @@ def _route_context_consumption_events():
             "event_id": "tl-route-context",
             "payload": {
                 "route_context": {
-                    **ROUTE_IDENTITY,
+                    **route_identity,
                     "caller_role": "observer",
                     "allowed_actions": ["dispatch_worker"],
                     "blocked_actions": ["apply_patch"],
@@ -100,7 +101,7 @@ def _route_context_consumption_events():
             "status": "allowed",
             "event_id": "tl-route-action",
             "verification": {
-                **ROUTE_IDENTITY,
+                **route_identity,
                 "allowed_action": "dispatch_worker",
                 "caller_role": "observer",
             },
@@ -112,7 +113,7 @@ def _route_context_consumption_events():
             "event_id": "tl-dispatch",
             "payload": {
                 "mf_subagent_dispatch_gate": {
-                    **ROUTE_IDENTITY,
+                    **route_identity,
                     "worker_id": "mf-sub-test",
                     "bounded": True,
                 }
@@ -125,7 +126,7 @@ def _route_context_consumption_events():
             "event_id": "tl-startup",
             "payload": {
                 "mf_subagent_startup_gate": {
-                    **ROUTE_IDENTITY,
+                    **route_identity,
                     "worker_id": "mf-sub-test",
                     "fence_token": "fence-test",
                     "actual_cwd": "/repo/.worktrees/mf-sub-test",
@@ -138,14 +139,15 @@ def _route_context_consumption_events():
     ]
 
 
-def _route_context_qa_verification_event():
+def _route_context_qa_verification_event(identity=None):
+    route_identity = dict(identity or ROUTE_IDENTITY)
     return {
         "event_kind": "qa_verification",
         "phase": "verification",
         "status": "passed",
         "event_id": "tl-qa-verification",
         "verification": {
-            **ROUTE_IDENTITY,
+            **route_identity,
             "contract_evidence": [
                 {
                     "requirement_id": "independent_verification_lane",
@@ -893,14 +895,19 @@ class TestTaskTimeline(unittest.TestCase):
         *,
         task_id="",
         include_source_lineage=True,
+        identity=None,
     ):
         from agent.governance import task_timeline
 
         if include_source_lineage:
-            self._record_route_owned_source_lineage(bug_id, task_id=task_id)
+            self._record_route_owned_source_lineage(
+                bug_id,
+                task_id=task_id,
+                identity=identity,
+            )
         for event in [
-            *_route_context_consumption_events(),
-            _route_context_qa_verification_event(),
+            *_route_context_consumption_events(identity=identity),
+            _route_context_qa_verification_event(identity=identity),
         ]:
             task_timeline.record_event(
                 self.conn,
@@ -2052,6 +2059,7 @@ class TestTaskTimeline(unittest.TestCase):
                     "backlog_id": "BUG-TL-MF-PARALLEL-TOKEN",
                     "event_type": "mf.implementation",
                     "event_kind": "implementation",
+                    "actor": "mf_sub",
                     "status": "accepted",
                     "route_token": issued["route_token"],
                 },
@@ -2066,6 +2074,49 @@ class TestTaskTimeline(unittest.TestCase):
             ("BUG-TL-MF-PARALLEL-TOKEN",),
         ).fetchone()["c"]
         self.assertEqual(count, 2)
+
+    def test_mf_parallel_timeline_accepts_ref_only_route_token_for_protected_implementation(self):
+        from agent.governance import server
+
+        bug_id = "BUG-TL-MF-PARALLEL-REF-ONLY-TOKEN"
+        self._insert_router_backlog(bug_id)
+        issued = self._issue_route_token(bug_id)
+        token = issued["route_token"]
+        identity = {
+            "route_id": token["route_id"],
+            "route_context_hash": token["route_context_hash"],
+            "prompt_contract_id": token["prompt_contract_id"],
+            "prompt_contract_hash": token["prompt_contract_hash"],
+            "visible_injection_manifest_hash": token["visible_injection_manifest_hash"],
+            "route_token_ref": issued["route_token_ref"],
+        }
+        self._record_route_context_consumption(bug_id, identity=identity)
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "event_type": "mf.implementation",
+                    "event_kind": "implementation",
+                    "actor": "mf_sub",
+                    "status": "accepted",
+                    **identity,
+                },
+                method="POST",
+            )
+        )
+
+        self.assertEqual(
+            result["route_token_gate"]["decision"],
+            "route_token_ref_resolved",
+        )
+        self.assertTrue(result["route_token_gate"]["server_issued_binding"])
+        self.assertTrue(result["route_token_gate"]["resolved_from_ref"])
+        self.assertEqual(
+            result["route_token_gate"]["route_token_ref"],
+            issued["route_token_ref"],
+        )
+        self.assertNotIn("route_token", result["payload"])
 
     def test_mf_parallel_timeline_accepts_route_token_for_bounded_dispatch_lane(self):
         from agent.governance import server
