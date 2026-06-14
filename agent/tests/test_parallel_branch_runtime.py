@@ -1218,6 +1218,212 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         )
 
 
+def test_runtime_context_close_gate_view_derives_same_lineage_timeline_evidence() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    projection = build_runtime_context_projection(
+        context,
+        contract_revision={
+            "revision_id": "crev-derived-runtime-context",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "observer_command_id": "cmd-derived-runtime-context",
+                "target_files": ["agent/governance/parallel_branch_runtime.py"],
+            },
+        },
+        startup_gate={
+            "worker_self_attesting": True,
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "status": "passed",
+                "worker_self_attesting": True,
+            },
+        },
+        timeline_events=[
+            {
+                "id": 4417,
+                "event_kind": "graph_query_trace",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "graph_trace_ids": ["gqt-observer-substitute"],
+                    "query_source": "observer",
+                },
+            },
+            {
+                "id": 4418,
+                "event_kind": "graph_query_trace",
+                "actor": "worker-runtime-context",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "graph_trace_ids": ["gqt-actor-only"],
+                },
+            },
+            {
+                "id": 4419,
+                "event_kind": "graph_query_trace",
+                "actor": "qa",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-qa-substitute"],
+                    "query_source": "mf_subagent",
+                },
+            },
+            {
+                "id": 4420,
+                "event_kind": "graph_query_trace",
+                "actor": "worker-runtime-context",
+                "status": "passed",
+                "payload": {
+                    "backlog_id": context.backlog_id,
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-backlog-only"],
+                    "query_source": "mf_subagent",
+                },
+            },
+            {
+                "id": 4421,
+                "event_kind": "graph_query_trace",
+                "actor": "worker-other-lane",
+                "status": "passed",
+                "payload": {
+                    "backlog_id": context.backlog_id,
+                    "task_id": "other-worker-lane",
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-other-task"],
+                    "query_source": "mf_subagent",
+                },
+            },
+            {
+                "id": 4422,
+                "event_kind": "graph_query_trace",
+                "actor": "worker-other-runtime",
+                "status": "passed",
+                "payload": {
+                    "backlog_id": context.backlog_id,
+                    "runtime_context_id": "mfrctx-other-lane",
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-other-runtime-context"],
+                    "query_source": "mf_subagent",
+                },
+            },
+            {
+                "id": 4423,
+                "event_kind": "graph_query_trace",
+                "actor": "worker-other-fence",
+                "status": "passed",
+                "payload": {
+                    "backlog_id": context.backlog_id,
+                    "parent_task_id": context.root_task_id,
+                    "fence_token": "other-fence",
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-other-fence"],
+                    "query_source": "mf_subagent",
+                },
+            },
+            {
+                "id": 4425,
+                "event_kind": "mf_subagent_read_receipt",
+                "actor": "worker-runtime-context",
+                "status": "accepted",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "fence_token": context.fence_token,
+                    "route_context_hash": "sha256:timeline-route",
+                    "prompt_contract_id": "rprompt-timeline",
+                    "prompt_contract_hash": "sha256:timeline-prompt",
+                    "route_token_ref": "rtok-timeline",
+                    "graph_trace_ids": ["gqt-worker-read"],
+                    "query_source": "mf_subagent",
+                },
+            },
+            {
+                "id": 4426,
+                "event_kind": "implementation",
+                "actor": "worker-runtime-context",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-worker-implementation"],
+                },
+            },
+            {
+                "id": 4427,
+                "event_kind": "finish_gate",
+                "actor": "worker-runtime-context",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "checkpoint_id": "ckpt-derived-runtime-context",
+                },
+            },
+            {
+                "id": 4428,
+                "event_kind": "verification",
+                "actor": "qa",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                },
+            },
+            {
+                "id": 4429,
+                "event_kind": "close_ready",
+                "actor": "worker-runtime-context",
+                "status": "accepted",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                },
+            },
+        ],
+        generated_at=NOW,
+    )
+
+    close_gate = projection.to_dict()["views"]["close_gate_view"]
+
+    assert close_gate["route_context_hash"] == "sha256:timeline-route"
+    assert close_gate["prompt_contract_hash"] == "sha256:timeline-prompt"
+    assert close_gate["route_token_ref"] == "rtok-timeline"
+    assert close_gate["finish_gate_ref"] == "4427"
+    assert close_gate["checkpoint_id"] == "ckpt-derived-runtime-context"
+    assert close_gate["graph_trace_ids"] == [
+        "gqt-worker-read",
+        "gqt-worker-implementation",
+    ]
+    assert "gqt-observer-substitute" not in close_gate["graph_trace_ids"]
+    assert "gqt-actor-only" not in close_gate["graph_trace_ids"]
+    assert "gqt-qa-substitute" not in close_gate["graph_trace_ids"]
+    assert "gqt-backlog-only" not in close_gate["graph_trace_ids"]
+    assert "gqt-other-task" not in close_gate["graph_trace_ids"]
+    assert "gqt-other-runtime-context" not in close_gate["graph_trace_ids"]
+    assert "gqt-other-fence" not in close_gate["graph_trace_ids"]
+    assert close_gate["ready"] is True
+
+
 def test_runtime_context_projection_content_address_is_stable_and_redacted() -> None:
     context = _runtime_projection_context(checkpoint_id="ckpt-runtime-context")
     private_secret = "raw-private-memory-secret"
