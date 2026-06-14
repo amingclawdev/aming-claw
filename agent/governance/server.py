@@ -21350,6 +21350,396 @@ def _canonical_route_id(
     return ""
 
 
+def _observer_root_route_event_id(event: Mapping[str, Any]) -> str:
+    return str(event.get("id") or event.get("event_id") or "").strip()
+
+
+def _observer_root_route_identity_missing_fields(
+    identity: Mapping[str, Any],
+) -> list[str]:
+    return [
+        field
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+        if not str(identity.get(field) or "").strip()
+    ]
+
+
+def _observer_root_route_identity_complete(identity: Mapping[str, Any]) -> bool:
+    return not _observer_root_route_identity_missing_fields(identity)
+
+
+def _observer_root_route_identity_matches_partial(
+    candidate: Mapping[str, Any],
+    partial: Mapping[str, Any],
+) -> bool:
+    for field in (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+    ):
+        expected = str(partial.get(field) or "").strip()
+        actual = str(candidate.get(field) or "").strip()
+        if expected and actual and expected != actual:
+            return False
+    return True
+
+
+def _observer_root_route_identity_key(identity: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(identity.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+    )
+
+
+def _observer_root_route_merge_identity(
+    base: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> dict[str, str]:
+    merged = {
+        field: str(base.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+    }
+    for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
+        if not merged.get(field):
+            token = str(candidate.get(field) or "").strip()
+            if token:
+                merged[field] = token
+    return merged
+
+
+def _observer_root_route_identity_from_event(
+    event: Mapping[str, Any],
+) -> dict[str, str]:
+    from . import task_timeline
+
+    summary = task_timeline.route_context_consumption_event_summary(dict(event))
+    route_identity = (
+        summary.get("route_identity")
+        if isinstance(summary.get("route_identity"), Mapping)
+        else {}
+    )
+    runtime_evidence = (
+        summary.get("runtime_dispatch_evidence")
+        if isinstance(summary.get("runtime_dispatch_evidence"), Mapping)
+        else {}
+    )
+    identity: dict[str, str] = {}
+    for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
+        token = str(route_identity.get(field) or runtime_evidence.get(field) or "").strip()
+        if token:
+            identity[field] = token
+    return identity
+
+
+def _observer_root_route_event_summary(
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import task_timeline
+
+    return task_timeline.route_context_consumption_event_summary(dict(event))
+
+
+def _observer_root_route_is_service_route_event(event: Mapping[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "").strip().lower()
+    event_kind = str(event.get("event_kind") or "").strip().lower()
+    return event_type.startswith("service.route.") or event_kind == "service_route"
+
+
+def _observer_root_route_identity_candidates(
+    events: list[dict[str, Any]],
+    *,
+    base_identity: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def _append(event: Mapping[str, Any], source: str) -> None:
+        summary = _observer_root_route_event_summary(event)
+        if not summary.get("passed"):
+            return
+        identity = _observer_root_route_identity_from_event(event)
+        if not identity:
+            return
+        if not _observer_root_route_identity_matches_partial(identity, base_identity):
+            return
+        candidates.append({
+            "source": source,
+            "event_id": _observer_root_route_event_id(event),
+            "event_kind": str(event.get("event_kind") or ""),
+            "event_type": str(event.get("event_type") or ""),
+            "identity": identity,
+        })
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if _observer_root_route_is_service_route_event(event):
+            continue
+        summary = _observer_root_route_event_summary(event)
+        categories = {str(item) for item in (summary.get("categories") or [])}
+        if "route_context" in categories:
+            _append(event, "passing_route_context")
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if _observer_root_route_is_service_route_event(event):
+            _append(event, "service_route_source_evidence")
+    return candidates
+
+
+def _observer_root_route_canonical_identity_projection(
+    events: list[dict[str, Any]],
+    *,
+    route_context_gate: dict[str, Any],
+    route_identity: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover a complete external route identity from real timeline evidence."""
+
+    base_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+    }
+    if not base_identity.get("route_id"):
+        base_identity["route_id"] = str(contract.get("route_id") or "").strip()
+
+    cleanup = route_context_gate.get("route_identity_cleanup") or {}
+    cleanup_identity = (
+        cleanup.get("route_identity")
+        if isinstance(cleanup, Mapping) and isinstance(cleanup.get("route_identity"), Mapping)
+        else {}
+    )
+    if cleanup_identity:
+        base_identity = _observer_root_route_merge_identity(base_identity, cleanup_identity)
+        cleanup_event = cleanup.get("event") if isinstance(cleanup, Mapping) else {}
+        cleanup_event_id = (
+            _observer_root_route_event_id(cleanup_event)
+            if isinstance(cleanup_event, Mapping)
+            else ""
+        )
+        for event in events:
+            if cleanup_event_id and _observer_root_route_event_id(event) == cleanup_event_id:
+                base_identity = _observer_root_route_merge_identity(
+                    base_identity,
+                    _observer_root_route_identity_from_event(event),
+                )
+                break
+
+    if not base_identity.get("route_id"):
+        base_identity["route_id"] = _canonical_route_id(
+            events, route_context_gate, dict(route_identity)
+        )
+    if not base_identity.get("visible_injection_manifest_hash"):
+        base_identity["visible_injection_manifest_hash"] = (
+            _canonical_visible_injection_manifest_hash(
+                events, route_context_gate, dict(route_identity)
+            )
+        )
+
+    candidates = _observer_root_route_identity_candidates(
+        events,
+        base_identity=base_identity,
+    )
+    for candidate in candidates:
+        base_identity = _observer_root_route_merge_identity(
+            base_identity,
+            candidate.get("identity") or {},
+        )
+        if _observer_root_route_identity_complete(base_identity):
+            return {
+                "identity": base_identity,
+                "source": candidate["source"],
+                "event_id": candidate["event_id"],
+                "ambiguous": False,
+                "missing_fields": [],
+                "candidates": candidates[:5],
+            }
+
+    complete_candidates = [
+        candidate
+        for candidate in candidates
+        if _observer_root_route_identity_complete(candidate.get("identity") or {})
+    ]
+    unique_complete = {
+        _observer_root_route_identity_key(candidate.get("identity") or {})
+        for candidate in complete_candidates
+    }
+    if len(unique_complete) == 1 and complete_candidates:
+        selected = complete_candidates[-1]
+        return {
+            "identity": dict(selected.get("identity") or {}),
+            "source": selected["source"],
+            "event_id": selected["event_id"],
+            "ambiguous": False,
+            "missing_fields": [],
+            "candidates": candidates[:5],
+        }
+    if len(unique_complete) > 1:
+        return {
+            "identity": base_identity,
+            "source": "ambiguous_route_source_evidence",
+            "event_id": "",
+            "ambiguous": True,
+            "missing_fields": _observer_root_route_identity_missing_fields(base_identity),
+            "candidates": candidates[:5],
+        }
+    return {
+        "identity": base_identity,
+        "source": "route_context_gate",
+        "event_id": "",
+        "ambiguous": False,
+        "missing_fields": _observer_root_route_identity_missing_fields(base_identity),
+        "candidates": candidates[:5],
+    }
+
+
+def _observer_root_route_close_gate_steps(
+    close_gate: Mapping[str, Any],
+    route_context_gate: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+
+    def _add(step_id: str, action: str, reason: str, **extra: Any) -> None:
+        if any(step["id"] == step_id for step in steps):
+            return
+        step: dict[str, Any] = {
+            "id": step_id,
+            "action": action,
+            "reason": reason,
+        }
+        step.update({key: value for key, value in extra.items() if value not in ("", [], {})})
+        steps.append(step)
+
+    missing_route = {
+        str(item)
+        for item in (route_context_gate.get("missing_requirement_ids") or [])
+        if str(item)
+    }
+    ignored_reasons = {
+        str(item.get("reason") or "")
+        for item in (route_context_gate.get("ignored_route_events") or [])
+        if isinstance(item, Mapping)
+    }
+    if "route_identity_mismatch" in missing_route or ignored_reasons.intersection(
+        {"superseded_route_identity", "route_identity_mismatch"}
+    ):
+        _add(
+            "route_identity_cleanup",
+            "record_route_identity_cleanup",
+            "route evidence is stale, mixed, or missing a canonical identity pin",
+        )
+
+    cross_ref_gate = close_gate.get("cross_ref_gate") or {}
+    if isinstance(cross_ref_gate, Mapping) and not cross_ref_gate.get("passed"):
+        rejected = cross_ref_gate.get("rejected_cross_ref_evidence") or []
+        if rejected:
+            _add(
+                "cross_ref_lineage_bridge",
+                "record_cross_ref_lineage_bridge",
+                "close evidence is split across task attempts or route scopes",
+                rejected_cross_ref_evidence=rejected,
+            )
+    attempt_task_ids = {
+        str(((item.get("lineage") or {}).get("task_id") if isinstance(item, Mapping) else "") or "").strip()
+        for item in (route_context_gate.get("attempt_lineage_candidates") or [])
+        if isinstance(item, Mapping)
+    }
+    attempt_task_ids.discard("")
+    bridged_membership = (
+        cross_ref_gate.get("bridged_lane_membership")
+        if isinstance(cross_ref_gate, Mapping)
+        else []
+    )
+    if len(attempt_task_ids) > 1 and not bridged_membership:
+        _add(
+            "cross_ref_lineage_bridge",
+            "record_cross_ref_lineage_bridge",
+            "multiple worker attempt lineages exist for this root row without an accepted bridge",
+            attempt_task_ids=sorted(attempt_task_ids),
+        )
+
+    close_startup_gate = close_gate.get("close_timeline_startup_gate") or {}
+    checks = close_gate.get("checks") or {}
+    if (
+        isinstance(close_startup_gate, Mapping)
+        and close_startup_gate.get("demoted_startup_events")
+    ) or (
+        isinstance(checks, Mapping)
+        and checks.get("mf_subagent_startup_close_satisfying") is False
+    ):
+        _add(
+            "real_mf_subagent_startup",
+            "record_server_verified_worker_startup_with_transcript",
+            "DB-backed startup exists but is not close-satisfying real worker evidence",
+        )
+
+    route_step_map = [
+        (
+            "route_context",
+            "route_context",
+            "record_route_context",
+            "route_context evidence is required before close",
+        ),
+        (
+            "route_action_precheck",
+            "route_action_precheck",
+            "record_route_action_precheck",
+            "route_action_precheck must be accepted for the canonical identity",
+        ),
+        (
+            "bounded_implementation_worker_dispatch",
+            "dispatch_bounded_worker",
+            "dispatch_bounded_worker",
+            "bounded implementation worker dispatch evidence is missing",
+        ),
+        (
+            "mf_subagent_startup",
+            "mf_subagent_startup",
+            "record_mf_subagent_startup",
+            "mf_subagent startup evidence is missing",
+        ),
+        (
+            "independent_verification_lane",
+            "independent_verification_lane",
+            "record_independent_verification",
+            "independent verification lane evidence is missing",
+        ),
+    ]
+    for missing_id, step_id, action, reason in route_step_map:
+        if missing_id in missing_route:
+            _add(step_id, action, reason)
+
+    missing_events = [
+        str(item)
+        for item in (close_gate.get("missing_event_kinds") or [])
+        if str(item)
+    ]
+    for event_kind in ("implementation", "verification", "close_ready"):
+        if event_kind in missing_events:
+            _add(
+                event_kind,
+                f"record_{event_kind}",
+                f"{event_kind} timeline evidence is missing",
+            )
+    return steps
+
+
+def _observer_root_route_next_legal_action_from_steps(
+    steps: list[dict[str, Any]],
+    *,
+    default: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not steps:
+        return dict(default)
+    first = steps[0]
+    return {
+        "id": first["id"],
+        "action": first["action"],
+        "detail": first["reason"],
+        "missing_prerequisites": [step["id"] for step in steps],
+        "ordered_missing_steps": steps,
+    }
+
+
 def _is_plausible_graph_trace_id(value: Any) -> bool:
     """Defensive format check for a caller-supplied graph query schema trace id.
 
@@ -21478,6 +21868,7 @@ def _observer_root_route_context_state(
         events, contract=contract
     )
     route_identity = route_context_gate.get("route_identity") or {}
+    close_gate = _mf_close_gate_verification(events, contract=contract)
 
     # Graph query_schema trace id: if the caller supplied a plausible trace id
     # (a fresh session that already ran query_schema passes its own gqt-* id),
@@ -21487,36 +21878,19 @@ def _observer_root_route_context_state(
     if _is_plausible_graph_trace_id(caller_graph_query_schema_trace_id):
         graph_trace_id = str(caller_graph_query_schema_trace_id).strip()
     else:
-        close_gate = _mf_close_gate_verification(events, contract=contract)
         worker_graph_trace_gate = close_gate.get("worker_graph_trace_gate") or {}
         trace_ids = worker_graph_trace_gate.get("trace_ids") or []
         if isinstance(trace_ids, list) and trace_ids:
             graph_trace_id = str(trace_ids[0] or "").strip()
 
-    route_context_for_bootstrap = dict(route_identity)
-    route_context_for_bootstrap.setdefault(
-        "route_id", str((contract.get("route_id") if isinstance(contract, dict) else "") or "")
+    identity_projection = _observer_root_route_canonical_identity_projection(
+        events,
+        route_context_gate=route_context_gate,
+        route_identity=route_identity,
+        contract=contract,
     )
-    # The gate's route_identity summary omits route_id (it is not in
-    # MF_ROUTE_IDENTITY_FIELDS) and the contract may not carry it. When the
-    # canonical identity is pinned by a route_identity_cleanup event, source
-    # route_id from that same pinning event so the returned external identity is
-    # complete and a consuming observer does not have to fork/fabricate it.
-    if not str(route_context_for_bootstrap.get("route_id") or "").strip():
-        route_context_for_bootstrap["route_id"] = _canonical_route_id(
-            events, route_context_gate, route_identity
-        )
+    route_context_for_bootstrap = dict(identity_projection.get("identity") or {})
     route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
-    # The gate's route_identity summary omits visible_injection_manifest_hash, so
-    # source it from the canonical pinning event and pass it through. Without it
-    # the returned identity is not a complete external identity and a consuming
-    # observer forks the route.
-    if not str(route_context_for_bootstrap.get("visible_injection_manifest_hash") or "").strip():
-        route_context_for_bootstrap["visible_injection_manifest_hash"] = (
-            _canonical_visible_injection_manifest_hash(
-                events, route_context_gate, route_identity
-            )
-        )
 
     transition_gate = observer_session.work_mode_transition_gate(
         events,
@@ -21557,6 +21931,17 @@ def _observer_root_route_context_state(
         transition_gate=transition_gate,
         canonical_route_identity=context.get("canonical_route_identity") or {},
     )
+    if identity_projection.get("ambiguous"):
+        ordered_missing_steps.insert(0, {
+            "id": "route_identity_cleanup",
+            "action": "record_route_identity_cleanup",
+            "reason": "multiple complete route identities were found in real timeline evidence",
+            "candidates": identity_projection.get("candidates") or [],
+        })
+    close_gate_steps = _observer_root_route_close_gate_steps(
+        close_gate,
+        route_context_gate,
+    )
     if effective_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR:
         ordered_missing_steps = [
             step
@@ -21567,6 +21952,9 @@ def _observer_root_route_context_state(
                 "observer_work_mode_transition",
             }
         ]
+        for step in close_gate_steps:
+            if not any(existing["id"] == step["id"] for existing in ordered_missing_steps):
+                ordered_missing_steps.append(step)
     context["requested_work_mode"] = requested_work_mode
     context["work_mode_projection"] = {
         "schema_version": "observer_root_route_context_work_mode_projection.v1",
@@ -21579,6 +21967,14 @@ def _observer_root_route_context_state(
         ),
         "ordered_missing_steps": ordered_missing_steps,
     }
+    context["canonical_route_identity_source"] = {
+        "schema_version": "observer_root_route_identity_source.v1",
+        "source": str(identity_projection.get("source") or ""),
+        "event_id": str(identity_projection.get("event_id") or ""),
+        "missing_fields": identity_projection.get("missing_fields") or [],
+        "ambiguous": bool(identity_projection.get("ambiguous")),
+        "raw_route_token_persisted": False,
+    }
     context["work_mode_transition_gate"] = transition_gate
     if ordered_missing_steps and context["work_mode"] == observer_session.WORK_MODE_LOOK_BEFORE_ACT:
         context["next_legal_action"] = {
@@ -21586,6 +21982,11 @@ def _observer_root_route_context_state(
             "missing_prerequisites": [step["id"] for step in ordered_missing_steps],
             "ordered_missing_steps": ordered_missing_steps,
         }
+    elif context["work_mode"] == observer_session.WORK_MODE_EXECUTION_SUPERVISOR:
+        context["next_legal_action"] = _observer_root_route_next_legal_action_from_steps(
+            ordered_missing_steps,
+            default=dict(context.get("next_legal_action") or {}),
+        )
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),
         "passed": bool(route_context_gate.get("passed")),
@@ -21596,6 +21997,19 @@ def _observer_root_route_context_state(
         "missing_requirement_ids": route_context_gate.get(
             "missing_requirement_ids", []
         ),
+        "route_identity_source": str(identity_projection.get("source") or ""),
+        "route_identity_source_event_id": str(identity_projection.get("event_id") or ""),
+        "route_identity_projection_missing_fields": (
+            identity_projection.get("missing_fields") or []
+        ),
+    }
+    context["close_gate_projection"] = {
+        "schema_version": "observer_root_route_close_gate_projection.v1",
+        "passed": bool(close_gate.get("passed")),
+        "status": str(close_gate.get("status") or ""),
+        "missing_event_kinds": close_gate.get("missing_event_kinds") or [],
+        "checks": close_gate.get("checks") or {},
+        "missing_evidence_groups": close_gate.get("missing_evidence_groups") or {},
     }
     context["backlog_row_present"] = bool(row)
     return context

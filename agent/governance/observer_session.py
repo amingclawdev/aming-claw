@@ -423,16 +423,53 @@ def _work_mode_transition_event_matches(
     return True
 
 
+def _work_mode_first_deep_text(value: Any, key: str) -> str:
+    if isinstance(value, Mapping):
+        token = str(value.get(key) or "").strip()
+        if token:
+            return token
+        for child in value.values():
+            found = _work_mode_first_deep_text(child, key)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _work_mode_first_deep_text(child, key)
+            if found:
+                return found
+    return ""
+
+
+def _work_mode_event_is_route_action_precheck(event: Mapping[str, Any]) -> bool:
+    marker = " ".join(
+        str(event.get(key) or "")
+        for key in ("event_kind", "event_type", "phase")
+    ).strip().lower().replace("-", "_").replace(".", "_")
+    if "route_action_precheck" in marker:
+        return True
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    service_id = (
+        str(payload.get("service_id") or "").strip().lower().replace("-", "_").replace(".", "_")
+    )
+    action = (
+        str(payload.get("action") or payload.get("requested_action") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(".", "_")
+    )
+    return service_id in {"route_action_precheck", "route_action_pre_mutation"} or (
+        service_id.startswith("route_action") and "precheck" in service_id
+    ) or action in {"route_action_precheck", "route_action_pre_mutation"}
+
+
 def _route_action_precheck_bound_to_identity(
     event: Mapping[str, Any],
     canonical_route_identity: Mapping[str, Any] | None,
 ) -> bool:
     if not isinstance(event, Mapping):
         return False
-    kind = str(
-        event.get("event_kind") or event.get("event_type") or ""
-    ).strip().lower().replace("-", "_").replace(".", "_")
-    if "route_action_precheck" not in kind:
+    if not _work_mode_event_is_route_action_precheck(event):
         return False
     status = str(event.get("status") or event.get("decision") or "").strip().lower()
     if status not in {"allow", "allowed", "passed", "accepted", "ok", "approved"}:
@@ -453,7 +490,7 @@ def _route_action_precheck_bound_to_identity(
     for key, want in expected.items():
         got = ""
         for source in (event, payload, verification):
-            candidate = str(source.get(key) or "").strip()
+            candidate = _work_mode_first_deep_text(source, key)
             if candidate:
                 got = candidate
                 break
