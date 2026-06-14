@@ -5949,6 +5949,7 @@ def _runtime_context_service_graph_trace_refs(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "backlog_id": backlog_id,
+        "fence_token": fence_token,
         "query_source": "mf_subagent" if verified else "",
         "worker_role": "mf_sub" if verified else "",
         "source_details": {
@@ -5960,6 +5961,14 @@ def _runtime_context_service_graph_trace_refs(
             "backlog_id": backlog_id,
         },
     }
+
+
+def _runtime_context_service_redact_graph_trace_refs(
+    refs: Mapping[str, Any],
+) -> dict[str, Any]:
+    redacted = dict(refs)
+    redacted.pop("fence_token", None)
+    return redacted
 
 
 def _runtime_context_service_query_values(
@@ -6111,12 +6120,15 @@ def _runtime_context_projection_response(
         fence_token=str(getattr(context, "fence_token", "") or ""),
         explicit_trace_ids=explicit_trace_ids,
     )
+    redacted_graph_trace_refs = _runtime_context_service_redact_graph_trace_refs(
+        graph_trace_refs
+    )
     projection = build_runtime_context_projection(
         context,
         contract_revision=latest_revision,
         route_identity=route_identity if isinstance(route_identity, Mapping) else {},
         timeline_refs=timeline_refs,
-        graph_trace_refs=graph_trace_refs,
+        graph_trace_refs=redacted_graph_trace_refs,
         startup_gate=startup_gate,
         finish_gate=finish_gate,
         close_evidence=close_evidence,
@@ -6210,7 +6222,7 @@ def _runtime_context_projection_response(
                 latest_revision.revision_id if latest_revision else ""
             ),
             "timeline": timeline_refs,
-            "graph_trace": graph_trace_refs,
+            "graph_trace": redacted_graph_trace_refs,
         },
         "privacy_boundary": {
             "raw_private_context_exposed": False,

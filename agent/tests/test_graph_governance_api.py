@@ -14389,6 +14389,92 @@ def test_finish_gate_server_accepts_db_sourced_real_startup_events(conn):
     assert result["gate"].get("caller_supplied_real_startup_events_ignored") is not True
 
 
+def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
+    task_id = "fence-token-db-trace-task"
+    parent_task_id = "fence-token-db-trace-parent"
+    fence_token = "fence-db-graph-trace"
+    worktree_path = "/tmp/nonexistent-fence-token-db-trace"
+    branch_ref = "refs/heads/f2/fence-token-db-trace"
+    trace_id = "gqt-fence-token-db-trace"
+
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id="AC-RUNTIME-CONTEXT-GRAPH-TRACE-EVIDENCE-FENCE-TOKEN-20260614",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-fence-token-db",
+            head_commit="base-fence-token-db",
+            target_head_commit="target-fence-token-db",
+            merge_queue_id="mergeq-fence-token-db",
+        ),
+        now_iso="2026-06-14T09:30:00Z",
+    )
+    real_event_payload = _make_real_startup_timeline_event(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id="AC-RUNTIME-CONTEXT-GRAPH-TRACE-EVIDENCE-FENCE-TOKEN-20260614",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor="mf_sub",
+        payload={"mf_subagent_startup_gate": real_event_payload},
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id_for_branch_context(context),
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(task_id, fence_token),
+    )
+    conn.commit()
+
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    body.update(
+        {
+            "parent_task_id": parent_task_id,
+            "changed_files": ["agent/governance/server.py"],
+            "graph_trace_ids": [trace_id],
+        }
+    )
+
+    result = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    graph_trace = result["gate"]["graph_trace_evidence"]
+    assert graph_trace["db_verified"] is True
+    assert graph_trace["trace_ids"] == [trace_id]
+    assert graph_trace["fence_token"] == fence_token
+    assert graph_trace["task_id"] == task_id
+    assert graph_trace["parent_task_id"] == parent_task_id
+    assert graph_trace["worker_role"] == "mf_sub"
+    assert graph_trace["missing_trace_ids"] == []
+    assert graph_trace["identity_mismatches"] == []
+
+
 def test_finish_gate_server_flags_caller_supplied_ignored(conn):
     """F2 transparency: when body does contain real_startup_events,
     the response should include caller_supplied_real_startup_events_ignored=True,
