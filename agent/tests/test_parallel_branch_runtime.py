@@ -1955,6 +1955,9 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
         "current",
         "gate_inputs",
         "worker_view",
+        "observer_view",
+        "qa_view",
+        "judge_view",
         "close_gate_view",
     }
     worker_node = content_address["nodes"]["worker_view"]

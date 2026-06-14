@@ -6,6 +6,7 @@ runtime context needed to make observer recovery replay-ready after restart.
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import secrets
@@ -575,6 +576,9 @@ class RuntimeContextProjection:
     capability_boundary: dict[str, Any]
     worker_view: dict[str, Any]
     close_gate_view: dict[str, Any]
+    observer_view: dict[str, Any] = field(default_factory=dict)
+    qa_view: dict[str, Any] = field(default_factory=dict)
+    judge_view: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         views = {
@@ -586,6 +590,12 @@ class RuntimeContextProjection:
             "worker_view": self.worker_view,
             "close_gate_view": self.close_gate_view,
         }
+        if self.observer_view:
+            views["observer_view"] = self.observer_view
+        if self.qa_view:
+            views["qa_view"] = self.qa_view
+        if self.judge_view:
+            views["judge_view"] = self.judge_view
         source_policy = {
             "immutable_sources_remain_owner_owned": True,
             "raw_private_context_exposed": False,
@@ -4080,6 +4090,28 @@ def _runtime_context_merge_dependency_projection(
         queue_projection.get("queue_state") or queue_projection.get("status")
     )
     raw_next_actions = _runtime_context_string_list(queue_projection.get("next_actions"))
+    observed_status = _runtime_context_text(
+        queue_projection.get("observed_status") or values.get("status")
+    )
+    terminal_complete = observed_status in {
+        STATE_VALIDATED,
+        STATE_MERGE_READY,
+        STATE_MERGED,
+    }
+    merge_allowed = bool(queue_projection.get("merge_allowed"))
+    target_branch_mutation_allowed = bool(
+        queue_projection.get("target_branch_mutation_allowed")
+    )
+    merge_eligible = (
+        queue_state == STATE_MERGE_READY
+        and merge_allowed
+        and target_branch_mutation_allowed
+    )
+    requires_merge_preview_refresh = bool(
+        queue_projection.get("requires_merge_preview_refresh")
+        or queue_projection.get("stale_target_head")
+        or queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE
+    )
 
     next_actions: list[str] = []
     if queue_state in {STATE_WAITING_DEPENDENCY, STATE_DEPENDENCY_BLOCKED} or blockers:
@@ -4093,7 +4125,7 @@ def _runtime_context_merge_dependency_projection(
     elif queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE or values.get(
         "dependency_merge_commit"
     ):
-        next_actions.extend(["revalidate", "refresh_merge_preview"])
+        next_actions.extend(["refresh_merge_preview", "revalidate"])
     elif queue_state == STATE_MERGE_READY:
         next_actions.append("merge_ready")
     for action in raw_next_actions:
@@ -4113,7 +4145,7 @@ def _runtime_context_merge_dependency_projection(
         next_action = "wait_for_dependency"
         status = queue_state or STATE_DEPENDENCY_BLOCKED
     elif queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE:
-        next_action = "revalidate"
+        next_action = "refresh_merge_preview"
         status = STATE_STALE_AFTER_DEPENDENCY_MERGE
     elif queue_state == STATE_MERGE_READY:
         next_action = "merge_ready"
@@ -4142,13 +4174,15 @@ def _runtime_context_merge_dependency_projection(
         "dependency_merge_commit": _runtime_context_text(
             values.get("dependency_merge_commit")
         ),
+        "observed_status": observed_status,
         "merge_preview_id": _runtime_context_text(
             queue_projection.get("merge_preview_id") or values.get("merge_preview_id")
         ),
-        "merge_allowed": bool(queue_projection.get("merge_allowed")),
-        "target_branch_mutation_allowed": bool(
-            queue_projection.get("target_branch_mutation_allowed")
-        ),
+        "terminal_complete": terminal_complete,
+        "merge_eligible": merge_eligible,
+        "requires_merge_preview_refresh": requires_merge_preview_refresh,
+        "merge_allowed": merge_allowed,
+        "target_branch_mutation_allowed": target_branch_mutation_allowed,
         "next_action": next_action,
         "next_actions": next_actions,
         "ordered_merge_dependencies": _runtime_context_string_list(
@@ -4374,10 +4408,12 @@ def build_runtime_context_control_plane_view(
     action_plan_view: Mapping[str, Any],
     *,
     capability_boundary_view: Mapping[str, Any] | None = None,
+    viewer_role: str = RUNTIME_CONTEXT_WORKER_ROLE,
 ) -> dict[str, Any]:
     """Expose the action plan under a stable Runtime Context control-plane view."""
 
     action_plan = dict(action_plan_view)
+    normalized_viewer_role = _runtime_context_text(viewer_role) or RUNTIME_CONTEXT_WORKER_ROLE
     capability_boundary = (
         dict(capability_boundary_view)
         if isinstance(capability_boundary_view, Mapping)
@@ -4385,8 +4421,8 @@ def build_runtime_context_control_plane_view(
     )
     return {
         "schema_version": RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
-        "role_scope": RUNTIME_CONTEXT_WORKER_ROLE,
-        "viewer_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "role_scope": normalized_viewer_role,
+        "viewer_role": normalized_viewer_role,
         "raw_session_token_exposed": False,
         "raw_route_token_exposed": False,
         "raw_fence_token_exposed": False,
@@ -4674,6 +4710,35 @@ def build_runtime_context_worker_view(
     }
 
 
+def _runtime_context_role_scoped_view(
+    worker_view: Mapping[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    """Project a sanitized worker-shaped view for non-worker reviewers."""
+
+    normalized_role = _runtime_context_text(role).lower().replace("-", "_")
+    role_view = copy.deepcopy(dict(worker_view))
+    role_view["role"] = normalized_role
+    role_view["role_scope"] = normalized_role
+
+    control_plane = dict(role_view.get("control_plane") or {})
+    control_plane["role_scope"] = normalized_role
+    control_plane["viewer_role"] = normalized_role
+    control_plane["raw_session_token_exposed"] = False
+    control_plane["raw_route_token_exposed"] = False
+    control_plane["raw_fence_token_exposed"] = False
+    role_view["control_plane"] = control_plane
+
+    role_filter_policy = dict(role_view.get("role_filter_policy") or {})
+    role_filter_policy["role"] = normalized_role
+    role_filter_policy["raw_private_context_exposed"] = False
+    role_filter_policy["other_worker_contexts_exposed"] = False
+    role_view["role_filter_policy"] = role_filter_policy
+
+    return role_view
+
+
 def build_runtime_context_projection(
     context: BranchTaskRuntimeContext,
     *,
@@ -4736,6 +4801,9 @@ def build_runtime_context_projection(
         control_plane_view=control_plane,
         capability_boundary_view=capability_boundary,
     )
+    observer_view = _runtime_context_role_scoped_view(worker_view, role="observer")
+    qa_view = _runtime_context_role_scoped_view(worker_view, role="qa")
+    judge_view = _runtime_context_role_scoped_view(worker_view, role="judge")
     return RuntimeContextProjection(
         project_id=context.project_id,
         runtime_context_id=runtime_context_id_for_branch_context(context),
@@ -4745,6 +4813,9 @@ def build_runtime_context_projection(
         control_plane=control_plane,
         capability_boundary=capability_boundary,
         worker_view=worker_view,
+        observer_view=observer_view,
+        qa_view=qa_view,
+        judge_view=judge_view,
         close_gate_view=close_gate,
     )
 
