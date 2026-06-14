@@ -550,10 +550,12 @@ class RuntimeContextMissingField:
     producer: str
     consumer: str
     evidence_ref: str = ""
+    evidence_refs_inspected: tuple[str, ...] = ()
     message: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload["evidence_refs_inspected"] = list(self.evidence_refs_inspected)
         if not payload["message"]:
             payload["message"] = (
                 f"{self.gate} gate missing {self.field} from {self.expected_source}"
@@ -2224,6 +2226,286 @@ def _runtime_context_graph_trace_refs(
     }
 
 
+def _runtime_context_deep_values(value: Any, key: str, *, depth: int = 0) -> list[Any]:
+    if depth > 6:
+        return []
+    if isinstance(value, Mapping):
+        found: list[Any] = []
+        if key in value:
+            found.append(value.get(key))
+        for child in value.values():
+            found.extend(_runtime_context_deep_values(child, key, depth=depth + 1))
+        return found
+    if isinstance(value, list):
+        found = []
+        for child in value:
+            found.extend(_runtime_context_deep_values(child, key, depth=depth + 1))
+        return found
+    return []
+
+
+def _runtime_context_deep_text(value: Any, key: str) -> str:
+    for item in _runtime_context_deep_values(value, key):
+        text = _runtime_context_text(item)
+        if text:
+            return text
+    return ""
+
+
+def _runtime_context_event_ref(event: Mapping[str, Any]) -> str:
+    return _runtime_context_text(
+        event.get("id")
+        or event.get("event_id")
+        or event.get("trace_id")
+        or _runtime_context_deep_text(event, "event_id")
+    )
+
+
+def _runtime_context_event_same_lineage(
+    event: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+) -> bool:
+    checks = (
+        ("runtime_context_id", runtime_context_id),
+        ("task_id", task_id),
+        ("parent_task_id", parent_task_id),
+        ("backlog_id", backlog_id),
+    )
+    saw_lineage = False
+    for key, expected in checks:
+        actual = _runtime_context_deep_text(event, key)
+        if not actual:
+            continue
+        saw_lineage = True
+        if expected and actual != expected:
+            return False
+    return saw_lineage
+
+
+def _runtime_context_event_status_ok(event: Mapping[str, Any]) -> bool:
+    status = _runtime_context_text(
+        event.get("status")
+        or event.get("decision")
+        or _runtime_context_deep_text(event, "status")
+    ).lower()
+    return status in _RUNTIME_CONTEXT_FULFILLING_STATUSES
+
+
+def _runtime_context_event_kind_token(event: Mapping[str, Any]) -> str:
+    return _runtime_context_lane_clause_id(
+        event.get("event_kind") or event.get("event_type") or event.get("phase")
+    )
+
+
+def _runtime_context_is_worker_evidence(event: Mapping[str, Any]) -> bool:
+    actor = _runtime_context_text(event.get("actor")).lower()
+    if actor in {
+        "observer",
+        "mf_observer",
+        "route_observer",
+        "observer_runtime_text",
+        "qa",
+        "independent_qa",
+        "qa_verifier",
+    }:
+        return False
+    worker_role = (
+        _runtime_context_deep_text(event, "worker_role")
+        or _runtime_context_deep_text(event, "role")
+    ).lower()
+    query_source = _runtime_context_deep_text(event, "query_source").lower()
+    if query_source and query_source != "mf_subagent":
+        return False
+    if worker_role and worker_role != RUNTIME_CONTEXT_WORKER_ROLE:
+        return False
+    return bool(
+        worker_role == RUNTIME_CONTEXT_WORKER_ROLE
+        or query_source == "mf_subagent"
+    )
+
+
+def _runtime_context_event_lane_bound(
+    event: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    fence_token: str,
+) -> bool:
+    """Return true only when graph evidence names the current worker lane."""
+
+    expected = (
+        ("runtime_context_id", runtime_context_id),
+        ("task_id", task_id),
+        ("fence_token", fence_token),
+    )
+    for key, expected_value in expected:
+        if not expected_value:
+            continue
+        actual = _runtime_context_deep_text(event, key)
+        if actual and actual == expected_value:
+            return True
+    return False
+
+
+def _runtime_context_timeline_derived_evidence(
+    events: Sequence[Mapping[str, Any]] | None,
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+    fence_token: str = "",
+) -> dict[str, Any]:
+    route_identity: dict[str, str] = {}
+    timeline_refs: dict[str, Any] = {}
+    graph_trace_ids: list[str] = []
+    graph_trace_event_refs: list[str] = []
+    implementation_refs: list[str] = []
+    verification_refs: list[str] = []
+    finish_gate: dict[str, Any] = {}
+    close_evidence: dict[str, Any] = {}
+    graph_kinds = {
+        "implementation",
+        "merge",
+        "merge_evidence",
+        "mf_subagent_read_receipt",
+        "runtime_context_read_receipt",
+        "worker_read_receipt",
+        "read_receipt",
+        "graph_query_trace",
+        "mf_subagent_graph_query_trace",
+    }
+    for raw_event in events or ():
+        if not isinstance(raw_event, Mapping):
+            continue
+        event = public_contract_revision_payload(raw_event)
+        if not _runtime_context_event_same_lineage(
+            event,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=backlog_id,
+        ):
+            continue
+        if not _runtime_context_event_status_ok(event):
+            continue
+        event_ref = _runtime_context_event_ref(event)
+        event_kind = _runtime_context_event_kind_token(event)
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        ):
+            if route_identity.get(key):
+                continue
+            value = _runtime_context_deep_text(event, key)
+            if value:
+                route_identity[key] = value
+        if event_kind in {
+            "mf_subagent_startup",
+            "mf_subagent_startup_gate",
+            "worker_startup",
+        }:
+            timeline_refs.setdefault("startup_event_ref", event_ref)
+        if event_kind in {
+            "mf_subagent_read_receipt",
+            "runtime_context_read_receipt",
+            "worker_read_receipt",
+            "read_receipt",
+        }:
+            timeline_refs.setdefault("read_receipt_event_ref", event_ref)
+        if event_kind in {"implementation", "worker_implementation"} and event_ref:
+            implementation_refs.append(event_ref)
+        if (
+            event_kind in {"verification", "qa_verification", "independent_verification"}
+            and event_ref
+        ):
+            verification_refs.append(event_ref)
+        if event_kind in {
+            "finish_gate",
+            "mf_subagent_finish_gate",
+            "review_ready",
+            "checkpoint",
+        }:
+            timeline_refs.setdefault("finish_event_ref", event_ref)
+            if not finish_gate:
+                finish_gate = {
+                    "event_id": event_ref,
+                    "source_ref": event_ref,
+                    "checkpoint_id": _runtime_context_deep_text(event, "checkpoint_id"),
+                    "payload": public_contract_revision_payload(
+                        event.get("payload") or {}
+                    ),
+                }
+        if event_kind in {"close_ready", "close_request", "finish_request"}:
+            timeline_refs.setdefault("close_ready_event_ref", event_ref)
+            if not close_evidence:
+                close_evidence = {
+                    "event_id": event_ref,
+                    "source_ref": event_ref,
+                    "payload": public_contract_revision_payload(
+                        event.get("payload") or {}
+                    ),
+                }
+        if (
+            event_kind in graph_kinds
+            and _runtime_context_is_worker_evidence(event)
+            and _runtime_context_event_lane_bound(
+                event,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                fence_token=fence_token,
+            )
+        ):
+            ids: list[str] = []
+            for key in (
+                "trace_id",
+                "graph_trace_id",
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            ):
+                for value in _runtime_context_deep_values(event, key):
+                    ids.extend(_runtime_context_string_list(value))
+            if ids:
+                graph_trace_ids.extend(ids)
+                if event_ref:
+                    graph_trace_event_refs.append(event_ref)
+    if implementation_refs:
+        timeline_refs["implementation_event_refs"] = _runtime_context_dedupe(
+            implementation_refs
+        )
+    if verification_refs:
+        timeline_refs["verification_event_refs"] = _runtime_context_dedupe(
+            verification_refs
+        )
+    return {
+        "route_identity": route_identity,
+        "timeline_refs": timeline_refs,
+        "graph_trace_refs": {
+            "source": "task_timeline.same_lineage",
+            "query_source": "mf_subagent",
+            "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "runtime_context_id": runtime_context_id,
+            "backlog_id": backlog_id,
+            "trace_ids": _runtime_context_dedupe(graph_trace_ids),
+            "source_details": {
+                "event_refs": _runtime_context_dedupe(graph_trace_event_refs),
+            },
+        },
+        "finish_gate": finish_gate,
+        "close_evidence": close_evidence,
+    }
+
+
 def _runtime_context_value_present(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -2856,6 +3138,7 @@ def _runtime_context_gate_field_view(
     gate: str,
     requirement: Mapping[str, str],
     values: Mapping[str, Any],
+    evidence_refs_inspected: Sequence[str] = (),
 ) -> tuple[str, dict[str, Any], RuntimeContextMissingField | None]:
     field_name = requirement["field"]
     value = values.get(field_name)
@@ -2871,6 +3154,7 @@ def _runtime_context_gate_field_view(
             "producer": requirement["producer"],
             "consumer": requirement["consumer"],
             "evidence_ref": requirement["evidence_ref"],
+            "evidence_refs_inspected": list(evidence_refs_inspected),
         }
         if present:
             return field_name, field_view, None
@@ -2881,6 +3165,7 @@ def _runtime_context_gate_field_view(
             producer=requirement["producer"],
             consumer=requirement["consumer"],
             evidence_ref=requirement["evidence_ref"],
+            evidence_refs_inspected=tuple(evidence_refs_inspected),
         )
         return field_name, field_view, missing
     present = _runtime_context_value_present(value)
@@ -2891,6 +3176,7 @@ def _runtime_context_gate_field_view(
         "producer": requirement["producer"],
         "consumer": requirement["consumer"],
         "evidence_ref": requirement["evidence_ref"],
+        "evidence_refs_inspected": list(evidence_refs_inspected),
     }
     if present:
         return field_name, field_view, None
@@ -2901,6 +3187,7 @@ def _runtime_context_gate_field_view(
         producer=requirement["producer"],
         consumer=requirement["consumer"],
         evidence_ref=requirement["evidence_ref"],
+        evidence_refs_inspected=tuple(evidence_refs_inspected),
     )
     return field_name, field_view, missing
 
@@ -2946,6 +3233,7 @@ def build_runtime_context_gate_inputs_view(
                 gate=gate,
                 requirement=requirement,
                 values=values,
+                evidence_refs_inspected=tuple(sorted(evidence_refs.keys())),
             )
             fields[field_name] = field_view
             if missing_field is not None:
@@ -3012,8 +3300,35 @@ def build_runtime_context_current_view(
         route_identity=route_identity,
         route_gate=route_gate,
     )
-    timeline = _runtime_context_timeline_refs(timeline_refs)
-    graph_trace = _runtime_context_graph_trace_refs(graph_trace_refs)
+    parent_task_id = _runtime_context_parent_task_id(context)
+    derived = _runtime_context_timeline_derived_evidence(
+        timeline_events,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=parent_task_id,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+    )
+    for key, value in _runtime_context_mapping(derived.get("route_identity")).items():
+        if value and not route.get(key):
+            route[key] = value
+    timeline = _runtime_context_timeline_refs(
+        {
+            **_runtime_context_mapping(derived.get("timeline_refs")),
+            **public_contract_revision_payload(timeline_refs or {}),
+        }
+    )
+    explicit_graph_trace = _runtime_context_graph_trace_refs(graph_trace_refs)
+    derived_graph_trace = _runtime_context_graph_trace_refs(
+        derived.get("graph_trace_refs")
+    )
+    graph_trace = dict(explicit_graph_trace)
+    graph_trace["trace_ids"] = _runtime_context_dedupe(
+        list(derived_graph_trace.get("trace_ids") or [])
+        + list(explicit_graph_trace.get("trace_ids") or [])
+    )
+    if not graph_trace.get("source_details"):
+        graph_trace["source_details"] = derived_graph_trace.get("source_details", {})
     target_file_values = _runtime_context_dedupe(
         list(target_files or ())
         or _runtime_context_revision_string_list(
@@ -3040,8 +3355,12 @@ def build_runtime_context_current_view(
         )
     )
     startup = _runtime_context_startup_gate_payload(startup_gate or {})
-    finish = public_contract_revision_payload(finish_gate or {})
-    close = public_contract_revision_payload(close_evidence or {})
+    finish = public_contract_revision_payload(
+        finish_gate or derived.get("finish_gate") or {}
+    )
+    close = public_contract_revision_payload(
+        close_evidence or derived.get("close_evidence") or {}
+    )
     observer_command_id = _runtime_context_text(
         revision_payload.get("observer_command_id")
         or startup.get("observer_command_id")
@@ -3208,6 +3527,9 @@ def build_runtime_context_close_gate_view(
         "checkpoint_id": values.get("checkpoint_id", ""),
         "finish_gate_ref": values.get("finish_gate_ref", ""),
         "close_ready_event_ref": values.get("close_ready_event_ref", ""),
+        "route_context_hash": values.get("route_context_hash", ""),
+        "prompt_contract_hash": values.get("prompt_contract_hash", ""),
+        "route_token_ref": values.get("route_token_ref", ""),
         "graph_trace_ids": list(values.get("graph_trace_ids") or []),
         "checklist": checklist,
         "missing": close_missing,

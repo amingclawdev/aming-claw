@@ -3428,7 +3428,7 @@ class TestTaskTimeline(unittest.TestCase):
         )
         self.assertIn("independent_qa", blocked["missing_evidence_groups"]["groups"])
 
-        ready = task_timeline.mf_close_gate_verification(
+        qa_only = task_timeline.mf_close_gate_verification(
             [
                 *base_events,
                 {
@@ -3442,9 +3442,126 @@ class TestTaskTimeline(unittest.TestCase):
             contract=contract,
         )
 
+        self.assertFalse(qa_only["passed"], qa_only)
+        self.assertTrue(qa_only["independent_qa_gate"]["passed"])
+        self.assertEqual(
+            qa_only["worker_graph_trace_gate"]["status"],
+            "process_gap",
+        )
+        self.assertEqual(
+            qa_only["worker_graph_trace_gate"]["rejected_evidence_events"][0]["reason"],
+            "unsupported_worker_graph_trace_event_kind",
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                {
+                    "event_kind": "qa_verification",
+                    "phase": "verification",
+                    "actor": "qa",
+                    "status": "passed",
+                },
+                {
+                    "event_kind": "graph_query_trace",
+                    "phase": "implementation",
+                    "actor": "worker-b",
+                    "status": "passed",
+                    "payload": {
+                        "query_source": "mf_subagent",
+                        "worker_role": "mf_sub",
+                        "graph_trace_ids": ["gqt-policy-close"],
+                    },
+                },
+            ],
+            contract=contract,
+        )
+
         self.assertTrue(ready["passed"], ready)
         self.assertEqual(ready["worker_graph_trace_gate"]["trace_ids"], ["gqt-policy-close"])
         self.assertTrue(ready["independent_qa_gate"]["passed"])
+
+    def test_007a033c_observer_trace_close_gate_shape_is_process_gap(self):
+        from agent.governance import task_timeline
+
+        contract = {"governance_policy": STRICT_GOVERNANCE_POLICY}
+        events = [
+            {
+                "id": 1,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "worker-b",
+                "status": "accepted",
+            },
+            {
+                "id": 2,
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "qa",
+                "status": "passed",
+            },
+            {
+                "id": 4417,
+                "event_kind": "graph_query_trace",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "query_source": "observer",
+                    "graph_trace_ids": ["gqt-observer-4417"],
+                    "runtime_context_id": "mfrctx-007a033c",
+                    "task_id": "worker-b",
+                    "parent_task_id": "AC-RUNTIME-CONTEXT-CLOSE-GATE-TIMELINE-SOURCE-GAP-20260606",
+                },
+            },
+            {
+                "id": 4418,
+                "event_kind": "graph_query_trace",
+                "phase": "implementation",
+                "actor": "qa",
+                "status": "passed",
+                "payload": {
+                    "query_source": "mf_subagent",
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-qa-substitute-4418"],
+                    "runtime_context_id": "mfrctx-007a033c",
+                    "task_id": "worker-b",
+                    "parent_task_id": "AC-RUNTIME-CONTEXT-CLOSE-GATE-TIMELINE-SOURCE-GAP-20260606",
+                },
+            },
+            {
+                "id": 4419,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "runtime_context_id": "mfrctx-007a033c",
+                    "task_id": "worker-b",
+                    "parent_task_id": "AC-RUNTIME-CONTEXT-CLOSE-GATE-TIMELINE-SOURCE-GAP-20260606",
+                    "observer_command_summary": {
+                        "graph_trace_ids": ["gqt-observer-4417"],
+                    },
+                },
+            },
+        ]
+
+        gate = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(gate["passed"], gate)
+        self.assertEqual(gate["worker_graph_trace_gate"]["status"], "process_gap")
+        self.assertEqual(gate["worker_graph_trace_gate"]["trace_ids"], [])
+        self.assertEqual(
+            gate["worker_graph_trace_gate"]["failure_reason"],
+            "observer_or_unsupported_graph_trace_cannot_satisfy_worker_evidence",
+        )
+        reasons = {
+            event["reason"]
+            for event in gate["worker_graph_trace_gate"]["rejected_evidence_events"]
+        }
+        self.assertIn("observer_substituted_worker_graph_trace", reasons)
+        self.assertIn("qa_substituted_worker_graph_trace", reasons)
+        self.assertIn("worker_graph_trace", gate["missing_evidence_groups"]["groups"])
 
     # -----------------------------------------------------------------------
     # BUG-ROUTE-CONTEXT-CLOSE-GATE-QA-20260531: independence-by-identity tests

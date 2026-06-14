@@ -1027,16 +1027,73 @@ def _event_graph_trace_ids(event: Mapping[str, Any]) -> set[str]:
     return ids
 
 
+def _worker_graph_trace_event_gate(event: Mapping[str, Any]) -> tuple[bool, str]:
+    status = _text(event.get("status") or event.get("decision")).strip().lower()
+    if status and status not in MF_CLOSE_PASS_STATUSES:
+        return False, "non_passing_status"
+    kind = _route_marker(
+        event.get("event_kind") or event.get("event_type") or event.get("phase")
+    )
+    if kind not in {
+        "implementation",
+        "merge",
+        "merge_evidence",
+        "mf_subagent_read_receipt",
+        "runtime_context_read_receipt",
+        "worker_read_receipt",
+        "read_receipt",
+        "graph_query_trace",
+        "mf_subagent_graph_query_trace",
+    }:
+        return False, "unsupported_worker_graph_trace_event_kind"
+    actor = _text(event.get("actor")).strip().lower()
+    query_source = _first_deep_text(event, "query_source").lower()
+    worker_role = (
+        _first_deep_text(event, "worker_role")
+        or _first_deep_text(event, "role")
+    ).lower()
+    if actor in {"observer", "mf_observer", "route_observer", "observer_runtime_text"}:
+        return False, "observer_substituted_worker_graph_trace"
+    if actor in {
+        "qa",
+        "independent_qa",
+        "qa_verifier",
+        "qa_reviewer",
+        "independent_verifier",
+    }:
+        return False, "qa_substituted_worker_graph_trace"
+    if query_source and query_source != "mf_subagent":
+        return False, "query_source_not_mf_subagent"
+    if worker_role and worker_role != "mf_sub":
+        return False, "worker_role_not_mf_sub"
+    if query_source == "mf_subagent" or worker_role == "mf_sub":
+        return True, ""
+    return False, "missing_mf_subagent_identity"
+
+
 def _worker_graph_trace_gate(
     rows: list[dict[str, Any]],
     policy: Mapping[str, Any],
 ) -> dict[str, Any]:
     required = _policy_requires(policy, "worker_graph_trace")
     evidence_events: list[dict[str, Any]] = []
+    rejected_events: list[dict[str, Any]] = []
     trace_ids: set[str] = set()
     for event in rows:
         ids = _event_graph_trace_ids(_mapping(event))
         if not ids:
+            continue
+        ok, reason = _worker_graph_trace_event_gate(_mapping(event))
+        if not ok:
+            rejected_events.append({
+                "id": event.get("id"),
+                "event_kind": event.get("event_kind"),
+                "phase": event.get("phase"),
+                "status": event.get("status"),
+                "actor": event.get("actor"),
+                "reason": reason,
+                "graph_trace_ids": sorted(ids),
+            })
             continue
         trace_ids.update(ids)
         evidence_events.append({
@@ -1047,14 +1104,21 @@ def _worker_graph_trace_gate(
             "graph_trace_ids": sorted(ids),
         })
     passed = bool(trace_ids) or not required
+    process_gap = bool(required and not trace_ids and rejected_events)
     return {
         "schema_version": "worker_graph_trace_gate.v1",
         "required": required,
         "passed": passed,
-        "status": "passed" if passed else "failed",
+        "status": "passed" if passed else ("process_gap" if process_gap else "failed"),
         "trace_ids": sorted(trace_ids),
         "missing_requirement_ids": [] if passed else ["worker_graph_trace"],
         "evidence_events": evidence_events,
+        "rejected_evidence_events": rejected_events,
+        "failure_reason": (
+            "observer_or_unsupported_graph_trace_cannot_satisfy_worker_evidence"
+            if process_gap
+            else ("" if passed else "missing_mf_subagent_graph_trace")
+        ),
     }
 
 
