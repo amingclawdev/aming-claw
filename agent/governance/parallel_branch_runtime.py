@@ -319,6 +319,7 @@ MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
 MERGE_REVALIDATION_BLOCKING_STATES = {
     STATE_RUNNING,
+    STATE_WAITING_DEPENDENCY,
     STATE_DEPENDENCY_BLOCKED,
     STATE_VALIDATING,
     STATE_STALE_AFTER_DEPENDENCY_MERGE,
@@ -3380,6 +3381,18 @@ def build_runtime_context_current_view(
         finish_gate=finish,
         close_evidence=close,
     )
+    current_values["merge_queue_projection"] = public_contract_revision_payload(
+        revision_payload.get("merge_queue_projection")
+    )
+    current_values["ordered_merge_dependencies"] = _runtime_context_string_list(
+        revision_payload.get("ordered_merge_dependencies")
+    )
+    current_values["dependency_merge_commit"] = _runtime_context_text(
+        revision_payload.get("dependency_merge_commit")
+    )
+    current_values["close_precheck"] = public_contract_revision_payload(
+        revision_payload.get("close_precheck")
+    )
     evidence_refs = _runtime_context_evidence_refs(
         context,
         runtime_context_id=runtime_context_id,
@@ -4057,6 +4070,140 @@ def _runtime_context_audit_archive_action(
     }
 
 
+def _runtime_context_merge_dependency_projection(
+    *,
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    queue_projection = _runtime_context_mapping(values.get("merge_queue_projection"))
+    blockers = _runtime_context_string_list(queue_projection.get("dependency_blockers"))
+    queue_state = _runtime_context_text(
+        queue_projection.get("queue_state") or queue_projection.get("status")
+    )
+    raw_next_actions = _runtime_context_string_list(queue_projection.get("next_actions"))
+
+    next_actions: list[str] = []
+    if queue_state in {STATE_WAITING_DEPENDENCY, STATE_DEPENDENCY_BLOCKED} or blockers:
+        next_actions.extend(
+            [
+                "wait_for_dependency",
+                "merge_dependency_first",
+                "do_not_merge_current_lane",
+            ]
+        )
+    elif queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE or values.get(
+        "dependency_merge_commit"
+    ):
+        next_actions.extend(["revalidate", "refresh_merge_preview"])
+    elif queue_state == STATE_MERGE_READY:
+        next_actions.append("merge_ready")
+    for action in raw_next_actions:
+        normalized = {
+            "do_not_merge": "do_not_merge_current_lane",
+            "refresh_merge_preview": "refresh_merge_preview",
+        }.get(action, action)
+        if (
+            queue_state in {STATE_WAITING_DEPENDENCY, STATE_DEPENDENCY_BLOCKED}
+            and normalized == "resolve_dependency"
+        ):
+            continue
+        if normalized not in next_actions:
+            next_actions.append(normalized)
+
+    if queue_state in {STATE_WAITING_DEPENDENCY, STATE_DEPENDENCY_BLOCKED} or blockers:
+        next_action = "wait_for_dependency"
+        status = queue_state or STATE_DEPENDENCY_BLOCKED
+    elif queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE:
+        next_action = "revalidate"
+        status = STATE_STALE_AFTER_DEPENDENCY_MERGE
+    elif queue_state == STATE_MERGE_READY:
+        next_action = "merge_ready"
+        status = STATE_MERGE_READY
+    elif queue_projection:
+        next_action = next_actions[0] if next_actions else "inspect_merge_queue"
+        status = queue_state or "unknown"
+    else:
+        next_action = "none"
+        status = "not_applicable"
+
+    return {
+        "schema_version": "runtime_context.merge_dependency_projection.v1",
+        "status": status,
+        "queue_state": queue_state,
+        "merge_queue_id": _runtime_context_text(values.get("merge_queue_id")),
+        "queue_item_id": _runtime_context_text(queue_projection.get("queue_item_id")),
+        "task_id": _runtime_context_text(
+            queue_projection.get("task_id") or values.get("task_id")
+        ),
+        "branch_ref": _runtime_context_text(queue_projection.get("branch_ref")),
+        "dependency_blockers": blockers,
+        "dependency_blocker_types": public_contract_revision_payload(
+            queue_projection.get("dependency_blocker_types")
+        ),
+        "dependency_merge_commit": _runtime_context_text(
+            values.get("dependency_merge_commit")
+        ),
+        "merge_preview_id": _runtime_context_text(
+            queue_projection.get("merge_preview_id") or values.get("merge_preview_id")
+        ),
+        "merge_allowed": bool(queue_projection.get("merge_allowed")),
+        "target_branch_mutation_allowed": bool(
+            queue_projection.get("target_branch_mutation_allowed")
+        ),
+        "next_action": next_action,
+        "next_actions": next_actions,
+        "ordered_merge_dependencies": _runtime_context_string_list(
+            values.get("ordered_merge_dependencies")
+        ),
+    }
+
+
+def _runtime_context_close_precheck_gap_projection(
+    *,
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    close_precheck = _runtime_context_mapping(values.get("close_precheck"))
+    gap_specs = {
+        "route_identity_cleanup_required": (
+            "cleanup_route_identity",
+            "Remove stale/superseded route identity evidence and rebind the canonical route.",
+        ),
+        "independent_verification_required": (
+            "record_independent_verification",
+            "Record an independent verification lane before close.",
+        ),
+        "route_token_action_scope_mismatch": (
+            "refresh_route_token_scope",
+            "Refresh route-token evidence with the task_timeline_append action scope.",
+        ),
+        "target_graph_stale": (
+            "reconcile_target_graph",
+            "Reconcile the target graph before claiming close-ready state.",
+        ),
+        "worker_graph_query_identity_required": (
+            "query_graph_as_mf_subagent",
+            "Run graph queries with mf_subagent identity and attach trace ids.",
+        ),
+    }
+    gaps: list[dict[str, Any]] = []
+    next_actions: list[str] = []
+    for code, (next_action, message) in gap_specs.items():
+        if close_precheck.get(code) is True:
+            gaps.append(
+                {
+                    "code": code,
+                    "message": message,
+                    "next_action": next_action,
+                }
+            )
+            next_actions.append(next_action)
+    return {
+        "schema_version": "runtime_context.close_precheck_gap_projection.v1",
+        "status": "blocked" if gaps else "clear",
+        "gaps": gaps,
+        "next_actions": next_actions,
+    }
+
+
 def _runtime_context_next_legal_action(
     *,
     route_token_action: Mapping[str, Any],
@@ -4131,6 +4278,12 @@ def build_runtime_context_action_plan_view(
         values={**values, "runtime_context_id": current_view.get("runtime_context_id", "")},
         close_blocker_explanation=close_blocker_explanation,
     )
+    merge_dependency_projection = _runtime_context_merge_dependency_projection(
+        values=values,
+    )
+    close_precheck_gap_projection = _runtime_context_close_precheck_gap_projection(
+        values=values,
+    )
     next_legal_action = _runtime_context_next_legal_action(
         route_token_action=route_token_action,
         read_receipt_hash_action=read_receipt_hash_action,
@@ -4159,6 +4312,15 @@ def build_runtime_context_action_plan_view(
                 "next_action": read_receipt_hash_action.get("next_action", ""),
             }
         )
+    for gap in close_precheck_gap_projection.get("gaps") or []:
+        if isinstance(gap, Mapping):
+            blocking_reasons.append(
+                {
+                    "code": _runtime_context_text(gap.get("code")),
+                    "message": _runtime_context_text(gap.get("message")),
+                    "next_action": _runtime_context_text(gap.get("next_action")),
+                }
+            )
     for event in lane_plan.get("blocking_events") or []:
         if isinstance(event, Mapping):
             blocking_reasons.append(
@@ -4189,6 +4351,8 @@ def build_runtime_context_action_plan_view(
         "route_token_action": route_token_action,
         "read_receipt_hash_action": read_receipt_hash_action,
         "audit_archive_action": audit_archive_action,
+        "merge_dependency_projection": merge_dependency_projection,
+        "close_precheck_gap_projection": close_precheck_gap_projection,
         "close_blocker_explanation": close_blocker_explanation,
         "deferred_hardening": {
             "permission_tree": "deferred_next_layer",
@@ -4221,6 +4385,11 @@ def build_runtime_context_control_plane_view(
     )
     return {
         "schema_version": RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
+        "role_scope": RUNTIME_CONTEXT_WORKER_ROLE,
+        "viewer_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "raw_fence_token_exposed": False,
         "runtime_context_id": action_plan.get("runtime_context_id", ""),
         "task_id": action_plan.get("task_id", ""),
         "next_legal_action": action_plan.get("next_legal_action", ""),
@@ -4231,6 +4400,12 @@ def build_runtime_context_control_plane_view(
             action_plan.get("read_receipt_hash_action") or {}
         ),
         "audit_archive_action": dict(action_plan.get("audit_archive_action") or {}),
+        "merge_dependency_projection": dict(
+            action_plan.get("merge_dependency_projection") or {}
+        ),
+        "close_precheck_gap_projection": dict(
+            action_plan.get("close_precheck_gap_projection") or {}
+        ),
         "close_blocker_explanation": dict(
             action_plan.get("close_blocker_explanation") or {}
         ),
@@ -4377,6 +4552,7 @@ def build_runtime_context_worker_view(
     return {
         "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
         "role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "role_scope": RUNTIME_CONTEXT_WORKER_ROLE,
         "runtime_context_id": current_view.get("runtime_context_id", ""),
         "observer_command_id": values.get("observer_command_id", ""),
         "route_id": values.get("route_id", ""),
