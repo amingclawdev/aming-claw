@@ -1829,6 +1829,31 @@ def _lineage_text_list(value: Any) -> list[str]:
     )
 
 
+def _lineage_list_field_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return True
+    return bool(_string(value))
+
+
+def _lineage_first_present_list_value(
+    *sources: tuple[Mapping[str, Any], Sequence[str]],
+) -> tuple[Any, bool]:
+    for source, field_names in sources:
+        for field_name in field_names:
+            if field_name not in source:
+                continue
+            value = source.get(field_name)
+            if _lineage_list_field_present(value):
+                return value, True
+    return None, False
+
+
 def _lineage_first_text(*values: Any) -> str:
     for value in values:
         texts = _lineage_text_list(value)
@@ -1951,6 +1976,39 @@ def _normalize_parent_route_lineage(
             _nested_mapping(packet, "selected_scope").get("backlog_ids"),
         )
 
+    allowed_actions_value, allowed_actions_present = _lineage_first_present_list_value(
+        (packet, ("allowed_actions",)),
+        (route_machine_context, ("allowed_actions",)),
+    )
+    blocked_actions_value, blocked_actions_present = _lineage_first_present_list_value(
+        (packet, ("blocked_actions",)),
+        (route_machine_context, ("blocked_actions",)),
+    )
+    required_lanes_value, required_lanes_present = _lineage_first_present_list_value(
+        (packet, ("required_lanes",)),
+        (route_machine_context, ("required_lanes",)),
+    )
+    required_evidence_value, required_evidence_present = (
+        _lineage_first_present_list_value(
+            (
+                packet,
+                (
+                    "required_evidence",
+                    "required_evidence_ids",
+                    "evidence_required",
+                    "evidence_requirements",
+                ),
+            ),
+            (
+                route_machine_context,
+                (
+                    "required_evidence",
+                    "required_evidence_ids",
+                    "evidence_required",
+                ),
+            ),
+        )
+    )
     normalized = {
         "schema_version": PARENT_ROUTE_LINEAGE_SCHEMA_VERSION,
         "route_id": _lineage_first_text(
@@ -1981,30 +2039,26 @@ def _normalize_parent_route_lineage(
         ),
         "selected_project": selected_project,
         "selected_backlog_id": selected_backlog_id,
-        "allowed_actions": _lineage_text_list(
-            packet.get("allowed_actions") or route_machine_context.get("allowed_actions")
-        ),
-        "blocked_actions": _lineage_text_list(
-            packet.get("blocked_actions") or route_machine_context.get("blocked_actions")
-        ),
-        "required_lanes": _lineage_text_list(
-            packet.get("required_lanes") or route_machine_context.get("required_lanes")
-        ),
-        "required_evidence": _lineage_text_list(
-            packet.get("required_evidence")
-            or packet.get("required_evidence_ids")
-            or packet.get("evidence_required")
-            or packet.get("evidence_requirements")
-            or route_machine_context.get("required_evidence")
-            or route_machine_context.get("required_evidence_ids")
-            or route_machine_context.get("evidence_required")
-        ),
+        "allowed_actions": _lineage_text_list(allowed_actions_value),
+        "blocked_actions": _lineage_text_list(blocked_actions_value),
+        "required_lanes": _lineage_text_list(required_lanes_value),
+        "required_evidence": _lineage_text_list(required_evidence_value),
+    }
+    required_list_fields_present = {
+        "allowed_actions": allowed_actions_present,
+        "blocked_actions": blocked_actions_present,
+        "required_lanes": required_lanes_present,
+        "required_evidence": required_evidence_present,
     }
 
     missing = [
         field
         for field in _PARENT_ROUTE_LINEAGE_REQUIRED_FIELDS
-        if not normalized[field]
+        if (
+            not required_list_fields_present[field]
+            if field in required_list_fields_present
+            else not normalized[field]
+        )
     ]
     if missing and required:
         raise MfSubagentContractError(

@@ -426,8 +426,16 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
             "worker_role": "mf_sub",
             "task_id": "task-runtime-context-projection",
             "parent_task_id": "task-parent",
+            "fence_token": "fence-runtime-context",
             "query_purpose": "subagent_context_build",
             "trace_ids": ["gqt-runtime-context"],
+        },
+        "startup_gate": {
+            "event_id": "timeline:startup",
+            **_self_attested_startup_fields(
+                worker_session_id="worker-runtime-context",
+                transcript_path="/tmp/worker-runtime-context.jsonl",
+            ),
         },
         "finish_gate": {
             "checkpoint_id": "ckpt-runtime-context",
@@ -440,7 +448,7 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
     worker_view = projection["views"]["worker_view"]
     validation = validate_mf_subagent_worker_runtime_context_view(
         worker_view,
-        context=context,
+        expected_task_id=context.task_id,
     )
     worker_view_only = build_mf_subagent_worker_runtime_context_view(context, **kwargs)
 
@@ -1038,11 +1046,16 @@ def _graph_trace_evidence(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": "mf_subagent_graph_trace.v1",
         "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
         "trace_ids": ["gqt-test-mf-subagent-1"],
         "task_id": "task-mf-sub-1",
         "parent_task_id": "task-mf-parent",
         "worker_role": "mf_sub",
         "fence_token": "fence-1",
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
     }
     payload.update(overrides)
     return payload
@@ -1649,6 +1662,23 @@ def _startup_evidence(**overrides: object) -> dict[str, object]:
     return evidence
 
 
+def _startup_event(
+    startup_evidence: dict[str, object] | None = None,
+    *,
+    event_id: str = "evt-startup-test",
+) -> dict[str, object]:
+    return {
+        "id": event_id,
+        "event_type": "mf_subagent.startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {
+            "mf_subagent_startup_gate": startup_evidence or _startup_evidence()
+        },
+    }
+
+
 def test_route_action_gate_rejects_observer_direct_implementation_action() -> None:
     with pytest.raises(MfSubagentContractError, match="observer_judger_must_not_implement"):
         validate_route_action_gate(_route_action_payload())
@@ -1846,7 +1876,7 @@ def test_route_action_gate_allows_high_risk_worker_with_bounded_dispatch_and_sta
         _route_action_payload(
             caller_role="implementation_worker",
             mf_subagent_dispatch_gate=dispatch,
-            mf_subagent_startup_gate=_startup_evidence(),
+            real_startup_events=[_startup_event()],
             **_high_risk_route_machine_fields(),
         )
     )
@@ -1946,7 +1976,7 @@ def test_route_action_gate_allows_actual_startup_timeline_event_packet() -> None
         _route_action_payload(
             caller_role="implementation_worker",
             mf_subagent_dispatch_gate=dispatch,
-            startup_timeline_event=startup_event,
+            real_startup_events=[startup_event],
             **_high_risk_route_machine_fields(),
         )
     )
@@ -1967,7 +1997,9 @@ def test_route_action_gate_allows_high_risk_worker_without_optional_prompt_contr
             caller_role="implementation_worker",
             prompt_contract_hash="",
             mf_subagent_dispatch_gate=dispatch,
-            mf_subagent_startup_gate=_startup_evidence(prompt_contract_hash=""),
+            real_startup_events=[
+                _startup_event(_startup_evidence(prompt_contract_hash=""))
+            ],
             **_high_risk_route_machine_fields(),
         )
     )
@@ -2557,6 +2589,27 @@ def _context(**overrides: object) -> BranchTaskRuntimeContext:
     return BranchTaskRuntimeContext(**fields)
 
 
+def _self_attested_startup_fields(
+    *,
+    worker_session_id: str = "worker-session-codex-1",
+    transcript_path: str = "/tmp/worker-session-codex-1.jsonl",
+    harness_type: str = "codex",
+) -> dict[str, object]:
+    return {
+        "filer_principal": worker_session_id,
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": transcript_path,
+        "harness_type": harness_type,
+        "worker_self_attestation": {
+            "status": "passed",
+            "worker_self_attesting": True,
+            "worker_session_id": worker_session_id,
+            "worker_transcript_path": transcript_path,
+            "harness_type": harness_type,
+        },
+    }
+
+
 def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": "mf_subagent_startup_gate.v1",
@@ -2582,6 +2635,7 @@ def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
         "route_token_ref": "rtok-finish-visible",
         "observer_command_id": "cmd-finish",
         "read_receipt_event_id": "2873",
+        **_self_attested_startup_fields(),
     }
     payload.update(overrides)
     return payload
@@ -2798,6 +2852,7 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
             "fence_token": "fence-2",
             "summary": "Ready.",
             "mf_subagent_startup_gate": _finish_startup_evidence(),
+            "real_startup_events": [_startup_event(_finish_startup_evidence())],
             "read_receipt_hash": "sha256:read-finish",
             "read_receipt_event_id": "2873",
             "gate_receipt_hash": "sha256:gate-finish",
@@ -2848,6 +2903,7 @@ def test_finish_gate_accepts_nested_startup_evidence_object(nested_key: str) -> 
                 "read_receipt_hash": "sha256:read-finish",
                 "read_receipt_event_id": "2873",
             },
+            "real_startup_events": [_startup_event(_finish_startup_evidence())],
         },
         context=_context(),
     )
@@ -2881,6 +2937,7 @@ def test_finish_gate_requires_read_receipt_event_lineage() -> None:
                 "fence_token": "fence-2",
                 "summary": "Ready.",
                 "mf_subagent_startup_gate": startup_evidence,
+                "real_startup_events": [_startup_event(startup_evidence)],
                 "read_receipt_hash": "sha256:read-finish",
             },
             context=_context(),
@@ -2914,7 +2971,11 @@ def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> No
 
     with pytest.raises(MfSubagentContractError, match="mf_subagent_read_receipt"):
         validate_mf_subagent_finish_gate(
-            {**base_payload, "mf_subagent_startup_gate": _finish_startup_evidence()},
+            {
+                **base_payload,
+                "mf_subagent_startup_gate": _finish_startup_evidence(),
+                "real_startup_events": [_startup_event(_finish_startup_evidence())],
+            },
             context=_context(),
         )
 
@@ -3041,6 +3102,7 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
                 },
             },
             "mf_subagent_startup_gate": _finish_startup_evidence(),
+            "real_startup_events": [_startup_event(_finish_startup_evidence())],
             "read_receipt_hash": "sha256:read-finish",
             "read_receipt_event_id": "2873",
             "summary": "Ready.",
@@ -3058,6 +3120,74 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
     )
     assert gate["governed_evidence_required"] is True
     assert gate["graph_trace_evidence"]["trace_ids"] == ["gqt-test-finish-1"]
+
+
+def test_finish_gate_accepts_empty_parent_route_blocked_actions() -> None:
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": "ckpt-finish-empty-blocked-actions",
+            "fence_token": "fence-2",
+            "parent_task_id": "task-mf-parent",
+            "parent_route_lineage": _parent_route_lineage(blocked_actions=[]),
+            "graph_trace_evidence": _graph_trace_evidence(fence_token="fence-2"),
+            "mf_subagent_startup_gate": _finish_startup_evidence(),
+            "real_startup_events": [_startup_event(_finish_startup_evidence())],
+            "read_receipt_hash": "sha256:read-finish",
+            "read_receipt_event_id": "2873",
+            "summary": "Ready.",
+        },
+        context=_context(),
+    )
+
+    assert gate["parent_route_lineage"]["blocked_actions"] == []
+    assert "none" not in gate["parent_route_lineage"]["blocked_actions"]
+    assert gate["governed_evidence_required"] is True
+    assert gate["close_ready"] is True
+
+
+def test_finish_gate_rejects_omitted_parent_route_blocked_actions() -> None:
+    parent_route_lineage = _parent_route_lineage()
+    parent_route_lineage.pop("blocked_actions")
+
+    with pytest.raises(MfSubagentContractError, match="blocked_actions"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-missing-blocked-actions",
+                "fence_token": "fence-2",
+                "parent_task_id": "task-mf-parent",
+                "parent_route_lineage": parent_route_lineage,
+                "graph_trace_evidence": _graph_trace_evidence(fence_token="fence-2"),
+                "mf_subagent_startup_gate": _finish_startup_evidence(),
+                "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
+                "summary": "Ready.",
+            },
+            context=_context(),
+        )
 
 
 def test_finish_gate_rejects_parent_route_without_graph_trace() -> None:
@@ -3323,6 +3453,10 @@ def _real_session_startup() -> dict:
         "actual_git_root": "/repo/.worktrees/mf-sub",
         "branch": "refs/heads/codex/mf-sub",
         "head_commit": "head-real",
+        **_self_attested_startup_fields(
+            worker_session_id="worker-session-real",
+            transcript_path="/tmp/worker-session-real.jsonl",
+        ),
     }
 
 
@@ -3436,6 +3570,10 @@ def _real_worker_startup_matching_lineage(event_id: str = "evt-real-001") -> dic
         "actual_git_root": "/repo/.worktrees/sg-test",
         "branch": "refs/heads/task-sg-test",
         "head_commit": "head-sg-real",
+        **_self_attested_startup_fields(
+            worker_session_id="worker-session-sg",
+            transcript_path="/tmp/worker-session-sg.jsonl",
+        ),
     }
 
 
