@@ -3750,6 +3750,112 @@ def _runtime_context_read_receipt_hash_action(
         payload=close_gate_view,
     )
     status = "present" if read_receipt_ref else "missing"
+    worker_query = _runtime_context_mapping(values.get("graph_query_identity"))
+    ordered_steps = [
+        {
+            "id": "query_runtime_contract",
+            "status": "required",
+            "entrypoint": {
+                "method": "GET",
+                "path": (
+                    "/api/graph-governance/{project_id}/parallel-branches/"
+                    "runtime-contexts/{runtime_context_id}/runtime-contract"
+                ),
+                "required_query_fields": [
+                    "task_id",
+                    "parent_task_id",
+                    "worker_role",
+                    "fence_token",
+                    "runtime_context_id",
+                ],
+            },
+            "must_precede": [
+                "record_read_receipt",
+                "worker_graph_query",
+                "record_startup",
+                "implementation",
+            ],
+        },
+        {
+            "id": "record_read_receipt",
+            "status": status,
+            "timeline_event_kind": "mf_subagent_read_receipt",
+            "required_payload_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "fence_token",
+                "worker_slot_id",
+                "observer_command_id",
+                "read_receipt_hash or launch_text_hash",
+            ],
+            "hash_bridge": {
+                "accepted_inputs": ["read_receipt_hash", "launch_text_hash"],
+                "startup_field": "read_receipt_hash",
+                "rule": (
+                    "if no dedicated read_receipt_hash exists, carry the "
+                    "accepted launch_text_hash as the startup read_receipt_hash"
+                ),
+            },
+            "must_precede": ["worker_graph_query", "record_startup", "implementation"],
+        },
+        {
+            "id": "worker_graph_query",
+            "status": "required",
+            "query_source": "mf_subagent",
+            "allowed_query_purposes": [
+                "subagent_context_build",
+                "subagent_gate_validation",
+            ],
+            "required_identity": {
+                "task_id": _runtime_context_text(values.get("task_id")),
+                "parent_task_id": _runtime_context_text(values.get("parent_task_id")),
+                "worker_role": _runtime_context_text(values.get("worker_role")),
+                "query_source": _runtime_context_text(
+                    worker_query.get("query_source") or "mf_subagent"
+                ),
+                "fence_token_required": True,
+            },
+            "evidence_required": "DB-verified graph_trace_ids",
+        },
+        {
+            "id": "implementation_and_tests",
+            "status": "required",
+            "owned_files": list(values.get("owned_files") or []),
+            "required_outputs": [
+                "owned file diff",
+                "focused tests",
+                "git diff --check",
+            ],
+        },
+        {
+            "id": "transcript_self_attestation",
+            "status": "required_for_close_satisfying_startup",
+            "required_facts": [
+                "runtime identity",
+                "timeline read receipt",
+                "owned file diff",
+                "DB-verified mf_subagent graph traces",
+            ],
+        },
+        {
+            "id": "record_startup",
+            "status": "required",
+            "close_satisfying_rule": (
+                "read receipt plus server-verified same-owner startup remains "
+                "close_satisfying=false until worker transcript/self-attestation passes"
+            ),
+            "required_fields": [
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+                "worker_transcript_path",
+                "worker_session_id",
+                "harness_type",
+                "graph_trace_ids",
+            ],
+        },
+    ]
     return {
         "schema_version": "runtime_context.read_receipt_hash_action.v1",
         "status": status,
@@ -3790,6 +3896,16 @@ def _runtime_context_read_receipt_hash_action(
             if not read_receipt_ref
             else "Read receipt evidence is present in the task timeline."
         ),
+        "ordered_worker_startup_bridge": {
+            "schema_version": "runtime_context.worker_startup_bridge.v1",
+            "status": "ready" if read_receipt_ref else "waiting_for_read_receipt",
+            "steps": ordered_steps,
+            "privacy_boundary": {
+                "raw_session_token_persisted": False,
+                "raw_route_token_persisted": False,
+                "raw_launch_text_persisted": False,
+            },
+        },
     }
 
 
@@ -6314,6 +6430,35 @@ def _startup_route_identity(payload: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _startup_read_receipt_hash(payload: Mapping[str, Any]) -> tuple[str, str]:
+    direct = str(
+        payload.get("read_receipt_hash")
+        or payload.get("worker_read_receipt_hash")
+        or ""
+    ).strip()
+    if direct:
+        return direct, "payload.read_receipt_hash"
+    read_receipt = (
+        payload.get("read_receipt")
+        if isinstance(payload.get("read_receipt"), Mapping)
+        else {}
+    )
+    for source, value in (
+        ("read_receipt.read_receipt_hash", read_receipt.get("read_receipt_hash")),
+        (
+            "read_receipt.worker_read_receipt_hash",
+            read_receipt.get("worker_read_receipt_hash"),
+        ),
+        ("read_receipt.hash", read_receipt.get("hash")),
+        ("read_receipt.launch_text_hash", read_receipt.get("launch_text_hash")),
+        ("payload.launch_text_hash", payload.get("launch_text_hash")),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text, source
+    return "", ""
+
+
 def _startup_route_identity_mismatches(
     *,
     expected: Mapping[str, Any],
@@ -6444,9 +6589,7 @@ def record_mf_subagent_startup(
     )
     launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
     observer_command_id = str(payload.get("observer_command_id") or "").strip()
-    read_receipt_hash = str(
-        payload.get("read_receipt_hash") or payload.get("worker_read_receipt_hash") or ""
-    ).strip()
+    read_receipt_hash, read_receipt_hash_source = _startup_read_receipt_hash(payload)
     read_receipt = payload.get("read_receipt") if isinstance(payload.get("read_receipt"), Mapping) else {}
     read_receipt_event_id = str(
         payload.get("read_receipt_event_id")
@@ -6830,6 +6973,7 @@ def record_mf_subagent_startup(
         "owned_files": list(owned_files),
         "observer_command_id": observer_command_id,
         "read_receipt_hash": read_receipt_hash,
+        "read_receipt_hash_source": read_receipt_hash_source,
         "read_receipt_event_id": read_receipt_event_id,
         "route_token_ref": route_token_ref,
         "filer_principal": filer_principal,
@@ -6949,6 +7093,7 @@ def record_mf_subagent_startup(
         "self_filed": bool(filer_principal and not filed_on_behalf_by),
         "observer_command_id": observer_command_id,
         "read_receipt_hash": read_receipt_hash,
+        "read_receipt_hash_source": read_receipt_hash_source,
         "read_receipt_event_id": read_receipt_event_id,
         "read_receipt": dict(read_receipt),
         "host_startup_id": host_startup_id,

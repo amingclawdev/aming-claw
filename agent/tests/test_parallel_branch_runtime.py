@@ -870,6 +870,27 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         f"runtime_context/{projection['runtime_context_id']}/current"
     )
     assert read_action["hash_material"]["current_view_hash"].startswith("sha256:")
+    bridge = read_action["ordered_worker_startup_bridge"]
+    assert bridge["schema_version"] == "runtime_context.worker_startup_bridge.v1"
+    assert [step["id"] for step in bridge["steps"]] == [
+        "query_runtime_contract",
+        "record_read_receipt",
+        "worker_graph_query",
+        "implementation_and_tests",
+        "transcript_self_attestation",
+        "record_startup",
+    ]
+    read_receipt_step = bridge["steps"][1]
+    assert read_receipt_step["hash_bridge"]["accepted_inputs"] == [
+        "read_receipt_hash",
+        "launch_text_hash",
+    ]
+    assert read_receipt_step["hash_bridge"]["startup_field"] == "read_receipt_hash"
+    assert "observer_command_id" in read_receipt_step["required_payload_fields"]
+    startup_step = bridge["steps"][-1]
+    assert "worker_transcript_path" in startup_step["required_fields"]
+    assert "graph_trace_ids" in startup_step["required_fields"]
+    assert "close_satisfying=false" in startup_step["close_satisfying_rule"]
 
     with_receipt = build_runtime_context_projection(
         context,
@@ -889,6 +910,7 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert present_action["status"] == "present"
     assert present_action["next_action"] == "none"
     assert present_action["read_receipt_event_ref"] == "timeline:read-runtime-context"
+    assert present_action["ordered_worker_startup_bridge"]["status"] == "ready"
 
 
 def test_runtime_context_action_plan_translates_close_blockers_for_operator() -> None:
@@ -1757,6 +1779,41 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
                 fence_token="fence-startup",
                 session_token=supplied_token,
             )
+
+
+def test_startup_bridges_launch_text_hash_read_receipt_without_close_satisfying(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-launch-receipt"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            read_receipt_hash="",
+            launch_text_hash="sha256:launch-text-startup",
+            worker_transcript_path="",
+            worker_session_id="",
+            harness_type="",
+        ),
+        now_iso=NOW,
+    )
+
+    gate = result["startup_gate"]
+    assert result["ok"] is True
+    assert gate["read_receipt_hash"] == "sha256:launch-text-startup"
+    assert gate["read_receipt_hash_source"] == "payload.launch_text_hash"
+    assert gate["identity_join"]["read_receipt_lineage_present"] is True
+    assert gate["session_token_evidence_type"] == "server_verified"
+    assert gate["worker_self_attesting"] is False
+    assert gate["close_satisfying"] is False
+    assert "missing_worker_session_id" in gate["worker_self_attestation"]["blockers"]
+    assert "missing_worker_transcript_path" in gate["worker_self_attestation"]["blockers"]
 
 
 def test_mf_sub_startup_rejects_same_owner_self_filled_unissued_session_token(
