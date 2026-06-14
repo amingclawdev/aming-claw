@@ -21367,6 +21367,80 @@ def _is_plausible_graph_trace_id(value: Any) -> bool:
     return bool(re.match(r"^gqt-\d{8}-[0-9a-f]+$", s))
 
 
+def _observer_root_route_ordered_missing_steps(
+    *,
+    route_context_gate: Mapping[str, Any],
+    transition_gate: Mapping[str, Any],
+    canonical_route_identity: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return ordered recovery steps for root observer route-context projection."""
+
+    present = {
+        str(item or "").strip()
+        for item in (route_context_gate.get("present_requirement_ids") or [])
+        if str(item or "").strip()
+    }
+    missing = {
+        str(item or "").strip()
+        for item in (route_context_gate.get("missing_requirement_ids") or [])
+        if str(item or "").strip()
+    }
+    transition_missing = {
+        str(item or "").strip()
+        for item in (transition_gate.get("missing") or [])
+        if str(item or "").strip()
+    }
+    identity_missing = [
+        field
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+        if not str(canonical_route_identity.get(field) or "").strip()
+    ]
+    steps: list[dict[str, Any]] = []
+
+    def _add(step_id: str, action: str, reason: str, **extra: Any) -> None:
+        if any(step["id"] == step_id for step in steps):
+            return
+        step: dict[str, Any] = {
+            "id": step_id,
+            "action": action,
+            "reason": reason,
+        }
+        step.update({key: value for key, value in extra.items() if value not in ("", [], {})})
+        steps.append(step)
+
+    if identity_missing:
+        _add(
+            "canonical_route_identity",
+            "record_or_repair_canonical_route_identity",
+            "canonical route identity is incomplete",
+            missing_fields=identity_missing,
+        )
+    if "route_context" in missing or (
+        bool(route_context_gate.get("required")) and "route_context" not in present
+    ):
+        _add(
+            "route_context",
+            "record_route_context",
+            "route_context evidence is required before execution-supervisor lineage",
+        )
+    if (
+        "route_action_precheck" in missing
+        or "route_action_precheck_bound_to_canonical_route" in transition_missing
+    ):
+        _add(
+            "route_action_precheck",
+            "record_route_action_precheck",
+            "route_action_precheck must be accepted and bound to the canonical route identity",
+        )
+    if "work_mode_transition_event" in transition_missing:
+        _add(
+            "observer_work_mode_transition",
+            "record_work_mode_transition",
+            "observer_work_mode_transition must be accepted before execution-supervisor mode",
+        )
+    return steps
+
+
 def _observer_root_route_context_state(
     conn,
     project_id: str,
@@ -21444,14 +21518,74 @@ def _observer_root_route_context_state(
             )
         )
 
+    transition_gate = observer_session.work_mode_transition_gate(
+        events,
+        canonical_route_identity=route_context_for_bootstrap,
+    )
+    canonical_identity_complete = all(
+        str(route_context_for_bootstrap.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+    )
+    requested_work_mode = observer_session.normalize_work_mode(work_mode)
+    effective_work_mode = requested_work_mode
+    projection_source = "requested_work_mode"
+    if (
+        transition_gate.get("allowed")
+        and canonical_identity_complete
+        and requested_work_mode != observer_session.WORK_MODE_HOTFIX_EXCEPTION
+    ):
+        effective_work_mode = observer_session.WORK_MODE_EXECUTION_SUPERVISOR
+        projection_source = "timeline_transition_gate"
+    elif (
+        requested_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
+        and (not transition_gate.get("allowed") or not canonical_identity_complete)
+        and (route_context_gate.get("required") or any(route_context_for_bootstrap.values()))
+    ):
+        effective_work_mode = observer_session.WORK_MODE_LOOK_BEFORE_ACT
+        projection_source = "blocked_missing_transition_prerequisites"
+
     context = observer_session.build_observer_root_route_context(
         backlog_id=backlog_id,
-        work_mode=work_mode,
+        work_mode=effective_work_mode,
         route_context=route_context_for_bootstrap,
         loaded_skills=loaded_skills,
         loaded_resources=loaded_resources,
         graph_query_schema_trace_id=graph_trace_id,
     )
+    ordered_missing_steps = _observer_root_route_ordered_missing_steps(
+        route_context_gate=route_context_gate,
+        transition_gate=transition_gate,
+        canonical_route_identity=context.get("canonical_route_identity") or {},
+    )
+    if effective_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR:
+        ordered_missing_steps = [
+            step
+            for step in ordered_missing_steps
+            if step["id"] not in {
+                "route_context",
+                "route_action_precheck",
+                "observer_work_mode_transition",
+            }
+        ]
+    context["requested_work_mode"] = requested_work_mode
+    context["work_mode_projection"] = {
+        "schema_version": "observer_root_route_context_work_mode_projection.v1",
+        "requested_work_mode": requested_work_mode,
+        "effective_work_mode": context["work_mode"],
+        "source": projection_source,
+        "transition_allowed": bool(transition_gate.get("allowed")),
+        "canonical_route_identity_complete": bool(
+            context.get("canonical_route_identity_complete")
+        ),
+        "ordered_missing_steps": ordered_missing_steps,
+    }
+    context["work_mode_transition_gate"] = transition_gate
+    if ordered_missing_steps and context["work_mode"] == observer_session.WORK_MODE_LOOK_BEFORE_ACT:
+        context["next_legal_action"] = {
+            **dict(context.get("next_legal_action") or {}),
+            "missing_prerequisites": [step["id"] for step in ordered_missing_steps],
+            "ordered_missing_steps": ordered_missing_steps,
+        }
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),
         "passed": bool(route_context_gate.get("passed")),

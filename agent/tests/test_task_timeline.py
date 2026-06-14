@@ -1014,6 +1014,169 @@ class TestTaskTimeline(unittest.TestCase):
         ).fetchone()["c"]
         self.assertEqual(count, 1)
 
+    def test_root_route_context_projects_execution_supervisor_after_transition_precheck(self):
+        from agent.governance import observer_session, server, task_timeline
+
+        bug_id = "BUG-WORK-MODE-ROOT-CONTEXT-PROJECTION"
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+            },
+        )
+        identity = {
+            **ROUTE_IDENTITY,
+            "route_id": "route-20260614-canonical",
+            "visible_injection_manifest_hash": _fake_sha("canonical-visible"),
+        }
+        common = {"project_id": "proj", "backlog_id": bug_id, "task_id": bug_id}
+        task_timeline.record_event(
+            self.conn,
+            event_type="route.context",
+            event_kind="route_context",
+            phase="dispatch",
+            status="passed",
+            payload={
+                "route_context": {
+                    **identity,
+                    "caller_role": "observer",
+                    "required_lanes": ["bounded_implementation_worker"],
+                },
+                **identity,
+            },
+            **common,
+        )
+        precheck = task_timeline.record_event(
+            self.conn,
+            event_type="route.action.precheck",
+            event_kind="route_action_precheck",
+            phase="pre_mutation",
+            status="allowed",
+            payload={
+                "route_action_precheck": {
+                    **identity,
+                    "caller_role": "observer",
+                    "allowed_action": "dispatch_bounded_worker",
+                },
+                **identity,
+            },
+            verification={**identity, "allowed_action": "dispatch_bounded_worker"},
+            **common,
+        )
+        task_timeline.record_event(
+            self.conn,
+            event_type="observer.work_mode_transition",
+            event_kind="observer_work_mode_transition",
+            phase="routing",
+            actor="observer",
+            status="accepted",
+            payload={
+                "from_work_mode": "observer_look_before_act",
+                "to_work_mode": "observer_execution_supervisor",
+                "route_identity": identity,
+                "route_action_precheck_event_id": f"timeline:{precheck['id']}",
+                **identity,
+            },
+            **common,
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            work_mode=observer_session.normalize_work_mode(None),
+        )
+
+        self.assertEqual(result["work_mode"], "observer_execution_supervisor")
+        self.assertEqual(
+            result["work_mode_projection"]["source"],
+            "timeline_transition_gate",
+        )
+        self.assertTrue(result["work_mode_transition_gate"]["allowed"])
+        self.assertEqual(result["next_legal_action"]["id"], "dispatch_bounded_worker")
+        self.assertEqual(result["canonical_route_identity"]["route_id"], identity["route_id"])
+        self.assertTrue(result["canonical_route_identity_complete"])
+        self.assertNotIn(
+            "route_action_precheck",
+            [
+                step["id"]
+                for step in result["work_mode_projection"]["ordered_missing_steps"]
+            ],
+        )
+
+    def test_root_route_context_reports_missing_precheck_before_execution_supervisor(self):
+        from agent.governance import observer_session, server, task_timeline
+
+        bug_id = "BUG-WORK-MODE-ROOT-CONTEXT-MISSING-PRECHECK"
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+            },
+        )
+        identity = {
+            **ROUTE_IDENTITY,
+            "route_id": "route-20260614-missing-precheck",
+            "visible_injection_manifest_hash": _fake_sha("missing-precheck-visible"),
+        }
+        common = {"project_id": "proj", "backlog_id": bug_id, "task_id": bug_id}
+        task_timeline.record_event(
+            self.conn,
+            event_type="route.context",
+            event_kind="route_context",
+            phase="dispatch",
+            status="passed",
+            payload={
+                "route_context": {
+                    **identity,
+                    "caller_role": "observer",
+                    "required_lanes": ["bounded_implementation_worker"],
+                },
+                **identity,
+            },
+            **common,
+        )
+        task_timeline.record_event(
+            self.conn,
+            event_type="observer.work_mode_transition",
+            event_kind="observer_work_mode_transition",
+            phase="routing",
+            actor="observer",
+            status="accepted",
+            payload={
+                "from_work_mode": "observer_look_before_act",
+                "to_work_mode": "observer_execution_supervisor",
+                "route_identity": identity,
+                "route_action_precheck_event_id": "timeline:4667",
+                **identity,
+            },
+            **common,
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            work_mode=observer_session.normalize_work_mode(None),
+        )
+
+        self.assertEqual(result["work_mode"], "observer_look_before_act")
+        self.assertFalse(result["work_mode_transition_gate"]["allowed"])
+        self.assertIn(
+            "route_action_precheck_bound_to_canonical_route",
+            result["work_mode_transition_gate"]["missing"],
+        )
+        self.assertIn(
+            "route_action_precheck",
+            result["next_legal_action"]["missing_prerequisites"],
+        )
+        self.assertEqual(
+            result["next_legal_action"]["ordered_missing_steps"][0]["id"],
+            "route_action_precheck",
+        )
+
     def test_timeline_append_accepts_observer_cross_ref_lineage_bridge(self):
         from agent.governance import server
 
@@ -2785,20 +2948,28 @@ class TestTaskTimeline(unittest.TestCase):
             "bootstrap_project",
             return_value={"project_id": "bootstrap-project", "graph_stats": {}},
         ) as bootstrap_project:
-            with self.assertRaises(GovernanceError) as raised:
-                server.handle_project_bootstrap(
-                    _ctx(
-                        method="POST",
-                        body={
-                            "workspace_path": workspace_path,
-                            "project_id": "bootstrap-project",
-                            "route_identity": route_identity,
-                        },
-                    )
+            status, result = server.handle_project_bootstrap(
+                _ctx(
+                    method="POST",
+                    body={
+                        "workspace_path": workspace_path,
+                        "project_id": "bootstrap-project",
+                        "route_identity": route_identity,
+                    },
                 )
+            )
 
-        self.assertEqual(raised.exception.code, "route_token_required")
-        bootstrap_project.assert_not_called()
+        self.assertEqual(status, 200)
+        bootstrap_project.assert_called_once()
+        handoff = result["route_bootstrap_handoff"]
+        self.assertFalse(handoff["route_token_required_before_bootstrap"])
+        self.assertTrue(handoff["server_minted_first_run_binding_available"])
+        self.assertFalse(handoff["raw_route_token_persisted"])
+        gate = result["route_token_gate"]
+        self.assertEqual(gate["action"], "project_bootstrap")
+        self.assertTrue(gate["server_issued_binding"])
+        self.assertEqual(gate["bootstrap_gate_decision"], "server_minted_first_run_binding")
+        self.assertTrue(gate["route_token_ref"].startswith("rtok-"))
 
     def test_observer_repair_route_evidence_records_service_route_gate_inputs(self):
         from agent.governance import server, task_timeline
@@ -3526,7 +3697,7 @@ class TestTaskTimeline(unittest.TestCase):
             event_type="mf.implementation.completed",
             phase="implement",
             event_kind="implementation",
-            actor="observer",
+            actor="mf_sub",
             status="passed",
             payload={"changed_files": ["agent/governance/server.py"]},
         )
@@ -3537,7 +3708,7 @@ class TestTaskTimeline(unittest.TestCase):
             event_type="mf.verification.completed",
             phase="verify",
             event_kind="verification",
-            actor="observer",
+            actor="qa",
             status="passed",
             verification={"tests_run": ["pytest -q agent/tests/test_task_timeline.py"]},
         )
@@ -4654,6 +4825,21 @@ class TestTaskTimeline(unittest.TestCase):
             **current_lineage,
         )
         current_qa["id"] = 3016
+        lineage_bridge = {
+            "id": 3009,
+            "event_type": "mf.cross_ref_lineage_bridge",
+            "event_kind": "cross_ref_lineage_bridge",
+            "phase": "lineage",
+            "actor": "observer",
+            "status": "accepted",
+            "task_id": current_lineage["task_id"],
+            "payload": {
+                **ROUTE_IDENTITY,
+                "bridged_identities": [
+                    {"task_id": stale_lineage["task_id"]},
+                ],
+            },
+        }
         close_events = [
             _add_attempt_lineage(
                 {
@@ -4692,6 +4878,7 @@ class TestTaskTimeline(unittest.TestCase):
         events = [
             *stale_route_events,
             stale_read_receipt,
+            lineage_bridge,
             *current_route_events[:3],
             current_read_receipt,
             current_route_events[3],
@@ -4805,6 +4992,25 @@ class TestTaskTimeline(unittest.TestCase):
             "backlog_id": parent_task_id,
             "payload": {"route_identity_cleanup": ROUTE_IDENTITY},
         }
+        lineage_bridge = {
+            "id": 4109,
+            "event_type": "mf.cross_ref_lineage_bridge",
+            "event_kind": "cross_ref_lineage_bridge",
+            "phase": "lineage",
+            "actor": "observer",
+            "status": "accepted",
+            "backlog_id": parent_task_id,
+            "task_id": current_lineage["task_id"],
+            "payload": {
+                **ROUTE_IDENTITY,
+                "bridged_identities": [
+                    {
+                        "backlog_id": parent_task_id,
+                        "task_id": stale_lineage["task_id"],
+                    },
+                ],
+            },
+        }
         current_qa = _add_attempt_lineage(
             _route_context_qa_verification_event(),
             **current_lineage,
@@ -4852,6 +5058,7 @@ class TestTaskTimeline(unittest.TestCase):
         events = [
             *stale_route_events,
             stale_read_receipt,
+            lineage_bridge,
             *current_route_events[:3],
             current_read_receipt,
             current_route_events[3],
@@ -6534,7 +6741,7 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(result["backlog_id"], "BUG-LIVE")
         self.assertEqual(result["task_id"], "task-live")
         self.assertEqual(result["latest_event"]["id"], event["id"])
-        self.assertEqual(result["active_count"], 2)
+        self.assertEqual(result["active_count"], 1)
         self.assertEqual(result["active_backlog"][0]["bug_id"], "BUG-LIVE")
 
     def test_backlog_timeline_gate_precheck_matches_close_gate_evidence(self):
@@ -6729,7 +6936,15 @@ class TestTaskTimeline(unittest.TestCase):
         ready = server.handle_backlog_timeline_gate(
             _ctx(path_params={"bug_id": "BUG-MF-CONTRACT-PRECHECK"})
         )
-        self.assertTrue(ready["can_close"], ready)
+        self.assertFalse(ready["can_close"], ready)
+        self.assertEqual(
+            ready["timeline_gate"]["route_context_gate"]["missing_requirement_ids"],
+            ["mf_subagent_startup"],
+        )
+        self.assertEqual(
+            ready["timeline_gate"]["route_context_gate"]["ignored_route_events"][0]["reason"],
+            "non_passing_route_evidence",
+        )
         self.assertTrue(ready["timeline_gate"]["contract_gate"]["passed"])
 
     def test_backlog_close_handler_loads_instantiated_contract(self):

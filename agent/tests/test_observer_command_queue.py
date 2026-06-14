@@ -131,6 +131,11 @@ def _route_event(kind: str, event_id: int, route: dict, *, status: str = "passed
     if kind == "mf_subagent_startup":
         body.update({
             "fence_token": "fence-a3",
+            "recorded": True,
+            "actual_startup_recorded": True,
+            "session_token_hash": "sha256:canonical-a3-worker-token",
+            "session_token_present": True,
+            "session_token_evidence_type": "server_verified",
             "actual_cwd": "/repo/.worktrees/mf-sub-a3",
             "actual_git_root": "/repo/.worktrees/mf-sub-a3",
             "branch": "refs/heads/codex/a3",
@@ -175,6 +180,7 @@ def _canonical_close_evidence(*, include_close_ready: bool = True, include_clean
             "id": 1817,
             "event_kind": "verification",
             "phase": "verification",
+            "actor": "qa",
             "status": "passed",
             "verification": {
                 **CANONICAL_A3_ROUTE,
@@ -1087,7 +1093,7 @@ def test_execute_backlog_row_completion_does_not_project_without_closed_backlog_
     command_after = completed["command"]
     projection = command_after["result"]["terminal_contract_projection"]
     assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
-    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert command_after["error"] == "missing_canonical_backlog_fixed_or_closed"
     assert projection["command_projection_status"] == "unresolved"
     assert "canonical_backlog_fixed_or_closed" in projection["missing_requirement_ids"]
 
@@ -1124,7 +1130,9 @@ def test_execute_backlog_row_completion_keeps_blocker_without_superseding_route_
     command_after = completed["command"]
     projection = command_after["result"]["terminal_contract_projection"]
     assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
-    assert command_after["error"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert command_after["error"] == (
+        "missing_canonical_close_gate_passed_and_superseding_route_or_contract_relation"
+    )
     assert projection["command_projection_status"] == "unresolved"
     assert "superseding_route_or_contract_relation" in projection["missing_requirement_ids"]
 

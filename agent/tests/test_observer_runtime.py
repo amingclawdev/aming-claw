@@ -209,6 +209,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
                 route_context_hash="sha256:route-a1",
                 prompt_contract_id="rprompt-a1",
                 prompt_contract_hash="sha256:prompt-a1",
+                route_token_ref="rtok-runtime-text-a1",
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),
@@ -245,6 +246,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert self_lookup["required"] is True
     assert self_lookup["query_identity"] == {
         "project_id": "aming-claw",
+        "observer_command_id": "cmd-a1",
         "governance_project_id": "aming-claw",
         "target_project_id": "aming-claw",
         "target_project_root": "",
@@ -256,6 +258,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     }
     assert set(self_lookup["required_query_fields"]) == {
         "task_id",
+        "observer_command_id",
         "parent_task_id",
         "worker_role",
         "fence_token",
@@ -272,6 +275,8 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         "aming-claw",
         "--runtime-context-id",
         "mfrctx-runtime-text-a1",
+        "--observer-command-id",
+        "cmd-a1",
         "--parent-task-id",
         "AC-RUNTIME-TEXT-A1",
         "--fence-token",
@@ -358,6 +363,7 @@ def test_runtime_text_prepare_hydrates_persisted_allocation_from_runtime_context
                 route_context_hash="sha256:route-a2",
                 prompt_contract_id="rprompt-a2",
                 prompt_contract_hash="sha256:prompt-a2",
+                route_token_ref="rtok-runtime-text-a2",
             ),
             main_worktree=str(main),
             owned_files=("agent/observer_runtime.py",),

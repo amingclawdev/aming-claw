@@ -4183,6 +4183,34 @@ def complete_command(
         terminal_projection = _command_terminal_projection_from_result(command, result_payload)
         if terminal_projection:
             _attach_command_terminal_projection(result_payload, terminal_projection)
+            if not terminal_projection.get("passed"):
+                result_payload["ok"] = False
+                result_payload["status"] = "failed"
+                error = str(
+                    terminal_projection.get("divergence_reason")
+                    or "canonical_close_projection_unresolved"
+                )
+                conn.execute(
+                    """UPDATE observer_command_queue
+                          SET status = ?, completed_at = ?, result_json = ?, error = ?
+                        WHERE project_id = ? AND command_id = ?""",
+                    (
+                        COMMAND_STATUS_FAILED,
+                        timestamp,
+                        _json_dumps(result_payload),
+                        error,
+                        pid,
+                        command_id,
+                    ),
+                )
+                conn.commit()
+                return {
+                    "ok": True,
+                    "project_id": pid,
+                    "observer_session_id": sid,
+                    "command": get_command(conn, project_id=pid, command_id=command_id),
+                    "terminal_contract_projection": terminal_projection,
+                }
     if (
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and _contains_actual_startup_evidence(result_payload)

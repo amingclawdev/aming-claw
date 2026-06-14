@@ -426,8 +426,19 @@ _META_ACTION_ALIASES = {
     "implement": "implementation",
     "worker_progress": "worker_progress",
     "progress": "worker_progress",
+    "task_started": "worker_progress",
+    "task_claimed": "worker_progress",
+    "task_completed": "worker_progress",
+    "task_succeeded": "worker_progress",
+    "ai_implementation_evidence_proposed": "worker_progress",
+    "gate_evidence_verified": "worker_progress",
+    "gate_result": "worker_progress",
+    "observation": "worker_progress",
     "patch": "patch",
     "apply_patch": "patch",
+    "mf_test_scenario_decision": "observer_command",
+    "scenario_spec": "observer_command",
+    "mf_process_timeline": "observer_command",
     "mf_subagent_read_receipt": "read_receipt",
     "mf_subagent_read_receipt_v1": "read_receipt",
     "read_receipt": "read_receipt",
@@ -468,6 +479,8 @@ _META_ACTION_ALIASES = {
     "hotfix_under_action": "hotfix_under_action",
     "route_token_gate": "route_token_gate",
     "route_token_gate_project_bootstrap_refusal": "route_token_gate",
+    "route_waiver": "route_token_gate",
+    "route_waiver_recorded": "route_token_gate",
     "route_identity_cleanup": "route_identity_cleanup",
     "route_identity": "route_identity_cleanup",
     "route_action_source_event": "service_route",
@@ -4808,6 +4821,8 @@ def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
     actor_role = _meta_normalize_role(actor)
     if actor_role in {OBSERVER_COORDINATOR_ROLE, "qa", MF_SUB_ROLE, "operator", "judge", "system"}:
         return actor_role
+    if action in {"service_route", "route_token_gate", "stale_artifact_cleanup"}:
+        return "system"
 
     for key in ("caller_role", "role", "worker_role", "actor_role", "lane_role"):
         role = _meta_normalize_role(_meta_first_string(event, (key,)))
@@ -4829,8 +4844,6 @@ def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
         "judge",
         "system",
     }:
-        return "system"
-    if action in {"service_route", "route_token_gate", "stale_artifact_cleanup"}:
         return "system"
     return actor_role or "observer"
 

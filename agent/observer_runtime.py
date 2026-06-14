@@ -3171,6 +3171,7 @@ def _runtime_text_local_projection(
         "route_context_hash": request.route.route_context_hash,
         "prompt_contract_id": request.route.prompt_contract_id,
         "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
         "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
     }
     return {
@@ -3722,6 +3723,36 @@ def build_observer_runtime_text_context(
     except MfSubagentContractError as exc:
         dispatch_gate_validation = {"allowed": False, "error": str(exc)}
 
+    startup_token_join_gaps: list[dict[str, Any]] = []
+    if not request.route.route_token_ref:
+        startup_token_join_gaps.append(
+            {
+                "id": "route_token_ref",
+                "action": "request_server_issued_route_token_ref",
+                "reason": (
+                    "mf_sub startup must join a server-issued route token ref; "
+                    "raw route tokens are not persisted in runtime text"
+                ),
+            }
+        )
+    if startup_token_join_gaps and not dispatch_gate_validation.get("allowed"):
+        next_legal_action = {
+            "id": "complete_startup_token_join",
+            "action": "request_runtime_contract_with_route_token_ref",
+            "missing_prerequisites": [
+                str(item.get("id") or "") for item in startup_token_join_gaps
+            ],
+            "ordered_missing_steps": startup_token_join_gaps,
+        }
+        dispatch_gate_validation = {
+            **dispatch_gate_validation,
+            "status": dispatch_gate_validation.get("status")
+            or "missing_startup_token_join",
+            "missing_startup_token_join_gaps": startup_token_join_gaps,
+            "missing": list(next_legal_action["missing_prerequisites"]),
+            "next_legal_action": next_legal_action,
+        }
+
     allocation_required = bool(branch_runtime_evidence.get("allocation_required"))
     if allocation_required:
         dispatch_gate_validation = {
@@ -3850,6 +3881,8 @@ def build_observer_runtime_text_context(
         "runtime_context": asdict(context),
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
+        "startup_token_join_gaps": startup_token_join_gaps,
+        "next_legal_action": dispatch_gate_validation.get("next_legal_action") or {},
         "branch_identity": launch_payload["branch_identity"],
         "mf_subagent_input": mf_subagent_input,
         "dispatch_gate": dispatch_gate,
@@ -3867,6 +3900,7 @@ def build_observer_runtime_text_context(
             "route_context_hash": request.route.route_context_hash,
             "prompt_contract_id": request.route.prompt_contract_id,
             "prompt_contract_hash": request.route.prompt_contract_hash,
+            "route_token_ref": request.route.route_token_ref,
             "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
         },
         "calls_models": False,
