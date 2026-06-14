@@ -40,7 +40,10 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_FAILED,
+    STATE_MERGE_READY,
     STATE_MERGED,
+    STATE_STALE_AFTER_DEPENDENCY_MERGE,
+    STATE_WAITING_DEPENDENCY,
     STATE_RECLAIMABLE,
     STATE_RUNNING,
     STATE_ALLOCATED,
@@ -48,6 +51,7 @@ from agent.governance.parallel_branch_runtime import (
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
+    MergeQueueItem,
     append_branch_contract_revision,
     branch_context_from_chain_stage,
     branch_runtime_context_id,
@@ -55,6 +59,7 @@ from agent.governance.parallel_branch_runtime import (
     build_runtime_context_gate_inputs_view,
     build_runtime_context_lane_plan_view,
     build_runtime_context_projection,
+    decide_merge_queue,
     decide_restart_recovery,
     ensure_branch_runtime_schema,
     get_branch_context,
@@ -911,6 +916,258 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert present_action["next_action"] == "none"
     assert present_action["read_receipt_event_ref"] == "timeline:read-runtime-context"
     assert present_action["ordered_worker_startup_bridge"]["status"] == "ready"
+
+
+def test_runtime_context_action_plan_projects_ordered_merge_dependency_wait() -> None:
+    worker1 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mq-runtime-context",
+        queue_item_id="mqi-worker-1",
+        task_id="worker-1",
+        branch_ref="refs/heads/codex/worker-1",
+        queue_index=1,
+        status=STATE_WAITING_DEPENDENCY,
+        branch_head="head-worker-1",
+    )
+    worker2 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mq-runtime-context",
+        queue_item_id="mqi-worker-2",
+        task_id="worker-2",
+        branch_ref="refs/heads/codex/worker-2",
+        queue_index=2,
+        status=STATE_MERGE_READY,
+        depends_on=("worker-1",),
+        branch_head="head-worker-2",
+        merge_preview_id="mp-worker-2",
+    )
+    merge_plan = decide_merge_queue(
+        [worker1, worker2],
+        scenario_id="runtime-context-ordered-dependency",
+    )
+    worker2_decision = {
+        decision.task_id: decision.to_dashboard_row()
+        for decision in merge_plan.decisions
+    }["worker-2"]
+
+    projection = build_runtime_context_projection(
+        _runtime_projection_context(
+            task_id="worker-2",
+            root_task_id="AC-RUNTIME-ACTION-PLAN-GAP-PROJECTION-20260614",
+            merge_queue_id="mq-runtime-context",
+            merge_preview_id="mp-worker-2",
+        ),
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        contract_revision={
+            "revision_id": "crev-runtime-context-merge-wait",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "merge_queue_projection": worker2_decision,
+                "ordered_merge_dependencies": ["worker-1"],
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    dependency_projection = projection["views"]["action_plan"][
+        "merge_dependency_projection"
+    ]
+
+    assert worker2_decision["queue_state"] == STATE_DEPENDENCY_BLOCKED
+    assert dependency_projection["status"] == STATE_DEPENDENCY_BLOCKED
+    assert dependency_projection["dependency_blockers"] == ["worker-1"]
+    assert dependency_projection["merge_allowed"] is False
+    assert dependency_projection["target_branch_mutation_allowed"] is False
+    assert dependency_projection["next_action"] == "wait_for_dependency"
+    assert dependency_projection["next_actions"] == [
+        "wait_for_dependency",
+        "merge_dependency_first",
+        "do_not_merge_current_lane",
+    ]
+    assert projection["views"]["control_plane"]["merge_dependency_projection"] == (
+        dependency_projection
+    )
+
+
+def test_runtime_context_action_plan_projects_dependency_after_merge_revalidation() -> None:
+    worker1 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mq-runtime-context",
+        queue_item_id="mqi-worker-1",
+        task_id="worker-1",
+        branch_ref="refs/heads/codex/worker-1",
+        queue_index=1,
+        status=STATE_MERGED,
+        branch_head="head-worker-1",
+        merge_commit="merge-worker-1",
+        snapshot_id="scope-worker-1",
+        projection_id="semproj-worker-1",
+    )
+    worker2 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mq-runtime-context",
+        queue_item_id="mqi-worker-2",
+        task_id="worker-2",
+        branch_ref="refs/heads/codex/worker-2",
+        queue_index=2,
+        status=STATE_MERGE_READY,
+        depends_on=("worker-1",),
+        branch_head="head-worker-2",
+        validated_target_head="target-before-worker-1",
+        current_target_head="merge-worker-1",
+        merge_preview_id="mp-worker-2-stale",
+    )
+    merge_plan = decide_merge_queue(
+        [worker1, worker2],
+        scenario_id="runtime-context-after-dependency-merge",
+    )
+    worker2_decision = {
+        decision.task_id: decision.to_dashboard_row()
+        for decision in merge_plan.decisions
+    }["worker-2"]
+
+    projection = build_runtime_context_projection(
+        _runtime_projection_context(
+            task_id="worker-2",
+            root_task_id="AC-RUNTIME-ACTION-PLAN-GAP-PROJECTION-20260614",
+            merge_queue_id="mq-runtime-context",
+            merge_preview_id="mp-worker-2-stale",
+        ),
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        contract_revision={
+            "revision_id": "crev-runtime-context-merge-revalidate",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "merge_queue_projection": worker2_decision,
+                "dependency_merge_commit": "merge-worker-1",
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    dependency_projection = projection["views"]["action_plan"][
+        "merge_dependency_projection"
+    ]
+
+    assert worker2_decision["queue_state"] == STATE_STALE_AFTER_DEPENDENCY_MERGE
+    assert dependency_projection["status"] in {
+        STATE_MERGE_READY,
+        STATE_STALE_AFTER_DEPENDENCY_MERGE,
+    }
+    assert dependency_projection["dependency_blockers"] == []
+    assert dependency_projection["merge_preview_id"] == "mp-worker-2-stale"
+    assert dependency_projection["next_action"] in {
+        "revalidate",
+        "refresh_merge_preview",
+    }
+    assert "refresh_merge_preview" in dependency_projection["next_actions"]
+    assert "revalidate" in dependency_projection["next_actions"]
+
+
+def test_runtime_context_action_plan_projects_close_precheck_gaps() -> None:
+    projection = build_runtime_context_projection(
+        _runtime_projection_context(),
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        contract_revision={
+            "revision_id": "crev-runtime-context-close-precheck",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "close_precheck": {
+                    "route_identity_cleanup_required": True,
+                    "independent_verification_required": True,
+                    "route_token_action_scope_mismatch": True,
+                    "target_graph_stale": True,
+                    "worker_graph_query_identity_required": True,
+                }
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    close_projection = projection["views"]["action_plan"][
+        "close_precheck_gap_projection"
+    ]
+    gap_codes = {item["code"] for item in close_projection["gaps"]}
+    blocking_codes = {
+        item["code"] for item in projection["views"]["action_plan"]["blocking_reasons"]
+    }
+
+    assert close_projection["status"] == "blocked"
+    assert gap_codes == {
+        "route_identity_cleanup_required",
+        "independent_verification_required",
+        "route_token_action_scope_mismatch",
+        "target_graph_stale",
+        "worker_graph_query_identity_required",
+    }
+    assert "cleanup_route_identity" in close_projection["next_actions"]
+    assert "record_independent_verification" in close_projection["next_actions"]
+    assert "refresh_route_token_scope" in close_projection["next_actions"]
+    assert "reconcile_target_graph" in close_projection["next_actions"]
+    assert "query_graph_as_mf_subagent" in close_projection["next_actions"]
+    assert gap_codes <= blocking_codes
+
+
+def test_runtime_context_worker_view_control_plane_is_role_scoped_without_raw_tokens() -> None:
+    context = _runtime_projection_context(
+        session_token_hash=mf_subagent_session_token_hash("raw-worker-session-token"),
+    )
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+            "raw_route_token": "raw-route-token-secret",
+        },
+        contract_revision={
+            "revision_id": "crev-runtime-context-role-scope",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "observer_command_id": "cmd-runtime-context",
+                "worker_session_token": "raw-worker-session-token",
+                "fence_token": "fence-runtime-context",
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    worker_view = projection["views"]["worker_view"]
+    control_plane = worker_view["control_plane"]
+    serialized_worker_view = json.dumps(worker_view, sort_keys=True)
+    serialized_control_plane = json.dumps(control_plane, sort_keys=True)
+
+    assert worker_view["role_scope"] == "mf_sub"
+    assert control_plane["role_scope"] == "mf_sub"
+    assert control_plane["viewer_role"] == "mf_sub"
+    assert control_plane["raw_session_token_exposed"] is False
+    assert control_plane["raw_route_token_exposed"] is False
+    assert "raw-worker-session-token" not in serialized_worker_view
+    assert "raw-worker-session-token" not in serialized_control_plane
+    assert "raw-route-token-secret" not in serialized_worker_view
+    assert "raw-route-token-secret" not in serialized_control_plane
+    assert "fence-runtime-context" not in serialized_control_plane
+    assert worker_view["capability_boundary"]["role"] == "mf_sub"
 
 
 def test_runtime_context_action_plan_translates_close_blockers_for_operator() -> None:
