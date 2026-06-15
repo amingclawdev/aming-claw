@@ -6326,6 +6326,7 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/runtime-contract")
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/runtime-contract")
 def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: RequestContext):
     """Return a worker contract view by runtime_context_id plus current fence."""
@@ -6426,6 +6427,7 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/current-state")
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/current-state")
 def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: RequestContext):
     """Return Runtime Context Service current-state or role-filtered worker view."""

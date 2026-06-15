@@ -2544,6 +2544,64 @@ def test_parallel_branch_runtime_context_contract_route_rejects_wrong_fence(conn
     assert exc_info.value.status == 403
 
 
+def test_runtime_context_canonical_read_routes_use_runtime_context_facade(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-canonical-read-task",
+            root_task_id="runtime-canonical-read-parent",
+            backlog_id="AC-RUNTIME-CANONICAL-READ",
+            branch_ref="refs/heads/codex/runtime-canonical-read-task",
+            worktree_path="/repo/.worktrees/runtime-canonical-read-task",
+            base_commit="base-canonical",
+            target_head_commit="target-canonical",
+            merge_queue_id="mq-canonical",
+            fence_token="fence-canonical",
+            status="running",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-15T00:00:00Z",
+    )
+
+    def resolve(path: str):
+        handler_obj = object.__new__(server.GovernanceHandler)
+        handler_obj.path = path
+        route_handler, params, _unused = server.GovernanceHandler._find_handler(
+            handler_obj,
+            "GET",
+        )
+        assert route_handler is not None
+        return route_handler, params
+
+    current_handler, current_params = resolve(
+        f"/api/graph-governance/{PID}/runtime-contexts/"
+        f"{context.runtime_context_id}/current-state"
+    )
+    assert (
+        current_handler
+        is server.handle_graph_governance_parallel_branch_runtime_context_current_state
+    )
+    current = current_handler(_ctx_with_role(current_params, "observer"))
+    assert current["ok"] is True
+    assert current["runtime_context_id"] == context.runtime_context_id
+    assert current["task_id"] == "runtime-canonical-read-task"
+
+    contract_handler, contract_params = resolve(
+        f"/api/graph-governance/{PID}/runtime-contexts/"
+        f"{context.runtime_context_id}/runtime-contract"
+    )
+    assert (
+        contract_handler
+        is server.handle_graph_governance_parallel_branch_runtime_contract_by_context
+    )
+    contract = contract_handler(_ctx_with_role(contract_params, "observer"))
+    assert contract["ok"] is True
+    assert contract["runtime_contract"]["runtime_context"]["task_id"] == (
+        "runtime-canonical-read-task"
+    )
+
+
 def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     context = upsert_branch_context(
         conn,
