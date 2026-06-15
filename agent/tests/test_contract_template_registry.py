@@ -151,6 +151,51 @@ def test_mf_parallel_template_declares_route_topology_and_worker_prompt_boundary
     assert "observer_only_context" in worker_prompt_contract["forbidden_context_sources"]
 
 
+def test_observer_hotfix_direct_mutation_template_declares_pre_and_post_timeline_contract():
+    template = get_contract_template("observer_hotfix_direct_mutation.v1")
+    timeline_contract = template["timeline_contract"]
+    pre_event = timeline_contract["pre_mutation_reason_event"]
+    post_event = timeline_contract["post_mutation_action_event"]
+    evidence_ids = {item["id"] for item in template["evidence_requirements"]}
+
+    assert template["version"] == "v1"
+    assert template["source"]["type"] == "source_controlled"
+    assert pre_event["event_kind"] == "hotfix_entered"
+    assert pre_event["event_type"] == "hotfix.entered"
+    assert pre_event["close_satisfying"] is False
+    assert "reason" in pre_event["required_payload_fields"]
+    assert "allowed_files" in pre_event["required_payload_fields"]
+    assert "dirty_scope_before_mutation" in pre_event["required_payload_fields"]
+    assert post_event["event_kind"] == "hotfix_under_action"
+    assert post_event["event_type"] == "hotfix.under_action"
+    assert post_event["close_satisfying"] is False
+    assert "pre_reason_event_id" in post_event["required_payload_fields"]
+    assert "what_changed" in post_event["required_payload_fields"]
+    assert timeline_contract["close_gate_evidence_still_required"] == [
+        "implementation",
+        "verification",
+        "close_ready",
+    ]
+    assert {
+        "hotfix_pre_reason",
+        "hotfix_post_action_summary",
+        "focused_verification",
+        "close_ready",
+    }.issubset(evidence_ids)
+    assert "bypass_timeline_gate" in template["forbidden_capabilities"]
+
+
+def test_observer_hotfix_direct_mutation_template_resolves_for_pre_mutation_stage():
+    templates = list_contract_templates(
+        task_type="observer_hotfix",
+        stage="pre_mutation",
+    )
+
+    assert [template["template_id"] for template in templates] == [
+        "observer_hotfix_direct_mutation.v1"
+    ]
+
+
 def test_unknown_template_id_raises_explicit_error():
     with pytest.raises(UnknownContractTemplateError):
         get_contract_template("missing.v1")

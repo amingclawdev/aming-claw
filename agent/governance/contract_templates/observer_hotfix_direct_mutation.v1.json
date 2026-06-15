@@ -1,0 +1,130 @@
+{
+  "schema_version": "observer_hotfix_direct_mutation_contract.v1",
+  "template_id": "observer_hotfix_direct_mutation.v1",
+  "version": "v1",
+  "description": "Narrow contract for tiny observer hotfix direct mutations when the governed workflow itself is blocked. It records a pre-mutation reason and a post-mutation action summary without weakening verification or close gates.",
+  "task_types": [
+    "observer_hotfix",
+    "manual_fix",
+    "chain_rescue"
+  ],
+  "stages": [
+    "pre_mutation",
+    "post_implementation",
+    "pre_close_gate"
+  ],
+  "required_instance_fields": [
+    "contract_instance_id",
+    "backlog_id",
+    "allowed_files",
+    "blocked_normal_route_evidence",
+    "planned_verification"
+  ],
+  "applicability": {
+    "allowed_only_for": "tiny_deterministic_direct_mutation_when_governed_flow_is_blocked",
+    "not_for": [
+      "governed_nontrivial_implementation",
+      "runtime_gate_policy_change",
+      "worker_evidence_substitution",
+      "route_token_or_close_gate_bypass",
+      "architecture_rewrite"
+    ],
+    "inherits_policy_from": [
+      "mf_parallel.v1 observer_contract.direct_mutation_exception_policy",
+      "meta_contract.v1 hotfix_profile",
+      "manual-fix-sop R18/R22/R24"
+    ]
+  },
+  "timeline_contract": {
+    "pre_mutation_reason_event": {
+      "event_type": "hotfix.entered",
+      "event_kind": "hotfix_entered",
+      "phase": "pre_mutation_reason",
+      "status_values": [
+        "accepted",
+        "passed",
+        "succeeded"
+      ],
+      "required_payload_fields": [
+        "schema_version",
+        "reason",
+        "blocked_normal_route_evidence",
+        "allowed_files",
+        "dirty_scope_before_mutation",
+        "planned_verification",
+        "forbidden_actions"
+      ],
+      "required_payload_schema_version": "observer_hotfix_pre_reason.v1",
+      "close_satisfying": false,
+      "description": "Append before any file mutation. Explains why the normal governed route is blocked, which exact files may be touched, what verification will run, and which actions remain forbidden."
+    },
+    "post_mutation_action_event": {
+      "event_type": "hotfix.under_action",
+      "event_kind": "hotfix_under_action",
+      "phase": "post_implementation_summary",
+      "status_values": [
+        "accepted",
+        "passed",
+        "succeeded"
+      ],
+      "required_payload_fields": [
+        "schema_version",
+        "pre_reason_event_id",
+        "what_changed",
+        "changed_files",
+        "verification_evidence_refs",
+        "deviations_from_plan",
+        "remaining_close_gate_evidence"
+      ],
+      "required_payload_schema_version": "observer_hotfix_action_summary.v1",
+      "close_satisfying": false,
+      "description": "Append after the tiny mutation and before close. Records what actually changed and links back to the pre-mutation reason. It is audit evidence, not worker-owned implementation evidence."
+    },
+    "close_gate_evidence_still_required": [
+      "implementation",
+      "verification",
+      "close_ready"
+    ],
+    "close_gate_policy": "This contract does not replace the existing MF close gate. If backlog close requires R18 evidence, append implementation, verification, and close_ready timeline events with the normal route-token or waiver evidence."
+  },
+  "evidence_requirements": [
+    {
+      "id": "hotfix_pre_reason",
+      "required": true,
+      "phase": "pre_mutation",
+      "event_kind": "hotfix_entered",
+      "description": "Pre-mutation timeline reason exists before any allowed file changes."
+    },
+    {
+      "id": "hotfix_post_action_summary",
+      "required": true,
+      "phase": "post_implementation",
+      "event_kind": "hotfix_under_action",
+      "description": "Post-mutation timeline summary records what changed and points to verification evidence refs."
+    },
+    {
+      "id": "focused_verification",
+      "required": true,
+      "phase": "verification",
+      "event_kind": "verification",
+      "description": "Focused tests or an explicit no-test decision still must be recorded before close."
+    },
+    {
+      "id": "close_ready",
+      "required": true,
+      "phase": "pre_close_gate",
+      "event_kind": "close_ready",
+      "description": "Close-ready evidence is still required by the normal MF close gate."
+    }
+  ],
+  "forbidden_capabilities": [
+    "author_worker_evidence",
+    "bypass_timeline_gate",
+    "self_clear_judge_blocker",
+    "surrogate_startup",
+    "merge",
+    "push",
+    "release_gates",
+    "close_backlog_without_r18_evidence"
+  ]
+}
