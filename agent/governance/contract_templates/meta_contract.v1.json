@@ -20,6 +20,7 @@
   "worker_evidence_actions": [
     "implementation",
     "mf_subagent_startup",
+    "record_finish_time_worker_attestation",
     "read_receipt",
     "review_ready",
     "worker_progress",
@@ -68,6 +69,7 @@
       "allowed_actions": [
         "read_receipt",
         "mf_subagent_startup",
+        "record_finish_time_worker_attestation",
         "implementation",
         "review_ready",
         "worker_progress",
@@ -87,6 +89,7 @@
       "allowed_actions": [
         "read_receipt",
         "mf_subagent_startup",
+        "record_finish_time_worker_attestation",
         "implementation",
         "review_ready",
         "worker_progress",

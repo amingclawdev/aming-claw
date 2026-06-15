@@ -1022,6 +1022,72 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(gate["role"], "observer")
         self.assertEqual(gate["action"], "observer_work_mode_transition")
 
+    def test_record_event_accepts_finish_time_worker_attestation_action(self):
+        from agent.governance import task_timeline
+        from agent.governance.mf_subagent_contract import MfSubagentContractError
+
+        payload = {
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": "mfrctx-finish-attestation",
+            "task_id": "mfsub-finish-attestation",
+            "parent_task_id": "AC-FINISH-ATTESTATION",
+            "worker_role": "mf_sub",
+            "worker_session_id": "worker-finish-attestation",
+            "filer_principal": "worker-finish-attestation",
+            "finish_time_worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "ok": True,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "worker-finish-attestation",
+                "filer_principal": "worker-finish-attestation",
+                "worker_transcript_path": "/tmp/worker-finish-attestation.jsonl",
+                "harness_type": "codex",
+                "blockers": [],
+            },
+        }
+        recorded = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-FINISH-ATTESTATION",
+            task_id="mfsub-finish-attestation",
+            event_type="mf_subagent.finish_time_worker_attestation",
+            event_kind="worker_progress",
+            phase="finish_time_worker_attestation",
+            actor="worker-finish-attestation",
+            status="passed",
+            payload=payload,
+        )
+
+        gate = recorded["payload"]["meta_contract_gate"]
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["role"], "mf_sub")
+        self.assertEqual(gate["action"], "worker_progress")
+
+        with self.assertRaises(MfSubagentContractError):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="AC-FINISH-ATTESTATION",
+                task_id="mfsub-finish-attestation",
+                event_type="mf_subagent.finish_time_worker_attestation",
+                event_kind="worker_progress",
+                phase="finish_time_worker_attestation",
+                actor="observer",
+                status="passed",
+                payload={
+                    **payload,
+                    "worker_role": "observer",
+                    "on_behalf_of": "worker-finish-attestation",
+                    "self_attesting": True,
+                    "worker_self_attesting": True,
+                },
+            )
+
     def test_timeline_append_accepts_observer_work_mode_transition(self):
         from agent.governance import server
 

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -5766,7 +5766,13 @@ def _runtime_context_service_timeline_refs(
             startup_event = dict(event)
         if not refs.get("read_receipt_event_ref") and is_read_receipt:
             refs["read_receipt_event_ref"] = ref
-        if not refs.get("finish_event_ref") and "finish" in haystack:
+        is_finish_gate = event_kind_normalized in {
+            "finish_gate",
+            "mf_subagent_finish_gate",
+            "review_ready",
+            "checkpoint",
+        }
+        if not refs.get("finish_event_ref") and is_finish_gate:
             refs["finish_event_ref"] = ref
             finish_event = dict(event)
         if (
@@ -5785,7 +5791,11 @@ def _runtime_context_service_timeline_refs(
             refs["verification_event_refs"].append(ref)
         if (
             is_verification
-            or "finish" in haystack
+            or is_finish_gate
+            or (
+                event_kind_normalized == "worker_progress"
+                and "finish_time_worker_attestation" in haystack
+            )
             or event_kind_normalized == "close_ready"
         ):
             timeline_graph_trace_ids.extend(
@@ -6492,6 +6502,53 @@ def _runtime_context_worker_guide_response(
             ],
             "auth": _auth_guide("body.session_token"),
         },
+        "finish_time_worker_attestation": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/task/{project_id}/timeline",
+                "event_kind": "worker_progress",
+                "payload_action": "record_finish_time_worker_attestation",
+            },
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/finish-time-worker-attestation"
+            ),
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/finish-time-worker-attestation"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+                "worker_session_id",
+                "filer_principal",
+                "worker_transcript_path",
+                "harness_type",
+                "graph_trace_ids",
+                "read_receipt_event_id",
+                "test_results",
+            ],
+            "server_derived_fields": [
+                "route_identity",
+                "head_commit",
+                "changed_files",
+                "graph_trace_db_evidence",
+                "read_receipt_lineage",
+            ],
+            "finish_gate_submission": {
+                "field": "finish_time_worker_self_attestation",
+                "description": (
+                    "Use the attestation object returned by this facade in the "
+                    "runtime-context finish-gate request when requested."
+                ),
+            },
+            "auth": _auth_guide("body.session_token"),
+        },
         "finish_gate": {
             "legacy_bridge": {
                 "method": "POST",
@@ -7191,6 +7248,105 @@ def _runtime_context_gate_identity_mismatches(
     return mismatched
 
 
+def _runtime_context_public_finish_attestation(
+    attestation: Mapping[str, Any],
+) -> dict[str, Any]:
+    allowed = {
+        "schema_version",
+        "attestation_phase",
+        "status",
+        "ok",
+        "worker_self_attesting",
+        "self_attesting",
+        "finish_time_self_attesting",
+        "finish_time_blockers",
+        "worker_session_id",
+        "filer_principal",
+        "worker_transcript_path",
+        "resolved_transcript_path",
+        "harness_type",
+        "blockers",
+        "known_bad_playback_4178",
+    }
+    return {key: attestation.get(key) for key in allowed if key in attestation}
+
+
+def _runtime_context_test_results_passed(value: Any) -> bool:
+    if not isinstance(value, Mapping) or not value:
+        return False
+    status = str(value.get("status") or "").strip().lower()
+    return bool(value.get("passed")) or status in {
+        "pass",
+        "passed",
+        "ok",
+        "succeeded",
+        "success",
+        "clean",
+    }
+
+
+def _runtime_context_same_string_set(left: Any, right: Any) -> bool:
+    return set(_runtime_context_service_query_values({"value": left}, "value")) == set(
+        _runtime_context_service_query_values({"value": right}, "value")
+    )
+
+
+def _runtime_context_latest_finish_attestation(
+    conn,
+    *,
+    project_id: str,
+    context,
+    runtime_context_id: str,
+    parent_task_id: str,
+    head_commit: str = "",
+    changed_files: Sequence[str] | None = None,
+    test_results: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    from . import task_timeline
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+        event_kind="worker_progress",
+        limit=200,
+    )
+    expected_head = str(head_commit or "").strip()
+    expected_changed = list(changed_files or [])
+    expected_tests = dict(test_results or {})
+    for event in reversed(events):
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        if payload.get("action") != "record_finish_time_worker_attestation":
+            continue
+        if str(payload.get("runtime_context_id") or "") != runtime_context_id:
+            continue
+        if str(payload.get("task_id") or "") != str(getattr(context, "task_id", "") or ""):
+            continue
+        if parent_task_id and str(payload.get("parent_task_id") or "") != parent_task_id:
+            continue
+        if expected_head and str(payload.get("head_commit") or "").strip() != expected_head:
+            continue
+        if expected_changed and not _runtime_context_same_string_set(
+            payload.get("changed_files"),
+            expected_changed,
+        ):
+            continue
+        if expected_tests:
+            candidate_tests = (
+                payload.get("test_results")
+                if isinstance(payload.get("test_results"), Mapping)
+                else {}
+            )
+            if dict(candidate_tests) != expected_tests:
+                continue
+        attestation = payload.get("finish_time_worker_self_attestation")
+        if isinstance(attestation, Mapping):
+            return dict(attestation)
+    return {}
+
+
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
 def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext):
     """Return a role-scoped runtime/contract view for one bounded worker lane."""
@@ -7581,6 +7737,292 @@ def handle_graph_governance_runtime_context_checkpoint(ctx: RequestContext):
     )
 
 
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/finish-time-worker-attestation")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/finish-time-worker-attestation")
+def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: RequestContext):
+    """Record public-safe finish-time worker self-attestation evidence."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.finish-time-worker-attestation",
+            allow_validated=True,
+        )
+        route_identity = _runtime_context_latest_route_identity(conn, context)
+        parent_task_id = (
+            str(body.get("parent_task_id") or "").strip()
+            or _runtime_context_mf_sub_parent_task_id(context)
+        )
+        supplied_route = {
+            field: str(body.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(body.get(field) or "").strip()
+        }
+        supplied_nested = (
+            body.get("route_identity")
+            if isinstance(body.get("route_identity"), Mapping)
+            else {}
+        )
+        if supplied_nested:
+            supplied_route["route_identity"] = supplied_nested
+        route_mismatches = _runtime_context_gate_identity_mismatches(
+            supplied_route,
+            route_identity,
+            expected_scope={
+                "project_id": project_id,
+                "backlog_id": context.backlog_id,
+                "task_id": context.task_id,
+            },
+        )
+        if route_mismatches:
+            raise GovernanceError(
+                "route_identity_mismatch",
+                (
+                    "runtime-context finish-time worker attestation route identity "
+                    "conflicts with server-derived route identity"
+                ),
+                422,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "mismatched_fields": route_mismatches,
+                    "source": "runtime_context_latest_route_identity",
+                },
+            )
+
+        from . import batch_jobs, task_timeline
+        from .worker_transcript_verify import verify_worker_transcript
+
+        worktree_path = str(context.worktree_path or "")
+        actual_head = ""
+        if worktree_path and os.path.exists(worktree_path):
+            try:
+                actual_head = batch_jobs.git_commit(worktree_path)
+            except batch_jobs.BatchJobError:
+                actual_head = ""
+        head_commit = actual_head or str(body.get("head_commit") or context.head_commit or "")
+        changed_files: list[str] = []
+        if worktree_path and os.path.exists(worktree_path) and context.base_commit:
+            try:
+                changed_files = batch_jobs.git_changed_files(
+                    worktree_path,
+                    base_ref=context.base_commit,
+                    head_ref=head_commit or "HEAD",
+                )
+            except batch_jobs.BatchJobError:
+                changed_files = []
+        claimed_changed = _runtime_context_service_query_values(
+            body,
+            "changed_files",
+            "owned_changed_files",
+            "worker_changed_files",
+        )
+        if claimed_changed and set(claimed_changed) != set(changed_files):
+            raise ValidationError("changed_files do not match assigned worktree diff")
+        test_results = (
+            body.get("test_results") if isinstance(body.get("test_results"), Mapping) else {}
+        )
+        if not _runtime_context_test_results_passed(test_results):
+            raise ValidationError(
+                "finish-time worker attestation requires non-empty passed test_results"
+            )
+
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+        )
+        timeline_refs, _startup_gate, _finish_gate, _close_evidence = (
+            _runtime_context_service_timeline_refs(
+                conn,
+                project_id=project_id,
+                task_id=context.task_id,
+                backlog_id=context.backlog_id,
+                timeline_events=timeline_events,
+            )
+        )
+        read_receipt_event_id = str(
+            body.get("read_receipt_event_id")
+            or body.get("read_receipt_timeline_id")
+            or timeline_refs.get("read_receipt_event_ref")
+            or ""
+        ).strip()
+        if read_receipt_event_id.startswith("timeline:"):
+            read_receipt_event_id = read_receipt_event_id.split(":", 1)[1]
+        read_receipt_hash = str(body.get("read_receipt_hash") or "").strip()
+        if not read_receipt_hash:
+            for event in timeline_events:
+                payload = (
+                    event.get("payload")
+                    if isinstance(event, Mapping) and isinstance(event.get("payload"), Mapping)
+                    else {}
+                )
+                if str(payload.get("runtime_context_id") or "") != runtime_context_id:
+                    continue
+                read_receipt_hash = str(payload.get("read_receipt_hash") or "").strip()
+                if read_receipt_hash:
+                    break
+        if not read_receipt_event_id or not read_receipt_hash:
+            raise ValidationError(
+                "finish-time worker attestation requires read_receipt_hash and "
+                "read_receipt_event_id lineage"
+            )
+
+        graph_trace_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                body,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "trace_ids",
+                "graph_trace_id",
+                "graph_query_trace_id",
+            )
+        )
+        if not graph_trace_ids:
+            raise ValidationError(
+                "finish-time worker attestation requires explicit graph trace ids"
+            )
+        graph_trace_db_evidence = _runtime_context_service_graph_trace_refs(
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=context.backlog_id,
+            fence_token=_runtime_context_request_value(ctx, "fence_token"),
+            explicit_trace_ids=graph_trace_ids,
+        )
+        if not graph_trace_db_evidence.get("db_verified"):
+            raise ValidationError(
+                "finish-time worker attestation requires verified mf_sub graph trace ids"
+            )
+
+        worker_session_id = str(body.get("worker_session_id") or "").strip()
+        filer_principal = str(body.get("filer_principal") or body.get("actor") or "").strip()
+        if not worker_session_id:
+            raise ValidationError("worker_session_id is required")
+        if filer_principal != worker_session_id:
+            raise ValidationError("filer_principal must match worker_session_id")
+        if str(body.get("filed_on_behalf_by") or body.get("on_behalf_of") or "").strip():
+            raise ValidationError("finish-time worker attestation cannot be filed on behalf")
+        if bool(body.get("filed_on_behalf") or body.get("on_behalf")):
+            raise ValidationError("finish-time worker attestation cannot be filed on behalf")
+        if str(
+            body.get("attestation_phase")
+            or body.get("worker_attestation_phase")
+            or ""
+        ).strip().lower() == "startup":
+            raise ValidationError(
+                "finish-time worker attestation cannot use startup attestation_phase"
+            )
+
+        attestation_payload = {
+            **body,
+            "attestation_phase": "finish",
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": context.backlog_id,
+            "worker_role": "mf_sub",
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "worker_session_id": worker_session_id,
+            "filer_principal": filer_principal,
+            "actor": filer_principal,
+            "fence_token": _runtime_context_request_value(ctx, "fence_token"),
+            "worktree_path": worktree_path,
+            "actual_cwd": str(body.get("actual_cwd") or worktree_path),
+            "actual_git_root": str(body.get("actual_git_root") or worktree_path),
+            "branch_ref": context.branch_ref,
+            "branch": context.branch_ref,
+            "base_commit": context.base_commit,
+            "target_head_commit": context.target_head_commit,
+            "head_commit": head_commit,
+            "changed_files": changed_files,
+            "owned_files": list(body.get("owned_files") or changed_files),
+            "observer_command_id": str(body.get("observer_command_id") or ""),
+            "read_receipt_hash": read_receipt_hash,
+            "read_receipt_event_id": read_receipt_event_id,
+            "route_token_ref": route_identity.get("route_token_ref") or "",
+            "graph_trace_ids": graph_trace_ids,
+            "graph_trace_db_evidence": graph_trace_db_evidence,
+            "test_results": test_results,
+        }
+        attestation = verify_worker_transcript(attestation_payload)
+        if not attestation.get("ok"):
+            raise ValidationError(
+                "finish-time worker attestation blocked: "
+                + ", ".join(str(item) for item in attestation.get("blockers") or [])
+            )
+        public_attestation = _runtime_context_public_finish_attestation(attestation)
+        public_attestation["filer_principal"] = filer_principal
+
+        payload = {
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": context.backlog_id,
+            "worker_role": "mf_sub",
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "worker_session_id": worker_session_id,
+            "filer_principal": filer_principal,
+            "route_id": route_identity.get("route_id") or "",
+            "route_context_hash": route_identity.get("route_context_hash") or "",
+            "prompt_contract_id": route_identity.get("prompt_contract_id") or "",
+            "prompt_contract_hash": route_identity.get("prompt_contract_hash") or "",
+            "route_token_ref": route_identity.get("route_token_ref") or "",
+            "visible_injection_manifest_hash": route_identity.get(
+                "visible_injection_manifest_hash"
+            )
+            or "",
+            "head_commit": head_commit,
+            "changed_files": changed_files,
+            "graph_trace_ids": graph_trace_db_evidence.get("verified_trace_ids") or [],
+            "read_receipt_hash": read_receipt_hash,
+            "read_receipt_event_id": read_receipt_event_id,
+            "test_results": test_results,
+            "finish_time_worker_self_attestation": public_attestation,
+        }
+        event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+            attempt_num=int(body.get("attempt_num") or 0),
+            event_type="mf_subagent.finish_time_worker_attestation",
+            event_kind="worker_progress",
+            phase="finish_time_worker_attestation",
+            status="passed",
+            actor=filer_principal,
+            payload=payload,
+            commit_sha=head_commit,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    response = _runtime_context_write_response(
+        action="record_finish_time_worker_attestation",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint="/api/task/{project_id}/timeline",
+        result={"ok": True},
+        event=event,
+        gate=event.get("meta_contract_gate") if isinstance(event, Mapping) else None,
+    )
+    response["finish_time_worker_self_attestation"] = public_attestation
+    response["finish_gate_submission"] = {
+        "finish_time_worker_self_attestation": public_attestation,
+    }
+    return response
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/finish-gate")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/finish-gate")
 def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
@@ -7595,6 +8037,47 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
             action="graph-governance.runtime-context.finish-gate",
             allow_validated=True,
         )
+        parent_task_id = (
+            str(body.get("parent_task_id") or "").strip()
+            or _runtime_context_mf_sub_parent_task_id(context)
+        )
+        from . import batch_jobs
+
+        worktree_path = str(context.worktree_path or "")
+        expected_head_commit = str(body.get("head_commit") or context.head_commit or "").strip()
+        if worktree_path and os.path.exists(worktree_path):
+            try:
+                expected_head_commit = batch_jobs.git_commit(worktree_path)
+            except batch_jobs.BatchJobError:
+                pass
+        expected_changed_files = _runtime_context_service_query_values(
+            body,
+            "changed_files",
+            "owned_changed_files",
+            "worker_changed_files",
+        )
+        if worktree_path and os.path.exists(worktree_path) and context.base_commit:
+            try:
+                expected_changed_files = batch_jobs.git_changed_files(
+                    worktree_path,
+                    base_ref=context.base_commit,
+                    head_ref=expected_head_commit or "HEAD",
+                )
+            except batch_jobs.BatchJobError:
+                pass
+        expected_test_results = (
+            body.get("test_results") if isinstance(body.get("test_results"), Mapping) else {}
+        )
+        recorded_attestation = _runtime_context_latest_finish_attestation(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=parent_task_id,
+            head_commit=expected_head_commit,
+            changed_files=expected_changed_files,
+            test_results=expected_test_results,
+        )
     finally:
         conn.close()
 
@@ -7604,16 +8087,24 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
         "task_id": context.task_id,
         "runtime_context_id": runtime_context_id,
         "backlog_id": context.backlog_id,
-        "parent_task_id": (
-            str(body.get("parent_task_id") or "").strip()
-            or _runtime_context_mf_sub_parent_task_id(context)
-        ),
+        "parent_task_id": parent_task_id,
         "fence_token": _runtime_context_request_value(ctx, "fence_token"),
         "branch_ref": context.branch_ref,
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
     }
+    evidence = finish_body.get("evidence") if isinstance(finish_body.get("evidence"), Mapping) else {}
+    if (
+        recorded_attestation
+        and not isinstance(finish_body.get("finish_time_worker_self_attestation"), Mapping)
+        and not isinstance(finish_body.get("worker_self_attestation"), Mapping)
+        and not isinstance(finish_body.get("finish_attestation"), Mapping)
+        and not isinstance(evidence.get("finish_time_worker_self_attestation"), Mapping)
+        and not isinstance(evidence.get("worker_self_attestation"), Mapping)
+        and not isinstance(evidence.get("finish_attestation"), Mapping)
+    ):
+        finish_body["finish_time_worker_self_attestation"] = recorded_attestation
     result = handle_graph_governance_parallel_branch_finish_gate(
         _runtime_context_forward_request(ctx, body=finish_body)
     )

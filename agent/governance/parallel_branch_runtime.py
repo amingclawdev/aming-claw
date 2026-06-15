@@ -2478,6 +2478,19 @@ def _runtime_context_timeline_derived_evidence(
             and event_ref
         ):
             verification_refs.append(event_ref)
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        if (
+            event_kind == "worker_progress"
+            and payload.get("action") == "record_finish_time_worker_attestation"
+            and not finish_gate
+        ):
+            finish_gate = {
+                "payload": public_contract_revision_payload(payload),
+                "worker_self_attestation": public_contract_revision_payload(
+                    payload.get("finish_time_worker_self_attestation") or {}
+                ),
+                "attestation_event_id": event_ref,
+            }
         if event_kind in {
             "finish_gate",
             "mf_subagent_finish_gate",
@@ -2485,15 +2498,14 @@ def _runtime_context_timeline_derived_evidence(
             "checkpoint",
         }:
             timeline_refs.setdefault("finish_event_ref", event_ref)
-            if not finish_gate:
-                finish_gate = {
-                    "event_id": event_ref,
-                    "source_ref": event_ref,
-                    "checkpoint_id": _runtime_context_deep_text(event, "checkpoint_id"),
-                    "payload": public_contract_revision_payload(
-                        event.get("payload") or {}
-                    ),
-                }
+            finish_gate = {
+                "event_id": event_ref,
+                "source_ref": event_ref,
+                "checkpoint_id": _runtime_context_deep_text(event, "checkpoint_id"),
+                "payload": public_contract_revision_payload(
+                    event.get("payload") or {}
+                ),
+            }
         if event_kind in {"close_ready", "close_request", "finish_request"}:
             timeline_refs.setdefault("close_ready_event_ref", event_ref)
             if not close_evidence:

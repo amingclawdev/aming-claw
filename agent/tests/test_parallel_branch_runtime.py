@@ -1524,6 +1524,62 @@ def test_runtime_context_current_values_prefer_finish_time_worker_attestation() 
     assert "finish_time_worker_attestation" not in next_required_ids
 
 
+def test_runtime_context_worker_guide_repairs_next_action_after_finish_attestation() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        startup_gate={
+            "worker_self_attesting": False,
+            "worker_self_attestation": {
+                "status": "blocked",
+                "worker_self_attesting": False,
+                "blockers": ["missing_finish_time_worker_self_attestation"],
+            },
+        },
+        finish_gate={
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "session-runtime-context",
+                "filer_principal": "session-runtime-context",
+                "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "harness_type": "codex",
+            },
+            "attestation_event_id": "timeline:finish-attestation-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        generated_at=NOW,
+    ).to_dict()
+
+    current_values = projection["views"]["current"]["current_values"]
+    worker_view = projection["views"]["worker_view"]
+    next_required = worker_view["next_required_evidence"]
+    next_required_ids = [item["id"] for item in next_required]
+
+    assert current_values["worker_self_attesting"] is True
+    assert current_values["finish_gate_ref"] == ""
+    assert "finish_time_worker_attestation" not in next_required_ids
+    assert "finish_gate" in next_required_ids
+    assert worker_view["control_plane"]["next_legal_action"] == "record_finish_gate"
+
+
 def test_runtime_context_action_plan_links_audit_archive_for_historical_close_blocker() -> None:
     context = _runtime_projection_context()
     projection = build_runtime_context_projection(
