@@ -1221,6 +1221,69 @@ class TestTaskTimeline(unittest.TestCase):
             "route_action_precheck",
         )
 
+    def test_root_route_context_uses_backlog_row_close_context_for_route_requirements(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-CLOSE-CONTEXT-ROUTE-REQUIRED"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, target_files, test_files,
+                acceptance_criteria, chain_trigger_json, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P0', ?, ?, ?, ?, '2026-06-15T00:00:00Z',
+                       '2026-06-15T00:00:00Z')""",
+            (
+                bug_id,
+                "Runtime context facade projection test",
+                json.dumps(["agent/governance/server.py"]),
+                json.dumps(["agent/tests/test_graph_governance_api.py"]),
+                json.dumps(["Root context must match close-gate route requirements."]),
+                json.dumps(
+                    {
+                        "schema_version": "runtime_context_facade_plan.v1",
+                        "intent": "centralize runtime context happy path",
+                    }
+                ),
+            ),
+        )
+        self.conn.commit()
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        )
+
+        self.assertEqual(
+            result["work_mode"],
+            observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        )
+        self.assertEqual(
+            result["work_mode_projection"]["source"],
+            "blocked_missing_transition_prerequisites",
+        )
+        self.assertTrue(result["route_context_gate"]["required"])
+        self.assertFalse(result["route_context_gate"]["passed"])
+        self.assertIn(
+            "route_context",
+            result["route_context_gate"]["missing_requirement_ids"],
+        )
+        self.assertIn(
+            "bounded_implementation_worker_dispatch",
+            result["route_context_gate"]["missing_requirement_ids"],
+        )
+        self.assertFalse(
+            result["close_gate_projection"]["checks"]["has_route_context_consumption"]
+        )
+        self.assertIn(
+            "route_context",
+            result["next_legal_action"]["missing_prerequisites"],
+        )
+        self.assertIn(
+            "route_action_precheck",
+            result["next_legal_action"]["missing_prerequisites"],
+        )
+
     def test_root_route_context_restores_identity_from_service_route_source_evidence(self):
         from agent.governance import observer_session, server
 

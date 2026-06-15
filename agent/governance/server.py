@@ -22761,6 +22761,7 @@ def _observer_root_route_context_state(
         contract = backlog_runtime.parse_json_object(
             _row_get(row, "chain_trigger_json", "{}")
         )
+        contract = _mf_close_contract_with_route_context(contract, row, {})
     events = task_timeline.list_events(
         conn, project_id, backlog_id=backlog_id, limit=1000
     )
