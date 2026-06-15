@@ -6345,7 +6345,11 @@ def _runtime_context_worker_guide_response(
                 "path": "/api/task/{project_id}/timeline",
                 "event_kind": "mf_subagent_read_receipt",
             },
-            "canonical_facade_status": "planned",
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/read-receipts"
+            ),
             "planned_path": (
                 "/api/graph-governance/{project_id}/runtime-contexts/"
                 "{runtime_context_id}/read-receipts"
@@ -6362,7 +6366,11 @@ def _runtime_context_worker_guide_response(
                 "method": "POST",
                 "path": "/api/graph-governance/{project_id}/parallel-branches/startup",
             },
-            "canonical_facade_status": "planned",
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/startup"
+            ),
             "planned_path": (
                 "/api/graph-governance/{project_id}/runtime-contexts/"
                 "{runtime_context_id}/startup"
@@ -6381,7 +6389,11 @@ def _runtime_context_worker_guide_response(
                 "method": "POST",
                 "path": "/api/graph-governance/{project_id}/parallel-branches/checkpoint",
             },
-            "canonical_facade_status": "planned",
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/checkpoints"
+            ),
             "planned_path": (
                 "/api/graph-governance/{project_id}/runtime-contexts/"
                 "{runtime_context_id}/checkpoints"
@@ -6398,7 +6410,11 @@ def _runtime_context_worker_guide_response(
                 "method": "POST",
                 "path": "/api/graph-governance/{project_id}/parallel-branches/finish-gate",
             },
-            "canonical_facade_status": "planned",
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/finish-gate"
+            ),
             "planned_path": (
                 "/api/graph-governance/{project_id}/runtime-contexts/"
                 "{runtime_context_id}/finish-gate"
@@ -6540,6 +6556,297 @@ def _runtime_context_worker_guide_response(
             "raw_route_token_exposed": False,
             "raw_fence_token_exposed": False,
             "worker_evidence_substitution_allowed": False,
+        },
+    }
+
+
+def _runtime_context_mf_sub_parent_task_id(context) -> str:
+    return str(
+        getattr(context, "root_task_id", "")
+        or getattr(context, "chain_id", "")
+        or getattr(context, "stage_task_id", "")
+        or getattr(context, "backlog_id", "")
+        or getattr(context, "task_id", "")
+        or ""
+    )
+
+
+def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    query = ctx.query if isinstance(ctx.query, Mapping) else {}
+    return str(body.get(key) or query.get(key) or "").strip()
+
+
+def _runtime_context_mf_sub_write_context(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str,
+):
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        runtime_context_id_for_branch_context,
+        validate_mf_subagent_runtime_context_lookup,
+    )
+    from .permissions import session_role
+
+    project_id = ctx.get_project_id()
+    runtime_context_id = str(
+        ctx.path_params.get("runtime_context_id")
+        or _runtime_context_request_value(ctx, "runtime_context_id")
+        or ""
+    ).strip()
+    if not runtime_context_id:
+        raise ValidationError("runtime_context_id is required")
+    session = _require_graph_governance_mf_subagent(
+        ctx,
+        conn,
+        action,
+    )
+    role = session_role(session)
+    if role != "mf_sub":
+        raise GovernanceError(
+            "mf_subagent_required",
+            "runtime-context worker evidence write requires an mf_sub session",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "role": role,
+                "action": action,
+            },
+        )
+    fence_token = _runtime_context_request_value(ctx, "fence_token")
+    if not fence_token:
+        raise ValidationError("fence_token is required for mf_sub runtime context write")
+    try:
+        context = validate_mf_subagent_runtime_context_lookup(
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=_runtime_context_request_value(ctx, "parent_task_id"),
+            worker_role="mf_sub",
+            fence_token=fence_token,
+            governance_project_id=(
+                _runtime_context_request_value(ctx, "governance_project_id")
+                or _runtime_context_request_value(ctx, "backlog_project_id")
+                or project_id
+            ),
+            target_project_id=(
+                _runtime_context_request_value(ctx, "target_project_id")
+                or _runtime_context_request_value(ctx, "graph_project_id")
+                or project_id
+            ),
+            target_project_root=(
+                _runtime_context_request_value(ctx, "target_project_root")
+                or _runtime_context_request_value(ctx, "target_graph_root")
+            ),
+            session_token=_runtime_context_request_value(ctx, "session_token"),
+        )
+    except BranchRuntimeFenceError as exc:
+        raise GovernanceError(
+            "fence_invalidated_or_unknown",
+            "mf_subagent runtime context fence is invalidated or unknown",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "governance_project_id": (
+                    _runtime_context_request_value(ctx, "governance_project_id")
+                    or _runtime_context_request_value(ctx, "backlog_project_id")
+                    or project_id
+                ),
+                "target_project_id": (
+                    _runtime_context_request_value(ctx, "target_project_id")
+                    or _runtime_context_request_value(ctx, "graph_project_id")
+                    or project_id
+                ),
+                "reason": "fence_invalidated_or_unknown",
+            },
+        ) from exc
+    resolved_runtime_context_id = runtime_context_id_for_branch_context(context)
+    if resolved_runtime_context_id != runtime_context_id:
+        raise ValidationError("runtime_context_id does not match task runtime context")
+    return context, runtime_context_id, session
+
+
+def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
+    from .parallel_branch_runtime import (
+        get_latest_branch_contract_revision,
+        runtime_context_id_for_branch_context,
+    )
+
+    revision = get_latest_branch_contract_revision(
+        conn,
+        getattr(context, "project_id", ""),
+        runtime_context_id_for_branch_context(context),
+    )
+    route_identity = (
+        revision.route_identity
+        if revision is not None and isinstance(revision.route_identity, Mapping)
+        else {}
+    )
+    return dict(route_identity)
+
+
+def _runtime_context_forward_request(
+    ctx: RequestContext,
+    *,
+    body: Mapping[str, Any],
+) -> RequestContext:
+    forward = RequestContext(
+        ctx.handler,
+        "POST",
+        {"project_id": ctx.get_project_id()},
+        dict(ctx.query or {}),
+        dict(body),
+        ctx.request_id,
+        ctx.token,
+        ctx.idem_key,
+    )
+    forward._session = ctx._session
+    return forward
+
+
+def _runtime_context_public_context_summary(
+    value: Mapping[str, Any] | Any,
+    *,
+    fallback_context=None,
+) -> dict[str, Any]:
+    from .parallel_branch_runtime import (
+        runtime_context_id_for_branch_context,
+        runtime_context_secret_hash,
+    )
+
+    source = value if isinstance(value, Mapping) else {}
+    context = fallback_context
+    runtime_context_id = str(source.get("runtime_context_id") or "")
+    if not runtime_context_id and context is not None:
+        runtime_context_id = runtime_context_id_for_branch_context(context)
+    fence_hash = str(source.get("fence_token_hash") or "")
+    if not fence_hash and context is not None and getattr(context, "fence_token", ""):
+        fence_hash = runtime_context_secret_hash(getattr(context, "fence_token", ""))
+    parent_task_id = str(source.get("parent_task_id") or "")
+    if not parent_task_id and context is not None:
+        parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    return {
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(source.get("task_id") or getattr(context, "task_id", "") or ""),
+        "parent_task_id": parent_task_id,
+        "backlog_id": str(
+            source.get("backlog_id") or getattr(context, "backlog_id", "") or ""
+        ),
+        "status": str(source.get("status") or getattr(context, "status", "") or ""),
+        "checkpoint_id": str(
+            source.get("checkpoint_id") or getattr(context, "checkpoint_id", "") or ""
+        ),
+        "replay_source": str(
+            source.get("replay_source") or getattr(context, "replay_source", "") or ""
+        ),
+        "head_commit": str(
+            source.get("head_commit") or getattr(context, "head_commit", "") or ""
+        ),
+        "branch_ref": str(
+            source.get("branch_ref") or getattr(context, "branch_ref", "") or ""
+        ),
+        "worktree_path": str(
+            source.get("worktree_path") or getattr(context, "worktree_path", "") or ""
+        ),
+        "fence_token_hash": fence_hash,
+        "fence_token_redacted": bool(fence_hash),
+    }
+
+
+def _runtime_context_timeline_event_summary(event: Mapping[str, Any] | None) -> dict:
+    if not isinstance(event, Mapping) or not event:
+        return {}
+    event_id = str(event.get("id") or "")
+    return {
+        "id": event_id,
+        "event_ref": f"timeline:{event_id}" if event_id else "",
+        "event_type": str(event.get("event_type") or ""),
+        "event_kind": str(event.get("event_kind") or ""),
+        "phase": str(event.get("phase") or ""),
+        "status": str(event.get("status") or ""),
+        "task_id": str(event.get("task_id") or ""),
+        "backlog_id": str(event.get("backlog_id") or ""),
+        "created_at": str(event.get("created_at") or ""),
+    }
+
+
+def _runtime_context_gate_summary(gate: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(gate, Mapping):
+        return {}
+    allowed_keys = (
+        "schema_version",
+        "gate_kind",
+        "status",
+        "ok",
+        "allowed",
+        "bounded",
+        "started",
+        "startup_complete",
+        "actual_startup_recorded",
+        "close_satisfying",
+        "worker_self_attesting",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "worker_slot_id",
+        "agent_id",
+        "agent_id_match_mode",
+        "session_token_evidence_type",
+        "server_issued_session_token_verified",
+        "checkpoint_id",
+        "merge_queue_ready",
+        "validated_head_commit",
+        "runtime_status",
+        "validated_changed_files",
+        "caller_supplied_real_startup_events_ignored",
+        "caller_supplied_startup_evidence_ignored",
+        "blocker_id",
+        "message",
+        "missing",
+        "blockers",
+    )
+    return {key: gate[key] for key in allowed_keys if key in gate}
+
+
+def _runtime_context_write_response(
+    *,
+    action: str,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+    legacy_endpoint: str,
+    result: Mapping[str, Any] | None = None,
+    event: Mapping[str, Any] | None = None,
+    gate: Mapping[str, Any] | None = None,
+    updated_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = result if isinstance(result, Mapping) else {}
+    event_summary = _runtime_context_timeline_event_summary(event)
+    return {
+        "ok": bool(result.get("ok", True)),
+        "schema_version": "runtime_context.write_facade_response.v1",
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": getattr(context, "task_id", ""),
+        "action": action,
+        "legacy_bridge": {
+            "method": "POST",
+            "path": legacy_endpoint,
+        },
+        "timeline_event": event_summary,
+        "gate": _runtime_context_gate_summary(gate),
+        "context": _runtime_context_public_context_summary(
+            updated_context or {},
+            fallback_context=context,
+        ),
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "raw_session_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "raw_fence_token_exposed": False,
         },
     }
 
@@ -6863,6 +7170,262 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
         state_ctx
     )
     return _runtime_context_worker_guide_response(current_state)
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/read-receipts")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/read-receipts")
+def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
+    """Append an mf_sub read receipt through the runtime-context facade."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.read-receipts",
+        )
+        route_identity = _runtime_context_latest_route_identity(conn, context)
+    finally:
+        conn.close()
+
+    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    payload = dict(payload)
+    parent_task_id = (
+        str(body.get("parent_task_id") or "").strip()
+        or _runtime_context_mf_sub_parent_task_id(context)
+    )
+    for key, value in {
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": _runtime_context_request_value(ctx, "fence_token"),
+        "worker_role": "mf_sub",
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "governance_project_id": context.governance_project_id or project_id,
+        "target_project_id": context.target_project_id or project_id,
+        "target_project_root": context.target_project_root,
+    }.items():
+        if value:
+            payload[key] = value
+    for key in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        if route_identity.get(key):
+            payload[key] = route_identity.get(key)
+    for key in ("read_receipt_hash", "launch_text_hash"):
+        if body.get(key):
+            payload[key] = body.get(key)
+
+    event_body = {
+        "task_id": context.task_id,
+        "backlog_id": context.backlog_id,
+        "event_type": body.get("event_type") or "mf_subagent_read_receipt",
+        "event_kind": body.get("event_kind") or "mf_subagent_read_receipt",
+        "phase": body.get("phase") or "startup_read_receipt",
+        "actor": (
+            body.get("actor")
+            or context.worker_slot_id
+            or context.worker_id
+            or "mf_sub"
+        ),
+        "status": body.get("status") or "ok",
+        "payload": payload,
+        "verification": body.get("verification") or {},
+        "artifact_refs": body.get("artifact_refs") or {},
+        "trace_id": body.get("trace_id") or "",
+        "commit_sha": body.get("commit_sha") or "",
+    }
+    result = handle_task_timeline_append(
+        _runtime_context_forward_request(ctx, body=event_body)
+    )
+    response = _runtime_context_write_response(
+        action="read_receipt",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint="/api/task/{project_id}/timeline",
+        result={"ok": True},
+        event=result,
+    )
+    response["read_receipt"] = {
+        "read_receipt_hash": str(payload.get("read_receipt_hash") or ""),
+        "launch_text_hash": str(payload.get("launch_text_hash") or ""),
+    }
+    return response
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/startup")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/startup")
+def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
+    """Record real mf_sub startup evidence through the runtime-context facade."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.startup",
+        )
+        route_identity = _runtime_context_latest_route_identity(conn, context)
+    finally:
+        conn.close()
+
+    parent_task_id = (
+        str(body.get("parent_task_id") or "").strip()
+        or _runtime_context_mf_sub_parent_task_id(context)
+    )
+    startup_body = {
+        **body,
+        "task_id": context.task_id,
+        "runtime_context_id": runtime_context_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "fence_token": _runtime_context_request_value(ctx, "fence_token"),
+        "session_token": _runtime_context_request_value(ctx, "session_token"),
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "agent_id": body.get("agent_id") or context.agent_id,
+        "allocation_owner": context.allocation_owner or context.agent_id,
+        "branch": context.branch_ref,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "governance_project_id": context.governance_project_id or project_id,
+        "target_project_id": context.target_project_id or project_id,
+        "target_project_root": context.target_project_root,
+    }
+    for key in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        if route_identity.get(key):
+            startup_body.setdefault(key, route_identity.get(key))
+    result = handle_graph_governance_parallel_branch_startup(
+        _runtime_context_forward_request(ctx, body=startup_body)
+    )
+    return _runtime_context_write_response(
+        action="startup",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint=(
+            "/api/graph-governance/{project_id}/parallel-branches/startup"
+        ),
+        result=result,
+        event=result.get("timeline_event_recorded")
+        if isinstance(result, Mapping)
+        else None,
+        gate=result.get("startup_gate") if isinstance(result, Mapping) else None,
+        updated_context=result.get("context") if isinstance(result, Mapping) else None,
+    )
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/checkpoints")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/checkpoints")
+def handle_graph_governance_runtime_context_checkpoint(ctx: RequestContext):
+    """Record an mf_sub checkpoint through the runtime-context facade."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    checkpoint_id = str(body.get("checkpoint_id") or "").strip()
+    if not checkpoint_id:
+        raise ValidationError("checkpoint_id is required")
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import branch_context_to_dict, record_branch_checkpoint
+
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.checkpoints",
+        )
+        with sqlite_write_lock():
+            saved = record_branch_checkpoint(
+                conn,
+                project_id=context.project_id,
+                task_id=context.task_id,
+                checkpoint_id=checkpoint_id,
+                fence_token=_runtime_context_request_value(ctx, "fence_token"),
+                head_commit=str(body.get("head_commit") or "").strip(),
+                replay_source=str(body.get("replay_source") or "checkpoint"),
+                now_iso=str(body.get("now_iso") or ""),
+            )
+            conn.commit()
+        saved_context = branch_context_to_dict(saved)
+    finally:
+        conn.close()
+    return _runtime_context_write_response(
+        action="checkpoint",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint=(
+            "/api/graph-governance/{project_id}/parallel-branches/checkpoint"
+        ),
+        result={"ok": True},
+        updated_context=saved_context,
+    )
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/finish-gate")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/finish-gate")
+def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
+    """Validate an mf_sub finish claim through the runtime-context facade."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.finish-gate",
+        )
+    finally:
+        conn.close()
+
+    finish_body = {
+        **body,
+        "project_id": project_id,
+        "task_id": context.task_id,
+        "runtime_context_id": runtime_context_id,
+        "backlog_id": context.backlog_id,
+        "parent_task_id": (
+            str(body.get("parent_task_id") or "").strip()
+            or _runtime_context_mf_sub_parent_task_id(context)
+        ),
+        "fence_token": _runtime_context_request_value(ctx, "fence_token"),
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+    }
+    result = handle_graph_governance_parallel_branch_finish_gate(
+        _runtime_context_forward_request(ctx, body=finish_body)
+    )
+    return _runtime_context_write_response(
+        action="finish_gate",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint=(
+            "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
+        ),
+        result=result,
+        gate=result.get("gate") if isinstance(result, Mapping) else None,
+        updated_context=result.get("context") if isinstance(result, Mapping) else None,
+    )
 
 
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract/revisions")

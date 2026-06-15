@@ -2564,12 +2564,12 @@ def test_runtime_context_canonical_read_routes_use_runtime_context_facade(conn):
         now_iso="2026-06-15T00:00:00Z",
     )
 
-    def resolve(path: str):
+    def resolve(path: str, method: str = "GET"):
         handler_obj = object.__new__(server.GovernanceHandler)
         handler_obj.path = path
         route_handler, params, _unused = server.GovernanceHandler._find_handler(
             handler_obj,
-            "GET",
+            method,
         )
         assert route_handler is not None
         return route_handler, params
@@ -2613,6 +2613,21 @@ def test_runtime_context_canonical_read_routes_use_runtime_context_facade(conn):
     assert guide["ok"] is True
     assert guide["schema_version"] == "runtime_context.worker_guide_response.v1"
     assert guide["worker_guide"]["runtime_context_id"] == context.runtime_context_id
+
+    write_routes = {
+        "read-receipts": server.handle_graph_governance_runtime_context_read_receipt,
+        "startup": server.handle_graph_governance_runtime_context_startup,
+        "checkpoints": server.handle_graph_governance_runtime_context_checkpoint,
+        "finish-gate": server.handle_graph_governance_runtime_context_finish_gate,
+    }
+    for suffix, expected_handler in write_routes.items():
+        write_handler, write_params = resolve(
+            f"/api/graph-governance/{PID}/runtime-contexts/"
+            f"{context.runtime_context_id}/{suffix}",
+            method="POST",
+        )
+        assert write_handler is expected_handler
+        assert write_params["runtime_context_id"] == context.runtime_context_id
 
 
 def test_runtime_context_current_state_route_role_filters_worker_view(conn):
@@ -2940,29 +2955,206 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     )
     worker_guide = worker_guide_result["worker_guide"]
     assert worker_guide["schema_version"] == "runtime_context.worker_guide.v1"
-    assert worker_guide["next_legal_action"] == "record_finish_gate"
-    assert worker_guide["read_endpoints"]["current_state"]["path"] == (
-        "/api/graph-governance/{project_id}/runtime-contexts/"
-        "{runtime_context_id}/current-state"
+    assert worker_view["action_plan"]["next_legal_action"] == (
+        worker_view["control_plane"]["next_legal_action"]
     )
-    assert worker_guide["read_endpoints"]["graph_query"]["path"] == (
-        "/api/graph-governance/{project_id}/query"
+    assert worker_guide["next_legal_action"] == (
+        worker_view["control_plane"]["next_legal_action"]
     )
-    assert worker_guide["read_endpoints"]["graph_query"]["query_source"] == (
-        "mf_subagent"
+    assert worker_guide["next_required_evidence"] == (
+        worker_view["control_plane"]["next_required_evidence"]
     )
-    assert worker_guide["read_endpoints"]["route_context"]["source_view_path"] == (
-        "runtime_context_service.views.worker_view.route_identity"
+    assert worker_guide["next_required_evidence"] == (
+        worker_view["action_plan"]["next_required_evidence"]
     )
-    assert worker_guide["write_guides"]["startup"]["legacy_bridge"]["path"] == (
-        "/api/graph-governance/{project_id}/parallel-branches/startup"
-    )
-    assert worker_guide["write_guides"]["startup"]["canonical_facade_status"] == (
-        "planned"
-    )
-    assert worker_guide["write_guides"]["finish_gate"]["legacy_bridge"]["path"] == (
-        "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
-    )
+
+    read_endpoints = worker_guide["read_endpoints"]
+    assert set(read_endpoints) == {
+        "current_state",
+        "runtime_contract",
+        "graph_query",
+        "route_context",
+    }
+    read_interface_contracts = {
+        "current_state": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/current-state"
+            ),
+            "facade_status": "available",
+            "required_query_fields_for_mf_sub": {
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+            },
+        },
+        "runtime_contract": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/runtime-contract"
+            ),
+            "facade_status": "available",
+            "required_query_fields_for_mf_sub": {
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+            },
+        },
+        "graph_query": {
+            "method": "POST",
+            "path": "/api/graph-governance/{project_id}/query",
+            "facade_status": "available",
+            "required_body_fields": {"tool", "query_source", "query_purpose"},
+            "required_identity_fields": {
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "fence_token",
+            },
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+        },
+        "route_context": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/current-state"
+            ),
+            "facade_status": "available_via_current_state",
+            "source_view_path": (
+                "runtime_context_service.views.worker_view.route_identity"
+            ),
+            "safe_fields": {
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+            },
+        },
+    }
+    for interface_name, expected in read_interface_contracts.items():
+        interface = read_endpoints[interface_name]
+        assert interface["method"] == expected["method"]
+        assert interface["path"] == expected["path"]
+        assert interface["facade_status"] == expected["facade_status"]
+        for field_name, expected_value in expected.items():
+            if field_name in {"method", "path", "facade_status"}:
+                continue
+            actual_value = interface[field_name]
+            if isinstance(expected_value, set):
+                assert set(actual_value) == expected_value
+            else:
+                assert actual_value == expected_value
+
+    write_guides = worker_guide["write_guides"]
+    assert set(write_guides) == {
+        "read_receipt",
+        "startup",
+        "checkpoint",
+        "finish_gate",
+        "close_ready",
+    }
+    write_guide_contracts = {
+        "read_receipt": {
+            "legacy_method": "POST",
+            "legacy_path": "/api/task/{project_id}/timeline",
+            "canonical_facade_status": "available",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/read-receipts"
+            ),
+            "required_fields": {
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "read_receipt_hash",
+            },
+        },
+        "startup": {
+            "legacy_method": "POST",
+            "legacy_path": (
+                "/api/graph-governance/{project_id}/parallel-branches/startup"
+            ),
+            "canonical_facade_status": "available",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/startup"
+            ),
+            "required_fields": {
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "fence_token",
+                "session_token",
+            },
+        },
+        "checkpoint": {
+            "legacy_method": "POST",
+            "legacy_path": (
+                "/api/graph-governance/{project_id}/parallel-branches/checkpoint"
+            ),
+            "canonical_facade_status": "available",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/checkpoints"
+            ),
+            "required_fields": {
+                "runtime_context_id",
+                "task_id",
+                "checkpoint_id",
+                "evidence_refs",
+            },
+        },
+        "finish_gate": {
+            "legacy_method": "POST",
+            "legacy_path": (
+                "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
+            ),
+            "canonical_facade_status": "available",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/finish-gate"
+            ),
+            "required_fields": {
+                "runtime_context_id",
+                "task_id",
+                "checkpoint_id",
+                "fence_token",
+                "session_token",
+            },
+        },
+        "close_ready": {
+            "legacy_method": "POST",
+            "legacy_path": "/api/task/{project_id}/timeline",
+            "canonical_facade_status": "planned",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/close-ready"
+            ),
+            "required_fields": {
+                "runtime_context_id",
+                "task_id",
+                "verification_evidence_refs",
+                "graph_current_evidence_ref",
+            },
+        },
+    }
+    for guide_name, expected in write_guide_contracts.items():
+        guide = write_guides[guide_name]
+        legacy_bridge = guide["legacy_bridge"]
+        assert legacy_bridge["method"] == expected["legacy_method"]
+        assert legacy_bridge["path"] == expected["legacy_path"]
+        assert guide["canonical_facade_status"] == expected["canonical_facade_status"]
+        if expected["canonical_facade_status"] == "available":
+            assert guide["path"] == expected["planned_path"]
+        assert guide["planned_path"] == expected["planned_path"]
+        assert expected["required_fields"].issubset(set(guide["required_fields"]))
+
     assert worker_guide["graph_query_identity"]["fence_token_hash"] == fence_hash
     assert worker_guide["graph_query_identity"]["fence_token_redacted"] is True
     assert "surrogate_startup" in worker_guide["blocked_actions"]
@@ -3005,6 +3197,312 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert "runtime-current-session" not in worker_audit_row["metadata_json"]
     assert "fence-current" not in worker_audit_row["metadata_json"]
     assert "must-not-leak" not in worker_audit_row["metadata_json"]
+
+
+def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="runtime-context-facade-worker",
+    )
+    worktree = fixture.root
+    branch_name = "codex/runtime-facade-task"
+    branch_ref = f"refs/heads/{branch_name}"
+    changed_path = "agent/governance/server.py"
+    subprocess.run(
+        ["git", "checkout", "-B", branch_name, fixture.main_head],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target_file = worktree / changed_path
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text(
+        "def runtime_facade_marker():\n"
+        "    return 'head-facade'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", changed_path],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "runtime facade worker change"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-facade-task",
+            root_task_id="runtime-facade-parent",
+            backlog_id="AC-RUNTIME-FACADE",
+            worker_id="worker-runtime-facade",
+            worker_slot_id="worker-runtime-facade",
+            actual_host_worker_id="agent-runtime-facade",
+            agent_id="agent-runtime-facade",
+            allocation_owner="agent-runtime-facade",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref=branch_ref,
+            worktree_path=str(worktree),
+            base_commit=fixture.main_head,
+            head_commit=fixture.main_head,
+            target_head_commit=fixture.main_head,
+            snapshot_id="scope-facade",
+            projection_id="semproj-facade",
+            merge_queue_id="mq-facade",
+            fence_token="fence-facade",
+            session_token_hash=mf_subagent_session_token_hash("facade-session"),
+            status="worktree_ready",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-15T11:00:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-facade",
+        contract_version="mf_parallel.v1",
+        payload={
+            "target_files": ["agent/governance/server.py"],
+            "acceptance_criteria": ["runtime context write facade happy path works"],
+        },
+        route_identity={
+            "route_id": "route-facade",
+            "route_context_hash": "sha256:route-facade",
+            "prompt_contract_id": "rprompt-facade",
+            "prompt_contract_hash": "sha256:prompt-facade",
+            "route_token_ref": "rtok-facade",
+            "visible_injection_manifest_hash": "sha256:visible-facade",
+            "route_token": "raw-route-token-facade",
+        },
+        now_iso="2026-06-15T11:01:00Z",
+    )
+    runtime_context_id = context.runtime_context_id
+    graph_trace_id = "gqt-runtime-facade"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id="runtime-facade-parent",
+        snapshot_id="scope-facade",
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        worker_role="mf_sub",
+        fence_token="fence-facade",
+        run_id=_mf_sub_run_id(context.task_id, "fence-facade"),
+    )
+    common_body = {
+        "parent_task_id": "runtime-facade-parent",
+        "fence_token": "fence-facade",
+        "session_token": "facade-session",
+    }
+
+    with pytest.raises(GovernanceError) as observer_exc:
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "observer",
+                method="POST",
+                body={**common_body, "read_receipt_hash": "sha256:read-facade"},
+            )
+        )
+    assert observer_exc.value.code == "mf_subagent_required"
+
+    read_receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                **common_body,
+                "read_receipt_hash": "sha256:read-facade",
+                "payload": {
+                    "runtime_context_id": "stale-runtime-context",
+                    "task_id": "stale-task",
+                    "parent_task_id": "stale-parent",
+                    "fence_token": "stale-fence",
+                    "route_id": "stale-route",
+                    "route_context_hash": "sha256:stale-route",
+                    "prompt_contract_id": "stale-prompt",
+                    "prompt_contract_hash": "sha256:stale-prompt",
+                    "route_token_ref": "stale-route-token-ref",
+                    "visible_injection_manifest_hash": "sha256:stale-visible",
+                    "read_receipt_hash": "sha256:stale-read",
+                },
+            },
+        )
+    )
+    assert read_receipt["ok"] is True
+    assert read_receipt["action"] == "read_receipt"
+    assert read_receipt["timeline_event"]["event_kind"] == (
+        "mf_subagent_read_receipt"
+    )
+    assert read_receipt["read_receipt"]["read_receipt_hash"] == "sha256:read-facade"
+    stored_read_receipt = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (read_receipt["timeline_event"]["id"],),
+    ).fetchone()
+    stored_read_payload = json.loads(stored_read_receipt["payload_json"])
+    assert stored_read_payload["runtime_context_id"] == runtime_context_id
+    assert stored_read_payload["task_id"] == context.task_id
+    assert stored_read_payload["parent_task_id"] == "runtime-facade-parent"
+    assert stored_read_payload["fence_token"] == "fence-facade"
+    assert stored_read_payload["route_id"] == "route-facade"
+    assert stored_read_payload["route_context_hash"] == "sha256:route-facade"
+    assert stored_read_payload["prompt_contract_id"] == "rprompt-facade"
+    assert stored_read_payload["prompt_contract_hash"] == "sha256:prompt-facade"
+    assert stored_read_payload["route_token_ref"] == "rtok-facade"
+    assert stored_read_payload["visible_injection_manifest_hash"] == (
+        "sha256:visible-facade"
+    )
+    assert stored_read_payload["read_receipt_hash"] == "sha256:read-facade"
+
+    transcript_path = tmp_path / "runtime-facade-transcript.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "event": "mf_subagent graph_query startup attestation",
+                "worker_session_id": "worker-session-facade",
+                "task_id": context.task_id,
+                "runtime_context_id": runtime_context_id,
+                "fence_token": "fence-facade",
+                "worktree_path": str(worktree),
+                "branch_ref": branch_ref,
+                "changed_files": [changed_path],
+                "graph_trace_ids": [graph_trace_id],
+                "observer_command_id": "cmd-facade",
+                "read_receipt_hash": "sha256:read-facade",
+                "read_receipt_event_id": read_receipt["timeline_event"]["id"],
+                "route_token_ref": "rtok-facade",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                **common_body,
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "actual_host_worker_id": "agent-runtime-facade",
+                "agent_id": "agent-runtime-facade",
+                "head_commit": head_commit,
+                "owned_files": [changed_path],
+                "observer_command_id": "cmd-facade",
+                "read_receipt_hash": "sha256:read-facade",
+                "read_receipt_event_id": read_receipt["timeline_event"]["id"],
+                "worker_session_id": "worker-session-facade",
+                "worker_transcript_path": str(transcript_path),
+                "harness_type": "codex",
+                "graph_trace_ids": [graph_trace_id],
+            },
+        )
+    )
+    assert startup["ok"] is True
+    assert startup["action"] == "startup"
+    assert startup["timeline_event"]["event_kind"] == "mf_subagent_startup"
+    assert startup["gate"]["actual_startup_recorded"] is True
+    assert startup["gate"]["close_satisfying"] is True
+    assert startup["gate"]["session_token_evidence_type"] == "server_verified"
+    assert startup["context"]["status"] == "running"
+
+    checkpoint = server.handle_graph_governance_runtime_context_checkpoint(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                **common_body,
+                "checkpoint_id": "ckpt-runtime-facade",
+                "head_commit": head_commit,
+                "evidence_refs": ["timeline:test-runtime-facade"],
+            },
+        )
+    )
+    assert checkpoint["ok"] is True
+    assert checkpoint["action"] == "checkpoint"
+    assert checkpoint["context"]["checkpoint_id"] == "ckpt-runtime-facade"
+    assert checkpoint["context"]["replay_source"] == "checkpoint"
+
+    finish = server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                **common_body,
+                "status": "succeeded",
+                "changed_files": [changed_path],
+                "test_results": {
+                    "status": "passed",
+                    "passed": True,
+                    "command": "pytest -q",
+                },
+                "checkpoint_id": "ckpt-runtime-facade-finish",
+                "head_commit": head_commit,
+                "agent_id": "agent-runtime-facade",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "owned_files": [changed_path],
+                "observer_command_id": "cmd-facade",
+                "read_receipt_hash": "sha256:read-facade",
+                "read_receipt_event_id": read_receipt["timeline_event"]["id"],
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-facade",
+                    worktree_path=str(worktree),
+                    branch_ref=branch_ref,
+                    head_commit=head_commit,
+                ),
+            },
+        )
+    )
+    assert finish["ok"] is True
+    assert finish["action"] == "finish_gate"
+    assert finish["gate"]["checkpoint_id"] == "ckpt-runtime-facade-finish"
+    assert finish["gate"]["validated_head_commit"] == head_commit
+    assert finish["context"]["replay_source"] == "mf_sub_finish_gate"
+    assert finish["context"]["status"] == "validated"
+
+    for response in (read_receipt, startup, checkpoint, finish):
+        response_json = json.dumps(response, sort_keys=True)
+        assert "fence-facade" not in response_json
+        assert "facade-session" not in response_json
+        assert "raw-route-token-facade" not in response_json
 
 
 def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_events(conn):
