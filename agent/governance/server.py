@@ -7643,6 +7643,11 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     event_body = {
         "task_id": context.task_id,
         "backlog_id": context.backlog_id,
+        "route_id": route_identity.get("route_id") or "",
+        "route_context_hash": route_identity.get("route_context_hash") or "",
+        "prompt_contract_id": route_identity.get("prompt_contract_id") or "",
+        "prompt_contract_hash": route_identity.get("prompt_contract_hash") or "",
+        "route_token_ref": route_identity.get("route_token_ref") or "",
         "event_type": body.get("event_type") or "mf.implementation",
         "event_kind": body.get("event_kind") or "implementation",
         "phase": body.get("phase") or "implementation",
@@ -7688,30 +7693,11 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                     "source": "runtime_context_latest_route_identity",
                 },
             )
-        event_body["route_waiver"] = {
-            "accepted": True,
-            "waiver_type": "manual_fix",
-            "manual_fix": True,
-            "allowed_action": "task_timeline_append",
-            "project_id": project_id,
-            "backlog_id": context.backlog_id,
-            "task_id": context.task_id,
-            "route_context_hash": route_identity.get("route_context_hash") or "",
-            "prompt_contract_id": route_identity.get("prompt_contract_id") or "",
-            "caller_role": gate.get("caller_role") or "observer",
-            "reason": (
-                "runtime-context facade derived mf_sub worker role from "
-                "validated worker session/finish-gate lineage"
-            ),
-            "timeline_evidence": {
-                "event_id": body.get("finish_gate_event_ref") or "runtime-context",
-            },
-        }
 
     result = handle_task_timeline_append(
         _runtime_context_forward_request(ctx, body=event_body)
     )
-    return _runtime_context_write_response(
+    response = _runtime_context_write_response(
         action="implementation_evidence",
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -7721,6 +7707,9 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         event=result,
         gate=result.get("meta_contract_gate") if isinstance(result, Mapping) else None,
     )
+    if isinstance(result, Mapping) and isinstance(result.get("route_token_gate"), Mapping):
+        response["route_token_gate"] = result.get("route_token_gate")
+    return response
 
 
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract/revisions")

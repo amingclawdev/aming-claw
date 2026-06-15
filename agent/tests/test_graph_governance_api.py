@@ -3556,6 +3556,22 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         ),
         now_iso="2026-06-15T11:00:00Z",
     )
+    from agent.governance import observer_route_context
+
+    issued_route = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-runtime-facade-route-token"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued_route["route_token_ref"],
+        token=issued_route["route_token"],
+    )
     append_branch_contract_revision(
         conn,
         context,
@@ -3566,12 +3582,16 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             "acceptance_criteria": ["runtime context write facade happy path works"],
         },
         route_identity={
-            "route_id": "route-facade",
-            "route_context_hash": "sha256:route-facade",
-            "prompt_contract_id": "rprompt-facade",
-            "prompt_contract_hash": "sha256:prompt-facade",
-            "route_token_ref": "rtok-facade",
-            "visible_injection_manifest_hash": "sha256:visible-facade",
+            "route_id": issued_route["route_id"],
+            "route_context_hash": issued_route["route_context_hash"],
+            "prompt_contract_id": issued_route["prompt_contract_id"],
+            "prompt_contract_hash": issued_route["route_token"][
+                "prompt_contract_hash"
+            ],
+            "route_token_ref": issued_route["route_token_ref"],
+            "visible_injection_manifest_hash": issued_route[
+                "visible_injection_manifest_hash"
+            ],
             "route_token": "raw-route-token-facade",
         },
         now_iso="2026-06-15T11:01:00Z",
@@ -3652,13 +3672,19 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_read_payload["task_id"] == context.task_id
     assert stored_read_payload["parent_task_id"] == "runtime-facade-parent"
     assert stored_read_payload["fence_token"] == "fence-facade"
-    assert stored_read_payload["route_id"] == "route-facade"
-    assert stored_read_payload["route_context_hash"] == "sha256:route-facade"
-    assert stored_read_payload["prompt_contract_id"] == "rprompt-facade"
-    assert stored_read_payload["prompt_contract_hash"] == "sha256:prompt-facade"
-    assert stored_read_payload["route_token_ref"] == "rtok-facade"
+    assert stored_read_payload["route_id"] == issued_route["route_id"]
+    assert stored_read_payload["route_context_hash"] == issued_route[
+        "route_context_hash"
+    ]
+    assert stored_read_payload["prompt_contract_id"] == issued_route[
+        "prompt_contract_id"
+    ]
+    assert stored_read_payload["prompt_contract_hash"] == issued_route["route_token"][
+        "prompt_contract_hash"
+    ]
+    assert stored_read_payload["route_token_ref"] == issued_route["route_token_ref"]
     assert stored_read_payload["visible_injection_manifest_hash"] == (
-        "sha256:visible-facade"
+        issued_route["visible_injection_manifest_hash"]
     )
     assert stored_read_payload["read_receipt_hash"] == "sha256:read-facade"
 
@@ -3678,7 +3704,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                 "observer_command_id": "cmd-facade",
                 "read_receipt_hash": "sha256:read-facade",
                 "read_receipt_event_id": read_receipt["timeline_event"]["id"],
-                "route_token_ref": "rtok-facade",
+                "route_token_ref": issued_route["route_token_ref"],
             },
             sort_keys=True,
         )
@@ -3883,8 +3909,16 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                         "status": "accepted",
                         "action": "task_timeline_append",
                         "decision": "route_token",
-                        "route_token_ref": "rtok-facade",
+                        "route_token_ref": issued_route["route_token_ref"],
                         "caller_role": "observer",
+                        "route_identity": {
+                            "route_context_hash": issued_route[
+                                "route_context_hash"
+                            ],
+                            "prompt_contract_id": issued_route[
+                                "prompt_contract_id"
+                            ],
+                        },
                         "scope": {
                             "project_id": PID,
                             "backlog_id": context.backlog_id,
@@ -3898,6 +3932,12 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert implementation["ok"] is True
     assert implementation["action"] == "implementation_evidence"
     assert implementation["timeline_event"]["event_kind"] == "implementation"
+    assert implementation["route_token_gate"]["decision"] == (
+        "route_token_ref_resolved"
+    )
+    assert implementation["route_token_gate"]["route_token_ref"] == (
+        issued_route["route_token_ref"]
+    )
     stored_implementation = conn.execute(
         "SELECT payload_json FROM task_timeline_events WHERE id = ?",
         (implementation["timeline_event"]["id"],),
