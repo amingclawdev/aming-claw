@@ -6266,6 +6266,28 @@ def _runtime_context_worker_guide_response(
         or action_plan.get("next_legal_action")
         or ""
     )
+    def _auth_guide(location: str) -> dict[str, Any]:
+        return {
+            "primary": "runtime_context_session_token",
+            "runtime_context_session_token": {
+                "accepted_location": location,
+                "required_companion_fields": [
+                    "runtime_context_id",
+                    "parent_task_id",
+                    "fence_token",
+                    "target_project_root",
+                ],
+                "scope": (
+                    "Validated against runtime_context_id, fence_token, "
+                    "parent_task_id, session_token, and target_project_root."
+                ),
+            },
+            "x_gov_token": {
+                "header": "X-Gov-Token",
+                "role_required": "mf_sub",
+                "required": False,
+            },
+        }
 
     read_endpoints = {
         "current_state": {
@@ -6286,6 +6308,7 @@ def _runtime_context_worker_guide_response(
                 "fence_token",
                 "session_token",
             ],
+            "auth": _auth_guide("query.session_token"),
         },
         "runtime_contract": {
             "method": "GET",
@@ -6300,6 +6323,7 @@ def _runtime_context_worker_guide_response(
                 "fence_token",
                 "session_token",
             ],
+            "auth": _auth_guide("query.session_token"),
         },
         "graph_query": {
             "method": "POST",
@@ -6320,6 +6344,7 @@ def _runtime_context_worker_guide_response(
                 or "subagent_context_build"
             ),
             "raw_fence_token_source": "worker launch envelope; never echoed by runtime context",
+            "auth": _auth_guide("body.session_token"),
         },
         "route_context": {
             "method": "GET",
@@ -6336,6 +6361,7 @@ def _runtime_context_worker_guide_response(
                 "prompt_contract_hash",
                 "visible_injection_manifest_hash",
             ],
+            "auth": _auth_guide("query.session_token"),
         },
     }
     write_guides = {
@@ -6358,8 +6384,12 @@ def _runtime_context_worker_guide_response(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
                 "read_receipt_hash",
             ],
+            "auth": _auth_guide("body.session_token"),
         },
         "startup": {
             "legacy_bridge": {
@@ -6382,7 +6412,9 @@ def _runtime_context_worker_guide_response(
                 "worker_role",
                 "fence_token",
                 "session_token",
+                "target_project_root",
             ],
+            "auth": _auth_guide("body.session_token"),
         },
         "checkpoint": {
             "legacy_bridge": {
@@ -6401,9 +6433,14 @@ def _runtime_context_worker_guide_response(
             "required_fields": [
                 "runtime_context_id",
                 "task_id",
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
                 "checkpoint_id",
                 "evidence_refs",
             ],
+            "auth": _auth_guide("body.session_token"),
         },
         "finish_gate": {
             "legacy_bridge": {
@@ -6423,9 +6460,12 @@ def _runtime_context_worker_guide_response(
                 "runtime_context_id",
                 "task_id",
                 "checkpoint_id",
+                "parent_task_id",
                 "fence_token",
                 "session_token",
+                "target_project_root",
             ],
+            "auth": _auth_guide("body.session_token"),
         },
         "close_ready": {
             "legacy_bridge": {
@@ -6444,6 +6484,7 @@ def _runtime_context_worker_guide_response(
                 "verification_evidence_refs",
                 "graph_current_evidence_ref",
             ],
+            "auth": _auth_guide("body.session_token"),
         },
     }
     return {
@@ -6577,48 +6618,76 @@ def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
     return str(body.get(key) or query.get(key) or "").strip()
 
 
-def _runtime_context_mf_sub_write_context(
+def _runtime_context_anonymous_token_free_fallback(
+    ctx: RequestContext,
+    session: Mapping[str, Any],
+) -> bool:
+    return (
+        not ctx.token
+        and str(session.get("session_id") or "") == "anonymous"
+        and str(session.get("principal_id") or "") == "anonymous"
+        and str(session.get("role") or "").strip().lower() == "coordinator"
+    )
+
+
+def _runtime_context_scoped_mf_sub_session(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+) -> dict[str, Any]:
+    principal = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or getattr(context, "agent_id", "")
+        or "mf_sub"
+    )
+    return {
+        "session_id": f"runtime-context:{runtime_context_id}:mf_sub",
+        "principal_id": principal,
+        "project_id": project_id,
+        "role": "mf_sub",
+        "scope": [
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "worker_role": "mf_sub",
+            }
+        ],
+        "token": "",
+        "permissions": ["runtime-context:worker"],
+        "auth_source": "runtime_context_session_token",
+    }
+
+
+def _runtime_context_validate_mf_sub_lookup(
     ctx: RequestContext,
     conn,
     *,
-    action: str,
+    project_id: str,
+    runtime_context_id: str,
+    require_session_token: bool = False,
+    require_target_project_root: bool = False,
 ):
     from .parallel_branch_runtime import (
         BranchRuntimeFenceError,
         runtime_context_id_for_branch_context,
         validate_mf_subagent_runtime_context_lookup,
     )
-    from .permissions import session_role
 
-    project_id = ctx.get_project_id()
-    runtime_context_id = str(
-        ctx.path_params.get("runtime_context_id")
-        or _runtime_context_request_value(ctx, "runtime_context_id")
-        or ""
-    ).strip()
-    if not runtime_context_id:
-        raise ValidationError("runtime_context_id is required")
-    session = _require_graph_governance_mf_subagent(
-        ctx,
-        conn,
-        action,
-    )
-    role = session_role(session)
-    if role != "mf_sub":
-        raise GovernanceError(
-            "mf_subagent_required",
-            "runtime-context worker evidence write requires an mf_sub session",
-            403,
-            {
-                "runtime_context_id": runtime_context_id,
-                "role": role,
-                "action": action,
-            },
-        )
     fence_token = _runtime_context_request_value(ctx, "fence_token")
     if not fence_token:
         raise ValidationError("fence_token is required for mf_sub runtime context write")
+    session_token = _runtime_context_request_value(ctx, "session_token")
+    target_project_root = (
+        _runtime_context_request_value(ctx, "target_project_root")
+        or _runtime_context_request_value(ctx, "target_graph_root")
+    )
     try:
+        if require_session_token and not session_token:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        if require_target_project_root and not target_project_root:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
         context = validate_mf_subagent_runtime_context_lookup(
             conn,
             project_id=project_id,
@@ -6636,11 +6705,8 @@ def _runtime_context_mf_sub_write_context(
                 or _runtime_context_request_value(ctx, "graph_project_id")
                 or project_id
             ),
-            target_project_root=(
-                _runtime_context_request_value(ctx, "target_project_root")
-                or _runtime_context_request_value(ctx, "target_graph_root")
-            ),
-            session_token=_runtime_context_request_value(ctx, "session_token"),
+            target_project_root=target_project_root,
+            session_token=session_token,
         )
     except BranchRuntimeFenceError as exc:
         raise GovernanceError(
@@ -6665,7 +6731,121 @@ def _runtime_context_mf_sub_write_context(
     resolved_runtime_context_id = runtime_context_id_for_branch_context(context)
     if resolved_runtime_context_id != runtime_context_id:
         raise ValidationError("runtime_context_id does not match task runtime context")
-    return context, runtime_context_id, session
+    return context
+
+
+def _runtime_context_mf_sub_read_context(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str,
+    runtime_context_id: str,
+):
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+    from .permissions import session_role
+
+    project_id = ctx.get_project_id()
+    session = _require_graph_governance_mf_subagent(ctx, conn, action)
+    role = session_role(session)
+    if role == "mf_sub":
+        context = _runtime_context_validate_mf_sub_lookup(
+            ctx,
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+        )
+        return context, "mf_sub", session
+    if (
+        _runtime_context_anonymous_token_free_fallback(ctx, session)
+        and _runtime_context_request_value(ctx, "session_token")
+    ):
+        context = _runtime_context_validate_mf_sub_lookup(
+            ctx,
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            require_session_token=True,
+            require_target_project_root=True,
+        )
+        session = _runtime_context_scoped_mf_sub_session(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            context=context,
+        )
+        ctx._session = session
+        return context, "mf_sub", session
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None:
+        raise GovernanceError(
+            "runtime_context_not_found",
+            f"branch runtime context not found: {project_id}/{runtime_context_id}",
+            404,
+            {"runtime_context_id": runtime_context_id},
+        )
+    return context, role, session
+
+
+def _runtime_context_mf_sub_write_context(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str,
+):
+    from .permissions import session_role
+
+    project_id = ctx.get_project_id()
+    runtime_context_id = str(
+        ctx.path_params.get("runtime_context_id")
+        or _runtime_context_request_value(ctx, "runtime_context_id")
+        or ""
+    ).strip()
+    if not runtime_context_id:
+        raise ValidationError("runtime_context_id is required")
+    session = _require_graph_governance_mf_subagent(
+        ctx,
+        conn,
+        action,
+    )
+    role = session_role(session)
+    if role == "mf_sub":
+        context = _runtime_context_validate_mf_sub_lookup(
+            ctx,
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+        )
+        return context, runtime_context_id, session
+    if _runtime_context_anonymous_token_free_fallback(ctx, session):
+        context = _runtime_context_validate_mf_sub_lookup(
+            ctx,
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            require_session_token=True,
+            require_target_project_root=True,
+        )
+        session = _runtime_context_scoped_mf_sub_session(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            context=context,
+        )
+        ctx._session = session
+        return context, runtime_context_id, session
+    else:
+        raise GovernanceError(
+            "mf_subagent_required",
+            "runtime-context worker evidence write requires an mf_sub session",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "role": role,
+                "action": action,
+            },
+        )
 
 
 def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
@@ -6950,12 +7130,6 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
 def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: RequestContext):
     """Return a worker contract view by runtime_context_id plus current fence."""
     project_id = ctx.get_project_id()
-    from .parallel_branch_runtime import (
-        BranchRuntimeFenceError,
-        get_branch_context_by_runtime_context_id,
-        validate_mf_subagent_runtime_context_lookup,
-    )
-    from .permissions import session_role
 
     runtime_context_id = str(
         ctx.path_params.get("runtime_context_id") or ctx.query.get("runtime_context_id") or ""
@@ -6965,74 +7139,12 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
 
     conn = get_connection(project_id)
     try:
-        session = _require_graph_governance_mf_subagent(
+        context, role, session = _runtime_context_mf_sub_read_context(
             ctx,
             conn,
-            "graph-governance.parallel-branches.runtime-contract",
+            action="graph-governance.parallel-branches.runtime-contract",
+            runtime_context_id=runtime_context_id,
         )
-        role = session_role(session)
-        if role == "mf_sub":
-            fence_token = str(ctx.query.get("fence_token") or "").strip()
-            if not fence_token:
-                raise ValidationError("fence_token is required for mf_sub runtime contract query")
-            try:
-                context = validate_mf_subagent_runtime_context_lookup(
-                    conn,
-                    project_id=project_id,
-                    runtime_context_id=runtime_context_id,
-                    parent_task_id=str(ctx.query.get("parent_task_id") or ""),
-                    worker_role="mf_sub",
-                    fence_token=fence_token,
-                    governance_project_id=str(
-                        ctx.query.get("governance_project_id")
-                        or ctx.query.get("backlog_project_id")
-                        or project_id
-                    ),
-                    target_project_id=str(
-                        ctx.query.get("target_project_id")
-                        or ctx.query.get("graph_project_id")
-                        or project_id
-                    ),
-                    target_project_root=str(
-                        ctx.query.get("target_project_root")
-                        or ctx.query.get("target_graph_root")
-                        or ""
-                    ),
-                    session_token=str(ctx.query.get("session_token") or ""),
-                )
-            except BranchRuntimeFenceError as exc:
-                raise GovernanceError(
-                    "fence_invalidated_or_unknown",
-                    "mf_subagent runtime contract fence is invalidated or unknown",
-                    403,
-                    {
-                        "runtime_context_id": runtime_context_id,
-                        "governance_project_id": str(
-                            ctx.query.get("governance_project_id")
-                            or ctx.query.get("backlog_project_id")
-                            or project_id
-                        ),
-                        "target_project_id": str(
-                            ctx.query.get("target_project_id")
-                            or ctx.query.get("graph_project_id")
-                            or project_id
-                        ),
-                        "reason": "fence_invalidated_or_unknown",
-                    },
-                ) from exc
-        else:
-            context = get_branch_context_by_runtime_context_id(
-                conn,
-                project_id,
-                runtime_context_id,
-            )
-            if context is None:
-                raise GovernanceError(
-                    "runtime_context_not_found",
-                    f"branch runtime context not found: {project_id}/{runtime_context_id}",
-                    404,
-                    {"runtime_context_id": runtime_context_id},
-                )
 
         return _parallel_branch_runtime_contract_response(
             ctx,
@@ -7051,12 +7163,6 @@ def handle_graph_governance_parallel_branch_runtime_contract_by_context(ctx: Req
 def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: RequestContext):
     """Return Runtime Context Service current-state or role-filtered worker view."""
     project_id = ctx.get_project_id()
-    from .parallel_branch_runtime import (
-        BranchRuntimeFenceError,
-        get_branch_context_by_runtime_context_id,
-        validate_mf_subagent_runtime_context_lookup,
-    )
-    from .permissions import session_role
 
     runtime_context_id = str(
         ctx.path_params.get("runtime_context_id") or ctx.query.get("runtime_context_id") or ""
@@ -7066,76 +7172,12 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
 
     conn = get_connection(project_id)
     try:
-        session = _require_graph_governance_mf_subagent(
+        context, role, session = _runtime_context_mf_sub_read_context(
             ctx,
             conn,
-            "graph-governance.parallel-branches.runtime-context.current-state",
+            action="graph-governance.parallel-branches.runtime-context.current-state",
+            runtime_context_id=runtime_context_id,
         )
-        role = session_role(session)
-        if role == "mf_sub":
-            fence_token = str(ctx.query.get("fence_token") or "").strip()
-            if not fence_token:
-                raise ValidationError(
-                    "fence_token is required for mf_sub runtime context query"
-                )
-            try:
-                context = validate_mf_subagent_runtime_context_lookup(
-                    conn,
-                    project_id=project_id,
-                    runtime_context_id=runtime_context_id,
-                    parent_task_id=str(ctx.query.get("parent_task_id") or ""),
-                    worker_role="mf_sub",
-                    fence_token=fence_token,
-                    governance_project_id=str(
-                        ctx.query.get("governance_project_id")
-                        or ctx.query.get("backlog_project_id")
-                        or project_id
-                    ),
-                    target_project_id=str(
-                        ctx.query.get("target_project_id")
-                        or ctx.query.get("graph_project_id")
-                        or project_id
-                    ),
-                    target_project_root=str(
-                        ctx.query.get("target_project_root")
-                        or ctx.query.get("target_graph_root")
-                        or ""
-                    ),
-                    session_token=str(ctx.query.get("session_token") or ""),
-                )
-            except BranchRuntimeFenceError as exc:
-                raise GovernanceError(
-                    "fence_invalidated_or_unknown",
-                    "mf_subagent runtime context fence is invalidated or unknown",
-                    403,
-                    {
-                        "runtime_context_id": runtime_context_id,
-                        "governance_project_id": str(
-                            ctx.query.get("governance_project_id")
-                            or ctx.query.get("backlog_project_id")
-                            or project_id
-                        ),
-                        "target_project_id": str(
-                            ctx.query.get("target_project_id")
-                            or ctx.query.get("graph_project_id")
-                            or project_id
-                        ),
-                        "reason": "fence_invalidated_or_unknown",
-                    },
-                ) from exc
-        else:
-            context = get_branch_context_by_runtime_context_id(
-                conn,
-                project_id,
-                runtime_context_id,
-            )
-            if context is None:
-                raise GovernanceError(
-                    "runtime_context_not_found",
-                    f"branch runtime context not found: {project_id}/{runtime_context_id}",
-                    404,
-                    {"runtime_context_id": runtime_context_id},
-                )
 
         return _runtime_context_projection_response(
             ctx,

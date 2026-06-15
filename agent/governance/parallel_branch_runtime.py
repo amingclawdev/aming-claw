@@ -7533,6 +7533,7 @@ def record_mf_subagent_startup(
         "session_token_present": token_evidence["session_token_present"],
         "host_adapter_startup_token_accepted": host_adapter_startup,
         "graph_trace_db_evidence": graph_trace_db_evidence,
+        "attestation_phase": "startup",
     }
     worker_self_attestation = dict(
         verify_worker_transcript(worker_self_attestation_payload)
@@ -7552,11 +7553,16 @@ def record_mf_subagent_startup(
                 "ok": False,
                 "worker_self_attesting": False,
                 "self_attesting": False,
+                "finish_time_self_attesting": False,
                 "blockers": blockers,
+                "finish_time_blockers": blockers,
                 "host_adapter_startup_surrogate_not_close_satisfying": True,
             }
         )
     worker_self_attesting = bool(worker_self_attestation.get("worker_self_attesting"))
+    finish_time_self_attesting = bool(
+        worker_self_attestation.get("finish_time_self_attesting")
+    )
 
     # For first-sight ('hash') startups, persist the server-computed token hash
     # so subsequent startups can be server-verified.  For 'claimed_unverified'
@@ -7599,9 +7605,10 @@ def record_mf_subagent_startup(
         "actual_startup_required": False,
         "same_as_expected_worker": bool(actual_host_worker_id == worker_slot_id),
         "fence_token_matches": True,
-        "close_satisfying": worker_self_attesting,
+        "close_satisfying": bool(worker_self_attesting and finish_time_self_attesting),
         "worker_self_attesting": worker_self_attesting,
         "self_attesting": worker_self_attesting,
+        "finish_time_self_attesting": finish_time_self_attesting,
         "worker_self_attestation_required": True,
         "worker_self_attestation": worker_self_attestation,
         "graph_trace_db_evidence": graph_trace_db_evidence,

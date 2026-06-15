@@ -415,6 +415,11 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         payload.get("worker_transcript_path") or payload.get("transcript_path")
     )
     harness_type = _text(payload.get("harness_type") or payload.get("worker_harness_type")).lower()
+    attestation_phase = _text(
+        payload.get("attestation_phase") or payload.get("worker_attestation_phase")
+    ).lower()
+    if attestation_phase not in {"startup", "finish"}:
+        attestation_phase = "finish"
     layers: list[dict[str, Any]] = []
     required_blockers: list[str] = []
     if not worker_session_id:
@@ -430,6 +435,7 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
             worker_session_id=worker_session_id,
             worker_transcript_path=worker_transcript_path,
             harness_type=harness_type,
+            attestation_phase=attestation_phase,
         )
     )
 
@@ -617,18 +623,31 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     )
 
-    blockers = [
+    all_blockers = [
         blocker
         for layer in layers
         for blocker in layer.get("blockers", [])
     ]
+    if attestation_phase == "startup":
+        blockers = [
+            blocker
+            for layer in layers
+            if layer.get("id") != "owned_files_diff"
+            for blocker in layer.get("blockers", [])
+        ]
+    else:
+        blockers = list(all_blockers)
+    finish_time_blockers = list(all_blockers)
     passed = not blockers
     return {
         "schema_version": WORKER_TRANSCRIPT_ATTESTATION_SCHEMA_VERSION,
+        "attestation_phase": attestation_phase,
         "status": "passed" if passed else "blocked",
         "ok": passed,
         "worker_self_attesting": passed,
         "self_attesting": passed,
+        "finish_time_self_attesting": not finish_time_blockers,
+        "finish_time_blockers": finish_time_blockers,
         "worker_session_id": worker_session_id,
         "worker_transcript_path": worker_transcript_path,
         "resolved_transcript_path": loaded.get("resolved_path", ""),

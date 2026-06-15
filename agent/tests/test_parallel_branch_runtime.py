@@ -2511,13 +2511,14 @@ def test_worker_transcript_mf_sub_startup_marks_missing_transcript_not_self_atte
     )
 
 
-def test_worker_transcript_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_attesting(
+def test_worker_transcript_mf_sub_startup_accepts_identity_before_owned_diff(
     tmp_path,
 ) -> None:
     conn = _runtime_conn()
     worktree = tmp_path / "workers" / "mf-sub-startup-idle"
     worktree.mkdir(parents=True)
     _insert_startup_context(conn, str(worktree))
+    base_commit = _git(worktree, "rev-list", "--max-parents=0", "HEAD")
 
     idle = record_mf_subagent_startup(
         conn,
@@ -2526,12 +2527,30 @@ def test_worker_transcript_mf_sub_startup_marks_idle_or_no_graph_trace_not_self_
         payload=_startup_payload(
             str(worktree),
             changed_files=[],
-            head_commit=_git(worktree, "rev-list", "--max-parents=0", "HEAD"),
+            head_commit=base_commit,
         ),
         now_iso=NOW,
     )
-    assert idle["startup_gate"]["worker_self_attesting"] is False
-    assert "no_owned_files_diff" in idle["startup_gate"]["worker_self_attestation"]["blockers"]
+    idle_gate = idle["startup_gate"]
+    assert idle["ok"] is True
+    assert idle_gate["actual_startup_recorded"] is True
+    assert idle_gate["worker_self_attesting"] is True
+    assert idle_gate["worker_self_attestation"]["status"] == "passed"
+    assert idle_gate["worker_self_attestation"]["attestation_phase"] == "startup"
+    assert idle_gate["worker_self_attestation"]["finish_time_self_attesting"] is False
+    assert "no_owned_files_diff" in idle_gate["worker_self_attestation"][
+        "finish_time_blockers"
+    ]
+    assert idle_gate["close_satisfying"] is False
+
+
+def test_worker_transcript_mf_sub_startup_marks_no_graph_trace_not_self_attesting(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-no-graph"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
 
     no_graph = record_mf_subagent_startup(
         conn,
@@ -2568,11 +2587,14 @@ def test_worker_transcript_forged_strings_missing_db_trace_and_diff_mismatch_rej
     )
 
     blockers = result["startup_gate"]["worker_self_attestation"]["blockers"]
+    finish_blockers = result["startup_gate"]["worker_self_attestation"][
+        "finish_time_blockers"
+    ]
     assert result["ok"] is True
     assert result["startup_gate"]["worker_self_attesting"] is False
     assert any(
         blocker.startswith("claimed_changed_files_do_not_match_git_diff")
-        for blocker in blockers
+        for blocker in finish_blockers
     )
     assert "graph_trace_ids_not_db_verified" in blockers
     assert "graph_trace_missing_from_db:gqt-forged-transcript-only" in blockers
