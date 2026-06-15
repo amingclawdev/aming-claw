@@ -3815,6 +3815,43 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "prompt_contract_id",
     ]
 
+    with pytest.raises(GovernanceError) as nested_identity_exc:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "changed_files": [changed_path],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
+                    "payload": {"worker_role": "mf_sub"},
+                    "route_token_gate": {
+                        "caller_role": "observer",
+                        "route_identity": {
+                            "route_context_hash": "sha256:nested-conflict",
+                            "prompt_contract_id": "nested-conflict",
+                        },
+                        "scope": {
+                            "project_id": PID,
+                            "backlog_id": context.backlog_id,
+                            "task_id": "caller-conflict-task",
+                        },
+                    },
+                },
+            )
+        )
+    assert nested_identity_exc.value.code == "route_identity_mismatch"
+    assert nested_identity_exc.value.details["mismatched_fields"] == [
+        "route_identity.route_context_hash",
+        "route_identity.prompt_contract_id",
+        "scope.task_id",
+    ]
+
     implementation = (
         server.handle_graph_governance_runtime_context_implementation_evidence(
             _ctx_with_role(

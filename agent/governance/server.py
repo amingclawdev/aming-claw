@@ -7106,6 +7106,8 @@ _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS = (
 def _runtime_context_gate_identity_mismatches(
     gate: Mapping[str, Any],
     route_identity: Mapping[str, Any],
+    *,
+    expected_scope: Mapping[str, Any] | None = None,
 ) -> list[str]:
     mismatched: list[str] = []
     for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
@@ -7115,6 +7117,27 @@ def _runtime_context_gate_identity_mismatches(
         derived = str(route_identity.get(field) or "").strip()
         if supplied != derived:
             mismatched.append(field)
+    nested_identity = (
+        gate.get("route_identity")
+        if isinstance(gate.get("route_identity"), Mapping)
+        else {}
+    )
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        supplied = str(nested_identity.get(field) or "").strip()
+        if not supplied:
+            continue
+        derived = str(route_identity.get(field) or "").strip()
+        if supplied != derived:
+            mismatched.append(f"route_identity.{field}")
+    scope = gate.get("scope") if isinstance(gate.get("scope"), Mapping) else {}
+    expected = expected_scope or {}
+    for field in ("project_id", "backlog_id", "task_id"):
+        supplied = str(scope.get(field) or "").strip()
+        if not supplied:
+            continue
+        derived = str(expected.get(field) or "").strip()
+        if supplied != derived:
+            mismatched.append(f"scope.{field}")
     return mismatched
 
 
@@ -7642,7 +7665,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         event_body["route_waiver"] = body.get("route_waiver")
     elif isinstance(body.get("route_token_gate"), Mapping):
         gate = dict(body.get("route_token_gate") or {})
-        mismatched = _runtime_context_gate_identity_mismatches(gate, route_identity)
+        mismatched = _runtime_context_gate_identity_mismatches(
+            gate,
+            route_identity,
+            expected_scope={
+                "project_id": project_id,
+                "backlog_id": context.backlog_id,
+                "task_id": context.task_id,
+            },
+        )
         if mismatched:
             raise GovernanceError(
                 "route_identity_mismatch",
