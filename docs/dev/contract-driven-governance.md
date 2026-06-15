@@ -98,6 +98,24 @@ Legal actions are a white-list; **anything not listed is denied**. The FORBIDDEN
 | IMPLEMENTING | graph_query as mf_sub (own fence), edit only owned subtree, commit with Chain trailers | edit outside granted subtree; merge/push; close; reconcile |
 | REVIEW_READY | submit review_ready with test results | self-merge; self-QA |
 
+Worker implementation evidence append is runtime-context-native. After a
+successful finish gate, an `mf_sub` worker appends implementation evidence with:
+
+```text
+POST /api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/implementation-evidence
+```
+
+The request uses the runtime-context session token in the body with
+`runtime_context_id`, `parent_task_id`, `fence_token`, `session_token`, and
+`target_project_root`. Workers should supply `changed_files`, `tests` (or
+`test_results`), `finish_gate_event_ref`, and optional `summary`/`risk`.
+The server derives `actor`, `task_id`, `worker_id`, `worker_slot_id`,
+`route_identity`, and `payload.worker_role="mf_sub"` from the verified runtime
+context. Workers must omit top-level `role`, `caller_role`, `actor_role`, and
+`lane_role`; those fields are stripped before validation. A nested
+`route_token_gate.caller_role="observer"` is audit metadata only and must not
+override the runtime-context worker role.
+
 ### qa
 | state | legal | forbidden |
 |---|---|---|

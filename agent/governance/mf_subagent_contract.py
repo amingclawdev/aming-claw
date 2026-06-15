@@ -4824,6 +4824,19 @@ def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
     if action in {"service_route", "route_token_gate", "stale_artifact_cleanup"}:
         return "system"
 
+    if action in {
+        "implementation",
+        "mf_subagent_startup",
+        "read_receipt",
+        "review_ready",
+        "worker_progress",
+        "patch",
+    }:
+        for key in ("worker_role", "lane_role", "actor_role", "role", "caller_role"):
+            role = _meta_normalize_role(_meta_first_string(event, (key,)))
+            if role:
+                return role
+
     for key in ("caller_role", "role", "worker_role", "actor_role", "lane_role"):
         role = _meta_normalize_role(_meta_first_string(event, (key,)))
         if role:

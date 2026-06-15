@@ -2619,6 +2619,9 @@ def test_runtime_context_canonical_read_routes_use_runtime_context_facade(conn):
         "startup": server.handle_graph_governance_runtime_context_startup,
         "checkpoints": server.handle_graph_governance_runtime_context_checkpoint,
         "finish-gate": server.handle_graph_governance_runtime_context_finish_gate,
+        "implementation-evidence": (
+            server.handle_graph_governance_runtime_context_implementation_evidence
+        ),
     }
     for suffix, expected_handler in write_routes.items():
         write_handler, write_params = resolve(
@@ -3783,6 +3786,68 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert finish["context"]["replay_source"] == "mf_sub_finish_gate"
     assert finish["context"]["status"] == "validated"
 
+    implementation = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "changed_files": [changed_path],
+                    "tests": [
+                        {
+                            "command": "pytest -q agent/tests/test_graph_governance_api.py",
+                            "status": "passed",
+                        }
+                    ],
+                    "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
+                    "payload": {
+                        "caller_role": "observer",
+                        "role": "observer",
+                        "worker_role": "mf_sub",
+                        "summary": "worker appended implementation evidence",
+                    },
+                    "route_token_gate": {
+                        "schema_version": "route_token_mutation_gate.v1",
+                        "allowed": True,
+                        "status": "accepted",
+                        "action": "task_timeline_append",
+                        "decision": "route_token",
+                        "route_token_ref": "rtok-facade",
+                        "caller_role": "observer",
+                        "scope": {
+                            "project_id": PID,
+                            "backlog_id": context.backlog_id,
+                            "task_id": context.task_id,
+                        },
+                    },
+                },
+            )
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["action"] == "implementation_evidence"
+    assert implementation["timeline_event"]["event_kind"] == "implementation"
+    stored_implementation = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (implementation["timeline_event"]["id"],),
+    ).fetchone()
+    stored_implementation_payload = json.loads(stored_implementation["payload_json"])
+    assert stored_implementation_payload["worker_role"] == "mf_sub"
+    assert "caller_role" not in stored_implementation_payload
+    assert "role" not in stored_implementation_payload
+    assert stored_implementation_payload["route_token_gate"]["caller_role"] == (
+        "observer"
+    )
+    assert stored_implementation_payload["meta_contract_gate"]["role"] == "mf_sub"
+    assert stored_implementation_payload["meta_contract_gate"]["action"] == (
+        "implementation"
+    )
+
     current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
             {
@@ -3815,7 +3880,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert replay_finish["timeline_event"]["event_ref"].startswith("timeline:")
     assert replay_finish["context"]["status"] == "validated"
 
-    for response in (read_receipt, startup, checkpoint, finish):
+    for response in (read_receipt, startup, checkpoint, finish, implementation):
         response_json = json.dumps(response, sort_keys=True)
         assert "fence-facade" not in response_json
         assert "facade-session" not in response_json
@@ -14752,6 +14817,61 @@ def test_timeline_append_meta_contract_rejects_observer_authoring_worker_evidenc
         backlog_id=backlog_id,
         event_kind="implementation",
     ) == []
+
+
+def test_timeline_append_meta_contract_prefers_worker_role_over_route_gate_observer(conn):
+    backlog_id = "AC-META-CONTRACT-WORKER-ROLE-ROUTE-GATE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": "worker-role-route-gate-task",
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "worker-runtime-context-1",
+                "status": "passed",
+                "payload": {
+                    "caller_role": "observer",
+                    "role": "observer",
+                    "worker_role": "mf_sub",
+                    "changed_files": ["agent/governance/server.py"],
+                    "route_token_gate": {
+                        "schema_version": "route_token_mutation_gate.v1",
+                        "allowed": True,
+                        "status": "accepted",
+                        "action": "task_timeline_append",
+                        "decision": "route_token",
+                        "caller_role": "observer",
+                    },
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id="worker-role-route-gate-task",
+                ),
+            },
+        )
+    )
+
+    assert result["event_kind"] == "implementation"
+    assert result["meta_contract_gate"]["role"] == "mf_sub"
+    assert result["meta_contract_gate"]["action"] == "implementation"
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="implementation",
+    )[0]
+    payload = event["payload"]
+    assert payload["worker_role"] == "mf_sub"
+    assert "caller_role" not in payload
+    assert "role" not in payload
+    assert payload["route_token_gate"]["caller_role"] == "observer"
 
 
 def test_timeline_append_meta_contract_allows_observer_on_behalf_worker_evidence(conn):

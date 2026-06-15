@@ -6467,6 +6467,54 @@ def _runtime_context_worker_guide_response(
             ],
             "auth": _auth_guide("body.session_token"),
         },
+        "implementation_evidence": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/task/{project_id}/timeline",
+                "event_kind": "implementation",
+            },
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/implementation-evidence"
+            ),
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/implementation-evidence"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+                "changed_files",
+                "tests",
+            ],
+            "server_derived_fields": [
+                "actor",
+                "worker_role",
+                "worker_id",
+                "worker_slot_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "route_identity",
+            ],
+            "payload_role_fields": {
+                "worker_role": "mf_sub",
+                "role": "omit",
+                "caller_role": "omit",
+                "actor_role": "omit",
+                "lane_role": "omit",
+            },
+            "route_token_gate_note": (
+                "route_token_gate.caller_role may be observer; runtime context "
+                "lineage and worker_role=mf_sub remain authoritative."
+            ),
+            "auth": _auth_guide("body.session_token"),
+        },
         "close_ready": {
             "legacy_bridge": {
                 "method": "POST",
@@ -7485,6 +7533,126 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
         else None,
         gate=result.get("gate") if isinstance(result, Mapping) else None,
         updated_context=result.get("context") if isinstance(result, Mapping) else None,
+    )
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/implementation-evidence")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/implementation-evidence")
+def handle_graph_governance_runtime_context_implementation_evidence(ctx: RequestContext):
+    """Append mf_sub implementation evidence through the runtime-context facade."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.implementation-evidence",
+            allow_validated=True,
+        )
+        route_identity = _runtime_context_latest_route_identity(conn, context)
+    finally:
+        conn.close()
+
+    supplied_payload = (
+        body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    )
+    payload = _strip_top_level_timeline_role_fields(supplied_payload)
+    parent_task_id = (
+        str(body.get("parent_task_id") or "").strip()
+        or _runtime_context_mf_sub_parent_task_id(context)
+    )
+    for key, value in {
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "governance_project_id": context.governance_project_id or project_id,
+        "target_project_id": context.target_project_id or project_id,
+        "target_project_root": context.target_project_root,
+        "finish_gate_event_ref": body.get("finish_gate_event_ref") or "",
+    }.items():
+        if value:
+            payload[key] = value
+    for key in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        if route_identity.get(key):
+            payload[key] = route_identity.get(key)
+    for key in ("changed_files", "tests", "test_results", "risk", "summary"):
+        if key in body:
+            payload[key] = body.get(key)
+    if isinstance(body.get("route_token_gate"), Mapping):
+        payload["route_token_gate"] = body.get("route_token_gate")
+
+    event_body = {
+        "task_id": context.task_id,
+        "backlog_id": context.backlog_id,
+        "event_type": body.get("event_type") or "mf.implementation",
+        "event_kind": body.get("event_kind") or "implementation",
+        "phase": body.get("phase") or "implementation",
+        "actor": (
+            body.get("actor")
+            or context.worker_slot_id
+            or context.worker_id
+            or "mf_sub"
+        ),
+        "status": body.get("status") or "passed",
+        "payload": payload,
+        "verification": body.get("verification") or {},
+        "artifact_refs": body.get("artifact_refs") or {},
+        "trace_id": body.get("trace_id") or "",
+        "commit_sha": body.get("commit_sha") or "",
+    }
+    if isinstance(body.get("route_token"), Mapping):
+        event_body["route_token"] = body.get("route_token")
+    elif isinstance(body.get("route_waiver"), Mapping):
+        event_body["route_waiver"] = body.get("route_waiver")
+    elif isinstance(body.get("route_token_gate"), Mapping):
+        gate = dict(body.get("route_token_gate") or {})
+        event_body["route_waiver"] = {
+            "accepted": True,
+            "waiver_type": "manual_fix",
+            "manual_fix": True,
+            "allowed_action": "task_timeline_append",
+            "project_id": project_id,
+            "backlog_id": context.backlog_id,
+            "task_id": context.task_id,
+            "route_context_hash": gate.get("route_context_hash")
+            or route_identity.get("route_context_hash")
+            or "",
+            "prompt_contract_id": gate.get("prompt_contract_id")
+            or route_identity.get("prompt_contract_id")
+            or "",
+            "caller_role": gate.get("caller_role") or "observer",
+            "reason": (
+                "runtime-context facade derived mf_sub worker role from "
+                "validated worker session/finish-gate lineage"
+            ),
+            "timeline_evidence": {
+                "event_id": body.get("finish_gate_event_ref") or "runtime-context",
+            },
+        }
+
+    result = handle_task_timeline_append(
+        _runtime_context_forward_request(ctx, body=event_body)
+    )
+    return _runtime_context_write_response(
+        action="implementation_evidence",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint="/api/task/{project_id}/timeline",
+        result={"ok": True},
+        event=result,
+        gate=result.get("meta_contract_gate") if isinstance(result, Mapping) else None,
     )
 
 
@@ -23224,6 +23392,21 @@ def _apply_supersession_hook_if_needed(
         )
 
 
+_TIMELINE_TOP_LEVEL_ROLE_FIELDS = frozenset(
+    ("caller_role", "role", "actor_role", "lane_role")
+)
+
+
+def _strip_top_level_timeline_role_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop caller-supplied top-level role hints before timeline storage/validation."""
+
+    return {
+        key: value
+        for key, value in dict(payload).items()
+        if key not in _TIMELINE_TOP_LEVEL_ROLE_FIELDS
+    }
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
@@ -23293,9 +23476,8 @@ def handle_task_timeline_append(ctx: RequestContext):
                 422,
                 {"error": str(exc), "code": "mf_read_receipt_validation_failed"},
             )
-        validation_payload = (
-            dict(norm_payload) if isinstance(norm_payload, Mapping) else {}
-        )
+        norm_payload = _strip_top_level_timeline_role_fields(norm_payload)
+        validation_payload = dict(norm_payload)
         validation_payload.pop("meta_contract_gate", None)
         try:
             meta_contract_gate = validate_meta_contract_timeline_event(
