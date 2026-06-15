@@ -359,6 +359,18 @@ record the worker read receipt under that command/route lineage; then record
 actual startup/counting evidence or launch/resume the worker. Missing
 `route_token_ref`, stale/superseded route identity, unsupported graph query
 purpose, or unresolved merge queue identity must block before worker launch.
+For a fresh `mf_sub` session, the Runtime Context worker guide is the
+concentrated entrypoint. The worker must read
+`runtime_context_worker_guide` before implementation and use it for the
+current route context, graph-query identity, read receipt facade, startup
+facade, implementation-evidence facade, finish-time attestation, finish gate,
+and close-gate gap list. The normal sequence is guide -> worker-authored read
+receipt -> real pre-implementation startup -> worker-scoped graph query ->
+owned-scope implementation and implementation evidence -> finish attestation
+and finish gate -> `review_ready` or `waiting_merge`.
+Do not let the observer author worker implementation evidence, fill in worker
+evidence after the fact, or reconstruct historical evidence as the normal close
+path. QA/audit bypass is a separate audited recovery path, not the happy path.
 For deterministic MF workflow workers, use the privileged-stage graph
 `dispatch -> implementation_wait -> handoff_gate -> merge_gate ->
 merge_queue_entry -> merge_preview -> live_merge -> reconcile -> close_gate ->
@@ -538,11 +550,15 @@ each as a status fact on the close-gate evidence:
 2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status(project_id="<project_id>")` when available. If the live runtime is older than the documented skill contract or lacks `graph_query(tool=query_schema)`, stop and ask for reload/redeploy/update before relying on new graph tools.
 3. Check graph state: `graph_status` and `graph_operations_queue`.
 4. If governance is offline or this is a fresh install, read `aming-claw://seed-graph-summary` for packaged MVP structure before asking the user to start services.
-5. For AI or semantic work, check local AI runtime readiness through the project AI config before queueing jobs.
-6. Call `graph_query` with `tool=query_schema` to discover the live query contract. After calling query_schema, pass its trace id to `POST /api/projects/{project_id}/observer-root-route-context` (body field `graph_query_schema_trace_id`) to bind it to the compact handoff. Surface `work_mode` and `next_legal_action` to the user, then stop — do not dispatch/merge/close until the `record_work_mode_transition` + `route_action_precheck` flow is complete.
-7. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `list_features`, `function_index`, `function_callers`, `function_callees`, `high_function_degree`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. Start with compact graph queries; use `search_semantic`, `get_node(include_semantic=true)`, or `get_neighbors(include_edge_semantic=true)` for semantic payloads. See [graph-first.md](references/graph-first.md).
-8. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
-9. Inspect files only after graph discovery identifies likely owners and reusable modules.
+5. In a fresh observer session, read `docs/onboarding.md` for the full
+   first-run flow and read `aming-claw://mf-sop` before Manual Fix or worker
+   dispatch. Do this before observer-root-route-context, dispatch, or
+   implementation planning.
+6. For AI or semantic work, check local AI runtime readiness through the project AI config before queueing jobs.
+7. Call `graph_query` with `tool=query_schema` to discover the live query contract. After calling query_schema, pass its trace id to `POST /api/projects/{project_id}/observer-root-route-context` (body field `graph_query_schema_trace_id`) to bind it to the compact handoff. Surface `work_mode` and `next_legal_action` to the user, then stop — do not dispatch/merge/close until the `record_work_mode_transition` + `route_action_precheck` flow is complete.
+8. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `list_features`, `function_index`, `function_callers`, `function_callees`, `high_function_degree`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. Start with compact graph queries; use `search_semantic`, `get_node(include_semantic=true)`, or `get_neighbors(include_edge_semantic=true)` for semantic payloads. See [graph-first.md](references/graph-first.md).
+9. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
+10. Inspect files only after graph discovery identifies likely owners and reusable modules.
 
 ## Local AI Runtime Readiness
 

@@ -98,6 +98,15 @@ Legal actions are a white-list; **anything not listed is denied**. The FORBIDDEN
 | IMPLEMENTING | graph_query as mf_sub (own fence), edit only owned subtree, commit with Chain trailers | edit outside granted subtree; merge/push; close; reconcile |
 | REVIEW_READY | submit review_ready with test results | self-merge; self-QA |
 
+The Runtime Context worker guide is the role-scoped entrypoint for the worker
+lane. A fresh worker reads it before implementation and follows its
+`next_legal_action`: read receipt first, real startup second, worker-scoped
+graph query third, implementation evidence fourth, then finish-time
+attestation and the finish gate. The guide carries the public route identity,
+route token ref, graph-query identity, write facades, allowed/blocked actions,
+and close-gate gaps in one place, so daily demo lanes do not need manual
+route/startup/identity repair.
+
 Worker implementation evidence append is runtime-context-native. After a
 successful finish gate, an `mf_sub` worker appends implementation evidence with:
 
@@ -115,6 +124,13 @@ context. Workers must omit top-level `role`, `caller_role`, `actor_role`, and
 `lane_role`; those fields are stripped before validation. A nested
 `route_token_gate.caller_role="observer"` is audit metadata only and must not
 override the runtime-context worker role.
+
+Observer-authored implementation, observer-filled worker evidence, and
+historical evidence reconstruction are not normal close paths. QA/audit bypass
+is a separate audited recovery path with its own status and reason; the happy
+path is a worker-owned read receipt, real pre-implementation startup,
+worker-authored implementation evidence, independent verification, finish gate,
+and close gate.
 
 ### qa
 | state | legal | forbidden |
@@ -199,10 +215,13 @@ This satisfies "give the observer freedom when fully stuck, as long as it leaves
 
 1. Observer appends intent + commits a lane contract (conforms-to meta-contract); projection root advances; server mints the worker-role nonce node.
 2. Observer dispatches: hands `(runtime_context_id, revision-root-hash, granted-subtree-path)` + worker credential — **not** a launch_text.
-3. Worker fetches its subtree (incl. nonce) with its worker credential; server logs the access (principal=worker-session, role=worker).
-4. Worker works within the subtree; submits ONE `subtree_hash` (incl. nonce) at startup/finish — not 13 echoed fields. The event references the contract clause + revision hash.
-5. Gate validates: hash recomputes from store (L1) ∧ computed with the worker nonce (L2) ∧ access log shows this worker session read it as worker, no anomalous read (L3) ∧ (transcript corroborates, L4) ∧ the event fulfils a worker clause the meta-contract permits in this state.
-6. Observer reads the role-scoped state snapshot → sees fulfilled vs missing clauses (plan view) → next legal action.
+3. Worker reads the Runtime Context worker guide to get the current route
+   context, graph-query identity, write facades, startup requirements,
+   implementation-evidence contract, finish gate, and close-gate gaps.
+4. Worker fetches its subtree (incl. nonce) with its worker credential; server logs the access (principal=worker-session, role=worker).
+5. Worker works within the subtree; submits ONE `subtree_hash` (incl. nonce) at startup/finish — not 13 echoed fields. The event references the contract clause + revision hash.
+6. Gate validates: hash recomputes from store (L1) ∧ computed with the worker nonce (L2) ∧ access log shows this worker session read it as worker, no anomalous read (L3) ∧ (transcript corroborates, L4) ∧ the event fulfils a worker clause the meta-contract permits in this state.
+7. Observer reads the role-scoped state snapshot → sees fulfilled vs missing clauses (plan view) → next legal action.
 
 ---
 

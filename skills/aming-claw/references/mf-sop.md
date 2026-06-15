@@ -43,6 +43,11 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - The only direct observer mutation exception is tiny deterministic scope:
      record the explicit reason, allowed files, exact dirty-scope match
      evidence, and timeline event before mutation.
+   - In a fresh observer session, load `aming-claw://current-context`,
+     `aming-claw://skill`, `aming-claw://graph-first`, and this `mf-sop`
+     resource before observer-root-route-context, dispatch, or implementation
+     planning. Do not rely on dashboard health or remembered route state as a
+     substitute for the current Aming Claw context.
 2. Ensure a backlog row exists with target files, acceptance criteria, and details.
 3. Predeclare/start the MF row with an MF id.
    - In MVP, API/storage may show `mf_type=chain_rescue` for observer-hotfix or
@@ -155,6 +160,19 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      `task_id`, `parent_task_id`, `worker_role=mf_sub`, `branch_ref`,
      `worktree_path`, `base_commit`, `target_head_commit`, `merge_queue_id`,
      and `fence_token`;
+   - require every fresh `mf_sub` worker with a `runtime_context_id` to read
+     `runtime_context_worker_guide` before implementation. Treat the guide as
+     the concentrated route/startup/evidence entrypoint: it provides safe route
+     context, route token ref, graph-query identity, read receipt and startup
+     facades, implementation-evidence facade, finish-time attestation guidance,
+     finish gate inputs, and close-gate gaps;
+   - follow the worker guide order for the normal path: worker-authored read
+     receipt, real pre-implementation startup, worker-scoped graph query,
+     owned-scope implementation, runtime-context implementation evidence,
+     finish-time worker attestation, finish gate, then `review_ready` or
+     `waiting_merge`. Historical startup replay, observer-filled worker
+     evidence, and QA/audit archive paths are recovery evidence only, not the
+     happy path for close;
    - assign every worker a branch/worktree/file fence before dispatch, then
      require it to stay inside that fence and stop at `review_ready` or
      `waiting_merge`, never merge/push or mutate merge queues;

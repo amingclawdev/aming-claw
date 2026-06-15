@@ -780,6 +780,22 @@ function verifyAssetRelationGraphOpsContract() {
   ok("asset relation inspector exposes navigation, FileLink, review-gated operations, and known drift follow-up");
 }
 
+function verifyRuntimeGuideDocsContract({ announce = true } = {}) {
+  if (announce) phase("runtime guide docs contract");
+  const onboardingSource = readFileSync(path.join(REPO_ROOT, "docs/onboarding.md"), "utf8");
+  const contractDocSource = readFileSync(path.join(REPO_ROOT, "docs/dev/contract-driven-governance.md"), "utf8");
+  const skillSource = readFileSync(path.join(REPO_ROOT, "skills/aming-claw/SKILL.md"), "utf8");
+  const mfSopSource = readFileSync(path.join(REPO_ROOT, "skills/aming-claw/references/mf-sop.md"), "utf8");
+
+  assert(onboardingSource.includes("Read `aming-claw://current-context`.") && onboardingSource.includes("Read `aming-claw://skill`.") && onboardingSource.includes("Read `aming-claw://graph-first`."), "Onboarding should require fresh sessions to load current Aming Claw MCP context before observer work");
+  assert(onboardingSource.includes("`runtime_context_worker_guide`") && onboardingSource.includes("`submit_mf_subagent_read_receipt`"), "Onboarding should point mf_sub workers at the Runtime Context worker guide and read-receipt next action");
+  assert(onboardingSource.includes("daily-planner-lite") && onboardingSource.includes("normal close gate") && onboardingSource.includes("route/startup/identity repair"), "Onboarding should preserve the one-prompt demo happy-path contract");
+  assert(contractDocSource.includes("read receipt first, real startup second, worker-scoped") && contractDocSource.includes("Observer-authored implementation, observer-filled worker evidence"), "Contract-driven governance doc should forbid observer-filled worker evidence as a normal close path");
+  assert(skillSource.includes("Runtime Context worker guide is the") && skillSource.includes("reconstruct historical evidence as the normal close"), "Aming Claw skill should make the worker guide the fresh mf_sub entrypoint");
+  assert(mfSopSource.includes("`runtime_context_worker_guide` before implementation") && mfSopSource.includes("QA/audit archive paths are recovery evidence only"), "MF SOP should guide fresh workers through runtime guide, startup, evidence, and finish gates");
+  ok("runtime guide docs cover fresh-session context, startup/read-receipt surfaces, and normal-close boundaries");
+}
+
 function verifyBacklogEvidenceContract() {
   phase("backlog evidence contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
@@ -829,6 +845,7 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("[\"runtime mode\", firstText(privacy.provider_runtime)]"), "Privacy boundary should render public-safe runtime mode labels");
   assert(viewSource.includes("private advisory decisions are supporting context only"), "Route guidance should use public-safe supporting-context language");
   assert(viewSource.includes("Observer coordination or review evidence does not count as implementation worker evidence."), "Worker guidance should use public-safe review role language");
+  verifyRuntimeGuideDocsContract({ announce: false });
   assert(viewSource.includes("function sanitizeRouteGuidanceDisplayText"), "Backlog route guidance should define a UI display sanitizer");
   assert(viewSource.includes("command: sanitizeRouteGuidanceDisplayText(command || id)"), "Backend route action commands should be sanitized before display");
   assert(viewSource.includes("label: sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id))"), "Backend route action labels should be sanitized before display");
@@ -1115,6 +1132,8 @@ async function main() {
     if (ONLY) {
       if (ONLY === "simple-mode-request-first-desktop") {
         verifySimpleModeRequestFirstDesktopContract();
+      } else if (ONLY === "runtime-guide-docs") {
+        verifyRuntimeGuideDocsContract();
       } else if (
         ONLY === "ordinary-user-entry-desktop" ||
         ONLY === "engineer-homepage-entry-desktop" ||

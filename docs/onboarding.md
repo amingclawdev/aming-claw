@@ -54,8 +54,17 @@ context:
 
 1. List MCP resources.
 2. Confirm `aming-claw://current-context` is present.
-3. Read `aming-claw://current-context` and use its project id, governance URL,
-   and guardrails as the session anchor.
+3. Read `aming-claw://current-context`.
+4. Read `aming-claw://skill`.
+5. Read `aming-claw://graph-first`.
+6. For Manual Fix or worker-lane work, read `aming-claw://mf-sop`.
+
+Use the current-context project id, governance URL, dashboard URL, graph state,
+and guardrails as the session anchor before observer root-route-context,
+dispatch, graph queries, or implementation planning. A fresh observer should
+not begin by relying on remembered project state, dashboard health, or old
+prompt text; it should load the current Aming Claw resources first, then read
+the backlog row/route context for the current task.
 
 Governance health, `/api/health`, and a working `/dashboard` prove the service
 can answer HTTP. They do not prove the AI host loaded `.mcp.json`, exposed the
@@ -220,13 +229,42 @@ worktrees, or mutate merge queues. The observer also does not wait, merge, or
 push by default unless the user explicitly asks or a documented governance
 transition requires it.
 
-When an `mf_sub` worker has a `runtime_context_id`, it should read the Runtime
-Context Service before acting: use MCP `runtime_context_current`, CLI
-`aming-claw runtime-context current`, or HTTP
-`/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/current-state`.
-Use `/worker-guide` or the returned `worker_guide` to find the graph route
-context and write-guide surfaces for read receipts, startup, checkpoints,
-implementation evidence, and finish gates.
+When an `mf_sub` worker has a `runtime_context_id`, it should use the Runtime
+Context worker guide as the concentrated entrypoint before acting: use MCP
+`runtime_context_worker_guide` or the HTTP worker-guide facade, and refresh
+`runtime_context_current` when a gate or evidence write needs the latest state.
+The guide is the worker-facing map for safe route context, graph-query
+identity, read/write evidence facades, startup, implementation evidence,
+finish-time attestation, finish gate, and close-gate gaps.
+
+The normal worker order is:
+
+1. Read the worker guide and confirm the next legal action. A fresh worker
+   should normally see `submit_mf_subagent_read_receipt`.
+2. Record a worker-authored read receipt through the runtime-context
+   `read-receipts` facade, using the guide hash material and public route
+   identity. Do not persist raw session, route, or launch-text tokens.
+3. Record real startup before implementation through `parallel_branch_startup`
+   or the runtime-context `startup` facade, including actual cwd/git root,
+   branch/head, base/target head, merge queue id, owned files, read-receipt
+   refs, route identity, and route token ref.
+4. Run worker-scoped `graph_query` as `query_source=mf_subagent` with
+   `query_purpose=subagent_context_build` or `subagent_gate_validation`,
+   carrying `task_id`, `parent_task_id`, `worker_role=mf_sub`, fence, and
+   session identity.
+5. Implement only inside the file/worktree fence, then write implementation
+   evidence through the runtime-context `implementation-evidence` facade with
+   changed files, tests, and graph trace ids.
+6. Record finish-time worker attestation and the finish gate, then stop at
+   `review_ready` or `waiting_merge`.
+
+For the `daily-planner-lite` one-prompt demo, the intended fixture path is two
+parallel backlog rows moving from open through normal close gate with no manual
+route/startup/identity repair. If a worker guide says route context, read
+receipt, startup, graph trace, implementation evidence, finish gate, or
+close-gate evidence is missing, repair that surface through its documented
+facade before implementation or handoff rather than treating post-hoc
+reconstruction as the happy path.
 
 Worker final evidence should name the branch/worktree, owned changed files,
 tests run, graph query trace ids, precheck evidence, generated assets policy,
