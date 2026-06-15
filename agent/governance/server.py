@@ -6232,6 +6232,318 @@ def _runtime_context_projection_response(
     }
 
 
+def _runtime_context_worker_guide_response(
+    current_state_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    service = current_state_response.get("runtime_context_service")
+    service = service if isinstance(service, Mapping) else {}
+    views = service.get("views") if isinstance(service.get("views"), Mapping) else {}
+    worker_view = dict(views.get("worker_view") or {})
+    action_plan = dict(worker_view.get("action_plan") or views.get("action_plan") or {})
+    control_plane = dict(
+        worker_view.get("control_plane") or views.get("control_plane") or {}
+    )
+    capability_boundary = dict(
+        worker_view.get("capability_boundary")
+        or views.get("capability_boundary")
+        or {}
+    )
+    graph_identity = dict(worker_view.get("graph_query_identity") or {})
+    task = dict(worker_view.get("task") or {})
+    route_identity = dict(worker_view.get("route_identity") or {})
+    runtime_context_id = str(current_state_response.get("runtime_context_id") or "")
+    project_id = str(current_state_response.get("project_id") or "")
+    task_id = str(current_state_response.get("task_id") or task.get("task_id") or "")
+    parent_task_id = str(graph_identity.get("parent_task_id") or task.get("parent_task_id") or "")
+    next_required_evidence = list(
+        control_plane.get("next_required_evidence")
+        or action_plan.get("next_required_evidence")
+        or worker_view.get("next_required_evidence")
+        or []
+    )
+    next_legal_action = str(
+        control_plane.get("next_legal_action")
+        or action_plan.get("next_legal_action")
+        or ""
+    )
+
+    read_endpoints = {
+        "current_state": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/current-state"
+            ),
+            "facade_status": "available",
+            "returns": [
+                "worker_view",
+                "action_plan",
+                "control_plane",
+                "route_identity",
+            ],
+            "required_query_fields_for_mf_sub": [
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+            ],
+        },
+        "runtime_contract": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/runtime-contract"
+            ),
+            "facade_status": "available",
+            "returns": ["runtime_contract", "latest_revision_id", "contract_changed"],
+            "required_query_fields_for_mf_sub": [
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+            ],
+        },
+        "graph_query": {
+            "method": "POST",
+            "path": "/api/graph-governance/{project_id}/query",
+            "facade_status": "available",
+            "required_body_fields": ["tool", "query_source", "query_purpose"],
+            "required_identity_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "fence_token",
+            ],
+            "query_source": graph_identity.get("query_source") or "mf_subagent",
+            "query_purpose": (
+                graph_identity.get("query_purpose")
+                or graph_identity.get("purpose")
+                or "subagent_context_build"
+            ),
+            "raw_fence_token_source": "worker launch envelope; never echoed by runtime context",
+        },
+        "route_context": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/current-state"
+            ),
+            "facade_status": "available_via_current_state",
+            "source_view_path": "runtime_context_service.views.worker_view.route_identity",
+            "safe_fields": [
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+            ],
+        },
+    }
+    write_guides = {
+        "read_receipt": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/task/{project_id}/timeline",
+                "event_kind": "mf_subagent_read_receipt",
+            },
+            "canonical_facade_status": "planned",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/read-receipts"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "read_receipt_hash",
+            ],
+        },
+        "startup": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/graph-governance/{project_id}/parallel-branches/startup",
+            },
+            "canonical_facade_status": "planned",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/startup"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "fence_token",
+                "session_token",
+            ],
+        },
+        "checkpoint": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/graph-governance/{project_id}/parallel-branches/checkpoint",
+            },
+            "canonical_facade_status": "planned",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/checkpoints"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "checkpoint_id",
+                "evidence_refs",
+            ],
+        },
+        "finish_gate": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/graph-governance/{project_id}/parallel-branches/finish-gate",
+            },
+            "canonical_facade_status": "planned",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/finish-gate"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "checkpoint_id",
+                "fence_token",
+                "session_token",
+            ],
+        },
+        "close_ready": {
+            "legacy_bridge": {
+                "method": "POST",
+                "path": "/api/task/{project_id}/timeline",
+                "event_kind": "close_ready",
+            },
+            "canonical_facade_status": "planned",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/close-ready"
+            ),
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "verification_evidence_refs",
+                "graph_current_evidence_ref",
+            ],
+        },
+    }
+    return {
+        "ok": True,
+        "schema_version": "runtime_context.worker_guide_response.v1",
+        "project_id": project_id,
+        "governance_project_id": current_state_response.get("governance_project_id"),
+        "target_project_id": current_state_response.get("target_project_id"),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "role_scope": current_state_response.get("role_scope"),
+        "worker_guide": {
+            "schema_version": "runtime_context.worker_guide.v1",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "next_legal_action": next_legal_action,
+            "next_required_evidence": next_required_evidence,
+            "missing_evidence": list(
+                control_plane.get("missing_evidence")
+                or action_plan.get("missing_evidence")
+                or []
+            ),
+            "blocking_reasons": list(
+                control_plane.get("blocking_reasons")
+                or action_plan.get("blocking_reasons")
+                or []
+            ),
+            "read_endpoints": read_endpoints,
+            "write_guides": write_guides,
+            "graph_query_identity": {
+                "runtime_context_id": runtime_context_id,
+                "task_id": graph_identity.get("task_id") or task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": graph_identity.get("worker_role") or "mf_sub",
+                "governance_project_id": (
+                    graph_identity.get("governance_project_id")
+                    or current_state_response.get("governance_project_id")
+                    or project_id
+                ),
+                "target_project_id": (
+                    graph_identity.get("target_project_id")
+                    or current_state_response.get("target_project_id")
+                    or project_id
+                ),
+                "target_project_root": graph_identity.get("target_project_root") or "",
+                "fence_token_hash": graph_identity.get("fence_token_hash") or "",
+                "fence_token_redacted": True,
+            },
+            "route_identity": route_identity,
+            "capability_boundary_hash": capability_boundary.get(
+                "capability_boundary_hash",
+                "",
+            ),
+            "control_plane_summary": {
+                "route_token_action": dict(
+                    control_plane.get("route_token_action") or {}
+                ),
+                "read_receipt_hash_action": dict(
+                    control_plane.get("read_receipt_hash_action") or {}
+                ),
+                "close_precheck_gap_projection": dict(
+                    control_plane.get("close_precheck_gap_projection") or {}
+                ),
+            },
+            "blocked_actions": [
+                "author_worker_evidence_as_observer",
+                "bypass_timeline_gate",
+                "surrogate_startup",
+                "raw_token_exfiltration",
+                "merge",
+                "push",
+                "close_backlog_without_close_ready",
+            ],
+            "recovery_actions": [
+                {
+                    "id": "follow_next_legal_action",
+                    "action": next_legal_action,
+                    "status": "available" if next_legal_action else "unknown",
+                },
+                {
+                    "id": "refresh_current_state",
+                    "action": "read_current_state_before_each_evidence_write",
+                    "endpoint": "current_state",
+                },
+            ],
+        },
+        "source_refs": {
+            "current_state_endpoint": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/current-state"
+            ),
+            "current_state_audit_id": (
+                (current_state_response.get("access_audit") or {}).get("audit_id")
+                if isinstance(current_state_response.get("access_audit"), Mapping)
+                else ""
+            ),
+            "branch_runtime": (current_state_response.get("source_refs") or {}).get(
+                "branch_runtime",
+                "",
+            )
+            if isinstance(current_state_response.get("source_refs"), Mapping)
+            else "",
+        },
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "other_worker_contexts_exposed": False,
+            "raw_source_of_truth_copied": False,
+            "raw_session_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "worker_evidence_substitution_allowed": False,
+        },
+    }
+
+
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
 def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext):
     """Return a role-scoped runtime/contract view for one bounded worker lane."""
@@ -6528,6 +6840,29 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
         )
     finally:
         conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/worker-guide")
+@route("GET", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/worker-guide")
+def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: RequestContext):
+    """Return public-safe instructions for a worker to consume runtime context."""
+    query = dict(ctx.query or {})
+    query["view"] = "all"
+    state_ctx = RequestContext(
+        ctx.handler,
+        ctx.method,
+        dict(ctx.path_params or {}),
+        query,
+        dict(ctx.body or {}),
+        ctx.request_id,
+        ctx.token,
+        ctx.idem_key,
+    )
+    state_ctx._session = ctx._session
+    current_state = handle_graph_governance_parallel_branch_runtime_context_current_state(
+        state_ctx
+    )
+    return _runtime_context_worker_guide_response(current_state)
 
 
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract/revisions")

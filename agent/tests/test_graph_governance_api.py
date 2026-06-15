@@ -2601,6 +2601,19 @@ def test_runtime_context_canonical_read_routes_use_runtime_context_facade(conn):
         "runtime-canonical-read-task"
     )
 
+    guide_handler, guide_params = resolve(
+        f"/api/graph-governance/{PID}/runtime-contexts/"
+        f"{context.runtime_context_id}/worker-guide"
+    )
+    assert (
+        guide_handler
+        is server.handle_graph_governance_parallel_branch_runtime_context_worker_guide
+    )
+    guide = guide_handler(_ctx_with_role(guide_params, "observer"))
+    assert guide["ok"] is True
+    assert guide["schema_version"] == "runtime_context.worker_guide_response.v1"
+    assert guide["worker_guide"]["runtime_context_id"] == context.runtime_context_id
+
 
 def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     context = upsert_branch_context(
@@ -2902,6 +2915,63 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert "runtime-current-session" not in json.dumps(worker_result, sort_keys=True)
     assert "raw-route-token-current" not in json.dumps(worker_result, sort_keys=True)
     assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
+    worker_guide_result = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-current-parent",
+                    "fence_token": "fence-current",
+                    "session_token": "runtime-current-session",
+                    "graph_trace_id": "gqt-runtime-current",
+                    "view": "current",
+                },
+            )
+        )
+    )
+    assert worker_guide_result["ok"] is True
+    assert worker_guide_result["role_scope"] == "worker"
+    assert worker_guide_result["schema_version"] == (
+        "runtime_context.worker_guide_response.v1"
+    )
+    worker_guide = worker_guide_result["worker_guide"]
+    assert worker_guide["schema_version"] == "runtime_context.worker_guide.v1"
+    assert worker_guide["next_legal_action"] == "record_finish_gate"
+    assert worker_guide["read_endpoints"]["current_state"]["path"] == (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/current-state"
+    )
+    assert worker_guide["read_endpoints"]["graph_query"]["path"] == (
+        "/api/graph-governance/{project_id}/query"
+    )
+    assert worker_guide["read_endpoints"]["graph_query"]["query_source"] == (
+        "mf_subagent"
+    )
+    assert worker_guide["read_endpoints"]["route_context"]["source_view_path"] == (
+        "runtime_context_service.views.worker_view.route_identity"
+    )
+    assert worker_guide["write_guides"]["startup"]["legacy_bridge"]["path"] == (
+        "/api/graph-governance/{project_id}/parallel-branches/startup"
+    )
+    assert worker_guide["write_guides"]["startup"]["canonical_facade_status"] == (
+        "planned"
+    )
+    assert worker_guide["write_guides"]["finish_gate"]["legacy_bridge"]["path"] == (
+        "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
+    )
+    assert worker_guide["graph_query_identity"]["fence_token_hash"] == fence_hash
+    assert worker_guide["graph_query_identity"]["fence_token_redacted"] is True
+    assert "surrogate_startup" in worker_guide["blocked_actions"]
+    assert "bypass_timeline_gate" in worker_guide["blocked_actions"]
+    worker_guide_json = json.dumps(worker_guide_result, sort_keys=True)
+    assert "fence-current" not in worker_guide_json
+    assert "runtime-current-session" not in worker_guide_json
+    assert "raw-route-token-current" not in worker_guide_json
+    assert "must-not-leak" not in worker_guide_json
     worker_content_address = worker_result["runtime_context_service"][
         "content_address"
     ]
