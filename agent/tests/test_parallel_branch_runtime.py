@@ -1524,6 +1524,123 @@ def test_runtime_context_current_values_prefer_finish_time_worker_attestation() 
     assert "finish_time_worker_attestation" not in next_required_ids
 
 
+def test_runtime_context_current_values_read_nested_finish_gate_attestation() -> None:
+    context = _runtime_projection_context(checkpoint_id="")
+    worker_attestation = {
+        "schema_version": "worker_transcript_self_attestation.v1",
+        "status": "passed",
+        "attestation_phase": "finish",
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "finish_time_self_attesting": True,
+        "finish_time_blockers": [],
+        "worker_session_id": "session-runtime-context",
+        "filer_principal": "session-runtime-context",
+        "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+        "harness_type": "codex",
+    }
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        timeline_events=[
+            {
+                "event_id": "timeline:startup-runtime-context",
+                "event_kind": "mf_subagent_startup",
+                "status": "passed",
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "payload": {
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                },
+            },
+            {
+                "event_id": "timeline:read-runtime-context",
+                "event_kind": "mf_subagent_read_receipt",
+                "status": "ok",
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "payload": {
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                },
+            },
+            {
+                "event_id": "timeline:attestation-runtime-context",
+                "event_kind": "worker_progress",
+                "status": "passed",
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "payload": {
+                    "action": "record_finish_time_worker_attestation",
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    "worker_role": "mf_sub",
+                    "finish_time_worker_self_attestation": worker_attestation,
+                },
+            },
+            {
+                "event_id": "timeline:finish-runtime-context",
+                "event_kind": "mf_subagent_finish_gate",
+                "status": "passed",
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "payload": {
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    "mf_subagent_finish_gate": {
+                        "checkpoint_id": "ckpt-runtime-context",
+                        "worker_self_attestation": worker_attestation,
+                        "worker_self_attestation_gate": {
+                            "status": "passed",
+                            "close_satisfying": True,
+                        },
+                        "test_results": {
+                            "status": "passed",
+                            "passed": True,
+                            "command": "pytest -q",
+                        },
+                    },
+                },
+            },
+        ],
+        generated_at=NOW,
+    ).to_dict()
+
+    current = projection["views"]["current"]
+    current_values = current["current_values"]
+    gate_inputs = projection["views"]["gate_inputs"]
+    close_gate = projection["views"]["close_gate_view"]
+    missing = {(item["gate"], item["field"]) for item in gate_inputs["missing"]}
+    close_checklist = {item["id"]: item for item in close_gate["checklist"]}
+
+    assert current_values["worker_self_attesting"] is True
+    assert current_values["worker_self_attestation"]["attestation_phase"] == "finish"
+    assert current_values["test_results"]["status"] == "passed"
+    assert current_values["checkpoint_id"] == "ckpt-runtime-context"
+    assert ("finish", "worker_self_attesting") not in missing
+    assert ("close", "worker_self_attesting") not in missing
+    assert ("close", "verification_event_refs") in missing
+    assert close_checklist["close_ready"]["status"] == "missing"
+    assert close_gate["ready"] is False
+
+
 def test_runtime_context_worker_guide_repairs_next_action_after_finish_attestation() -> None:
     context = _runtime_projection_context()
     projection = build_runtime_context_projection(
