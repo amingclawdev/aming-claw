@@ -2756,6 +2756,7 @@ def _runtime_context_current_values(
             route_identity.get("visible_injection_manifest_hash")
         ),
         "target_files": list(target_files),
+        "owned_files": list(target_files),
         "acceptance_criteria": list(acceptance_criteria),
         "graph_query_identity": {
             "query_source": "mf_subagent",
@@ -3875,6 +3876,38 @@ def _runtime_context_read_receipt_hash_action(
     )
     status = "present" if read_receipt_ref else "missing"
     worker_query = _runtime_context_mapping(values.get("graph_query_identity"))
+    owned_files = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("owned_files"))
+        or _runtime_context_string_list(values.get("target_files"))
+    )
+    worker_identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": _runtime_context_text(values.get("task_id")),
+        "parent_task_id": _runtime_context_text(values.get("parent_task_id")),
+        "backlog_id": _runtime_context_text(values.get("backlog_id")),
+        "worker_role": _runtime_context_text(
+            values.get("worker_role") or RUNTIME_CONTEXT_WORKER_ROLE
+        ),
+        "worker_id": _runtime_context_text(values.get("worker_id")),
+        "worker_slot_id": _runtime_context_text(values.get("worker_slot_id")),
+    }
+    hash_material = {
+        "projection_hash_source": (
+            "runtime_context_service.content_address.projection_hash"
+        ),
+        "current_view_hash": current_node["view_hash"],
+        "gate_inputs_view_hash": gate_inputs_node["view_hash"],
+        "close_gate_view_hash": close_gate_node["view_hash"],
+    }
+    guide_hash = runtime_context_content_hash(
+        {
+            "schema_version": "runtime_context.worker_guide_hash_material.v1",
+            "runtime_context_id": runtime_context_id,
+            "worker_identity": worker_identity,
+            "owned_files": owned_files,
+            "hash_material": hash_material,
+        }
+    )
     ordered_steps = [
         {
             "id": "query_runtime_contract",
@@ -3882,14 +3915,14 @@ def _runtime_context_read_receipt_hash_action(
             "entrypoint": {
                 "method": "GET",
                 "path": (
-                    "/api/graph-governance/{project_id}/parallel-branches/"
-                    "runtime-contexts/{runtime_context_id}/runtime-contract"
+                    "/api/graph-governance/{project_id}/runtime-contexts/"
+                    "{runtime_context_id}/runtime-contract"
                 ),
                 "required_query_fields": [
-                    "task_id",
                     "parent_task_id",
-                    "worker_role",
                     "fence_token",
+                    "session_token",
+                    "target_project_root",
                     "runtime_context_id",
                 ],
             },
@@ -3941,15 +3974,53 @@ def _runtime_context_read_receipt_hash_action(
                 "fence_token_required": True,
             },
             "evidence_required": "DB-verified graph_trace_ids",
+            "entrypoint": {
+                "method": "POST",
+                "path": "/api/graph-governance/{project_id}/query",
+                "required_body_fields": [
+                    "tool",
+                    "query_source",
+                    "query_purpose",
+                    "runtime_context_id",
+                    "fence_token",
+                    "session_token",
+                    "target_project_root",
+                ],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "allowed_query_purposes": [
+                    "subagent_context_build",
+                    "subagent_gate_validation",
+                ],
+                "route_identity_fields": [
+                    "route_id",
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                    "route_token_ref",
+                ],
+                "privacy_boundary": {
+                    "raw_session_token_persisted": False,
+                    "raw_fence_token_echoed": False,
+                    "raw_route_token_required": False,
+                },
+            },
         },
         {
             "id": "implementation_and_tests",
             "status": "required",
-            "owned_files": list(values.get("owned_files") or []),
+            "owned_files": owned_files,
             "required_outputs": [
                 "owned file diff",
                 "focused tests",
                 "git diff --check",
+            ],
+            "evidence_to_file": [
+                "implementation_evidence",
+                "finish_time_worker_attestation",
+                "finish_gate",
+                "verification_or_test_results",
             ],
         },
         {
@@ -3980,8 +4051,19 @@ def _runtime_context_read_receipt_hash_action(
             ],
         },
     ]
+    worker_next_moves = [
+        {
+            "id": step["id"],
+            "status": _runtime_context_text(step.get("status") or "required"),
+            "must_precede": list(step.get("must_precede") or []),
+        }
+        for step in ordered_steps
+    ]
     return {
         "schema_version": "runtime_context.read_receipt_hash_action.v1",
+        "guide_id": "runtime_context_worker_guide.startup_bridge.v1",
+        "guide_hash": guide_hash,
+        "worker_identity": worker_identity,
         "status": status,
         "next_action": "none"
         if read_receipt_ref
@@ -3992,14 +4074,7 @@ def _runtime_context_read_receipt_hash_action(
             "gate_inputs": gate_inputs_node,
             "close_gate_view": close_gate_node,
         },
-        "hash_material": {
-            "projection_hash_source": (
-                "runtime_context_service.content_address.projection_hash"
-            ),
-            "current_view_hash": current_node["view_hash"],
-            "gate_inputs_view_hash": gate_inputs_node["view_hash"],
-            "close_gate_view_hash": close_gate_node["view_hash"],
-        },
+        "hash_material": hash_material,
         "entrypoint": {
             "method": "POST",
             "path": "/api/task/{project_id}/timeline",
@@ -4013,6 +4088,34 @@ def _runtime_context_read_receipt_hash_action(
                 "read_receipt_hash or launch_text_hash",
             ],
         },
+        "worker_next_moves": worker_next_moves,
+        "worker_constraints": {
+            "blocked_actions": [
+                "merge",
+                "push",
+                "close_backlog_without_close_ready",
+                "raw_token_exfiltration",
+                "author_worker_evidence_as_observer",
+                "bypass_timeline_gate",
+            ],
+            "scope": {
+                "owned_files": owned_files,
+                "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+                "query_source": "mf_subagent",
+            },
+        },
+        "observer_remediation_actions": [
+            {
+                "id": "refresh_route_token_ref",
+                "role": "observer",
+                "when": "route_token_ref_missing_stale_or_scope_mismatch",
+            },
+            {
+                "id": "review_worker_finish_gate",
+                "role": "observer",
+                "when": "worker_records_finish_gate_and_handoff_is_review_ready",
+            },
+        ],
         "operator_instruction": (
             "Submit a worker-authored mf_subagent_read_receipt before counted "
             "startup/finish evidence, using the runtime-context content-address "
@@ -4297,8 +4400,16 @@ def _runtime_context_merge_dependency_projection(
 def _runtime_context_close_precheck_gap_projection(
     *,
     values: Mapping[str, Any],
+    close_gate_view: Mapping[str, Any],
 ) -> dict[str, Any]:
     close_precheck = _runtime_context_mapping(values.get("close_precheck"))
+    missing_close_fields = _runtime_context_dedupe(
+        [
+            _runtime_context_text(item.get("field"))
+            for item in close_gate_view.get("missing") or []
+            if isinstance(item, Mapping)
+        ]
+    )
     gap_specs = {
         "route_identity_cleanup_required": (
             "cleanup_route_identity",
@@ -4338,6 +4449,24 @@ def _runtime_context_close_precheck_gap_projection(
         "status": "blocked" if gaps else "clear",
         "gaps": gaps,
         "next_actions": next_actions,
+        "done_state_projection": {
+            "schema_version": "runtime_context.done_state_projection.v1",
+            "status": "review_ready" if close_gate_view.get("ready") else "gap_open",
+            "close_gate_ready": bool(close_gate_view.get("ready")),
+            "close_ready_event_ref": _runtime_context_text(
+                values.get("close_ready_event_ref")
+            ),
+            "finish_gate_ref": _runtime_context_text(values.get("finish_gate_ref")),
+            "checkpoint_id": _runtime_context_text(values.get("checkpoint_id")),
+            "graph_trace_ids": list(values.get("graph_trace_ids") or []),
+            "verification_event_refs": list(
+                values.get("verification_event_refs") or []
+            ),
+            "missing_close_fields": missing_close_fields,
+            "handoff_terminal_status": (
+                "review_ready" if close_gate_view.get("ready") else "waiting_merge_gap"
+            ),
+        },
     }
 
 
@@ -4620,6 +4749,7 @@ def build_runtime_context_action_plan_view(
     )
     close_precheck_gap_projection = _runtime_context_close_precheck_gap_projection(
         values=values,
+        close_gate_view=close_gate,
     )
     next_legal_action = _runtime_context_next_legal_action(
         route_token_action=route_token_action,
@@ -4639,6 +4769,17 @@ def build_runtime_context_action_plan_view(
         close_gate_view=close_gate,
         lane_plan=lane_plan,
     )
+    worker_next_moves = [
+        {
+            "id": item.get("id", ""),
+            "next_action": item.get("next_action", ""),
+            "status": item.get("status", ""),
+            "is_next": bool(item.get("is_next")),
+            "requires": list(item.get("requires") or []),
+        }
+        for item in next_required_evidence
+        if isinstance(item, Mapping)
+    ]
     blocking_reasons: list[dict[str, Any]] = []
     if route_token_action.get("status") in {"missing", "stale"}:
         blocking_reasons.append(
@@ -4690,6 +4831,7 @@ def build_runtime_context_action_plan_view(
         "task_id": values.get("task_id", ""),
         "parent_task_id": values.get("parent_task_id", ""),
         "next_legal_action": next_legal_action,
+        "worker_next_moves": worker_next_moves,
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
@@ -4698,6 +4840,10 @@ def build_runtime_context_action_plan_view(
         "audit_archive_action": audit_archive_action,
         "merge_dependency_projection": merge_dependency_projection,
         "close_precheck_gap_projection": close_precheck_gap_projection,
+        "done_state_projection": close_precheck_gap_projection.get(
+            "done_state_projection",
+            {},
+        ),
         "close_blocker_explanation": close_blocker_explanation,
         "deferred_hardening": {
             "permission_tree": "deferred_next_layer",
@@ -4740,6 +4886,7 @@ def build_runtime_context_control_plane_view(
         "runtime_context_id": action_plan.get("runtime_context_id", ""),
         "task_id": action_plan.get("task_id", ""),
         "next_legal_action": action_plan.get("next_legal_action", ""),
+        "worker_next_moves": list(action_plan.get("worker_next_moves") or []),
         "next_required_evidence": list(
             action_plan.get("next_required_evidence") or []
         ),
@@ -4755,6 +4902,9 @@ def build_runtime_context_control_plane_view(
         ),
         "close_precheck_gap_projection": dict(
             action_plan.get("close_precheck_gap_projection") or {}
+        ),
+        "done_state_projection": dict(
+            action_plan.get("done_state_projection") or {}
         ),
         "close_blocker_explanation": dict(
             action_plan.get("close_blocker_explanation") or {}
@@ -4914,7 +5064,7 @@ def build_runtime_context_worker_view(
             "",
         ),
         "target_files": list(values.get("target_files") or []),
-        "owned_files": list(values.get("target_files") or []),
+        "owned_files": list(values.get("owned_files") or values.get("target_files") or []),
         "task": {
             key: values.get(key, "")
             for key in (
@@ -4970,9 +5120,11 @@ def build_runtime_context_worker_view(
         )
         or runtime_context_content_hash(capability_boundary),
         "lane_plan": dict(_runtime_context_mapping(current_view.get("lane_plan"))),
+        "worker_next_moves": list(action_plan.get("worker_next_moves") or []),
         "next_required_evidence": list(
             action_plan.get("next_required_evidence") or []
         ),
+        "done_state_projection": dict(action_plan.get("done_state_projection") or {}),
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,
         "action_plan": action_plan,

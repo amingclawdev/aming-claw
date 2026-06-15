@@ -232,7 +232,7 @@ def test_governance_mcp_runtime_context_current_tool_is_read_only(monkeypatch):
     assert calls == [
         (
             "GET",
-            "/api/graph-governance/aming-claw/parallel-branches/runtime-contexts/"
+            "/api/graph-governance/aming-claw/runtime-contexts/"
             "mfrctx-test/current-state?"
             "fence_token=fence-test&parent_task_id=AC-PARENT&view=all&graph_trace_id=gqt-test",
             None,
@@ -282,7 +282,7 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
     assert calls == [
         (
             "GET",
-            "/api/graph-governance/aming-claw/parallel-branches/runtime-contexts/"
+            "/api/graph-governance/aming-claw/runtime-contexts/"
             "mfrctx-test/worker-guide?"
             "fence_token=fence-test&parent_task_id=AC-PARENT&view=worker_view&"
             "graph_trace_id=gqt-test&session_token=session-test&"

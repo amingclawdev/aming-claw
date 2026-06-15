@@ -200,6 +200,43 @@ Bad:
 ```json
 {"project_id":"aming-claw","tool":"find_node_by_path","path":"agent/governance/server.py"}
 ```
+
+### Runtime Context Worker Guide
+
+Bounded `mf_sub` workers should start from the Runtime Context Service instead
+of reconstructing lane state from prompt text.
+
+- `runtime_context_worker_guide`: read the worker guide for one
+  `runtime_context_id`. Supply `parent_task_id`, `fence_token`,
+  `session_token`, and `target_project_root` from the launch envelope. The
+  guide is read-only and must not echo raw session, fence, route, or private
+  context material.
+- `runtime_context_current`: read the same role-filtered worker view before
+  each evidence write. Use it to refresh `next_legal_action`,
+  `next_required_evidence`, route identity, owned files, and close-gap state.
+- Read endpoints are available at
+  `/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/current-state`
+  and
+  `/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/runtime-contract`.
+- The worker guide exposes canonical write facades for read receipts, startup,
+  checkpoints, implementation evidence, finish-time worker attestation, and
+  finish gate. `close_ready` may still be a planned facade with a legacy
+  `task_timeline_append(event_kind=close_ready)` bridge; workers stop at
+  `review_ready` or `waiting_merge` and do not close backlog rows.
+- For graph discovery, use `graph_query` with
+  `query_source="mf_subagent"` and
+  `query_purpose="subagent_context_build"` or
+  `"subagent_gate_validation"`. Include `task_id`, `parent_task_id`,
+  `worker_role="mf_sub"`, `fence_token`, and the scoped `session_token`; the
+  runtime stores graph trace ids as DB evidence and must not persist raw tokens.
+- Route context is discovered from `runtime_context_current` /
+  `runtime_context_worker_guide` under the safe route identity fields:
+  `route_id`, `route_context_hash`, `prompt_contract_id`,
+  `prompt_contract_hash`, `visible_injection_manifest_hash`, and
+  `route_token_ref`.
+- Required worker evidence is ordered: read receipt, real startup, graph query
+  traces, implementation evidence with changed owned files and tests, finish
+  time worker attestation, finish gate, and checkpoint or review-ready handoff.
 - Direct Update graph is the preferred MVP path when HEAD and the active graph diverge:
   call governance `POST /api/graph-governance/{project_id}/reconcile/pending-scope`
   with `activate=true` and `semantic_use_ai=false`. Pass `target_commit_sha`

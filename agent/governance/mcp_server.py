@@ -710,7 +710,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
         return _http(
             "GET",
-            f"/api/graph-governance/{pid}/parallel-branches/runtime-contexts/"
+            f"/api/graph-governance/{pid}/runtime-contexts/"
             f"{runtime_context_id}/{suffix}{qs}",
         )
 

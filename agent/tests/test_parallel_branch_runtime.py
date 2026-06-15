@@ -856,10 +856,23 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         generated_at=NOW,
     ).to_dict()
 
+    current_values = projection["views"]["current"]["current_values"]
     read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
 
+    assert current_values["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert read_action["status"] == "missing"
     assert read_action["next_action"] == "submit_mf_subagent_read_receipt"
+    assert read_action["guide_id"] == "runtime_context_worker_guide.startup_bridge.v1"
+    assert read_action["guide_hash"].startswith("sha256:")
+    assert read_action["worker_identity"] == {
+        "runtime_context_id": projection["runtime_context_id"],
+        "task_id": "mf-sub-runtime-context",
+        "parent_task_id": "parent-runtime-context",
+        "backlog_id": "BUG-RUNTIME-CONTEXT",
+        "worker_role": "mf_sub",
+        "worker_id": "worker-runtime-context",
+        "worker_slot_id": "worker-runtime-context",
+    }
     assert read_action["entrypoint"] == {
         "method": "POST",
         "path": "/api/task/{project_id}/timeline",
@@ -887,6 +900,12 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "transcript_self_attestation",
         "record_startup",
     ]
+    contract_step = bridge["steps"][0]
+    assert contract_step["entrypoint"]["path"] == (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/runtime-contract"
+    )
+    assert "session_token" in contract_step["entrypoint"]["required_query_fields"]
     read_receipt_step = bridge["steps"][1]
     assert read_receipt_step["hash_bridge"]["accepted_inputs"] == [
         "read_receipt_hash",
@@ -894,10 +913,33 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     ]
     assert read_receipt_step["hash_bridge"]["startup_field"] == "read_receipt_hash"
     assert "observer_command_id" in read_receipt_step["required_payload_fields"]
+    graph_query_step = bridge["steps"][2]
+    assert graph_query_step["entrypoint"]["path"] == (
+        "/api/graph-governance/{project_id}/query"
+    )
+    assert graph_query_step["entrypoint"]["query_source"] == "mf_subagent"
+    assert graph_query_step["entrypoint"]["query_purpose"] == "subagent_context_build"
+    assert "runtime_context_id" in graph_query_step["entrypoint"]["required_body_fields"]
+    implementation_step = bridge["steps"][3]
+    assert implementation_step["owned_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+    assert implementation_step["evidence_to_file"] == [
+        "implementation_evidence",
+        "finish_time_worker_attestation",
+        "finish_gate",
+        "verification_or_test_results",
+    ]
     startup_step = bridge["steps"][-1]
     assert "worker_transcript_path" in startup_step["required_fields"]
     assert "graph_trace_ids" in startup_step["required_fields"]
     assert "close_satisfying=false" in startup_step["close_satisfying_rule"]
+    assert read_action["worker_next_moves"][0]["id"] == "query_runtime_contract"
+    assert read_action["worker_constraints"]["scope"]["owned_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+    assert "merge" in read_action["worker_constraints"]["blocked_actions"]
+    assert read_action["observer_remediation_actions"][0]["role"] == "observer"
 
     with_receipt = build_runtime_context_projection(
         context,
@@ -1629,6 +1671,7 @@ def test_runtime_context_current_values_read_nested_finish_gate_attestation() ->
     close_gate = projection["views"]["close_gate_view"]
     missing = {(item["gate"], item["field"]) for item in gate_inputs["missing"]}
     close_checklist = {item["id"]: item for item in close_gate["checklist"]}
+    done_state = projection["views"]["action_plan"]["done_state_projection"]
 
     assert current_values["worker_self_attesting"] is True
     assert current_values["worker_self_attestation"]["attestation_phase"] == "finish"
@@ -1638,6 +1681,9 @@ def test_runtime_context_current_values_read_nested_finish_gate_attestation() ->
     assert ("close", "worker_self_attesting") not in missing
     assert ("close", "verification_event_refs") in missing
     assert close_checklist["close_ready"]["status"] == "missing"
+    assert done_state["status"] == "gap_open"
+    assert done_state["close_gate_ready"] is False
+    assert "verification_event_refs" in done_state["missing_close_fields"]
     assert close_gate["ready"] is False
 
 
@@ -1931,6 +1977,12 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     assert worker_view["control_plane"]["capability_boundary"] == boundary
     assert worker_view["control_plane"]["capability_boundary_hash"] == (
         boundary["capability_boundary_hash"]
+    )
+    assert worker_view["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
+    assert worker_view["worker_next_moves"] == []
+    assert worker_view["done_state_projection"]["status"] == "review_ready"
+    assert worker_view["control_plane"]["done_state_projection"]["status"] == (
+        "review_ready"
     )
     dispatch_fence = worker_view["gate_inputs"]["gates"]["dispatch"]["fields"][
         "fence_token"
