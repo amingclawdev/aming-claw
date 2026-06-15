@@ -68,6 +68,7 @@ OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION = "observer_poll_timeline_payload.
 DOGFOOD_OBSERVER_PLAN_SCHEMA_VERSION = "observer_dogfood_plan.v1"
 OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION = "observer_runtime_text_context.v1"
 OBSERVER_RUNTIME_TEXT_SERVICE_SCHEMA_VERSION = "observer_runtime_text_service.v1"
+OBSERVER_WORKER_LAUNCH_PACK_SCHEMA_VERSION = "observer_worker_launch_pack.v1"
 ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION = "observer_one_hop_execution_gate.v1"
 EXECUTE_BACKLOG_ROW_COMMAND_TYPE = "execute_backlog_row"
 EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS = (
@@ -107,6 +108,75 @@ RUNTIME_TEXT_REQUIRED_EVIDENCE = (
     "first_progress_evidence",
     "finish_gate",
 )
+WORKER_LAUNCH_PACK_REQUIRED_FIELDS = (
+    "schema_version",
+    "project_id",
+    "backlog_id",
+    "task_id",
+    "runtime_context_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "worker_role",
+    "branch",
+    "worktree_path",
+    "base_commit",
+    "target_head_commit",
+    "fence_token",
+    "owned_files",
+    "merge_queue_id",
+    "graph_query_schema_trace_id",
+    "context_pack_refs",
+    "context_pack_status",
+    "worker_guide_ref",
+    "worker_guide_hash",
+    "worker_guide_status",
+    "allowed_actions",
+    "blocked_actions",
+    "next_legal_action",
+    "startup_preflight",
+    "required_evidence",
+    "transcript_refs",
+    "transcript_digests",
+)
+WORKER_LAUNCH_PACK_ALLOWED_ACTIONS = (
+    "submit_mf_subagent_read_receipt",
+    "record_mf_subagent_startup",
+    "run_worker_graph_query",
+    "patch_owned_files",
+    "run_focused_tests",
+    "record_implementation_evidence",
+    "record_finish_time_worker_attestation",
+    "record_finish_gate",
+    "report_review_ready",
+    "report_waiting_merge",
+)
+WORKER_LAUNCH_PACK_BLOCKED_ACTIONS = (
+    "author_worker_evidence_as_observer",
+    "bypass_timeline_gate",
+    "surrogate_startup",
+    "raw_token_exfiltration",
+    "merge",
+    "push",
+    "activate_graph",
+    "release_gate",
+    "create_task",
+    "delete_worktree",
+    "modify_merge_queue",
+    "close_backlog_without_close_ready",
+)
+WORKER_LAUNCH_PACK_OBSERVER_ONLY_NEXT_ACTIONS = {
+    "record_work_mode_transition",
+    "dispatch_bounded_worker",
+    "observer_dispatch_bounded_worker",
+    "route_action_precheck",
+    "merge",
+    "close",
+    "close_backlog",
+    "modify_merge_queue",
+}
 RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS = (
     "/parallel-branches/allocate",
     "parallel-branches/allocate",
@@ -300,6 +370,17 @@ class ObserverRuntimeTextPrepareRequest:
     route_id: str = ""
     precheck_run_id: str = ""
     visible_injection_manifest_hash: str = ""
+    graph_query_schema_trace_id: str = ""
+    context_pack_refs: tuple[str, ...] = ()
+    context_pack_status: str = ""
+    context_pack_resolution: Mapping[str, Any] = field(default_factory=dict)
+    worker_guide_ref: str = ""
+    worker_guide_hash: str = ""
+    worker_guide_status: str = ""
+    worker_next_legal_action: str = ""
+    startup_prerequisites: Mapping[str, Any] = field(default_factory=dict)
+    transcript_refs: tuple[str, ...] = ()
+    transcript_digests: tuple[str, ...] = ()
     selected_topology: str = RUNTIME_TEXT_DEFAULT_TOPOLOGY
     recommended_topology: str = RUNTIME_TEXT_DEFAULT_TOPOLOGY
 
@@ -667,6 +748,11 @@ def build_observer_poll_plan(
 def _stable_suffix(*parts: str, length: int = 12) -> str:
     payload = "\n".join(str(part or "") for part in parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
+
+
+def _stable_json_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _normalize_path(path: str) -> str:
@@ -3405,6 +3491,299 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
     )
 
 
+def _runtime_text_context_pack_status(
+    request: ObserverRuntimeTextPrepareRequest,
+) -> tuple[list[str], str, dict[str, Any]]:
+    refs = _runtime_text_items(request.context_pack_refs)
+    resolution = (
+        dict(request.context_pack_resolution)
+        if isinstance(request.context_pack_resolution, Mapping)
+        else {}
+    )
+    status = str(
+        request.context_pack_status
+        or resolution.get("status")
+        or resolution.get("resolution_status")
+        or ""
+    ).strip()
+    if not status:
+        status = "not_required" if not refs and not resolution else "ready"
+    return refs, status, resolution
+
+
+def _runtime_text_worker_launch_pack(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    context: Any,
+    runtime_context_id: str,
+    observer_command_id: str,
+    parent_task_id: str,
+    owned_files: Sequence[str],
+    runtime_context_projection: Mapping[str, Any],
+    runtime_context_projection_diagnostics: Mapping[str, Any],
+    branch_runtime_evidence: Mapping[str, Any],
+    dispatch_gate_validation: Mapping[str, Any],
+    graph_first_obligations: Mapping[str, Any],
+    launch_text_hash: str,
+) -> dict[str, Any]:
+    context_pack_refs, context_pack_status, context_pack_resolution = (
+        _runtime_text_context_pack_status(request)
+    )
+    graph_query_schema_trace_id = (
+        request.graph_query_schema_trace_id
+        or (request.graph_trace_ids[0] if request.graph_trace_ids else "")
+    )
+    worker_guide_ref = request.worker_guide_ref or (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/worker-guide"
+    )
+    worker_guide_ref = worker_guide_ref.format(
+        project_id=request.project_id,
+        runtime_context_id=runtime_context_id,
+    )
+    worker_guide_status = str(request.worker_guide_status or "ready").strip()
+    next_legal_action = str(
+        request.worker_next_legal_action or "submit_mf_subagent_read_receipt"
+    ).strip()
+    required_evidence = [
+        {
+            "id": "runtime_context_read_receipt",
+            "required": True,
+            "producer": "mf_subagent_worker",
+            "expected_source": "task_timeline.mf_subagent_read_receipt",
+        },
+        {
+            "id": "mf_subagent_startup",
+            "required": True,
+            "producer": "mf_subagent_worker",
+            "expected_source": "task_timeline.mf_subagent_startup",
+        },
+        {
+            "id": "worker_graph_trace",
+            "required": True,
+            "producer": "graph_query_trace",
+            "query_source": "mf_subagent",
+        },
+        {
+            "id": "implementation_evidence",
+            "required": True,
+            "producer": "runtime_context.implementation_evidence",
+        },
+        {
+            "id": "finish_time_worker_attestation",
+            "required": True,
+            "producer": "worker_transcript_verify",
+        },
+        {
+            "id": "finish_gate",
+            "required": True,
+            "producer": "mf_subagent_worker",
+            "done_state": ["review_ready", "waiting_merge"],
+        },
+    ]
+    worker_guide = {
+        "schema_version": "worker_guide.schema.v1",
+        "guide_id": f"{runtime_context_id}:worker-guide:{context.task_id}",
+        "backlog_id": request.backlog_id,
+        "worker_role": "mf_sub",
+        "bounded_scope": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "branch": context.branch_ref,
+            "worktree_path": context.worktree_path,
+            "owned_files": list(owned_files),
+        },
+        "worker_next_moves": [
+            "submit_mf_subagent_read_receipt",
+            "record_mf_subagent_startup",
+            "run_worker_graph_query",
+            "patch_owned_files",
+            "run_focused_tests",
+            "record_implementation_evidence",
+            "record_finish_time_worker_attestation",
+            "record_finish_gate",
+            "report_review_ready_or_waiting_merge",
+        ],
+        "observer_remediation": [
+            "repair_route_identity",
+            "resolve_context_packs",
+            "refresh_runtime_context_projection",
+        ],
+        "constraints": {
+            "allowed_actions": list(WORKER_LAUNCH_PACK_ALLOWED_ACTIONS),
+            "blocked_actions": list(WORKER_LAUNCH_PACK_BLOCKED_ACTIONS),
+            "raw_tokens_persisted": False,
+            "worker_evidence_substitution_allowed": False,
+        },
+        "tests_to_run": list(request.test_commands),
+        "evidence_to_file": required_evidence,
+        "done_state": ["review_ready", "waiting_merge"],
+    }
+    worker_guide_hash = request.worker_guide_hash or _stable_json_hash(worker_guide)
+    blockers: list[dict[str, Any]] = []
+
+    def add_blocker(code: str, message: str, **details: Any) -> None:
+        blockers.append({"code": code, "message": message, **details})
+
+    projection_mismatches: list[dict[str, str]] = []
+    for field_name, expected in (
+        ("route_id", request.route_id),
+        ("route_context_hash", request.route.route_context_hash),
+        ("prompt_contract_id", request.route.prompt_contract_id),
+        ("prompt_contract_hash", request.route.prompt_contract_hash),
+        ("route_token_ref", request.route.route_token_ref),
+    ):
+        actual = _runtime_text_projection_value(runtime_context_projection, field_name)
+        actual_text = str(actual or "").strip()
+        expected_text = str(expected or "").strip()
+        if actual_text and expected_text and actual_text != expected_text:
+            projection_mismatches.append(
+                {
+                    "field": field_name,
+                    "expected": expected_text,
+                    "actual": actual_text,
+                }
+            )
+    if any(item["field"] == "route_context_hash" for item in projection_mismatches):
+        add_blocker(
+            "stale_route_context",
+            "runtime context projection route hash differs from canonical route",
+            mismatches=projection_mismatches,
+        )
+    if projection_mismatches:
+        add_blocker(
+            "stale_route_identity",
+            "runtime context projection route identity differs from canonical route",
+            mismatches=projection_mismatches,
+        )
+    if not request.route.route_token_ref:
+        add_blocker(
+            "missing_route_token_ref",
+            "worker launch requires a route_token_ref or accepted source-event lineage",
+        )
+    guide_status_normalized = worker_guide_status.lower()
+    if guide_status_normalized in {"", "missing", "not_found"}:
+        add_blocker("missing_worker_guide", "worker guide is missing")
+    elif guide_status_normalized not in {"ready", "ok", "available"}:
+        add_blocker(
+            "worker_guide_not_ready",
+            "worker guide is present but not ready for worker launch",
+            worker_guide_status=worker_guide_status,
+        )
+    if next_legal_action in WORKER_LAUNCH_PACK_OBSERVER_ONLY_NEXT_ACTIONS:
+        add_blocker(
+            "observer_only_next_action",
+            "next legal action is observer-only and cannot be assigned to a worker",
+            next_legal_action=next_legal_action,
+        )
+    if not runtime_context_projection_diagnostics.get("passed"):
+        add_blocker(
+            "stale_projection",
+            "runtime context projection is missing required startup/finish fields",
+            diagnostics=dict(runtime_context_projection_diagnostics),
+        )
+    if not str(getattr(context, "merge_queue_id", "") or "").strip():
+        add_blocker("unresolved_merge_queue", "worker launch requires merge_queue_id")
+    if not str(getattr(context, "fence_token", "") or "").strip():
+        add_blocker("unresolved_fence", "worker launch requires a fence_token")
+    if context_pack_status not in {
+        "ready",
+        "ok",
+        "resolved",
+        "not_required",
+        "fallback_recorded",
+    }:
+        add_blocker(
+            "unresolved_context_packs",
+            "context packs are unresolved for this worker launch",
+            context_pack_status=context_pack_status,
+        )
+
+    startup_prerequisites = {
+        "observer_command_id": bool(observer_command_id),
+        "branch_runtime_registered": not bool(
+            branch_runtime_evidence.get("allocation_required")
+        ),
+        "route_context_hash": bool(request.route.route_context_hash),
+        "prompt_contract_id": bool(request.route.prompt_contract_id),
+        **{
+            str(key): bool(value)
+            for key, value in (
+                request.startup_prerequisites.items()
+                if isinstance(request.startup_prerequisites, Mapping)
+                else []
+            )
+        },
+    }
+    missing_prerequisites = [
+        key for key, present in startup_prerequisites.items() if not present
+    ]
+    if missing_prerequisites:
+        add_blocker(
+            "missing_startup_prerequisites",
+            "worker launch is missing startup prerequisites",
+            missing=missing_prerequisites,
+        )
+
+    startup_preflight = {
+        "schema_version": "observer_worker_launch_pack.startup_preflight.v1",
+        "allowed": not blockers,
+        "status": "passed" if not blockers else "blocked",
+        "fail_closed": True,
+        "blockers": blockers,
+        "graph_query_schema_trace_id": graph_query_schema_trace_id,
+        "dispatch_gate_allowed": bool(dispatch_gate_validation.get("allowed")),
+        "startup_prerequisites": startup_prerequisites,
+    }
+    pack = {
+        "schema_version": OBSERVER_WORKER_LAUNCH_PACK_SCHEMA_VERSION,
+        "required_fields": list(WORKER_LAUNCH_PACK_REQUIRED_FIELDS),
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": context.task_id,
+        "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "parent_task_id": parent_task_id,
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "worker_role": "mf_sub",
+        "branch": context.branch_ref,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "fence_token": context.fence_token,
+        "owned_files": list(owned_files),
+        "merge_queue_id": context.merge_queue_id,
+        "graph_query_schema_trace_id": graph_query_schema_trace_id,
+        "context_pack_refs": context_pack_refs,
+        "context_pack_status": context_pack_status,
+        "context_pack_resolution": context_pack_resolution,
+        "worker_guide_ref": worker_guide_ref,
+        "worker_guide_hash": worker_guide_hash,
+        "worker_guide_status": worker_guide_status,
+        "worker_guide": worker_guide,
+        "allowed_actions": list(WORKER_LAUNCH_PACK_ALLOWED_ACTIONS),
+        "blocked_actions": list(WORKER_LAUNCH_PACK_BLOCKED_ACTIONS),
+        "next_legal_action": next_legal_action,
+        "startup_preflight": startup_preflight,
+        "required_evidence": required_evidence,
+        "transcript_refs": _runtime_text_items(request.transcript_refs),
+        "transcript_digests": _runtime_text_items(request.transcript_digests),
+        "launch_text_hash": launch_text_hash,
+        "graph_first_obligations": dict(graph_first_obligations),
+        "raw_tokens_persisted": False,
+    }
+    pack["worker_launch_pack_hash"] = _stable_json_hash(
+        {key: value for key, value in pack.items() if key != "worker_launch_pack_hash"}
+    )
+    return pack
+
+
 def build_observer_runtime_text_context(
     request: ObserverRuntimeTextPrepareRequest,
 ) -> dict[str, Any]:
@@ -3790,12 +4169,44 @@ def build_observer_runtime_text_context(
                 "receipt evidence can be prepared"
             ),
         }
-    ok = (
+    preliminary_ok = (
         bool(dispatch_gate_validation.get("allowed"))
         and not input_error
         and not projection_missing
         and not observer_command_missing
     )
+    worker_launch_pack = _runtime_text_worker_launch_pack(
+        request=request,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
+        parent_task_id=parent_task_id,
+        owned_files=owned_files,
+        runtime_context_projection=runtime_context_projection,
+        runtime_context_projection_diagnostics=runtime_context_projection_diagnostics,
+        branch_runtime_evidence=branch_runtime_evidence,
+        dispatch_gate_validation=dispatch_gate_validation,
+        graph_first_obligations=graph_first_obligations,
+        launch_text_hash=launch_text_hash,
+    )
+    worker_launch_pack_preflight = dict(
+        worker_launch_pack.get("startup_preflight") or {}
+    )
+    if not worker_launch_pack_preflight.get("allowed"):
+        preflight_status = (
+            "worker_launch_pack_preflight_failed"
+            if preliminary_ok
+            else str(dispatch_gate_validation.get("status") or "")
+            or "worker_launch_pack_preflight_failed"
+        )
+        dispatch_gate_validation = {
+            **dispatch_gate_validation,
+            "allowed": False,
+            "status": preflight_status,
+            "error": "worker launch pack startup preflight failed closed",
+            "worker_launch_pack_preflight": worker_launch_pack_preflight,
+        }
+    ok = preliminary_ok and bool(worker_launch_pack_preflight.get("allowed"))
     startup_intent_event = (
         _runtime_text_startup_intent_event(
             request=request,
@@ -3874,6 +4285,10 @@ def build_observer_runtime_text_context(
             "close_ready": False,
             "startup_recording": startup_recording,
             "startup_intent_event": startup_intent_event,
+            "worker_launch_pack_hash": worker_launch_pack.get(
+                "worker_launch_pack_hash",
+                "",
+            ),
         },
         "startup_intent_event": startup_intent_event,
         "startup_recording": startup_recording,
@@ -3881,6 +4296,7 @@ def build_observer_runtime_text_context(
         "runtime_context": asdict(context),
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
+        "worker_launch_pack": worker_launch_pack,
         "startup_token_join_gaps": startup_token_join_gaps,
         "next_legal_action": dispatch_gate_validation.get("next_legal_action") or {},
         "branch_identity": launch_payload["branch_identity"],

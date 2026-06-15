@@ -24706,6 +24706,7 @@ def _persist_observer_runtime_text_contract_revision(
         conn.close()
 
 
+@route("POST", "/api/projects/{project_id}/observer/worker-launch-pack/prepare")
 @route("POST", "/api/projects/{project_id}/observer/runtime-text/prepare")
 def handle_observer_runtime_text_prepare(ctx: RequestContext):
     """Prepare host/Codex mf_sub launch text plus startup intent packet."""
@@ -24782,6 +24783,29 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         visible_injection_manifest_hash=str(
             body.get("visible_injection_manifest_hash") or ""
         ),
+        graph_query_schema_trace_id=str(body.get("graph_query_schema_trace_id") or ""),
+        context_pack_refs=tuple(
+            str(item) for item in (body.get("context_pack_refs") or [])
+        ),
+        context_pack_status=str(body.get("context_pack_status") or ""),
+        context_pack_resolution=(
+            body.get("context_pack_resolution")
+            if isinstance(body.get("context_pack_resolution"), Mapping)
+            else {}
+        ),
+        worker_guide_ref=str(body.get("worker_guide_ref") or ""),
+        worker_guide_hash=str(body.get("worker_guide_hash") or ""),
+        worker_guide_status=str(body.get("worker_guide_status") or ""),
+        worker_next_legal_action=str(body.get("worker_next_legal_action") or ""),
+        startup_prerequisites=(
+            body.get("startup_prerequisites")
+            if isinstance(body.get("startup_prerequisites"), Mapping)
+            else {}
+        ),
+        transcript_refs=tuple(str(item) for item in (body.get("transcript_refs") or [])),
+        transcript_digests=tuple(
+            str(item) for item in (body.get("transcript_digests") or [])
+        ),
     )
     prepared = build_observer_runtime_text_context(request)
     revision = _persist_observer_runtime_text_contract_revision(
@@ -24820,6 +24844,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "branch_runtime_evidence": branch_runtime_evidence,
         "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
+        "worker_launch_pack": dict(prepared.get("worker_launch_pack") or {}),
         "full_payload_path": full_payload_path,
         "full_payload_sha256": full_payload_sha256,
         "request_id": str(ctx.request_id),

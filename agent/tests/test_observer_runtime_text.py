@@ -230,6 +230,93 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         == "observer_runtime_text"
     )
 
+    launch_pack = result["worker_launch_pack"]
+    assert launch_pack["schema_version"] == "observer_worker_launch_pack.v1"
+    assert set(launch_pack["required_fields"]).issubset(launch_pack)
+    assert launch_pack["project_id"] == "aming-claw"
+    assert launch_pack["backlog_id"] == "AC-RUNTIME-TEXT"
+    assert launch_pack["task_id"] == "AC-RUNTIME-TEXT-impl-1"
+    assert launch_pack["runtime_context_id"] == "mfrctx-runtime-text"
+    assert launch_pack["route_id"] == "route-20260603-runtime"
+    assert launch_pack["route_context_hash"] == "sha256:route"
+    assert launch_pack["prompt_contract_id"] == "rprompt-runtime"
+    assert launch_pack["prompt_contract_hash"] == "sha256:prompt"
+    assert launch_pack["route_token_ref"] == "route-token-ref"
+    assert launch_pack["worker_role"] == "mf_sub"
+    assert launch_pack["branch"] == "refs/heads/runtime-text/ac-runtime-text-impl-1"
+    assert launch_pack["worktree_path"].endswith(
+        ".worktrees/worker-1/ac-runtime-text-impl-1"
+    )
+    assert launch_pack["base_commit"] == "base123"
+    assert launch_pack["target_head_commit"] == "target123"
+    assert launch_pack["fence_token"] == "fence-runtime-text"
+    assert launch_pack["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
+    assert launch_pack["merge_queue_id"] == "mq-runtime-text"
+    assert launch_pack["graph_query_schema_trace_id"] == "gqt-runtime-text"
+    assert launch_pack["context_pack_refs"] == []
+    assert launch_pack["context_pack_status"] == "not_required"
+    assert launch_pack["worker_guide_status"] == "ready"
+    assert launch_pack["worker_guide_ref"].endswith("/worker-guide")
+    assert launch_pack["worker_guide_hash"].startswith("sha256:")
+    assert launch_pack["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert "submit_mf_subagent_read_receipt" in launch_pack["allowed_actions"]
+    assert "merge" in launch_pack["blocked_actions"]
+    assert launch_pack["startup_preflight"]["allowed"] is True
+    assert launch_pack["startup_preflight"]["status"] == "passed"
+    assert launch_pack["startup_preflight"]["blockers"] == []
+    assert "runtime_context_read_receipt" in {
+        item["id"] for item in launch_pack["required_evidence"]
+    }
+    assert launch_pack["transcript_refs"] == []
+    assert launch_pack["transcript_digests"] == []
+    assert result["persistent_evidence"]["worker_launch_pack_hash"] == (
+        launch_pack["worker_launch_pack_hash"]
+    )
+
+
+def test_runtime_text_worker_launch_pack_rejects_missing_route_token_ref(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            route=RoutePromptContract(
+                route_context_hash="sha256:route",
+                prompt_contract_id="rprompt-runtime",
+                prompt_contract_hash="sha256:prompt",
+                route_token_ref="",
+            ),
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "rejected"
+    launch_pack = result["worker_launch_pack"]
+    assert launch_pack["startup_preflight"]["allowed"] is False
+    assert "missing_route_token_ref" in {
+        item["code"] for item in launch_pack["startup_preflight"]["blockers"]
+    }
+    assert result["dispatch_gate_validation"]["status"] in {
+        "missing_startup_token_join",
+        "worker_launch_pack_preflight_failed",
+    }
+
+
+def test_runtime_text_worker_launch_pack_rejects_observer_only_next_action(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            worker_guide_status="ready",
+            worker_next_legal_action="dispatch_bounded_worker",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "rejected"
+    launch_pack = result["worker_launch_pack"]
+    assert launch_pack["next_legal_action"] == "dispatch_bounded_worker"
+    assert "observer_only_next_action" in {
+        item["code"] for item in launch_pack["startup_preflight"]["blockers"]
+    }
+
 
 def test_runtime_text_builder_rejects_missing_observer_command_id(tmp_path):
     result = build_observer_runtime_text_context(
