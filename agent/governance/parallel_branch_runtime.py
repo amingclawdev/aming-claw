@@ -2631,22 +2631,36 @@ def _runtime_context_current_values(
     verification_event_refs = _runtime_context_string_list(
         timeline_refs.get("verification_event_refs")
     )
+    finish_gate_payload = _runtime_context_mapping(finish_gate.get("payload"))
     worker_self_attestation = public_contract_revision_payload(
-        startup_gate.get("worker_self_attestation")
-        or finish_gate.get("worker_self_attestation")
+        finish_gate.get("worker_self_attestation")
+        or finish_gate_payload.get("worker_self_attestation")
         or {}
     )
+    worker_self_attestation_gate = _runtime_context_mapping(
+        finish_gate.get("worker_self_attestation_gate")
+        or finish_gate_payload.get("worker_self_attestation_gate")
+    )
     worker_self_attesting = bool(worker_self_attestation) and bool(
-        startup_gate.get("worker_self_attesting")
-        or startup_gate.get("self_attesting")
-        or worker_self_attestation.get("worker_self_attesting")
+        worker_self_attestation.get("worker_self_attesting")
         or worker_self_attestation.get("self_attesting")
     )
+    worker_self_attesting = worker_self_attesting and bool(
+        worker_self_attestation.get("finish_time_self_attesting")
+    )
+    worker_self_attesting = worker_self_attesting and not bool(
+        worker_self_attestation.get("finish_time_blockers") or []
+    )
+    if worker_self_attestation_gate:
+        worker_self_attesting = worker_self_attesting and bool(
+            worker_self_attestation_gate.get("passed")
+        )
     worker_self_attesting = worker_self_attesting and _runtime_context_text(
-        worker_self_attestation.get("status")
-        or startup_gate.get("worker_self_attestation_status")
-        or "passed"
+        worker_self_attestation.get("status") or "passed"
     ).lower() in {"passed", "ok", "success", "succeeded"}
+    worker_self_attesting = worker_self_attesting and _runtime_context_text(
+        worker_self_attestation.get("attestation_phase")
+    ).lower() != "startup"
     fence_token_hash = runtime_context_secret_hash(context.fence_token)
     return {
         "project_id": context.project_id,
@@ -3088,7 +3102,7 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
         },
         {
             "field": "worker_self_attesting",
-            "expected_source": "worker_transcript_verify.worker_self_attestation",
+            "expected_source": "worker_transcript_verify.finish_time_worker_self_attestation",
             "producer": "worker_transcript_verify",
             "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
             "evidence_ref": "finish_gate",
@@ -3146,7 +3160,7 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
         },
         {
             "field": "worker_self_attesting",
-            "expected_source": "worker_transcript_verify.worker_self_attestation",
+            "expected_source": "worker_transcript_verify.finish_time_worker_self_attestation",
             "producer": "worker_transcript_verify",
             "consumer": "close_gate",
             "evidence_ref": "finish_gate",
@@ -3556,7 +3570,7 @@ def build_runtime_context_close_gate_view(
         ("observer_command", "observer_command_id"),
         ("startup_evidence", "startup_event_ref"),
         ("read_receipt", "read_receipt_event_ref"),
-        ("worker_self_attestation", "worker_self_attesting"),
+        ("finish_time_worker_attestation", "worker_self_attesting"),
         ("finish_gate", "finish_gate_ref"),
         ("close_ready", "close_ready_event_ref"),
         ("checkpoint", "checkpoint_id"),
@@ -4008,7 +4022,9 @@ def _runtime_context_close_blocker_explanation(
         "finish_gate_ref": "record the worker finish gate after implementation is complete",
         "verification_event_refs": "record independent verification evidence for the focused tests/checks",
         "graph_trace_ids": "run worker-scoped graph queries and attach trace ids",
-        "worker_self_attesting": "include worker self-attestation accepted by the finish gate",
+        "worker_self_attesting": (
+            "include finish-time worker self-attestation accepted by the finish gate"
+        ),
         "route_token_ref": "refresh route_token_ref under the canonical route identity",
         "route_context_hash": "restore canonical route context hash evidence",
         "prompt_contract_hash": "restore prompt contract hash evidence",
@@ -4303,7 +4319,7 @@ def _runtime_context_next_legal_action(
         ("checkpoint_id", "record_checkpoint"),
         ("verification_event_refs", "record_independent_verification"),
         ("graph_trace_ids", "run_worker_graph_query"),
-        ("worker_self_attesting", "record_worker_self_attestation"),
+        ("worker_self_attesting", "record_finish_time_worker_attestation"),
         ("close_ready_event_ref", "record_close_ready"),
     ):
         if field in missing_fields:
@@ -4430,13 +4446,13 @@ def _runtime_context_next_required_evidence(
     if "worker_self_attesting" in missing_fields:
         requires = ["worker_graph_trace"] if "worker_graph_trace" in seen else []
         _add(
-            item_id="worker_self_attestation",
+            item_id="finish_time_worker_attestation",
             field="worker_self_attesting",
             gate="finish",
-            next_action="record_worker_self_attestation",
+            next_action="record_finish_time_worker_attestation",
             producer="worker_transcript_verify",
             consumer="mf_subagent_contract.validate_mf_subagent_finish_gate",
-            expected_source="worker_transcript_verify.worker_self_attestation",
+            expected_source="worker_transcript_verify.finish_time_worker_self_attestation",
             evidence_ref="finish_gate",
             close_satisfying_required=True,
             requires=requires,
@@ -4444,7 +4460,7 @@ def _runtime_context_next_required_evidence(
     if "finish_gate_ref" in missing_fields:
         requires = [
             evidence_id
-            for evidence_id in ("worker_graph_trace", "worker_self_attestation")
+            for evidence_id in ("worker_graph_trace", "finish_time_worker_attestation")
             if evidence_id in seen
         ]
         _add(

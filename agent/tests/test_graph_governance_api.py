@@ -271,6 +271,21 @@ def _finish_gate_evidence(
                 "blockers": [],
             },
         },
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": f"session-{fence_token}",
+            "filer_principal": f"session-{fence_token}",
+            "worker_transcript_path": f"/tmp/transcript-{fence_token}.jsonl",
+            "harness_type": "codex",
+            "blockers": [],
+        },
         "read_receipt_hash": f"sha256:read-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
     }
@@ -2966,10 +2981,10 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert worker_view["action_plan"]["next_required_evidence"] == next_required
     assert worker_view["control_plane"]["next_required_evidence"] == next_required
     assert [item["id"] for item in next_required[:2]] == [
-        "worker_self_attestation",
+        "finish_time_worker_attestation",
         "finish_gate",
     ]
-    assert next_required[0]["next_action"] == "record_worker_self_attestation"
+    assert next_required[0]["next_action"] == "record_finish_time_worker_attestation"
     assert next_required[1]["runtime_context_id"] == context.runtime_context_id
     assert "current_values" not in worker_view
     assert "fence-current" not in json.dumps(worker_result, sort_keys=True)
@@ -4358,7 +4373,28 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
         event_kind="mf_subagent_finish_gate",
         phase="finish_gate",
         status="passed",
-        payload={"graph_trace_ids": ["gqt-finish-payload"]},
+        payload={
+            "graph_trace_ids": ["gqt-finish-payload"],
+            "worker_self_attestation_gate": {
+                "passed": True,
+                "blockers": [],
+            },
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "ok": True,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "codex-session-runtime-a4",
+                "filer_principal": "codex-session-runtime-a4",
+                "worker_transcript_path": "/tmp/runtime-a4-transcript.jsonl",
+                "harness_type": "codex",
+                "blockers": [],
+            },
+        },
     )
     task_timeline.record_event(
         conn,
@@ -14632,6 +14668,21 @@ def _surrogate_finish_gate_body(
         "read_receipt_hash": f"sha256:rr-{fence_token}",
         "read_receipt_event_id": f"rr-{fence_token}",
         "observer_command_id": f"cmd-{fence_token}",
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": f"session-{task_id}",
+            "filer_principal": f"session-{task_id}",
+            "worker_transcript_path": f"/tmp/transcript-{task_id}.jsonl",
+            "harness_type": "codex",
+            "blockers": [],
+        },
     }
     if real_startup_events is not None:
         body["real_startup_events"] = real_startup_events

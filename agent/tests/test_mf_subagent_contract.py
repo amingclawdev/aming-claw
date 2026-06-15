@@ -440,6 +440,11 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
         "finish_gate": {
             "checkpoint_id": "ckpt-runtime-context",
             "test_results": {"status": "passed"},
+            "worker_self_attestation_gate": {"passed": True},
+            "worker_self_attestation": _finish_time_worker_attestation(
+                worker_session_id="worker-runtime-context",
+                transcript_path="/tmp/worker-runtime-context.jsonl",
+            ),
         },
         "generated_at": "2026-06-06T00:00:00Z",
     }
@@ -2610,6 +2615,32 @@ def _self_attested_startup_fields(
     }
 
 
+def _finish_time_worker_attestation(
+    *,
+    worker_session_id: str = "worker-session-codex-1",
+    transcript_path: str = "/tmp/worker-session-codex-1.jsonl",
+    harness_type: str = "codex",
+    **overrides: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "worker_transcript_self_attestation.v1",
+        "attestation_phase": "finish",
+        "status": "passed",
+        "ok": True,
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "finish_time_self_attesting": True,
+        "finish_time_blockers": [],
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "worker_transcript_path": transcript_path,
+        "harness_type": harness_type,
+        "blockers": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": "mf_subagent_startup_gate.v1",
@@ -2851,6 +2882,7 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
             "checkpoint_id": "ckpt-finish",
             "fence_token": "fence-2",
             "summary": "Ready.",
+            "worker_self_attestation": _finish_time_worker_attestation(),
             "mf_subagent_startup_gate": _finish_startup_evidence(),
             "real_startup_events": [_startup_event(_finish_startup_evidence())],
             "read_receipt_hash": "sha256:read-finish",
@@ -2873,7 +2905,168 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["receipt_gate"]["startup_present"] is True
     assert gate["finish_precheck"]["parent_main_clean"] is True
     assert gate["finish_precheck"]["owned_file_scope_passed"] is True
+    assert gate["startup_worker_identity_gate"]["passed"] is True
+    assert gate["worker_self_attestation_gate"]["passed"] is True
+    assert gate["worker_self_attestation_gate"]["attestation_phase"] == "finish"
+    assert gate["worker_self_attestation"]["finish_time_self_attesting"] is True
     assert gate["close_ready"] is True
+
+
+def test_finish_gate_accepts_startup_at_base_commit_with_finish_time_attestation() -> None:
+    startup_evidence = _finish_startup_evidence(head_commit="base123")
+
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": "ckpt-finish-worker-head",
+            "fence_token": "fence-2",
+            "summary": "Ready.",
+            "real_startup_events": [_startup_event(startup_evidence)],
+            "read_receipt_hash": "sha256:read-finish",
+            "read_receipt_event_id": "2873",
+            "finish_time_worker_self_attestation": (
+                _finish_time_worker_attestation()
+            ),
+        },
+        context=_context(),
+    )
+
+    assert gate["startup_evidence"]["head_commit"] == "base123"
+    assert gate["head_commit"] == "head456"
+    assert gate["startup_worker_identity_gate"]["passed"] is True
+    assert gate["worker_self_attestation_gate"]["passed"] is True
+    assert gate["worker_self_attestation"]["finish_time_self_attesting"] is True
+    assert gate["close_ready"] is True
+
+
+def test_finish_gate_requires_finish_time_worker_attestation() -> None:
+    with pytest.raises(
+        MfSubagentContractError,
+        match="missing_finish_time_worker_self_attestation",
+    ):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-missing-attestation",
+                "fence_token": "fence-2",
+                "summary": "Ready.",
+                "real_startup_events": [_startup_event(_finish_startup_evidence())],
+                "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_startup_phase_attestation_as_finish_evidence() -> None:
+    with pytest.raises(
+        MfSubagentContractError,
+        match="attestation_phase_startup_not_finish",
+    ):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-startup-phase-attestation",
+                "fence_token": "fence-2",
+                "summary": "Ready.",
+                "real_startup_events": [_startup_event(_finish_startup_evidence())],
+                "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
+                "worker_self_attestation": _finish_time_worker_attestation(
+                    attestation_phase="startup",
+                ),
+            },
+            context=_context(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_blocker"),
+    [
+        ({"filer_principal": None}, "missing_filer_principal"),
+        (
+            {"filer_principal": "observer"},
+            "finish_attestation_filer_is_generic_or_observer",
+        ),
+        (
+            {"filer_principal": "mf sub"},
+            "finish_attestation_filer_is_generic_or_observer",
+        ),
+        (
+            {"filer_principal": "session-other"},
+            "finish_attestation_filer_principal_not_worker_session",
+        ),
+        ({"filed_on_behalf": True}, "finish_attestation_filed_on_behalf"),
+        (
+            {"filed_on_behalf_by": "observer"},
+            "finish_attestation_filed_on_behalf",
+        ),
+    ],
+)
+def test_finish_gate_requires_finish_attestation_filed_by_worker_session(
+    overrides: dict[str, object],
+    expected_blocker: str,
+) -> None:
+    with pytest.raises(MfSubagentContractError, match=expected_blocker):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-filer-principal",
+                "fence_token": "fence-2",
+                "summary": "Ready.",
+                "real_startup_events": [_startup_event(_finish_startup_evidence())],
+                "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
+                "finish_time_worker_self_attestation": (
+                    _finish_time_worker_attestation(**overrides)
+                ),
+            },
+            context=_context(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2900,6 +3093,9 @@ def test_finish_gate_accepts_nested_startup_evidence_object(nested_key: str) -> 
             "summary": "Ready.",
             "evidence": {
                 nested_key: _finish_startup_evidence(),
+                "finish_time_worker_self_attestation": (
+                    _finish_time_worker_attestation()
+                ),
                 "read_receipt_hash": "sha256:read-finish",
                 "read_receipt_event_id": "2873",
             },
@@ -2938,6 +3134,7 @@ def test_finish_gate_requires_read_receipt_event_lineage() -> None:
                 "summary": "Ready.",
                 "mf_subagent_startup_gate": startup_evidence,
                 "real_startup_events": [_startup_event(startup_evidence)],
+                "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
                 "read_receipt_hash": "sha256:read-finish",
             },
             context=_context(),
@@ -2975,6 +3172,7 @@ def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> No
                 **base_payload,
                 "mf_subagent_startup_gate": _finish_startup_evidence(),
                 "real_startup_events": [_startup_event(_finish_startup_evidence())],
+                "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
             },
             context=_context(),
         )
@@ -3103,6 +3301,7 @@ def test_finish_gate_carries_route_lineage_when_present() -> None:
             },
             "mf_subagent_startup_gate": _finish_startup_evidence(),
             "real_startup_events": [_startup_event(_finish_startup_evidence())],
+            "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
             "read_receipt_hash": "sha256:read-finish",
             "read_receipt_event_id": "2873",
             "summary": "Ready.",
@@ -3144,6 +3343,7 @@ def test_finish_gate_accepts_empty_parent_route_blocked_actions() -> None:
             "graph_trace_evidence": _graph_trace_evidence(fence_token="fence-2"),
             "mf_subagent_startup_gate": _finish_startup_evidence(),
             "real_startup_events": [_startup_event(_finish_startup_evidence())],
+            "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
             "read_receipt_hash": "sha256:read-finish",
             "read_receipt_event_id": "2873",
             "summary": "Ready.",
@@ -3974,6 +4174,10 @@ def _make_finish_gate_payload_with_surrogate_startup(
         "read_receipt_hash": "sha256:rr-f2-test",
         "read_receipt_event_id": "rr-f2-evt-001",
         "observer_command_id": "cmd-f2-test",
+        "finish_time_worker_self_attestation": _finish_time_worker_attestation(
+            worker_session_id="session-task-sg-01",
+            transcript_path="/tmp/transcript-real.jsonl",
+        ),
         "worktree_path": worktree_path,
         "branch_ref": branch_ref,
         "base_commit": "base-f2",

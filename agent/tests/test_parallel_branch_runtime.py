@@ -1443,22 +1443,85 @@ def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish
     assert control_plane["next_required_evidence"] == next_required
     assert worker_view["next_required_evidence"] == next_required
     assert worker_view["control_plane"]["next_required_evidence"] == next_required
-    assert ["worker_graph_trace", "worker_self_attestation", "finish_gate"] == [
+    assert ["worker_graph_trace", "finish_time_worker_attestation", "finish_gate"] == [
         item["id"] for item in next_required[:3]
     ]
     assert by_id["worker_graph_trace"]["next_action"] == "run_worker_graph_query"
     assert by_id["worker_graph_trace"]["producer"] == "graph_query_trace"
     assert by_id["worker_graph_trace"]["worker_owned"] is True
-    assert by_id["worker_self_attestation"]["next_action"] == (
-        "record_worker_self_attestation"
+    assert by_id["finish_time_worker_attestation"]["next_action"] == (
+        "record_finish_time_worker_attestation"
     )
-    assert by_id["worker_self_attestation"]["close_satisfying_required"] is True
+    assert by_id["finish_time_worker_attestation"]["expected_source"] == (
+        "worker_transcript_verify.finish_time_worker_self_attestation"
+    )
+    assert by_id["finish_time_worker_attestation"]["close_satisfying_required"] is True
     assert by_id["finish_gate"]["next_action"] == "record_finish_gate"
     assert by_id["finish_gate"]["requires"] == [
         "worker_graph_trace",
-        "worker_self_attestation",
+        "finish_time_worker_attestation",
     ]
     assert by_id["finish_gate"]["runtime_context_id"] == projection["runtime_context_id"]
+
+
+def test_runtime_context_current_values_prefer_finish_time_worker_attestation() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+            "finish_event_ref": "timeline:finish-runtime-context",
+        },
+        startup_gate={
+            "worker_self_attesting": True,
+            "worker_self_attestation": {
+                "status": "passed",
+                "attestation_phase": "startup",
+                "worker_self_attesting": True,
+                "finish_time_self_attesting": False,
+                "finish_time_blockers": ["no_owned_files_diff"],
+            },
+        },
+        finish_gate={
+            "event_id": "timeline:finish-runtime-context",
+            "checkpoint_id": "ckpt-runtime-context",
+            "worker_self_attestation_gate": {"passed": True},
+            "worker_self_attestation": {
+                "status": "passed",
+                "attestation_phase": "finish",
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "session-runtime-context",
+                "filer_principal": "session-runtime-context",
+                "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "harness_type": "codex",
+            },
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        generated_at=NOW,
+    ).to_dict()
+
+    current_values = projection["views"]["current"]["current_values"]
+    next_required_ids = {
+        item["id"]
+        for item in projection["views"]["action_plan"]["next_required_evidence"]
+    }
+
+    assert current_values["worker_self_attesting"] is True
+    assert current_values["worker_self_attestation"]["attestation_phase"] == "finish"
+    assert current_values["worker_self_attestation"]["finish_time_self_attesting"] is True
+    assert "finish_time_worker_attestation" not in next_required_ids
 
 
 def test_runtime_context_action_plan_links_audit_archive_for_historical_close_blocker() -> None:
@@ -1621,6 +1684,22 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "checkpoint_id": "ckpt-runtime-context",
             "event_id": "timeline:finish",
             "test_results": {"status": "passed"},
+            "worker_self_attestation_gate": {"passed": True},
+            "worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "ok": True,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "session-runtime-context",
+                "filer_principal": "session-runtime-context",
+                "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "harness_type": "codex",
+                "blockers": [],
+            },
         },
         close_evidence={
             "event_id": "timeline:close-ready",
@@ -1900,6 +1979,22 @@ def test_runtime_context_close_gate_view_derives_same_lineage_timeline_evidence(
                     "task_id": context.task_id,
                     "parent_task_id": context.root_task_id,
                     "checkpoint_id": "ckpt-derived-runtime-context",
+                    "worker_self_attestation_gate": {"passed": True},
+                    "worker_self_attestation": {
+                        "schema_version": "worker_transcript_self_attestation.v1",
+                        "attestation_phase": "finish",
+                        "status": "passed",
+                        "ok": True,
+                        "worker_self_attesting": True,
+                        "self_attesting": True,
+                        "finish_time_self_attesting": True,
+                        "finish_time_blockers": [],
+                        "worker_session_id": "worker-runtime-context",
+                        "filer_principal": "worker-runtime-context",
+                        "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                        "harness_type": "codex",
+                        "blockers": [],
+                    },
                 },
             },
             {
@@ -2322,6 +2417,10 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
             route_identity={
                 "route_id": "route-startup",
                 "route_context_hash": "sha256:wrong-route",
+                "prompt_contract_id": "rprompt-startup",
+                "prompt_contract_hash": "sha256:prompt-startup",
+                "route_token_ref": "rtok-startup",
+                "visible_injection_manifest_hash": "sha256:visible-startup",
             },
         )
 
@@ -2692,6 +2791,21 @@ def _finish_gate_payload(
         "observer_command_id": f"cmd-{context.task_id}",
         "read_receipt_hash": f"sha256:rr-{context.task_id}",
         "read_receipt_event_id": f"rr-{context.task_id}",
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": f"session-{context.task_id}",
+            "filer_principal": f"session-{context.task_id}",
+            "worker_transcript_path": f"/tmp/transcript-{context.task_id}.jsonl",
+            "harness_type": "codex",
+            "blockers": [],
+        },
     }
     payload.update(overrides)
     return payload

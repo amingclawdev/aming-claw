@@ -114,6 +114,40 @@ _FAIL_STATUSES = {
     "reject",
     "rejected",
 }
+_FINISH_WORKER_ATTESTATION_KEYS = (
+    "finish_time_worker_self_attestation",
+    "worker_self_attestation",
+    "finish_attestation",
+)
+_FINISH_WORKER_ATTESTATION_PUBLIC_FIELDS = (
+    "schema_version",
+    "attestation_phase",
+    "status",
+    "ok",
+    "worker_self_attesting",
+    "self_attesting",
+    "finish_time_self_attesting",
+    "finish_time_blockers",
+    "worker_session_id",
+    "filer_principal",
+    "worker_transcript_path",
+    "resolved_transcript_path",
+    "harness_type",
+    "blockers",
+    "known_bad_playback_4178",
+)
+_GENERIC_OR_OBSERVER_WORKER_FILERS = {
+    "api",
+    "host-adapter",
+    "host_adapter",
+    "implementation_worker",
+    "mf_sub",
+    "mf_subagent",
+    "observer",
+    "subagent",
+    "system",
+    "worker",
+}
 _FORBIDDEN_RESULT_FLAGS = {
     "merge_commit": "merge",
     "push_performed": "push",
@@ -3866,6 +3900,311 @@ def _worker_self_attestation_close_gate(
     }
 
 
+def _attestation_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [_string(item) for item in value if _string(item)]
+    return [_string(value)] if _string(value) else []
+
+
+def _finish_worker_attestation_candidate(
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    evidence = _nested_mapping(payload, "evidence")
+    for container_name, container in (
+        ("payload", payload),
+        ("evidence", evidence),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        for key in _FINISH_WORKER_ATTESTATION_KEYS:
+            candidate = container.get(key)
+            if isinstance(candidate, Mapping):
+                return dict(candidate), f"{container_name}.{key}"
+    return {}, ""
+
+
+def _public_finish_worker_attestation(
+    attestation: Mapping[str, Any],
+    *,
+    worker_session_id: str = "",
+    filer_principal: str = "",
+    worker_transcript_path: str = "",
+    harness_type: str = "",
+) -> dict[str, Any]:
+    safe: dict[str, Any] = {
+        key: attestation.get(key)
+        for key in _FINISH_WORKER_ATTESTATION_PUBLIC_FIELDS
+        if key in attestation
+    }
+    if worker_session_id and not _string(safe.get("worker_session_id")):
+        safe["worker_session_id"] = worker_session_id
+    if filer_principal and not _string(safe.get("filer_principal")):
+        safe["filer_principal"] = filer_principal
+    if worker_transcript_path and not _string(safe.get("worker_transcript_path")):
+        safe["worker_transcript_path"] = worker_transcript_path
+    if harness_type and not _string(safe.get("harness_type")):
+        safe["harness_type"] = harness_type
+    for list_key in ("blockers", "finish_time_blockers"):
+        if list_key in safe:
+            safe[list_key] = _attestation_string_list(safe.get(list_key))
+    return safe
+
+
+def _finish_attestation_value(
+    name: str,
+    *,
+    attestation: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    aliases: Sequence[str] = (),
+) -> Any:
+    for key in (name, *aliases):
+        if key in attestation:
+            return attestation.get(key)
+    for key in (name, *aliases):
+        if key in payload:
+            return payload.get(key)
+    for key in (name, *aliases):
+        if key in evidence:
+            return evidence.get(key)
+    return None
+
+
+def _normalized_worker_filer(value: Any) -> str:
+    return "_".join(_string(value).lower().replace("-", "_").split())
+
+
+def _finish_time_worker_attestation_gate(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate finish-time worker self-attestation from the finish payload."""
+
+    attestation, source = _finish_worker_attestation_candidate(payload)
+    evidence = _nested_mapping(payload, "evidence")
+    worker_session_id = _string(
+        _finish_attestation_value(
+            "worker_session_id",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("session_id",),
+        )
+    )
+    worker_transcript_path = _string(
+        _finish_attestation_value(
+            "worker_transcript_path",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("transcript_path",),
+        )
+    )
+    harness_type = _string(
+        _finish_attestation_value(
+            "harness_type",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("worker_harness_type",),
+        )
+    ).lower()
+    attestation_phase = _string(
+        _finish_attestation_value(
+            "attestation_phase",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("worker_attestation_phase",),
+        )
+    ).lower()
+    status = _string(
+        _finish_attestation_value(
+            "status",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+        )
+    ).lower()
+    worker_self_attesting = _bool(
+        _finish_attestation_value(
+            "worker_self_attesting",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("self_attesting",),
+        )
+    )
+    finish_time_self_attesting = _bool(
+        _finish_attestation_value(
+            "finish_time_self_attesting",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+        )
+    )
+    finish_time_blockers = _attestation_string_list(
+        _finish_attestation_value(
+            "finish_time_blockers",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+        )
+    )
+    filer_principal = _string(
+        _finish_attestation_value(
+            "filer_principal",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("actor", "filed_by"),
+        )
+    )
+    filed_on_behalf_by = _string(
+        _finish_attestation_value(
+            "filed_on_behalf_by",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("on_behalf_of",),
+        )
+    )
+    filed_on_behalf = _bool(
+        _finish_attestation_value(
+            "filed_on_behalf",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("on_behalf",),
+        )
+    )
+    blockers: list[str] = []
+    if not attestation:
+        blockers.append("missing_finish_time_worker_self_attestation")
+    if attestation_phase == "startup":
+        blockers.append("attestation_phase_startup_not_finish")
+    if status not in _PASS_STATUSES or not worker_self_attesting:
+        blockers.append("worker_self_attestation_not_passed")
+    if not finish_time_self_attesting:
+        blockers.append("finish_time_self_attestation_not_passed")
+    if finish_time_blockers:
+        blockers.append("finish_time_blockers_present")
+    if not worker_session_id:
+        blockers.append("missing_worker_session_id")
+    if not filer_principal:
+        blockers.append("missing_filer_principal")
+    elif worker_session_id and filer_principal != worker_session_id:
+        blockers.append("finish_attestation_filer_principal_not_worker_session")
+    if not worker_transcript_path:
+        blockers.append("missing_worker_transcript_path")
+    if harness_type not in {"claude", "codex"}:
+        blockers.append("missing_or_unsupported_harness_type")
+    normalized_filer = _normalized_worker_filer(filer_principal)
+    if normalized_filer in _GENERIC_OR_OBSERVER_WORKER_FILERS:
+        blockers.append("finish_attestation_filer_is_generic_or_observer")
+    if filed_on_behalf or filed_on_behalf_by:
+        blockers.append("finish_attestation_filed_on_behalf")
+    passed = not blockers
+    public_attestation = _public_finish_worker_attestation(
+        attestation,
+        worker_session_id=worker_session_id,
+        filer_principal=filer_principal,
+        worker_transcript_path=worker_transcript_path,
+        harness_type=harness_type,
+    )
+    if finish_time_self_attesting and "finish_time_self_attesting" not in public_attestation:
+        public_attestation["finish_time_self_attesting"] = True
+    if "finish_time_blockers" not in public_attestation:
+        public_attestation["finish_time_blockers"] = finish_time_blockers
+    if status and "status" not in public_attestation:
+        public_attestation["status"] = status
+    if worker_self_attesting and "worker_self_attesting" not in public_attestation:
+        public_attestation["worker_self_attesting"] = True
+    if attestation_phase and "attestation_phase" not in public_attestation:
+        public_attestation["attestation_phase"] = attestation_phase
+    return {
+        "schema_version": "mf_subagent_finish_time_worker_self_attestation_gate.v1",
+        "status": "passed" if passed else "blocked",
+        "passed": passed,
+        "close_satisfying": passed,
+        "source": source,
+        "attestation_phase": attestation_phase or "",
+        "worker_self_attesting": worker_self_attesting,
+        "finish_time_self_attesting": finish_time_self_attesting,
+        "worker_session_id": worker_session_id,
+        "filer_principal": filer_principal,
+        "worker_transcript_path": worker_transcript_path,
+        "harness_type": harness_type,
+        "finish_time_blockers": finish_time_blockers,
+        "blockers": blockers,
+        "attestation": public_attestation,
+    }
+
+
+def _startup_worker_identity_close_gate(
+    startup_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate that startup evidence is a real worker identity, not finish proof."""
+
+    evidence = dict(startup_evidence) if isinstance(startup_evidence, Mapping) else {}
+    attestation = _nested_mapping(evidence, "worker_self_attestation")
+    worker_session_id = _string(
+        evidence.get("worker_session_id") or attestation.get("worker_session_id")
+    )
+    worker_transcript_path = _string(
+        evidence.get("worker_transcript_path")
+        or attestation.get("worker_transcript_path")
+    )
+    harness_type = _string(
+        evidence.get("harness_type") or attestation.get("harness_type")
+    ).lower()
+    filer_principal = _string(evidence.get("filer_principal") or evidence.get("actor"))
+    blockers: list[str] = []
+    status = _string(evidence.get("status") or evidence.get("decision")).lower()
+    if status in _FAIL_STATUSES or _explicit_false(evidence.get("ok")):
+        blockers.append("startup_gate_not_passed")
+    if _startup_is_host_adapter_surrogate(evidence):
+        blockers.append("startup_is_host_adapter_surrogate")
+    if not filer_principal:
+        blockers.append("missing_filer_principal")
+    elif worker_session_id and filer_principal != worker_session_id:
+        blockers.append("startup_filer_principal_not_worker_session")
+    if filer_principal in _GENERIC_OR_OBSERVER_WORKER_FILERS:
+        blockers.append("startup_filer_is_generic_or_observer")
+    if _string(evidence.get("filed_on_behalf_by")) or _bool(
+        evidence.get("filed_on_behalf")
+    ):
+        blockers.append("startup_filed_on_behalf")
+    known_bad = (
+        _bool(evidence.get("known_bad_playback_4178"))
+        or _bool(attestation.get("known_bad_playback_4178"))
+        or "4178" in _string(evidence.get("agent_id")).lower()
+        or "4178" in _string(evidence.get("startup_source")).lower()
+    )
+    if known_bad:
+        blockers.append("known_bad_playback_4178_shape")
+    if not worker_session_id:
+        blockers.append("missing_worker_session_id")
+    if not worker_transcript_path:
+        blockers.append("missing_worker_transcript_path")
+    if harness_type not in {"claude", "codex"}:
+        blockers.append("missing_or_unsupported_harness_type")
+    passed = not blockers
+    return {
+        "schema_version": "mf_subagent_startup_worker_identity_close_gate.v1",
+        "status": "passed" if passed else "blocked",
+        "passed": passed,
+        "real_startup_identity": passed,
+        "worker_session_id": worker_session_id,
+        "worker_transcript_path": worker_transcript_path,
+        "harness_type": harness_type,
+        "blockers": blockers,
+    }
+
+
 def _bounded_worker_evidence_matches(
     dispatch_evidence: Mapping[str, Any],
     startup_evidence: Mapping[str, Any],
@@ -6273,9 +6612,10 @@ def validate_mf_subagent_finish_gate(
         startup_evidence,
         surrogate_join_gate=surrogate_join_gate,
     )
-    worker_self_attestation_gate = _worker_self_attestation_close_gate(
+    startup_worker_identity_gate = _startup_worker_identity_close_gate(
         close_satisfying_startup_evidence
     )
+    worker_self_attestation_gate = _finish_time_worker_attestation_gate(payload)
     observer_command_id = _dispatch_string(
         payload,
         names=("observer_command_id",),
@@ -6317,10 +6657,17 @@ def validate_mf_subagent_finish_gate(
             "MF subagent finish gate requires actual mf_subagent_startup evidence "
             "before close-ready"
         )
+    if not startup_worker_identity_gate["passed"]:
+        blockers = ", ".join(startup_worker_identity_gate.get("blockers") or [])
+        raise MfSubagentContractError(
+            "MF subagent finish gate requires real startup worker identity before "
+            f"close-ready ({blockers})"
+        )
     if not worker_self_attestation_gate["passed"]:
         blockers = ", ".join(worker_self_attestation_gate.get("blockers") or [])
         raise MfSubagentContractError(
-            "MF subagent finish gate requires worker_self_attestation before "
+            "MF subagent finish gate requires finish-time worker_self_attestation "
+            "before "
             f"close-ready ({blockers})"
         )
     if not observer_command_id:
@@ -6368,6 +6715,7 @@ def validate_mf_subagent_finish_gate(
         "governed_evidence_required": governed_evidence_required,
         "startup_evidence": startup_evidence,
         "surrogate_join_gate": surrogate_join_gate,
+        "startup_worker_identity_gate": startup_worker_identity_gate,
         "worker_self_attestation_gate": worker_self_attestation_gate,
         "worker_self_attestation": worker_self_attestation_gate.get("attestation", {}),
         "read_receipt_hash": read_receipt_hash,
