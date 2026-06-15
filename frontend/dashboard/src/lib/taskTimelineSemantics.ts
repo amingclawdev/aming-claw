@@ -891,7 +891,7 @@ export interface GateMatrixRow {
   /** Plain-English label (operator-readable). */
   label: string;
   /** Gate family group. */
-  family: "timeline" | "route_context" | "contract" | "receipt_projection" | "cross_ref" | "impact" | "other";
+  family: "timeline" | "route_context" | "contract" | "receipt_projection" | "cross_ref" | "impact" | "audit_close" | "other";
   /** Human-readable family label. */
   familyLabel: string;
   /** Whether this gate item is mandatory for close. */
@@ -950,6 +950,10 @@ const GATE_ROW_LABELS: Record<string, string> = {
   // Worker graph trace
   worker_graph_trace:                     "Worker graph trace recorded",
   independent_qa:                         "Independent QA gate passed",
+  normal_close_gate:                      "Normal MF close remains blocked",
+  audit_close_gate:                       "Audit close accepted",
+  qa_acceptance:                          "QA acceptance passed",
+  evidence_reconstruction:                "Historical evidence not reconstructed",
   // Post-verification
   post_verification_actions:              "Post-verification actions completed",
   // Approval
@@ -970,6 +974,7 @@ function gateFamily(id: string): GateMatrixRow["family"] {
     "route_identity_mismatch", "same_route_identity", "route_identity_cleanup",
   ].includes(id)) return "route_context";
   if (id === "cross_ref_gate" || id.startsWith("cross_ref")) return "cross_ref";
+  if (id === "audit_close_gate" || id === "normal_close_gate" || id === "qa_acceptance" || id === "evidence_reconstruction") return "audit_close";
   if (id.includes("read_receipt") || id === "contract_projection") return "receipt_projection";
   if (id === "contract_gate" || id.includes("contract")) return "contract";
   return "other";
@@ -982,6 +987,7 @@ const FAMILY_LABELS: Record<GateMatrixRow["family"], string> = {
   receipt_projection:"Receipt / projection",
   cross_ref:         "Cross-ref gate",
   impact:            "Impact",
+  audit_close:       "Audit close & QA",
   other:             "Other checks",
 };
 
@@ -1039,6 +1045,11 @@ export function projectGateMatrix(
     cross_ref_gate?: { passed?: boolean; status?: string };
     worker_graph_trace_gate?: { required?: boolean; passed?: boolean; status?: string; trace_ids?: string[] };
     independent_qa_gate?: { required?: boolean; passed?: boolean; status?: string };
+    normal_close_gate?: Record<string, unknown>;
+    audit_archive?: Record<string, unknown>;
+    audit_close_gate?: Record<string, unknown>;
+    qa_acceptance?: Record<string, unknown>;
+    fixed_close_waiver_alert?: Record<string, unknown>;
     contract_projection_gate?: { passed?: boolean; status?: string };
     checks?: Record<string, boolean | number | string>;
   } | undefined,
@@ -1233,6 +1244,10 @@ export function projectGateMatrix(
     });
   }
 
+  // ── 8. Audit archive / audit close path rows ────────────────────────────
+  const auditRows = auditCloseRows(gate);
+  rows.push(...auditRows);
+
   // Deduplicate by id (first occurrence wins)
   const seen = new Set<string>();
   const deduped = rows.filter((r) => {
@@ -1248,4 +1263,149 @@ export function projectGateMatrix(
     gatePresent: true,
     applicable,
   };
+}
+
+function auditCloseRows(gate: {
+  normal_close_gate?: Record<string, unknown>;
+  audit_archive?: Record<string, unknown>;
+  audit_close_gate?: Record<string, unknown>;
+  qa_acceptance?: Record<string, unknown>;
+  fixed_close_waiver_alert?: Record<string, unknown>;
+}): GateMatrixRow[] {
+  const archive = asRecord(gate.audit_archive);
+  const archiveEvidence = asRecord(archive.evidence);
+  const normalGate = firstRecord(gate.normal_close_gate, archive.normal_close_gate);
+  const auditGate = firstRecord(gate.audit_close_gate, archive.audit_close_gate, archive);
+  const qaAcceptance = firstRecord(gate.qa_acceptance, archive.qa_acceptance, archiveEvidence.verification);
+  const alert = asRecord(gate.fixed_close_waiver_alert);
+  const hasAuditClose =
+    Object.keys(archive).length > 0
+    || Object.keys(auditGate).length > 0
+    || Object.keys(qaAcceptance).length > 0
+    || Object.keys(normalGate).length > 0
+    || Object.keys(alert).length > 0;
+  if (!hasAuditClose) return [];
+
+  const rows: GateMatrixRow[] = [];
+  const normalBlocked = normalCloseBlocked(normalGate, archive, alert);
+  if (Object.keys(normalGate).length > 0 || Object.keys(archive).length > 0 || Object.keys(alert).length > 0) {
+    rows.push({
+      id: "normal_close_gate",
+      label: gateRowLabel("normal_close_gate"),
+      family: "audit_close",
+      familyLabel: FAMILY_LABELS.audit_close,
+      required: true,
+      status: normalBlocked ? "failed" : "unknown",
+      nextAction: normalBlocked
+        ? "Normal close remains blocked; do not backfill missing startup or close_ready evidence."
+        : "Confirm normal close remains separate from audit close.",
+      evidenceEventIds: eventIdsFromLooseRecord(normalGate, archive),
+      evidenceLabels: eventIdsFromLooseRecord(normalGate, archive).map(() => "audit archive"),
+    });
+  }
+
+  const auditAccepted = acceptedLike(auditGate) || stringFrom(archive.status) === "audit_archived" || stringFrom(archive.row_status).toUpperCase() === "WAIVED";
+  if (Object.keys(auditGate).length > 0 || Object.keys(archive).length > 0) {
+    rows.push({
+      id: "audit_close_gate",
+      label: gateRowLabel("audit_close_gate"),
+      family: "audit_close",
+      familyLabel: FAMILY_LABELS.audit_close,
+      required: true,
+      status: auditAccepted ? "passed" : "unknown",
+      nextAction: auditAccepted ? "" : "Record audit close gate acceptance.",
+      evidenceEventIds: eventIdsFromLooseRecord(auditGate, archive),
+      evidenceLabels: eventIdsFromLooseRecord(auditGate, archive).map(() => "audit close"),
+    });
+  }
+
+  if (Object.keys(qaAcceptance).length > 0) {
+    const qaPassed = acceptedLike(qaAcceptance);
+    rows.push({
+      id: "qa_acceptance",
+      label: gateRowLabel("qa_acceptance"),
+      family: "audit_close",
+      familyLabel: FAMILY_LABELS.audit_close,
+      required: true,
+      status: qaPassed ? "passed" : "missing",
+      nextAction: qaPassed ? "" : "Record independent QA acceptance before audit close.",
+      evidenceEventIds: eventIdsFromLooseRecord(qaAcceptance),
+      evidenceLabels: eventIdsFromLooseRecord(qaAcceptance).map(() => "QA acceptance"),
+    });
+  }
+
+  if (Object.keys(archive).length > 0) {
+    const reason = stringFrom(archive.non_reconstructable_evidence_reason);
+    const evidence = firstRecord(archive.evidence);
+    const failureAudit = firstRecord(archive.failure_audit, evidence.failure_audit);
+    const reconstructed =
+      evidence.reconstructed
+      ?? archive.reconstructed
+      ?? archive.historical_evidence_reconstructed
+      ?? failureAudit.historical_evidence_reconstructed;
+    const notReconstructed = reconstructed === false || Boolean(reason);
+    rows.push({
+      id: "evidence_reconstruction",
+      label: gateRowLabel("evidence_reconstruction"),
+      family: "audit_close",
+      familyLabel: FAMILY_LABELS.audit_close,
+      required: true,
+      status: notReconstructed ? "passed" : "unknown",
+      nextAction: notReconstructed
+        ? reason || "Historical MF evidence was not reconstructed."
+        : "Record why missing historical evidence cannot be reconstructed.",
+      evidenceEventIds: eventIdsFromLooseRecord(archive),
+      evidenceLabels: eventIdsFromLooseRecord(archive).map(() => "audit archive"),
+    });
+  }
+
+  return rows;
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> {
+  for (const value of values) {
+    const record = asRecord(value);
+    if (Object.keys(record).length > 0) return record;
+  }
+  return {};
+}
+
+function acceptedLike(record: Record<string, unknown>): boolean {
+  if (record.accepted === true || record.passed === true || record.approved === true) return true;
+  const text = [
+    stringFrom(record.status),
+    stringFrom(record.decision),
+    stringFrom(record.result),
+  ].join(" ").toLowerCase();
+  return /\b(accepted|passed|approved|ok|success|audit_archived)\b/.test(text);
+}
+
+function normalCloseBlocked(
+  normalGate: Record<string, unknown>,
+  archive: Record<string, unknown>,
+  alert: Record<string, unknown>,
+): boolean {
+  if (normalGate.normal_close_gate_passed === false || normalGate.can_close === false || normalGate.can_close_claimed === false) return true;
+  if (normalGate.close_ready_emitted === false || normalGate.ordinary_mf_close_claimed === false) return true;
+  if (alert.alert === true) return true;
+  const timelinePrecheck = asRecord(asRecord(archive.evidence).timeline_precheck_failure_summary);
+  if (timelinePrecheck.can_close === false) return true;
+  return stringFrom(archive.status) === "audit_archived";
+}
+
+function eventIdsFromLooseRecord(...records: Record<string, unknown>[]): string[] {
+  const ids: string[] = [];
+  for (const record of records) {
+    for (const key of ["event_id", "id", "timeline_event_id"]) {
+      const id = normalizeEventId(record[key]);
+      if (id) ids.push(id);
+    }
+    for (const key of ["event_ids", "evidence_event_ids", "timeline_event_ids"]) {
+      const value = record[key];
+      if (Array.isArray(value)) ids.push(...value.map(normalizeEventId).filter(Boolean));
+    }
+    const { ids: nested } = eventIdsFromGateEvents(record.evidence_events);
+    ids.push(...nested);
+  }
+  return Array.from(new Set(ids)).slice(0, 8);
 }

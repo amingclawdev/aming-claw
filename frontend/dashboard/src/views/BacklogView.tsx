@@ -12,8 +12,11 @@ import type { GateMatrixRow, GateMatrixProjection, TaskTimelineSemanticRelation 
 import { ReferencesAndEvidenceSection, EventSemanticDetail } from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
+  BacklogAuditArchive,
+  BacklogAuditCloseGate,
   BacklogResponse,
   BacklogTimelineGateResponse,
+  BacklogQaAcceptance,
   ContentSysDemoVisualizationEvidence,
   AgentTaskContractProjection,
   MfCloseTimelineGate,
@@ -26,14 +29,15 @@ interface Props {
   projectId: string;
 }
 
-type StatusFilter = "OPEN" | "FIXED" | "ALL";
+type StatusFilter = "OPEN" | "CLOSED" | "ALL";
 type PriorityFilter = "ALL" | "P0" | "P1" | "P2" | "P3";
 type DetailTab = "timeline" | "contract";
 type ContractEvidenceStatus = "passed" | "missing" | "failed" | "bypassed" | "inferred" | "not_applicable";
 
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
-const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
+const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "WAIVED"]);
+const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);
 const BACKLOG_URL_PARAM = "backlog";
 const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
 const CONTENT_SYS_DEMO_VISUALIZATION_SCHEMA = "content_sys.demo_visualization_evidence.v1";
@@ -208,18 +212,29 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
   const stats = useMemo(() => {
     if (backlog.summary) {
+      const summaryClosed = Object.entries(backlog.summary.by_status ?? {}).reduce(
+        (total, [status, count]) => total + (CLOSED_STATUSES.has(normalizeStatus(status)) ? Number(count || 0) : 0),
+        0,
+      );
+      const loadedAuditClosedWithoutClosedStatus = bugs.filter(
+        (bug) => isAuditClosedBug(bug) && !CLOSED_STATUSES.has(normalizeStatus(bug.status)),
+      ).length;
+      const closed = summaryClosed + loadedAuditClosedWithoutClosedStatus;
       return {
         total: backlog.summary.total,
-        open: backlog.summary.open,
-        fixed: backlog.summary.fixed,
-        urgent: backlog.summary.urgent_open,
+        open: Math.max(0, backlog.summary.total - closed),
+        closed,
+        urgent: Math.max(
+          0,
+          backlog.summary.urgent_open - bugs.filter((b) => isAuditClosedBug(b) && ["P0", "P1"].includes(normalizePriority(b.priority))).length,
+        ),
       };
     }
     const open = bugs.filter(isOpenBug);
     return {
       total: backlog.total_count ?? bugs.length,
       open: open.length,
-      fixed: bugs.filter((b) => normalizeStatus(b.status) === "FIXED").length,
+      closed: bugs.filter(isClosedBug).length,
       urgent: open.filter((b) => ["P0", "P1"].includes(normalizePriority(b.priority))).length,
     };
   }, [backlog.summary, backlog.total_count, bugs]);
@@ -229,7 +244,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
     return bugs
       .filter((bug) => {
         if (statusFilter === "OPEN" && !isOpenBug(bug)) return false;
-        if (statusFilter === "FIXED" && normalizeStatus(bug.status) !== "FIXED") return false;
+        if (statusFilter === "CLOSED" && !isClosedBug(bug)) return false;
         if (priorityFilter !== "ALL" && normalizePriority(bug.priority) !== priorityFilter) return false;
         if (!q) return true;
         const hay = [
@@ -433,19 +448,19 @@ export default function BacklogView({ backlog, projectId }: Props) {
       <div className="score-grid backlog-score-grid">
         <Kpi label="Open" value={stats.open} tone={stats.open > 0 ? "amber" : "green"} />
         <Kpi label="P0/P1 open" value={stats.urgent} tone={stats.urgent > 0 ? "red" : "neutral"} />
-        <Kpi label="Fixed" value={stats.fixed} tone="green" />
+        <Kpi label="Closed" value={stats.closed} tone="green" />
         <Kpi label="Total" value={stats.total} tone="blue" />
       </div>
 
       <div className="backlog-toolbar card">
         <div className="backlog-filter-group">
-          {(["OPEN", "FIXED", "ALL"] as StatusFilter[]).map((s) => (
+          {(["OPEN", "CLOSED", "ALL"] as StatusFilter[]).map((s) => (
             <button
               key={s}
               className={`chip ${statusFilter === s ? "on" : "off"}`}
               onClick={() => setStatusFilter(s)}
             >
-              {s === "ALL" ? "All status" : s}
+              {s === "ALL" ? "All status" : s === "CLOSED" ? "Closed" : s}
             </button>
           ))}
         </div>
@@ -542,6 +557,7 @@ function BacklogRow({
   const commandRecovery = commandProjection?.recovery;
   const commandProjectionStatus = commandRecovery?.classification || commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "";
   const commandDivergence = commandRecovery ? "target_session_unavailable" : commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
+  const auditClose = buildAuditCloseState(bug);
   return (
     <>
       <tr>
@@ -617,6 +633,12 @@ function BacklogRow({
               {commandRecoveryLine(commandRecovery)}
             </div>
           ) : null}
+          {auditClose.present ? (
+            <div className="backlog-commit mono" title={auditClose.reason || "Audit archive close path"}>
+              audit close {auditClose.accepted ? "accepted" : auditClose.status || "recorded"}
+              {auditClose.qaPassed ? " · QA passed" : ""}
+            </div>
+          ) : null}
           {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
           {bug.worktree_branch ? <div className="backlog-commit mono">{bug.worktree_branch}</div> : null}
         </td>
@@ -656,7 +678,7 @@ function BacklogDetailModal({
   const dag = useMemo(() => buildTimelineDag(bug, events, gate), [bug, events, gate]);
   const contractAudit = useMemo(() => buildContractAudit(bug, events, gate, timeline?.gate), [bug, events, gate, timeline?.gate]);
   const gateMatrix = useMemo(
-    () => projectGateMatrix(gate, timeline?.gate?.applicable !== false),
+    () => projectGateMatrix(timelineGateWithAuditClose(gate, timeline?.gate), timeline?.gate?.applicable !== false),
     [gate, timeline?.gate],
   );
   const [activeTab, setActiveTab] = useState<DetailTab>("timeline");
@@ -700,7 +722,7 @@ function BacklogDetailModal({
 
         {loadingBug ? <div className="timeline-empty">Loading backlog detail...</div> : null}
         {error ? <div className="timeline-empty timeline-error">Backlog detail load failed: {error}</div> : null}
-        {bug ? <BacklogDetailSummary bug={bug} gate={gate} /> : null}
+        {bug ? <BacklogDetailSummary bug={bug} gate={gate} response={timeline?.gate} /> : null}
 
         <div className="backlog-modal-tabs" role="tablist" aria-label="Backlog detail sections">
           <button
@@ -803,10 +825,19 @@ function BacklogDetailModal({
   );
 }
 
-function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTimelineGate }) {
+function BacklogDetailSummary({
+  bug,
+  gate,
+  response,
+}: {
+  bug: BacklogBug;
+  gate?: MfCloseTimelineGate;
+  response?: BacklogTimelineGateResponse;
+}) {
   const contract = gate?.contract_gate;
   const routeGate = gate?.route_context_gate;
   const projection = contractProjectionForSummary(bug, gate);
+  const auditClose = buildAuditCloseState(bug, gate, response);
   const commandProjection = bug.observer_command_projection;
   const commandRecovery = commandProjection?.recovery;
   const commandProjectionStatus = commandRecovery?.classification || commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "not loaded";
@@ -827,11 +858,20 @@ function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTi
       <SummaryItem label="Command" value={commandProjectionStatus} tone={commandProjectionTone(commandProjectionStatus, commandDivergence)} />
       <SummaryItem label="Route context" value={routeGate?.status || (routeGate?.required ? "required" : "not required")} tone={routeGate?.passed ? "status-complete" : routeGate?.required ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Close gate" value={gate?.status || (gate ? (gate.passed ? "passed" : "blocked") : "not loaded")} tone={gate?.passed ? "status-complete" : gate ? "status-failed" : "status-unknown"} />
+      {auditClose.present ? (
+        <>
+          <SummaryItem label="Audit close" value={auditClose.accepted ? "accepted" : auditClose.status || "recorded"} tone={auditClose.accepted ? "status-complete" : "status-unknown"} />
+          <SummaryItem label="Normal close" value={auditClose.normalCloseBlocked ? "blocked" : "not claimed"} tone={auditClose.normalCloseBlocked ? "status-failed" : "status-unknown"} />
+          <SummaryItem label="QA acceptance" value={auditClose.qaPassed ? "passed" : "not recorded"} tone={auditClose.qaPassed ? "status-complete" : "status-failed"} />
+          <SummaryItem label="Evidence" value={auditClose.evidenceNotReconstructed ? "not reconstructed" : "unknown"} tone={auditClose.evidenceNotReconstructed ? "status-complete" : "status-unknown"} />
+        </>
+      ) : null}
       <SummaryItem label="Missing" value={missing.length ? String(missing.length) : "none"} tone={missing.length ? "status-failed" : "status-complete"} />
       <DetailList label="Target files" values={listFrom(bug.target_files)} />
       <DetailList label="Tests" values={listFrom(bug.test_files)} />
       <DetailList label="Required docs" values={listFrom(bug.required_docs)} />
       <DetailList label="Provenance / related" values={related} />
+      {auditClose.present ? <DetailList label="Audit close reason" values={auditClose.reason ? [auditClose.reason] : []} /> : null}
       {commandRecovery ? <DetailList label="Command recovery" values={commandRecoveryDetailValues(commandRecovery)} /> : null}
     </div>
   );
@@ -868,6 +908,125 @@ function commandProjectionTone(status: string, divergenceReason = ""): string {
   if (normalized.includes("recovery_required") || normalized === "blocked") return "status-failed";
   if (normalized === "unresolved" || divergenceReason.startsWith("missing_")) return "status-failed";
   return "status-pending";
+}
+
+interface AuditCloseState {
+  present: boolean;
+  status: string;
+  accepted: boolean;
+  qaPassed: boolean;
+  normalCloseBlocked: boolean;
+  evidenceNotReconstructed: boolean;
+  reason: string;
+}
+
+function timelineGateWithAuditClose(
+  gate?: MfCloseTimelineGate,
+  response?: BacklogTimelineGateResponse,
+): MfCloseTimelineGate | undefined {
+  if (!gate) return undefined;
+  return {
+    ...gate,
+    audit_archive: gate.audit_archive ?? response?.audit_archive,
+    audit_close_gate: gate.audit_close_gate ?? response?.audit_close_gate,
+    qa_acceptance: gate.qa_acceptance ?? response?.qa_acceptance,
+    fixed_close_waiver_alert: gate.fixed_close_waiver_alert ?? response?.fixed_close_waiver_alert,
+  };
+}
+
+function buildAuditCloseState(
+  bug: BacklogBug,
+  gate?: MfCloseTimelineGate,
+  response?: BacklogTimelineGateResponse,
+): AuditCloseState {
+  const takeover = firstRecord(bug.takeover, parseJsonRecord(bug.takeover_json));
+  const archive = firstRecord(
+    bug.audit_archive,
+    takeover.audit_archive,
+    gate?.audit_archive,
+    response?.audit_archive,
+  ) as BacklogAuditArchive;
+  const archiveEvidence = asRecord(archive.evidence);
+  const auditGate = firstRecord(
+    bug.audit_close_gate,
+    takeover.audit_close_gate,
+    archive.audit_close_gate,
+    gate?.audit_close_gate,
+    response?.audit_close_gate,
+    archive,
+  ) as BacklogAuditCloseGate;
+  const qa = firstRecord(
+    bug.qa_acceptance,
+    takeover.qa_acceptance,
+    archive.qa_acceptance,
+    archiveEvidence.verification,
+    gate?.qa_acceptance,
+    response?.qa_acceptance,
+  ) as BacklogQaAcceptance;
+  const normalGate = firstRecord(archive.normal_close_gate, gate?.normal_close_gate);
+  const failureAudit = firstRecord(archive.failure_audit, archiveEvidence.failure_audit);
+  const timelinePrecheck = asRecord(archiveEvidence.timeline_precheck_failure_summary);
+  const hasAuditRuntime = isAuditClosedBug(bug);
+  const present =
+    hasAuditRuntime
+    || Object.keys(archive).length > 0
+    || Object.keys(auditGate).length > 0
+    || Object.keys(qa).length > 0
+    || Object.keys(normalGate).length > 0;
+  if (!present) {
+    return {
+      present: false,
+      status: "",
+      accepted: false,
+      qaPassed: false,
+      normalCloseBlocked: false,
+      evidenceNotReconstructed: false,
+      reason: "",
+    };
+  }
+  const accepted =
+    auditAccepted(auditGate)
+    || firstText(archive.status) === "audit_archived"
+    || firstText(archive.row_status).toUpperCase() === "WAIVED"
+    || normalizeRuntimeState(bug.runtime_state) === "audit_archived";
+  const normalCloseBlocked =
+    response?.can_close === false
+    || gate?.passed === false
+    || normalGate.can_close === false
+    || normalGate.normal_close_gate_passed === false
+    || normalGate.can_close_claimed === false
+    || normalGate.close_ready_emitted === false
+    || timelinePrecheck.can_close === false;
+  const evidenceNotReconstructed =
+    archiveEvidence.reconstructed === false
+    || archive.reconstructed === false
+    || archive.historical_evidence_reconstructed === false
+    || failureAudit.historical_evidence_reconstructed === false
+    || Boolean(firstText(archive.non_reconstructable_evidence_reason));
+  return {
+    present,
+    status: firstText(auditGate.status, archive.status) || (accepted ? "accepted" : "recorded"),
+    accepted,
+    qaPassed: auditAccepted(qa),
+    normalCloseBlocked,
+    evidenceNotReconstructed,
+    reason: firstText(archive.reason, auditGate.reason, qa.reason, archive.non_reconstructable_evidence_reason),
+  };
+}
+
+function auditAccepted(record: Record<string, unknown>): boolean {
+  if (record.accepted === true || record.passed === true || record.approved === true) return true;
+  const text = firstText(record.status, record.decision, record.result).toLowerCase();
+  return /\b(accepted|passed|approved|ok|success|audit_archived)\b/.test(text);
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    return asRecord(JSON.parse(value) as unknown);
+  } catch {
+    return {};
+  }
 }
 
 function compactProjectionReason(value: string): string {
@@ -2940,12 +3099,24 @@ function compareBugs(a: BacklogBug, b: BacklogBug): number {
   return dateValue(b.updated_at || b.created_at || b.fixed_at) - dateValue(a.updated_at || a.created_at || a.fixed_at);
 }
 
+function isClosedBug(bug: BacklogBug): boolean {
+  return CLOSED_STATUSES.has(normalizeStatus(bug.status)) || isAuditClosedBug(bug);
+}
+
+function isAuditClosedBug(bug: BacklogBug): boolean {
+  return normalizeStatus(bug.status) === "WAIVED" || AUDIT_ARCHIVED_RUNTIME_STATES.has(normalizeRuntimeState(bug.runtime_state));
+}
+
 function isOpenBug(bug: BacklogBug): boolean {
-  return !CLOSED_STATUSES.has(normalizeStatus(bug.status));
+  return !isClosedBug(bug);
 }
 
 function normalizeStatus(status?: string): string {
   return (status || "OPEN").toUpperCase();
+}
+
+function normalizeRuntimeState(runtimeState?: string): string {
+  return (runtimeState || "").trim().toLowerCase();
 }
 
 function normalizePriority(priority?: string): string {
@@ -2963,6 +3134,7 @@ function priorityTone(priority?: string): string {
 function statusClass(status?: string): string {
   const s = normalizeStatus(status);
   if (s === "FIXED" || s === "DONE" || s === "RESOLVED") return "status-complete";
+  if (s === "WAIVED" || s === "CANCELLED") return "status-unknown";
   if (s === "FAILED" || s === "BLOCKED") return "status-failed";
   if (s === "RUNNING" || s === "CLAIMED" || s === "IN_CHAIN") return "status-running";
   if (s === "OPEN" || s === "QUEUED") return "status-pending";

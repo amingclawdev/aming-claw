@@ -26717,6 +26717,32 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 },
             }
         can_close = bool(verification.get("passed"))
+        audit_archive = _backlog_row_audit_archive(row)
+        if audit_archive:
+            verification = dict(verification)
+            verification["audit_archive"] = audit_archive
+            audit_close_gate = _json_object_field(audit_archive.get("audit_close_gate"))
+            qa_acceptance = _json_object_field(audit_archive.get("qa_acceptance"))
+            normal_close_gate = _json_object_field(audit_archive.get("normal_close_gate"))
+            evidence = _json_object_field(audit_archive.get("evidence"))
+            timeline_failure = _json_object_field(evidence.get("timeline_precheck_failure_summary"))
+            verification["passed"] = False
+            verification["can_close"] = False
+            verification["status"] = "audit_archived_normal_close_failed"
+            if timeline_failure:
+                verification["missing_event_kinds"] = _audit_archive_list_field(
+                    timeline_failure.get("missing_event_kinds")
+                )
+                verification["failed_gates"] = _audit_archive_list_field(
+                    timeline_failure.get("failed_gates")
+                )
+            if audit_close_gate:
+                verification["audit_close_gate"] = audit_close_gate
+            if qa_acceptance:
+                verification["qa_acceptance"] = qa_acceptance
+            if normal_close_gate:
+                verification["normal_close_gate"] = normal_close_gate
+            can_close = False
         result = {
             "ok": True,
             "project_id": pid,
@@ -26726,6 +26752,14 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "can_close": can_close,
             "event_count": len(events),
         }
+        if audit_archive:
+            result["audit_archive"] = audit_archive
+            audit_close_gate = _json_object_field(audit_archive.get("audit_close_gate"))
+            qa_acceptance = _json_object_field(audit_archive.get("qa_acceptance"))
+            if audit_close_gate:
+                result["audit_close_gate"] = audit_close_gate
+            if qa_acceptance:
+                result["qa_acceptance"] = qa_acceptance
         if view == "compact":
             # Compact view: derive summary from full result without re-evaluating gate logic
             compact_summary = task_timeline.compact_gate_summary(
@@ -26856,6 +26890,325 @@ def _json_object_field(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _backlog_row_audit_archive(row: Mapping[str, Any] | sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    takeover = backlog_runtime.parse_json_object(_row_get(row, "takeover_json", "{}"))
+    audit_archive = takeover.get("audit_archive") if isinstance(takeover, dict) else {}
+    return audit_archive if isinstance(audit_archive, dict) else {}
+
+
+def _audit_archive_text_has_non_reconstructable_reason(text: str) -> bool:
+    normalized = re.sub(r"[\s_-]+", " ", str(text or "").lower())
+    if not normalized:
+        return False
+    what_happened_terms = (
+        "historical",
+        "implemented",
+        "implementation",
+        "missing",
+        "failed",
+        "not recorded",
+        "startup",
+        "mf subagent startup",
+        "close ready",
+        "close gate",
+    )
+    non_reconstructable_terms = (
+        "non reconstruct",
+        "cannot reconstruct",
+        "cannot be reconstruct",
+        "not reconstructable",
+        "cannot be backfill",
+        "cannot backfill",
+        "not backfill",
+        "fabricat",
+    )
+    return any(term in normalized for term in what_happened_terms) and any(
+        term in normalized for term in non_reconstructable_terms
+    )
+
+
+def _audit_archive_list_field(value: Any, *fallbacks: Any) -> list[str]:
+    values: list[str] = []
+    for raw in (value, *fallbacks):
+        for item in _string_list_field(raw):
+            item = item.strip()
+            if item and item not in values:
+                values.append(item)
+    return values
+
+
+def _audit_archive_forbidden_reconstruction_claim(payload: Mapping[str, Any]) -> str:
+    forbidden_keys = {
+        "startup_reconstructed",
+        "reconstructed_startup",
+        "mf_subagent_startup_reconstructed",
+        "startup_backfilled",
+        "backfilled_startup",
+        "mf_subagent_startup_backfilled",
+        "backfilled_mf_subagent_startup",
+        "close_ready_reconstructed",
+        "reconstructed_close_ready",
+        "close_ready_backfilled",
+        "backfilled_close_ready",
+        "close_ready_emitted",
+        "emitted_close_ready",
+        "historical_evidence_reconstructed",
+        "historical_evidence_backfilled",
+        "startup_or_close_ready_backfilled",
+    }
+    forbidden_phrases = (
+        "reconstructed startup",
+        "startup reconstructed",
+        "reconstructed mf subagent startup",
+        "mf subagent startup reconstructed",
+        "reconstructed close ready",
+        "close ready reconstructed",
+        "backfilled startup",
+        "startup backfilled",
+        "backfilled mf subagent startup",
+        "mf subagent startup backfilled",
+        "backfilled close ready",
+        "close ready backfilled",
+        "backfilled historical evidence",
+        "historical evidence backfilled",
+    )
+
+    def scan(value: Any) -> str:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                normalized_key = str(key or "").strip().lower()
+                if normalized_key in forbidden_keys and bool(nested):
+                    return normalized_key
+                found = scan(nested)
+                if found:
+                    return found
+        elif isinstance(value, str):
+            normalized_text = re.sub(r"[\s_-]+", " ", value.lower())
+            for phrase in forbidden_phrases:
+                if phrase in normalized_text:
+                    return value
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                found = scan(item)
+                if found:
+                    return found
+        return ""
+
+    found = scan(payload)
+    if found:
+        return found
+    return ""
+
+
+def _build_backlog_audit_failure_audit(
+    *,
+    reason: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    failure_audit = _json_object_field(body.get("failure_audit"))
+    non_reconstructable_reason = str(
+        body.get("non_reconstructable_evidence_reason")
+        or failure_audit.get("non_reconstructable_evidence_reason")
+        or failure_audit.get("why_non_reconstructable")
+        or failure_audit.get("non_reconstructable_reason")
+        or ""
+    ).strip()
+    what_happened = str(
+        failure_audit.get("what_happened")
+        or failure_audit.get("summary")
+        or failure_audit.get("reason")
+        or reason
+    ).strip()
+    combined = " ".join(
+        item
+        for item in (
+            reason,
+            what_happened,
+            non_reconstructable_reason,
+            str(failure_audit.get("impact") or ""),
+        )
+        if item
+    )
+    if failure_audit:
+        forbidden = _audit_archive_forbidden_reconstruction_claim(failure_audit)
+        if forbidden:
+            raise ValidationError(
+                "audit archive failure_audit must not claim startup/close_ready "
+                f"was reconstructed or backfilled: {forbidden}"
+            )
+        if not what_happened:
+            raise ValidationError("audit archive failure_audit requires what_happened or summary")
+        if not non_reconstructable_reason and not _audit_archive_text_has_non_reconstructable_reason(combined):
+            raise ValidationError(
+                "audit archive failure_audit requires non_reconstructable_evidence_reason"
+            )
+    elif not _audit_archive_text_has_non_reconstructable_reason(combined):
+        raise ValidationError(
+            "audit archive requires failure_audit or a reason that describes what happened and why evidence is non-reconstructable"
+        )
+    if not non_reconstructable_reason:
+        non_reconstructable_reason = (
+            "Historical MF close evidence was not recorded at the time of execution; "
+            "real mf_subagent_startup/close_ready evidence cannot be backfilled "
+            "without fabricating append-only timeline facts."
+        )
+    result = dict(failure_audit)
+    result.setdefault("schema_version", "audit_close_failure_audit.v1")
+    result["what_happened"] = what_happened
+    result["non_reconstructable_evidence_reason"] = non_reconstructable_reason
+    result["historical_evidence_reconstructed"] = False
+    return result
+
+
+def _qa_acceptance_passed(qa_acceptance: Mapping[str, Any]) -> bool:
+    if qa_acceptance.get("passed") is True:
+        return True
+    status = str(
+        qa_acceptance.get("status")
+        or qa_acceptance.get("gate_status")
+        or qa_acceptance.get("decision")
+        or qa_acceptance.get("gate_decision")
+        or ""
+    ).strip().lower()
+    return status in {"pass", "passed", "accepted", "approved", "pass_with_followups"}
+
+
+def _validate_backlog_audit_qa_acceptance(
+    *,
+    qa_acceptance: Mapping[str, Any],
+    body: Mapping[str, Any],
+    failure_audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not qa_acceptance:
+        raise ValidationError("audit archive requires passed qa_acceptance evidence")
+    if not _qa_acceptance_passed(qa_acceptance):
+        raise ValidationError("audit archive qa_acceptance must be passed")
+
+    reviewer = str(
+        qa_acceptance.get("reviewer")
+        or qa_acceptance.get("reviewer_id")
+        or qa_acceptance.get("accepted_by")
+        or qa_acceptance.get("actor")
+        or ""
+    ).strip()
+    if not reviewer:
+        raise ValidationError("audit archive qa_acceptance requires reviewer identity")
+    reviewer_role = str(
+        qa_acceptance.get("reviewer_role")
+        or qa_acceptance.get("role")
+        or qa_acceptance.get("lane")
+        or ""
+    ).strip().lower()
+    if reviewer_role in {"observer", "worker", "mf_sub", "subagent", "implementation_worker"}:
+        raise ValidationError("audit archive qa_acceptance reviewer must be independent of observer/worker")
+
+    known_non_qa_identities = {
+        str(body.get("actor") or "observer").strip().lower(),
+        str(body.get("observer") or "").strip().lower(),
+        str(body.get("observer_id") or "").strip().lower(),
+        str(body.get("worker") or "").strip().lower(),
+        str(body.get("worker_id") or "").strip().lower(),
+        str(failure_audit.get("observer") or "").strip().lower(),
+        str(failure_audit.get("observer_id") or "").strip().lower(),
+        str(failure_audit.get("worker") or "").strip().lower(),
+        str(failure_audit.get("worker_id") or "").strip().lower(),
+    }
+    known_non_qa_identities.discard("")
+    if reviewer.lower() in known_non_qa_identities:
+        raise ValidationError("audit archive qa_acceptance reviewer must differ from observer/worker")
+
+    tests = _audit_archive_list_field(
+        qa_acceptance.get("tests"),
+        qa_acceptance.get("test_commands"),
+        qa_acceptance.get("test_results"),
+    )
+    if not tests:
+        raise ValidationError("audit archive qa_acceptance requires tests or test_commands")
+    artifacts = _audit_archive_list_field(
+        qa_acceptance.get("artifacts"),
+        qa_acceptance.get("artifact_refs"),
+        qa_acceptance.get("evidence_refs"),
+    )
+    if not artifacts:
+        raise ValidationError("audit archive qa_acceptance requires artifacts or evidence_refs")
+
+    forbidden = _audit_archive_forbidden_reconstruction_claim(qa_acceptance)
+    if forbidden:
+        raise ValidationError(
+            "audit archive qa_acceptance must not claim startup/close_ready "
+            f"was reconstructed or backfilled: {forbidden}"
+        )
+
+    result = dict(qa_acceptance)
+    result.setdefault("schema_version", "audit_close_qa_acceptance.v1")
+    result["passed"] = True
+    result["reviewer"] = reviewer
+    result["reviewer_role"] = reviewer_role or "qa"
+    result["tests"] = tests
+    result["artifacts"] = artifacts
+    result["independent_reviewer"] = True
+    result["startup_or_close_ready_reconstructed"] = False
+    return result
+
+
+def _validate_requested_audit_close_gate(audit_close_gate: Mapping[str, Any]) -> None:
+    if not audit_close_gate:
+        return
+    for key in (
+        "close_ready_emitted",
+        "startup_reconstructed",
+        "reconstructed_startup",
+        "startup_backfilled",
+        "backfilled_startup",
+        "mf_subagent_startup_backfilled",
+        "backfilled_mf_subagent_startup",
+        "close_ready_reconstructed",
+        "reconstructed_close_ready",
+        "close_ready_backfilled",
+        "backfilled_close_ready",
+        "historical_evidence_reconstructed",
+        "historical_evidence_backfilled",
+        "startup_or_close_ready_backfilled",
+    ):
+        if bool(audit_close_gate.get(key)):
+            raise ValidationError(f"audit_close_gate must not set {key}=true")
+    if "normal_close_gate" in audit_close_gate:
+        normal_gate = audit_close_gate.get("normal_close_gate")
+        if isinstance(normal_gate, Mapping) and bool(normal_gate.get("can_close")):
+            raise ValidationError("audit_close_gate must not claim normal_close_gate.can_close=true")
+
+
+def _build_backlog_audit_close_gate(
+    *,
+    timeline_precheck: Mapping[str, Any],
+    qa_acceptance: Mapping[str, Any],
+    failure_audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    failed_gates = _audit_archive_list_field(
+        timeline_precheck.get("failed_gates"),
+        timeline_precheck.get("missing_event_kinds"),
+    )
+    return {
+        "schema_version": "audit_close_gate.v1",
+        "gate": "audit_close_with_qa_acceptance",
+        "status": "passed",
+        "allowed": True,
+        "passed": True,
+        "can_archive": True,
+        "normal_close_gate_can_close": False,
+        "normal_close_gate_passed": False,
+        "close_ready_emitted": False,
+        "timeline_precheck_can_close": False,
+        "failed_or_missing_normal_gate_evidence": failed_gates,
+        "failure_audit_present": bool(failure_audit),
+        "qa_acceptance_passed": bool(qa_acceptance.get("passed")),
+        "qa_reviewer": str(qa_acceptance.get("reviewer") or ""),
+        "historical_evidence_reconstructed": False,
+    }
+
+
 def _require_backlog_audit_archive_evidence(
     *,
     timeline_precheck: Mapping[str, Any],
@@ -26936,6 +27289,18 @@ def _build_backlog_audit_archive_payload(
         verification=verification,
         graph_snapshot=graph_snapshot,
     )
+    failure_audit = _build_backlog_audit_failure_audit(reason=reason, body=body)
+    qa_acceptance = _validate_backlog_audit_qa_acceptance(
+        qa_acceptance=_json_object_field(body.get("qa_acceptance")),
+        body=body,
+        failure_audit=failure_audit,
+    )
+    _validate_requested_audit_close_gate(_json_object_field(body.get("audit_close_gate")))
+    audit_close_gate = _build_backlog_audit_close_gate(
+        timeline_precheck=timeline_precheck,
+        qa_acceptance=qa_acceptance,
+        failure_audit=failure_audit,
+    )
     return {
         "schema_version": _BACKLOG_AUDIT_ARCHIVE_SCHEMA_VERSION,
         "status": "audit_archived",
@@ -26947,12 +27312,10 @@ def _build_backlog_audit_archive_payload(
         "implementation_commit": commit_sha,
         "reason": reason,
         "non_reconstructable_evidence_reason": str(
-            body.get("non_reconstructable_evidence_reason")
-            or "Historical MF close evidence was not recorded at the time of execution; "
-               "real mf_subagent_startup/close_ready evidence cannot be backfilled "
-               "without fabricating append-only timeline facts."
+            failure_audit.get("non_reconstructable_evidence_reason")
         ),
         "references": references,
+        "audit_close_gate": audit_close_gate,
         "normal_close_gate": {
             "normal_close_gate_passed": False,
             "can_close": False,
@@ -26961,10 +27324,15 @@ def _build_backlog_audit_archive_payload(
             "ordinary_mf_close_claimed": False,
             "observed_timeline_precheck_can_close": observed_can_close,
         },
+        "failure_audit": failure_audit,
+        "qa_acceptance": qa_acceptance,
         "evidence": {
             "verification": verification,
             "graph_snapshot": graph_snapshot,
             "timeline_precheck_failure_summary": timeline_precheck,
+            "failure_audit": failure_audit,
+            "qa_acceptance": qa_acceptance,
+            "audit_close_gate": audit_close_gate,
             "runtime_context": _json_object_field(body.get("runtime_context")),
             "source_backlog_id": str(body.get("source_backlog_id") or bug_id),
             "source_runtime_context_id": str(body.get("source_runtime_context_id") or ""),

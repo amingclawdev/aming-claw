@@ -141,6 +141,17 @@ export interface TaskPlaybackCloseGateSummary {
   next_expected_evidence: string[];
   blocked: boolean;
   event_count: number;
+  audit_close: TaskPlaybackAuditCloseSummary | null;
+}
+
+export interface TaskPlaybackAuditCloseSummary {
+  present: boolean;
+  accepted: boolean;
+  qa_passed: boolean;
+  normal_close_blocked: boolean;
+  evidence_not_reconstructed: boolean;
+  status: string;
+  reason: string;
 }
 
 export interface TaskPlaybackPrivacyBoundary {
@@ -217,7 +228,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
   const frames = events.map((event, index) => frameFromEvent(event, index));
   const closeGateSummary = closeGateSummaryFrom(input.gateResponse);
   const lanes = lanesFromFrames(frames, input.backlog, closeGateSummary);
-  const closeGateMatrix = projectGateMatrix(input.gateResponse?.timeline_gate, closeGateSummary.applicable);
+  const closeGateMatrix = projectGateMatrix(timelineGateWithAuditClose(input.gateResponse), closeGateSummary.applicable);
   const source = input.source ?? (input.taskTimeline || input.gateResponse ? "governed" : "fallback_sample");
   const evidenceRefs = stableEvidence(frames.flatMap((frame) => frame.evidence_refs));
   const artifactRefs = stableArtifacts(frames.flatMap((frame) => frame.artifact_refs));
@@ -598,6 +609,7 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
   ]);
   pushSurrogateCloseEvidenceFact(facts, event);
   pushCloseSubGateFacts(facts, event);
+  pushAuditCloseFacts(facts, event);
   pushFirstFact(facts, event, "topology", "topology", [
     "payload.selected_topology",
     "payload.recommended_topology",
@@ -936,6 +948,70 @@ function pushCloseSubGateFacts(facts: TaskPlaybackStructuredFact[], event: TaskT
   }
 }
 
+function pushAuditCloseFacts(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent): void {
+  const auditStatus = firstPublicValueAtPaths(event, [
+    "payload.audit_archive.status",
+    "payload.audit_close_gate.status",
+    "payload.audit_close_gate.decision",
+    "verification.audit_archive.status",
+    "verification.audit_close_gate.status",
+  ]);
+  if (auditStatus && /audit|archive|accept|pass|waiv/i.test(auditStatus.value)) {
+    pushFact(facts, "audit_close_gate", "audit close gate", auditStatus.value, auditStatus.source);
+  }
+
+  const normalClose = firstPublicValueAtPaths(event, [
+    "payload.audit_archive.normal_close_gate.normal_close_gate_passed",
+    "payload.audit_archive.normal_close_gate.can_close",
+    "payload.normal_close_gate.normal_close_gate_passed",
+    "payload.normal_close_gate.can_close",
+    "verification.normal_close_gate.normal_close_gate_passed",
+    "verification.normal_close_gate.can_close",
+  ]);
+  if (normalClose) {
+    const value = /^(false|no|0)$/i.test(normalClose.value)
+      ? "blocked - normal MF close remains false"
+      : normalClose.value;
+    pushFact(facts, "normal_close_gate", "normal close gate", value, normalClose.source);
+  }
+
+  const qaAcceptance = firstPublicValueAtPaths(event, [
+    "payload.qa_acceptance.status",
+    "payload.qa_acceptance.decision",
+    "payload.audit_archive.qa_acceptance.status",
+    "payload.audit_archive.evidence.verification.status",
+    "payload.audit_archive.evidence.verification.passed",
+    "verification.qa_acceptance.status",
+    "verification.status",
+    "verification.passed",
+  ]);
+  if (qaAcceptance) {
+    const value = /^(true|yes|1)$/i.test(qaAcceptance.value) ? "passed" : qaAcceptance.value;
+    if (/pass|accept|approve|ok|true/i.test(value)) pushFact(facts, "qa_acceptance", "QA acceptance", value, qaAcceptance.source);
+  }
+
+  const nonReconstructable = firstPublicValueAtPaths(event, [
+    "payload.audit_archive.non_reconstructable_evidence_reason",
+    "payload.non_reconstructable_evidence_reason",
+    "verification.non_reconstructable_evidence_reason",
+  ]);
+  const reconstructed = firstPublicValueAtPaths(event, [
+    "payload.audit_archive.evidence.reconstructed",
+    "payload.audit_archive.reconstructed",
+    "payload.reconstructed",
+    "verification.reconstructed",
+  ]);
+  if (nonReconstructable || reconstructed?.value.toLowerCase() === "false") {
+    pushFact(
+      facts,
+      "evidence_reconstruction",
+      "historical evidence reconstruction",
+      nonReconstructable?.value || "not reconstructed",
+      nonReconstructable?.source ?? reconstructed?.source ?? "semantic",
+    );
+  }
+}
+
 function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybackFrameStatus): TaskPlaybackStructuredFact[] {
   const diagnosis: TaskPlaybackStructuredFact[] = [];
   const blockerIds = publicValuesAtPaths(event, [
@@ -1204,6 +1280,10 @@ function eventChecklistFromEvent(
     "cross_ref_gate",
     "stale_route_evidence_gate",
     "surrogate_close_satisfying",
+    "audit_close_gate",
+    "normal_close_gate",
+    "qa_acceptance",
+    "evidence_reconstruction",
   ]);
   for (const fact of specificFacts) {
     if (!factAllowList.has(fact.kind)) continue;
@@ -1232,6 +1312,10 @@ const CHECKLIST_STRUCTURED_ROOTS: Array<{ path: string; label: string; status?: 
   { path: "payload.route_context_gate", label: "Route context gate" },
   { path: "payload.contract_gate", label: "Contract gate" },
   { path: "payload.close_gate", label: "Close gate" },
+  { path: "payload.audit_archive", label: "Audit archive" },
+  { path: "payload.audit_close_gate", label: "Audit close gate" },
+  { path: "payload.qa_acceptance", label: "QA acceptance" },
+  { path: "payload.fixed_close_waiver_alert", label: "Fixed close waiver alert" },
   { path: "payload.contract_evidence", label: "Contract evidence" },
   { path: "payload.matrix", label: "Matrix row" },
   { path: "payload.test_results", label: "Test result" },
@@ -1239,6 +1323,10 @@ const CHECKLIST_STRUCTURED_ROOTS: Array<{ path: string; label: string; status?: 
   { path: "verification.checklist", label: "Verification checklist" },
   { path: "verification.checks", label: "Verification checks" },
   { path: "verification.gate", label: "Verification gate" },
+  { path: "verification.audit_archive", label: "Audit archive" },
+  { path: "verification.audit_close_gate", label: "Audit close gate" },
+  { path: "verification.qa_acceptance", label: "QA acceptance" },
+  { path: "verification.fixed_close_waiver_alert", label: "Fixed close waiver alert" },
   { path: "verification.contract_evidence", label: "Contract evidence" },
   { path: "verification.matrix", label: "Verification matrix" },
   { path: "verification.test_results", label: "Test result" },
@@ -2092,7 +2180,7 @@ function isTerminalFrameStatus(status: TaskPlaybackFrameStatus): boolean {
 }
 
 function isTerminalBacklogStatus(status?: string): boolean {
-  return /^(closed|fixed|done|complete|completed|resolved|merged)$/i.test(safeText(status ?? ""));
+  return /^(closed|fixed|done|complete|completed|resolved|merged|waived|audit_archived|archived|cancelled)$/i.test(safeText(status ?? ""));
 }
 
 function findLastFrame(frames: TaskPlaybackFrame[], predicate: (frame: TaskPlaybackFrame) => boolean): TaskPlaybackFrame | undefined {
@@ -2123,6 +2211,7 @@ function closeGateSummaryFrom(response?: BacklogTimelineGateResponse | null): Ta
       next_expected_evidence: [],
       blocked: false,
       event_count: 0,
+      audit_close: null,
     };
   }
   const missingEventKinds = stable((gate.missing_event_kinds ?? []).map(safeText).filter(Boolean));
@@ -2131,11 +2220,16 @@ function closeGateSummaryFrom(response?: BacklogTimelineGateResponse | null): Ta
   const blocked = response.applicable && (!response.can_close || gate.passed === false || missingEventKinds.length > 0 || missingRequirementCount > 0);
   const nextExpectedEvidence = stable([...missingEventKinds, ...missingRequirementIds]).slice(0, 8);
   const notApplicable = response.applicable === false;
+  const auditClose = auditCloseSummaryFromResponse(response);
   return {
     applicable: Boolean(response.applicable),
     can_close: Boolean(response.can_close),
     status: notApplicable ? "recorded" : blocked ? "blocked" : gate.passed || response.can_close ? "passed" : "recorded",
-    label: response.applicable ? (blocked ? "Close gate blocked" : "Close gate ready") : "Close gate not applicable",
+    label: response.applicable
+      ? auditClose?.accepted && blocked
+        ? "Normal close blocked; audit close accepted"
+        : (blocked ? "Close gate blocked" : "Close gate ready")
+      : "Close gate not applicable",
     missing_event_kinds: missingEventKinds,
     missing_requirement_ids: missingRequirementIds,
     missing_requirement_count: missingRequirementCount,
@@ -2144,6 +2238,59 @@ function closeGateSummaryFrom(response?: BacklogTimelineGateResponse | null): Ta
     next_expected_evidence: nextExpectedEvidence,
     blocked,
     event_count: response.event_count ?? gate.event_count ?? response.events?.length ?? 0,
+    audit_close: auditClose,
+  };
+}
+
+function timelineGateWithAuditClose(response?: BacklogTimelineGateResponse | null): BacklogTimelineGateResponse["timeline_gate"] | undefined {
+  const gate = response?.timeline_gate;
+  if (!gate) return undefined;
+  return {
+    ...gate,
+    audit_archive: gate.audit_archive ?? response?.audit_archive,
+    audit_close_gate: gate.audit_close_gate ?? response?.audit_close_gate,
+    qa_acceptance: gate.qa_acceptance ?? response?.qa_acceptance,
+    fixed_close_waiver_alert: gate.fixed_close_waiver_alert ?? response?.fixed_close_waiver_alert,
+  };
+}
+
+function auditCloseSummaryFromResponse(response: BacklogTimelineGateResponse): TaskPlaybackAuditCloseSummary | null {
+  const gate = response.timeline_gate;
+  const auditArchive = firstRecord(gate.audit_archive, response.audit_archive);
+  const auditGate = firstRecord(gate.audit_close_gate, response.audit_close_gate, auditArchive.audit_close_gate, auditArchive);
+  const archiveEvidence = asRecord(auditArchive.evidence);
+  const qaAcceptance = firstRecord(gate.qa_acceptance, response.qa_acceptance, auditArchive.qa_acceptance, archiveEvidence.verification);
+  const normalGate = firstRecord(gate.normal_close_gate, auditArchive.normal_close_gate);
+  const failureAudit = firstRecord(auditArchive.failure_audit, archiveEvidence.failure_audit);
+  const present =
+    Object.keys(auditArchive).length > 0
+    || Object.keys(auditGate).length > 0
+    || Object.keys(qaAcceptance).length > 0
+    || Object.keys(normalGate).length > 0;
+  if (!present) return null;
+  const accepted = acceptedLike(auditGate) || stringFrom(auditArchive.status) === "audit_archived" || stringFrom(auditArchive.row_status).toUpperCase() === "WAIVED";
+  const qaPassed = acceptedLike(qaAcceptance);
+  const timelinePrecheck = asRecord(archiveEvidence.timeline_precheck_failure_summary);
+  const normalCloseBlocked =
+    response.can_close === false
+    || gate.passed === false
+    || normalGate.can_close === false
+    || normalGate.normal_close_gate_passed === false
+    || timelinePrecheck.can_close === false;
+  const evidenceNotReconstructed =
+    archiveEvidence.reconstructed === false
+    || auditArchive.reconstructed === false
+    || auditArchive.historical_evidence_reconstructed === false
+    || failureAudit.historical_evidence_reconstructed === false
+    || Boolean(stringFrom(auditArchive.non_reconstructable_evidence_reason));
+  return {
+    present,
+    accepted,
+    qa_passed: qaPassed,
+    normal_close_blocked: normalCloseBlocked,
+    evidence_not_reconstructed: evidenceNotReconstructed,
+    status: stringFrom(auditGate.status) || stringFrom(auditArchive.status) || (accepted ? "accepted" : "recorded"),
+    reason: stringFrom(auditArchive.reason) || stringFrom(auditGate.reason) || stringFrom(qaAcceptance.reason),
   };
 }
 
@@ -2593,6 +2740,24 @@ function firstStringField(record: Record<string, unknown>, keys: string[]): stri
     if (value) return value;
   }
   return "";
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> {
+  for (const value of values) {
+    const record = asRecord(value);
+    if (Object.keys(record).length > 0) return record;
+  }
+  return {};
+}
+
+function acceptedLike(record: Record<string, unknown>): boolean {
+  if (record.accepted === true || record.passed === true || record.approved === true) return true;
+  const text = [
+    stringFrom(record.status),
+    stringFrom(record.decision),
+    stringFrom(record.result),
+  ].join(" ").toLowerCase();
+  return /\b(accepted|passed|approved|ok|success|audit_archived)\b/.test(text);
 }
 
 function compactUnknown(value: unknown): string {

@@ -196,6 +196,20 @@ def test_observer_hotfix_direct_mutation_template_resolves_for_pre_mutation_stag
     ]
 
 
+def test_audit_close_with_qa_acceptance_template_declares_no_backfill_policy():
+    template = get_contract_template("audit_close_with_qa_acceptance.v1")
+    evidence_ids = {item["id"] for item in template["evidence_requirements"]}
+
+    assert template["version"] == "v1"
+    assert template["source"]["type"] == "source_controlled"
+    assert template["gate_policy"]["normal_close_gate"]["can_close"] is False
+    assert template["gate_policy"]["audit_close_gate"]["requires_independent_qa_acceptance"] is True
+    assert "qa_acceptance_passed" in evidence_ids
+    assert "normal_close_gate_false_preserved" in evidence_ids
+    assert "backfill_mf_subagent_startup" in template["forbidden_capabilities"]
+    assert "backfill_close_ready" in template["forbidden_capabilities"]
+
+
 def test_unknown_template_id_raises_explicit_error():
     with pytest.raises(UnknownContractTemplateError):
         get_contract_template("missing.v1")

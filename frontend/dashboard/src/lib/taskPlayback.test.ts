@@ -1178,6 +1178,170 @@ function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
 }
 
+function taskPlaybackAuditCloseAssertions(): string[] {
+  const backlog: BacklogBug = {
+    bug_id: "AC-AUDIT-CLOSE-QA-ACCEPTANCE-CONTRACT-20260615",
+    title: "Audit close with QA acceptance",
+    status: "WAIVED",
+    priority: "P0",
+    runtime_state: "audit_archived",
+  };
+  const auditArchive = {
+    schema_version: "backlog_audit_archive.v1",
+    status: "audit_archived",
+    row_status: "WAIVED",
+    reason: "Historical startup and close_ready evidence was not recorded.",
+    non_reconstructable_evidence_reason: "Real mf_subagent_startup and close_ready evidence cannot be reconstructed without fabricating timeline facts.",
+    normal_close_gate: {
+      normal_close_gate_passed: false,
+      can_close: false,
+      close_ready_emitted: false,
+    },
+    audit_close_gate: {
+      schema_version: "audit_close_gate.v1",
+      status: "passed",
+      allowed: true,
+      passed: true,
+    },
+    failure_audit: {
+      historical_evidence_reconstructed: false,
+    },
+    qa_acceptance: {
+      status: "passed",
+      passed: true,
+      reviewer: "qa-reviewer-1",
+      tests: ["pytest agent/tests/test_backlog_db.py"],
+      artifacts: ["artifact://pytest/backlog-db"],
+    },
+    evidence: {
+      timeline_precheck_failure_summary: {
+        can_close: false,
+        failed_gates: ["mf_subagent_startup", "close_ready"],
+      },
+      reconstructed: false,
+    },
+  };
+  const events: TaskTimelineEvent[] = [
+    {
+      id: 5101,
+      event_type: "backlog.audit_archive",
+      event_kind: "backlog_audit_archive",
+      phase: "audit_archive",
+      actor: "observer",
+      status: "audit_archived",
+      backlog_id: backlog.bug_id,
+      payload: { audit_archive: auditArchive },
+      verification: { qa_acceptance: auditArchive.qa_acceptance },
+      created_at: "2026-06-15T12:00:00Z",
+    },
+  ];
+  const gateResponse: BacklogTimelineGateResponse = {
+    ok: true,
+    project_id: "aming-claw",
+    bug_id: backlog.bug_id,
+    applicable: true,
+    can_close: false,
+    event_count: events.length,
+    audit_archive: auditArchive,
+    audit_close_gate: auditArchive.audit_close_gate,
+    qa_acceptance: auditArchive.qa_acceptance,
+    timeline_gate: {
+      schema_version: "mf_close_timeline_gate.v1",
+      passed: false,
+      status: "failed",
+      required_event_kinds: ["implementation", "verification", "close_ready"],
+      present_event_kinds: ["verification"],
+      missing_event_kinds: ["mf_subagent_startup", "close_ready"],
+      event_count: events.length,
+      audit_archive: auditArchive,
+      audit_close_gate: auditArchive.audit_close_gate,
+      qa_acceptance: auditArchive.qa_acceptance,
+      normal_close_gate: auditArchive.normal_close_gate,
+    },
+    events,
+  };
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events, count: events.length },
+    gateResponse,
+    source: "governed",
+    generatedAt: "2026-06-15T12:01:00Z",
+  });
+  assertFixture(trace.close_gate_summary.blocked, "normal close gate should remain blocked");
+  assertFixture(trace.close_gate_summary.audit_close?.accepted === true, "audit close should be accepted separately");
+  assertFixture(trace.close_gate_summary.audit_close?.qa_passed === true, "audit close summary should show QA passed");
+  assertFixture(trace.close_gate_summary.audit_close?.evidence_not_reconstructed === true, "audit close summary should show evidence not reconstructed");
+
+  const auditRows = trace.close_gate_matrix.rows.filter((row) => row.family === "audit_close");
+  assertFixture(auditRows.some((row) => row.id === "normal_close_gate" && row.status === "failed"), "matrix should show normal close gate remains failed");
+  assertFixture(auditRows.some((row) => row.id === "audit_close_gate" && row.status === "passed"), "matrix should show audit close gate passed");
+  assertFixture(auditRows.some((row) => row.id === "qa_acceptance" && row.status === "passed"), "matrix should show QA acceptance passed");
+
+  const frame = trace.frames[0];
+  assertFixture(frame.specific_facts.some((fact) => fact.kind === "audit_close_gate" && fact.value.includes("audit_archived")), "event facts should include audit close gate");
+  assertFixture(frame.specific_facts.some((fact) => fact.kind === "qa_acceptance" && fact.value.includes("passed")), "event facts should include QA acceptance");
+  assertFixture(frame.specific_facts.some((fact) => fact.kind === "evidence_reconstruction"), "event facts should include evidence reconstruction state");
+
+  const playbackSource = readFileSync(new URL("./taskPlayback.ts", import.meta.url), "utf8");
+  assertFixture(playbackSource.includes("waived|audit_archived"), "playback normalization should treat WAIVED/audit_archived rows as terminal");
+
+  const backlogViewSource = readFileSync(new URL("../views/BacklogView.tsx", import.meta.url), "utf8");
+  assertFixture(
+    backlogViewSource.includes('type StatusFilter = "OPEN" | "CLOSED" | "ALL";'),
+    "backlog filters should expose closed rows rather than only FIXED rows",
+  );
+  assertFixture(
+    backlogViewSource.includes('const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);'),
+    "backlog filters should classify audit_archived runtime rows as closed",
+  );
+  assertFixture(
+    backlogViewSource.includes('if (statusFilter === "CLOSED" && !isClosedBug(bug)) return false;'),
+    "closed filter should use the shared closed-row classifier",
+  );
+  assertFixture(
+    backlogViewSource.includes('normalizeStatus(bug.status) === "WAIVED" || AUDIT_ARCHIVED_RUNTIME_STATES.has(normalizeRuntimeState(bug.runtime_state))'),
+    "closed-row classifier should include WAIVED status and audit_archived runtime state",
+  );
+  assertFixture(
+    backlogViewSource.includes('if (s === "WAIVED" || s === "CANCELLED") return "status-unknown";'),
+    "WAIVED rows should be visually distinct from normal FIXED rows",
+  );
+  assertFixture(
+    backlogViewSource.includes("Audit close") && backlogViewSource.includes("Evidence") && backlogViewSource.includes("not reconstructed"),
+    "detail summary should surface audit close, QA acceptance, and non-reconstructed evidence state",
+  );
+
+  const taskPlaybackViewSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
+  assertFixture(
+    taskPlaybackViewSource.includes('type StatusFilter = "open" | "closed" | "all";'),
+    "playback selector should expose closed rows rather than only fixed rows",
+  );
+  assertFixture(
+    taskPlaybackViewSource.includes('const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);'),
+    "playback selector should classify audit_archived runtime rows as closed",
+  );
+  assertFixture(
+    taskPlaybackViewSource.includes('if (statusFilter === "closed" && !isClosedBug(bug)) return false;'),
+    "playback selector closed filter should use the shared closed-row classifier",
+  );
+  assertFixture(
+    taskPlaybackViewSource.includes('["closed", "Closed"]'),
+    "playback selector status filter label should say Closed",
+  );
+  assertFixture(
+    taskPlaybackViewSource.includes("const openDelta = Number(isOpenBug(b)) - Number(isOpenBug(a));"),
+    "playback selector sorting should keep open rows ahead of closed audit rows",
+  );
+
+  return [
+    trace.close_gate_summary.label,
+    ...auditRows.map((row) => `${row.id}:${row.status}`),
+  ];
+}
+
+export const taskPlaybackAuditCloseSummary: string[] = taskPlaybackAuditCloseAssertions();
+
 // ---------------------------------------------------------------------------
 // AC-PLAYBACK-ROW-PRIVACY-FLAG-NOT-REGEX-20260608: explicit flag tests
 // ---------------------------------------------------------------------------

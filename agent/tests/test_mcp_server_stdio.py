@@ -109,9 +109,16 @@ def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():
     tools = responses[0]["result"]["tools"]
     audit_archive = next(tool for tool in tools if tool["name"] == "backlog_audit_archive")
     properties = audit_archive["inputSchema"]["properties"]
-    assert {"commit", "reason", "timeline_precheck", "verification", "graph_snapshot"}.issubset(
-        properties
-    )
+    assert {
+        "commit",
+        "reason",
+        "timeline_precheck",
+        "failure_audit",
+        "qa_acceptance",
+        "audit_close_gate",
+        "verification",
+        "graph_snapshot",
+    }.issubset(properties)
     assert "route_token" in properties
     assert "route_waiver" in properties
     assert "route_token_waiver" in properties
@@ -121,6 +128,14 @@ def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():
         "commit",
         "reason",
     ]
+
+    legacy_archive = next(
+        tool for tool in governance_mcp_server.TOOLS if tool["name"] == "backlog_audit_archive"
+    )
+    legacy_properties = legacy_archive["inputSchema"]["properties"]
+    assert {"failure_audit", "qa_acceptance", "audit_close_gate"}.issubset(
+        legacy_properties
+    )
 
 
 def test_mcp_stdio_protected_write_schemas_expose_route_gate_fields():
@@ -308,6 +323,22 @@ def test_mcp_backlog_audit_archive_forwards_payload():
         "reason": "Unit test supplies explicit route waiver evidence.",
         "timeline_evidence": {"event_id": "event-archive"},
     }
+    failure_audit = {
+        "what_happened": "Implementation landed before real close evidence was recorded.",
+        "non_reconstructable_evidence_reason": "Startup and close_ready cannot be backfilled.",
+    }
+    qa_acceptance = {
+        "passed": True,
+        "reviewer": "qa-reviewer-1",
+        "reviewer_role": "qa",
+        "tests": ["pytest"],
+        "artifacts": ["artifact://pytest"],
+    }
+    audit_close_gate = {
+        "allowed": True,
+        "passed": True,
+        "normal_close_gate": {"can_close": False},
+    }
 
     result = dispatcher.dispatch(
         "backlog_audit_archive",
@@ -317,6 +348,9 @@ def test_mcp_backlog_audit_archive_forwards_payload():
             "commit": "abc123",
             "reason": "Historical close evidence cannot be reconstructed.",
             "timeline_precheck": {"can_close": False},
+            "failure_audit": failure_audit,
+            "qa_acceptance": qa_acceptance,
+            "audit_close_gate": audit_close_gate,
             "verification": {"tests": ["pytest"]},
             "route_waiver": route_waiver,
         },
@@ -331,6 +365,9 @@ def test_mcp_backlog_audit_archive_forwards_payload():
                 "commit": "abc123",
                 "reason": "Historical close evidence cannot be reconstructed.",
                 "timeline_precheck": {"can_close": False},
+                "failure_audit": failure_audit,
+                "qa_acceptance": qa_acceptance,
+                "audit_close_gate": audit_close_gate,
                 "verification": {"tests": ["pytest"]},
                 "route_waiver": route_waiver,
             },

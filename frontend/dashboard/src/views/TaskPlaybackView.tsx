@@ -29,7 +29,7 @@ interface Props {
   projectId: string;
 }
 
-type StatusFilter = "open" | "fixed" | "all";
+type StatusFilter = "open" | "closed" | "all";
 type GateFilter = "all" | "gate_candidate" | "timeline_loaded" | "blocked_gate" | "no_timeline";
 type ActivityMode = "activity" | "history";
 
@@ -44,7 +44,8 @@ const RECENT_EVENTS_LIMIT = 100;
 const EVENTS_PAGE_SIZE = 10;
 const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
-const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "MERGED", "SUPERSEDED"]);
+const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "MERGED", "SUPERSEDED", "WAIVED"]);
+const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);
 
 interface PlaybackLoadState {
   loading: boolean;
@@ -329,7 +330,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     return publicBugs
       .filter((bug) => {
         if (statusFilter === "open" && !isOpenBug(bug)) return false;
-        if (statusFilter === "fixed" && isOpenBug(bug)) return false;
+        if (statusFilter === "closed" && !isClosedBug(bug)) return false;
         if (!matchesGateFilter(gateFilter, bug, playbackByBug[bug.bug_id])) return false;
         if (!q) return true;
         const hay = [
@@ -876,7 +877,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 value={statusFilter}
                 options={[
                   ["open", "Open"],
-                  ["fixed", "Fixed"],
+                  ["closed", "Closed"],
                   ["all", "All"],
                 ]}
                 onChange={setStatusFilter}
@@ -1174,11 +1175,23 @@ function navigateToPlayback(backlogId: string, eventId?: string): void {
 }
 
 function isOpenBug(bug: BacklogBug): boolean {
-  return !CLOSED_STATUSES.has(normalizeStatus(bug.status));
+  return !isClosedBug(bug);
 }
 
-function normalizeStatus(status: string): string {
+function isClosedBug(bug: BacklogBug): boolean {
+  return CLOSED_STATUSES.has(normalizeStatus(bug.status)) || isAuditClosedBug(bug);
+}
+
+function isAuditClosedBug(bug: BacklogBug): boolean {
+  return normalizeStatus(bug.status) === "WAIVED" || AUDIT_ARCHIVED_RUNTIME_STATES.has(normalizeRuntimeState(bug.runtime_state));
+}
+
+function normalizeStatus(status?: string): string {
   return (status || "UNKNOWN").trim().toUpperCase();
+}
+
+function normalizeRuntimeState(runtimeState?: string): string {
+  return (runtimeState || "").trim().toLowerCase();
 }
 
 function priorityWeight(priority: string): number {
@@ -1186,6 +1199,8 @@ function priorityWeight(priority: string): number {
 }
 
 function compareBacklogRows(a: BacklogBug, b: BacklogBug): number {
+  const openDelta = Number(isOpenBug(b)) - Number(isOpenBug(a));
+  if (openDelta !== 0) return openDelta;
   const priority = priorityWeight(a.priority) - priorityWeight(b.priority);
   if (priority !== 0) return priority;
   return Date.parse(b.updated_at || b.created_at || "") - Date.parse(a.updated_at || a.created_at || "");
@@ -1193,6 +1208,7 @@ function compareBacklogRows(a: BacklogBug, b: BacklogBug): number {
 
 function statusClass(status: string): string {
   const normalized = status.toLowerCase();
+  if (["waived", "cancelled", "audit_archived"].some((item) => normalized.includes(item))) return "status-unknown";
   if (["fixed", "closed", "done", "resolved", "passed", "complete"].some((item) => normalized.includes(item))) return "status-complete";
   if (["blocked", "failed", "missing", "error"].some((item) => normalized.includes(item))) return "status-failed";
   if (["progress", "running", "claimed", "open"].some((item) => normalized.includes(item))) return "status-running";

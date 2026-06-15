@@ -1,0 +1,151 @@
+{
+  "schema_version": "audit_close_with_qa_acceptance_contract.v1",
+  "template_id": "audit_close_with_qa_acceptance.v1",
+  "version": "v1",
+  "contract_kind": "manual_fix_audit_archive",
+  "description": "Contract for archiving implemented historical MF rows whose required startup or close-ready evidence cannot legally be reconstructed. This is a separate audit-close gate backed by independent QA acceptance; it does not make the normal MF close gate pass.",
+  "task_types": [
+    "manual_fix",
+    "chain_rescue",
+    "observer_hotfix"
+  ],
+  "stages": [
+    "normal_close_gate_precheck",
+    "failure_audit",
+    "independent_qa_acceptance",
+    "audit_archive"
+  ],
+  "source": {
+    "type": "source_controlled",
+    "path": "agent/governance/contract_templates/audit_close_with_qa_acceptance.v1.json"
+  },
+  "applicability": {
+    "allowed_only_for": "implemented historical rows with missing or failed MF close evidence that cannot be reconstructed without fabricating append-only facts",
+    "not_for": [
+      "normal_mf_close",
+      "bypass_timeline_gate",
+      "startup_or_close_ready_backfill",
+      "surrogate_startup_substitution",
+      "new_work_without_worker_evidence",
+      "normal_close_gate_success_claim"
+    ]
+  },
+  "gate_policy": {
+    "normal_close_gate": {
+      "required_state": "failed",
+      "can_close": false,
+      "close_ready_emitted": false,
+      "must_remain_visible": true
+    },
+    "audit_close_gate": {
+      "required_state": "passed",
+      "allowed": true,
+      "requires_failure_audit": true,
+      "requires_independent_qa_acceptance": true,
+      "does_not_reconstruct_historical_evidence": true
+    }
+  },
+  "required_inputs": [
+    "backlog_id",
+    "implementation_commit",
+    "timeline_precheck",
+    "failure_audit",
+    "qa_acceptance",
+    "graph_snapshot"
+  ],
+  "evidence_requirements": [
+    {
+      "id": "contract_template_added",
+      "required": true,
+      "phase": "audit_archive",
+      "description": "This source-controlled contract template exists and is referenced by the backlog row."
+    },
+    {
+      "id": "normal_close_gate_failed",
+      "required": true,
+      "phase": "normal_close_gate_precheck",
+      "description": "timeline_precheck.can_close is false and includes missing_event_kinds or failed_gates."
+    },
+    {
+      "id": "failure_audit",
+      "required": true,
+      "phase": "failure_audit",
+      "description": "Explains what happened and why required historical startup or close-ready evidence is non-reconstructable."
+    },
+    {
+      "id": "qa_acceptance_passed",
+      "required": true,
+      "phase": "independent_qa_acceptance",
+      "description": "Independent QA acceptance passed, names reviewer identity, lists tests, and lists artifacts or evidence refs."
+    },
+    {
+      "id": "normal_close_gate_false_preserved",
+      "required": true,
+      "phase": "audit_archive",
+      "description": "Payload keeps normal_close_gate.can_close=false and close_ready_emitted=false visible."
+    },
+    {
+      "id": "audit_close_gate_passed",
+      "required": true,
+      "phase": "audit_archive",
+      "description": "Payload exposes audit_close_gate.allowed=true and audit_close_gate.passed=true as the archive authority."
+    },
+    {
+      "id": "no_evidence_reconstruction_claim",
+      "required": true,
+      "phase": "audit_archive",
+      "description": "Payload and QA acceptance do not claim startup or close_ready evidence was reconstructed."
+    },
+    {
+      "id": "backend_tests",
+      "required": true,
+      "phase": "verification",
+      "description": "Focused backend tests prove rejection without QA and acceptance with passed QA."
+    },
+    {
+      "id": "mcp_schema_forwarding",
+      "required": true,
+      "phase": "verification",
+      "description": "MCP schema exposes and forwarding preserves qa_acceptance, failure_audit, and audit_close_gate fields."
+    }
+  ],
+  "qa_acceptance_contract": {
+    "required_fields": [
+      "passed",
+      "reviewer",
+      "tests",
+      "artifacts"
+    ],
+    "reviewer_policy": "Reviewer identity must be independent from observer and worker identities when those identities are known.",
+    "forbidden_claims": [
+      "startup_reconstructed",
+      "close_ready_reconstructed",
+      "close_ready_emitted",
+      "normal_close_gate_can_close_true"
+    ]
+  },
+  "forbidden_capabilities": [
+    "bypass_timeline_gate",
+    "author_worker_evidence",
+    "backfill_mf_subagent_startup",
+    "backfill_close_ready",
+    "claim_normal_close_gate_passed",
+    "claim_startup_or_close_ready_reconstructed"
+  ],
+  "output_contract": {
+    "required_payload_fields": [
+      "audit_close_gate",
+      "normal_close_gate",
+      "failure_audit",
+      "qa_acceptance"
+    ],
+    "audit_close_gate": {
+      "allowed": true,
+      "passed": true
+    },
+    "normal_close_gate": {
+      "can_close": false,
+      "close_ready_emitted": false
+    }
+  }
+}

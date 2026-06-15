@@ -726,6 +726,16 @@ export interface BacklogBug {
   chain_trigger_json?: Record<string, unknown> | string;
   bypass_policy_json?: string;
   bypass_policy?: Record<string, unknown>;
+  takeover_json?: string;
+  takeover?: {
+    audit_archive?: BacklogAuditArchive;
+    audit_close_gate?: BacklogAuditCloseGate;
+    qa_acceptance?: BacklogQaAcceptance;
+    [key: string]: unknown;
+  };
+  audit_archive?: BacklogAuditArchive;
+  audit_close_gate?: BacklogAuditCloseGate;
+  qa_acceptance?: BacklogQaAcceptance;
   created_at?: string;
   updated_at?: string;
   fixed_at?: string;
@@ -755,6 +765,82 @@ export interface BacklogBug {
   /** True when the row is safe to display in public playback views. Defaults to true. */
   public_safe?: boolean;
   compact?: boolean;
+}
+
+export interface BacklogAuditArchive {
+  schema_version?: "backlog_audit_archive.v1" | string;
+  status?: "audit_archived" | string;
+  row_status?: "WAIVED" | string;
+  project_id?: string;
+  bug_id?: string;
+  archived_at?: string;
+  archived_by?: string;
+  implementation_commit?: string;
+  reason?: string;
+  non_reconstructable_evidence_reason?: string;
+  references?: string[];
+  normal_close_gate?: BacklogAuditNormalCloseGate;
+  audit_close_gate?: BacklogAuditCloseGate;
+  qa_acceptance?: BacklogQaAcceptance;
+  evidence?: {
+    verification?: BacklogQaAcceptance | Record<string, unknown>;
+    graph_snapshot?: Record<string, unknown>;
+    timeline_precheck_failure_summary?: Record<string, unknown>;
+    runtime_context?: Record<string, unknown>;
+    source_backlog_id?: string;
+    source_runtime_context_id?: string;
+    [key: string]: unknown;
+  };
+  runtime_context_entrypoint?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface BacklogAuditNormalCloseGate {
+  normal_close_gate_passed?: boolean;
+  can_close?: boolean;
+  can_close_claimed?: boolean;
+  close_ready_emitted?: boolean;
+  ordinary_mf_close_claimed?: boolean;
+  observed_timeline_precheck_can_close?: boolean;
+  [key: string]: unknown;
+}
+
+export interface BacklogAuditCloseGate {
+  schema_version?: string;
+  accepted?: boolean;
+  passed?: boolean;
+  status?: string;
+  decision?: string;
+  reason?: string;
+  evidence_event_ids?: Array<string | number>;
+  evidence_events?: Record<string, unknown>[];
+  [key: string]: unknown;
+}
+
+export interface BacklogQaAcceptance {
+  schema_version?: string;
+  accepted?: boolean;
+  passed?: boolean;
+  status?: string;
+  decision?: string;
+  reason?: string;
+  reviewer?: string;
+  evidence_event_ids?: Array<string | number>;
+  evidence_events?: Record<string, unknown>[];
+  checks?: Record<string, boolean | number | string>;
+  [key: string]: unknown;
+}
+
+export interface BacklogFixedCloseWaiverAlert {
+  schema_version?: "mf_fixed_close_waiver_alert.v1" | string;
+  alert?: boolean;
+  status?: string;
+  is_fixed?: boolean;
+  can_close?: boolean;
+  has_close_waiver?: boolean;
+  close_waiver_state?: Record<string, unknown>;
+  reason?: string;
+  [key: string]: unknown;
 }
 
 export interface BacklogContractSummary {
@@ -807,6 +893,11 @@ export interface BacklogTimelineGateResponse {
   timeline_gate: MfCloseTimelineGate;
   event_count: number;
   events?: TaskTimelineEvent[];
+  audit_archive?: BacklogAuditArchive;
+  audit_close_gate?: BacklogAuditCloseGate;
+  qa_acceptance?: BacklogQaAcceptance;
+  fixed_close_waiver_alert?: BacklogFixedCloseWaiverAlert;
+  governance_alert?: BacklogFixedCloseWaiverAlert | Record<string, unknown>;
   request_id?: string;
 }
 
@@ -824,6 +915,11 @@ export interface MfCloseTimelineGate {
   contract_projection?: AgentTaskContractProjection;
   missing_evidence_groups?: MfMissingEvidenceGroups;
   route_context_reminder?: MfRouteContextReminder;
+  normal_close_gate?: BacklogAuditNormalCloseGate;
+  audit_archive?: BacklogAuditArchive;
+  audit_close_gate?: BacklogAuditCloseGate;
+  qa_acceptance?: BacklogQaAcceptance;
+  fixed_close_waiver_alert?: BacklogFixedCloseWaiverAlert;
   checks?: Record<string, boolean | number | string>;
 }
 

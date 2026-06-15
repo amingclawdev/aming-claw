@@ -771,6 +771,7 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
             handle_backlog_audit_archive,
             handle_backlog_get,
             handle_backlog_list,
+            handle_backlog_timeline_gate,
             handle_backlog_upsert,
         )
 
@@ -801,6 +802,20 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
                         "can_close": False,
                         "failed_gates": ["mf_subagent_startup", "close_ready"],
                     },
+                    "failure_audit": {
+                        "what_happened": "Implementation landed before real startup and close_ready evidence was recorded.",
+                        "non_reconstructable_evidence_reason": (
+                            "Real mf_subagent_startup and close_ready events cannot be reconstructed "
+                            "after the fact without fabricating append-only timeline evidence."
+                        ),
+                    },
+                    "qa_acceptance": {
+                        "passed": True,
+                        "reviewer": "qa-reviewer-1",
+                        "reviewer_role": "qa",
+                        "tests": ["pytest agent/tests/test_backlog_db.py"],
+                        "artifacts": ["artifact://pytest/backlog-db"],
+                    },
                     "verification": {"tests": ["pytest agent/tests/test_backlog_db.py"]},
                     "graph_snapshot_id": "scope-test-audit",
                     "route_waiver": _route_waiver("backlog_audit_archive", bug_id),
@@ -819,10 +834,17 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         self.assertFalse(archive["normal_close_gate"]["can_close_claimed"])
         self.assertFalse(archive["normal_close_gate"]["close_ready_emitted"])
         self.assertFalse(archive["normal_close_gate"]["normal_close_gate_passed"])
+        self.assertTrue(archive["audit_close_gate"]["allowed"])
+        self.assertTrue(archive["audit_close_gate"]["passed"])
+        self.assertFalse(archive["audit_close_gate"]["normal_close_gate_can_close"])
+        self.assertEqual(archive["qa_acceptance"]["reviewer"], "qa-reviewer-1")
+        self.assertTrue(archive["qa_acceptance"]["passed"])
+        self.assertFalse(archive["failure_audit"]["historical_evidence_reconstructed"])
         self.assertEqual(
             archive["evidence"]["timeline_precheck_failure_summary"]["failed_gates"],
             ["mf_subagent_startup", "close_ready"],
         )
+        self.assertTrue(archive["evidence"]["audit_close_gate"]["qa_acceptance_passed"])
         self.assertEqual(
             archive["evidence"]["graph_snapshot"]["snapshot_id"],
             "scope-test-audit",
@@ -836,6 +858,19 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         self.assertEqual(row["takeover"]["audit_archive"]["row_status"], "WAIVED")
         self.assertIn("normal_close_gate_passed: false", row["details_md"])
 
+        gate = handle_backlog_timeline_gate(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                query={"include_events": "true"},
+            )
+        )
+        self.assertFalse(gate["can_close"])
+        self.assertEqual(gate["audit_archive"]["row_status"], "WAIVED")
+        self.assertTrue(gate["audit_close_gate"]["passed"])
+        self.assertEqual(gate["qa_acceptance"]["reviewer"], "qa-reviewer-1")
+        self.assertTrue(gate["timeline_gate"]["audit_close_gate"]["allowed"])
+        self.assertTrue(gate["timeline_gate"]["qa_acceptance"]["passed"])
+
         active = handle_backlog_list(
             self._make_ctx(
                 {"project_id": "test-project"},
@@ -843,6 +878,184 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
             )
         )
         self.assertNotIn(bug_id, {item["bug_id"] for item in active["bugs"]})
+
+    def test_audit_archive_rejects_without_qa_acceptance(self):
+        from governance.errors import GovernanceError
+        from governance.server import handle_backlog_audit_archive, handle_backlog_upsert
+
+        bug_id = "BW-AUDIT-ARCHIVE-NO-QA"
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Historical close blocker missing QA",
+                    "status": "OPEN",
+                    "force_admit": True,
+                },
+            )
+        )
+
+        with self.assertRaises(GovernanceError) as cm:
+            handle_backlog_audit_archive(
+                self._make_ctx(
+                    {"project_id": "test-project", "bug_id": bug_id},
+                    body={
+                        "commit": "abc123",
+                        "reason": "Historical close_ready evidence cannot be reconstructed.",
+                        "timeline_precheck": {
+                            "can_close": False,
+                            "missing_event_kinds": ["mf_subagent_startup", "close_ready"],
+                        },
+                        "failure_audit": {
+                            "what_happened": "The implementation already landed but required MF events are missing.",
+                            "non_reconstructable_evidence_reason": (
+                                "Real startup and close_ready events cannot be backfilled now."
+                            ),
+                        },
+                        "verification": {"tests": ["pytest agent/tests/test_backlog_db.py"]},
+                        "graph_snapshot": {"snapshot_id": "scope-test"},
+                        "route_waiver": _route_waiver("backlog_audit_archive", bug_id),
+                    },
+                )
+            )
+        self.assertEqual(cm.exception.code, "invalid_request")
+        self.assertIn("qa_acceptance", cm.exception.message)
+
+    def test_audit_archive_rejects_reconstructed_evidence_claim(self):
+        from governance.errors import GovernanceError
+        from governance.server import handle_backlog_audit_archive, handle_backlog_upsert
+
+        bug_id = "BW-AUDIT-ARCHIVE-RECONSTRUCTED"
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Historical close blocker with bad QA claim",
+                    "status": "OPEN",
+                    "force_admit": True,
+                },
+            )
+        )
+
+        with self.assertRaises(GovernanceError) as cm:
+            handle_backlog_audit_archive(
+                self._make_ctx(
+                    {"project_id": "test-project", "bug_id": bug_id},
+                    body={
+                        "commit": "abc123",
+                        "reason": "Historical close_ready evidence cannot be reconstructed.",
+                        "timeline_precheck": {
+                            "can_close": False,
+                            "missing_event_kinds": ["mf_subagent_startup", "close_ready"],
+                        },
+                        "failure_audit": {
+                            "what_happened": "The implementation already landed but required MF events are missing.",
+                            "non_reconstructable_evidence_reason": (
+                                "Real startup and close_ready events cannot be backfilled now."
+                            ),
+                        },
+                        "qa_acceptance": {
+                            "passed": True,
+                            "reviewer": "qa-reviewer-1",
+                            "reviewer_role": "qa",
+                            "tests": ["pytest agent/tests/test_backlog_db.py"],
+                            "artifacts": ["artifact://pytest/backlog-db"],
+                            "close_ready_reconstructed": True,
+                        },
+                        "verification": {"tests": ["pytest agent/tests/test_backlog_db.py"]},
+                        "graph_snapshot": {"snapshot_id": "scope-test"},
+                        "route_waiver": _route_waiver("backlog_audit_archive", bug_id),
+                    },
+                )
+            )
+        self.assertEqual(cm.exception.code, "invalid_request")
+        self.assertIn("must not claim", cm.exception.message)
+
+    def test_audit_archive_rejects_positive_backfill_claims(self):
+        from governance.errors import GovernanceError
+        from governance.server import handle_backlog_audit_archive, handle_backlog_upsert
+
+        def valid_failure_audit() -> dict[str, object]:
+            return {
+                "what_happened": "The implementation already landed but required MF events are missing.",
+                "non_reconstructable_evidence_reason": (
+                    "Real startup and close_ready events cannot be backfilled now."
+                ),
+            }
+
+        def valid_qa_acceptance() -> dict[str, object]:
+            return {
+                "passed": True,
+                "reviewer": "qa-reviewer-1",
+                "reviewer_role": "qa",
+                "tests": ["pytest agent/tests/test_backlog_db.py"],
+                "artifacts": ["artifact://pytest/backlog-db"],
+            }
+
+        cases = [
+            (
+                "BW-AUDIT-ARCHIVE-STARTUP-BACKFILLED",
+                {
+                    "failure_audit": {
+                        **valid_failure_audit(),
+                        "startup_backfilled": True,
+                    },
+                    "qa_acceptance": valid_qa_acceptance(),
+                },
+                "failure_audit",
+                "startup_backfilled",
+            ),
+            (
+                "BW-AUDIT-ARCHIVE-CLAIM-BACKFILLED",
+                {
+                    "failure_audit": valid_failure_audit(),
+                    "qa_acceptance": {
+                        **valid_qa_acceptance(),
+                        "claims": ["Backfilled close_ready evidence"],
+                    },
+                },
+                "qa_acceptance",
+                "Backfilled close_ready evidence",
+            ),
+        ]
+
+        for bug_id, body_update, expected_section, expected_claim in cases:
+            with self.subTest(bug_id=bug_id):
+                handle_backlog_upsert(
+                    self._make_ctx(
+                        {"project_id": "test-project", "bug_id": bug_id},
+                        body={
+                            "title": "Historical close blocker with bad backfill claim",
+                            "status": "OPEN",
+                            "force_admit": True,
+                        },
+                    )
+                )
+
+                with self.assertRaises(GovernanceError) as cm:
+                    handle_backlog_audit_archive(
+                        self._make_ctx(
+                            {"project_id": "test-project", "bug_id": bug_id},
+                            body={
+                                "commit": "abc123",
+                                "reason": "Historical close_ready evidence cannot be reconstructed.",
+                                "timeline_precheck": {
+                                    "can_close": False,
+                                    "missing_event_kinds": ["mf_subagent_startup", "close_ready"],
+                                },
+                                "verification": {"tests": ["pytest agent/tests/test_backlog_db.py"]},
+                                "graph_snapshot": {"snapshot_id": "scope-test"},
+                                "route_waiver": _route_waiver(
+                                    "backlog_audit_archive", bug_id
+                                ),
+                                **body_update,
+                            },
+                        )
+                    )
+                self.assertEqual(cm.exception.code, "invalid_request")
+                self.assertIn(expected_section, cm.exception.message)
+                self.assertIn("must not claim", cm.exception.message)
+                self.assertIn(expected_claim, cm.exception.message)
 
     def test_audit_archive_rejects_missing_core_evidence(self):
         from governance.errors import GovernanceError
