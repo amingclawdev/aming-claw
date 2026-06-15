@@ -151,6 +151,22 @@ If a fresh Codex session can see the Aming Claw skill but
 `ListMcpResourcesTool()` does not list `aming-claw://current-context`, stop
 normal governed work. Use the launcher/doctor path, reload or open a new
 session, and only use HTTP/CLI fallback for explicit system-recovery work.
+Governance health and dashboard health are not enough; they do not prove the
+current AI host loaded `.mcp.json` or exposed Aming Claw MCP resources.
+
+Path root matters. Hosts discover project-scoped `.mcp.json` from the opened
+workspace/plugin root, so opening the parent directory of the plugin checkout
+can leave the server undiscovered. Fix by opening or reloading the root that
+contains `.mcp.json`, or by using the installed plugin cache/host config, then
+verify `aming-claw://current-context` in the new session.
+
+Runtime-context workers should prefer the role-scoped helper surfaces. Read the
+current state through MCP `runtime_context_current`, CLI
+`aming-claw runtime-context current`, or HTTP
+`/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/current-state`.
+Use `/worker-guide` or the returned `worker_guide` for graph route context and
+write-guide surfaces before read receipts, startup, checkpoints,
+implementation evidence, or finish gates.
 
 ## Compatibility Checks
 

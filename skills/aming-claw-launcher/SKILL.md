@@ -30,6 +30,15 @@ action, not a long tutorial. Use `aming-claw status` to check health and
   bootstrap, or one-shot setup.
 - Use `aming-claw plugin install` for local plugin setup or repair. After
   plugin install/update, ask for a new host session so skills and MCP load.
+- Before observer or governed implementation work, verify the current host can
+  list and read `aming-claw://current-context`. Governance health, dashboard
+  health, and `aming-claw start` are not MCP readiness.
+- If current-context is missing, stop normal governed work. Reload or open a
+  new host session from the plugin/workspace root that contains `.mcp.json`, or
+  use the installed plugin cache/host config, then verify current-context
+  again. Opening the parent directory can leave `.mcp.json` undiscovered.
+- Use HTTP/CLI fallback without current-context only for explicit
+  system-recovery diagnosis or hotfix work.
 
 ## 治理边界：gate 是约束，不是对手
 
@@ -44,27 +53,32 @@ action, not a long tutorial. Use `aming-claw status` to check health and
 
 ## State Machine
 
-Start by reading current context when available:
+Start by proving current host MCP context visibility:
 
 ```text
 aming-claw://current-context
 ```
 
-If MCP is unavailable, use `aming-claw status` or `GET /api/health`.
-After each state branch, run [Fixed First-Value Steps](#fixed-first-value-steps).
+If `aming-claw://current-context` is unavailable, use `aming-claw status` or
+`GET /api/health` only for launcher diagnosis. Do not continue into observer or
+governed implementation work until the host session reloads and current-context
+is visible.
+After each state branch that reaches current-context visibility, run
+[Fixed First-Value Steps](#fixed-first-value-steps).
 
 ### State A: Governance Offline
 
-When health/current-context is missing, refused, or stale enough to be unsafe:
+When governance health is missing, refused, or stale enough to be unsafe:
 
 1. Show the explicit startup path: `aming-claw launcher`, then
    `aming-claw start`.
 2. Explain that `aming-claw start` is long-running when it succeeds and should
    stay open in its own terminal. The root path `/` may return `404`; use
    `/dashboard`.
-3. After the user starts it, verify with `aming-claw status`, MCP
-   `runtime_status(project_id="<project_id>")`, or `/api/health`.
-4. Then re-enter the state machine at State B or State C.
+3. After the user starts it, verify service health with `aming-claw status` or
+   `/api/health`.
+4. Then verify MCP current-context visibility in the host session before
+   observer/governed work, and re-enter the state machine at State B or State C.
 
 ### State B: Governance Running, Workspace Unregistered
 

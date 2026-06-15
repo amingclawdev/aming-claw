@@ -46,7 +46,30 @@ http://localhost:40000/dashboard
 
 The root path `/` is not the dashboard and may return `404`.
 
-## 2. Register A Target Project
+## 2. Verify Host MCP Context
+
+Before a new Codex or Claude Code observer session does observer or governed
+implementation work, verify the host session can see Aming Claw MCP current
+context:
+
+1. List MCP resources.
+2. Confirm `aming-claw://current-context` is present.
+3. Read `aming-claw://current-context` and use its project id, governance URL,
+   and guardrails as the session anchor.
+
+Governance health, `/api/health`, and a working `/dashboard` prove the service
+can answer HTTP. They do not prove the AI host loaded `.mcp.json`, exposed the
+Aming Claw MCP server, or has route/current-context visibility.
+
+If `aming-claw://current-context` is missing, stop normal governed work. Reload
+or open a new Codex/Claude host session from the plugin or workspace root that
+contains `.mcp.json`, or use the installed plugin cache/host config, then verify
+current-context again. Opening the parent directory instead of the actual
+plugin checkout can leave `.mcp.json` undiscovered. HTTP/CLI fallback is only
+for an explicit system-recovery hotfix or diagnosis, not ordinary governed
+implementation.
+
+## 3. Register A Target Project
 
 Project registration is explicit. Do not silently register a workspace just
 because `/api/projects` is empty.
@@ -150,7 +173,7 @@ project id. For a dirty first-run target that is not yet registered, this event
 lives in the requested project's governance timeline DB even though the project
 registry row is not created.
 
-## 3. Project Config In V1
+## 4. Project Config In V1
 
 V1 stores most user project metadata in the Aming Claw project registry. It
 should not default to creating or mutating `.aming-claw.yaml` in the target
@@ -164,7 +187,7 @@ For source-controlled projects that want a config file, see
 - `testing.e2e` suite metadata.
 - `ai.routing`, especially the `semantic` provider/model.
 
-## 4. First Useful Actions
+## 5. First Useful Actions
 
 After graph build:
 
@@ -193,6 +216,14 @@ worktrees, or mutate merge queues. The observer also does not wait, merge, or
 push by default unless the user explicitly asks or a documented governance
 transition requires it.
 
+When an `mf_sub` worker has a `runtime_context_id`, it should read the Runtime
+Context Service before acting: use MCP `runtime_context_current`, CLI
+`aming-claw runtime-context current`, or HTTP
+`/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/current-state`.
+Use `/worker-guide` or the returned `worker_guide` to find the graph route
+context and write-guide surfaces for read receipts, startup, checkpoints,
+implementation evidence, and finish gates.
+
 Worker final evidence should name the branch/worktree, owned changed files,
 tests run, graph query trace ids, precheck evidence, generated assets policy,
 and risks/open questions. Merge review checks contract fit, diff scope, test
@@ -203,7 +234,7 @@ follow-up so auditability can be materialized.
 Chain trailers are MF audit anchors on commits; they do not mean auto-chain
 execution is active.
 
-## 5. AI Enrich
+## 6. AI Enrich
 
 Configure the project's `semantic` provider/model in AI config before live
 semantic jobs. OpenAI routes use Codex CLI (`codex`); Anthropic routes use
@@ -226,7 +257,7 @@ Recommended flow:
 `ai_complete` means a proposal exists. It is not trusted project memory until
 reviewed and accepted.
 
-## 6. Governance Hint
+## 7. Governance Hint
 
 Governance Hint is the V1-safe graph correction path for orphan doc/test/config
 files that already appear in snapshot file inventory.
@@ -240,7 +271,7 @@ It writes a source-controlled hint into the file, then requires:
 It does not create nodes, rewrite ownership, move hierarchy edges, or edit
 dependency/function-call relations.
 
-## 7. What Is Not The V1 Default
+## 8. What Is Not The V1 Default
 
 - Auto-chain PM -> Dev -> Test -> QA -> Merge is experimental in V1 and is
   not the V1 default implementation route.

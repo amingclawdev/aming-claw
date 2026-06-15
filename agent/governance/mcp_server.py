@@ -121,6 +121,60 @@ def _task_timeline_body(args: dict) -> dict:
     }
     return {key: args[key] for key in allowed if key in args and args[key] is not None}
 
+
+_RUNTIME_CONTEXT_QUERY_FIELDS = (
+    "fence_token",
+    "parent_task_id",
+    "view",
+    "graph_trace_id",
+    "session_token",
+    "target_project_root",
+)
+
+
+def _runtime_context_query(args: dict) -> dict:
+    return {
+        key: str(args[key])
+        for key in _RUNTIME_CONTEXT_QUERY_FIELDS
+        if args.get(key)
+    }
+
+
+def _runtime_context_schema_properties() -> dict[str, Any]:
+    return {
+        "project_id": {"type": "string", "description": "Project identifier."},
+        "runtime_context_id": {
+            "type": "string",
+            "description": "Runtime context id, e.g. mfrctx-...",
+        },
+        "fence_token": {
+            "type": "string",
+            "description": "Required for mf_sub role-filtered worker lookup.",
+        },
+        "parent_task_id": {
+            "type": "string",
+            "description": "Parent observer/MF task id for worker fence validation.",
+        },
+        "view": {
+            "type": "string",
+            "enum": ["auto", "current", "gate_inputs", "worker_view", "close_gate_view", "all"],
+            "description": "Observer view selector. mf_sub callers always receive worker_view.",
+        },
+        "graph_trace_id": {
+            "type": "string",
+            "description": "Optional graph trace id fallback when no trace row is persisted.",
+        },
+        "session_token": {
+            "type": "string",
+            "description": "Scoped worker session token issued at allocation.",
+        },
+        "target_project_root": {
+            "type": "string",
+            "description": "Target project root used to validate worker route identity.",
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # MCP protocol constants
 # ---------------------------------------------------------------------------
@@ -372,30 +426,16 @@ TOOLS: list[dict] = [
         "description": "Read the Runtime Context Service current-state projection. mf_sub callers receive only the role-filtered worker view.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "project_id": {"type": "string", "description": "Project identifier."},
-                "runtime_context_id": {
-                    "type": "string",
-                    "description": "Runtime context id, e.g. mfrctx-...",
-                },
-                "fence_token": {
-                    "type": "string",
-                    "description": "Required for mf_sub role-filtered worker lookup.",
-                },
-                "parent_task_id": {
-                    "type": "string",
-                    "description": "Parent observer/MF task id for worker fence validation.",
-                },
-                "view": {
-                    "type": "string",
-                    "enum": ["auto", "current", "gate_inputs", "worker_view", "close_gate_view", "all"],
-                    "description": "Observer view selector. mf_sub callers always receive worker_view.",
-                },
-                "graph_trace_id": {
-                    "type": "string",
-                    "description": "Optional graph trace id fallback when no trace row is persisted.",
-                },
-            },
+            "properties": _runtime_context_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_worker_guide",
+        "description": "Read the Runtime Context Service worker guide, including read/write guide intent for a bounded worker.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_schema_properties(),
             "required": ["project_id", "runtime_context_id"],
         },
     },
@@ -662,24 +702,16 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         return _http("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
 
-    if name == "runtime_context_current":
+    if name in {"runtime_context_current", "runtime_context_worker_guide"}:
         pid = args["project_id"]
         runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
-        query = {
-            key: str(args[key])
-            for key in (
-                "fence_token",
-                "parent_task_id",
-                "view",
-                "graph_trace_id",
-            )
-            if args.get(key)
-        }
+        query = _runtime_context_query(args)
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
         return _http(
             "GET",
             f"/api/graph-governance/{pid}/parallel-branches/runtime-contexts/"
-            f"{runtime_context_id}/current-state{qs}",
+            f"{runtime_context_id}/{suffix}{qs}",
         )
 
     if name == "observer_repair_run_plan":

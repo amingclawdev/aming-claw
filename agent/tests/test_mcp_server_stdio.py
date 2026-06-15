@@ -205,6 +205,8 @@ def test_governance_mcp_runtime_context_current_tool_is_read_only(monkeypatch):
     assert schema["required"] == ["project_id", "runtime_context_id"]
     assert "fence_token" in schema["properties"]
     assert "parent_task_id" in schema["properties"]
+    assert "session_token" in schema["properties"]
+    assert "target_project_root" in schema["properties"]
 
     calls = []
 
@@ -233,6 +235,58 @@ def test_governance_mcp_runtime_context_current_tool_is_read_only(monkeypatch):
             "/api/graph-governance/aming-claw/parallel-branches/runtime-contexts/"
             "mfrctx-test/current-state?"
             "fence_token=fence-test&parent_task_id=AC-PARENT&view=all&graph_trace_id=gqt-test",
+            None,
+        )
+    ]
+
+
+def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypatch):
+    tool = next(
+        tool for tool in governance_mcp_server.TOOLS if tool["name"] == "runtime_context_worker_guide"
+    )
+    schema = tool["inputSchema"]
+    assert schema["required"] == ["project_id", "runtime_context_id"]
+    assert "read/write guide" in tool["description"]
+    assert "fence_token" in schema["properties"]
+    assert "parent_task_id" in schema["properties"]
+    assert "view" in schema["properties"]
+    assert "graph_trace_id" in schema["properties"]
+    assert "session_token" in schema["properties"]
+    assert "target_project_root" in schema["properties"]
+    assert "route_token" not in schema["properties"]
+    assert "route_waiver" not in schema["properties"]
+
+    calls = []
+
+    def fake_http(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return {"ok": True, "guide": {"intent": "read_write"}}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-test",
+            "fence_token": "fence-test",
+            "parent_task_id": "AC-PARENT",
+            "view": "worker_view",
+            "graph_trace_id": "gqt-test",
+            "session_token": "session-test",
+            "target_project_root": "/repo/fixture",
+        },
+    )
+
+    assert result == {"ok": True, "guide": {"intent": "read_write"}}
+    assert calls == [
+        (
+            "GET",
+            "/api/graph-governance/aming-claw/parallel-branches/runtime-contexts/"
+            "mfrctx-test/worker-guide?"
+            "fence_token=fence-test&parent_task_id=AC-PARENT&view=worker_view&"
+            "graph_trace_id=gqt-test&session_token=session-test&"
+            "target_project_root=%2Frepo%2Ffixture",
             None,
         )
     ]

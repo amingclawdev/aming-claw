@@ -116,6 +116,8 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "stale_artifact_cleanup",
         "stale_artifact_cleanup_apply",
         "graph_query",
+        "runtime_context_current",
+        "runtime_context_worker_guide",
         "parallel_branch_allocate",
         "parallel_branch_startup",
         "parallel_branch_checkpoint",
@@ -139,6 +141,69 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "observer_command_fail",
         "observer_runtime_text_prepare",
     }.issubset(names)
+
+
+def test_active_runtime_context_tools_are_read_only_and_route_to_current_service():
+    tools = {str(tool["name"]): tool for tool in TOOLS}
+    current_schema = tools["runtime_context_current"]["inputSchema"]
+    guide_tool = tools["runtime_context_worker_guide"]
+    guide_schema = guide_tool["inputSchema"]
+    expected_fields = {
+        "project_id",
+        "runtime_context_id",
+        "fence_token",
+        "parent_task_id",
+        "view",
+        "graph_trace_id",
+        "session_token",
+        "target_project_root",
+    }
+
+    assert current_schema["required"] == ["project_id", "runtime_context_id"]
+    assert guide_schema["required"] == ["project_id", "runtime_context_id"]
+    assert expected_fields.issubset(current_schema["properties"])
+    assert expected_fields.issubset(guide_schema["properties"])
+    assert "read/write guide" in guide_tool["description"]
+    assert "route_token" not in current_schema["properties"]
+    assert "route_waiver" not in current_schema["properties"]
+    assert "route_token" not in guide_schema["properties"]
+    assert "route_waiver" not in guide_schema["properties"]
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    args = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-test",
+        "fence_token": "fence-test",
+        "parent_task_id": "AC-PARENT",
+        "view": "worker_view",
+        "graph_trace_id": "gqt-test",
+        "session_token": "session-test",
+        "target_project_root": "/repo/fixture",
+    }
+
+    dispatcher.dispatch("runtime_context_current", args)
+    dispatcher.dispatch("runtime_context_worker_guide", args)
+
+    query = (
+        "fence_token=fence-test&parent_task_id=AC-PARENT&view=worker_view&"
+        "graph_trace_id=gqt-test&session_token=session-test&"
+        "target_project_root=%2Frepo%2Ffixture"
+    )
+    assert recorder.calls == [
+        (
+            "GET",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            f"mfrctx-test/current-state?{query}",
+            None,
+        ),
+        (
+            "GET",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            f"mfrctx-test/worker-guide?{query}",
+            None,
+        ),
+    ]
 
 
 def test_mcp_observer_command_list_advertises_consumer_recovery_diagnostics():

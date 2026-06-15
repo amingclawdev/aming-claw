@@ -3,6 +3,43 @@
 Send these prompts one message at a time. Wait for the observer to answer each
 step before sending the next one.
 
+## Cross-Host Runtime Prompts
+
+Use these two prompts when the demo needs a Codex-to-Claude resume without
+pasting a long handoff.
+
+### A. Start In Codex
+
+```text
+Open a new Codex session for the Vibe Queue demo. First verify Aming Claw MCP
+current-context is visible; governance health or dashboard health alone is not
+enough. If current-context is missing, stop and ask me to reload or open the
+plugin/workspace root that contains .mcp.json.
+
+Start governed development for Daily Planner Lite from the fixture/runtime
+state. Use the dashboard, backlog, and timeline as the source of truth. Create
+or continue the required backlog row, dispatch bounded work only if the
+route/context checks pass, and show the runtime, backlog, and timeline
+evidence. If any governance write fails, intentionally stop midstream with the
+failing command or HTTP operation, response/error, and next recovery step. Do
+not work around the failure by doing normal unmanaged implementation.
+```
+
+### B. Resume In Claude
+
+```text
+Open a new Claude Code session to resume the Vibe Queue demo. Load
+/aming-claw:aming-claw-launcher or docs/onboarding.md, verify Aming Claw MCP
+current-context is visible, then read current-context. Do not rely on pasted
+handoff text.
+
+Resume Daily Planner Lite by reading runtime context current-state or
+worker-guide when a runtime_context_id is available, plus backlog, timeline, and
+operations/graph status. Treat runtime, backlog, and timeline as the source of
+truth. Continue only from evidence that is current in governance, record what
+you read, and stop if current-context or required write surfaces are missing.
+```
+
 ## 1. Start The Demo
 
 ```text
@@ -12,8 +49,8 @@ Show Daily Planner Lite as the target project first. Use Codex's in-app browser
 for the Aming Claw dashboard, and tell me to open the planner preview in my
 normal browser. Show me:
 
-- Open Aming Claw Dashboard — Use in Codex
-- Open Daily Planner Preview — Open in external browser
+- Open Aming Claw Dashboard - Use in Codex
+- Open Daily Planner Preview - Open in external browser
 - Project id
 - Fixture root
 - Dashboard backlog, timeline, and prompt queue links
