@@ -5849,6 +5849,7 @@ def _runtime_context_service_graph_trace_refs(
     backlog_id: str,
     fence_token: str,
     explicit_trace_ids: list[str],
+    strict_explicit_trace_ids: bool = False,
 ) -> dict[str, Any]:
     requested_trace_ids: list[str] = []
     seen_requested: set[str] = set()
@@ -5857,53 +5858,69 @@ def _runtime_context_service_graph_trace_refs(
         if text and text not in seen_requested:
             seen_requested.add(text)
             requested_trace_ids.append(text)
-    current_run_id_like = ""
-    if task_id and fence_token:
-        fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
-        current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
-    explicit_clause = ""
-    explicit_params: tuple[str, ...] = ()
-    if requested_trace_ids:
-        explicit_clause = "OR trace_id IN ({})".format(
-            ",".join("?" for _ in requested_trace_ids)
-        )
-        explicit_params = tuple(requested_trace_ids)
     try:
-        rows = conn.execute(
-            """
-            SELECT trace_id, query_source, query_purpose, worker_role,
-                   parent_task_id, task_id, runtime_context_id, run_id,
-                   fence_token
-            FROM graph_query_traces
-            WHERE project_id = ?
-              AND (
-                0
-                {explicit_clause}
-                OR (? != '' AND runtime_context_id = ?)
-                OR (? != '' AND task_id = ?)
-                OR (? != '' AND fence_token = ?)
-                OR (
-                  query_source = 'mf_subagent'
-                  AND ? != ''
-                  AND run_id LIKE ?
+        if requested_trace_ids and strict_explicit_trace_ids:
+            explicit_clause = ",".join("?" for _ in requested_trace_ids)
+            rows = conn.execute(
+                f"""
+                SELECT trace_id, query_source, query_purpose, worker_role,
+                       parent_task_id, task_id, runtime_context_id, run_id,
+                       fence_token
+                FROM graph_query_traces
+                WHERE project_id = ?
+                  AND trace_id IN ({explicit_clause})
+                ORDER BY created_at DESC, trace_id DESC
+                LIMIT 20
+                """,
+                (project_id, *tuple(requested_trace_ids)),
+            ).fetchall()
+        else:
+            current_run_id_like = ""
+            if task_id and fence_token:
+                fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+                current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
+            explicit_clause = ""
+            explicit_params: tuple[str, ...] = ()
+            if requested_trace_ids:
+                explicit_clause = "OR trace_id IN ({})".format(
+                    ",".join("?" for _ in requested_trace_ids)
                 )
-              )
-            ORDER BY created_at DESC, trace_id DESC
-            LIMIT 20
-            """.format(explicit_clause=explicit_clause),
-            (
-                project_id,
-                *explicit_params,
-                runtime_context_id,
-                runtime_context_id,
-                task_id,
-                task_id,
-                fence_token,
-                fence_token,
-                current_run_id_like,
-                current_run_id_like,
-            ),
-        ).fetchall()
+                explicit_params = tuple(requested_trace_ids)
+            rows = conn.execute(
+                """
+                SELECT trace_id, query_source, query_purpose, worker_role,
+                       parent_task_id, task_id, runtime_context_id, run_id,
+                       fence_token
+                FROM graph_query_traces
+                WHERE project_id = ?
+                  AND (
+                    0
+                    {explicit_clause}
+                    OR (? != '' AND runtime_context_id = ?)
+                    OR (? != '' AND task_id = ?)
+                    OR (? != '' AND fence_token = ?)
+                    OR (
+                      query_source = 'mf_subagent'
+                      AND ? != ''
+                      AND run_id LIKE ?
+                    )
+                )
+                ORDER BY created_at DESC, trace_id DESC
+                LIMIT 20
+                """.format(explicit_clause=explicit_clause),
+                (
+                    project_id,
+                    *explicit_params,
+                    runtime_context_id,
+                    runtime_context_id,
+                    task_id,
+                    task_id,
+                    fence_token,
+                    fence_token,
+                    current_run_id_like,
+                    current_run_id_like,
+                ),
+            ).fetchall()
     except sqlite3.OperationalError:
         rows = []
     verified: list[str] = []
@@ -7894,6 +7911,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             backlog_id=context.backlog_id,
             fence_token=_runtime_context_request_value(ctx, "fence_token"),
             explicit_trace_ids=graph_trace_ids,
+            strict_explicit_trace_ids=True,
         )
         if not graph_trace_db_evidence.get("db_verified"):
             raise ValidationError(
