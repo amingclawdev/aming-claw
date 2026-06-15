@@ -50,6 +50,39 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function isAllowedFixtureSetupTimelineEvent(event) {
+  const eventType = String(event?.event_type || "");
+  const eventKind = String(event?.event_kind || "");
+  const phase = String(event?.phase || "");
+  const backlogId = String(event?.backlog_id || "");
+  const taskId = String(event?.task_id || "");
+  return (
+    !backlogId
+    && !taskId
+    && phase === "route_gate"
+    && eventKind === "route_token_gate"
+    && eventType === "route_token_gate.project_bootstrap"
+  );
+}
+
+function fixtureTimelineSummary(timeline) {
+  const events = Array.isArray(timeline?.events) ? timeline.events : [];
+  const unexpectedEvents = events.filter((event) => !isAllowedFixtureSetupTimelineEvent(event));
+  return {
+    total_event_count: events.length,
+    allowed_setup_event_count: events.length - unexpectedEvents.length,
+    unexpected_event_count: unexpectedEvents.length,
+    unexpected_event_refs: unexpectedEvents.slice(0, 5).map((event) => ({
+      id: event.id || "",
+      event_type: event.event_type || "",
+      event_kind: event.event_kind || "",
+      phase: event.phase || "",
+      backlog_id: event.backlog_id || "",
+      task_id: event.task_id || "",
+    })),
+  };
+}
+
 async function http(method, route, body) {
   const headers = { Accept: "application/json" };
   const init = { method, headers };
@@ -286,9 +319,19 @@ async function runAudit() {
   };
   const baselineBacklog = await http("GET", `/api/backlog/${pid(PROJECT)}`);
   const baselineTimeline = await http("GET", `/api/task/${pid(PROJECT)}/timeline`);
+  const baselineTimelineSummary = fixtureTimelineSummary(baselineTimeline);
   assert(Number(baselineBacklog.count || baselineBacklog.bugs?.length || 0) === 0, "fixture backlog was not empty");
-  assert(Number(baselineTimeline.count || 0) === 0, "fixture timeline was not empty");
-  audit.checks.push({ name: "fixture starts without implementation evidence", passed: true });
+  assert(
+    baselineTimelineSummary.unexpected_event_count === 0,
+    `fixture timeline had unexpected events: ${baselineTimelineSummary.unexpected_event_refs
+      .map((event) => `${event.id || "?"}:${event.event_type || event.event_kind || "unknown"}`)
+      .join(", ")}`
+  );
+  audit.checks.push({
+    name: "fixture starts without implementation evidence",
+    passed: true,
+    fixture_setup_timeline: baselineTimelineSummary,
+  });
 
   const appTrace = await graphQuery("find_node_by_path", { path: "src/app.js" });
   const reminderTrace = await graphQuery("find_node_by_path", { path: "src/reminders.js" });
@@ -448,6 +491,21 @@ function runSelfTest() {
     project_id: "daily-planner-lite-vibe-self-test",
     dashboard_url: "http://127.0.0.1:40000/dashboard?project_id=daily-planner-lite-vibe-self-test",
     planner_preview_url: "http://127.0.0.1:4173/",
+    fixture_setup_timeline: {
+      total_event_count: 1,
+      allowed_setup_event_count: 1,
+      unexpected_event_count: 0,
+    },
+    demo_pages: {
+      governance: {
+        label: "Aming Claw Governance",
+        url: "http://127.0.0.1:40000/dashboard?project_id=daily-planner-lite-vibe-self-test&view=backlog",
+      },
+      project: {
+        label: "Daily Planner Lite",
+        url: "http://127.0.0.1:4173/",
+      },
+    },
     dashboard_links: {
       backlog: "http://127.0.0.1:40000/dashboard?project_id=daily-planner-lite-vibe-self-test&view=backlog",
     },
@@ -456,6 +514,8 @@ function runSelfTest() {
   const parsed = parseFixtureOutput(noisy);
   assert(parsed.project_id === fixture.project_id, "self-test parsed the wrong JSON object");
   assert(parsed.dashboard_links.backlog === fixture.dashboard_links.backlog, "self-test lost nested object fields");
+  assert(fixtureTimelineSummary({ events: [{ event_type: "route_token_gate.project_bootstrap", event_kind: "route_token_gate", phase: "route_gate" }] }).unexpected_event_count === 0, "self-test rejected allowed bootstrap route-token timeline event");
+  assert(fixtureTimelineSummary({ events: [{ event_type: "route_token_gate.project_bootstrap", event_kind: "route_token_gate", phase: "route_gate", backlog_id: "DPL-TODAY-FOCUS-20260615" }] }).unexpected_event_count === 1, "self-test allowed backlog-scoped bootstrap timeline event");
   console.log("VIBE QUEUE AUDIT SELF TEST OK");
 }
 

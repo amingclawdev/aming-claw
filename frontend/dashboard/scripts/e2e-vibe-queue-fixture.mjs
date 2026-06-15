@@ -18,7 +18,7 @@ const PREVIEW_PORT = Number(FLAGS["preview-port"] || process.env.VIBE_QUEUE_PREV
 const RESET = FLAGS.reset === true || FLAGS["reset-fixture"] === true;
 
 function parseFlags(args) {
-  const bool = new Set(["no-browser", "reset", "reset-fixture"]);
+  const bool = new Set(["no-browser", "reset", "reset-fixture", "self-test"]);
   const out = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -55,6 +55,95 @@ function previewUrl() {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function isAllowedFixtureSetupTimelineEvent(event) {
+  const eventType = String(event?.event_type || "");
+  const eventKind = String(event?.event_kind || "");
+  const phase = String(event?.phase || "");
+  const backlogId = String(event?.backlog_id || "");
+  const taskId = String(event?.task_id || "");
+  return (
+    !backlogId
+    && !taskId
+    && phase === "route_gate"
+    && eventKind === "route_token_gate"
+    && eventType === "route_token_gate.project_bootstrap"
+  );
+}
+
+function unexpectedFixtureTimelineEvents(timeline) {
+  const events = Array.isArray(timeline?.events) ? timeline.events : [];
+  return events.filter((event) => !isAllowedFixtureSetupTimelineEvent(event));
+}
+
+function fixtureTimelineSummary(timeline) {
+  const events = Array.isArray(timeline?.events) ? timeline.events : [];
+  const allowedSetupEvents = events.filter(isAllowedFixtureSetupTimelineEvent);
+  const unexpectedEvents = events.filter((event) => !isAllowedFixtureSetupTimelineEvent(event));
+  return {
+    total_event_count: events.length,
+    allowed_setup_event_count: allowedSetupEvents.length,
+    unexpected_event_count: unexpectedEvents.length,
+    allowed_setup_event_refs: allowedSetupEvents.map((event) => ({
+      id: event.id || "",
+      event_type: event.event_type || "",
+      event_kind: event.event_kind || "",
+      phase: event.phase || "",
+    })),
+    unexpected_event_refs: unexpectedEvents.slice(0, 5).map((event) => ({
+      id: event.id || "",
+      event_type: event.event_type || "",
+      event_kind: event.event_kind || "",
+      phase: event.phase || "",
+      backlog_id: event.backlog_id || "",
+      task_id: event.task_id || "",
+    })),
+  };
+}
+
+function demoPages() {
+  return {
+    governance: {
+      label: "Aming Claw Governance",
+      url: dashboardUrl("backlog"),
+      recommended_browser: "codex_in_app_browser",
+    },
+    project: {
+      label: "Daily Planner Lite",
+      url: previewUrl(),
+      recommended_browser: "external_browser",
+      serve_command: `python3 -m http.server ${PREVIEW_PORT} --directory ${FIXTURE_ROOT}`,
+    },
+  };
+}
+
+function runSelfTest() {
+  const allowed = {
+    event_type: "route_token_gate.project_bootstrap",
+    event_kind: "route_token_gate",
+    phase: "route_gate",
+  };
+  const unexpectedBacklogScoped = {
+    event_type: "route_token_gate.project_bootstrap",
+    event_kind: "route_token_gate",
+    phase: "route_gate",
+    backlog_id: "DPL-TODAY-FOCUS-20260615",
+  };
+  const unexpectedNonBootstrap = {
+    event_type: "route_token_gate.worker_dispatch",
+    event_kind: "route_token_gate",
+    phase: "route_gate",
+  };
+  const timeline = { events: [allowed, unexpectedBacklogScoped, unexpectedNonBootstrap] };
+  assert(isAllowedFixtureSetupTimelineEvent(allowed), "self-test did not allow bootstrap route-token event");
+  assert(!isAllowedFixtureSetupTimelineEvent(unexpectedBacklogScoped), "self-test allowed backlog-scoped setup event");
+  assert(!isAllowedFixtureSetupTimelineEvent(unexpectedNonBootstrap), "self-test allowed non-bootstrap setup event");
+  assert(unexpectedFixtureTimelineEvents(timeline).length === 2, "self-test unexpected event filter mismatch");
+  const pages = demoPages();
+  assert(pages.governance.url.includes("/dashboard?project_id="), "self-test governance page link missing dashboard");
+  assert(pages.project.url.startsWith("http://127.0.0.1:"), "self-test project page link missing preview URL");
+  console.log("VIBE QUEUE FIXTURE SELF TEST OK");
 }
 
 async function http(method, route, body) {
@@ -208,8 +297,17 @@ async function main() {
     assert(Number(query.result?.count || 0) > 0, "graph cannot resolve src/app.js");
     const backlog = await http("GET", `/api/backlog/${pid(PROJECT)}`);
     const timeline = await http("GET", `/api/task/${pid(PROJECT)}/timeline`);
+    const timelineSummary = fixtureTimelineSummary(timeline);
+    const unexpectedTimelineEvents = unexpectedFixtureTimelineEvents(timeline);
     assert(Number(backlog.count || backlog.bugs?.length || 0) === 0, "vibe fixture must not seed backlog rows");
-    assert(Number(timeline.count || 0) === 0, "vibe fixture must not seed timeline events");
+    assert(
+      unexpectedTimelineEvents.length === 0,
+      `vibe fixture seeded unexpected timeline events: ${unexpectedTimelineEvents
+        .slice(0, 3)
+        .map((event) => `${event.id || "?"}:${event.event_type || event.event_kind || "unknown"}`)
+        .join(", ")}`
+    );
+    const pages = demoPages();
     console.log(JSON.stringify({
       ok: true,
       project_id: PROJECT,
@@ -217,6 +315,18 @@ async function main() {
       baseline_commit: commit,
       snapshot_id: status.active_snapshot_id,
       trace_id: query.trace_id || "",
+      fixture_setup_timeline_event_count: timelineSummary.total_event_count,
+      unexpected_timeline_event_count: timelineSummary.unexpected_event_count,
+      fixture_setup_timeline: timelineSummary,
+      demo_pages: pages,
+      handoff_manifest: {
+        project_id: PROJECT,
+        fixture_root: FIXTURE_ROOT,
+        baseline_commit: commit,
+        governance_page_url: pages.governance.url,
+        project_page_url: pages.project.url,
+        preview_command: pages.project.serve_command,
+      },
       two_window_setup: {
         default: "Use Codex's in-app browser for the Aming Claw dashboard. Open the planner preview in your normal browser.",
         codex_page: "Open Aming Claw Dashboard",
@@ -240,4 +350,5 @@ async function main() {
   }
 }
 
-await main();
+if (FLAGS["self-test"]) runSelfTest();
+else await main();
