@@ -28445,7 +28445,7 @@ def _mf_close_gate_verification(events: list[dict] | None, contract: dict | None
         verification["close_timeline_startup_gate"] = startup_gate
         checks = dict(verification.get("checks") or {})
         checks["mf_subagent_startup_close_satisfying"] = bool(
-            not startup_gate.get("demoted_startup_events")
+            startup_gate.get("passed")
         )
         verification["checks"] = checks
     return verification

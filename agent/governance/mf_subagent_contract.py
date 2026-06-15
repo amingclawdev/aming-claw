@@ -3612,10 +3612,12 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
     ]
     demoted: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
+    startup_event_count = 0
     for index, event in enumerate(rows):
         gate = _timeline_startup_gate_from_event(event)
         if not gate:
             continue
+        startup_event_count += 1
         surrogate_gate = surrogate_startup_evidence_gate(
             gate,
             real_startup_events=passing_rows,
@@ -3646,10 +3648,11 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
                     worker_self_attestation_gate.get("blockers") or []
                 )
             demoted.append(event_ref)
+    passed = bool(accepted) if startup_event_count else True
     return {
         "schema_version": CLOSE_TIMELINE_STARTUP_GATE_SCHEMA_VERSION,
-        "passed": not demoted,
-        "status": "passed" if not demoted else "failed",
+        "passed": passed,
+        "status": "passed" if passed else "failed",
         "accepted_startup_events": accepted,
         "demoted_startup_events": demoted,
         "demoted_startup_event_indexes": [item["index"] for item in demoted],

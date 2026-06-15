@@ -3653,6 +3653,95 @@ def test_close_timeline_demotes_event_4178_like_surrogate_without_real_join() ->
     assert normalized["events"][0]["status"] == "demoted"
 
 
+def test_close_timeline_accepted_startup_overrides_demoted_history() -> None:
+    demoted_startup = _real_worker_startup_matching_lineage(
+        "evt-historical-demoted"
+    )
+    demoted_startup["worker_self_attesting"] = False
+    demoted_startup["worker_self_attestation"] = {
+        **demoted_startup["worker_self_attestation"],
+        "status": "blocked",
+        "worker_self_attesting": False,
+        "self_attesting": False,
+    }
+    demoted_event = {
+        "id": "evt-historical-demoted",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": demoted_startup},
+    }
+    accepted_startup = _real_worker_startup_matching_lineage("evt-accepted-startup")
+    accepted_event = {
+        "id": "evt-accepted-startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "accepted",
+        "payload": {"mf_subagent_startup_gate": accepted_startup},
+    }
+
+    gate = close_timeline_startup_event_gate([demoted_event, accepted_event])
+
+    assert gate["passed"] is True
+    assert gate["status"] == "passed"
+    assert gate["accepted_startup_events"][0]["id"] == "evt-accepted-startup"
+    assert gate["demoted_startup_events"][0]["id"] == "evt-historical-demoted"
+    assert gate["demoted_startup_event_indexes"] == [0]
+
+    normalized = close_timeline_events_for_verification(
+        [demoted_event, accepted_event]
+    )
+    assert normalized["startup_gate"]["passed"] is True
+    assert normalized["events"][0]["status"] == "demoted"
+    assert normalized["events"][1]["status"] == "accepted"
+
+
+def test_server_close_gate_check_uses_accepted_startup_gate_with_demoted_history() -> None:
+    from agent.governance import server as server_module
+
+    demoted_startup = _real_worker_startup_matching_lineage(
+        "evt-server-historical-demoted"
+    )
+    demoted_startup["worker_self_attesting"] = False
+    demoted_startup["worker_self_attestation"] = {
+        **demoted_startup["worker_self_attestation"],
+        "status": "blocked",
+        "worker_self_attesting": False,
+        "self_attesting": False,
+    }
+    demoted_event = {
+        "id": "evt-server-historical-demoted",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": demoted_startup},
+    }
+    accepted_startup = _real_worker_startup_matching_lineage(
+        "evt-server-accepted-startup"
+    )
+    accepted_event = {
+        "id": "evt-server-accepted-startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "accepted",
+        "payload": {"mf_subagent_startup_gate": accepted_startup},
+    }
+
+    verification = server_module._mf_close_gate_verification(
+        [demoted_event, accepted_event]
+    )
+
+    startup_gate = verification["close_timeline_startup_gate"]
+    assert startup_gate["passed"] is True
+    assert startup_gate["demoted_startup_events"][0]["id"] == (
+        "evt-server-historical-demoted"
+    )
+    assert startup_gate["accepted_startup_events"][0]["id"] == (
+        "evt-server-accepted-startup"
+    )
+    assert verification["checks"]["mf_subagent_startup_close_satisfying"] is True
+
+
 def test_close_timeline_demotes_agent_id_mismatch_without_registered_adapter() -> None:
     startup = _real_worker_startup_matching_lineage("evt-agent-mismatch")
     startup.update(
