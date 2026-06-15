@@ -3878,6 +3878,75 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "scope.task_id",
     ]
 
+    unresolved_route_identity = {
+        "route_id": issued_route["route_id"],
+        "route_context_hash": issued_route["route_context_hash"],
+        "prompt_contract_id": issued_route["prompt_contract_id"],
+        "prompt_contract_hash": issued_route["route_token"]["prompt_contract_hash"],
+        "route_token_ref": "rtok-facade-unresolved",
+        "visible_injection_manifest_hash": issued_route[
+            "visible_injection_manifest_hash"
+        ],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-facade-unresolved-route-token-ref",
+        contract_version="mf_parallel.v1",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=unresolved_route_identity,
+        now_iso="2026-06-15T11:03:00Z",
+    )
+    with pytest.raises(GovernanceError) as unresolved_ref_exc:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "changed_files": [changed_path],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
+                    "payload": {"worker_role": "mf_sub"},
+                    "route_token_gate": {"caller_role": "observer"},
+                },
+            )
+    )
+    assert unresolved_ref_exc.value.code == "route_token_required"
+    implementation_count_after_unresolved = conn.execute(
+        """
+        SELECT COUNT(*) FROM task_timeline_events
+        WHERE task_id = ? AND event_kind = 'implementation'
+        """,
+        (context.task_id,),
+    ).fetchone()[0]
+    assert implementation_count_after_unresolved == 0
+
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-facade-restored-route-token-ref",
+        contract_version="mf_parallel.v1",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity={
+            "route_id": issued_route["route_id"],
+            "route_context_hash": issued_route["route_context_hash"],
+            "prompt_contract_id": issued_route["prompt_contract_id"],
+            "prompt_contract_hash": issued_route["route_token"][
+                "prompt_contract_hash"
+            ],
+            "route_token_ref": issued_route["route_token_ref"],
+            "visible_injection_manifest_hash": issued_route[
+                "visible_injection_manifest_hash"
+            ],
+        },
+        now_iso="2026-06-15T11:04:00Z",
+    )
+
     implementation = (
         server.handle_graph_governance_runtime_context_implementation_evidence(
             _ctx_with_role(
