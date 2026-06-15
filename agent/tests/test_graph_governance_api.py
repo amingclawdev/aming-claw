@@ -3786,6 +3786,35 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert finish["context"]["replay_source"] == "mf_sub_finish_gate"
     assert finish["context"]["status"] == "validated"
 
+    with pytest.raises(GovernanceError) as route_identity_exc:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "changed_files": [changed_path],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
+                    "payload": {"worker_role": "mf_sub"},
+                    "route_token_gate": {
+                        "caller_role": "observer",
+                        "route_context_hash": "sha256:caller-conflict",
+                        "prompt_contract_id": "caller-conflict",
+                    },
+                },
+            )
+        )
+    assert route_identity_exc.value.code == "route_identity_mismatch"
+    assert route_identity_exc.value.details["mismatched_fields"] == [
+        "route_context_hash",
+        "prompt_contract_id",
+    ]
+
     implementation = (
         server.handle_graph_governance_runtime_context_implementation_evidence(
             _ctx_with_role(

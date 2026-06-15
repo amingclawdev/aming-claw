@@ -7093,6 +7093,31 @@ def _runtime_context_write_response(
     }
 
 
+_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _runtime_context_gate_identity_mismatches(
+    gate: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+) -> list[str]:
+    mismatched: list[str] = []
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        supplied = str(gate.get(field) or "").strip()
+        if not supplied:
+            continue
+        derived = str(route_identity.get(field) or "").strip()
+        if supplied != derived:
+            mismatched.append(field)
+    return mismatched
+
+
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract")
 def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext):
     """Return a role-scoped runtime/contract view for one bounded worker lane."""
@@ -7617,6 +7642,21 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         event_body["route_waiver"] = body.get("route_waiver")
     elif isinstance(body.get("route_token_gate"), Mapping):
         gate = dict(body.get("route_token_gate") or {})
+        mismatched = _runtime_context_gate_identity_mismatches(gate, route_identity)
+        if mismatched:
+            raise GovernanceError(
+                "route_identity_mismatch",
+                (
+                    "runtime-context implementation evidence route_token_gate "
+                    "identity conflicts with server-derived route identity"
+                ),
+                422,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "mismatched_fields": mismatched,
+                    "source": "runtime_context_latest_route_identity",
+                },
+            )
         event_body["route_waiver"] = {
             "accepted": True,
             "waiver_type": "manual_fix",
@@ -7625,12 +7665,8 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             "project_id": project_id,
             "backlog_id": context.backlog_id,
             "task_id": context.task_id,
-            "route_context_hash": gate.get("route_context_hash")
-            or route_identity.get("route_context_hash")
-            or "",
-            "prompt_contract_id": gate.get("prompt_contract_id")
-            or route_identity.get("prompt_contract_id")
-            or "",
+            "route_context_hash": route_identity.get("route_context_hash") or "",
+            "prompt_contract_id": route_identity.get("prompt_contract_id") or "",
             "caller_role": gate.get("caller_role") or "observer",
             "reason": (
                 "runtime-context facade derived mf_sub worker role from "
