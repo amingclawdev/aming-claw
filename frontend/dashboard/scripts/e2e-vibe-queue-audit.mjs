@@ -208,6 +208,99 @@ async function appendTimeline(body) {
   return http("POST", `/api/task/${pid(PROJECT)}/timeline`, body);
 }
 
+function taskIdFor(bugId) {
+  return `task-${clean(bugId).toLowerCase()}`;
+}
+
+async function issueObserverRoute(bugId, targetFiles, evidenceRefs = []) {
+  const issued = await http("POST", `/api/projects/${pid(PROJECT)}/observer/route-context/issue`, {
+    caller_role: "observer",
+    backlog_id: bugId,
+    task_id: taskIdFor(bugId),
+    target_files: targetFiles,
+    evidence_refs: evidenceRefs,
+    ttl_hours: 4,
+  });
+  assert(issued?.route_token?.route_context_hash, `route token issue failed for ${bugId}`);
+  assert(issued?.route_token_ref, `route token ref missing for ${bugId}`);
+  return issued;
+}
+
+function withRoute(body, issued) {
+  if (!issued?.route_token) return body;
+  const token = issued.route_token;
+  const scope = token.scope || {};
+  return {
+    ...body,
+    task_id: body.task_id || scope.task_id || issued.execute_backlog_row_payload?.task_id || "",
+    route_token: token,
+    route_token_ref: issued.route_token_ref || "",
+    route_id: issued.route_id || token.route_id || "",
+    route_context_hash: issued.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued.prompt_contract_id || token.prompt_contract_id || "",
+    prompt_contract_hash: token.prompt_contract_hash || "",
+    visible_injection_manifest_hash: issued.visible_injection_manifest_hash || token.visible_injection_manifest_hash || "",
+  };
+}
+
+function publicRouteRef(backlogId, issued) {
+  const token = issued?.route_token || {};
+  return {
+    backlog_id: backlogId,
+    task_id: token.scope?.task_id || "",
+    route_token_ref: issued?.route_token_ref || "",
+    route_id: issued?.route_id || token.route_id || "",
+    route_context_hash: issued?.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued?.prompt_contract_id || token.prompt_contract_id || "",
+  };
+}
+
+function observerCommandEvent(backlogId, command, payload = {}) {
+  return {
+    backlog_id: backlogId,
+    actor: "observer:vibe-queue",
+    event_type: `observer_command.${command}`,
+    event_kind: "observer_command",
+    phase: "observer_command",
+    status: "accepted",
+    payload: {
+      schema_version: "vibe_queue_observer_command.v1",
+      action: "observer_command",
+      command,
+      ...payload,
+    },
+  };
+}
+
+function dispatchEvent(backlogId, payload = {}) {
+  return {
+    actor: "observer:vibe-queue",
+    backlog_id: backlogId,
+    event_type: "bounded_implementation_worker_dispatch",
+    event_kind: "bounded_implementation_worker_dispatch",
+    phase: "dispatch",
+    status: "accepted",
+    payload: {
+      schema_version: "vibe_queue_dispatch.v1",
+      action: "dispatch_bounded_worker",
+      ...payload,
+    },
+  };
+}
+
+function closeReadyEvent(backlogId, commit, test) {
+  return {
+    backlog_id: backlogId,
+    actor: "observer:vibe-queue",
+    event_type: "close_ready",
+    event_kind: "close_ready",
+    phase: "close_ready",
+    status: "accepted",
+    payload: { commit, queue_state: "Done" },
+    verification: { tests_run: [test.command], tests_exit_code: 0 },
+  };
+}
+
 function commitAll(message, bugId) {
   git(["add", "."]);
   git(["commit", "-m", [message, "", "Chain-Source-Stage: observer-hotfix", `Chain-Project: ${PROJECT}`, `Chain-Bug-Id: ${bugId}`].join("\n")]);
@@ -303,7 +396,7 @@ async function runAudit() {
     project_id: PROJECT,
     backend: BACKEND,
     fixture_root: FIXTURE_ROOT,
-    evidence: { backlog_ids: [], timeline_event_ids: [], trace_ids: [], commits: [], tests: [], queue_states: [] },
+    evidence: { backlog_ids: [], timeline_event_ids: [], trace_ids: [], route_token_refs: [], commits: [], tests: [], queue_states: [] },
     checks: [],
     warnings: [],
   };
@@ -340,11 +433,15 @@ async function runAudit() {
   const reqA = `VIBE-${RUN_ID}-FOCUS`;
   const reqB = `VIBE-${RUN_ID}-REMINDER`;
   const reqC = `VIBE-${RUN_ID}-CAPTURE`;
+  const routes = new Map();
   for (const [bugId, title, files] of [
     [reqA, "Add Today Focus at top of task list", ["src/app.js", "tests/planner.test.mjs"]],
     [reqB, "Add per-task reminder toggle defaulting off", ["src/reminders.js", "tests/planner.test.mjs"]],
   ]) {
-    await upsertBacklog(bugId, {
+    const route = await issueObserverRoute(bugId, files, audit.evidence.trace_ids.filter(Boolean));
+    routes.set(bugId, route);
+    audit.evidence.route_token_refs.push(publicRouteRef(bugId, route));
+    await upsertBacklog(bugId, withRoute({
       actor: "observer:vibe-queue",
       title,
       status: "OPEN",
@@ -356,8 +453,8 @@ async function runAudit() {
       provenance_paths: audit.evidence.trace_ids.filter(Boolean),
       acceptance_criteria: [`${title}.`, "Observer records requirement before dispatch."],
       details_md: "Created during audit requirement mode; no implementation event existed before explicit start.",
-    });
-    const event = await appendTimeline({ backlog_id: bugId, actor: "observer:vibe-queue", event_type: "requirement_confirmed", event_kind: "requirement", phase: "Clarifying", status: "accepted", payload: { queue_state: "Backlog Contracts" } });
+    }, route));
+    const event = await appendTimeline(withRoute(observerCommandEvent(bugId, "requirement_confirmed", { queue_state: "Backlog Contracts" }), route));
     if (event?.id) audit.evidence.timeline_event_ids.push(event.id);
     audit.evidence.backlog_ids.push(bugId);
   }
@@ -367,26 +464,21 @@ async function runAudit() {
   audit.checks.push({ name: "requirement mode first", passed: true, backlog_count: 2, implementation_events_before_start: 0 });
 
   for (const bugId of [reqA, reqB]) {
-    await upsertBacklog(bugId, { actor: "observer:vibe-queue", status: "MF_IN_PROGRESS", force_admit: true });
+    await upsertBacklog(bugId, withRoute({ actor: "observer:vibe-queue", status: "MF_IN_PROGRESS", force_admit: true }, routes.get(bugId)));
   }
-  const dispatch = await appendTimeline({
-    actor: "observer:vibe-queue",
-    backlog_id: reqA,
-    event_type: "parallel_compatible_dispatch",
-    event_kind: "implementation",
-    phase: "In Progress",
-    status: "accepted",
-    payload: {
+  const dispatch = await appendTimeline(withRoute(dispatchEvent(reqA, {
       workers: [
         { backlog_id: reqA, owned_files: ["src/app.js", "tests/planner.test.mjs"] },
         { backlog_id: reqB, owned_files: ["src/reminders.js", "tests/planner.test.mjs"], note: "shared test file requires serial commit merge" },
       ],
       graph_query_trace_ids: audit.evidence.trace_ids.filter(Boolean),
-    },
-  });
+    }), routes.get(reqA)));
   if (dispatch?.id) audit.evidence.timeline_event_ids.push(dispatch.id);
 
-  await upsertBacklog(reqC, {
+  const routeC = await issueObserverRoute(reqC, ["src/quick-capture.js", "tests/quick-capture.test.mjs"], audit.evidence.trace_ids.filter(Boolean));
+  routes.set(reqC, routeC);
+  audit.evidence.route_token_refs.push(publicRouteRef(reqC, routeC));
+  await upsertBacklog(reqC, withRoute({
     actor: "observer:vibe-queue",
     title: "Add quick capture input for fast task entry",
     status: "OPEN",
@@ -397,8 +489,8 @@ async function runAudit() {
     test_files: ["tests/quick-capture.test.mjs"],
     acceptance_criteria: ["Quick capture can add a task with only text.", "Requirement is queued while A/B are already in progress."],
     details_md: "Mid-run requirement queued by observer without interrupting active worker scopes.",
-  });
-  const queued = await appendTimeline({ backlog_id: reqC, actor: "observer:vibe-queue", event_type: "mid_run_requirement_queued", event_kind: "requirement", phase: "User Ideas", status: "accepted", payload: { queue_state: "Backlog Contracts", active_backlog_ids: [reqA, reqB] } });
+  }, routeC));
+  const queued = await appendTimeline(withRoute(observerCommandEvent(reqC, "mid_run_requirement_queued", { queue_state: "Backlog Contracts", active_backlog_ids: [reqA, reqB] }), routeC));
   if (queued?.id) audit.evidence.timeline_event_ids.push(queued.id);
   audit.evidence.backlog_ids.push(reqC);
 
@@ -408,8 +500,9 @@ async function runAudit() {
   let commit = commitAll("feat: add today focus", reqA);
   audit.evidence.tests.push(test);
   audit.evidence.commits.push({ backlog_id: reqA, commit });
-  await appendTimeline({ backlog_id: reqA, actor: "observer:vibe-queue", event_type: "serial_commit_done", event_kind: "close_ready", phase: "Done", status: "accepted", payload: { commit, queue_state: "Done" }, verification: { tests_run: [test.command], tests_exit_code: 0 } });
-  await upsertBacklog(reqA, { actor: "observer:vibe-queue", status: "FIXED", commit, force_admit: true });
+  const closeA = await appendTimeline(withRoute(closeReadyEvent(reqA, commit, test), routes.get(reqA)));
+  if (closeA?.id) audit.evidence.timeline_event_ids.push(closeA.id);
+  await upsertBacklog(reqA, withRoute({ actor: "observer:vibe-queue", status: "FIXED", commit, force_admit: true }, routes.get(reqA)));
 
   applyReminderToggle();
   test = run("node", ["tests/planner.test.mjs"], FIXTURE_ROOT, true);
@@ -417,8 +510,9 @@ async function runAudit() {
   commit = commitAll("feat: add reminder toggle", reqB);
   audit.evidence.tests.push(test);
   audit.evidence.commits.push({ backlog_id: reqB, commit });
-  await appendTimeline({ backlog_id: reqB, actor: "observer:vibe-queue", event_type: "serial_commit_done", event_kind: "close_ready", phase: "Done", status: "accepted", payload: { commit, queue_state: "Done" }, verification: { tests_run: [test.command], tests_exit_code: 0 } });
-  await upsertBacklog(reqB, { actor: "observer:vibe-queue", status: "FIXED", commit, force_admit: true });
+  const closeB = await appendTimeline(withRoute(closeReadyEvent(reqB, commit, test), routes.get(reqB)));
+  if (closeB?.id) audit.evidence.timeline_event_ids.push(closeB.id);
+  await upsertBacklog(reqB, withRoute({ actor: "observer:vibe-queue", status: "FIXED", commit, force_admit: true }, routes.get(reqB)));
 
   applyQuickCapture();
   test = run("node", ["tests/quick-capture.test.mjs"], FIXTURE_ROOT, true);
@@ -426,8 +520,9 @@ async function runAudit() {
   commit = commitAll("feat: add quick capture", reqC);
   audit.evidence.tests.push(test);
   audit.evidence.commits.push({ backlog_id: reqC, commit });
-  await appendTimeline({ backlog_id: reqC, actor: "observer:vibe-queue", event_type: "serial_commit_done", event_kind: "close_ready", phase: "Done", status: "accepted", payload: { commit, queue_state: "Done" }, verification: { tests_run: [test.command], tests_exit_code: 0 } });
-  await upsertBacklog(reqC, { actor: "observer:vibe-queue", status: "FIXED", commit, force_admit: true });
+  const closeC = await appendTimeline(withRoute(closeReadyEvent(reqC, commit, test), routes.get(reqC)));
+  if (closeC?.id) audit.evidence.timeline_event_ids.push(closeC.id);
+  await upsertBacklog(reqC, withRoute({ actor: "observer:vibe-queue", status: "FIXED", commit, force_admit: true }, routes.get(reqC)));
 
   const reconcile = await http("POST", `/api/graph-governance/${pid(PROJECT)}/reconcile/full`, { actor: "observer:vibe-queue", project_root: FIXTURE_ROOT, activate: true, semantic_enrich: false, run_id: `vibe-${RUN_ID}` });
   audit.evidence.reconcile = reconcile;
@@ -435,6 +530,7 @@ async function runAudit() {
   audit.checks.push({ name: "serial commits and tests complete", passed: true, commit_count: audit.evidence.commits.length, test_count: audit.evidence.tests.length });
   audit.self_review = [
     "This audit uses real governance backlog, timeline, graph query, test, commit, and reconcile calls.",
+    "Protected governance writes are bound to server-issued observer route tokens and route_token_gate timeline evidence.",
     "Parallelism is shown as compatible dispatch evidence; commits are intentionally serial.",
     "The mid-run requirement is queued while earlier work is in progress, which is the public-facing behavior under test.",
   ];
@@ -464,6 +560,7 @@ open the planner preview in a normal browser.
 - Backlog rows: ${audit.evidence.backlog_ids.map((id) => `\`${id}\``).join(", ")}
 - Timeline events: ${audit.evidence.timeline_event_ids.map((id) => `\`${id}\``).join(", ")}
 - Graph traces: ${audit.evidence.trace_ids.filter(Boolean).map((id) => `\`${id}\``).join(", ")}
+- Route token refs: ${(audit.evidence.route_token_refs || []).map((item) => `\`${item.backlog_id}:${item.route_token_ref}\``).join(", ")}
 - Queue states: ${audit.evidence.queue_states.join(" -> ")}
 - Commits: ${audit.evidence.commits.map((item) => `\`${item.backlog_id}:${item.commit.slice(0, 12)}\``).join(", ")}
 
