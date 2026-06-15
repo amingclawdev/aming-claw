@@ -3680,6 +3680,19 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     )
     runtime_context_id = context.runtime_context_id
     graph_trace_id = "gqt-runtime-facade"
+    older_graph_trace_id = "gqt-runtime-facade-older"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=older_graph_trace_id,
+        parent_task_id="runtime-facade-parent",
+        snapshot_id="scope-facade",
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        worker_role="mf_sub",
+        fence_token="fence-facade",
+        run_id=_mf_sub_run_id(context.task_id, "fence-facade"),
+        created_at="2026-06-15T10:59:00Z",
+    )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id=graph_trace_id,
@@ -4097,6 +4110,8 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_attestation_payload["action"] == (
         "record_finish_time_worker_attestation"
     )
+    assert stored_attestation_payload["graph_trace_ids"] == [graph_trace_id]
+    assert older_graph_trace_id not in stored_attestation_payload["graph_trace_ids"]
     assert stored_attestation_payload["meta_contract_gate"]["role"] == "mf_sub"
     assert stored_attestation_payload["meta_contract_gate"]["action"] == (
         "worker_progress"
