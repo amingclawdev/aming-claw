@@ -3810,6 +3810,22 @@ def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _route_action_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve startup evidence for the pre-mutation route-action gate."""
+
+    server_evidence = _route_startup_evidence(payload)
+    if server_evidence:
+        return server_evidence
+    return _first_mapping(
+        payload,
+        (
+            "mf_subagent_startup_gate",
+            "startup_evidence",
+            "bounded_startup_evidence",
+        ),
+    )
+
+
 def _close_satisfying_startup_evidence(
     startup_evidence: Mapping[str, Any],
     *,
@@ -4388,10 +4404,6 @@ def validate_route_action_gate(
         raise MfSubagentContractError(
             "implementation action requires route_context_hash and prompt_contract_id"
         )
-    if implementation_action and not route_token_ref:
-        raise MfSubagentContractError(
-            "implementation action requires route_token_ref"
-        )
     if (
         caller_role in _OBSERVER_JUDGER_ROLES
         and implementation_action
@@ -4455,7 +4467,7 @@ def validate_route_action_gate(
         or payload.get("mf_subagent_dispatch_gate"),
         field_name="bounded_dispatch_evidence",
     )
-    startup_evidence = _route_startup_evidence(payload)
+    startup_evidence = _route_action_startup_evidence(payload)
     bounded_worker_evidence = _bounded_worker_evidence_matches(
         dispatch_evidence,
         startup_evidence,

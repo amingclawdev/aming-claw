@@ -23612,6 +23612,7 @@ def _observer_root_route_context_state(
     loaded_skills=None,
     loaded_resources=None,
     caller_graph_query_schema_trace_id: Any = None,
+    materialize_requested_work_mode: bool = False,
 ) -> dict[str, Any]:
     """Assemble the aming-owned observer root route context for a backlog row.
 
@@ -23676,6 +23677,11 @@ def _observer_root_route_context_state(
     requested_work_mode = observer_session.normalize_work_mode(work_mode)
     effective_work_mode = requested_work_mode
     projection_source = "requested_work_mode"
+    requested_supervisor_missing_prerequisites = (
+        requested_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
+        and (not transition_gate.get("allowed") or not canonical_identity_complete)
+        and (route_context_gate.get("required") or any(route_context_for_bootstrap.values()))
+    )
     if (
         transition_gate.get("allowed")
         and canonical_identity_complete
@@ -23683,11 +23689,9 @@ def _observer_root_route_context_state(
     ):
         effective_work_mode = observer_session.WORK_MODE_EXECUTION_SUPERVISOR
         projection_source = "timeline_transition_gate"
-    elif (
-        requested_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
-        and (not transition_gate.get("allowed") or not canonical_identity_complete)
-        and (route_context_gate.get("required") or any(route_context_for_bootstrap.values()))
-    ):
+    elif requested_supervisor_missing_prerequisites and materialize_requested_work_mode:
+        projection_source = "requested_work_mode_pending_transition_prerequisites"
+    elif requested_supervisor_missing_prerequisites:
         effective_work_mode = observer_session.WORK_MODE_LOOK_BEFORE_ACT
         projection_source = "blocked_missing_transition_prerequisites"
 
@@ -23715,7 +23719,13 @@ def _observer_root_route_context_state(
         close_gate,
         route_context_gate,
     )
-    if effective_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR:
+    supervisor_transition_prerequisites_satisfied = bool(
+        transition_gate.get("allowed") and canonical_identity_complete
+    )
+    if (
+        effective_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
+        and supervisor_transition_prerequisites_satisfied
+    ):
         ordered_missing_steps = [
             step
             for step in ordered_missing_steps
@@ -23725,6 +23735,7 @@ def _observer_root_route_context_state(
                 "observer_work_mode_transition",
             }
         ]
+    if effective_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR:
         for step in close_gate_steps:
             if not any(existing["id"] == step["id"] for existing in ordered_missing_steps):
                 ordered_missing_steps.append(step)
@@ -23840,6 +23851,7 @@ def handle_observer_root_route_context_post(ctx: RequestContext):
             loaded_skills=body.get("loaded_skills") or body.get("skills"),
             loaded_resources=body.get("loaded_resources") or body.get("resources"),
             caller_graph_query_schema_trace_id=caller_trace_id,
+            materialize_requested_work_mode=True,
         )
 
 
