@@ -6668,9 +6668,12 @@ def _runtime_context_validate_mf_sub_lookup(
     runtime_context_id: str,
     require_session_token: bool = False,
     require_target_project_root: bool = False,
+    allow_validated: bool = False,
 ):
     from .parallel_branch_runtime import (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
         BranchRuntimeFenceError,
+        STATE_VALIDATED,
         runtime_context_id_for_branch_context,
         validate_mf_subagent_runtime_context_lookup,
     )
@@ -6707,6 +6710,14 @@ def _runtime_context_validate_mf_sub_lookup(
             ),
             target_project_root=target_project_root,
             session_token=session_token,
+            allowed_statuses=(
+                {
+                    *ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
+                    STATE_VALIDATED,
+                }
+                if allow_validated
+                else None
+            ),
         )
     except BranchRuntimeFenceError as exc:
         raise GovernanceError(
@@ -6794,6 +6805,7 @@ def _runtime_context_mf_sub_write_context(
     conn,
     *,
     action: str,
+    allow_validated: bool = False,
 ):
     from .permissions import session_role
 
@@ -6817,6 +6829,7 @@ def _runtime_context_mf_sub_write_context(
             conn,
             project_id=project_id,
             runtime_context_id=runtime_context_id,
+            allow_validated=allow_validated,
         )
         return context, runtime_context_id, session
     if _runtime_context_anonymous_token_free_fallback(ctx, session):
@@ -6827,6 +6840,7 @@ def _runtime_context_mf_sub_write_context(
             runtime_context_id=runtime_context_id,
             require_session_token=True,
             require_target_project_root=True,
+            allow_validated=allow_validated,
         )
         session = _runtime_context_scoped_mf_sub_session(
             project_id=project_id,
@@ -7433,6 +7447,7 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
             ctx,
             conn,
             action="graph-governance.runtime-context.finish-gate",
+            allow_validated=True,
         )
     finally:
         conn.close()
@@ -7465,6 +7480,9 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
             "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
         ),
         result=result,
+        event=result.get("timeline_event_recorded")
+        if isinstance(result, Mapping)
+        else None,
         gate=result.get("gate") if isinstance(result, Mapping) else None,
         updated_context=result.get("context") if isinstance(result, Mapping) else None,
     )
@@ -7640,6 +7658,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
     from .parallel_branch_runtime import (
         branch_context_to_dict,
         get_branch_context,
+        public_contract_revision_payload,
         record_branch_finish_gate,
         runtime_context_id_for_branch_context,
     )
@@ -7835,12 +7854,40 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 )
             except Exception:
                 pass
+            safe_gate_payload = public_contract_revision_payload(gate)
+            finish_event = _task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=saved.backlog_id,
+                attempt_num=int(ctx.body.get("attempt_num") or 0),
+                event_type="mf_subagent.finish_gate",
+                event_kind="mf_subagent_finish_gate",
+                phase="finish_gate",
+                status="passed",
+                actor=str(
+                    ctx.body.get("worker_session_id")
+                    or ctx.body.get("agent_id")
+                    or ctx.body.get("actor")
+                    or "mf_subagent"
+                ),
+                payload={
+                    "mf_subagent_finish_gate": safe_gate_payload,
+                    "checkpoint_id": saved.checkpoint_id,
+                    "validated_head_commit": saved.head_commit,
+                    "runtime_context_id": runtime_context_id_for_branch_context(saved),
+                    "task_id": task_id,
+                    "backlog_id": saved.backlog_id,
+                },
+                commit_sha=saved.head_commit,
+            )
             conn.commit()
         return {
             "ok": True,
             "project_id": project_id,
             "gate": gate,
             "context": branch_context_to_dict(saved),
+            "timeline_event_recorded": finish_event,
         }
     finally:
         conn.close()

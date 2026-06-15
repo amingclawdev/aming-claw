@@ -354,6 +354,7 @@ _RUNTIME_CONTEXT_EVENT_KIND_CLAUSES: dict[str, tuple[str, ...]] = {
     "mf_subagent_startup": ("mf_subagent_startup",),
     "mf_subagent_startup_gate": ("mf_subagent_startup",),
     "worker_startup": ("mf_subagent_startup",),
+    "mf_subagent_read_receipt": ("runtime_context_read_receipt",),
     "runtime_context_read_receipt": ("runtime_context_read_receipt",),
     "worker_read_receipt": ("runtime_context_read_receipt",),
     "read_receipt": ("runtime_context_read_receipt",),
@@ -372,6 +373,7 @@ _RUNTIME_CONTEXT_FULFILLING_STATUSES = {
     "passed",
     "ready",
     "recorded",
+    "resolved",
     "satisfied",
     "success",
     "succeeded",
@@ -1938,6 +1940,31 @@ def _runtime_context_lane_event_ref(event: Mapping[str, Any]) -> str:
     )
 
 
+def _runtime_context_lane_normalized_ref(value: Any) -> str:
+    ref = _runtime_context_text(value)
+    if ref.startswith("timeline:"):
+        return ref.removeprefix("timeline:")
+    return ref
+
+
+def _runtime_context_lane_resolved_refs(event: Mapping[str, Any]) -> list[str]:
+    merged = _runtime_context_lane_event_mapping(event)
+    refs: list[str] = []
+    for key in (
+        "resolves_event_ref",
+        "resolved_event_ref",
+        "blocked_event_ref",
+        "resolves_event_id",
+        "resolved_event_id",
+        "blocked_event_id",
+    ):
+        refs.extend(
+            _runtime_context_lane_normalized_ref(item)
+            for item in _runtime_context_string_list(merged.get(key))
+        )
+    return _runtime_context_dedupe([ref for ref in refs if ref])
+
+
 def _runtime_context_lane_event_clauses(event: Mapping[str, Any]) -> list[str]:
     merged = _runtime_context_lane_event_mapping(event)
     explicit: list[str] = []
@@ -1973,6 +2000,7 @@ def build_runtime_context_lane_plan_view(
     clause_by_id = {item["clause"]: dict(item) for item in clause_items}
     fulfilled: dict[str, dict[str, Any]] = {}
     blocking_events: list[dict[str, Any]] = []
+    resolved_event_refs: set[str] = set()
     last_event: dict[str, Any] = {}
     lane = _runtime_context_text(lane_id)
     for _, event in sorted(
@@ -2015,6 +2043,7 @@ def build_runtime_context_lane_plan_view(
             continue
         if status not in _RUNTIME_CONTEXT_FULFILLING_STATUSES:
             continue
+        resolved_event_refs.update(_runtime_context_lane_resolved_refs(event))
         for clause in clauses:
             if clause in fulfilled:
                 continue
@@ -2023,6 +2052,13 @@ def build_runtime_context_lane_plan_view(
                 | event_view
                 | {"clause": clause, "status": "fulfilled"}
             )
+    if resolved_event_refs:
+        blocking_events = [
+            event
+            for event in blocking_events
+            if _runtime_context_lane_normalized_ref(event.get("event_ref"))
+            not in resolved_event_refs
+        ]
     fulfilled_items = [fulfilled[clause] for clause in clause_order if clause in fulfilled]
     missing_items = [
         dict(clause_by_id[clause]) | {"status": "missing"}
@@ -7749,6 +7785,7 @@ def validate_mf_subagent_runtime_context_lookup(
     target_project_id: str = "",
     target_project_root: str = "",
     session_token: str = "",
+    allowed_statuses: Sequence[str] | None = None,
 ) -> BranchTaskRuntimeContext:
     """Validate runtime_context_id + fence identity for worker contract polling."""
 
@@ -7771,7 +7808,8 @@ def validate_mf_subagent_runtime_context_lookup(
     except BranchRuntimeFenceError as exc:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
 
-    if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+    allowed = set(allowed_statuses or ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES)
+    if context.status not in allowed:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.lease_expires_at and context.lease_expires_at < utc_now():
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")

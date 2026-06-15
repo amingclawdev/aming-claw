@@ -3537,6 +3537,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             allocation_owner="agent-runtime-facade",
             governance_project_id=PID,
             target_project_id=PID,
+            target_project_root=str(worktree),
             branch_ref=branch_ref,
             worktree_path=str(worktree),
             base_commit=fixture.main_head,
@@ -3589,6 +3590,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "parent_task_id": "runtime-facade-parent",
         "fence_token": "fence-facade",
         "session_token": "facade-session",
+        "target_project_root": str(worktree),
     }
 
     with pytest.raises(GovernanceError) as observer_exc:
@@ -3736,6 +3738,31 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert checkpoint["context"]["checkpoint_id"] == "ckpt-runtime-facade"
     assert checkpoint["context"]["replay_source"] == "checkpoint"
 
+    finish_body = {
+        **common_body,
+        "status": "succeeded",
+        "changed_files": [changed_path],
+        "test_results": {
+            "status": "passed",
+            "passed": True,
+            "command": "pytest -q",
+        },
+        "checkpoint_id": "ckpt-runtime-facade-finish",
+        "head_commit": head_commit,
+        "agent_id": "agent-runtime-facade",
+        "actual_cwd": str(worktree),
+        "actual_git_root": str(worktree),
+        "owned_files": [changed_path],
+        "observer_command_id": "cmd-facade",
+        "read_receipt_hash": "sha256:read-facade",
+        "read_receipt_event_id": read_receipt["timeline_event"]["id"],
+        "evidence": _finish_gate_evidence(
+            fence_token="fence-facade",
+            worktree_path=str(worktree),
+            branch_ref=branch_ref,
+            head_commit=head_commit,
+        ),
+    }
     finish = server.handle_graph_governance_runtime_context_finish_gate(
         _ctx_with_role(
             {
@@ -3744,39 +3771,49 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             },
             "mf_sub",
             method="POST",
-            body={
-                **common_body,
-                "status": "succeeded",
-                "changed_files": [changed_path],
-                "test_results": {
-                    "status": "passed",
-                    "passed": True,
-                    "command": "pytest -q",
-                },
-                "checkpoint_id": "ckpt-runtime-facade-finish",
-                "head_commit": head_commit,
-                "agent_id": "agent-runtime-facade",
-                "actual_cwd": str(worktree),
-                "actual_git_root": str(worktree),
-                "owned_files": [changed_path],
-                "observer_command_id": "cmd-facade",
-                "read_receipt_hash": "sha256:read-facade",
-                "read_receipt_event_id": read_receipt["timeline_event"]["id"],
-                "evidence": _finish_gate_evidence(
-                    fence_token="fence-facade",
-                    worktree_path=str(worktree),
-                    branch_ref=branch_ref,
-                    head_commit=head_commit,
-                ),
-            },
+            body=finish_body,
         )
     )
     assert finish["ok"] is True
     assert finish["action"] == "finish_gate"
+    assert finish["timeline_event"]["event_kind"] == "mf_subagent_finish_gate"
+    assert finish["timeline_event"]["event_ref"].startswith("timeline:")
     assert finish["gate"]["checkpoint_id"] == "ckpt-runtime-facade-finish"
     assert finish["gate"]["validated_head_commit"] == head_commit
     assert finish["context"]["replay_source"] == "mf_sub_finish_gate"
     assert finish["context"]["status"] == "validated"
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+    current_values = current_state["runtime_context_service"]["views"]["current"][
+        "current_values"
+    ]
+    assert current_values["finish_gate_ref"] == finish["timeline_event"]["event_ref"]
+    assert current_values["checkpoint_id"] == "ckpt-runtime-facade-finish"
+
+    replay_finish = server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            method="POST",
+            body=finish_body,
+        )
+    )
+    assert replay_finish["ok"] is True
+    assert replay_finish["action"] == "finish_gate"
+    assert replay_finish["timeline_event"]["event_kind"] == "mf_subagent_finish_gate"
+    assert replay_finish["timeline_event"]["event_ref"].startswith("timeline:")
+    assert replay_finish["context"]["status"] == "validated"
 
     for response in (read_receipt, startup, checkpoint, finish):
         response_json = json.dumps(response, sort_keys=True)
@@ -3841,8 +3878,6 @@ def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_event
         "verification",
     ):
         payload = {"runtime_context_id": context.runtime_context_id}
-        if event_kind == "mf_subagent_read_receipt":
-            payload["required_evidence"] = ["runtime_context_read_receipt"]
         recorded_events.append(
             task_timeline.record_event(
                 conn,
@@ -3856,6 +3891,31 @@ def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_event
                 payload=payload,
             )
         )
+    blocked_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-lane-plan-task",
+        backlog_id="AC-RUNTIME-LANE-PLAN",
+        event_type="dispatch_no_progress",
+        event_kind="dispatch_no_progress",
+        phase="dispatch",
+        status="blocked",
+        payload={"runtime_context_id": context.runtime_context_id},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-lane-plan-task",
+        backlog_id="AC-RUNTIME-LANE-PLAN",
+        event_type="dispatch_no_progress.resolved",
+        event_kind="dispatch_no_progress_resolved",
+        phase="dispatch",
+        status="resolved",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "resolves_event_ref": str(blocked_event["id"]),
+        },
+    )
     task_timeline.record_event(
         conn,
         project_id=PID,
@@ -3889,9 +3949,13 @@ def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_event
     assert lane_plan["lane_id"] == "runtime-lane-plan-task"
     assert lane_plan["current_state"]["fulfilled_count"] == 6
     assert lane_plan["current_state"]["missing_count"] == 1
+    assert lane_plan["current_state"]["blocking_count"] == 0
     assert lane_plan["current_state"]["status"] == "missing_required_clauses"
     assert missing == {"close_ready"}
     assert fulfilled["route_context"]["event_ref"] == str(recorded_events[0]["id"])
+    assert fulfilled["runtime_context_read_receipt"]["event_ref"] == str(
+        recorded_events[4]["id"]
+    )
     assert fulfilled["independent_verification"]["event_ref"] == str(
         recorded_events[-1]["id"]
     )
