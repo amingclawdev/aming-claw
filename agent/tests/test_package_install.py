@@ -187,7 +187,9 @@ class TestLocalPluginPackaging:
         config = json.loads(config_text)
         server = config["mcpServers"]["aming-claw"]
 
-        assert server["command"] == "python"
+        command = server["command"]
+        assert command == "python" or command == "python3" or command.startswith("./")
+        assert not Path(command).expanduser().is_absolute()
         assert server["args"][:2] == ["-m", "agent.mcp.server"]
         assert "--workers" in server["args"]
         assert server["args"][server["args"].index("--workers") + 1] == "0"
@@ -351,7 +353,7 @@ class TestClaudePluginPackaging:
         assert servers, "Claude plugin manifest must declare mcpServers"
         assert "aming-claw" in servers, "mcpServers must include 'aming-claw'"
         aming = servers["aming-claw"]
-        assert aming.get("command") == "python"
+        assert aming.get("command") in {"python", "python3"}
         args = aming.get("args") or []
         assert "-m" in args and "agent.mcp.server" in args
         # cwd must use ${CLAUDE_PLUGIN_ROOT} so python -m agent.mcp.server can

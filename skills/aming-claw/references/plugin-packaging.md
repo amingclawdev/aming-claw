@@ -5,7 +5,8 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 ## MVP Status
 
 - Codex local plugin shape is present: `.codex-plugin/plugin.json`,
-  `skills/`, demo docs/scripts, and `.mcp.json`.
+  `skills/`, demo docs/scripts, `.mcp.json`, and generated
+  `.codex/config.toml` in installed cache/marketplace payloads.
 - Claude Code local plugin shape is present: `.claude-plugin/plugin.json`
   and `.claude-plugin/marketplace.json` at the repo root; `skills/` and
   `.mcp.json` are auto-discovered. Skills are namespaced
@@ -81,6 +82,9 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   runner. It can create the isolated fixture with `--ensure-fixture
   --no-browser` without requiring the full dashboard source tree or npm install.
 - `.mcp.json`: active MCP server config using `agent.mcp.server`.
+- `.codex/config.toml`: generated Codex host-readable MCP registration in the
+  installed cache and local marketplace payloads. It mirrors `.mcp.json` for
+  the Aming Claw server and injects the runtime checkout through `PYTHONPATH`.
 - `agent/plugin_installer.py` + `scripts/install_from_git.py`: Git URL plugin
   installer used by the CLI and first-run fallback flows.
 
@@ -130,15 +134,23 @@ needed.
 
 `.mcp.json` must remain relocatable. Use `"cwd": "."` and avoid absolute
 developer-machine paths such as `C:\Users\...`; package tests enforce this.
+The installer may rewrite installed cache/marketplace copies with absolute
+local runtime paths because those files are user-local generated artifacts.
 
 Claude Code can read project-scoped MCP servers from `.mcp.json` when the
 workspace/plugin host loads that file. Treat MCP visibility as a separate
 runtime check: plugin skill install does not by itself prove Claude Code loaded
 `mcpServers`. Prefer `claude mcp list` or a new-session tool visibility check;
 `claude plugin details` can report `MCP servers (0)` even when the plugin
-server connects. Codex local plugin packaging reads the plugin manifest's
-`mcpServers` pointer. Keeping the same stdio entrypoint at `.mcp.json` lets both
-surfaces reuse one MCP contract.
+server connects. Codex plugin installs must provide both the manifest
+`mcpServers` pointer and generated `.codex/config.toml`; `aming-claw plugin
+doctor` must fail or warn when either registration surface is missing. Keeping
+the same stdio entrypoint at `.mcp.json` lets hosts reuse one MCP contract.
+
+If a fresh Codex session can see the Aming Claw skill but
+`ListMcpResourcesTool()` does not list `aming-claw://current-context`, stop
+normal governed work. Use the launcher/doctor path, reload or open a new
+session, and only use HTTP/CLI fallback for explicit system-recovery work.
 
 ## Compatibility Checks
 

@@ -12,6 +12,14 @@ Before any response that uses this skill, in this exact order:
   ReadMcpResourceTool(uri="aming-claw://skill")
   ReadMcpResourceTool(uri="aming-claw://graph-first")
 
+If `ListMcpResourcesTool()` does not show `aming-claw://current-context`, the
+current Codex session has not loaded the Aming Claw MCP server. Hard-stop
+governed demo, observer, and implementation work. Do not treat skill visibility,
+`aming-claw start`, or dashboard health as proof that runtime context is
+available. The allowed fallback is diagnosis or an explicitly requested
+system-recovery backlog/hotfix through HTTP/CLI; reload Codex or open a new
+session before resuming normal governed work.
+
 current-context anchors project_id, governance URLs, and 3 guardrails.
 skill is the operating contract (Start Sequence, Observer Operating Modes).
 graph-first has copy-pasteable graph_query payload examples.

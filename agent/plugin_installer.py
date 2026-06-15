@@ -589,6 +589,12 @@ def install_codex_plugin_cache(
         python_executable=python_executable,
         dry_run=dry_run,
     )
+    _write_codex_runtime_config(
+        plugin_root,
+        target,
+        python_executable=python_executable,
+        dry_run=dry_run,
+    )
     return target
 
 
@@ -638,6 +644,12 @@ def install_codex_marketplace(
         python_executable=python_executable,
         dry_run=False,
     )
+    _write_codex_runtime_config(
+        plugin_root,
+        plugin_target,
+        python_executable=python_executable,
+        dry_run=False,
+    )
     return root
 
 
@@ -646,6 +658,43 @@ def _toml_quote(value: Union[str, Path]) -> str:
     if "'" not in text:
         return f"'{text}'"
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_array(values: Sequence[object]) -> str:
+    return "[" + ", ".join(_toml_quote(str(value)) for value in values) + "]"
+
+
+def _codex_runtime_config_toml(plugin_root: Path, *, python_executable: Optional[str] = None) -> str:
+    payload = _cache_runtime_mcp_config(plugin_root, python_executable=python_executable)
+    server = payload["mcpServers"]["aming-claw"]
+    lines = [
+        "[mcp_servers.aming-claw]",
+        f"command = {_toml_quote(str(server.get('command') or 'python'))}",
+        f"args = {_toml_array([str(arg) for arg in server.get('args') or []])}",
+    ]
+    env = server.get("env") if isinstance(server.get("env"), dict) else {}
+    if env:
+        lines.extend(["", "[mcp_servers.aming-claw.env]"])
+        for key in sorted(str(item) for item in env):
+            lines.append(f"{key} = {_toml_quote(str(env[key]))}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_codex_runtime_config(
+    plugin_root: Path,
+    target_root: Path,
+    *,
+    python_executable: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
+    if dry_run:
+        return
+    target = target_root.expanduser().resolve() / ".codex" / "config.toml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        _codex_runtime_config_toml(plugin_root, python_executable=python_executable),
+        encoding="utf-8",
+    )
 
 
 def _toml_table_pattern(table_name: str) -> re.Pattern[str]:
@@ -1697,6 +1746,35 @@ def _validate_mcp_runtime_entrypoint(mcp_path: Path) -> tuple[bool, str]:
     return False, f"{mcp_path}: cannot import agent.mcp.server from cwd/PYTHONPATH ({checked})"
 
 
+def _validate_codex_runtime_config(config_path: Path) -> tuple[bool, str]:
+    try:
+        payload = _load_toml_text(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"{config_path}: {exc}"
+    servers = payload.get("mcp_servers") if isinstance(payload, dict) else {}
+    server = servers.get("aming-claw") if isinstance(servers, dict) else None
+    if not isinstance(server, dict):
+        return False, f"{config_path}: missing mcp_servers.aming-claw"
+    command = str(server.get("command") or "").strip()
+    if not command:
+        return False, f"{config_path}: mcp_servers.aming-claw.command is empty"
+    args = server.get("args")
+    if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
+        return False, f"{config_path}: mcp_servers.aming-claw.args must launch agent.mcp.server"
+
+    env = server.get("env") if isinstance(server.get("env"), dict) else {}
+    runtime_paths = [
+        Path(item).expanduser()
+        for item in str(env.get("PYTHONPATH") or "").split(os.pathsep)
+        if item
+    ]
+    for candidate in runtime_paths:
+        if (candidate / "agent" / "mcp" / "server.py").is_file():
+            return True, f"{config_path}: Codex MCP runtime import root {candidate}"
+    checked = ", ".join(str(path) for path in runtime_paths) or "<empty PYTHONPATH>"
+    return False, f"{config_path}: cannot import agent.mcp.server from PYTHONPATH ({checked})"
+
+
 def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
     marketplace_path = root / ".agents" / "plugins" / "marketplace.json"
     try:
@@ -1727,7 +1805,10 @@ def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
     mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(resolved / ".mcp.json")
     if not mcp_ok:
         return False, mcp_detail
-    return True, f"{marketplace_path} -> {resolved}; {mcp_detail}"
+    codex_ok, codex_detail = _validate_codex_runtime_config(resolved / ".codex" / "config.toml")
+    if not codex_ok:
+        return False, codex_detail
+    return True, f"{marketplace_path} -> {resolved}; {mcp_detail}; {codex_detail}"
 
 
 def _codex_plugin_enabled(text: str) -> bool:
@@ -1798,7 +1879,10 @@ def _check_codex_cache(plugin_root: Path, *, codex_home: Optional[Union[Path, st
             mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(cache_root / ".mcp.json")
             if not mcp_ok:
                 return _doctor_check("codex_plugin_cache", "fail", mcp_detail)
-            return _doctor_check("codex_plugin_cache", "ok", f"{manifest}; {mcp_detail}")
+            codex_ok, codex_detail = _validate_codex_runtime_config(cache_root / ".codex" / "config.toml")
+            if not codex_ok:
+                return _doctor_check("codex_plugin_cache", "fail", codex_detail)
+            return _doctor_check("codex_plugin_cache", "ok", f"{manifest}; {mcp_detail}; {codex_detail}")
     return _doctor_check(
         "codex_plugin_cache",
         "fail",

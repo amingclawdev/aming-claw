@@ -14,8 +14,10 @@ second onboarding skill. In Claude Code the memorable command is:
 
 Keep this skill short and stateful. Full bootstrap schema, route-gate behavior,
 and project-config details live in [docs/onboarding.md](../../docs/onboarding.md).
+Non-preview governance work belongs to [skills/aming-claw/SKILL.md](../aming-claw/SKILL.md).
 At the CLI, show `aming-claw launcher`. The launcher gives the next safe
-action, not a long tutorial.
+action, not a long tutorial. Use `aming-claw status` to check health and
+`aming-claw open` to open the dashboard after governance is running.
 
 ## Ground Rules
 
@@ -26,7 +28,8 @@ action, not a long tutorial.
   onboarding health.
 - Ask before bootstrap unless the user requested initialize, register,
   bootstrap, or one-shot setup.
-- After plugin install/update, ask for a new host session so skills and MCP load.
+- Use `aming-claw plugin install` for local plugin setup or repair. After
+  plugin install/update, ask for a new host session so skills and MCP load.
 
 ## 治理边界：gate 是约束，不是对手
 

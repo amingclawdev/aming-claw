@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -618,8 +619,14 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     server = mcp["mcpServers"]["aming-claw"]
     assert server["command"] == "python3.12"
     assert server["cwd"] == str(tmp_path.resolve())
-    assert str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(":") or str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(";")
+    assert str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(os.pathsep)
     assert server["args"][:2] == ["-m", "agent.mcp.server"]
+
+    codex_config = _load_toml_text((target / ".codex" / "config.toml").read_text(encoding="utf-8"))
+    codex_server = codex_config["mcp_servers"]["aming-claw"]
+    assert codex_server["command"] == "python3.12"
+    assert codex_server["args"][:2] == ["-m", "agent.mcp.server"]
+    assert str(tmp_path.resolve()) in codex_server["env"]["PYTHONPATH"].split(os.pathsep)
 
 
 def test_install_codex_plugin_cache_replaces_existing_symlink_payload(tmp_path):
@@ -658,6 +665,7 @@ def test_install_codex_marketplace_replaces_existing_symlink_payload(tmp_path):
     assert refreshed == marketplace_root
     assert not (plugin_target / "skills").is_symlink()
     assert (plugin_target / "skills" / "aming-claw" / "SKILL.md").is_file()
+    assert (plugin_target / ".codex" / "config.toml").is_file()
 
 
 def test_doctor_plugin_fails_when_cache_payload_is_partial(tmp_path):
@@ -685,6 +693,56 @@ def test_doctor_plugin_fails_when_cache_payload_is_partial(tmp_path):
     assert "missing payload skills" in checks["codex_plugin_cache"].detail
 
 
+def test_doctor_plugin_fails_when_cache_codex_runtime_config_is_missing(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    marketplace_root = tmp_path / "marketplace-root"
+    cache_target = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+    codex_config = configure_codex_plugin(
+        codex_config=codex_home / "config.toml",
+        marketplace_root=marketplace_root,
+    )
+    (cache_target / ".codex" / "config.toml").unlink()
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        codex_home=codex_home,
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_plugin_cache"].status == "fail"
+    assert ".codex/config.toml" in checks["codex_plugin_cache"].detail
+
+
+def test_doctor_plugin_fails_when_marketplace_codex_runtime_config_is_missing(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    marketplace_root = tmp_path / "marketplace-root"
+    install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    marketplace_target = install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+    codex_config = configure_codex_plugin(
+        codex_config=codex_home / "config.toml",
+        marketplace_root=marketplace_root,
+    )
+    (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".codex" / "config.toml").unlink()
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        codex_home=codex_home,
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_config"].status == "fail"
+    assert ".codex/config.toml" in checks["codex_config"].detail
+
+
 def test_codex_install_surfaces_do_not_write_external_project_cwd(tmp_path, monkeypatch):
     plugin_root = tmp_path / "plugin-root"
     _write_plugin_fixture(plugin_root)
@@ -704,7 +762,9 @@ def test_codex_install_surfaces_do_not_write_external_project_cwd(tmp_path, monk
     )
 
     assert (cache_target / ".mcp.json").is_file()
+    assert (cache_target / ".codex" / "config.toml").is_file()
     assert (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".mcp.json").is_file()
+    assert (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".codex" / "config.toml").is_file()
     assert (cache_target / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs").is_file()
     assert (
         marketplace_target / ".agents" / "plugins" / "aming-claw" / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs"
