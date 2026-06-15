@@ -2580,6 +2580,17 @@ def _runtime_context_value_present(value: Any) -> bool:
     return True
 
 
+def _runtime_context_nested_finish_gate_payload(
+    finish_gate_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    nested = _runtime_context_mapping(
+        finish_gate_payload.get("mf_subagent_finish_gate")
+    )
+    if nested:
+        return nested
+    return _runtime_context_mapping(finish_gate_payload.get("finish_gate"))
+
+
 def _runtime_context_evidence_refs(
     context: BranchTaskRuntimeContext,
     *,
@@ -2644,14 +2655,19 @@ def _runtime_context_current_values(
         timeline_refs.get("verification_event_refs")
     )
     finish_gate_payload = _runtime_context_mapping(finish_gate.get("payload"))
+    nested_finish_gate_payload = _runtime_context_nested_finish_gate_payload(
+        finish_gate_payload
+    )
     worker_self_attestation = public_contract_revision_payload(
         finish_gate.get("worker_self_attestation")
         or finish_gate_payload.get("worker_self_attestation")
+        or nested_finish_gate_payload.get("worker_self_attestation")
         or {}
     )
     worker_self_attestation_gate = _runtime_context_mapping(
         finish_gate.get("worker_self_attestation_gate")
         or finish_gate_payload.get("worker_self_attestation_gate")
+        or nested_finish_gate_payload.get("worker_self_attestation_gate")
     )
     worker_self_attesting = bool(worker_self_attestation) and bool(
         worker_self_attestation.get("worker_self_attesting")
@@ -2664,8 +2680,28 @@ def _runtime_context_current_values(
         worker_self_attestation.get("finish_time_blockers") or []
     )
     if worker_self_attestation_gate:
-        worker_self_attesting = worker_self_attesting and bool(
-            worker_self_attestation_gate.get("passed")
+        gate_status = _runtime_context_text(
+            worker_self_attestation_gate.get("status")
+        ).lower()
+        worker_self_attesting = worker_self_attesting and (
+            bool(
+                worker_self_attestation_gate.get("passed")
+                or worker_self_attestation_gate.get("close_satisfying")
+            )
+            or gate_status in {"passed", "ok", "success", "succeeded"}
+        )
+    finish_test_results = public_contract_revision_payload(
+        finish_gate.get("test_results")
+        or finish_gate_payload.get("test_results")
+        or nested_finish_gate_payload.get("test_results")
+    )
+    if not finish_test_results and isinstance(
+        nested_finish_gate_payload.get("evidence"), Mapping
+    ):
+        finish_test_results = public_contract_revision_payload(
+            _runtime_context_mapping(
+                nested_finish_gate_payload.get("evidence")
+            ).get("test_results")
         )
     worker_self_attesting = worker_self_attesting and _runtime_context_text(
         worker_self_attestation.get("status") or "passed"
@@ -2757,7 +2793,7 @@ def _runtime_context_current_values(
         "worker_self_attesting": worker_self_attesting,
         "worker_self_attestation": worker_self_attestation,
         "checkpoint_id": checkpoint_id,
-        "test_results": public_contract_revision_payload(finish_gate.get("test_results")),
+        "test_results": finish_test_results,
     }
 
 
