@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from agent import plugin_installer
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -195,6 +196,45 @@ class TestLocalPluginPackaging:
         assert server["args"][server["args"].index("--workers") + 1] == "0"
         assert server["cwd"] == "."
         assert "C:\\Users\\" not in config_text
+
+    def test_plugin_doctor_reports_parent_mcp_bridge_without_rewriting_repo_config(self, tmp_path):
+        plugin_root = tmp_path / "aming-claw"
+        plugin_root.mkdir()
+        (plugin_root / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "aming-claw": {
+                            "command": "./.venv/bin/python",
+                            "args": ["-m", "agent.mcp.server"],
+                            "cwd": ".",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "aming-claw": {
+                            "command": str(plugin_root / ".venv" / "bin" / "python"),
+                            "args": ["-m", "agent.mcp.server"],
+                            "cwd": str(plugin_root),
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        check = plugin_installer._check_mcp_launch_roots(plugin_root)
+
+        assert check.status == "ok"
+        assert "repo .mcp.json is relocatable" in check.detail
+        assert "parent bridge" in check.detail
+        assert "aming-claw://current-context" in check.detail
 
     def test_pyproject_exposes_governance_console_scripts(self):
         data = _load_pyproject()

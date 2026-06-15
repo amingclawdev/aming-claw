@@ -62,12 +62,16 @@ can answer HTTP. They do not prove the AI host loaded `.mcp.json`, exposed the
 Aming Claw MCP server, or has route/current-context visibility.
 
 If `aming-claw://current-context` is missing, stop normal governed work. Reload
-or open a new Codex/Claude host session from the plugin or workspace root that
-contains `.mcp.json`, or use the installed plugin cache/host config, then verify
-current-context again. Opening the parent directory instead of the actual
-plugin checkout can leave `.mcp.json` undiscovered. HTTP/CLI fallback is only
-for an explicit system-recovery hotfix or diagnosis, not ordinary governed
-implementation.
+or open a new Codex/Claude host session from a root whose MCP config actually
+points at the plugin checkout. That can be the plugin/workspace root with the
+source-controlled, relocatable `.mcp.json`; it can also be a parent/workspace
+root with a host-local bridge `.mcp.json` whose absolute `cwd` points back to
+the plugin checkout. The readiness test is not which directory looks correct;
+it is whether the new host session lists and can read
+`aming-claw://current-context`. Use `aming-claw plugin doctor` to inspect the
+repo-local config, installed plugin cache, and any parent bridge. HTTP/CLI
+fallback is only for an explicit system-recovery hotfix or diagnosis, not
+ordinary governed implementation.
 
 ## 3. Register A Target Project
 

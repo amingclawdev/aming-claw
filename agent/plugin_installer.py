@@ -1683,6 +1683,96 @@ def _check_mcp_config(plugin_root: Path) -> DoctorCheck:
     return _doctor_check("mcp_config", "ok", str(path))
 
 
+def _mcp_server_from(path: Path) -> tuple[dict, str]:
+    payload = _read_json_file(path)
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
+    if not isinstance(servers, dict):
+        return {}, "missing mcpServers"
+    server = servers.get("aming-claw")
+    if not isinstance(server, dict):
+        return {}, "missing mcpServers.aming-claw"
+    return server, ""
+
+
+def _check_mcp_launch_roots(plugin_root: Path) -> DoctorCheck:
+    """Explain which .mcp.json launch roots can expose current-context."""
+
+    project_path = plugin_root / ".mcp.json"
+    try:
+        project_server, error = _mcp_server_from(project_path)
+    except Exception as exc:
+        return _doctor_check("mcp_launch_roots", "fail", f"{project_path}: {exc}")
+    if error:
+        return _doctor_check("mcp_launch_roots", "fail", f"{project_path}: {error}")
+
+    command = str(project_server.get("command") or "").strip()
+    cwd = str(project_server.get("cwd") or "").strip()
+    command_relocatable = bool(command) and not Path(command).expanduser().is_absolute()
+    cwd_relocatable = cwd in {"", "."}
+    if not command_relocatable or not cwd_relocatable:
+        return _doctor_check(
+            "mcp_launch_roots",
+            "warn",
+            (
+                f"repo .mcp.json is not fully relocatable (command={command!r}, cwd={cwd!r}); "
+                "keep source-controlled config relative and use installed/bridge configs for host-specific paths"
+            ),
+        )
+
+    parent_path = plugin_root.parent / ".mcp.json"
+    if not parent_path.is_file():
+        return _doctor_check(
+            "mcp_launch_roots",
+            "warn",
+            (
+                f"repo .mcp.json is relocatable (command={command!r}, cwd={cwd or '.'!r}); "
+                f"no parent bridge at {parent_path}. Opening the parent directory may not load "
+                "aming-claw://current-context unless the installed plugin cache/host config is active."
+            ),
+        )
+
+    try:
+        parent_server, parent_error = _mcp_server_from(parent_path)
+    except Exception as exc:
+        return _doctor_check(
+            "mcp_launch_roots",
+            "warn",
+            f"repo .mcp.json is relocatable; parent bridge {parent_path} is unreadable: {exc}",
+        )
+    if parent_error:
+        return _doctor_check(
+            "mcp_launch_roots",
+            "warn",
+            f"repo .mcp.json is relocatable; parent bridge {parent_path}: {parent_error}",
+        )
+
+    parent_cwd = str(parent_server.get("cwd") or "").strip()
+    parent_command = str(parent_server.get("command") or "").strip()
+    parent_cwd_path = Path(parent_cwd).expanduser() if parent_cwd else Path()
+    parent_points_to_plugin = parent_cwd_path.is_absolute() and parent_cwd_path.resolve() == plugin_root.resolve()
+    if parent_points_to_plugin:
+        return _doctor_check(
+            "mcp_launch_roots",
+            "ok",
+            (
+                f"repo .mcp.json is relocatable (command={command!r}, cwd={cwd or '.'!r}); "
+                f"parent bridge {parent_path} points cwd to plugin root {plugin_root}. "
+                "Either launch root can be valid; the real readiness check is whether the host lists "
+                "aming-claw://current-context."
+            ),
+        )
+    return _doctor_check(
+        "mcp_launch_roots",
+        "warn",
+        (
+            f"repo .mcp.json is relocatable (command={command!r}, cwd={cwd or '.'!r}); "
+            f"parent bridge {parent_path} uses command={parent_command!r}, cwd={parent_cwd!r}, "
+            f"which does not point to plugin root {plugin_root}. Opening the parent directory may load "
+            "the wrong MCP server or none at all."
+        ),
+    )
+
+
 def _load_toml_text(text: str) -> dict:
     try:
         import tomllib  # type: ignore[import-not-found]
@@ -2044,6 +2134,7 @@ def doctor_plugin(
     result.checks.append(_check_claude_manifest(root))
     result.checks.append(_check_claude_marketplace(root))
     result.checks.append(_check_mcp_config(root))
+    result.checks.append(_check_mcp_launch_roots(root))
     codex_config_path = Path(codex_config).expanduser() if codex_config else default_codex_config_path()
     result.checks.append(_check_codex_config(codex_config_path))
     result.checks.append(_check_codex_cache(root, codex_home=codex_home, codex_config=codex_config_path))

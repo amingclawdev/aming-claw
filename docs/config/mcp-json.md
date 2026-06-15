@@ -76,3 +76,28 @@ Each server entry contains:
 - Host-ops tools such as `manager_health`, `manager_start`, `governance_redeploy`, `executor_respawn`, and `runtime_status` are a facade over ServiceManager/manager_http_server. They do not make MCP the owner of long-lived services.
 - `manager_start` currently bootstraps the Windows PowerShell host script. Linux/macOS bootstrap scripts are tracked separately in `OPT-BACKLOG-HOST-OPS-CROSS-PLATFORM-SCRIPTS`.
 - See [.aming-claw.yaml](aming-claw-yaml.md) for project-level configuration.
+
+## Launch Roots And Bridge Configs
+
+The source-controlled plugin `.mcp.json` must stay relocatable: keep `command`
+relative or PATH-based and keep `cwd` as `"."`. Do not commit a user-machine
+absolute Python path or checkout path into this file.
+
+Some hosts resolve `.mcp.json` relative to the workspace root they opened. If a
+session opened from a parent directory can see `aming-claw://current-context`
+while a session opened from the plugin checkout cannot, inspect which config the
+host loaded. A parent/workspace `.mcp.json` may intentionally act as a
+host-local bridge by using absolute `command` and `cwd` values that point back
+to the plugin checkout. That bridge can be valid for one machine, but it should
+not replace the relocatable repo config.
+
+Run:
+
+```bash
+aming-claw plugin doctor
+```
+
+The doctor reports the repo-local config, installed plugin cache, and whether a
+parent bridge points back to the plugin root. The final readiness check is still
+inside the new Codex/Claude session: list MCP resources and confirm
+`aming-claw://current-context` is present.

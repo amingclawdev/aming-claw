@@ -34,9 +34,12 @@ action, not a long tutorial. Use `aming-claw status` to check health and
   list and read `aming-claw://current-context`. Governance health, dashboard
   health, and `aming-claw start` are not MCP readiness.
 - If current-context is missing, stop normal governed work. Reload or open a
-  new host session from the plugin/workspace root that contains `.mcp.json`, or
-  use the installed plugin cache/host config, then verify current-context
-  again. Opening the parent directory can leave `.mcp.json` undiscovered.
+  new host session from a root whose MCP config points at the plugin checkout.
+  This may be the plugin/workspace root with the repo-local relocatable
+  `.mcp.json`, the installed plugin cache/host config, or a parent/workspace
+  root with a host-local bridge `.mcp.json` whose absolute `cwd` points back to
+  the plugin checkout. Verify current-context again; directory choice is only
+  valid if the host can list and read `aming-claw://current-context`.
 - Use HTTP/CLI fallback without current-context only for explicit
   system-recovery diagnosis or hotfix work.
 
