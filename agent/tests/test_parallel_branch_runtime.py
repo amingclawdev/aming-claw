@@ -2277,6 +2277,54 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     )
     assert accepted.task_id == "mf-sub-startup"
 
+    accepted_by_runtime_context = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=branch_runtime_context_id(PROJECT_ID, "mf-sub-startup"),
+        task_id="",
+        parent_task_id="",
+        worker_role="mf_sub",
+        fence_token="fence-startup",
+        session_token="secret-worker-session-token",
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+    )
+    assert accepted_by_runtime_context.task_id == "mf-sub-startup"
+
+    with pytest.raises(BranchRuntimeFenceError, match="runtime_context_task_mismatch"):
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=branch_runtime_context_id(PROJECT_ID, "mf-sub-startup"),
+            task_id="other-task",
+            parent_task_id="",
+            worker_role="mf_sub",
+            fence_token="fence-startup",
+            session_token="secret-worker-session-token",
+        )
+
+    with pytest.raises(BranchRuntimeFenceError, match="route_identity_mismatch"):
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=branch_runtime_context_id(PROJECT_ID, "mf-sub-startup"),
+            task_id="",
+            parent_task_id="",
+            worker_role="mf_sub",
+            fence_token="fence-startup",
+            session_token="secret-worker-session-token",
+            route_identity={
+                "route_id": "route-startup",
+                "route_context_hash": "sha256:wrong-route",
+            },
+        )
+
     for supplied_token in ("", "wrong-worker-session-token"):
         with pytest.raises(BranchRuntimeFenceError):
             validate_mf_subagent_graph_query_identity(

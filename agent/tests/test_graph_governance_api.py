@@ -3054,13 +3054,35 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
             "method": "POST",
             "path": "/api/graph-governance/{project_id}/query",
             "facade_status": "available",
-            "required_body_fields": {"tool", "query_source", "query_purpose"},
+            "required_body_fields": {
+                "tool",
+                "query_source",
+                "query_purpose",
+                "runtime_context_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+            },
             "required_identity_fields": {
                 "runtime_context_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+            },
+            "server_resolved_identity_fields": {
                 "task_id",
                 "parent_task_id",
                 "worker_role",
-                "fence_token",
+                "governance_project_id",
+                "target_project_id",
+            },
+            "route_identity_fields": {
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
             },
             "query_source": "mf_subagent",
             "query_purpose": "subagent_context_build",
@@ -3118,6 +3140,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "startup",
         "checkpoint",
         "finish_gate",
+        "implementation_evidence",
         "close_ready",
     }
     write_guide_contracts = {
@@ -3198,6 +3221,25 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "fence_token",
                 "session_token",
                 "target_project_root",
+            },
+        },
+        "implementation_evidence": {
+            "legacy_method": "POST",
+            "legacy_path": "/api/task/{project_id}/timeline",
+            "canonical_facade_status": "available",
+            "planned_path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/implementation-evidence"
+            ),
+            "required_fields": {
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+                "changed_files",
+                "tests",
             },
         },
         "close_ready": {
@@ -10413,6 +10455,119 @@ def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
     )
     assert fetched["trace"]["query_source"] == "mf_subagent"
     assert fetched["trace"]["parent_task_id"] == "parent-task-1"
+
+
+def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
+    conn,
+    tmp_path,
+):
+    _activate_basic_graph(conn, "full-query-mf-sub-runtime-context")
+    target_root = tmp_path / "target-runtime-context"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-context",
+            root_task_id="parent-runtime-context",
+            backlog_id="AC-RUNTIME-CONTEXT-GRAPH-QUERY",
+            stage_task_id="worker-runtime-context",
+            worker_id="worker-runtime-context",
+            worker_slot_id="worker-runtime-context",
+            branch_ref="refs/heads/codex/worker-runtime-context",
+            status="worktree_ready",
+            fence_token="fence-runtime-context",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-runtime-context"
+            ),
+        ),
+    )
+    route_identity = {
+        "route_id": "route-runtime-context",
+        "route_context_hash": "sha256:route-runtime-context",
+        "prompt_contract_id": "rprompt-runtime-context",
+        "prompt_contract_hash": "sha256:prompt-runtime-context",
+        "route_token_ref": "rtok-runtime-context",
+        "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-context-graph-query",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+
+    body = {
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "runtime_context_id": context.runtime_context_id,
+        "fence_token": "fence-runtime-context",
+        "session_token": "session-runtime-context",
+        "target_project_root": str(target_root),
+        **route_identity,
+    }
+    queried = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert queried["ok"] is True
+    fetched = server.handle_graph_governance_query_trace_get(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": queried["trace_id"]},
+            "mf_sub",
+        )
+    )
+    trace = fetched["trace"]
+    assert trace["query_source"] == "mf_subagent"
+    assert trace["runtime_context_id"] == context.runtime_context_id
+    assert trace["task_id"] == "worker-runtime-context"
+    assert trace["parent_task_id"] == "parent-runtime-context"
+    assert trace["worker_role"] == "mf_sub"
+    assert trace["graph_query_identity"]["fence_token_redacted"] is True
+    assert "session-runtime-context" not in json.dumps(trace, sort_keys=True)
+
+    with pytest.raises(GovernanceError) as mismatched_task:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={**body, "task_id": "other-runtime-task"},
+            )
+        )
+    assert mismatched_task.value.code == "fence_invalidated_or_unknown"
+    assert mismatched_task.value.details["reason"] == "runtime_context_task_mismatch"
+
+    with pytest.raises(GovernanceError) as mismatched_route:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={**body, "route_context_hash": "sha256:wrong-route"},
+            )
+        )
+    assert mismatched_route.value.code == "fence_invalidated_or_unknown"
+    assert mismatched_route.value.details["reason"] == "route_identity_mismatch"
+    assert mismatched_route.value.details["route_identity_mismatches"] == [
+        {
+            "field": "route_context_hash",
+            "expected": "sha256:route-runtime-context",
+            "actual": "sha256:wrong-route",
+        }
+    ]
 
 
 def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):

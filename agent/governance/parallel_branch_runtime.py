@@ -6058,34 +6058,75 @@ def _require_current_fence(context: BranchTaskRuntimeContext, fence_token: str) 
         raise BranchRuntimeFenceError("Fence token mismatch: branch context was reclaimed")
 
 
+MF_SUBAGENT_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _graph_query_fence_error(
+    reason: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> BranchRuntimeFenceError:
+    exc = BranchRuntimeFenceError(reason)
+    exc.details = dict(details or {})  # type: ignore[attr-defined]
+    return exc
+
+
 def validate_mf_subagent_graph_query_identity(
     conn: sqlite3.Connection,
     *,
     project_id: str,
     task_id: str,
     fence_token: str,
+    runtime_context_id: str = "",
     parent_task_id: str = "",
     worker_role: str = "",
     governance_project_id: str = "",
     target_project_id: str = "",
     target_project_root: str = "",
     session_token: str = "",
+    route_identity: Mapping[str, Any] | None = None,
 ) -> BranchTaskRuntimeContext:
-    """Validate the task/fence identity an mf_sub worker presents for graph reads."""
+    """Validate the runtime/fence identity an mf_sub worker presents for graph reads."""
     ensure_branch_runtime_schema(conn)
     task = str(task_id or "").strip()
+    runtime_id = str(runtime_context_id or "").strip()
     fence = str(fence_token or "").strip()
     role = str(worker_role or "").strip().lower().replace("-", "_")
+    if runtime_id and not role:
+        role = "mf_sub"
     if role != "mf_sub":
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    if not task or not fence:
+    if not fence or (not task and not runtime_id):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     query_project_id = str(project_id or "").strip()
     context_project_id = str(governance_project_id or query_project_id).strip()
-    context = get_branch_context(conn, context_project_id, task)
+    if runtime_id:
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            context_project_id,
+            runtime_id,
+        )
+    else:
+        context = get_branch_context(conn, context_project_id, task)
     if context is None or not context.fence_token:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if runtime_id and task and task != context.task_id:
+        raise _graph_query_fence_error(
+            "runtime_context_task_mismatch",
+            details={
+                "runtime_context_id": runtime_id,
+                "task_id": task,
+                "expected_task_id": context.task_id,
+            },
+        )
     try:
         _require_current_fence(context, fence)
     except BranchRuntimeFenceError as exc:
@@ -6144,6 +6185,54 @@ def validate_mf_subagent_graph_query_identity(
         }
         if allowed_parent_ids and parent not in allowed_parent_ids:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if runtime_id:
+        latest_revision = get_latest_branch_contract_revision(
+            conn,
+            context.project_id,
+            runtime_context_id_for_branch_context(context),
+        )
+        expected_route_identity = (
+            latest_revision.route_identity
+            if latest_revision is not None
+            and isinstance(latest_revision.route_identity, Mapping)
+            else {}
+        )
+        supplied_route_identity = {
+            field: str((route_identity or {}).get(field) or "").strip()
+            for field in MF_SUBAGENT_ROUTE_IDENTITY_FIELDS
+        }
+        missing_route_identity = [
+            field
+            for field in MF_SUBAGENT_ROUTE_IDENTITY_FIELDS
+            if str(expected_route_identity.get(field) or "").strip()
+            and not supplied_route_identity.get(field)
+        ]
+        if missing_route_identity:
+            raise _graph_query_fence_error(
+                "route_identity_missing",
+                details={
+                    "runtime_context_id": runtime_id,
+                    "missing_route_identity_fields": missing_route_identity,
+                    "latest_contract_revision_id": latest_revision.revision_id
+                    if latest_revision is not None
+                    else "",
+                },
+            )
+        route_mismatches = _startup_route_identity_mismatches(
+            expected=expected_route_identity,
+            actual=supplied_route_identity,
+        )
+        if route_mismatches:
+            raise _graph_query_fence_error(
+                "route_identity_mismatch",
+                details={
+                    "runtime_context_id": runtime_id,
+                    "route_identity_mismatches": route_mismatches,
+                    "latest_contract_revision_id": latest_revision.revision_id
+                    if latest_revision is not None
+                    else "",
+                },
+            )
     return context
 
 

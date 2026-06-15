@@ -1151,6 +1151,98 @@ def _independent_qa_reviewer_identity(event: dict[str, Any]) -> str:
     return actor
 
 
+_INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS = {"observer", "mf_observer", "route_observer"}
+
+
+def _independent_qa_ref_aliases(value: Any) -> set[str]:
+    refs: set[str] = set()
+    raw = _text(value).strip()
+    if not raw:
+        return refs
+    refs.add(raw)
+    bare = raw
+    for prefix in ("timeline:", "event:"):
+        if bare.lower().startswith(prefix):
+            bare = bare[len(prefix):].strip()
+            break
+    if bare.startswith("#"):
+        bare = bare[1:].strip()
+    if bare:
+        refs.add(bare)
+        refs.add(f"timeline:{bare}")
+        refs.add(f"event:{bare}")
+        refs.add(f"#{bare}")
+    return refs
+
+
+def _independent_qa_event_ref_tokens(event: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for key in ("id", "event_id"):
+        refs.update(_independent_qa_ref_aliases(event.get(key)))
+    return refs
+
+
+def _independent_qa_verdict_refs(event: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for container_key in ("payload", "verification", "artifact_refs"):
+        container = _mapping(event.get(container_key))
+        for key in ("qa_verdict_refs", "verdict_refs"):
+            refs.extend(_string_list(container.get(key)))
+    return list(dict.fromkeys(refs))
+
+
+def _independent_qa_event_kind_matches(event: dict[str, Any]) -> bool:
+    for key in ("event_kind", "event_type", "phase"):
+        token = _normalize_token(event.get(key))
+        if any(
+            marker in token
+            for marker in ("qa_review", "qa_verification", "independent_verification")
+        ):
+            return True
+    return False
+
+
+def _independent_qa_same_timeline_scope(
+    source: dict[str, Any],
+    target: dict[str, Any],
+) -> bool:
+    for field in ("project_id", "backlog_id"):
+        source_value = _text(source.get(field)).strip()
+        target_value = _text(target.get(field)).strip()
+        if source_value and target_value and source_value != target_value:
+            return False
+    return True
+
+
+def _independent_qa_resolved_verdict_refs(
+    event: dict[str, Any],
+    events_by_ref: dict[str, dict[str, Any]],
+    worker_slot_ids: set[str],
+) -> list[str]:
+    resolved: list[str] = []
+    for ref in _independent_qa_verdict_refs(event):
+        target = events_by_ref.get(ref)
+        if not target:
+            continue
+        status = _text(target.get("status") or target.get("decision")).lower()
+        if status not in MF_CLOSE_PASS_STATUSES:
+            continue
+        if not _independent_qa_event_kind_matches(target):
+            continue
+        if not _independent_qa_same_timeline_scope(event, target):
+            continue
+        target_reviewer_identity = _independent_qa_reviewer_identity(target)
+        target_reviewer = target_reviewer_identity.lower()
+        if (
+            not target_reviewer_identity
+            or target_reviewer in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+            or target_reviewer_identity in worker_slot_ids
+        ):
+            continue
+        resolved.append(ref)
+    return resolved
+
+
 def _independent_qa_gate(
     rows: list[dict[str, Any]],
     policy: Mapping[str, Any],
@@ -1217,10 +1309,13 @@ def _independent_qa_gate(
 
     # Plain-observer identity tokens that, without an independent reviewer, do
     # not constitute independent verification.
-    _PLAIN_OBSERVER_TOKENS = {"observer", "mf_observer", "route_observer"}
-
     evidence_events: list[dict[str, Any]] = []
     rejected_events: list[dict[str, Any]] = []
+    events_by_ref: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        event = _mapping(raw)
+        for ref in _independent_qa_event_ref_tokens(event):
+            events_by_ref.setdefault(ref, event)
 
     for raw_event in rows:
         event = _mapping(raw_event)
@@ -1261,34 +1356,42 @@ def _independent_qa_gate(
         # REJECT: plain observer token without an independent reviewer identity.
         # This catches raw "observer" verification events that are NOT on-behalf
         # transports (no on-behalf suffix, no payload.reviewer, no verdict refs).
-        if reviewer_lower in _PLAIN_OBSERVER_TOKENS:
-            # Check for qa_verdict_refs pointing at real qa_review events — that
-            # elevates a plain-observer transport to a legitimate verdict relay.
-            has_verdict_refs = False
-            for container_key in ("payload", "verification", "artifact_refs"):
-                container = _mapping(event.get(container_key))
-                refs = container.get("qa_verdict_refs") or container.get("verdict_refs")
-                if refs:
-                    has_verdict_refs = True
-                    break
-            if not has_verdict_refs:
+        resolved_verdict_refs: list[str] = []
+        if reviewer_lower in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS:
+            # Only same-timeline refs to real passing QA/IV events elevate a
+            # plain-observer transport to a legitimate verdict relay.
+            unresolved_verdict_refs = _independent_qa_verdict_refs(event)
+            resolved_verdict_refs = _independent_qa_resolved_verdict_refs(
+                event,
+                events_by_ref,
+                worker_slot_ids,
+            )
+            if not resolved_verdict_refs:
                 rejected_events.append({
                     "id": event.get("id"),
                     "event_kind": event.get("event_kind"),
                     "actor": event.get("actor"),
                     "status": event.get("status"),
-                    "reason": "plain_observer_no_independent_reviewer",
+                    "reason": (
+                        "plain_observer_no_resolving_qa_verdict_ref"
+                        if unresolved_verdict_refs
+                        else "plain_observer_no_independent_reviewer"
+                    ),
+                    "verdict_refs": unresolved_verdict_refs,
                 })
                 continue
 
-        evidence_events.append({
+        evidence = {
             "id": event.get("id"),
             "event_kind": event.get("event_kind"),
             "phase": event.get("phase"),
             "actor": event.get("actor"),
             "reviewer_identity": reviewer_identity,
             "status": event.get("status"),
-        })
+        }
+        if resolved_verdict_refs:
+            evidence["resolved_qa_verdict_refs"] = resolved_verdict_refs
+        evidence_events.append(evidence)
 
     passed = bool(evidence_events) or not required
     missing_ids = [] if passed else ["independent_qa"]

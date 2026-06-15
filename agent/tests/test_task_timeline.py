@@ -4480,8 +4480,34 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(len(result["evidence_events"]), 1)
         self.assertEqual(result["evidence_events"][0]["reviewer_identity"], "qa-lane-reviewer")
 
-    def test_observer_with_verdict_refs_counts_as_independent(self):
-        """Observer transport with qa_verdict_refs (even without on-behalf prefix) counts."""
+    def test_direct_independent_qa_mixed_row_list_still_counts(self):
+        """Direct independent QA is not rejected just because rows are mixed."""
+        from agent.governance import task_timeline
+
+        events = [
+            {
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "worker-other",
+                "status": "accepted",
+                "backlog_id": "OTHER-BUG",
+            },
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "passed",
+                "backlog_id": "BUG-IV-TEST",
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(len(result["evidence_events"]), 1)
+        self.assertEqual(result["evidence_events"][0]["reviewer_identity"], "qa-lane-reviewer")
+
+    def test_observer_with_fabricated_verdict_refs_is_rejected(self):
+        """Observer transport with non-resolving verdict refs remains missing QA."""
         from agent.governance import task_timeline
 
         events = [
@@ -4495,8 +4521,252 @@ class TestTaskTimeline(unittest.TestCase):
         ]
         policy = {"requirements": {"independent_qa": True}}
         result = task_timeline._independent_qa_gate(events, policy)
-        # observer with verdict_refs is treated as a legitimate relay
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["missing_requirement_ids"], ["independent_qa"])
+        self.assertEqual(
+            result["rejected_evidence_events"][0]["reason"],
+            "plain_observer_no_resolving_qa_verdict_ref",
+        )
+
+    def test_observer_with_valid_same_timeline_verdict_refs_counts_as_independent(self):
+        """Observer verdict refs count only when they resolve to same-timeline QA."""
+        from agent.governance import task_timeline
+
+        events = [
+            {
+                "id": 4897,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "id": 4898,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "id": 4899,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "event_id": "evt-string-id",
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "id": 4900,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "observer-on-behalf-of:qa-reviewer-on-behalf",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "id": 4901,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "observer",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+                "payload": {"reviewer": "qa-reviewer-payload"},
+            },
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "observer",
+                "status": "passed",
+                "backlog_id": "BUG-IV-TEST",
+                "payload": {
+                    "qa_verdict_refs": [
+                        "timeline:4897",
+                        "#4898",
+                        "event:4899",
+                        "evt-string-id",
+                        "timeline:4900",
+                        "#4901",
+                    ]
+                },
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
         self.assertTrue(result["passed"], result)
+        self.assertIn(
+            [
+                "timeline:4897",
+                "#4898",
+                "event:4899",
+                "evt-string-id",
+                "timeline:4900",
+                "#4901",
+            ],
+            [
+                event.get("resolved_qa_verdict_refs")
+                for event in result["evidence_events"]
+                if event.get("actor") == "observer"
+            ],
+        )
+
+    def test_observer_verdict_refs_cannot_launder_plain_observer_qa_review(self):
+        """Observer-authored QA target is not independently authored evidence."""
+        from agent.governance import task_timeline
+
+        events = [
+            {
+                "id": 4910,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "observer",
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "observer",
+                "status": "passed",
+                "backlog_id": "BUG-IV-TEST",
+                "payload": {"qa_verdict_refs": ["timeline:4910"]},
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["missing_requirement_ids"], ["independent_qa"])
+        self.assertEqual(
+            [
+                event.get("resolved_qa_verdict_refs")
+                for event in result["evidence_events"]
+                if event.get("actor") == "observer"
+            ],
+            [],
+        )
+        self.assertIn(
+            "plain_observer_no_resolving_qa_verdict_ref",
+            {
+                event["reason"]
+                for event in result["rejected_evidence_events"]
+            },
+        )
+
+    def test_observer_verdict_refs_cannot_launder_worker_authored_qa_review(self):
+        """Observer refs to worker-authored QA targets do not become independent."""
+        from agent.governance import task_timeline
+
+        worker_id = "codex-worker-impl-01"
+        events = [
+            self._startup_event(worker_id),
+            {
+                "id": 4920,
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": worker_id,
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "observer",
+                "status": "passed",
+                "backlog_id": "BUG-IV-TEST",
+                "payload": {"qa_verdict_refs": ["timeline:4920"]},
+            },
+        ]
+        policy = {"requirements": {"independent_qa": True}}
+        result = task_timeline._independent_qa_gate(events, policy)
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["missing_requirement_ids"], ["independent_qa"])
+        self.assertIn(worker_id, result["known_worker_slot_ids"])
+        self.assertIn(
+            "reviewer_is_known_worker",
+            {
+                event["reason"]
+                for event in result["rejected_evidence_events"]
+            },
+        )
+        self.assertIn(
+            "plain_observer_no_resolving_qa_verdict_ref",
+            {
+                event["reason"]
+                for event in result["rejected_evidence_events"]
+            },
+        )
+
+    def test_observer_with_cross_backlog_or_non_qa_verdict_refs_is_rejected(self):
+        """Refs to foreign rows or non-QA events do not satisfy independent QA."""
+        from agent.governance import task_timeline
+
+        policy = {"requirements": {"independent_qa": True}}
+
+        cross_backlog = task_timeline._independent_qa_gate(
+            [
+                {
+                    "id": "evt-cross",
+                    "event_kind": "qa_review",
+                    "phase": "verification",
+                    "actor": "observer",
+                    "status": "accepted",
+                    "backlog_id": "OTHER-BUG",
+                },
+                {
+                    "event_kind": "qa_verification",
+                    "phase": "verification",
+                    "actor": "observer",
+                    "status": "passed",
+                    "backlog_id": "BUG-IV-TEST",
+                    "payload": {"qa_verdict_refs": ["evt-cross"]},
+                },
+            ],
+            policy,
+        )
+        self.assertFalse(cross_backlog["passed"], cross_backlog)
+        self.assertIn(
+            "plain_observer_no_resolving_qa_verdict_ref",
+            {
+                event["reason"]
+                for event in cross_backlog["rejected_evidence_events"]
+            },
+        )
+
+        non_qa = task_timeline._independent_qa_gate(
+            [
+                {
+                    "id": "evt-impl",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "actor": "worker",
+                    "status": "accepted",
+                    "backlog_id": "BUG-IV-TEST",
+                },
+                {
+                    "event_kind": "qa_verification",
+                    "phase": "verification",
+                    "actor": "observer",
+                    "status": "passed",
+                    "backlog_id": "BUG-IV-TEST",
+                    "payload": {"verdict_refs": ["evt-impl"]},
+                },
+            ],
+            policy,
+        )
+        self.assertFalse(non_qa["passed"], non_qa)
+        self.assertEqual(
+            non_qa["rejected_evidence_events"][0]["reason"],
+            "plain_observer_no_resolving_qa_verdict_ref",
+        )
 
     def test_close_gate_passes_for_fixed_rows_without_iv_topology(self):
         """Rows without IV topology and without strict governance policy are unaffected.

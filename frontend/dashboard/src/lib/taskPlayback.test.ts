@@ -3198,6 +3198,22 @@ function eventChecklistAssertions(): string[] {
       },
       created_at: "2026-06-11T12:11:00Z",
     },
+    {
+      id: 4113,
+      event_type: "mf_subagent.review_ready",
+      event_kind: "review_ready",
+      phase: "review_ready",
+      actor: "mf_sub",
+      status: "passed",
+      backlog_id: backlog.bug_id,
+      payload: {
+        final_state: "review_ready",
+        tests_run: ["npx tsx frontend/dashboard/src/lib/taskPlayback.test.ts"],
+        graph_query_trace_ids: ["gqt-fixture-review-ready"],
+        generated_assets_policy: "none",
+      },
+      created_at: "2026-06-11T12:12:00Z",
+    },
   ];
   const trace = normalizeTaskPlaybackTrace({
     projectId: "aming-claw",
@@ -3219,6 +3235,7 @@ function eventChecklistAssertions(): string[] {
   const workModeFrame = trace.frames.find((frame) => frame.source_event_id === "#4110");
   const laneOpeningPrecheckFrame = trace.frames.find((frame) => frame.source_event_id === "#4111");
   const realBlockerFrame = trace.frames.find((frame) => frame.source_event_id === "#4112");
+  const reviewReadyFrame = trace.frames.find((frame) => frame.source_event_id === "#4113");
   assertFixture(Boolean(blocked), "blocked checklist fixture frame should exist");
   assertFixture(Boolean(passed), "passed checklist fixture frame should exist");
   assertFixture(Boolean(privateFrame), "privacy checklist fixture frame should exist");
@@ -3231,6 +3248,7 @@ function eventChecklistAssertions(): string[] {
   assertFixture(Boolean(workModeFrame), "observer work-mode transition fixture frame should exist");
   assertFixture(Boolean(laneOpeningPrecheckFrame), "lane-opening precheck fixture frame should exist");
   assertFixture(Boolean(realBlockerFrame), "real blocker fixture frame should exist");
+  assertFixture(Boolean(reviewReadyFrame), "review-ready fixture frame should exist");
 
   const blockedRows = blocked!.event_checklist.categories.flatMap((category) => category.items);
   assertFixture(blocked!.event_checklist.blocked_count >= 2, `blocked event checklist should surface unmet rows, got ${blocked!.event_checklist.blocked_count}`);
@@ -3306,6 +3324,13 @@ function eventChecklistAssertions(): string[] {
   assertFixture(implementationRows.some((item) => item.label === "Commit SHA"), "implementation evidence should render commit_sha presence");
   assertFixture(implementationRows.some((item) => item.label === "Worker precommit trace"), "implementation evidence should render worker precommit trace presence");
 
+  const reviewReadyRows = rowsFor(reviewReadyFrame!);
+  assertFixture(reviewReadyRows.length > 0, "review-ready worker evidence should render a non-empty checklist");
+  assertFixture(reviewReadyRows.some((item) => item.label === "Worker final state" && item.value === "review_ready"), "review-ready checklist should include worker final state");
+  assertFixture(reviewReadyRows.some((item) => item.label === "Test run" && item.value.includes("taskPlayback.test.ts")), "review-ready checklist should include tests_run");
+  assertFixture(reviewReadyRows.some((item) => item.label === "Worker graph trace" && item.value === "gqt-fixture-review-ready"), "review-ready checklist should include graph query trace evidence");
+  assertFixture(reviewReadyRows.some((item) => item.label === "Generated assets policy" && item.value === "none"), "review-ready checklist should include generated asset policy");
+
   const workModeRows = rowsFor(workModeFrame!);
   const countsRows = workModeRows.filter((item) => item.label === "Counts As Close Evidence");
   assertFixture(countsRows.length === 1, `counts_as_close_evidence should render once, got ${countsRows.length}`);
@@ -3331,7 +3356,7 @@ function eventChecklistAssertions(): string[] {
     `green frames may only contain red rows for real recorded blockers, got ${greenFramesWithRedRows.map((frame) => frame.source_event_id).join(", ")}`,
   );
 
-  const workerChecklistText = [routeGateFrame!, startupFrameA!, readReceiptFrame!, implementationFrame!, workModeFrame!, laneOpeningPrecheckFrame!]
+  const workerChecklistText = [routeGateFrame!, startupFrameA!, readReceiptFrame!, implementationFrame!, reviewReadyFrame!, workModeFrame!, laneOpeningPrecheckFrame!]
     .flatMap((frame) => rowsFor(frame))
     .map((item) => `${item.label} ${item.value}`)
     .join(" ");
@@ -3346,6 +3371,7 @@ function eventChecklistAssertions(): string[] {
     `event checklist startup gate rows: ${startupRowsA.length}`,
     `event checklist read-receipt rows: ${readRows.length}/${readAltRows.length}`,
     `event checklist implementation changed-file rows: ${changedFileRows.length}`,
+    `event checklist review-ready rows: ${reviewReadyRows.length}`,
     `event checklist pending precheck rows: ${pendingRows.length}`,
   ];
 }

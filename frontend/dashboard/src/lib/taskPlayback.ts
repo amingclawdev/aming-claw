@@ -1403,6 +1403,21 @@ function pushImplementationEvidenceChecklistItems(
   typedPaths: Set<string>,
   event: TaskTimelineEvent,
 ): void {
+  const workerHandoffEvent = isWorkerImplementationOrHandoffEvent(event);
+  if (workerHandoffEvent) {
+    pushFirstChecklistValue(items, typedPaths, event, "worker_final_state", "Worker final state", [
+      "payload.final_state",
+      "payload.handoff_state",
+      "payload.stop_state",
+      "payload.review_state",
+      "payload.status",
+      "verification.final_state",
+      "verification.handoff_state",
+      "verification.stop_state",
+      "verification.review_state",
+      "verification.status",
+    ], "recorded", false);
+  }
   pushChecklistValues(items, typedPaths, event, "changed_file", "Changed file", [
     "payload.changed_files",
     "payload.modified_files",
@@ -1426,6 +1441,43 @@ function pushImplementationEvidenceChecklistItems(
     "verification.worker_reported_precommit_trace",
     "artifact_refs.worker_reported_precommit_trace",
   ], "present", false);
+  if (workerHandoffEvent) {
+    pushChecklistValues(items, typedPaths, event, "test_run", "Test run", [
+      "payload.tests_run",
+      "payload.test_commands",
+      "payload.verification.tests_run",
+      "verification.tests_run",
+      "verification.test_commands",
+      "artifact_refs.tests_run",
+      "artifact_refs.test_commands",
+    ], "present", false);
+    pushChecklistValues(items, typedPaths, event, "worker_graph_trace", "Worker graph trace", [
+      "payload.graph_query_trace_ids",
+      "payload.graph_trace_ids",
+      "payload.query_trace_ids",
+      "payload.worker_graph_trace_ids",
+      "verification.graph_query_trace_ids",
+      "verification.graph_trace_ids",
+      "artifact_refs.graph_query_trace_ids",
+    ], "present", false);
+    pushFirstChecklistValue(items, typedPaths, event, "generated_assets_policy", "Generated assets policy", [
+      "payload.generated_assets_policy",
+      "payload.generated_assets",
+      "verification.generated_assets_policy",
+      "artifact_refs.generated_assets_policy",
+    ], "recorded", false);
+  }
+}
+
+function isWorkerImplementationOrHandoffEvent(event: TaskTimelineEvent): boolean {
+  const text = [
+    event.event_type,
+    event.event_kind,
+    event.phase,
+    event.actor,
+  ].map((item) => safeText(String(item || "")).toLowerCase()).join(" ");
+  return /(^|[\s._-])(implementation|review_ready|review-ready|waiting_merge|waiting-merge|finish_gate|finish-gate|handoff|checkpoint)([\s._-]|$)/.test(text)
+    || (/mf_subagent|worker|parallel_branch/.test(text) && /review|ready|finish|handoff|implementation|checkpoint/.test(text));
 }
 
 function pushRoutePromptHashChecklistItems(

@@ -4745,6 +4745,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         )
     task_id = str(body.get("task_id") or "").strip()
     parent_task_id = str(body.get("parent_task_id") or "").strip()
+    runtime_context_id = str(body.get("runtime_context_id") or "").strip()
     worker_role = str(body.get("worker_role") or "").strip().lower().replace("-", "_")
     fence_token = str(body.get("fence_token") or "").strip()
     session_token = str(body.get("session_token") or "").strip()
@@ -4766,14 +4767,26 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         or body.get("repo_root")
         or ""
     ).strip()
-    if not task_id:
-        raise ValidationError("task_id is required for mf_subagent graph query")
-    if not parent_task_id:
-        raise ValidationError("parent_task_id is required for mf_subagent graph query")
+    if runtime_context_id and not worker_role:
+        worker_role = "mf_sub"
+    if not runtime_context_id:
+        if not task_id:
+            raise ValidationError("task_id is required for mf_subagent graph query")
+        if not parent_task_id:
+            raise ValidationError("parent_task_id is required for mf_subagent graph query")
     if worker_role != "mf_sub":
         raise ValidationError("worker_role=mf_sub is required for mf_subagent graph query")
     if not fence_token:
         raise ValidationError("fence_token is required for mf_subagent graph query")
+    nested_route_identity = (
+        body.get("route_identity")
+        if isinstance(body.get("route_identity"), Mapping)
+        else {}
+    )
+    route_identity = {
+        field: str(body.get(field) or nested_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
     from .parallel_branch_runtime import (
         BranchRuntimeFenceError,
         validate_mf_subagent_graph_query_identity,
@@ -4783,6 +4796,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             conn,
             project_id=ctx.get_project_id(),
             task_id=task_id,
+            runtime_context_id=runtime_context_id,
             parent_task_id=parent_task_id,
             worker_role=worker_role,
             fence_token=fence_token,
@@ -4790,23 +4804,37 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             target_project_id=target_project_id,
             target_project_root=target_project_root,
             session_token=session_token,
+            route_identity=route_identity,
         )
     except BranchRuntimeFenceError as exc:
+        reason = str(exc) or "fence_invalidated_or_unknown"
+        details = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "governance_project_id": governance_project_id,
+            "target_project_id": target_project_id,
+            "reason": reason,
+        }
+        exc_details = getattr(exc, "details", None)
+        if isinstance(exc_details, Mapping):
+            details.update(exc_details)
         raise GovernanceError(
             "fence_invalidated_or_unknown",
             "mf_subagent graph query fence is invalidated or unknown",
             403,
-            {
-                "task_id": task_id,
-                "parent_task_id": parent_task_id,
-                "governance_project_id": governance_project_id,
-                "target_project_id": target_project_id,
-                "reason": "fence_invalidated_or_unknown",
-            },
+            details,
         ) from exc
     fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
     body["task_id"] = context.task_id
-    body["parent_task_id"] = parent_task_id or context.root_task_id or context.task_id
+    body["parent_task_id"] = (
+        parent_task_id
+        or context.root_task_id
+        or context.chain_id
+        or context.stage_task_id
+        or context.backlog_id
+        or context.task_id
+    )
     from .parallel_branch_runtime import runtime_context_id_for_branch_context
 
     body["runtime_context_id"] = runtime_context_id_for_branch_context(context)
@@ -6329,13 +6357,35 @@ def _runtime_context_worker_guide_response(
             "method": "POST",
             "path": "/api/graph-governance/{project_id}/query",
             "facade_status": "available",
-            "required_body_fields": ["tool", "query_source", "query_purpose"],
+            "required_body_fields": [
+                "tool",
+                "query_source",
+                "query_purpose",
+                "runtime_context_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+            ],
             "required_identity_fields": [
                 "runtime_context_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+            ],
+            "server_resolved_identity_fields": [
                 "task_id",
                 "parent_task_id",
                 "worker_role",
-                "fence_token",
+                "governance_project_id",
+                "target_project_id",
+            ],
+            "route_identity_fields": [
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
             ],
             "query_source": graph_identity.get("query_source") or "mf_subagent",
             "query_purpose": (
