@@ -443,6 +443,151 @@ def test_dashboard_dist_dir_explicit_override_wins_over_packaged_and_repo_dist(
     assert server._dashboard_dist_dir() == override_dist.resolve()
 
 
+def _patch_demo_environment_paths(monkeypatch, tmp_path):
+    demo_root = (tmp_path / "demo-root").resolve()
+    registry_dir = tmp_path / "demo-registry"
+    demo_root.mkdir(parents=True, exist_ok=True)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(server, "_demo_environment_root", lambda: demo_root)
+    monkeypatch.setattr(server, "_demo_environment_registry_dir", lambda _project_id: registry_dir)
+    return demo_root, registry_dir
+
+
+def test_demo_environments_list_empty_returns_template(tmp_path, monkeypatch):
+    _patch_demo_environment_paths(monkeypatch, tmp_path)
+
+    payload = server.handle_project_demo_environments_list(
+        _ctx({"project_id": "aming-claw"})
+    )
+
+    assert payload["ok"] is True
+    assert payload["project_id"] == "aming-claw"
+    assert payload["environments"] == []
+    assert payload["templates"][0]["id"] == "daily-planner-lite"
+
+
+def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path, monkeypatch):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    observed = {}
+
+    def fake_run_daily_planner_lite_fixture(
+        *,
+        environment_id,
+        fixture_root,
+        target_project_id,
+        preview_port,
+    ):
+        observed.update(
+            {
+                "environment_id": environment_id,
+                "fixture_root": fixture_root,
+                "target_project_id": target_project_id,
+                "preview_port": preview_port,
+            }
+        )
+        fixture_root.mkdir(parents=True, exist_ok=True)
+        return {
+            "ok": True,
+            "project_id": target_project_id,
+            "fixture_root": str(fixture_root),
+            "baseline_commit": "abc123",
+            "dashboard_url": f"http://127.0.0.1:40000/dashboard?project_id={target_project_id}&view=backlog",
+            "dashboard_links": {
+                "backlog": f"http://127.0.0.1:40000/dashboard?project_id={target_project_id}&view=backlog",
+                "timeline": f"http://127.0.0.1:40000/dashboard?project_id={target_project_id}&view=timeline",
+                "graph": f"http://127.0.0.1:40000/dashboard?project_id={target_project_id}&view=graph",
+            },
+            "planner_preview_url": "http://127.0.0.1:4173/",
+            "planner_preview_command": f"python3 -m http.server 4173 --directory {fixture_root}",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_run_daily_planner_lite_fixture",
+        fake_run_daily_planner_lite_fixture,
+    )
+
+    status, payload = server.handle_project_demo_environment_create(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={"template_id": "daily-planner-lite"},
+        )
+    )
+
+    assert status == 201
+    environment = payload["environment"]
+    assert payload["ok"] is True
+    assert environment["template_id"] == "daily-planner-lite"
+    assert environment["label"] == "Daily Planner Lite"
+    assert environment["project_id"] == observed["target_project_id"]
+    assert Path(environment["fixture_root"]).is_relative_to(demo_root)
+    assert environment["baseline_commit"] == "abc123"
+    assert environment["planner_preview_url"] == "http://127.0.0.1:4173/"
+    assert observed["preview_port"] == 4173
+    prompt = environment["launch_prompt"]
+    assert prompt.count("Create exactly one backlog row") == 1
+    assert "project_id: " in prompt
+    assert "runtime_status" in prompt
+    assert "graph_status" in prompt
+    assert "graph_operations_queue" in prompt
+    assert "visual smoke" in prompt
+    marker = Path(environment["fixture_root"]) / server.DEMO_ENVIRONMENT_MARKER
+    assert marker.exists()
+    registry_rows = server._read_demo_environment_registry("aming-claw")
+    assert [row["id"] for row in registry_rows] == [environment["id"]]
+
+
+def test_demo_environment_delete_refuses_unmanaged_and_arbitrary_paths(tmp_path, monkeypatch):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+
+    outside = tmp_path / "outside-demo-root"
+    server._write_demo_environment_registry(
+        "aming-claw",
+        [
+            {
+                "id": "unsafe-env",
+                "template_id": "daily-planner-lite",
+                "project_id": "unsafe-project",
+                "fixture_root": str(outside),
+            }
+        ],
+    )
+    status, payload = server.handle_project_demo_environment_delete(
+        _ctx(
+            {"project_id": "aming-claw", "environment_id": "unsafe-env"},
+            method="DELETE",
+        )
+    )
+    assert status == 409
+    assert payload["error"] == "unmanaged_demo_environment_refused"
+    assert "under managed demo root" in payload["message"]
+
+    unmarked = demo_root / "unmarked-env"
+    unmarked.mkdir(parents=True)
+    server._write_demo_environment_registry(
+        "aming-claw",
+        [
+            {
+                "id": "unmarked-env",
+                "template_id": "daily-planner-lite",
+                "project_id": "unmarked-project",
+                "fixture_root": str(unmarked),
+            }
+        ],
+    )
+    status, payload = server.handle_project_demo_environment_delete(
+        _ctx(
+            {"project_id": "aming-claw", "environment_id": "unmarked-env"},
+            method="DELETE",
+        )
+    )
+    assert status == 409
+    assert payload["error"] == "unmanaged_demo_environment_refused"
+    assert "managed marker" in payload["message"]
+    assert unmarked.exists()
+
+
 def test_project_bootstrap_first_run_mints_server_binding_and_records_gate(conn, monkeypatch):
     observed = {}
 
