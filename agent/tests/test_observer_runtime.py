@@ -174,6 +174,8 @@ def _patch_dogfood_no_progress(monkeypatch):
 
 
 def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tmp_path):
+    from agent.governance.server import _observer_runtime_text_contract_revision_payload
+
     main = tmp_path / "main"
     main.mkdir()
     worktree = tmp_path / ".worktrees" / "worker-a1" / "task-a1"
@@ -230,6 +232,19 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert prepared["status"] == "prepared"
     assert prepared["runtime_context_id"] == "mfrctx-runtime-text-a1"
     assert prepared["observer_command_id"] == "cmd-a1"
+    assert prepared["route_identity"] == {
+        "route_id": "route-a1",
+        "route_context_hash": "sha256:route-a1",
+        "prompt_contract_id": "rprompt-a1",
+        "prompt_contract_hash": "sha256:prompt-a1",
+        "route_token_ref": "rtok-runtime-text-a1",
+        "visible_injection_manifest_hash": "sha256:visible-a1",
+    }
+    revision_payload = _observer_runtime_text_contract_revision_payload(
+        {"owned_files": ["agent/observer_runtime.py"]},
+        prepared,
+    )
+    assert revision_payload["route_identity"] == prepared["route_identity"]
     assert prepared["runtime_context"]["worktree_path"] == str(worktree)
     assert prepared["runtime_context"]["fence_token"] == "fence-runtime-text-a1"
     assert prepared["runtime_context"]["base_commit"] == "base-a1"

@@ -843,6 +843,51 @@ def test_runtime_context_action_plan_reports_route_token_ref_present_from_revisi
     assert action_plan["next_legal_action"] != "refresh_route_token_ref"
 
 
+def test_runtime_context_action_plan_reads_nested_revision_route_token_ref() -> None:
+    from agent.governance.server import _parallel_branch_runtime_contract_route_identity
+
+    context = _runtime_projection_context()
+    revision = {
+        "revision_id": "crev-runtime-context",
+        "contract_version": "mf_parallel.v1",
+        "route_identity": {
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+        },
+        "payload": {
+            "target_files": ["agent/governance/parallel_branch_runtime.py"],
+            "route_identity": {
+                "route_id": "route-runtime-context",
+                "route_context_hash": "sha256:route-runtime-context",
+                "prompt_contract_id": "rprompt-runtime-context",
+                "prompt_contract_hash": "sha256:prompt-runtime-context",
+                "route_token_ref": "rtok-runtime-context",
+            },
+        },
+    }
+    route_identity = _parallel_branch_runtime_contract_route_identity(revision)
+
+    projection = build_runtime_context_projection(
+        context,
+        contract_revision=revision,
+        route_identity=route_identity,
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    route_action = action_plan["route_token_action"]
+    read_action = action_plan["read_receipt_hash_action"]
+
+    assert route_identity["route_token_ref"] == "rtok-runtime-context"
+    assert route_action["status"] == "present"
+    assert route_action["next_action"] == "none"
+    assert action_plan["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert read_action["next_action"] == "submit_mf_subagent_read_receipt"
+    assert action_plan["next_legal_action"] != "refresh_route_token_ref"
+
+
 def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> None:
     context = _runtime_projection_context()
     projection = build_runtime_context_projection(

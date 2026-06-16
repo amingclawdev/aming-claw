@@ -5557,21 +5557,57 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         conn.close()
 
 
-def _parallel_branch_runtime_contract_route_identity(source: Mapping[str, Any]) -> dict:
-    return {
-        key: source.get(key)
-        for key in (
-            "route_id",
-            "route_context_hash",
-            "prompt_contract_id",
-            "prompt_contract_hash",
-            "route_token_ref",
-            "visible_injection_manifest_hash",
-            "selected_project",
-            "selected_backlog_id",
-        )
-        if source.get(key)
-    }
+_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+    "selected_project",
+    "selected_backlog_id",
+)
+
+_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS = (
+    "route_identity",
+    "route_gate",
+    "route_token_gate",
+    "canonical_route_identity",
+    "expected_binding",
+    "contract_revision",
+    "runtime_contract_revision",
+    "revision",
+    "payload",
+)
+
+
+def _parallel_branch_runtime_contract_route_identity(
+    *sources: Mapping[str, Any],
+) -> dict:
+    identity: dict[str, Any] = {}
+    seen: set[int] = set()
+
+    def collect(source: Mapping[str, Any] | None) -> None:
+        if not isinstance(source, Mapping):
+            return
+        marker = id(source)
+        if marker in seen:
+            return
+        seen.add(marker)
+
+        for key in _PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS:
+            value = source.get(key)
+            if value and not identity.get(key):
+                identity[key] = value
+
+        for key in _PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS:
+            nested = source.get(key)
+            if isinstance(nested, Mapping):
+                collect(nested)
+
+    for source in sources:
+        collect(source)
+    return identity
 
 
 def _parallel_branch_runtime_contract_response(
@@ -5610,10 +5646,9 @@ def _parallel_branch_runtime_contract_response(
         or ctx.query.get("contract_revision_id")
         or ""
     )
-    route_identity = (
-        latest_revision_payload.get("route_identity")
-        if latest_revision_payload
-        else _parallel_branch_runtime_contract_route_identity(ctx.query)
+    route_identity = _parallel_branch_runtime_contract_route_identity(
+        latest_revision_payload,
+        ctx.query,
     )
     raw_view = build_mf_subagent_runtime_contract_view(
         context,
@@ -6122,10 +6157,9 @@ def _runtime_context_projection_response(
     latest_revision_payload = (
         branch_contract_revision_to_dict(latest_revision) if latest_revision else {}
     )
-    route_identity = (
-        latest_revision_payload.get("route_identity")
-        if latest_revision_payload
-        else _parallel_branch_runtime_contract_route_identity(ctx.query)
+    route_identity = _parallel_branch_runtime_contract_route_identity(
+        latest_revision_payload,
+        ctx.query,
     )
     timeline_events = _runtime_context_service_timeline_events(
         conn,
@@ -8322,7 +8356,11 @@ def handle_graph_governance_parallel_branch_runtime_contract_revision_append(ctx
         )
         if not isinstance(revision_payload, Mapping):
             raise ValidationError("contract revision payload must be an object")
-        route_identity = _parallel_branch_runtime_contract_route_identity(ctx.body)
+        route_identity = _parallel_branch_runtime_contract_route_identity(
+            route_gate,
+            ctx.body,
+            revision_payload,
+        )
         with sqlite_write_lock():
             try:
                 revision = append_branch_contract_revision(
@@ -24505,11 +24543,7 @@ def _observer_runtime_text_contract_revision_payload(
         "owned_files",
         "target_files",
     )
-    route_identity = (
-        prepared.get("route_identity")
-        if isinstance(prepared.get("route_identity"), Mapping)
-        else _parallel_branch_runtime_contract_route_identity(body)
-    )
+    route_identity = _parallel_branch_runtime_contract_route_identity(prepared, body)
     persistent_evidence = (
         prepared.get("persistent_evidence")
         if isinstance(prepared.get("persistent_evidence"), Mapping)
@@ -24684,10 +24718,9 @@ def _persist_observer_runtime_text_contract_revision(
                 404,
                 {"runtime_context_id": runtime_context_id},
             )
-        route_identity = (
-            prepared.get("route_identity")
-            if isinstance(prepared.get("route_identity"), Mapping)
-            else _parallel_branch_runtime_contract_route_identity(body)
+        route_identity = _parallel_branch_runtime_contract_route_identity(
+            prepared,
+            body,
         )
         route_gate = {
             "schema_version": "observer_runtime_text_route_gate.v1",
@@ -24855,6 +24888,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "runtime_context_id": str(prepared.get("runtime_context_id") or ""),
         "observer_command_id": str(prepared.get("observer_command_id") or ""),
         "runtime_context": dict(resolved_context),
+        "route_identity": (
+            dict(prepared.get("route_identity"))
+            if isinstance(prepared.get("route_identity"), Mapping)
+            else {}
+        ),
         "branch_runtime_evidence": branch_runtime_evidence,
         "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
