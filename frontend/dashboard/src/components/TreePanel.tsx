@@ -221,6 +221,14 @@ export default function TreePanel(props: Props) {
           onClick={() => props.onSelectView("inbox")}
         />
         <NavRow
+          icon="◈"
+          label="Demo"
+          meta="launch"
+          active={activeView === "demo"}
+          collapsed={collapsed}
+          onClick={() => props.onSelectView("demo")}
+        />
+        <NavRow
           icon="▦"
           label="Project overview"
           meta={`${nodes.length}`}
