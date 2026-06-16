@@ -527,6 +527,12 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert observed["preview_port"] == 4173
     prompt = environment["launch_prompt"]
     assert prompt.count("Create exactly one backlog row") == 1
+    assert "Intent:" in prompt
+    assert "Today Focus and reminder visual planner board" in prompt
+    assert "Parallel implementation shape:" in prompt
+    assert "Focus/UI lane" in prompt
+    assert "Reminder/domain lane" in prompt
+    assert "Do not stop after planning" in prompt
     assert "project_id: " in prompt
     assert "runtime_status" in prompt
     assert "graph_status" in prompt

@@ -22,7 +22,18 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
   graph_url: "http://127.0.0.1:40000/dashboard?project_id=daily-planner-lite-vibe-visual-happy-20260616-043027&view=graph",
   planner_preview_url: "http://127.0.0.1:4174/",
   planner_preview_command: "npm run preview -- --host 127.0.0.1 --port 4174",
-  launch_prompt: "Run the Aming Claw Daily Planner Lite visual happy-path demo from start to finish.",
+  launch_prompt: [
+    "Run the Aming Claw Daily Planner Lite visual happy-path demo from start to finish.",
+    "",
+    "Intent:",
+    "Implement one concrete user-facing requirement in this fixture, not just the setup flow:",
+    "Today Focus and reminder visual planner board.",
+    "",
+    "Parallel implementation shape:",
+    "Create exactly one backlog row for that requirement, then use bounded mf_sub worker lanes where safe:",
+    "- Focus/UI lane: src/app.js, index.html, styles.css, tests/planner.test.mjs",
+    "- Reminder/domain lane: src/reminders.js, tests/reminders.test.mjs",
+  ].join("\n"),
   status: "ready",
 };
 
@@ -52,6 +63,11 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (status.label !== "Ready") throw new Error("ready environment should render with ready status");
   if (shortBaseline !== "881326a51cb") throw new Error("baseline commit should be shortened for compact panels");
   if (!created.launch_prompt.includes("Daily Planner Lite")) throw new Error("launch prompt must be surfaced");
+  if (!created.launch_prompt.includes("Intent:")) throw new Error("launch prompt must include explicit intent");
+  if (!created.launch_prompt.includes("Today Focus and reminder visual planner board")) throw new Error("launch prompt must name the demo requirement");
+  if (!created.launch_prompt.includes("Parallel implementation shape:")) throw new Error("launch prompt must require parallel implementation shape");
+  if (!created.launch_prompt.includes("Focus/UI lane")) throw new Error("launch prompt must name the Focus/UI lane");
+  if (!created.launch_prompt.includes("Reminder/domain lane")) throw new Error("launch prompt must name the Reminder/domain lane");
 
   return links.map((link) => link.label);
 }
