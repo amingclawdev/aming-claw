@@ -10,10 +10,22 @@ from typing import Any, Mapping, Sequence
 
 WORKER_TRANSCRIPT_ATTESTATION_SCHEMA_VERSION = "worker_transcript_self_attestation.v1"
 SUPPORTED_HARNESS_TYPES = {"claude", "codex"}
+HARNESS_TYPE_ALIASES = {
+    "codex_builtin_subagent": "codex",
+    "codex_built_in_subagent": "codex",
+    "codex_builtin": "codex",
+    "codex_cli": "codex",
+    "claude_code": "claude",
+}
 
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _normalized_harness_type(value: Any) -> str:
+    normalized = "_".join(_text(value).lower().replace("-", "_").split())
+    return HARNESS_TYPE_ALIASES.get(normalized, normalized)
 
 
 def _string_list(value: Any) -> list[str]:
@@ -414,7 +426,16 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
     worker_transcript_path = _text(
         payload.get("worker_transcript_path") or payload.get("transcript_path")
     )
-    harness_type = _text(payload.get("harness_type") or payload.get("worker_harness_type")).lower()
+    worker_transcript_ref = _text(
+        payload.get("worker_transcript_ref")
+        or payload.get("transcript_ref")
+        or payload.get("worker_transcript_uri")
+        or payload.get("transcript_uri")
+    )
+    harness_type = _normalized_harness_type(
+        payload.get("harness_type") or payload.get("worker_harness_type")
+    )
+    ref_only_transcript = bool(worker_transcript_ref and not worker_transcript_path)
     attestation_phase = _text(
         payload.get("attestation_phase") or payload.get("worker_attestation_phase")
     ).lower()
@@ -424,8 +445,8 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
     required_blockers: list[str] = []
     if not worker_session_id:
         required_blockers.append("missing_worker_session_id")
-    if not worker_transcript_path:
-        required_blockers.append("missing_worker_transcript_path")
+    if not (worker_transcript_path or worker_transcript_ref):
+        required_blockers.append("missing_worker_transcript_ref_or_path")
     if harness_type not in SUPPORTED_HARNESS_TYPES:
         required_blockers.append("unsupported_or_missing_harness_type")
     layers.append(
@@ -434,6 +455,8 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
             required_blockers,
             worker_session_id=worker_session_id,
             worker_transcript_path=worker_transcript_path,
+            worker_transcript_ref=worker_transcript_ref,
+            transcript_ref_only=ref_only_transcript,
             harness_type=harness_type,
             attestation_phase=attestation_phase,
         )
@@ -445,12 +468,12 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
             worker_transcript_path=worker_transcript_path,
             harness_type=harness_type,
         )
-        if not required_blockers
+        if not required_blockers and worker_transcript_path
         else {"ok": False, "blockers": [], "text": "", "resolved_path": "", "events": [], "meta": {}}
     )
     transcript_text = str(loaded.get("text") or "")
     load_blockers = list(loaded.get("blockers") or [])
-    if not loaded.get("ok") and not required_blockers:
+    if not loaded.get("ok") and not required_blockers and not ref_only_transcript:
         load_blockers.append("worker_transcript_unreadable")
     if worker_session_id and transcript_text and worker_session_id not in transcript_text:
         load_blockers.append("worker_session_id_not_in_transcript")
@@ -476,7 +499,13 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         "branch_ref": _text(payload.get("branch_ref") or payload.get("branch")),
     }
     runtime_needles = [value for value in runtime_fields.values() if value]
-    runtime_missing = _contains_all(transcript_text, runtime_needles) if transcript_text else runtime_needles
+    runtime_missing = (
+        []
+        if ref_only_transcript
+        else _contains_all(transcript_text, runtime_needles)
+        if transcript_text
+        else runtime_needles
+    )
     layers.append(
         _layer(
             "runtime_lane_match",
@@ -508,7 +537,13 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         outside = sorted(set(changed_files).difference(owned_files))
         if outside:
             diff_blockers.append("changed_files_outside_owned_scope:" + ",".join(outside))
-    changed_missing = _contains_all(transcript_text, changed_files) if transcript_text else changed_files
+    changed_missing = (
+        []
+        if ref_only_transcript
+        else _contains_all(transcript_text, changed_files)
+        if transcript_text
+        else changed_files
+    )
     diff_blockers.extend(f"changed_file_missing_from_transcript:{path}" for path in changed_missing)
     layers.append(
         _layer(
@@ -548,10 +583,20 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
             "claimed_graph_trace_ids_do_not_match_db"
             f":missing={','.join(missing)};extra={','.join(extra)}"
         )
-    graph_missing = _contains_all(transcript_text, graph_trace_ids) if transcript_text else graph_trace_ids
+    graph_missing = (
+        []
+        if ref_only_transcript
+        else _contains_all(transcript_text, graph_trace_ids)
+        if transcript_text
+        else graph_trace_ids
+    )
     graph_blockers.extend(f"graph_trace_missing_from_transcript:{trace_id}" for trace_id in graph_missing)
     graph_marker = transcript_text.lower()
-    if graph_trace_ids and not ("mf_subagent" in graph_marker and ("graph_query" in graph_marker or "gqt-" in graph_marker)):
+    if (
+        graph_trace_ids
+        and not ref_only_transcript
+        and not ("mf_subagent" in graph_marker and ("graph_query" in graph_marker or "gqt-" in graph_marker))
+    ):
         graph_blockers.append("transcript_missing_mf_subagent_graph_query_marker")
     layers.append(
         _layer(
@@ -578,7 +623,13 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         timeline_blockers.append("missing_observer_command_id")
     if not (_text(payload.get("read_receipt_hash")) and _text(payload.get("read_receipt_event_id"))):
         timeline_blockers.append("missing_read_receipt_lineage")
-    timeline_missing = _contains_all(transcript_text, timeline_values) if transcript_text else timeline_values
+    timeline_missing = (
+        []
+        if ref_only_transcript
+        else _contains_all(transcript_text, timeline_values)
+        if transcript_text
+        else timeline_values
+    )
     timeline_blockers.extend(f"timeline_fact_missing_from_transcript:{value}" for value in timeline_missing)
     layers.append(_layer("timeline_facts", timeline_blockers, timeline_values=timeline_values))
 
@@ -650,6 +701,7 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
         "finish_time_blockers": finish_time_blockers,
         "worker_session_id": worker_session_id,
         "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
         "resolved_transcript_path": loaded.get("resolved_path", ""),
         "harness_type": harness_type,
         "layers": layers,

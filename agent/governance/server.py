@@ -7280,6 +7280,8 @@ def _runtime_context_public_finish_attestation(
         "worker_session_id",
         "filer_principal",
         "worker_transcript_path",
+        "worker_transcript_ref",
+        "transcript_ref",
         "resolved_transcript_path",
         "harness_type",
         "blockers",

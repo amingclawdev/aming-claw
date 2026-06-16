@@ -131,6 +131,8 @@ _FINISH_WORKER_ATTESTATION_PUBLIC_FIELDS = (
     "worker_session_id",
     "filer_principal",
     "worker_transcript_path",
+    "worker_transcript_ref",
+    "transcript_ref",
     "resolved_transcript_path",
     "harness_type",
     "blockers",
@@ -148,6 +150,16 @@ _GENERIC_OR_OBSERVER_WORKER_FILERS = {
     "system",
     "worker",
 }
+_WORKER_HARNESS_TYPE_ALIASES = {
+    "codex_builtin_subagent": "codex",
+    "codex_built_in_subagent": "codex",
+    "codex-built-in-subagent": "codex",
+    "codex_builtin": "codex",
+    "codex_cli": "codex",
+    "claude_code": "claude",
+    "claude-code": "claude",
+}
+_SUPPORTED_WORKER_HARNESS_TYPES = {"claude", "codex"}
 _FORBIDDEN_RESULT_FLAGS = {
     "merge_commit": "merge",
     "push_performed": "push",
@@ -3171,7 +3183,6 @@ def _startup_intent_only(evidence: Mapping[str, Any]) -> bool:
     return (
         schema_version == "mf_subagent_startup_intent.v1"
         or "startup_intent" in kind
-        or _explicit_false(evidence.get("close_satisfying"))
     )
 
 
@@ -3781,6 +3792,31 @@ def _trusted_startup_event_rows(events: Any) -> list[Mapping[str, Any]]:
     return []
 
 
+def _startup_finish_payload_lineage_gate(
+    startup_evidence: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    mismatches: list[dict[str, str]] = []
+    checked = False
+    for field, aliases in (
+        ("task_id", ("task_id",)),
+        ("parent_task_id", ("parent_task_id",)),
+        ("runtime_context_id", ("runtime_context_id",)),
+        ("fence_token", ("fence_token",)),
+    ):
+        expected = _dispatch_string(payload, names=aliases, nested_keys=(("evidence", aliases),))
+        actual = _string(startup_evidence.get(field))
+        if expected:
+            checked = True
+        if expected and actual and actual != expected:
+            mismatches.append({"field": field, "expected": expected, "actual": actual})
+    return {
+        "checked": checked,
+        "passed": not mismatches,
+        "mismatches": mismatches,
+    }
+
+
 def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve startup evidence only from server/DB-derived startup events."""
 
@@ -3803,10 +3839,31 @@ def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
             candidates.append(candidate)
     if not candidates:
         return {}
+    lineage_candidates: list[dict[str, Any]] = []
+    mismatched_candidates: list[dict[str, Any]] = []
+    lineage_checked = False
     for candidate in candidates:
+        lineage_gate = _startup_finish_payload_lineage_gate(candidate, payload)
+        if lineage_gate.get("checked"):
+            lineage_checked = True
+        if lineage_gate.get("passed"):
+            lineage_candidates.append(candidate)
+            continue
+        mismatched = dict(candidate)
+        mismatched["finish_lineage_mismatches"] = list(
+            lineage_gate.get("mismatches") or []
+        )
+        mismatched_candidates.append(mismatched)
+    selectable = lineage_candidates or ([] if lineage_checked else candidates)
+    if not selectable and mismatched_candidates:
+        return mismatched_candidates[0]
+    for candidate in selectable:
+        if _startup_worker_identity_close_gate(candidate).get("passed"):
+            return candidate
+    for candidate in selectable:
         if _worker_self_attestation_close_gate(candidate).get("passed"):
             return candidate
-    return candidates[0]
+    return selectable[0] if selectable else {}
     return {}
 
 
@@ -3949,6 +4006,7 @@ def _public_finish_worker_attestation(
     worker_session_id: str = "",
     filer_principal: str = "",
     worker_transcript_path: str = "",
+    worker_transcript_ref: str = "",
     harness_type: str = "",
 ) -> dict[str, Any]:
     safe: dict[str, Any] = {
@@ -3962,6 +4020,8 @@ def _public_finish_worker_attestation(
         safe["filer_principal"] = filer_principal
     if worker_transcript_path and not _string(safe.get("worker_transcript_path")):
         safe["worker_transcript_path"] = worker_transcript_path
+    if worker_transcript_ref and not _string(safe.get("worker_transcript_ref")):
+        safe["worker_transcript_ref"] = worker_transcript_ref
     if harness_type and not _string(safe.get("harness_type")):
         safe["harness_type"] = harness_type
     for list_key in ("blockers", "finish_time_blockers"):
@@ -3994,6 +4054,11 @@ def _normalized_worker_filer(value: Any) -> str:
     return "_".join(_string(value).lower().replace("-", "_").split())
 
 
+def _normalized_worker_harness_type(value: Any) -> str:
+    normalized = _normalized_worker_filer(value)
+    return _WORKER_HARNESS_TYPE_ALIASES.get(normalized, normalized)
+
+
 def _finish_time_worker_attestation_gate(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -4019,7 +4084,16 @@ def _finish_time_worker_attestation_gate(
             aliases=("transcript_path",),
         )
     )
-    harness_type = _string(
+    worker_transcript_ref = _string(
+        _finish_attestation_value(
+            "worker_transcript_ref",
+            attestation=attestation,
+            payload=payload,
+            evidence=evidence,
+            aliases=("transcript_ref", "worker_transcript_uri", "transcript_uri"),
+        )
+    )
+    harness_type = _normalized_worker_harness_type(
         _finish_attestation_value(
             "harness_type",
             attestation=attestation,
@@ -4027,7 +4101,7 @@ def _finish_time_worker_attestation_gate(
             evidence=evidence,
             aliases=("worker_harness_type",),
         )
-    ).lower()
+    )
     attestation_phase = _string(
         _finish_attestation_value(
             "attestation_phase",
@@ -4114,9 +4188,9 @@ def _finish_time_worker_attestation_gate(
         blockers.append("missing_filer_principal")
     elif worker_session_id and filer_principal != worker_session_id:
         blockers.append("finish_attestation_filer_principal_not_worker_session")
-    if not worker_transcript_path:
-        blockers.append("missing_worker_transcript_path")
-    if harness_type not in {"claude", "codex"}:
+    if not (worker_transcript_path or worker_transcript_ref):
+        blockers.append("missing_worker_transcript_ref_or_path")
+    if harness_type not in _SUPPORTED_WORKER_HARNESS_TYPES:
         blockers.append("missing_or_unsupported_harness_type")
     normalized_filer = _normalized_worker_filer(filer_principal)
     if normalized_filer in _GENERIC_OR_OBSERVER_WORKER_FILERS:
@@ -4129,6 +4203,7 @@ def _finish_time_worker_attestation_gate(
         worker_session_id=worker_session_id,
         filer_principal=filer_principal,
         worker_transcript_path=worker_transcript_path,
+        worker_transcript_ref=worker_transcript_ref,
         harness_type=harness_type,
     )
     if finish_time_self_attesting and "finish_time_self_attesting" not in public_attestation:
@@ -4153,6 +4228,7 @@ def _finish_time_worker_attestation_gate(
         "worker_session_id": worker_session_id,
         "filer_principal": filer_principal,
         "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
         "harness_type": harness_type,
         "finish_time_blockers": finish_time_blockers,
         "blockers": blockers,
@@ -4174,22 +4250,44 @@ def _startup_worker_identity_close_gate(
         evidence.get("worker_transcript_path")
         or attestation.get("worker_transcript_path")
     )
-    harness_type = _string(
+    worker_transcript_ref = _string(
+        evidence.get("worker_transcript_ref")
+        or evidence.get("transcript_ref")
+        or attestation.get("worker_transcript_ref")
+        or attestation.get("transcript_ref")
+    )
+    harness_type = _normalized_worker_harness_type(
         evidence.get("harness_type") or attestation.get("harness_type")
-    ).lower()
+    )
     filer_principal = _string(evidence.get("filer_principal") or evidence.get("actor"))
+    read_receipt = _nested_mapping(evidence, "read_receipt")
+    read_receipt_filer = _string(
+        evidence.get("read_receipt_filer_principal")
+        or evidence.get("read_receipt_actor")
+        or read_receipt.get("filer_principal")
+        or read_receipt.get("actor")
+        or read_receipt.get("filed_by")
+    )
     blockers: list[str] = []
     status = _string(evidence.get("status") or evidence.get("decision")).lower()
     if status in _FAIL_STATUSES or _explicit_false(evidence.get("ok")):
         blockers.append("startup_gate_not_passed")
     if _startup_is_host_adapter_surrogate(evidence):
         blockers.append("startup_is_host_adapter_surrogate")
+    if evidence.get("finish_lineage_mismatches"):
+        blockers.append("startup_finish_lineage_mismatch")
     if not filer_principal:
         blockers.append("missing_filer_principal")
     elif worker_session_id and filer_principal != worker_session_id:
         blockers.append("startup_filer_principal_not_worker_session")
-    if filer_principal in _GENERIC_OR_OBSERVER_WORKER_FILERS:
+    if _normalized_worker_filer(filer_principal) in _GENERIC_OR_OBSERVER_WORKER_FILERS:
         blockers.append("startup_filer_is_generic_or_observer")
+    if read_receipt_filer:
+        normalized_receipt_filer = _normalized_worker_filer(read_receipt_filer)
+        if normalized_receipt_filer in _GENERIC_OR_OBSERVER_WORKER_FILERS:
+            blockers.append("read_receipt_filer_is_generic_or_observer")
+        elif worker_session_id and read_receipt_filer != worker_session_id:
+            blockers.append("read_receipt_filer_principal_not_worker_session")
     if _string(evidence.get("filed_on_behalf_by")) or _bool(
         evidence.get("filed_on_behalf")
     ):
@@ -4204,10 +4302,24 @@ def _startup_worker_identity_close_gate(
         blockers.append("known_bad_playback_4178_shape")
     if not worker_session_id:
         blockers.append("missing_worker_session_id")
-    if not worker_transcript_path:
-        blockers.append("missing_worker_transcript_path")
-    if harness_type not in {"claude", "codex"}:
+    if not (worker_transcript_path or worker_transcript_ref):
+        blockers.append("missing_worker_transcript_ref_or_path")
+    if harness_type not in _SUPPORTED_WORKER_HARNESS_TYPES:
         blockers.append("missing_or_unsupported_harness_type")
+    if not _string(evidence.get("runtime_context_id")):
+        blockers.append("missing_runtime_context_id")
+    if not _fence_evidence_present(evidence):
+        blockers.append("missing_fence_token")
+    if not _string(evidence.get("route_id")):
+        blockers.append("missing_route_id")
+    for route_field in (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    ):
+        if not _string(evidence.get(route_field)):
+            blockers.append(f"missing_{route_field}")
     passed = not blockers
     return {
         "schema_version": "mf_subagent_startup_worker_identity_close_gate.v1",
@@ -4216,7 +4328,10 @@ def _startup_worker_identity_close_gate(
         "real_startup_identity": passed,
         "worker_session_id": worker_session_id,
         "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
         "harness_type": harness_type,
+        "runtime_context_id": _string(evidence.get("runtime_context_id")),
+        "read_receipt_filer_principal": read_receipt_filer,
         "blockers": blockers,
     }
 

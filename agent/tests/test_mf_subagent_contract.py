@@ -62,6 +62,7 @@ from agent.governance.mf_subagent_contract import (
 )
 from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
+    branch_runtime_context_id,
     _startup_token_evidence,
 )
 
@@ -432,6 +433,18 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
         },
         "startup_gate": {
             "event_id": "timeline:startup",
+            "runtime_context_id": branch_runtime_context_id(
+                context.project_id,
+                context.task_id,
+            ),
+            "fence_token_matches": True,
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+            "read_receipt_hash": "sha256:read-runtime-context",
+            "read_receipt_event_id": "timeline:read-receipt",
             **_self_attested_startup_fields(
                 worker_session_id="worker-runtime-context",
                 transcript_path="/tmp/worker-runtime-context.jsonl",
@@ -2598,18 +2611,21 @@ def _self_attested_startup_fields(
     *,
     worker_session_id: str = "worker-session-codex-1",
     transcript_path: str = "/tmp/worker-session-codex-1.jsonl",
+    transcript_ref: str = "codex-thread:worker-session-codex-1",
     harness_type: str = "codex",
 ) -> dict[str, object]:
     return {
         "filer_principal": worker_session_id,
         "worker_session_id": worker_session_id,
         "worker_transcript_path": transcript_path,
+        "worker_transcript_ref": transcript_ref,
         "harness_type": harness_type,
         "worker_self_attestation": {
             "status": "passed",
             "worker_self_attesting": True,
             "worker_session_id": worker_session_id,
             "worker_transcript_path": transcript_path,
+            "worker_transcript_ref": transcript_ref,
             "harness_type": harness_type,
         },
     }
@@ -2619,6 +2635,7 @@ def _finish_time_worker_attestation(
     *,
     worker_session_id: str = "worker-session-codex-1",
     transcript_path: str = "/tmp/worker-session-codex-1.jsonl",
+    transcript_ref: str = "codex-thread:worker-session-codex-1",
     harness_type: str = "codex",
     **overrides: object,
 ) -> dict[str, object]:
@@ -2634,6 +2651,7 @@ def _finish_time_worker_attestation(
         "worker_session_id": worker_session_id,
         "filer_principal": worker_session_id,
         "worker_transcript_path": transcript_path,
+        "worker_transcript_ref": transcript_ref,
         "harness_type": harness_type,
         "blockers": [],
     }
@@ -2658,13 +2676,17 @@ def _finish_startup_evidence(**overrides: object) -> dict[str, object]:
         "actual_cwd": "/tmp/aming-claw-wt/task-mf-sub-1",
         "actual_git_root": "/tmp/aming-claw-wt/task-mf-sub-1",
         "worktree": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "task_id": "task-mf-sub-1",
+        "runtime_context_id": "mfrctx-finish",
         "branch": "refs/heads/codex/task-mf-sub-1",
         "head_commit": "head456",
+        "route_id": "route-finish-child",
         "route_context_hash": "sha256:child-route-context",
         "prompt_contract_id": "rprompt-child",
         "prompt_contract_hash": "sha256:child-prompt",
         "route_token_ref": "rtok-finish-visible",
         "observer_command_id": "cmd-finish",
+        "read_receipt_hash": "sha256:read-finish",
         "read_receipt_event_id": "2873",
         **_self_attested_startup_fields(),
     }
@@ -2948,6 +2970,187 @@ def test_finish_gate_accepts_startup_at_base_commit_with_finish_time_attestation
     assert gate["worker_self_attestation_gate"]["passed"] is True
     assert gate["worker_self_attestation"]["finish_time_self_attesting"] is True
     assert gate["close_ready"] is True
+
+
+def test_finish_gate_accepts_actual_startup_identity_before_finish_attestation() -> None:
+    startup_evidence = _finish_startup_evidence(
+        close_satisfying=False,
+        worker_self_attesting=False,
+        self_attesting=False,
+        finish_time_self_attesting=False,
+        worker_self_attestation={},
+        worker_transcript_path="",
+        worker_transcript_ref="codex-thread:actual-startup",
+        harness_type="codex_builtin_subagent",
+    )
+
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": "ckpt-finish-actual-startup-identity",
+            "fence_token": "fence-2",
+            "summary": "Ready.",
+            "real_startup_events": [_startup_event(startup_evidence)],
+            "read_receipt_hash": "sha256:read-finish",
+            "read_receipt_event_id": "2873",
+            "finish_time_worker_self_attestation": (
+                _finish_time_worker_attestation(
+                    transcript_path="",
+                    transcript_ref="codex-thread:actual-startup",
+                    harness_type="codex_builtin_subagent",
+                )
+            ),
+        },
+        context=_context(),
+    )
+
+    assert gate["startup_evidence"]["close_satisfying"] is False
+    assert gate["startup_worker_identity_gate"]["passed"] is True
+    assert gate["startup_worker_identity_gate"]["worker_transcript_ref"] == (
+        "codex-thread:actual-startup"
+    )
+    assert gate["startup_worker_identity_gate"]["harness_type"] == "codex"
+    assert gate["worker_self_attestation_gate"]["passed"] is True
+    assert gate["worker_self_attestation_gate"]["worker_transcript_ref"] == (
+        "codex-thread:actual-startup"
+    )
+    assert gate["close_ready"] is True
+
+
+def test_finish_gate_keeps_adjacent_invalid_startup_lane_blocked() -> None:
+    invalid_adjacent_startup = _finish_startup_evidence(
+        task_id="task-mf-sub-2",
+        runtime_context_id="mfrctx-adjacent",
+        fence_token="fence-adjacent",
+        actual_cwd="/tmp/aming-claw-wt/task-mf-sub-2",
+        actual_git_root="/tmp/aming-claw-wt/task-mf-sub-2",
+        worktree="/tmp/aming-claw-wt/task-mf-sub-2",
+        branch="refs/heads/codex/task-mf-sub-2",
+        worker_session_id="worker-session-adjacent",
+        filer_principal="worker-session-adjacent",
+    )
+    valid_startup = _finish_startup_evidence(
+        close_satisfying=False,
+        worker_self_attesting=False,
+        self_attesting=False,
+        finish_time_self_attesting=False,
+        worker_self_attestation={},
+        worker_transcript_path="",
+        worker_transcript_ref="codex-thread:task-mf-sub-1",
+        harness_type="codex_builtin_subagent",
+    )
+    finish_payload = {
+        "project_id": "aming-claw",
+        "task_id": "task-mf-sub-1",
+        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "branch_ref": "refs/heads/codex/task-mf-sub-1",
+        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-1",
+        "head_commit": "head456",
+        "status": "succeeded",
+        "changed_files": ["agent/governance/mf_subagent_contract.py"],
+        "test_results": {"status": "passed", "command": "pytest -q"},
+        "checkpoint_id": "ckpt-finish-two-lane",
+        "fence_token": "fence-2",
+        "summary": "Ready.",
+        "read_receipt_hash": "sha256:read-finish",
+        "read_receipt_event_id": "2873",
+        "finish_time_worker_self_attestation": _finish_time_worker_attestation(
+            transcript_path="",
+            transcript_ref="codex-thread:task-mf-sub-1",
+            harness_type="codex_builtin_subagent",
+        ),
+    }
+
+    gate = validate_mf_subagent_finish_gate(
+        {
+            **finish_payload,
+            "real_startup_events": [
+                _startup_event(invalid_adjacent_startup, event_id="evt-adjacent"),
+                _startup_event(valid_startup, event_id="evt-valid"),
+            ],
+        },
+        context=_context(),
+    )
+
+    assert gate["startup_evidence"]["task_id"] == "task-mf-sub-1"
+    assert gate["startup_worker_identity_gate"]["passed"] is True
+
+    with pytest.raises(MfSubagentContractError, match="startup_finish_lineage_mismatch"):
+        validate_mf_subagent_finish_gate(
+            {
+                **finish_payload,
+                "real_startup_events": [
+                    _startup_event(invalid_adjacent_startup, event_id="evt-adjacent")
+                ],
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_observer_authored_startup_or_read_receipt() -> None:
+    base_payload = {
+        "project_id": "aming-claw",
+        "task_id": "task-mf-sub-1",
+        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "branch_ref": "refs/heads/codex/task-mf-sub-1",
+        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-1",
+        "head_commit": "head456",
+        "status": "succeeded",
+        "changed_files": ["agent/governance/mf_subagent_contract.py"],
+        "test_results": {"status": "passed", "command": "pytest -q"},
+        "checkpoint_id": "ckpt-finish-observer-authored",
+        "fence_token": "fence-2",
+        "summary": "Ready.",
+        "read_receipt_hash": "sha256:read-finish",
+        "read_receipt_event_id": "2873",
+        "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
+    }
+
+    with pytest.raises(MfSubagentContractError, match="startup_filer_is_generic_or_observer"):
+        validate_mf_subagent_finish_gate(
+            {
+                **base_payload,
+                "real_startup_events": [
+                    _startup_event(_finish_startup_evidence(filer_principal="observer"))
+                ],
+            },
+            context=_context(),
+        )
+
+    with pytest.raises(
+        MfSubagentContractError,
+        match="read_receipt_filer_is_generic_or_observer",
+    ):
+        validate_mf_subagent_finish_gate(
+            {
+                **base_payload,
+                "real_startup_events": [
+                    _startup_event(
+                        _finish_startup_evidence(
+                            read_receipt_filer_principal="observer"
+                        )
+                    )
+                ],
+            },
+            context=_context(),
+        )
 
 
 def test_finish_gate_requires_finish_time_worker_attestation() -> None:
@@ -3764,12 +3967,20 @@ def _real_worker_startup_matching_lineage(event_id: str = "evt-real-001") -> dic
         "worker_slot_id": "wslot-sg-01",
         "runtime_context_id": "mfrctx-sgtest01",
         "fence_token": "fence-sg-test",
+        "fence_token_matches": True,
         "worktree": "/repo/.worktrees/sg-test",
         "worktree_path": "/repo/.worktrees/sg-test",
         "actual_cwd": "/repo/.worktrees/sg-test",
         "actual_git_root": "/repo/.worktrees/sg-test",
         "branch": "refs/heads/task-sg-test",
         "head_commit": "head-sg-real",
+        "route_id": "route-sg-test",
+        "route_context_hash": "sha256:route-sg-test",
+        "prompt_contract_id": "rprompt-sg-test",
+        "prompt_contract_hash": "sha256:prompt-sg-test",
+        "route_token_ref": "rtok-sg-test",
+        "read_receipt_hash": "sha256:rr-f2-test",
+        "read_receipt_event_id": "rr-f2-evt-001",
         **_self_attested_startup_fields(
             worker_session_id="worker-session-sg",
             transcript_path="/tmp/worker-session-sg.jsonl",

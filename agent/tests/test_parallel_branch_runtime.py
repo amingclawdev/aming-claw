@@ -360,6 +360,7 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
         "read_receipt_event_id": "2873",
         "worker_session_id": worker_session_id,
         "worker_transcript_path": str(transcript_path),
+        "worker_transcript_ref": f"codex-thread:{worker_session_id}",
         "harness_type": "codex",
         "changed_files": ["agent/governance/parallel_branch_runtime.py"],
         "graph_trace_ids": ["gqt-startup"],
@@ -367,6 +368,7 @@ def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
     payload.update(overrides)
     transcript_record = {
         "session_id": payload.get("worker_session_id"),
+        "transcript_ref": payload.get("worker_transcript_ref"),
         "harness_type": payload.get("harness_type"),
         "event": "mf_subagent graph_query implementation",
         "query_source": "mf_subagent",
@@ -1155,13 +1157,19 @@ def test_runtime_context_action_plan_projects_close_precheck_gaps() -> None:
     }
 
     assert close_projection["status"] == "blocked"
-    assert gap_codes == {
+    assert {
         "route_identity_cleanup_required",
         "independent_verification_required",
         "route_token_action_scope_mismatch",
         "target_graph_stale",
         "worker_graph_query_identity_required",
-    }
+    } <= gap_codes
+    assert {
+        "read_receipt_missing",
+        "startup_missing",
+        "finish_time_worker_attestation_missing",
+        "finish_gate_missing",
+    } <= gap_codes
     assert "cleanup_route_identity" in close_projection["next_actions"]
     assert "record_independent_verification" in close_projection["next_actions"]
     assert "refresh_route_token_scope" in close_projection["next_actions"]
@@ -1485,9 +1493,17 @@ def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish
     assert control_plane["next_required_evidence"] == next_required
     assert worker_view["next_required_evidence"] == next_required
     assert worker_view["control_plane"]["next_required_evidence"] == next_required
-    assert ["worker_graph_trace", "finish_time_worker_attestation", "finish_gate"] == [
+    assert [
+        "mf_subagent_startup_identity",
+        "worker_graph_trace",
+        "finish_time_worker_attestation",
+    ] == [
         item["id"] for item in next_required[:3]
     ]
+    assert by_id["mf_subagent_startup_identity"]["next_action"] == (
+        "record_mf_subagent_startup"
+    )
+    assert by_id["mf_subagent_startup_identity"]["status"] == "stale"
     assert by_id["worker_graph_trace"]["next_action"] == "run_worker_graph_query"
     assert by_id["worker_graph_trace"]["producer"] == "graph_query_trace"
     assert by_id["worker_graph_trace"]["worker_owned"] is True
@@ -1703,10 +1719,31 @@ def test_runtime_context_worker_guide_repairs_next_action_after_finish_attestati
             "read_receipt_event_ref": "timeline:read-runtime-context",
         },
         startup_gate={
+            "runtime_context_id": branch_runtime_context_id(
+                PROJECT_ID,
+                context.task_id,
+            ),
+            "fence_token_matches": True,
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+            "read_receipt_hash": "sha256:read-runtime-context",
+            "read_receipt_event_id": "timeline:read-runtime-context",
+            "worker_session_id": "session-runtime-context",
+            "filer_principal": "session-runtime-context",
+            "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+            "worker_transcript_ref": "codex-thread:session-runtime-context",
+            "harness_type": "codex",
             "worker_self_attesting": False,
             "worker_self_attestation": {
                 "status": "blocked",
                 "worker_self_attesting": False,
+                "worker_session_id": "session-runtime-context",
+                "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "worker_transcript_ref": "codex-thread:session-runtime-context",
+                "harness_type": "codex",
                 "blockers": ["missing_finish_time_worker_self_attestation"],
             },
         },
@@ -1886,8 +1923,23 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "trace_ids": ["gqt-runtime-context"],
         },
         startup_gate={
+            "runtime_context_id": branch_runtime_context_id(
+                PROJECT_ID,
+                context.task_id,
+            ),
+            "fence_token_matches": True,
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+            "read_receipt_hash": "sha256:read-runtime-context",
+            "read_receipt_event_id": "timeline:read-receipt",
             "worker_session_id": "session-runtime-context",
             "filer_principal": "session-runtime-context",
+            "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+            "worker_transcript_ref": "codex-thread:session-runtime-context",
+            "harness_type": "codex",
             "worker_self_attesting": True,
             "worker_self_attestation": {
                 "schema_version": "worker_transcript_self_attestation.v1",
@@ -1895,6 +1947,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
                 "worker_self_attesting": True,
                 "worker_session_id": "session-runtime-context",
                 "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "worker_transcript_ref": "codex-thread:session-runtime-context",
                 "harness_type": "codex",
                 "blockers": [],
             },
@@ -2578,6 +2631,7 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert gate["graph_trace_db_evidence"]["db_verified"] is True
     assert gate["graph_trace_db_evidence"]["trace_ids"] == ["gqt-startup"]
     assert gate["worker_self_attestation"]["worker_session_id"] == "codex-session-startup"
+    assert gate["worker_transcript_ref"] == "codex-thread:codex-session-startup"
     assert gate["identity_join"]["runtime_context_id_matches"] is True
     assert gate["identity_join"]["route_identity_matches_latest_contract"] is True
     assert gate["identity_join"]["read_receipt_lineage_present"] is True
@@ -2679,6 +2733,7 @@ def test_startup_bridges_launch_text_hash_read_receipt_without_close_satisfying(
             read_receipt_hash="",
             launch_text_hash="sha256:launch-text-startup",
             worker_transcript_path="",
+            worker_transcript_ref="",
             worker_session_id="",
             harness_type="",
         ),
@@ -2694,7 +2749,7 @@ def test_startup_bridges_launch_text_hash_read_receipt_without_close_satisfying(
     assert gate["worker_self_attesting"] is False
     assert gate["close_satisfying"] is False
     assert "missing_worker_session_id" in gate["worker_self_attestation"]["blockers"]
-    assert "missing_worker_transcript_path" in gate["worker_self_attestation"]["blockers"]
+    assert "missing_worker_transcript_ref_or_path" in gate["worker_self_attestation"]["blockers"]
 
 
 def test_mf_sub_startup_rejects_same_owner_self_filled_unissued_session_token(
@@ -3064,11 +3119,18 @@ def _finish_startup_gate(
             context.task_id,
         ),
         "fence_token": context.fence_token,
+        "fence_token_matches": True,
         "actual_cwd": context.worktree_path,
         "actual_git_root": context.worktree_path,
         "worktree_path": context.worktree_path,
         "branch_ref": context.branch_ref,
         "head_commit": context.head_commit,
+        "route_id": f"route-{context.task_id}",
+        "route_context_hash": "sha256:route-finish-startup",
+        "prompt_contract_id": f"rprompt-{context.task_id}",
+        "prompt_contract_hash": "sha256:prompt-finish-startup",
+        "route_token_ref": f"rtok-{context.task_id}",
+        "read_receipt_hash": f"sha256:rr-{context.task_id}",
         "observer_command_id": f"cmd-{context.task_id}",
         "read_receipt_event_id": f"rr-{context.task_id}",
     }
@@ -3078,6 +3140,7 @@ def _finish_startup_gate(
                 "worker_session_id": f"session-{context.task_id}",
                 "filer_principal": f"session-{context.task_id}",
                 "worker_transcript_path": f"/tmp/transcript-{context.task_id}.jsonl",
+                "worker_transcript_ref": f"codex-thread:{context.task_id}",
                 "harness_type": "codex",
                 "worker_self_attesting": True,
                 "self_attesting": True,
@@ -3087,6 +3150,7 @@ def _finish_startup_gate(
                     "worker_self_attesting": True,
                     "worker_session_id": f"session-{context.task_id}",
                     "worker_transcript_path": f"/tmp/transcript-{context.task_id}.jsonl",
+                    "worker_transcript_ref": f"codex-thread:{context.task_id}",
                     "harness_type": "codex",
                     "blockers": [],
                 },

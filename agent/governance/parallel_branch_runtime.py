@@ -2669,6 +2669,50 @@ def _runtime_context_current_values(
         or finish_gate_payload.get("worker_self_attestation_gate")
         or nested_finish_gate_payload.get("worker_self_attestation_gate")
     )
+    startup_worker_attestation = public_contract_revision_payload(
+        startup_gate.get("worker_self_attestation") or {}
+    )
+    startup_read_receipt = _runtime_context_mapping(startup_gate.get("read_receipt"))
+    startup_worker_session_id = _runtime_context_text(
+        startup_gate.get("worker_session_id")
+        or startup_worker_attestation.get("worker_session_id")
+    )
+    startup_worker_transcript_path = _runtime_context_text(
+        startup_gate.get("worker_transcript_path")
+        or startup_worker_attestation.get("worker_transcript_path")
+    )
+    startup_worker_transcript_ref = _runtime_context_text(
+        startup_gate.get("worker_transcript_ref")
+        or startup_gate.get("transcript_ref")
+        or startup_worker_attestation.get("worker_transcript_ref")
+        or startup_worker_attestation.get("transcript_ref")
+        or startup_worker_transcript_path
+    )
+    startup_harness_type = _runtime_context_text(
+        startup_gate.get("harness_type") or startup_worker_attestation.get("harness_type")
+    )
+    startup_runtime_context_id = _runtime_context_text(
+        startup_gate.get("runtime_context_id")
+    )
+    startup_fence_token_present = bool(
+        startup_gate.get("fence_token")
+        or startup_gate.get("fence_token_hash")
+        or startup_gate.get("fence_token_present")
+        or startup_gate.get("fence_token_matches")
+    )
+    startup_read_receipt_hash = _runtime_context_text(
+        startup_gate.get("read_receipt_hash")
+        or startup_read_receipt.get("hash")
+        or startup_read_receipt.get("read_receipt_hash")
+    )
+    startup_read_receipt_event_id = _runtime_context_text(
+        startup_gate.get("read_receipt_event_id")
+        or startup_gate.get("read_receipt_timeline_id")
+        or startup_read_receipt.get("event_id")
+        or startup_read_receipt.get("timeline_event_id")
+        or startup_read_receipt.get("timeline_id")
+        or startup_read_receipt.get("id")
+    )
     worker_self_attesting = bool(worker_self_attestation) and bool(
         worker_self_attestation.get("worker_self_attesting")
         or worker_self_attestation.get("self_attesting")
@@ -2786,6 +2830,30 @@ def _runtime_context_current_values(
             or startup_gate.get("source_ref")
             or timeline_refs.get("startup_event_ref")
         ),
+        "startup_runtime_context_id": startup_runtime_context_id,
+        "startup_fence_token_present": startup_fence_token_present,
+        "startup_worker_session_id": startup_worker_session_id,
+        "startup_worker_transcript_path": startup_worker_transcript_path,
+        "startup_worker_transcript_ref": startup_worker_transcript_ref,
+        "startup_harness_type": startup_harness_type,
+        "startup_filer_principal": _runtime_context_text(
+            startup_gate.get("filer_principal") or startup_gate.get("actor")
+        ),
+        "startup_route_id": _runtime_context_text(startup_gate.get("route_id")),
+        "startup_route_context_hash": _runtime_context_text(
+            startup_gate.get("route_context_hash")
+        ),
+        "startup_prompt_contract_id": _runtime_context_text(
+            startup_gate.get("prompt_contract_id")
+        ),
+        "startup_prompt_contract_hash": _runtime_context_text(
+            startup_gate.get("prompt_contract_hash")
+        ),
+        "startup_route_token_ref": _runtime_context_text(
+            startup_gate.get("route_token_ref")
+        ),
+        "startup_read_receipt_hash": startup_read_receipt_hash,
+        "startup_read_receipt_event_id": startup_read_receipt_event_id,
         "finish_gate_ref": _runtime_context_text(
             finish_gate.get("event_id")
             or finish_gate.get("source_ref")
@@ -3027,10 +3095,101 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "evidence_ref": "contract_revision",
         },
         {
-            "field": "worker_self_attesting",
-            "expected_source": "worker_transcript_verify.worker_self_attestation",
-            "producer": "worker_transcript_verify",
+            "field": "startup_event_ref",
+            "expected_source": "task_timeline.mf_subagent_startup",
+            "producer": "mf_subagent_worker",
             "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "read_receipt_event_ref",
+            "expected_source": "task_timeline.mf_subagent_read_receipt",
+            "producer": "mf_subagent_worker",
+            "consumer": "record_mf_subagent_startup",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_runtime_context_id",
+            "expected_source": "task_timeline.mf_subagent_startup.runtime_context_id",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_fence_token_present",
+            "expected_source": "task_timeline.mf_subagent_startup.fence_token",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_worker_session_id",
+            "expected_source": "task_timeline.mf_subagent_startup.worker_session_id",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_worker_transcript_ref",
+            "expected_source": "task_timeline.mf_subagent_startup.worker_transcript_ref_or_path",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_harness_type",
+            "expected_source": "task_timeline.mf_subagent_startup.harness_type",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_route_id",
+            "expected_source": "task_timeline.mf_subagent_startup.route_id",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_route_context_hash",
+            "expected_source": "task_timeline.mf_subagent_startup.route_context_hash",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_prompt_contract_id",
+            "expected_source": "task_timeline.mf_subagent_startup.prompt_contract_id",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_prompt_contract_hash",
+            "expected_source": "task_timeline.mf_subagent_startup.prompt_contract_hash",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_route_token_ref",
+            "expected_source": "task_timeline.mf_subagent_startup.route_token_ref",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_read_receipt_hash",
+            "expected_source": "task_timeline.mf_subagent_startup.read_receipt_hash",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
+            "evidence_ref": "timeline",
+        },
+        {
+            "field": "startup_read_receipt_event_id",
+            "expected_source": "task_timeline.mf_subagent_startup.read_receipt_event_id",
+            "producer": "mf_subagent_worker",
+            "consumer": "mf_subagent_contract.validate_mf_subagent_finish_gate",
             "evidence_ref": "timeline",
         },
     ),
@@ -4434,16 +4593,126 @@ def _runtime_context_close_precheck_gap_projection(
     }
     gaps: list[dict[str, Any]] = []
     next_actions: list[str] = []
+
+    def _add_gap(*, code: str, message: str, next_action: str, field: str = "") -> None:
+        if not code or any(item.get("code") == code for item in gaps):
+            return
+        gap = {
+            "code": code,
+            "message": message,
+            "next_action": next_action,
+        }
+        if field:
+            gap["field"] = field
+            if field not in missing_close_fields:
+                missing_close_fields.append(field)
+        gaps.append(gap)
+        if next_action and next_action not in next_actions:
+            next_actions.append(next_action)
+
     for code, (next_action, message) in gap_specs.items():
         if close_precheck.get(code) is True:
-            gaps.append(
-                {
-                    "code": code,
-                    "message": message,
-                    "next_action": next_action,
-                }
+            _add_gap(
+                code=code,
+                message=message,
+                next_action=next_action,
             )
-            next_actions.append(next_action)
+    close_gap_specs = (
+        (
+            "read_receipt_event_ref",
+            "read_receipt_missing",
+            "submit_mf_subagent_read_receipt",
+            "Record worker-authored mf_subagent_read_receipt evidence before implementation evidence.",
+        ),
+        (
+            "startup_event_ref",
+            "startup_missing",
+            "record_mf_subagent_startup",
+            "Record actual mf_subagent_startup identity evidence for this worker lane.",
+        ),
+        (
+            "worker_self_attesting",
+            "finish_time_worker_attestation_missing",
+            "record_finish_time_worker_attestation",
+            "Record finish-time worker self-attestation separate from startup identity evidence.",
+        ),
+        (
+            "finish_gate_ref",
+            "finish_gate_missing",
+            "record_finish_gate",
+            "Run the mf_subagent finish gate after startup, graph, tests, and finish attestation are present.",
+        ),
+    )
+    for field, code, next_action, message in close_gap_specs:
+        if not _runtime_context_value_present(values.get(field)):
+            _add_gap(
+                code=code,
+                message=message,
+                next_action=next_action,
+                field=field,
+            )
+    if _runtime_context_value_present(values.get("startup_event_ref")):
+        startup_identity_gap_specs = (
+            (
+                "startup_runtime_context_id",
+                "startup_runtime_context_missing",
+                "runtime_context_id",
+            ),
+            ("startup_fence_token_present", "startup_fence_missing", "fence_token"),
+            (
+                "startup_worker_session_id",
+                "startup_worker_session_missing",
+                "worker_session_id",
+            ),
+            (
+                "startup_worker_transcript_ref",
+                "startup_worker_transcript_missing",
+                "worker_transcript_ref_or_path",
+            ),
+            ("startup_harness_type", "startup_harness_missing", "harness_type"),
+            ("startup_route_id", "startup_route_id_missing", "route_id"),
+            (
+                "startup_route_context_hash",
+                "startup_route_context_missing",
+                "route_context_hash",
+            ),
+            (
+                "startup_prompt_contract_id",
+                "startup_prompt_contract_id_missing",
+                "prompt_contract_id",
+            ),
+            (
+                "startup_prompt_contract_hash",
+                "startup_prompt_contract_hash_missing",
+                "prompt_contract_hash",
+            ),
+            (
+                "startup_route_token_ref",
+                "startup_route_token_ref_missing",
+                "route_token_ref",
+            ),
+            (
+                "startup_read_receipt_hash",
+                "startup_read_receipt_hash_missing",
+                "read_receipt_hash",
+            ),
+            (
+                "startup_read_receipt_event_id",
+                "startup_read_receipt_event_missing",
+                "read_receipt_event_id",
+            ),
+        )
+        for field, code, label in startup_identity_gap_specs:
+            if not _runtime_context_value_present(values.get(field)):
+                _add_gap(
+                    code=code,
+                    message=(
+                        "Existing mf_subagent_startup evidence is stale or incomplete; "
+                        f"missing startup {label}."
+                    ),
+                    next_action="record_mf_subagent_startup",
+                    field=field,
+                )
     return {
         "schema_version": "runtime_context.close_precheck_gap_projection.v1",
         "status": "blocked" if gaps else "clear",
@@ -4483,6 +4752,25 @@ def _runtime_context_next_legal_action(
     if read_receipt_hash_action.get("status") == "missing":
         return "submit_mf_subagent_read_receipt"
     if not _runtime_context_text(values.get("startup_event_ref")):
+        return "record_mf_subagent_startup"
+    startup_identity_fields = (
+        "startup_runtime_context_id",
+        "startup_fence_token_present",
+        "startup_worker_session_id",
+        "startup_worker_transcript_ref",
+        "startup_harness_type",
+        "startup_route_id",
+        "startup_route_context_hash",
+        "startup_prompt_contract_id",
+        "startup_prompt_contract_hash",
+        "startup_route_token_ref",
+        "startup_read_receipt_hash",
+        "startup_read_receipt_event_id",
+    )
+    if any(
+        not _runtime_context_value_present(values.get(field))
+        for field in startup_identity_fields
+    ):
         return "record_mf_subagent_startup"
     if lane_plan.get("blocking_events"):
         return "resolve_blocking_timeline_event"
@@ -4608,6 +4896,39 @@ def _runtime_context_next_required_evidence(
             close_satisfying_required=True,
             requires=requires,
         )
+    else:
+        stale_startup_fields = [
+            field
+            for field in (
+                "startup_runtime_context_id",
+                "startup_fence_token_present",
+                "startup_worker_session_id",
+                "startup_worker_transcript_ref",
+                "startup_harness_type",
+                "startup_route_id",
+                "startup_route_context_hash",
+                "startup_prompt_contract_id",
+                "startup_prompt_contract_hash",
+                "startup_route_token_ref",
+                "startup_read_receipt_hash",
+                "startup_read_receipt_event_id",
+            )
+            if not _runtime_context_value_present(values.get(field))
+        ]
+        if stale_startup_fields:
+            _add(
+                item_id="mf_subagent_startup_identity",
+                field=",".join(stale_startup_fields),
+                gate="finish",
+                next_action="record_mf_subagent_startup",
+                producer="mf_subagent_worker",
+                consumer="mf_subagent_contract.validate_mf_subagent_finish_gate",
+                expected_source="task_timeline.mf_subagent_startup.identity",
+                evidence_ref="timeline",
+                status="stale",
+                close_satisfying_required=True,
+                requires=[],
+            )
     if "graph_trace_ids" in missing_fields:
         _add(
             item_id="worker_graph_trace",
@@ -7147,6 +7468,9 @@ def _startup_refusal_timeline_event(
     worker_transcript_path = str(
         payload.get("worker_transcript_path") or payload.get("transcript_path") or ""
     ).strip()
+    worker_transcript_ref = str(
+        payload.get("worker_transcript_ref") or payload.get("transcript_ref") or ""
+    ).strip()
     harness_type = str(
         payload.get("harness_type") or payload.get("worker_harness_type") or ""
     ).strip()
@@ -7505,6 +7829,9 @@ def record_mf_subagent_startup(
     worker_transcript_path = str(
         payload.get("worker_transcript_path") or payload.get("transcript_path") or ""
     ).strip()
+    worker_transcript_ref = str(
+        payload.get("worker_transcript_ref") or payload.get("transcript_ref") or ""
+    ).strip()
     harness_type = str(
         payload.get("harness_type") or payload.get("worker_harness_type") or ""
     ).strip()
@@ -7848,6 +8175,7 @@ def record_mf_subagent_startup(
         **dict(payload),
         "worker_session_id": worker_session_id,
         "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
         "harness_type": harness_type,
         "task_id": task,
         "runtime_context_id": runtime_context_id,
@@ -8008,6 +8336,7 @@ def record_mf_subagent_startup(
         "startup_timing": "actual_worker_started",
         "worker_session_id": worker_session_id,
         "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
         "harness_type": harness_type,
         "filer_principal": filer_principal,
         "filed_on_behalf_by": filed_on_behalf_by,
@@ -8058,6 +8387,7 @@ def record_mf_subagent_startup(
             "session_token_evidence_type": token_evidence["session_token_evidence_type"],
             "worker_session_id": worker_session_id,
             "worker_transcript_path": worker_transcript_path,
+            "worker_transcript_ref": worker_transcript_ref,
             "harness_type": harness_type,
             "worker_self_attesting": worker_self_attesting,
             "filer_principal": filer_principal,
