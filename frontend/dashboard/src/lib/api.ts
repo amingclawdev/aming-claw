@@ -114,6 +114,27 @@ async function postJSON<T>(path: string, body: unknown, signal?: AbortSignal): P
   return (await res.json()) as T;
 }
 
+async function deleteJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const url = `${base()}${path}`;
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new ApiError(res.status, `DELETE ${path} → ${res.status}`, text);
+  }
+  if (res.status === 204) {
+    return { ok: true } as T;
+  }
+  const text = await res.text().catch(() => "");
+  if (!text.trim()) {
+    return { ok: true } as T;
+  }
+  return JSON.parse(text) as T;
+}
+
 export class ApiError extends Error {
   status: number;
   body: string;
@@ -196,6 +217,29 @@ export const api = {
   },
   selectGitRefFor(projectId: string, payload: ProjectGitRefSelectPayload, signal?: AbortSignal) {
     return postJSON<ProjectGitRefsResponse>(`/api/projects/${pidFor(projectId)}/git-ref`, payload, signal);
+  },
+  demoEnvironmentsFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<DemoEnvironmentsResponse>(
+      `/api/projects/${pidFor(projectId)}/demo-environments`,
+      signal,
+    );
+  },
+  createDemoEnvironmentFor(
+    projectId: string,
+    payload: DemoEnvironmentCreatePayload,
+    signal?: AbortSignal,
+  ) {
+    return postJSON<DemoEnvironmentCreateResponse>(
+      `/api/projects/${pidFor(projectId)}/demo-environments`,
+      payload,
+      signal,
+    );
+  },
+  deleteDemoEnvironmentFor(projectId: string, environmentId: string, signal?: AbortSignal) {
+    return deleteJSON<{ ok?: boolean }>(
+      `/api/projects/${pidFor(projectId)}/demo-environments/${encodeURIComponent(environmentId)}`,
+      signal,
+    );
   },
   projectInboxFor(projectId: string, signal?: AbortSignal) {
     return getJSON<ProjectInboxResponse>(`/api/projects/${pidFor(projectId)}/project-inbox`, signal);
@@ -976,6 +1020,53 @@ export interface ProjectsResponse {
   ok?: boolean;
   projects: ProjectListItem[];
 }
+
+export interface DemoTemplate {
+  id: string;
+  template_id?: string;
+  label: string;
+  description?: string;
+  status?: string;
+}
+
+export interface DemoEnvironment {
+  id: string;
+  template_id: string;
+  label: string;
+  project_id: string;
+  fixture_root: string;
+  baseline_commit: string;
+  created_at: string;
+  dashboard_url: string;
+  backlog_url: string;
+  timeline_url: string;
+  graph_url: string;
+  planner_preview_url: string;
+  planner_preview_command: string;
+  launch_prompt: string;
+  status?: string;
+  error?: string;
+}
+
+export interface DemoEnvironmentsResponse {
+  ok?: boolean;
+  project_id: string;
+  templates?: DemoTemplate[];
+  environments?: DemoEnvironment[];
+  error?: string;
+}
+
+export interface DemoEnvironmentCreatePayload {
+  template_id: string;
+}
+
+export type DemoEnvironmentCreateResponse =
+  | DemoEnvironment
+  | {
+      ok?: boolean;
+      environment?: DemoEnvironment;
+      error?: string;
+    };
 
 export interface E2ESuiteConfig {
   suite_id?: string;
