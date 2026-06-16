@@ -3238,6 +3238,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "runtime_contract",
         "graph_query",
         "route_context",
+        "session_token_reissue",
     }
     read_interface_contracts = {
         "current_state": {
@@ -5744,6 +5745,11 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "worker_role": "mf_sub",
                 "worker_id": "startup-worker",
                 "agent_id": "startup-agent",
+                "actual_host_worker_id": "host-startup-worker",
+                "worker_session_id": "host-startup-worker",
+                "worker_transcript_ref": "multi_agent:host-startup-worker",
+                "harness_type": "codex",
+                "filer_principal": "host-startup-worker",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -5783,7 +5789,13 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
     assert started["startup_gate"]["server_issued_session_token_verified"] is True
     assert started["timeline_event_recorded"]["event_kind"] == "mf_subagent_startup"
     assert len(events) == 1
-    assert events[0]["payload"]["mf_subagent_startup_gate"]["worker_role"] == "mf_sub"
+    startup_gate = events[0]["payload"]["mf_subagent_startup_gate"]
+    assert startup_gate["worker_role"] == "mf_sub"
+    assert startup_gate["actual_host_worker_id"] == "host-startup-worker"
+    assert startup_gate["worker_session_id"] == "host-startup-worker"
+    assert startup_gate["worker_transcript_ref"] == "multi_agent:host-startup-worker"
+    assert startup_gate["harness_type"] == "codex"
+    assert events[0]["actor"] == "host-startup-worker"
 
 
 def test_parallel_branch_startup_blocks_missing_command_read_receipt_lineage(
@@ -11219,6 +11231,183 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
     ]
 
 
+def test_runtime_context_current_state_and_guide_expose_session_token_lease(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-lease-current"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-lease",
+            root_task_id="parent-runtime-lease",
+            backlog_id="AC-RUNTIME-LEASE-CURRENT",
+            stage_task_id="worker-runtime-lease",
+            worker_id="worker-runtime-lease",
+            worker_slot_id="worker-runtime-lease",
+            branch_ref="refs/heads/codex/worker-runtime-lease",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-lease",
+            session_token_hash=mf_subagent_session_token_hash("runtime-lease-token"),
+            lease_id="lease-runtime-current",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    route_identity = {
+        "route_id": "route-runtime-lease",
+        "route_context_hash": "sha256:route-runtime-lease",
+        "prompt_contract_id": "rprompt-runtime-lease",
+        "prompt_contract_hash": "sha256:prompt-runtime-lease",
+        "route_token_ref": "rtok-runtime-lease",
+        "visible_injection_manifest_hash": "sha256:visible-runtime-lease",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-lease",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+    query = {
+        "parent_task_id": "parent-runtime-lease",
+        "fence_token": "fence-runtime-lease",
+        "session_token": "runtime-lease-token",
+        "target_project_root": str(target_root),
+        "view": "all",
+    }
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            query=query,
+        )
+    )
+    worker_view = current["runtime_context_service"]["views"]["worker_view"]
+
+    assert current["session_token_lease"]["lease_id"] == "lease-runtime-current"
+    assert current["session_token_lease"]["expired"] is False
+    assert current["session_token_lease"]["raw_session_token_persisted"] is False
+    assert worker_view["session_token_lease"] == current["session_token_lease"]
+    graph_payload = worker_view["graph_query_identity"]["payload_shape"]
+    assert graph_payload["runtime_context_id"] == context.runtime_context_id
+    assert graph_payload["target_project_root"] == str(target_root)
+    assert graph_payload["project_root"] == str(target_root)
+    assert graph_payload["repo_root"] == str(target_root)
+    assert graph_payload["route_identity"]["route_token_ref"] == "rtok-runtime-lease"
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            query=query,
+        )
+    )
+
+    assert guide["worker_guide"]["session_token_lease"]["lease_id"] == (
+        "lease-runtime-current"
+    )
+    assert "target_project_root" in guide["worker_guide"]["read_endpoints"]["graph_query"][
+        "required_body_fields"
+    ]
+    assert "route_token_ref" in guide["worker_guide"]["graph_query_identity"][
+        "required_route_identity_fields"
+    ]
+    reissue = guide["worker_guide"]["read_endpoints"]["session_token_reissue"]
+    assert reissue["facade_status"] == "available"
+    assert reissue["ttl_policy"]["raw_session_token_persisted"] is False
+    assert "wrong-token" in reissue["failure_policy"]
+
+
+def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-reissue"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-reissue",
+            root_task_id="parent-runtime-reissue",
+            backlog_id="AC-RUNTIME-TOKEN-REISSUE",
+            stage_task_id="worker-runtime-reissue",
+            worker_id="worker-runtime-reissue",
+            worker_slot_id="slot-runtime-reissue",
+            branch_ref="refs/heads/codex/worker-runtime-reissue",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-reissue",
+            session_token_hash=mf_subagent_session_token_hash("old-runtime-token"),
+            lease_id="lease-runtime-expired",
+            lease_expires_at="2000-01-01T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    result = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "worker-runtime-reissue",
+                "parent_task_id": "parent-runtime-reissue",
+                "fence_token": "fence-runtime-reissue",
+                "session_token": "old-runtime-token",
+                "target_project_root": str(target_root),
+                "ttl_seconds": 999999,
+                "now_iso": "2026-06-16T12:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["ttl_seconds"] == 7200
+    assert result["session_token_persisted"] is False
+    assert result["session_token_lease"]["lease_remaining_ttl_seconds"] == 7200
+    assert str(result["audit_event_ref"]).startswith("timeline:")
+    new_token = result["session_token"]
+    saved = get_branch_context(conn, PID, "worker-runtime-reissue")
+    assert saved is not None
+    assert saved.session_token_hash == mf_subagent_session_token_hash(new_token)
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-REISSUE",
+        event_kind="mf_subagent_session_token_reissue",
+    )
+    assert len(events) == 1
+    serialized_event = json.dumps(events[0], sort_keys=True)
+    assert "old-runtime-token" not in serialized_event
+    assert new_token not in serialized_event
+
+    with pytest.raises(GovernanceError) as wrong_token:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-reissue",
+                    "parent_task_id": "parent-runtime-reissue",
+                    "fence_token": "fence-runtime-reissue",
+                    "session_token": "wrong-runtime-token",
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+    assert wrong_token.value.code == "fence_invalidated_or_unknown"
+
+
 def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):
     _activate_basic_graph(conn, "full-query-mf-sub-unknown")
 
@@ -15647,6 +15836,98 @@ def _insert_simple_mf_close_backlog(conn, backlog_id: str) -> None:
         ),
     )
     conn.commit()
+
+
+def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            backlog_id,
+            "Non-MF open backlog",
+            "OPEN",
+            "2026-06-12T00:00:00Z",
+            "2026-06-12T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+
+def test_timeline_gate_non_applicable_open_row_never_reports_can_close_true(conn):
+    backlog_id = "AC-NON-MF-TIMELINE-GATE-NOT-APPLICABLE"
+    _insert_non_mf_backlog(conn, backlog_id)
+
+    full = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+    compact = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"view": "compact"},
+        )
+    )
+    repair = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"view": "repair"},
+        )
+    )
+
+    assert full["applicable"] is False
+    assert full["can_close"] is False
+    assert full["timeline_gate"]["status"] == "not_applicable"
+    assert full["timeline_gate"]["can_close"] is False
+    assert full["timeline_gate"]["repair_reasons"][0]["code"] == (
+        "timeline_gate_not_applicable"
+    )
+    assert compact["gate_summary"]["can_close"] is False
+    assert compact["gate_summary"]["applicable"] is False
+    assert compact["gate_summary"]["repair_reasons"][0]["code"] == (
+        "timeline_gate_not_applicable"
+    )
+    assert repair["repair_summary"]["can_close"] is False
+    assert repair["repair_summary"]["repair_reasons"][0]["code"] == (
+        "timeline_gate_not_applicable"
+    )
+    assert repair["repair_summary"]["next_legal_actions"]
+
+
+def test_timeline_repair_summary_names_missing_startup_identity_fields():
+    summary = task_timeline.repair_gate_summary(
+        {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": False,
+            "can_close": False,
+            "status": "failed",
+            "applicable": True,
+            "close_timeline_startup_gate": {
+                "status": "failed",
+                "passed": False,
+                "missing_requirement_ids": ["mf_subagent_startup"],
+                "blockers": [
+                    "missing_worker_session_id",
+                    "missing_worker_transcript_ref_or_path",
+                    "unsupported_or_missing_harness_type",
+                ],
+            },
+        },
+        request_id="req-startup-repair",
+    )
+
+    startup = next(
+        item
+        for item in summary["failed_gate_repairs"]
+        if item["gate"] == "close_timeline_startup_gate"
+    )
+    assert startup["missing_fields"] == [
+        "worker_session_id",
+        "worker_transcript_ref_or_worker_transcript_path",
+        "harness_type",
+    ]
+    assert startup["suggested_event_kind"] == "mf_subagent_startup"
+    assert "Do not observer-backfill" in startup["recommended_legal_action"]
+    assert startup["append_payload_skeleton"]["event_kind"] == "mf_subagent_startup"
 
 
 def test_timeline_append_meta_contract_rejects_observer_forbidden_action(conn):

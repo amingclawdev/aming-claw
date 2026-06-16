@@ -5618,7 +5618,11 @@ def compact_gate_summary(
 
     The full gate tree is NOT re-evaluated; this is a projection of the existing result.
     """
+    status = str(full_result.get("status") or "").strip().lower()
+    not_applicable = full_result.get("applicable") is False or status == "not_applicable"
     passed = bool(full_result.get("passed") or full_result.get("can_close"))
+    if not_applicable:
+        passed = False
     can_close = passed
 
     missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
@@ -5635,6 +5639,7 @@ def compact_gate_summary(
         "cross_ref_gate",
         "approval_scope_gate",
         "command_disposition_gate",
+        "close_timeline_startup_gate",
     ]
     failed_gates = []
     for key in gate_keys:
@@ -5683,6 +5688,28 @@ def compact_gate_summary(
         "failed_gates": failed_gates,
         "event_count": int(full_result.get("event_count") or 0),
     }
+    repair_reasons = list(full_result.get("repair_reasons") or [])
+    next_legal_actions = list(full_result.get("next_legal_actions") or [])
+    if not_applicable and not repair_reasons:
+        repair_reasons = [
+            {
+                "code": "timeline_gate_not_applicable",
+                "reason": str(full_result.get("reason") or ""),
+                "message": (
+                    "This row is not applicable to ordinary MF timeline close; "
+                    "can_close remains false."
+                ),
+                "next_legal_action": (
+                    "Use the row's appropriate workflow or a separately audited "
+                    "recovery path without fabricating close_ready evidence."
+                ),
+            }
+        ]
+        next_legal_actions = [repair_reasons[0]["next_legal_action"]]
+    if repair_reasons:
+        summary["repair_reasons"] = repair_reasons
+    if next_legal_actions:
+        summary["next_legal_actions"] = next_legal_actions
     for opt_key in ("project_id", "bug_id", "applicable"):
         if full_result.get(opt_key) is not None:
             summary[opt_key] = full_result[opt_key]
@@ -5705,6 +5732,7 @@ MF_REPAIR_GATE_KEYS = [
     "cross_ref_gate",
     "approval_scope_gate",
     "command_disposition_gate",
+    "close_timeline_startup_gate",
 ]
 
 
@@ -5838,10 +5866,48 @@ def _generic_repair_append_skeleton(gate_key: str, missing: list[str]) -> dict[s
             phase="close",
             payload={"command_id": "<originating_observer_command_id>", "status": "completed"},
         )
+    if gate_key == "close_timeline_startup_gate":
+        return _repair_append_skeleton(
+            "mf_subagent_startup",
+            phase="startup",
+            payload={
+                "worker_session_id": "<actual_host_worker_session_id>",
+                "worker_transcript_ref": "<host_transcript_ref>",
+                "worker_transcript_path": "<host_transcript_path_if_available>",
+                "harness_type": "codex",
+                "filer_principal": "<same_as_worker_session_id>",
+                "runtime_context_id": "<mfrctx-...>",
+                "route_token_ref": "<rtok-...>",
+            },
+        )
     return _repair_append_skeleton(
         "repair_evidence",
         payload={"gate": gate_key, "requirement_id": first_missing},
     )
+
+
+def _startup_identity_missing_fields(gate: dict[str, Any]) -> list[str]:
+    missing = _list(gate.get("missing_fields") or gate.get("missing_required_fields") or [])
+    blockers = _unique_compact_values(
+        [
+            *_list(gate.get("blockers")),
+            *_list(_mapping(gate.get("worker_self_attestation")).get("blockers")),
+            *_list(_mapping(gate.get("startup_worker_identity_gate")).get("blockers")),
+            *_list(_mapping(gate.get("worker_identity_gate")).get("blockers")),
+        ]
+    )
+    blocker_to_field = {
+        "missing_worker_session_id": "worker_session_id",
+        "missing_worker_transcript_path": "worker_transcript_path",
+        "missing_worker_transcript_ref_or_path": "worker_transcript_ref_or_worker_transcript_path",
+        "missing_or_unsupported_harness_type": "harness_type",
+        "unsupported_or_missing_harness_type": "harness_type",
+    }
+    for blocker in blockers:
+        field = blocker_to_field.get(str(blocker))
+        if field:
+            missing.append(field)
+    return _unique_compact_values([str(item) for item in missing if str(item or "").strip()])
 
 
 def _cross_ref_repair_diagnosis(
@@ -6054,6 +6120,43 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
     recommended_action = str(gate.get("next_action") or "").strip()
     suggested_event_kind = ""
 
+    if gate_key == "close_timeline_startup_gate":
+        startup_missing = _startup_identity_missing_fields(gate)
+        reasons = []
+        if startup_missing:
+            reasons.append(
+                "Startup evidence is missing close-sensitive worker fields: "
+                + ", ".join(startup_missing)
+            )
+        for field in ("reason", "missing_reason", "failure_reason", "message"):
+            value = str(gate.get(field) or "").strip()
+            if value:
+                reasons.append(value)
+        if not reasons:
+            reasons.append("Startup evidence is not close-satisfying.")
+        return {
+            "gate": gate_key,
+            "failed_gate_name": gate_key,
+            "status": str(gate.get("status") or "failed"),
+            "missing_requirement_ids": missing,
+            "missing_fields": startup_missing,
+            "diagnosis": "startup evidence missing real worker identity fields",
+            "reasons": _unique_compact_values(reasons),
+            "recommended_legal_action": (
+                "Record a new worker-authored mf_subagent_startup through the "
+                "runtime/parallel startup facade with worker_session_id, "
+                "worker_transcript_ref or worker_transcript_path, harness_type, "
+                "and filer_principal. Do not observer-backfill or audit-close "
+                "as a substitute for worker startup evidence."
+            ),
+            "suggested_event_kind": "mf_subagent_startup",
+            "append_payload_skeleton": _generic_repair_append_skeleton(
+                gate_key,
+                startup_missing or missing,
+            ),
+            "advisory_only": True,
+        }
+
     if gate_key == "cross_ref_gate":
         rejected = [_mapping(item) for item in _list(gate.get("rejected_cross_ref_evidence"))]
         diagnosis, reasons, suggested_event_kind = _cross_ref_repair_diagnosis(rejected)
@@ -6128,7 +6231,11 @@ def repair_gate_summary(
 ) -> dict[str, Any]:
     """Project failed MF close gates into compact, advisory repair steps."""
 
+    status = str(full_result.get("status") or "").strip().lower()
+    not_applicable = full_result.get("applicable") is False or status == "not_applicable"
     passed = bool(full_result.get("passed") or full_result.get("can_close"))
+    if not_applicable:
+        passed = False
     missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
     failed_gate_repairs = []
     for key in MF_REPAIR_GATE_KEYS:
@@ -6162,6 +6269,28 @@ def repair_gate_summary(
         "failed_gate_count": len(failed_gate_repairs),
         "event_count": int(full_result.get("event_count") or 0),
     }
+    repair_reasons = list(full_result.get("repair_reasons") or [])
+    next_legal_actions = list(full_result.get("next_legal_actions") or [])
+    if not_applicable and not repair_reasons:
+        repair_reasons = [
+            {
+                "code": "timeline_gate_not_applicable",
+                "reason": str(full_result.get("reason") or ""),
+                "message": (
+                    "This row is not applicable to ordinary MF timeline close; "
+                    "can_close remains false."
+                ),
+                "next_legal_action": (
+                    "Use the row's appropriate workflow or a separately audited "
+                    "recovery path without fabricating close_ready evidence."
+                ),
+            }
+        ]
+        next_legal_actions = [repair_reasons[0]["next_legal_action"]]
+    if repair_reasons:
+        summary["repair_reasons"] = repair_reasons
+    if next_legal_actions:
+        summary["next_legal_actions"] = next_legal_actions
     for opt_key in ("project_id", "bug_id", "applicable"):
         if full_result.get(opt_key) is not None:
             summary[opt_key] = full_result[opt_key]

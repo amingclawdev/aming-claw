@@ -91,6 +91,7 @@ def _task_timeline_body(args: dict) -> dict:
         "trace_id",
         "commit_sha",
         "route_token",
+        "route_token_ref",
         "route_waiver",
         "route_token_waiver",
     }
@@ -169,6 +170,7 @@ TOOLS: list[dict] = [
                 "priority": {"type": "integer", "description": "Priority (1=highest)", "default": 5},
                 "metadata": {"type": "object", "description": "Additional metadata (target_files, etc.)"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected task dispatch mutations."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
@@ -210,6 +212,7 @@ TOOLS: list[dict] = [
                 "status": {"type": "string", "enum": ["succeeded", "failed"]},
                 "result": {"type": "object", "description": "Task result (changed_files, test_report, etc.)"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for mutation-bearing task completion."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
@@ -576,6 +579,7 @@ TOOLS: list[dict] = [
                 "actor": {"type": "string"},
                 "force_admit": {"type": "boolean"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog state/close evidence writes."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
@@ -593,6 +597,7 @@ TOOLS: list[dict] = [
                 "commit": {"type": "string"},
                 "actor": {"type": "string"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog close."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
@@ -623,6 +628,7 @@ TOOLS: list[dict] = [
                 "source_runtime_context_id": {"type": "string"},
                 "actor": {"type": "string"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected audit archive."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
@@ -657,6 +663,7 @@ TOOLS: list[dict] = [
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
@@ -940,6 +947,14 @@ TOOLS: list[dict] = [
                 },
                 "repo_root": {"type": "string"},
                 "project_root": {"type": "string"},
+                "target_project_root": {
+                    "type": "string",
+                    "description": "When query_source=mf_subagent: assigned target project/worktree root; accepted as the same value as project_root/repo_root for worker contexts.",
+                },
+                "runtime_context_id": {
+                    "type": "string",
+                    "description": "When query_source=mf_subagent: the runtime context id from the worker launch envelope.",
+                },
                 "task_id": {
                     "type": "string",
                     "description": "Required when query_source=mf_subagent: the calling worker's task_id.",
@@ -959,6 +974,34 @@ TOOLS: list[dict] = [
                 "session_token": {
                     "type": "string",
                     "description": "Required for server-tokenized mf_subagent lanes: the scoped worker session_token issued at allocation.",
+                },
+                "route_id": {
+                    "type": "string",
+                    "description": "Safe route identity field from runtime_context_worker_guide/current-state.",
+                },
+                "route_context_hash": {
+                    "type": "string",
+                    "description": "Safe route identity field from runtime_context_worker_guide/current-state.",
+                },
+                "prompt_contract_id": {
+                    "type": "string",
+                    "description": "Safe route identity field from runtime_context_worker_guide/current-state.",
+                },
+                "prompt_contract_hash": {
+                    "type": "string",
+                    "description": "Safe route identity field from runtime_context_worker_guide/current-state.",
+                },
+                "route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque server-registered route token reference; raw route tokens are not required for mf_sub graph queries.",
+                },
+                "visible_injection_manifest_hash": {
+                    "type": "string",
+                    "description": "Safe route identity field from runtime_context_worker_guide/current-state.",
+                },
+                "route_identity": {
+                    "type": "object",
+                    "description": "Optional nested safe route identity block. Top-level route identity fields are also accepted.",
                 },
             },
             "required": ["project_id", "tool"],
@@ -1037,6 +1080,31 @@ TOOLS: list[dict] = [
                 "role": {"type": "string"},
                 "worker_id": {"type": "string"},
                 "agent_id": {"type": "string"},
+                "actual_host_worker_id": {
+                    "type": "string",
+                    "description": "Actual host-created worker/session id observed by the worker runtime.",
+                },
+                "worker_session_id": {
+                    "type": "string",
+                    "description": "Worker-owned runtime session id used for close-sensitive startup identity.",
+                },
+                "worker_transcript_ref": {
+                    "type": "string",
+                    "description": "Host transcript reference, e.g. multi_agent:<session-id>.",
+                },
+                "worker_transcript_path": {
+                    "type": "string",
+                    "description": "Local transcript path when the harness provides one.",
+                },
+                "harness_type": {
+                    "type": "string",
+                    "enum": ["codex", "claude"],
+                    "description": "Worker harness that owns the transcript/session evidence.",
+                },
+                "filer_principal": {
+                    "type": "string",
+                    "description": "Principal filing the startup evidence; for real worker evidence this should match worker_session_id.",
+                },
                 "session_token": {
                     "type": "string",
                     "description": "One-time worker session token. The server persists only a hash.",
@@ -1597,7 +1665,7 @@ class ToolDispatcher:
                 body["priority"] = args["priority"]
             if args.get("metadata"):
                 body["metadata"] = args["metadata"]
-            for key in ("route_token", "route_waiver", "route_token_waiver"):
+            for key in ("route_token", "route_token_ref", "route_waiver", "route_token_waiver"):
                 if args.get(key):
                     body[key] = args[key]
             return self._api("POST", f"/api/task/{pid}/create", body)
@@ -1617,7 +1685,7 @@ class ToolDispatcher:
             body = {"task_id": args["task_id"], "status": args["status"]}
             if args.get("result"):
                 body["result"] = args["result"]
-            for key in ("route_token", "route_waiver", "route_token_waiver"):
+            for key in ("route_token", "route_token_ref", "route_waiver", "route_token_waiver"):
                 if args.get(key):
                     body[key] = args[key]
             return self._api("POST", f"/api/task/{pid}/complete", body)
@@ -1792,7 +1860,7 @@ class ToolDispatcher:
             bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
             body = {
                 key: args[key]
-                for key in ("commit", "actor", "route_token", "route_waiver", "route_token_waiver")
+                for key in ("commit", "actor", "route_token", "route_token_ref", "route_waiver", "route_token_waiver")
                 if args.get(key)
             }
             return self._api("POST", f"/api/backlog/{pid}/{bug_id}/close", body)

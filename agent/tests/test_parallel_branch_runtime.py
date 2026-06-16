@@ -39,6 +39,7 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
+    MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_FAILED,
     STATE_MERGE_READY,
@@ -72,6 +73,7 @@ from agent.governance.parallel_branch_runtime import (
     mf_subagent_session_token_hash,
     plan_branch_runtime_context,
     queue_merge_item_for_branch_context,
+    reissue_mf_subagent_runtime_session_token,
     record_runtime_context_access_audit,
     record_branch_finish_gate,
     record_mf_subagent_startup,
@@ -81,6 +83,7 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_audit_nodes_for_views,
     runtime_context_content_hash,
     runtime_context_filter_content_address,
+    runtime_context_session_token_lease_view,
     runtime_tasks_from_contexts,
     upsert_branch_context,
     validate_mf_subagent_graph_query_identity,
@@ -1283,6 +1286,8 @@ def test_runtime_context_action_plan_projects_close_precheck_gaps() -> None:
 def test_runtime_context_worker_view_control_plane_is_role_scoped_without_raw_tokens() -> None:
     context = _runtime_projection_context(
         session_token_hash=mf_subagent_session_token_hash("raw-worker-session-token"),
+        lease_id="lease-runtime-context",
+        lease_expires_at="2999-01-01T00:00:00Z",
     )
     projection = build_runtime_context_projection(
         context,
@@ -1322,6 +1327,19 @@ def test_runtime_context_worker_view_control_plane_is_role_scoped_without_raw_to
     assert "raw-route-token-secret" not in serialized_control_plane
     assert "fence-runtime-context" not in serialized_control_plane
     assert worker_view["capability_boundary"]["role"] == "mf_sub"
+    lease = worker_view["session_token_lease"]
+    assert lease["has_lease"] is True
+    assert lease["status"] == "active"
+    assert lease["expired"] is False
+    assert lease["lease_expires_at"] == "2999-01-01T00:00:00Z"
+    assert lease["lease_remaining_ttl_seconds"] > 0
+    assert lease["renewal_supported"] is True
+    assert lease["raw_session_token_persisted"] is False
+    graph_payload = worker_view["graph_query_identity"]["payload_shape"]
+    assert graph_payload["target_project_root"] == "/repo"
+    assert graph_payload["project_root"] == "/repo"
+    assert graph_payload["repo_root"] == "/repo"
+    assert graph_payload["route_identity"]["route_token_ref"] == "rtok-runtime-context"
 
 
 def test_runtime_context_distinguishes_terminal_complete_from_merge_eligible() -> None:
@@ -2820,6 +2838,228 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
                 fence_token="fence-startup",
                 session_token=supplied_token,
             )
+
+
+def test_mf_sub_runtime_session_token_expiry_reports_bounded_reissue_hint(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    target_root = tmp_path / "expired-session-target"
+    target_root.mkdir()
+    expired_context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            governance_project_id=PROJECT_ID,
+            target_project_id=PROJECT_ID,
+            target_project_root=str(target_root),
+            task_id="mf-sub-expired-session",
+            root_task_id="parent-expired-session",
+            stage_task_id="mf-sub-expired-session",
+            worker_id="worker-expired-session",
+            worker_slot_id="worker-expired-session",
+            branch_ref="refs/heads/codex/mf-sub-expired-session",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-expired-session",
+            session_token_hash=mf_subagent_session_token_hash("expired-session-token"),
+            lease_id="lease-expired-session",
+            lease_expires_at="2000-01-01T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(BranchRuntimeFenceError) as expired:
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=expired_context.runtime_context_id,
+            task_id="",
+            parent_task_id="parent-expired-session",
+            worker_role="mf_sub",
+            fence_token="fence-expired-session",
+            session_token="expired-session-token",
+            target_project_root=str(target_root),
+        )
+
+    assert str(expired.value) == "runtime_session_token_expired"
+    details = expired.value.details
+    assert details["reason"] == "runtime_session_token_expired"
+    assert details["session_token_lease"]["expired"] is True
+    assert details["session_token_lease"]["raw_session_token_persisted"] is False
+    assert details["renewal"]["available"] is True
+    assert details["renewal"]["max_ttl_seconds"] == MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS
+    assert "session_token" in details["renewal"]["required_body_fields"]
+
+    with pytest.raises(BranchRuntimeFenceError) as wrong_token:
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=expired_context.runtime_context_id,
+            task_id="",
+            parent_task_id="parent-expired-session",
+            worker_role="mf_sub",
+            fence_token="fence-expired-session",
+            session_token="wrong-session-token",
+            target_project_root=str(target_root),
+        )
+
+    assert str(wrong_token.value) == "fence_invalidated_or_unknown"
+    assert getattr(wrong_token.value, "details", {}) == {}
+
+
+def test_reissue_mf_sub_runtime_session_token_rotates_hash_and_fails_closed(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    target_root = tmp_path / "reissue-session-target"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            governance_project_id=PROJECT_ID,
+            target_project_id=PROJECT_ID,
+            target_project_root=str(target_root),
+            task_id="mf-sub-reissue-session",
+            root_task_id="parent-reissue-session",
+            stage_task_id="mf-sub-reissue-session",
+            backlog_id="BUG-REISSUE-SESSION",
+            worker_id="worker-reissue-session",
+            worker_slot_id="slot-reissue-session",
+            branch_ref="refs/heads/codex/mf-sub-reissue-session",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-reissue-session",
+            session_token_hash=mf_subagent_session_token_hash("old-reissue-token"),
+            lease_id="lease-old-reissue",
+            lease_expires_at="2000-01-01T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    result = reissue_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        task_id="mf-sub-reissue-session",
+        parent_task_id="parent-reissue-session",
+        fence_token="fence-reissue-session",
+        session_token="old-reissue-token",
+        target_project_root=str(target_root),
+        ttl_seconds=999999,
+        now_iso="2999-01-01T00:00:00Z",
+    )
+
+    assert result["ok"] is True
+    assert result["ttl_seconds"] == MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS
+    assert result["expires_at"] == "2999-01-01T02:00:00Z"
+    assert result["session_token_persisted"] is False
+    assert result["raw_session_token_persisted"] is False
+    assert result["session_token_lease"]["lease_remaining_ttl_seconds"] == (
+        MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS
+    )
+    new_token = result["session_token"]
+    saved = get_branch_context(conn, PROJECT_ID, "mf-sub-reissue-session")
+    assert saved is not None
+    assert saved.session_token_hash == mf_subagent_session_token_hash(new_token)
+    assert saved.session_token_hash != mf_subagent_session_token_hash("old-reissue-token")
+    assert saved.lease_id.startswith("mfrlease-")
+
+    with pytest.raises(BranchRuntimeFenceError):
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=context.runtime_context_id,
+            task_id="",
+            parent_task_id="parent-reissue-session",
+            worker_role="mf_sub",
+            fence_token="fence-reissue-session",
+            session_token="old-reissue-token",
+            target_project_root=str(target_root),
+        )
+    accepted = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        task_id="",
+        parent_task_id="parent-reissue-session",
+        worker_role="mf_sub",
+        fence_token="fence-reissue-session",
+        session_token=new_token,
+        target_project_root=str(target_root),
+    )
+    assert accepted.task_id == "mf-sub-reissue-session"
+
+    for bad_request in (
+        {"fence_token": "wrong-fence", "session_token": new_token},
+        {"fence_token": "fence-reissue-session", "session_token": "wrong-token"},
+        {"target_project_root": str(target_root / "other"), "session_token": new_token},
+    ):
+        with pytest.raises(BranchRuntimeFenceError):
+            reissue_mf_subagent_runtime_session_token(
+                conn,
+                project_id=PROJECT_ID,
+                runtime_context_id=context.runtime_context_id,
+                task_id="mf-sub-reissue-session",
+                parent_task_id="parent-reissue-session",
+                fence_token=bad_request.get("fence_token", "fence-reissue-session"),
+                session_token=bad_request["session_token"],
+                target_project_root=bad_request.get("target_project_root", str(target_root)),
+            )
+
+    closed = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            target_project_root=str(target_root),
+            task_id="mf-sub-reissue-closed",
+            root_task_id="parent-reissue-session",
+            stage_task_id="mf-sub-reissue-closed",
+            worker_id="worker-reissue-closed",
+            branch_ref="refs/heads/codex/mf-sub-reissue-closed",
+            status=STATE_MERGE_FAILED,
+            fence_token="fence-reissue-closed",
+            session_token_hash=mf_subagent_session_token_hash("closed-token"),
+            lease_id="lease-closed",
+            lease_expires_at="2000-01-01T00:00:00Z",
+        ),
+    )
+    with pytest.raises(BranchRuntimeFenceError):
+        reissue_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=closed.runtime_context_id,
+            task_id="mf-sub-reissue-closed",
+            parent_task_id="parent-reissue-session",
+            fence_token="fence-reissue-closed",
+            session_token="closed-token",
+            target_project_root=str(target_root),
+        )
+
+
+def test_runtime_session_token_lease_view_reports_remaining_ttl_without_raw_token() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-lease-view",
+        branch_ref="refs/heads/codex/mf-sub-lease-view",
+        status=STATE_RUNNING,
+        fence_token="fence-lease-view",
+        session_token_hash=mf_subagent_session_token_hash("lease-view-token"),
+        lease_id="lease-view",
+        lease_expires_at="2026-06-16T13:00:00Z",
+    )
+
+    lease = runtime_context_session_token_lease_view(
+        context,
+        now_iso="2026-06-16T12:15:00Z",
+    )
+
+    assert lease["has_lease"] is True
+    assert lease["status"] == "active"
+    assert lease["expired"] is False
+    assert lease["lease_remaining_ttl_seconds"] == 2700
+    assert lease["renewal_supported"] is True
+    assert lease["raw_session_token_exposed"] is False
+    assert lease["raw_session_token_persisted"] is False
 
 
 def test_startup_bridges_launch_text_hash_read_receipt_without_close_satisfying(

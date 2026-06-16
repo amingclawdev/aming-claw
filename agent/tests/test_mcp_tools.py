@@ -405,10 +405,11 @@ def test_mcp_protected_mutations_forward_route_token_or_waiver():
 
 
 def test_mcp_protected_write_schemas_expose_route_gate_payloads():
-    for name in ("backlog_upsert", "backlog_close", "task_timeline_append"):
+    for name in ("backlog_upsert", "backlog_close", "backlog_audit_archive", "task_timeline_append"):
         properties = _tool_properties(name)
 
         assert properties["route_token"]["type"] == "object"
+        assert properties["route_token_ref"]["type"] == "string"
         assert properties["route_waiver"]["type"] == "object"
         assert properties["route_token_waiver"]["type"] == "object"
 
@@ -435,6 +436,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
         "reason": "Operator approved a bounded manual-fix route gate waiver.",
         "timeline_evidence": {"event_id": 42},
     }
+    route_token_ref = "rtok-protected-write"
     backlog_upsert_waiver = {**route_waiver, "allowed_action": "backlog_upsert"}
     timeline_token = {**route_token, "allowed_action": "task_timeline_append"}
     backlog_close_token = {**route_token, "allowed_action": "backlog_close"}
@@ -447,6 +449,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
             "bug_id": "BUG-1",
             "status": "FIXED",
             "route_token": route_token,
+            "route_token_ref": route_token_ref,
             "route_waiver": backlog_upsert_waiver,
         },
     )
@@ -458,6 +461,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
             "event_type": "mf.verification",
             "event_kind": "verification",
             "route_token": timeline_token,
+            "route_token_ref": route_token_ref,
             "route_waiver": route_waiver,
         },
     )
@@ -468,6 +472,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
             "bug_id": "BUG-1",
             "commit": "abc1234",
             "route_token": backlog_close_token,
+            "route_token_ref": route_token_ref,
             "route_waiver": backlog_close_waiver,
         },
     )
@@ -479,6 +484,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
             {
                 "status": "FIXED",
                 "route_token": route_token,
+                "route_token_ref": route_token_ref,
                 "route_waiver": backlog_upsert_waiver,
             },
         ),
@@ -490,6 +496,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
                 "event_type": "mf.verification",
                 "event_kind": "verification",
                 "route_token": timeline_token,
+                "route_token_ref": route_token_ref,
                 "route_waiver": route_waiver,
             },
         ),
@@ -499,6 +506,7 @@ def test_mcp_protected_backlog_and_timeline_dispatch_forward_route_gate_payloads
             {
                 "commit": "abc1234",
                 "route_token": backlog_close_token,
+                "route_token_ref": route_token_ref,
                 "route_waiver": backlog_close_waiver,
             },
         ),
@@ -969,6 +977,30 @@ def test_mcp_graph_tools_route_to_governance_api():
     )
 
 
+def test_mcp_graph_query_schema_exposes_mf_sub_runtime_identity_fields():
+    properties = _tool_properties("graph_query")
+
+    for key in (
+        "runtime_context_id",
+        "target_project_root",
+        "project_root",
+        "repo_root",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token",
+        "session_token",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+        "route_identity",
+    ):
+        assert key in properties
+
+
 def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     allocate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_allocate")
     startup = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_startup")
@@ -1019,6 +1051,12 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "worker_role",
         "worker_id",
         "agent_id",
+        "actual_host_worker_id",
+        "worker_session_id",
+        "worker_transcript_ref",
+        "worker_transcript_path",
+        "harness_type",
+        "filer_principal",
         "session_token",
         "session_token_surrogate",
         "fence_token",
@@ -1036,6 +1074,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "route_context_hash",
         "prompt_contract_id",
         "prompt_contract_hash",
+        "route_token_ref",
         "visible_injection_manifest_hash",
     ):
         assert key in startup_props
@@ -1112,6 +1151,12 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
             "worker_role": "mf_sub",
             "worker_id": "worker-1",
             "agent_id": "agent-1",
+            "actual_host_worker_id": "host-worker-1",
+            "worker_session_id": "host-worker-1",
+            "worker_transcript_ref": "multi_agent:host-worker-1",
+            "worker_transcript_path": "/repo/transcripts/host-worker-1.jsonl",
+            "harness_type": "codex",
+            "filer_principal": "host-worker-1",
             "session_token_surrogate": "host-session:worker-1",
             "fence_token": "fence-1",
             "actual_cwd": "/repo/.worktrees/mf-sub-1",
@@ -1126,6 +1171,7 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
             "route_context_hash": "sha256:route",
             "prompt_contract_id": "rprompt-1",
             "prompt_contract_hash": "sha256:prompt",
+            "route_token_ref": "rtok-1",
             "visible_injection_manifest_hash": "sha256:visible",
         },
     )
@@ -1197,6 +1243,12 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
                 "worker_role": "mf_sub",
                 "worker_id": "worker-1",
                 "agent_id": "agent-1",
+                "actual_host_worker_id": "host-worker-1",
+                "worker_session_id": "host-worker-1",
+                "worker_transcript_ref": "multi_agent:host-worker-1",
+                "worker_transcript_path": "/repo/transcripts/host-worker-1.jsonl",
+                "harness_type": "codex",
+                "filer_principal": "host-worker-1",
                 "session_token_surrogate": "host-session:worker-1",
                 "fence_token": "fence-1",
                 "actual_cwd": "/repo/.worktrees/mf-sub-1",
@@ -1211,6 +1263,7 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
                 "route_context_hash": "sha256:route",
                 "prompt_contract_id": "rprompt-1",
                 "prompt_contract_hash": "sha256:prompt",
+                "route_token_ref": "rtok-1",
                 "visible_injection_manifest_hash": "sha256:visible",
             },
         ),

@@ -14,7 +14,7 @@ import sqlite3
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -296,6 +296,9 @@ ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
     STATE_WORKTREE_READY,
     STATE_RUNNING,
 }
+MF_SUBAGENT_SESSION_REISSUE_DEFAULT_TTL_SECONDS = 3600
+MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS = 7200
+MF_SUBAGENT_SESSION_REISSUE_MIN_TTL_SECONDS = 60
 MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION = "mf_subagent_startup_gate.v1"
 MF_SUBAGENT_STARTUP_REFUSAL_SCHEMA_VERSION = "mf_subagent_startup_refusal.v1"
 MF_SUBAGENT_HOST_ADAPTER_IDENTITY_SCHEMA_VERSION = (
@@ -451,6 +454,131 @@ def issue_mf_subagent_session_token(
         "delivery": "worker_host_envelope",
         "raw_token_persistence": "not_persisted",
     }
+
+
+def _runtime_context_parse_utc(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _runtime_context_now_dt(now_iso: str = "") -> datetime:
+    return _runtime_context_parse_utc(now_iso) or datetime.now(timezone.utc)
+
+
+def _runtime_context_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def runtime_context_session_token_lease_view(
+    context: "BranchTaskRuntimeContext",
+    *,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    now_dt = _runtime_context_now_dt(now_iso)
+    expires_dt = _runtime_context_parse_utc(context.lease_expires_at)
+    remaining: int | None = None
+    expired = False
+    if expires_dt is not None:
+        remaining = int((expires_dt - now_dt).total_seconds())
+        expired = remaining <= 0
+    has_lease = bool(context.lease_id or context.lease_expires_at)
+    renewal_supported = bool(
+        context.status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+        and context.session_token_hash
+        and context.fence_token
+    )
+    return {
+        "schema_version": "mf_subagent_runtime_session_token_lease.v1",
+        "has_lease": has_lease,
+        "lease_id": context.lease_id,
+        "lease_expires_at": context.lease_expires_at,
+        "lease_remaining_ttl_seconds": (
+            max(0, remaining) if remaining is not None else None
+        ),
+        "expired": expired,
+        "status": (
+            "expired"
+            if expired
+            else ("active" if has_lease else "no_lease_recorded")
+        ),
+        "renewal_supported": renewal_supported,
+        "renewal_max_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS,
+        "renewal_default_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_DEFAULT_TTL_SECONDS,
+        "renewal_endpoint": (
+            "/api/graph-governance/{project_id}/runtime-contexts/"
+            "{runtime_context_id}/session-token/reissue"
+        ),
+        "raw_session_token_exposed": False,
+        "raw_session_token_persisted": False,
+        "now": _runtime_context_iso(now_dt),
+    }
+
+
+def _runtime_session_token_expired_error(
+    context: "BranchTaskRuntimeContext",
+    *,
+    runtime_context_id: str = "",
+    now_iso: str = "",
+) -> BranchRuntimeFenceError:
+    runtime_id = runtime_context_id or runtime_context_id_for_branch_context(context)
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    return _graph_query_fence_error(
+        "runtime_session_token_expired",
+        details={
+            "runtime_context_id": runtime_id,
+            "task_id": context.task_id,
+            "parent_task_id": _parent_task_id_for_context(context),
+            "reason": "runtime_session_token_expired",
+            "session_token_lease": lease,
+            "renewal": {
+                "schema_version": "mf_subagent_session_token_reissue_hint.v1",
+                "available": bool(lease.get("renewal_supported")),
+                "method": "POST",
+                "path": (
+                    "/api/graph-governance/{project_id}/runtime-contexts/"
+                    "{runtime_context_id}/session-token/reissue"
+                ),
+                "required_body_fields": [
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "fence_token",
+                    "session_token",
+                    "target_project_root",
+                ],
+                "max_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS,
+                "raw_session_token_persisted": False,
+                "fail_closed_for": [
+                    "stale_context",
+                    "closed_context",
+                    "scope_mismatch",
+                    "wrong_fence",
+                    "wrong_session_token",
+                ],
+            },
+        },
+    )
+
+
+def _bounded_reissue_ttl_seconds(value: Any) -> int:
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = MF_SUBAGENT_SESSION_REISSUE_DEFAULT_TTL_SECONDS
+    return max(
+        MF_SUBAGENT_SESSION_REISSUE_MIN_TTL_SECONDS,
+        min(requested, MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS),
+    )
 
 
 class BranchRuntimeFenceError(ValueError):
@@ -2713,6 +2841,7 @@ def _runtime_context_current_values(
     startup_gate: Mapping[str, Any],
     finish_gate: Mapping[str, Any],
     close_evidence: Mapping[str, Any],
+    generated_at: str = "",
 ) -> dict[str, Any]:
     parent_task_id = _runtime_context_parent_task_id(context)
     checkpoint_id = context.checkpoint_id or _runtime_context_text(
@@ -2858,6 +2987,12 @@ def _runtime_context_current_values(
         "projection_id": context.projection_id,
         "merge_queue_id": context.merge_queue_id,
         "merge_preview_id": context.merge_preview_id,
+        "lease_id": context.lease_id,
+        "lease_expires_at": context.lease_expires_at,
+        "session_token_lease": runtime_context_session_token_lease_view(
+            context,
+            now_iso=generated_at,
+        ),
         "route_id": _runtime_context_text(route_identity.get("route_id")),
         "route_context_hash": _runtime_context_text(
             route_identity.get("route_context_hash")
@@ -2880,12 +3015,57 @@ def _runtime_context_current_values(
             "task_id": context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+            "runtime_context_id": runtime_context_id,
             "fence_token_hash": fence_token_hash,
             "fence_token_redacted": bool(context.fence_token),
             "governance_project_id": context.governance_project_id
             or context.project_id,
             "target_project_id": context.target_project_id or context.project_id,
             "target_project_root": context.target_project_root,
+            "project_root": context.target_project_root,
+            "repo_root": context.target_project_root,
+            "required_route_identity_fields": [
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
+            ],
+            "payload_shape": {
+                "project_id": context.project_id,
+                "tool": "<graph_query_tool>",
+                "args": {},
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "runtime_context_id": runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+                "target_project_root": context.target_project_root,
+                "project_root": context.target_project_root,
+                "repo_root": context.target_project_root,
+                "route_identity": {
+                    "route_id": _runtime_context_text(route_identity.get("route_id")),
+                    "route_context_hash": _runtime_context_text(
+                        route_identity.get("route_context_hash")
+                    ),
+                    "prompt_contract_id": _runtime_context_text(
+                        route_identity.get("prompt_contract_id")
+                    ),
+                    "prompt_contract_hash": _runtime_context_text(
+                        route_identity.get("prompt_contract_hash")
+                    ),
+                    "route_token_ref": _runtime_context_text(
+                        route_identity.get("route_token_ref")
+                    ),
+                    "visible_injection_manifest_hash": _runtime_context_text(
+                        route_identity.get("visible_injection_manifest_hash")
+                    ),
+                },
+                "raw_session_token_persisted": False,
+                "raw_fence_token_echoed": False,
+            },
         },
         "graph_trace_ids": list(graph_trace_refs.get("trace_ids") or []),
         "dispatch_event_ref": timeline_refs.get("dispatch_event_ref", ""),
@@ -3726,6 +3906,7 @@ def build_runtime_context_current_view(
         startup_gate=startup,
         finish_gate=finish,
         close_evidence=close,
+        generated_at=generated_at,
     )
     current_values["merge_queue_projection"] = public_contract_revision_payload(
         revision_payload.get("merge_queue_projection")
@@ -5638,6 +5819,11 @@ def build_runtime_context_worker_view(
                 "merge_queue_id",
                 "merge_preview_id",
             )
+        }
+        | {
+            "session_token_lease": dict(
+                _runtime_context_mapping(values.get("session_token_lease"))
+            ),
         },
         "route_identity": {
             key: _runtime_context_mapping(current_view.get("route_identity")).get(
@@ -5650,6 +5836,9 @@ def build_runtime_context_worker_view(
         | {"raw_private_context_exposed": False},
         "work": dict(_runtime_context_mapping(current_view.get("work"))),
         "graph_query_identity": values.get("graph_query_identity", {}),
+        "session_token_lease": dict(
+            _runtime_context_mapping(values.get("session_token_lease"))
+        ),
         "worker_execution_safety": dict(
             capability_boundary.get("worker_execution_safety") or {}
         ),
@@ -5693,6 +5882,7 @@ def build_runtime_context_worker_view(
                 "work",
                 "lane_plan",
                 "graph_query_identity",
+                "session_token_lease",
                 "worker_execution_safety",
                 "capability_boundary",
                 "next_required_evidence",
@@ -6048,6 +6238,112 @@ def get_branch_context_by_runtime_context_id(
         (project_id, runtime_id),
     ).fetchone()
     return _context_from_row(row) if row else None
+
+
+def reissue_mf_subagent_runtime_session_token(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    fence_token: str,
+    session_token: str,
+    parent_task_id: str = "",
+    target_project_root: str = "",
+    ttl_seconds: Any = None,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Rotate an mf_sub runtime session token for an active matching context.
+
+    This is a narrow recovery path for system-repair workers whose scoped token
+    lease expires. It accepts the expired-but-matching current token and never
+    persists the replacement token in clear text.
+    """
+
+    ensure_branch_runtime_schema(conn)
+    runtime_id = str(runtime_context_id or "").strip()
+    task = str(task_id or "").strip()
+    fence = str(fence_token or "").strip()
+    presented_token = str(session_token or "").strip()
+    if not runtime_id or not task or not fence or not presented_token:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
+    if context is None or not context.fence_token:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.task_id != task:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    try:
+        _require_current_fence(context, fence)
+    except BranchRuntimeFenceError as exc:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+    if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if not context.session_token_hash:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if mf_subagent_session_token_hash(presented_token) != context.session_token_hash:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    requested_target_root = _startup_path_text(target_project_root)
+    context_target_root = _startup_path_text(context.target_project_root)
+    if requested_target_root and context_target_root and requested_target_root != context_target_root:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    parent = str(parent_task_id or "").strip()
+    if parent:
+        allowed_parent_ids = {
+            value
+            for value in (
+                context.root_task_id,
+                context.chain_id,
+                context.stage_task_id,
+                context.task_id,
+                context.backlog_id,
+            )
+            if value
+        }
+        if allowed_parent_ids and parent not in allowed_parent_ids:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    ttl = _bounded_reissue_ttl_seconds(ttl_seconds)
+    now_dt = _runtime_context_now_dt(now_iso)
+    expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
+    new_token = secrets.token_urlsafe(32)
+    new_hash = mf_subagent_session_token_hash(new_token)
+    lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
+    saved = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            lease_id=lease_id,
+            lease_expires_at=expires_at,
+            session_token_hash=new_hash,
+            last_recovery_action="mf_subagent_session_token_reissued",
+        ),
+        now_iso=_runtime_context_iso(now_dt),
+    )
+    lease = runtime_context_session_token_lease_view(
+        saved,
+        now_iso=_runtime_context_iso(now_dt),
+    )
+    return {
+        "ok": True,
+        "schema_version": "mf_subagent_session_token_reissue_response.v1",
+        "status": "session_token_reissued",
+        "project_id": saved.project_id,
+        "runtime_context_id": runtime_id,
+        "task_id": saved.task_id,
+        "parent_task_id": _parent_task_id_for_context(saved),
+        "backlog_id": saved.backlog_id,
+        "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "worker_id": saved.worker_id,
+        "worker_slot_id": saved.worker_slot_id or saved.worker_id,
+        "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
+        "session_token": new_token,
+        "session_token_hash": new_hash,
+        "session_token_persisted": False,
+        "raw_session_token_persisted": False,
+        "ttl_seconds": ttl,
+        "expires_at": expires_at,
+        "session_token_lease": lease,
+    }
 
 
 def _contract_revision_from_row(row: sqlite3.Row) -> BranchRuntimeContractRevision:
@@ -6890,11 +7186,14 @@ def validate_mf_subagent_graph_query_identity(
 
     if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    if context.lease_expires_at and context.lease_expires_at < utc_now():
-        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    supplied_token_hash = ""
+    token_matches_context = False
     if context.session_token_hash:
         supplied_token_hash = mf_subagent_session_token_hash(session_token)
-        if not supplied_token_hash or supplied_token_hash != context.session_token_hash:
+        token_matches_context = bool(
+            supplied_token_hash and supplied_token_hash == context.session_token_hash
+        )
+        if not token_matches_context:
             latest_revision = get_latest_branch_contract_revision(
                 conn,
                 context.project_id,
@@ -6909,6 +7208,13 @@ def validate_mf_subagent_graph_query_identity(
                 context,
             ):
                 raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.lease_expires_at and context.lease_expires_at < utc_now():
+        if context.session_token_hash and token_matches_context:
+            raise _runtime_session_token_expired_error(
+                context,
+                runtime_context_id=runtime_id,
+            )
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     requested_target_project_id = str(target_project_id or query_project_id).strip()
     context_governance_project_id = context.governance_project_id or context.project_id
@@ -8665,12 +8971,21 @@ def validate_mf_subagent_runtime_context_lookup(
     allowed = set(allowed_statuses or ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES)
     if context.status not in allowed:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    if context.lease_expires_at and context.lease_expires_at < utc_now():
-        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    token_matches_context = False
     if context.session_token_hash:
         supplied_token_hash = mf_subagent_session_token_hash(session_token)
-        if not supplied_token_hash or supplied_token_hash != context.session_token_hash:
+        token_matches_context = bool(
+            supplied_token_hash and supplied_token_hash == context.session_token_hash
+        )
+        if not token_matches_context:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.lease_expires_at and context.lease_expires_at < utc_now():
+        if context.session_token_hash and token_matches_context:
+            raise _runtime_session_token_expired_error(
+                context,
+                runtime_context_id=runtime_id,
+            )
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     requested_target_project_id = str(target_project_id or query_project_id).strip()
     context_governance_project_id = context.governance_project_id or context.project_id

@@ -95,6 +95,7 @@ def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():
     backlog_close = next(tool for tool in tools if tool["name"] == "backlog_close")
     properties = backlog_close["inputSchema"]["properties"]
     assert "route_token" in properties
+    assert "route_token_ref" in properties
     assert "route_waiver" in properties
     assert "route_token_waiver" in properties
 
@@ -120,6 +121,7 @@ def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():
         "graph_snapshot",
     }.issubset(properties)
     assert "route_token" in properties
+    assert "route_token_ref" in properties
     assert "route_waiver" in properties
     assert "route_token_waiver" in properties
     assert audit_archive["inputSchema"]["required"] == [
@@ -149,6 +151,7 @@ def test_mcp_stdio_protected_write_schemas_expose_route_gate_fields():
     for name in ("backlog_upsert", "task_timeline_append"):
         properties = tools[name]["inputSchema"]["properties"]
         assert "route_token" in properties
+        assert "route_token_ref" in properties
         assert "route_waiver" in properties
         assert "route_token_waiver" in properties
 
@@ -162,9 +165,17 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
     assert stderr == ""
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
     properties = tools["parallel_branch_startup"]["inputSchema"]["properties"]
-    assert "route_token_ref" in properties
-    assert "read_receipt_hash" in properties
-    assert "read_receipt_event_id" in properties
+    assert {
+        "actual_host_worker_id",
+        "worker_session_id",
+        "worker_transcript_ref",
+        "worker_transcript_path",
+        "harness_type",
+        "filer_principal",
+        "route_token_ref",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+    }.issubset(properties)
 
 
 def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():
@@ -334,6 +345,7 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
             "commit": "abc123",
             "actor": "observer",
             "route_token": route_token,
+            "route_token_ref": "rtok-close-test",
             "route_waiver": route_waiver,
         },
     )
@@ -347,6 +359,7 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
                 "commit": "abc123",
                 "actor": "observer",
                 "route_token": route_token,
+                "route_token_ref": "rtok-close-test",
                 "route_waiver": route_waiver,
             },
         )
@@ -470,6 +483,7 @@ def test_mcp_protected_write_dispatch_forwards_route_gate_payloads():
             "bug_id": "BUG-ROUTE",
             "status": "FIXED",
             "route_token": route_token,
+            "route_token_ref": "rtok-upsert-test",
         },
     )
     dispatcher.dispatch(
@@ -479,6 +493,7 @@ def test_mcp_protected_write_dispatch_forwards_route_gate_payloads():
             "backlog_id": "BUG-ROUTE",
             "event_type": "mf.verification",
             "event_kind": "verification",
+            "route_token_ref": "rtok-timeline-test",
             "route_waiver": route_waiver,
         },
     )
@@ -487,7 +502,11 @@ def test_mcp_protected_write_dispatch_forwards_route_gate_payloads():
         (
             "POST",
             "/api/backlog/aming-claw/BUG-ROUTE",
-            {"status": "FIXED", "route_token": route_token},
+            {
+                "status": "FIXED",
+                "route_token": route_token,
+                "route_token_ref": "rtok-upsert-test",
+            },
         ),
         (
             "POST",
@@ -496,6 +515,7 @@ def test_mcp_protected_write_dispatch_forwards_route_gate_payloads():
                 "backlog_id": "BUG-ROUTE",
                 "event_type": "mf.verification",
                 "event_kind": "verification",
+                "route_token_ref": "rtok-timeline-test",
                 "route_waiver": route_waiver,
             },
         ),
@@ -561,6 +581,12 @@ def test_mcp_parallel_branch_startup_forwards_read_receipt_bridge_fields():
         {
             "project_id": "aming-claw",
             "task_id": "AC-STARTUP",
+            "actual_host_worker_id": "host-session-2963",
+            "worker_session_id": "host-session-2963",
+            "worker_transcript_ref": "multi_agent:host-session-2963",
+            "worker_transcript_path": "/tmp/host-session-2963.jsonl",
+            "harness_type": "codex",
+            "filer_principal": "host-session-2963",
             "route_token_ref": "timeline_event:2966;service_event:2967",
             "read_receipt_hash": "sha256:read-receipt",
             "read_receipt_event_id": "2963",
@@ -574,6 +600,12 @@ def test_mcp_parallel_branch_startup_forwards_read_receipt_bridge_fields():
             "/api/graph-governance/aming-claw/parallel-branches/startup",
             {
                 "task_id": "AC-STARTUP",
+                "actual_host_worker_id": "host-session-2963",
+                "worker_session_id": "host-session-2963",
+                "worker_transcript_ref": "multi_agent:host-session-2963",
+                "worker_transcript_path": "/tmp/host-session-2963.jsonl",
+                "harness_type": "codex",
+                "filer_principal": "host-session-2963",
                 "route_token_ref": "timeline_event:2966;service_event:2967",
                 "read_receipt_hash": "sha256:read-receipt",
                 "read_receipt_event_id": "2963",

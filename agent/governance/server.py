@@ -5214,6 +5214,13 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         exc_details = getattr(exc, "details", None)
         if isinstance(exc_details, Mapping):
             details.update(exc_details)
+        if reason == "runtime_session_token_expired":
+            raise GovernanceError(
+                "runtime_session_token_expired",
+                "mf_subagent runtime session token lease has expired",
+                403,
+                details,
+            ) from exc
         raise GovernanceError(
             "fence_invalidated_or_unknown",
             "mf_subagent graph query fence is invalidated or unknown",
@@ -6656,6 +6663,21 @@ def _runtime_context_projection_response(
         content_address,
         nodes_read,
     )
+    worker_view_for_summary = (
+        exposed_views.get("worker_view")
+        if isinstance(exposed_views.get("worker_view"), Mapping)
+        else {}
+    )
+    branch_view_for_summary = (
+        worker_view_for_summary.get("branch")
+        if isinstance(worker_view_for_summary.get("branch"), Mapping)
+        else {}
+    )
+    session_token_lease = dict(
+        worker_view_for_summary.get("session_token_lease")
+        or branch_view_for_summary.get("session_token_lease")
+        or {}
+    )
     audit = record_runtime_context_access_audit(
         conn,
         project_id=context_project_id,
@@ -6683,6 +6705,7 @@ def _runtime_context_projection_response(
         "task_id": getattr(context, "task_id", ""),
         "role_scope": role_scope,
         "view": view_name,
+        "session_token_lease": session_token_lease,
         "runtime_context_service": {
             "schema_version": projection.get("schema_version"),
             "project_id": projection.get("project_id"),
@@ -6738,6 +6761,12 @@ def _runtime_context_worker_guide_response(
         or {}
     )
     graph_identity = dict(worker_view.get("graph_query_identity") or {})
+    branch_view = worker_view.get("branch") if isinstance(worker_view.get("branch"), Mapping) else {}
+    session_token_lease = dict(
+        worker_view.get("session_token_lease")
+        or branch_view.get("session_token_lease")
+        or {}
+    )
     task = dict(worker_view.get("task") or {})
     route_identity = dict(worker_view.get("route_identity") or {})
     runtime_context_id = str(current_state_response.get("runtime_context_id") or "")
@@ -6875,6 +6904,34 @@ def _runtime_context_worker_guide_response(
             ],
             "auth": _auth_guide("query.session_token"),
         },
+        "session_token_reissue": {
+            "method": "POST",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/session-token/reissue"
+            ),
+            "facade_status": "available",
+            "required_body_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "fence_token",
+                "session_token",
+                "target_project_root",
+            ],
+            "ttl_policy": {
+                "default_ttl_seconds": session_token_lease.get(
+                    "renewal_default_ttl_seconds"
+                ),
+                "max_ttl_seconds": session_token_lease.get("renewal_max_ttl_seconds"),
+                "raw_session_token_persisted": False,
+            },
+            "failure_policy": (
+                "stale, closed, scope-mismatched, wrong-fence, and wrong-token "
+                "requests fail closed"
+            ),
+            "auth": _auth_guide("body.session_token"),
+        },
     }
     write_guides = {
         "read_receipt": {
@@ -6925,6 +6982,10 @@ def _runtime_context_worker_guide_response(
                 "fence_token",
                 "session_token",
                 "target_project_root",
+                "worker_session_id",
+                "worker_transcript_ref or worker_transcript_path",
+                "harness_type",
+                "filer_principal",
             ],
             "auth": _auth_guide("body.session_token"),
         },
@@ -7140,8 +7201,19 @@ def _runtime_context_worker_guide_response(
                 "target_project_root": graph_identity.get("target_project_root") or "",
                 "fence_token_hash": graph_identity.get("fence_token_hash") or "",
                 "fence_token_redacted": True,
+                "project_root": graph_identity.get("project_root")
+                or graph_identity.get("target_project_root")
+                or "",
+                "repo_root": graph_identity.get("repo_root")
+                or graph_identity.get("target_project_root")
+                or "",
+                "required_route_identity_fields": list(
+                    graph_identity.get("required_route_identity_fields") or []
+                ),
+                "payload_shape": dict(graph_identity.get("payload_shape") or {}),
             },
             "route_identity": route_identity,
+            "session_token_lease": session_token_lease,
             "worker_execution_safety": worker_execution_safety,
             "capability_boundary_hash": capability_boundary.get(
                 "capability_boundary_hash",
@@ -7158,6 +7230,7 @@ def _runtime_context_worker_guide_response(
                     control_plane.get("close_precheck_gap_projection") or {}
                 ),
                 "worker_execution_safety": worker_execution_safety,
+                "session_token_lease": session_token_lease,
             },
             "blocked_actions": [
                 "author_worker_evidence_as_observer",
@@ -7178,6 +7251,17 @@ def _runtime_context_worker_guide_response(
                     "id": "refresh_current_state",
                     "action": "read_current_state_before_each_evidence_write",
                     "endpoint": "current_state",
+                },
+                {
+                    "id": "reissue_runtime_session_token",
+                    "action": "session_token_reissue",
+                    "endpoint": "session_token_reissue",
+                    "status": (
+                        "available"
+                        if session_token_lease.get("renewal_supported")
+                        else "not_available"
+                    ),
+                    "lease": session_token_lease,
                 },
             ],
         },
@@ -7329,24 +7413,36 @@ def _runtime_context_validate_mf_sub_lookup(
             ),
         )
     except BranchRuntimeFenceError as exc:
+        reason = str(exc) or "fence_invalidated_or_unknown"
+        details = {
+            "runtime_context_id": runtime_context_id,
+            "governance_project_id": (
+                _runtime_context_request_value(ctx, "governance_project_id")
+                or _runtime_context_request_value(ctx, "backlog_project_id")
+                or project_id
+            ),
+            "target_project_id": (
+                _runtime_context_request_value(ctx, "target_project_id")
+                or _runtime_context_request_value(ctx, "graph_project_id")
+                or project_id
+            ),
+            "reason": reason,
+        }
+        exc_details = getattr(exc, "details", None)
+        if isinstance(exc_details, Mapping):
+            details.update(exc_details)
+        if reason == "runtime_session_token_expired":
+            raise GovernanceError(
+                "runtime_session_token_expired",
+                "mf_subagent runtime session token lease has expired",
+                403,
+                details,
+            ) from exc
         raise GovernanceError(
             "fence_invalidated_or_unknown",
             "mf_subagent runtime context fence is invalidated or unknown",
             403,
-            {
-                "runtime_context_id": runtime_context_id,
-                "governance_project_id": (
-                    _runtime_context_request_value(ctx, "governance_project_id")
-                    or _runtime_context_request_value(ctx, "backlog_project_id")
-                    or project_id
-                ),
-                "target_project_id": (
-                    _runtime_context_request_value(ctx, "target_project_id")
-                    or _runtime_context_request_value(ctx, "graph_project_id")
-                    or project_id
-                ),
-                "reason": "fence_invalidated_or_unknown",
-            },
+            details,
         ) from exc
     resolved_runtime_context_id = runtime_context_id_for_branch_context(context)
     if resolved_runtime_context_id != runtime_context_id:
@@ -7982,6 +8078,86 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
         state_ctx
     )
     return _runtime_context_worker_guide_response(current_state)
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/reissue")
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/renew")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/reissue")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/renew")
+def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestContext):
+    """Rotate an active mf_sub runtime session token after matching-token proof."""
+    project_id = ctx.get_project_id()
+    runtime_context_id = str(
+        ctx.path_params.get("runtime_context_id")
+        or _runtime_context_request_value(ctx, "runtime_context_id")
+        or ""
+    ).strip()
+    if not runtime_context_id:
+        raise ValidationError("runtime_context_id is required")
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        from .parallel_branch_runtime import (
+            BranchRuntimeFenceError,
+            reissue_mf_subagent_runtime_session_token,
+        )
+        from . import task_timeline
+
+        try:
+            result = reissue_mf_subagent_runtime_session_token(
+                conn,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=str(body.get("task_id") or "").strip(),
+                parent_task_id=str(body.get("parent_task_id") or "").strip(),
+                fence_token=str(body.get("fence_token") or "").strip(),
+                session_token=str(body.get("session_token") or "").strip(),
+                target_project_root=str(
+                    body.get("target_project_root")
+                    or body.get("project_root")
+                    or body.get("repo_root")
+                    or ""
+                ).strip(),
+                ttl_seconds=body.get("ttl_seconds"),
+            )
+        except BranchRuntimeFenceError as exc:
+            raise GovernanceError(
+                "fence_invalidated_or_unknown",
+                "mf_subagent session token reissue requires active matching runtime/fence/session identity",
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": str(body.get("task_id") or ""),
+                    "parent_task_id": str(body.get("parent_task_id") or ""),
+                    "reason": str(exc) or "fence_invalidated_or_unknown",
+                    "fail_closed": True,
+                },
+            ) from exc
+
+        audit_payload = {
+            key: value
+            for key, value in result.items()
+            if key not in {"session_token"}
+        }
+        audit_payload["raw_session_token_persisted"] = False
+        audit_event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            task_id=str(result.get("task_id") or ""),
+            backlog_id=str(result.get("backlog_id") or ""),
+            event_type="mf_subagent.session_token_reissue",
+            event_kind="mf_subagent_session_token_reissue",
+            phase="runtime_context_recovery",
+            status="accepted",
+            actor=str(body.get("actor") or result.get("principal_id") or "mf_sub"),
+            payload=audit_payload,
+        )
+        conn.commit()
+        result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"
+        result["audit_event_id"] = audit_event.get("id", "")
+        return result
+    finally:
+        conn.close()
 
 
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/read-receipts")
@@ -21337,6 +21513,7 @@ def _publish_current_task_changed(
 _ROUTE_TOKEN_TASK_CREATE_TYPES = {"dev", "test", "qa", "gatekeeper", "merge", "deploy"}
 _ROUTE_GATE_PAYLOAD_KEYS = (
     "route_token",
+    "route_token_ref",
     "route_waiver",
     "route_token_waiver",
     "protected_route_waiver",
@@ -21348,6 +21525,8 @@ def _body_with_metadata_route_gate(body: dict, metadata: dict | None = None) -> 
     if isinstance(metadata, dict):
         if not payload.get("route_token") and metadata.get("route_token"):
             payload["route_token"] = metadata.get("route_token")
+        if not payload.get("route_token_ref") and metadata.get("route_token_ref"):
+            payload["route_token_ref"] = metadata.get("route_token_ref")
         if not payload.get("route_waiver") and metadata.get("route_waiver"):
             payload["route_waiver"] = metadata.get("route_waiver")
         if not payload.get("route_token_waiver") and metadata.get("route_token_waiver"):
@@ -27766,22 +27945,40 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             contract = _mf_close_contract_with_route_context(contract, row, ctx.query)
             verification = _mf_close_gate_verification(events, contract=contract)
         else:
+            repair_reason = {
+                "code": "timeline_gate_not_applicable",
+                "reason": applicable["reason"],
+                "message": (
+                    "This row is not eligible for ordinary MF timeline close; "
+                    "do not report can_close=true."
+                ),
+                "next_legal_action": (
+                    "Use the row's appropriate workflow, or have the observer "
+                    "classify a separate audited recovery path without emitting "
+                    "close_ready/can_close success."
+                ),
+            }
             verification = {
                 "schema_version": "mf_close_timeline_gate.v1",
-                "passed": True,
+                "passed": False,
+                "can_close": False,
                 "status": "not_applicable",
+                "applicable": False,
+                "reason": applicable["reason"],
+                "repair_reasons": [repair_reason],
+                "next_legal_actions": [repair_reason["next_legal_action"]],
                 "required_event_kinds": sorted(task_timeline.MF_CLOSE_REQUIRED_EVENT_KINDS),
                 "present_event_kinds": [],
                 "missing_event_kinds": [],
                 "event_count": len(events),
                 "ignored_required_events": [],
                 "checks": {
-                    "has_implementation": True,
-                    "has_verification": True,
-                    "has_close_ready": True,
+                    "has_implementation": False,
+                    "has_verification": False,
+                    "has_close_ready": False,
                 },
             }
-        can_close = bool(verification.get("passed"))
+        can_close = bool(applicable["is_mf"] and verification.get("passed"))
         audit_archive = _backlog_row_audit_archive(row)
         if audit_archive:
             verification = dict(verification)
