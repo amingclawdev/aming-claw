@@ -1539,6 +1539,38 @@ class TestTaskTimeline(unittest.TestCase):
         )
         self.assertEqual(result["close_gate_projection"]["missing_event_kinds"], ["close_ready"])
 
+    def test_root_route_context_next_action_skips_already_applied_cleanup(self):
+        from agent.governance import server
+
+        route_gate = {
+            "missing_requirement_ids": [],
+            "ignored_route_events": [
+                {"id": 5097, "reason": "superseded_route_identity"},
+            ],
+            "route_identity_cleanup": {
+                "applied": True,
+                "event": {"id": 5097},
+                "route_identity": ROUTE_IDENTITY,
+            },
+        }
+        close_gate = {
+            "missing_event_kinds": ["implementation"],
+            "cross_ref_gate": {"passed": True},
+            "close_timeline_startup_gate": {},
+            "checks": {},
+        }
+
+        steps = server._observer_root_route_close_gate_steps(close_gate, route_gate)
+        step_ids = [step["id"] for step in steps]
+        next_action = server._observer_root_route_next_legal_action_from_steps(
+            steps,
+            default={"id": "close_ready", "action": "record_close_ready"},
+        )
+
+        self.assertNotIn("route_identity_cleanup", step_ids)
+        self.assertEqual(step_ids[0], "implementation")
+        self.assertEqual(next_action["id"], "implementation")
+
     def test_root_route_context_multi_attempts_request_lineage_bridge_not_dispatch(self):
         from agent.governance import observer_session, server
 
@@ -8253,6 +8285,77 @@ def _cross_ref_worker_bridge_fixture():
     return row_identity, root_task, worker_implementation, bridge
 
 
+def _cross_ref_unproven_child_route_fixture():
+    canonical = {
+        **ROUTE_IDENTITY,
+        "route_id": "event.route_prompt_context.preview",
+        "visible_injection_manifest_hash": _fake_sha("canonical-parent-route"),
+    }
+    child = {
+        "route_id": "route-worker-a-child",
+        "route_context_hash": _fake_sha("worker-a-child-route-context"),
+        "prompt_contract_id": "rprompt-worker-a-child",
+        "prompt_contract_hash": _fake_sha("worker-a-child-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("worker-a-child-visible"),
+        "route_token_ref": "rtok-worker-a",
+    }
+    row_identity = {
+        "backlog_id": "AC-ROUTE-TOKEN-CHILD",
+        "project_id": "aming-claw",
+        "route_id": canonical["route_id"],
+        "prompt_contract_id": canonical["prompt_contract_id"],
+    }
+    cleanup = {
+        "id": 20,
+        "event_kind": "route_identity_cleanup",
+        "phase": "identity_recovery",
+        "status": "accepted",
+        "backlog_id": row_identity["backlog_id"],
+        "project_id": row_identity["project_id"],
+        "payload": {"route_identity_cleanup": {**canonical, "applied": True}},
+    }
+    route_context_gate = {
+        "passed": True,
+        "route_identity": canonical,
+        "route_identity_cleanup": {
+            "applied": True,
+            "event": {"id": cleanup["id"]},
+            "route_identity": canonical,
+        },
+    }
+    root_close = {
+        "id": 21,
+        "event_kind": "close_ready",
+        "phase": "close",
+        "status": "accepted",
+        "backlog_id": row_identity["backlog_id"],
+        "project_id": row_identity["project_id"],
+        "task_id": "root-task",
+        "payload": {**canonical, "observer_command_id": "cmd-root-route"},
+    }
+    worker_implementation = {
+        "id": 22,
+        "event_type": "mf.implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "actor": "mf-sub",
+        "status": "accepted",
+        "backlog_id": row_identity["backlog_id"],
+        "project_id": row_identity["project_id"],
+        "task_id": "worker-a-task",
+        "payload": {
+            **child,
+            "parent_task_id": row_identity["backlog_id"],
+            "runtime_context_id": "mfrctx-worker-a",
+            "fence_token": "fence-worker-a",
+            "worker_slot_id": "worker-a",
+            "observer_command_id": "cmd-root-route",
+            "allowed_action": "task_timeline_append",
+        },
+    }
+    return row_identity, route_context_gate, cleanup, root_close, worker_implementation
+
+
 def test_close_gate_rejects_worker_scoped_implementation_without_cross_ref_bridge():
     from agent.governance import task_timeline
 
@@ -8268,6 +8371,86 @@ def test_close_gate_rejects_worker_scoped_implementation_without_cross_ref_bridg
     assert [item["id"] for item in rejected] == [11]
     assert rejected[0]["event_kind"] == "implementation"
     assert rejected[0]["reason"] == "cross_ref_identity_mismatch"
+
+
+def test_cross_ref_keeps_unproven_route_token_child_lineage_advisory():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is False
+    assert gate["accepted_route_token_child_lineages"] == []
+    assert [item["event_id"] for item in gate["advisory_route_token_child_lineages"]] == [22]
+    assert gate["bridged_lane_membership"] == []
+    rejected = gate["rejected_cross_ref_evidence"]
+    assert [item["id"] for item in rejected] == [22]
+    lineage = rejected[0]["route_token_child_lineage"]
+    assert lineage["advisory_only"] is True
+    assert lineage["accepted"] is False
+    assert lineage["registry_verified"] is False
+    assert lineage["event_scope_complete"] is True
+    assert "route_token_registry_proof" in lineage["missing_fields"]
+    assert lineage["close_satisfying_by_itself"] is False
+
+
+def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    cross_ref_gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "missing_event_kinds": [],
+        "event_count": 3,
+        "cross_ref_gate": cross_ref_gate,
+    }
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+    cross_ref = next(
+        item for item in repair["failed_gate_repairs"]
+        if item["gate"] == "cross_ref_gate"
+    )
+    assert cross_ref["missing_requirement_ids"] == []
+    assert cross_ref["rejected_event_ids"] == [22]
+    assert "route-token child lineage" in cross_ref["diagnosis"]
+    assert "registry-proof" in cross_ref["reasons"][0]
+    assert "registry-backed active token proof" in cross_ref["recommended_legal_action"]
+    skeleton = cross_ref["append_payload_skeleton"]
+    bridge_scope = skeleton["payload"]["bridge_scope"]
+    assert bridge_scope["manual_bridge_advisory_only"] is True
+    assert bridge_scope["close_satisfying_worker_evidence_required"] is True
+    assert bridge_scope["canonical_parent_route_scope"]["route_id"] == (
+        "event.route_prompt_context.preview"
+    )
+    assert bridge_scope["child_route_scope"]["route_id"] == "route-worker-a-child"
+    assert bridge_scope["command_scope"]["observer_command_id"] == "cmd-root-route"
+    assert "route_token_registry_proof" in bridge_scope[
+        "route_token_child_lineage"
+    ]["missing_fields"]
+
+    compact = task_timeline.compact_gate_summary(full_gate)
+    compact_cross_ref = next(
+        item for item in compact["failed_gates"]
+        if item["gate"] == "cross_ref_gate"
+    )
+    assert compact_cross_ref["missing_requirement_ids"] == []
+    assert compact_cross_ref["rejected_event_ids"] == [22]
+    assert "route-token child lineage" in compact_cross_ref["diagnosis"]
 
 
 def test_repair_gate_summary_explains_cross_ref_task_mismatch_with_empty_missing_ids():

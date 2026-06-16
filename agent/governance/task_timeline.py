@@ -4478,6 +4478,14 @@ MF_CROSS_REF_BRIDGE_ROUTE_FIELDS = (
     "route_context_hash",
     "prompt_contract_id",
 )
+MF_CROSS_REF_ROUTE_SCOPE_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
 MF_CROSS_REF_BRIDGE_COMMAND_FIELDS = {
     "observer_command_id",
     "command_id",
@@ -4507,12 +4515,71 @@ def _cross_ref_bridge_route_scope(event: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _cross_ref_bridge_command(event: dict[str, Any]) -> str:
-    return _first_event_string(event, MF_CROSS_REF_BRIDGE_COMMAND_FIELDS)
+    return _first_event_string(event, MF_CROSS_REF_BRIDGE_COMMAND_FIELDS) or str(
+        event.get("correlation_id") or ""
+    ).strip()
+
+
+def _cross_ref_public_route_scope(value: Any) -> dict[str, str]:
+    return {
+        field: token
+        for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS
+        if (token := _first_deep_text(value, field))
+    }
+
+
+def _cross_ref_merge_public_route_scope(
+    base: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> dict[str, str]:
+    merged = {
+        field: str(base.get(field) or "").strip()
+        for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS
+        if str(base.get(field) or "").strip()
+    }
+    for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS:
+        if not merged.get(field):
+            token = str(candidate.get(field) or "").strip()
+            if token:
+                merged[field] = token
+    return merged
+
+
+def _cross_ref_canonical_route_scope(
+    rows: list[Any],
+    route_context_gate: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Return the canonical parent route scope, preferring cleanup evidence."""
+
+    gate = _mapping(route_context_gate)
+    cleanup = _mapping(gate.get("route_identity_cleanup"))
+    cleanup_scope = _cross_ref_public_route_scope(cleanup.get("route_identity") or {})
+    cleanup_event = _mapping(cleanup.get("event"))
+    cleanup_event_id = str(cleanup_event.get("id") or cleanup_event.get("event_id") or "").strip()
+
+    selected_cleanup_scope: dict[str, str] = {}
+    for raw in rows:
+        event = _mapping(raw)
+        if not event or not _route_event_is_identity_cleanup(event):
+            continue
+        if cleanup_event_id and str(event.get("id") or event.get("event_id") or "").strip() != cleanup_event_id:
+            continue
+        if not _route_event_passed(event):
+            continue
+        selected_cleanup_scope = _cross_ref_public_route_scope(event)
+        if selected_cleanup_scope:
+            break
+
+    scope = _cross_ref_merge_public_route_scope(cleanup_scope, selected_cleanup_scope)
+    gate_identity = _cross_ref_public_route_scope(gate.get("route_identity") or {})
+    scope = _cross_ref_merge_public_route_scope(scope, gate_identity)
+    return scope
 
 
 def _cross_ref_row_anchor(
     rows: list[Any],
     trusted: dict[str, str] | None = None,
+    route_context_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     """Derive the row's backlog_id/project_id + accepted route + originating
     observer command. Used to SCOPE which bridge-declared sibling identities are
@@ -4542,6 +4609,10 @@ def _cross_ref_row_anchor(
         trusted_value = str(trusted.get(field) or "").strip()
         if trusted_value:
             anchor[field] = trusted_value
+    canonical_route_scope = _cross_ref_canonical_route_scope(rows, route_context_gate)
+    for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
+        if canonical_route_scope.get(field):
+            anchor[field] = canonical_route_scope[field]
     for raw in rows:
         event = _mapping(raw)
         if not is_protected_close_evidence(event):
@@ -4567,6 +4638,151 @@ def _cross_ref_row_anchor(
                 if anchor["task_id"]:
                     break
     return anchor
+
+
+def _cross_ref_route_token_child_lineage_diagnosis(
+    event: dict[str, Any],
+    anchor: Mapping[str, Any],
+    canonical_route_scope: Mapping[str, Any],
+) -> dict[str, Any]:
+    lane = _cross_ref_lane_identity(event)
+    row_backlog = str(anchor.get("backlog_id") or "").strip()
+    row_project = str(anchor.get("project_id") or "").strip()
+    parent_task_id = _first_deep_text(event, "parent_task_id")
+    runtime_context_id = _first_deep_text(event, "runtime_context_id")
+    worker_slot_id = (
+        _first_deep_text(event, "worker_slot_id")
+        or _first_deep_text(event, "worker_id")
+    )
+    route_scope = _cross_ref_public_route_scope(event)
+    command = _cross_ref_bridge_command(event)
+    missing: list[str] = []
+
+    if row_backlog and lane.get("backlog_id") and lane["backlog_id"] != row_backlog:
+        missing.append("row_backlog_id_match")
+    if row_project and lane.get("project_id") and lane["project_id"] != row_project:
+        missing.append("row_project_id_match")
+    if not route_scope.get("route_token_ref"):
+        missing.append("route_token_ref")
+    if not route_scope.get("route_id"):
+        missing.append("child_route_id")
+    if not route_scope.get("route_context_hash"):
+        missing.append("child_route_context_hash")
+    if not route_scope.get("prompt_contract_id"):
+        missing.append("child_prompt_contract_id")
+    if not parent_task_id:
+        missing.append("parent_task_id")
+    elif row_backlog and parent_task_id != row_backlog:
+        missing.append("parent_task_id_matches_root_backlog")
+    if not runtime_context_id:
+        missing.append("runtime_context_id")
+    if not worker_slot_id:
+        missing.append("worker_slot_id")
+    if not command:
+        missing.append("observer_command_id")
+    if not canonical_route_scope.get("route_context_hash"):
+        missing.append("canonical_parent_route_context_hash")
+    if not canonical_route_scope.get("prompt_contract_id"):
+        missing.append("canonical_parent_prompt_contract_id")
+    # Event payloads can describe child lineage but cannot prove the route-token
+    # registry state. Close-satisfying admission needs a server-side registry
+    # check that the active, non-superseded token ref belongs to this canonical
+    # parent and matches the worker lane.
+    missing.append("route_token_registry_proof")
+    event_scope_complete = missing == ["route_token_registry_proof"]
+
+    return {
+        "schema_version": "mf_cross_ref_route_token_child_lineage.v1",
+        "event_id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "accepted": False,
+        "registry_verified": False,
+        "event_scope_complete": event_scope_complete,
+        "advisory_only": True,
+        "missing_fields": missing,
+        "registry_proof_required": [
+            "active_non_superseded_route_token_ref",
+            "canonical_parent_backlog_id",
+            "worker_task_id",
+            "runtime_context_id",
+            "fence_token",
+            "worker_slot_id",
+            "allowed_action",
+            "canonical_parent_route_identity",
+            "child_route_identity",
+        ],
+        "lane_identity": lane,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "worker_slot_id": worker_slot_id,
+        "child_route_scope": route_scope,
+        "canonical_parent_route_scope": {
+            field: str(canonical_route_scope.get(field) or "").strip()
+            for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS
+            if str(canonical_route_scope.get(field) or "").strip()
+        },
+        "command_scope": {
+            key: value
+            for key, value in {
+                "observer_command_id": command,
+                "row_command": str(anchor.get("command") or "").strip(),
+            }.items()
+            if value
+        },
+        "reason": (
+            "route_token_child_lineage_unproven_registry"
+            if event_scope_complete
+            else "route_token_child_lineage_missing_required_scope"
+        ),
+        "close_satisfying_by_itself": False,
+    }
+
+
+def _cross_ref_route_token_child_diagnostics(
+    rows: list[Any],
+    anchor: dict[str, str],
+    route_context_gate: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return route-token child diagnostics without granting close membership.
+
+    ``task_timeline`` receives timeline events, not the authoritative route-token
+    registry. Self-declared child-route fields are therefore advisory until a
+    server-side registry check proves active/non-superseded token ownership.
+    """
+
+    gate = _mapping(route_context_gate)
+    cleanup = _mapping(gate.get("route_identity_cleanup"))
+    if not cleanup.get("applied"):
+        return []
+
+    canonical_route_scope = _cross_ref_canonical_route_scope(rows, gate)
+    if not canonical_route_scope:
+        return []
+
+    diagnostics: list[dict[str, Any]] = []
+    row_backlog = str(anchor.get("backlog_id") or "").strip()
+    row_project = str(anchor.get("project_id") or "").strip()
+
+    for raw in rows:
+        event = _mapping(raw)
+        if not event or not is_protected_close_evidence(event):
+            continue
+        lane = _cross_ref_lane_identity(event)
+        if row_backlog and lane.get("backlog_id") and lane["backlog_id"] != row_backlog:
+            continue
+        if row_project and lane.get("project_id") and lane["project_id"] != row_project:
+            continue
+        route_scope = _cross_ref_public_route_scope(event)
+        parent_task_id = _first_deep_text(event, "parent_task_id")
+        if not route_scope.get("route_token_ref") and not parent_task_id:
+            continue
+        diagnosis = _cross_ref_route_token_child_lineage_diagnosis(
+            event,
+            anchor,
+            canonical_route_scope,
+        )
+        diagnostics.append(diagnosis)
+    return diagnostics
 
 
 def _cross_ref_bridge_scope_membership(
@@ -4639,6 +4855,7 @@ def _cross_ref_bridge_scope_membership(
 def mf_close_cross_ref_gate_verification(
     events: list[dict[str, Any]] | None,
     row_identity: dict[str, Any] | None = None,
+    route_context_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reject close evidence refs from a different row. [regression #3090]
 
@@ -4734,8 +4951,22 @@ def mf_close_cross_ref_gate_verification(
     for field in ("backlog_id", "project_id"):
         if not trusted_anchor.get(field) and expected.get(field):
             trusted_anchor[field] = str(expected.get(field) or "").strip()
-    anchor = _cross_ref_row_anchor(rows, trusted_anchor)
+    anchor = _cross_ref_row_anchor(
+        rows,
+        trusted_anchor,
+        route_context_gate=route_context_gate,
+    )
     lane_membership = _cross_ref_bridge_scope_membership(rows, anchor)
+    advisory_route_token_child_lineages = _cross_ref_route_token_child_diagnostics(
+        rows,
+        anchor,
+        route_context_gate,
+    )
+    child_diagnostics_by_event_id = {
+        str(item.get("event_id") or ""): item
+        for item in advisory_route_token_child_lineages
+        if item.get("event_id") not in ("", None)
+    }
 
     rejected: list[dict[str, Any]] = []
     for event in rows:
@@ -4773,6 +5004,19 @@ def mf_close_cross_ref_gate_verification(
                 "mismatches": mismatches,
                 "event_ref_identity": identity,
                 "lane_identity": lane,
+                "event_route_scope": _cross_ref_public_route_scope(event),
+                "command_scope": {
+                    key: value
+                    for key, value in {
+                        "observer_command_id": _cross_ref_bridge_command(event),
+                        "row_command": str(anchor.get("command") or "").strip(),
+                    }.items()
+                    if value
+                },
+                "route_token_child_lineage": child_diagnostics_by_event_id.get(
+                    str(event.get("id") or event.get("event_id") or ""),
+                    {},
+                ),
             })
     passed = not rejected
     return {
@@ -4780,10 +5024,15 @@ def mf_close_cross_ref_gate_verification(
         "passed": passed,
         "status": "passed" if passed else "blocked",
         "row_identity": expected,
+        "row_anchor": anchor,
+        "canonical_route_scope": _cross_ref_canonical_route_scope(rows, route_context_gate),
         "bridged_identities": sorted(bridged),
         "bridged_lane_membership": sorted(
             {"|".join(key) for key in lane_membership}
         ),
+        "accepted_route_token_child_lineages": [],
+        "advisory_route_token_child_lineages": advisory_route_token_child_lineages,
+        "ignored_route_token_child_lineages": advisory_route_token_child_lineages,
         "rejected_cross_ref_evidence": rejected,
     }
 
@@ -5200,7 +5449,10 @@ def mf_close_gate_verification(
         contract,
     )
     blocker_resolution_gate = mf_blocker_resolution_gate_verification(rows)
-    cross_ref_gate = mf_close_cross_ref_gate_verification(rows)
+    cross_ref_gate = mf_close_cross_ref_gate_verification(
+        rows,
+        route_context_gate=route_context_gate,
+    )
     stale_route_evidence_gate = mf_stale_route_evidence_gate_verification(rows, contract)
     approval_scope_gate = mf_close_approval_scope_gate_verification(rows)
     command_disposition_gate = mf_close_command_disposition_gate_verification(rows)
@@ -5391,11 +5643,30 @@ def compact_gate_summary(
             continue
         if not bool(gate.get("passed")):
             missing_req = list(gate.get("missing_requirement_ids") or [])
-            failed_gates.append({
+            failed_gate = {
                 "gate": key,
                 "status": str(gate.get("status") or "failed"),
                 "missing_requirement_ids": missing_req,
-            })
+            }
+            try:
+                repair = _gate_repair_summary(key, gate)
+            except Exception:
+                repair = {}
+            if repair:
+                for field in (
+                    "diagnosis",
+                    "reasons",
+                    "rejected_event_ids",
+                    "relevant_event_ids",
+                    "recommended_legal_action",
+                    "suggested_event_kind",
+                    "append_payload_skeleton",
+                    "advisory_only",
+                ):
+                    value = repair.get(field)
+                    if value not in ("", [], {}, None):
+                        failed_gate[field] = value
+            failed_gates.append(failed_gate)
 
     # Route identity from route_context_gate
     route_ctx_gate = _mapping(full_result.get("route_context_gate"))
@@ -5586,9 +5857,45 @@ def _cross_ref_repair_diagnosis(
         )
 
     mismatch_fields: set[str] = set()
+    route_token_lineages: list[dict[str, Any]] = []
     for item in rejected:
         mismatch_fields.update(_mapping(item.get("mismatches")).keys())
+        lineage = _mapping(item.get("route_token_child_lineage"))
+        if lineage:
+            route_token_lineages.append(lineage)
 
+    if "task_id" in mismatch_fields and route_token_lineages:
+        missing_fields = _unique_compact_values(
+            [
+                field
+                for lineage in route_token_lineages
+                for field in _list(lineage.get("missing_fields"))
+                if str(field or "").strip()
+            ]
+        )
+        reason = (
+            "Rejected worker evidence declares route-token child lineage, but it is "
+            "missing bridge-matching or registry-proof scope: " + ", ".join(missing_fields)
+            if missing_fields
+            else (
+                "Rejected worker evidence declares route-token child lineage, but "
+                "the lane is not registry-proven under the canonical parent route."
+            )
+        )
+        return (
+            "route-token child lineage scope mismatch",
+            [
+                reason,
+                (
+                    "A cross-ref bridge can document the lineage, but it is "
+                    "advisory only; close still requires server-recorded worker "
+                    "evidence with route_token_ref, parent_task_id, runtime_context_id, "
+                    "worker_slot_id, observer command scope, canonical parent route "
+                    "scope, and registry-backed active token proof."
+                ),
+            ],
+            "cross_ref_lineage_bridge",
+        )
     if "task_id" in mismatch_fields:
         return (
             "task_id mismatch; missing lineage bridge",
@@ -5637,6 +5944,11 @@ def _cross_ref_append_payload_skeleton(
     first = rejected[0] if rejected else {}
     first_lane = _mapping(first.get("lane_identity"))
     mismatches = _mapping(first.get("mismatches"))
+    row_anchor = _mapping(gate.get("row_anchor"))
+    canonical_parent_route_scope = _mapping(gate.get("canonical_route_scope"))
+    child_route_scope = _mapping(first.get("event_route_scope"))
+    command_scope = _mapping(first.get("command_scope"))
+    route_token_lineage = _mapping(first.get("route_token_child_lineage"))
     expected_task = str(_mapping(mismatches.get("task_id")).get("expected") or "").strip()
     actual_task = str(_mapping(mismatches.get("task_id")).get("actual") or "").strip()
 
@@ -5664,9 +5976,62 @@ def _cross_ref_append_payload_skeleton(
     if row_identity.get("backlog_id"):
         payload["backlog_id"] = row_identity["backlog_id"]
     for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
-        value = row_identity.get(field)
+        value = (
+            row_identity.get(field)
+            or canonical_parent_route_scope.get(field)
+            or row_anchor.get(field)
+        )
         if value:
             payload[field] = value
+    bridge_command = (
+        command_scope.get("row_command")
+        or command_scope.get("observer_command_id")
+        or row_anchor.get("command")
+    )
+    if bridge_command:
+        payload["observer_command_id"] = bridge_command
+    payload["bridge_scope"] = {
+        "row_anchor": {
+            key: value
+            for key, value in row_anchor.items()
+            if value not in ("", None)
+        },
+        "canonical_parent_route_scope": {
+            key: value
+            for key, value in canonical_parent_route_scope.items()
+            if value not in ("", None)
+        },
+        "child_route_scope": {
+            key: value
+            for key, value in child_route_scope.items()
+            if value not in ("", None)
+        },
+        "command_scope": {
+            key: value
+            for key, value in command_scope.items()
+            if value not in ("", None)
+        },
+        "route_token_child_lineage": route_token_lineage,
+        "registry_proof_required": route_token_lineage.get("registry_proof_required")
+        or [
+            "active_non_superseded_route_token_ref",
+            "canonical_parent_backlog_id",
+            "worker_task_id",
+            "runtime_context_id",
+            "fence_token",
+            "worker_slot_id",
+            "allowed_action",
+            "canonical_parent_route_identity",
+            "child_route_identity",
+        ],
+        "manual_bridge_advisory_only": True,
+        "close_satisfying_worker_evidence_required": True,
+        "advisory_only_reason": (
+            "The bridge can explain lane lineage but does not replace "
+            "route-token-bound worker dispatch/startup/implementation evidence "
+            "or registry-backed active token proof."
+        ),
+    }
     if suggested_event_kind == "lineage_bridge" and rejected:
         actual_backlog = str(
             _mapping(_mapping(first.get("mismatches")).get("backlog_id")).get("actual") or ""
@@ -5695,8 +6060,12 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
         rejected_event_ids = _event_ids_from_items(rejected)
         relevant_event_ids = list(rejected_event_ids)
         recommended_action = (
-            "Record an accepted cross-ref lineage bridge for intentional sibling-lane evidence, "
-            "or remove/re-record the rejected evidence under the row's canonical identity."
+            "Prefer route-token canonical child lineage: re-record rejected worker "
+            "evidence with route_token_ref, parent_task_id/root backlog, runtime_context_id, "
+            "worker_slot_id, observer command scope, canonical parent route scope, "
+            "and registry-backed active token proof. "
+            "A cross-ref bridge skeleton is advisory and is not close-satisfying "
+            "worker evidence by itself."
         )
         append_payload_skeleton = _cross_ref_append_payload_skeleton(
             gate,
