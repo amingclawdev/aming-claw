@@ -379,6 +379,9 @@ class ObserverRuntimeTextPrepareRequest:
     worker_guide_status: str = ""
     worker_next_legal_action: str = ""
     startup_prerequisites: Mapping[str, Any] = field(default_factory=dict)
+    read_receipt_hash: str = ""
+    read_receipt_event_id: str = ""
+    read_receipt: Mapping[str, Any] = field(default_factory=dict)
     transcript_refs: tuple[str, ...] = ()
     transcript_digests: tuple[str, ...] = ()
     selected_topology: str = RUNTIME_TEXT_DEFAULT_TOPOLOGY
@@ -1389,7 +1392,202 @@ def build_observer_invocation_request(request: ObserverRunRequest) -> AIInvocati
 def _runtime_text_items(values: Sequence[str] | None) -> list[str]:
     if not values:
         return []
+    if isinstance(values, str):
+        text = values.strip()
+        return [text] if text else []
+    if isinstance(values, Mapping):
+        return []
     return [str(item) for item in values if str(item or "").strip()]
+
+
+def _runtime_text_nested_mappings(source: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    if not isinstance(source, Mapping):
+        return []
+    mappings: list[Mapping[str, Any]] = []
+    stack: list[Mapping[str, Any]] = [source]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        mappings.append(current)
+        for key in (
+            "context",
+            "branch_identity",
+            "branch_context",
+            "parallel_branch_runtime_context",
+            "runtime_context",
+            "runtime_contract",
+            "runtime_context_projection",
+            "runtime_context_current",
+            "runtime_context_worker_view",
+            "worker_view",
+            "current",
+            "current_state",
+            "current_values",
+            "gate_inputs",
+            "close_gate_view",
+            "payload",
+            "contract",
+            "worker_launch_pack",
+            "startup_recording",
+            "startup_gate",
+            "mf_subagent_startup_gate",
+            "read_receipt",
+            "read_receipt_recording",
+            "read_receipt_recording_append",
+            "event",
+        ):
+            value = current.get(key)
+            if isinstance(value, Mapping):
+                stack.append(value)
+        views = current.get("views")
+        if isinstance(views, Mapping):
+            for value in views.values():
+                if isinstance(value, Mapping):
+                    stack.append(value)
+    return mappings
+
+
+def _runtime_text_first_items_from_mappings(
+    mappings: Sequence[Mapping[str, Any]],
+    *field_names: str,
+) -> list[str]:
+    for source in mappings:
+        for field_name in field_names:
+            items = _runtime_text_items(source.get(field_name))  # type: ignore[arg-type]
+            if items:
+                return items
+    return []
+
+
+def _runtime_text_owned_file_scope(
+    request: ObserverRuntimeTextPrepareRequest,
+    *,
+    branch_runtime_evidence: Mapping[str, Any] | None = None,
+    supplied_projection: Mapping[str, Any] | None = None,
+) -> list[str]:
+    direct = _runtime_text_items(request.owned_files)
+    if direct:
+        return direct
+    projection = supplied_projection if isinstance(supplied_projection, Mapping) else {}
+    projected = _runtime_text_items(
+        _runtime_text_projection_value(projection, "owned_files")
+        or _runtime_text_projection_value(projection, "target_files")
+    )
+    if projected:
+        return projected
+    return _runtime_text_first_items_from_mappings(
+        _runtime_text_nested_mappings(branch_runtime_evidence),
+        "owned_files",
+        "target_files",
+    )
+
+
+def _runtime_text_first_text_from_mappings(
+    mappings: Sequence[Mapping[str, Any]],
+    *field_names: str,
+) -> tuple[str, str]:
+    for source in mappings:
+        for field_name in field_names:
+            value = source.get(field_name)
+            text = str(value or "").strip()
+            if text:
+                return text, field_name
+    return "", ""
+
+
+def _runtime_text_read_receipt_identity(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    runtime_context_projection: Mapping[str, Any],
+    branch_runtime_evidence: Mapping[str, Any],
+    launch_text_hash: str,
+) -> dict[str, Any]:
+    mappings: list[Mapping[str, Any]] = []
+    request_receipt = (
+        request.read_receipt if isinstance(request.read_receipt, Mapping) else {}
+    )
+    if request.read_receipt_hash or request.read_receipt_event_id or request_receipt:
+        mappings.append(
+            {
+                "source": "observer_runtime_text_prepare.request",
+                "read_receipt_hash": request.read_receipt_hash,
+                "read_receipt_event_id": request.read_receipt_event_id,
+                "read_receipt": request_receipt,
+            }
+        )
+    mappings.extend(_runtime_text_projection_containers(runtime_context_projection))
+    mappings.extend(_runtime_text_nested_mappings(branch_runtime_evidence))
+
+    read_receipt_hash, hash_source = _runtime_text_first_text_from_mappings(
+        mappings,
+        "read_receipt_hash",
+        "worker_read_receipt_hash",
+        "startup_read_receipt_hash",
+    )
+    read_receipt_event_id, event_source = _runtime_text_first_text_from_mappings(
+        mappings,
+        "read_receipt_event_id",
+        "read_receipt_timeline_event_id",
+        "read_receipt_timeline_id",
+        "read_receipt_event_ref",
+        "startup_read_receipt_event_id",
+    )
+    if not read_receipt_hash:
+        nested_hash, nested_hash_source = _runtime_text_first_text_from_mappings(
+            mappings,
+            "hash",
+            "launch_text_hash",
+        )
+        if nested_hash and read_receipt_event_id:
+            read_receipt_hash = nested_hash
+            hash_source = nested_hash_source
+    if not read_receipt_event_id:
+        for source in mappings:
+            looks_like_read_receipt = (
+                str(source.get("event_kind") or "") == "mf_subagent_read_receipt"
+                or str(source.get("schema_version") or "") == "mf_subagent_read_receipt.v1"
+                or bool(
+                    source.get("read_receipt_hash")
+                    or source.get("worker_read_receipt_hash")
+                    or source.get("launch_text_hash")
+                )
+            )
+            if not looks_like_read_receipt:
+                continue
+            read_receipt_event_id, event_source = _runtime_text_first_text_from_mappings(
+                [source],
+                "timeline_event_id",
+                "timeline_id",
+                "event_id",
+            )
+            if read_receipt_event_id:
+                break
+    recorded = bool(read_receipt_hash and read_receipt_event_id)
+    return {
+        "schema_version": "observer_runtime_text_read_receipt_identity.v1",
+        "status": "recorded" if recorded else "not_recorded",
+        "recorded": recorded,
+        "read_receipt_hash": read_receipt_hash if recorded else "",
+        "read_receipt_event_id": read_receipt_event_id if recorded else "",
+        "hash_source": hash_source if recorded else "",
+        "event_id_source": event_source if recorded else "",
+        "launch_text_hash": launch_text_hash,
+        "accepted_hash_inputs": ["read_receipt_hash", "launch_text_hash"],
+        "next_legal_action": (
+            "record_mf_subagent_startup"
+            if recorded
+            else "submit_mf_subagent_read_receipt"
+        ),
+        "recording_rule": (
+            "Do not fabricate read_receipt_event_id. If no durable "
+            "mf_subagent_read_receipt timeline event exists, record that event "
+            "before startup."
+        ),
+    }
 
 
 def _runtime_text_observer_command_id(
@@ -3524,6 +3722,7 @@ def _runtime_text_worker_launch_pack(
     branch_runtime_evidence: Mapping[str, Any],
     dispatch_gate_validation: Mapping[str, Any],
     graph_first_obligations: Mapping[str, Any],
+    read_receipt_identity: Mapping[str, Any],
     launch_text_hash: str,
 ) -> dict[str, Any]:
     context_pack_refs, context_pack_status, context_pack_resolution = (
@@ -3735,6 +3934,10 @@ def _runtime_text_worker_launch_pack(
         "graph_query_schema_trace_id": graph_query_schema_trace_id,
         "dispatch_gate_allowed": bool(dispatch_gate_validation.get("allowed")),
         "startup_prerequisites": startup_prerequisites,
+        "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+        "read_receipt_next_action": str(
+            read_receipt_identity.get("next_legal_action") or ""
+        ),
     }
     pack = {
         "schema_version": OBSERVER_WORKER_LAUNCH_PACK_SCHEMA_VERSION,
@@ -3775,6 +3978,12 @@ def _runtime_text_worker_launch_pack(
         "transcript_refs": _runtime_text_items(request.transcript_refs),
         "transcript_digests": _runtime_text_items(request.transcript_digests),
         "launch_text_hash": launch_text_hash,
+        "read_receipt_identity": dict(read_receipt_identity),
+        "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+        "read_receipt_hash": str(read_receipt_identity.get("read_receipt_hash") or ""),
+        "read_receipt_event_id": str(
+            read_receipt_identity.get("read_receipt_event_id") or ""
+        ),
         "graph_first_obligations": dict(graph_first_obligations),
         "raw_tokens_persisted": False,
     }
@@ -3875,7 +4084,12 @@ def build_observer_runtime_text_context(
         runtime_context_id=request.runtime_context_id,
         explicit_expected_fields=expected_branch_fields,
     )
-    owned_files = _runtime_text_items(request.owned_files)
+    supplied_projection = _runtime_text_supplied_projection(request)
+    owned_files = _runtime_text_owned_file_scope(
+        request,
+        branch_runtime_evidence=hydrated_branch_runtime_evidence,
+        supplied_projection=supplied_projection,
+    )
     graph_trace_ids = _runtime_text_items(request.graph_trace_ids)
     runtime_context_id = (
         context.runtime_context_id
@@ -4034,7 +4248,6 @@ def build_observer_runtime_text_context(
         fence_token=context.fence_token,
         runtime_context_id=runtime_context_id,
     )
-    supplied_projection = _runtime_text_supplied_projection(request)
     runtime_context_projection = (
         supplied_projection
         if supplied_projection
@@ -4092,6 +4305,12 @@ def build_observer_runtime_text_context(
     launch_text_hash = "sha256:" + hashlib.sha256(
         launch_text.encode("utf-8")
     ).hexdigest()
+    read_receipt_identity = _runtime_text_read_receipt_identity(
+        request=request,
+        runtime_context_projection=runtime_context_projection,
+        branch_runtime_evidence=branch_runtime_evidence,
+        launch_text_hash=launch_text_hash,
+    )
 
     try:
         dispatch_gate_validation = validate_mf_subagent_dispatch_gate(
@@ -4187,6 +4406,7 @@ def build_observer_runtime_text_context(
         branch_runtime_evidence=branch_runtime_evidence,
         dispatch_gate_validation=dispatch_gate_validation,
         graph_first_obligations=graph_first_obligations,
+        read_receipt_identity=read_receipt_identity,
         launch_text_hash=launch_text_hash,
     )
     worker_launch_pack_preflight = dict(
@@ -4229,6 +4449,37 @@ def build_observer_runtime_text_context(
         "event_kind": "mf_subagent_startup",
         "observer_command_id": observer_command_id,
         "observer_command_requirement": observer_command_requirement,
+        "runtime_context_id": runtime_context_id,
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_slot_id": context.worker_slot_id or worker_id,
+        "fence_token": context.fence_token,
+        "branch": context.branch_ref,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "owned_files": list(owned_files),
+        "target_files": list(owned_files),
+        "launch_text_hash": launch_text_hash,
+        "read_receipt_identity": dict(read_receipt_identity),
+        "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+        "read_receipt_hash": str(
+            read_receipt_identity.get("read_receipt_hash") or ""
+        ),
+        "read_receipt_event_id": str(
+            read_receipt_identity.get("read_receipt_event_id") or ""
+        ),
         "intent_event_kind": "mf_subagent_startup_intent",
         "intent_event_ref": "startup_intent_event" if ok else "",
         "close_satisfying": False,
@@ -4282,6 +4533,8 @@ def build_observer_runtime_text_context(
             "startup_intent_event_generated": bool(ok),
             "actual_startup_required": bool(ok),
             "actual_startup_recorded": False,
+            "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+            "read_receipt_identity": dict(read_receipt_identity),
             "close_ready": False,
             "startup_recording": startup_recording,
             "startup_intent_event": startup_intent_event,
@@ -4292,6 +4545,12 @@ def build_observer_runtime_text_context(
         },
         "startup_intent_event": startup_intent_event,
         "startup_recording": startup_recording,
+        "read_receipt_identity": read_receipt_identity,
+        "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+        "read_receipt_hash": str(read_receipt_identity.get("read_receipt_hash") or ""),
+        "read_receipt_event_id": str(
+            read_receipt_identity.get("read_receipt_event_id") or ""
+        ),
         "close_ready": False,
         "runtime_context": asdict(context),
         "runtime_context_projection": runtime_context_projection,

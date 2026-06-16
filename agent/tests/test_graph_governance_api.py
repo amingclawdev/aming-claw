@@ -1769,7 +1769,7 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
                 "route_token_ref": "rtok-api",
                 "visible_injection_manifest_hash": "sha256:visible-api",
                 "main_worktree": str(main),
-                "owned_files": ["agent/observer_runtime.py"],
+                "target_files": ["agent/observer_runtime.py"],
                 "graph_trace_ids": ["gqt-runtime-api"],
             },
         )
@@ -1857,6 +1857,9 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
         "sha256:visible-api"
     )
     assert revision["payload"]["target_files"] == ["agent/observer_runtime.py"]
+    assert prepared["worker_launch_pack"]["owned_files"] == [
+        "agent/observer_runtime.py"
+    ]
     assert prepared["persistent_evidence"]["contract_revision_persisted"] is True
 
     current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
@@ -1983,6 +1986,8 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
                 "host_startup_id": "host-startup-prepare",
                 "host_session_id": "host-session-prepare",
                 "session_token_surrogate": "host-adapter:prepare",
+                "read_receipt_hash": "sha256:read-prepare-startup",
+                "read_receipt_event_id": "read-prepare-startup",
             },
         )
     )
@@ -2005,6 +2010,11 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
     assert registered["host_startup_id"] == "host-startup-prepare"
     assert registered["host_session_id"] == "host-session-prepare"
     assert registered["session_token_surrogate"] == "host-adapter:prepare"
+    assert latest_revision.payload["read_receipt_recorded"] is True
+    assert latest_revision.payload["read_receipt_hash"] == (
+        "sha256:read-prepare-startup"
+    )
+    assert latest_revision.payload["read_receipt_event_id"] == "read-prepare-startup"
 
     started = server.handle_graph_governance_parallel_branch_startup(
         _ctx_with_role(

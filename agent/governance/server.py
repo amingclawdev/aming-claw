@@ -24577,6 +24577,26 @@ def _observer_runtime_text_contract_revision_payload(
         if isinstance(branch_runtime_evidence.get("context"), Mapping)
         else {}
     )
+    worker_launch_pack = (
+        prepared.get("worker_launch_pack")
+        if isinstance(prepared.get("worker_launch_pack"), Mapping)
+        else {}
+    )
+    if not owned_files:
+        for source in (
+            worker_launch_pack,
+            startup_recording,
+            runtime_context,
+            branch_context,
+            branch_runtime_evidence,
+        ):
+            owned_files = _runtime_context_service_query_values(
+                source,
+                "owned_files",
+                "target_files",
+            )
+            if owned_files:
+                break
 
     def _first_text(*values: Any) -> str:
         for value in values:
@@ -24584,6 +24604,31 @@ def _observer_runtime_text_contract_revision_payload(
             if text:
                 return text
         return ""
+
+    read_receipt_identity = (
+        prepared.get("read_receipt_identity")
+        if isinstance(prepared.get("read_receipt_identity"), Mapping)
+        else startup_recording.get("read_receipt_identity")
+        if isinstance(startup_recording.get("read_receipt_identity"), Mapping)
+        else worker_launch_pack.get("read_receipt_identity")
+        if isinstance(worker_launch_pack.get("read_receipt_identity"), Mapping)
+        else {}
+    )
+    read_receipt_hash = _first_text(
+        body.get("read_receipt_hash"),
+        prepared.get("read_receipt_hash"),
+        startup_recording.get("read_receipt_hash"),
+        worker_launch_pack.get("read_receipt_hash"),
+        read_receipt_identity.get("read_receipt_hash"),
+    )
+    read_receipt_event_id = _first_text(
+        body.get("read_receipt_event_id"),
+        prepared.get("read_receipt_event_id"),
+        startup_recording.get("read_receipt_event_id"),
+        worker_launch_pack.get("read_receipt_event_id"),
+        read_receipt_identity.get("read_receipt_event_id"),
+    )
+    read_receipt_recorded = bool(read_receipt_hash and read_receipt_event_id)
 
     registered_host_adapter_spawn = build_registered_host_adapter_spawn_identity(
         project_id=_first_text(prepared.get("project_id"), body.get("project_id")),
@@ -24681,6 +24726,18 @@ def _observer_runtime_text_contract_revision_payload(
             "test_command",
         ),
         "launch_text_hash": str(prepared.get("launch_text_hash") or ""),
+        "read_receipt_identity": {
+            **dict(read_receipt_identity),
+            "recorded": read_receipt_recorded,
+            "status": "recorded" if read_receipt_recorded else "not_recorded",
+            "read_receipt_hash": read_receipt_hash if read_receipt_recorded else "",
+            "read_receipt_event_id": (
+                read_receipt_event_id if read_receipt_recorded else ""
+            ),
+        },
+        "read_receipt_recorded": read_receipt_recorded,
+        "read_receipt_hash": read_receipt_hash if read_receipt_recorded else "",
+        "read_receipt_event_id": read_receipt_event_id if read_receipt_recorded else "",
         "registered_host_adapter_spawn": registered_host_adapter_spawn,
         "raw_launch_text_persisted": False,
         "startup_intent_event_generated": bool(
@@ -24780,6 +24837,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         if isinstance(branch_runtime_evidence.get("context"), Mapping)
         else {}
     )
+    owned_files = _runtime_context_service_query_values(
+        body,
+        "owned_files",
+        "target_files",
+    )
     request = ObserverRuntimeTextPrepareRequest(
         project_id=project_id,
         backlog_id=str(body.get("backlog_id") or resolved_context.get("backlog_id") or ""),
@@ -24791,7 +24853,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         ),
         main_worktree=str(body.get("main_worktree") or body.get("workspace") or ""),
         workspace_root=str(body.get("workspace_root") or ""),
-        owned_files=tuple(str(item) for item in (body.get("owned_files") or [])),
+        owned_files=tuple(owned_files),
         observer_command_id=str(
             body.get("observer_command_id")
             or resolved_context.get("observer_command_id")
@@ -24853,6 +24915,13 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         startup_prerequisites=(
             body.get("startup_prerequisites")
             if isinstance(body.get("startup_prerequisites"), Mapping)
+            else {}
+        ),
+        read_receipt_hash=str(body.get("read_receipt_hash") or ""),
+        read_receipt_event_id=str(body.get("read_receipt_event_id") or ""),
+        read_receipt=(
+            body.get("read_receipt")
+            if isinstance(body.get("read_receipt"), Mapping)
             else {}
         ),
         transcript_refs=tuple(str(item) for item in (body.get("transcript_refs") or [])),

@@ -91,6 +91,61 @@ def _runtime_text_request(tmp_path: Path, **overrides: object) -> ObserverRuntim
     return ObserverRuntimeTextPrepareRequest(**values)
 
 
+def _runtime_context_projection(
+    tmp_path: Path,
+    *,
+    target_files: list[str],
+    read_receipt_hash: str = "",
+    read_receipt_event_id: str = "",
+) -> dict[str, object]:
+    worker_view: dict[str, object] = {
+        "schema_version": "runtime_context.worker_view.v1",
+        "project_id": "aming-claw",
+        "governance_project_id": "aming-claw",
+        "target_project_id": "aming-claw",
+        "target_project_root": "",
+        "runtime_context_id": "mfrctx-runtime-text",
+        "observer_command_id": "cmd-runtime-text",
+        "task_id": "AC-RUNTIME-TEXT-impl-1",
+        "parent_task_id": "AC-RUNTIME-TEXT",
+        "worker_role": "mf_sub",
+        "fence_token": "fence-runtime-text",
+        "branch_ref": "refs/heads/runtime-text/ac-runtime-text-impl-1",
+        "worktree_path": str(
+            tmp_path / "workers" / ".worktrees" / "worker-1" / "ac-runtime-text-impl-1"
+        ),
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-runtime-text",
+        "target_files": target_files,
+        "graph_query_identity": {"query_source": "mf_subagent"},
+    }
+    if read_receipt_hash:
+        worker_view["startup_read_receipt_hash"] = read_receipt_hash
+    if read_receipt_event_id:
+        worker_view["startup_read_receipt_event_id"] = read_receipt_event_id
+        worker_view["read_receipt_event_ref"] = read_receipt_event_id
+    gate_inputs = {
+        **worker_view,
+        "schema_version": "runtime_context.gate_inputs.v1",
+        "route_id": "route-20260603-runtime",
+        "route_context_hash": "sha256:route",
+        "prompt_contract_id": "rprompt-runtime",
+        "prompt_contract_hash": "sha256:prompt",
+        "route_token_ref": "route-token-ref",
+        "visible_injection_manifest_hash": "sha256:visible",
+    }
+    return {
+        "schema_version": "runtime_context.current.v1",
+        "worker_view": worker_view,
+        "gate_inputs": gate_inputs,
+        "close_gate_view": {
+            **worker_view,
+            "schema_version": "runtime_context.close_gate_view.v1",
+        },
+    }
+
+
 def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_path):
     result = build_observer_runtime_text_context(_runtime_text_request(tmp_path))
 
@@ -272,6 +327,76 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["persistent_evidence"]["worker_launch_pack_hash"] == (
         launch_pack["worker_launch_pack_hash"]
     )
+
+
+def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            owned_files=(),
+            runtime_context_projection=_runtime_context_projection(
+                tmp_path,
+                target_files=["agent/observer_runtime.py"],
+                read_receipt_hash="sha256:read-runtime-text",
+                read_receipt_event_id="4178",
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["read_receipt_recorded"] is True
+    assert result["read_receipt_hash"] == "sha256:read-runtime-text"
+    assert result["read_receipt_event_id"] == "4178"
+    launch_pack = result["worker_launch_pack"]
+    assert launch_pack["owned_files"] == ["agent/observer_runtime.py"]
+    assert launch_pack["read_receipt_recorded"] is True
+    assert launch_pack["read_receipt_hash"] == "sha256:read-runtime-text"
+    assert launch_pack["read_receipt_event_id"] == "4178"
+    assert launch_pack["startup_preflight"]["read_receipt_recorded"] is True
+    startup = result["startup_recording"]
+    assert startup["owned_files"] == ["agent/observer_runtime.py"]
+    assert startup["observer_command_id"] == "cmd-runtime-text"
+    assert startup["read_receipt_recorded"] is True
+    assert startup["read_receipt_hash"] == "sha256:read-runtime-text"
+    assert startup["read_receipt_event_id"] == "4178"
+    assert startup["recorded"] is False
+    assert startup["close_satisfying"] is False
+    persistent = result["persistent_evidence"]["startup_recording"]
+    assert persistent["read_receipt_hash"] == "sha256:read-runtime-text"
+    assert persistent["read_receipt_event_id"] == "4178"
+
+
+def test_runtime_text_read_receipt_without_timeline_event_is_not_recorded(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            runtime_context_projection=_runtime_context_projection(
+                tmp_path,
+                target_files=["agent/observer_runtime.py", "agent/cli.py"],
+                read_receipt_hash="sha256:prepared-only",
+                read_receipt_event_id="",
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["read_receipt_recorded"] is False
+    assert result["read_receipt_hash"] == ""
+    assert result["read_receipt_event_id"] == ""
+    assert result["read_receipt_identity"]["status"] == "not_recorded"
+    launch_pack = result["worker_launch_pack"]
+    assert launch_pack["read_receipt_recorded"] is False
+    assert launch_pack["read_receipt_hash"] == ""
+    assert launch_pack["read_receipt_event_id"] == ""
+    assert launch_pack["startup_preflight"]["read_receipt_recorded"] is False
+    assert launch_pack["startup_preflight"]["read_receipt_next_action"] == (
+        "submit_mf_subagent_read_receipt"
+    )
+    startup = result["startup_recording"]
+    assert startup["read_receipt_recorded"] is False
+    assert startup["read_receipt_event_id"] == ""
+    assert startup["recorded"] is False
+    assert startup["actual_startup_required"] is True
 
 
 def test_runtime_text_worker_launch_pack_rejects_missing_route_token_ref(tmp_path):
