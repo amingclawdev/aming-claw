@@ -2165,6 +2165,39 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return 400, {"ok": False, "error": "evidence_refs must be a list"}
 
+    parent_route_identity = body.get("parent_route_identity")
+    if parent_route_identity is not None and not isinstance(parent_route_identity, Mapping):
+        return 400, {"ok": False, "error": "parent_route_identity must be an object"}
+    raw_parent_fields = (
+        "parent_route_token",
+        "parent_raw_route_token",
+        "parent_token",
+        "parent_token_body",
+        "parent_session_token",
+    )
+    for field in raw_parent_fields:
+        if field in body:
+            return 400, {
+                "ok": False,
+                "error": "parent route identity must not include raw route/session token fields",
+            }
+    parent_identity_fields = (
+        "parent_route_id",
+        "parent_route_context_hash",
+        "parent_prompt_contract_id",
+        "parent_prompt_contract_hash",
+        "parent_visible_injection_manifest_hash",
+        "parent_route_token_ref",
+    )
+    parent_identity_args: dict[str, str] = {}
+    for field in parent_identity_fields:
+        value = body.get(field, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            return 400, {"ok": False, "error": f"{field} must be a string"}
+        parent_identity_args[field] = value.strip()
+
     try:
         ttl_hours = float(body.get("ttl_hours", 24))
     except (TypeError, ValueError):
@@ -2188,6 +2221,8 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             ttl_hours=ttl_hours,
             evidence_refs=evidence_refs,
             project_root=project_root,
+            parent_route_identity=parent_route_identity,
+            **parent_identity_args,
         )
     except ValueError as exc:
         return 400, {"ok": False, "error": str(exc)}
@@ -2223,6 +2258,10 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         "provider": issued.get("provider", {}),
         "ref_registered": not bool(ref_persist_warning),
     }
+    for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
+        value = issued.get(key)
+        if isinstance(value, Mapping):
+            response[key] = dict(value)
     if ref_persist_warning:
         response["ref_persist_warning"] = ref_persist_warning
     return response
