@@ -107,6 +107,9 @@ MF_CLOSE_PASS_STATUSES = {
 
 MF_CONTRACT_SCHEMA_VERSION = "mf_contract_gate.v1"
 MF_CONTRACT_PROJECTION_SCHEMA_VERSION = "mf_contract_projection.v1"
+MF_SUBAGENT_FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION = (
+    "mf_subagent_finish_gate_close_projection.v1"
+)
 MF_OBSERVER_COMMAND_TERMINAL_PROJECTION_SCHEMA_VERSION = "observer_command_terminal_projection.v1"
 MF_SUBAGENT_READ_RECEIPT_GATE_SCHEMA_VERSION = "mf_subagent_read_receipt_gate.v1"
 MF_LANE_OWNERSHIP_SCHEMA_VERSION = "mf_lane_ownership_gate.v1"
@@ -2592,9 +2595,19 @@ def _route_identity_matches_filter(
     return not expected_prompt_hash or identity.get("prompt_contract_hash", "") == expected_prompt_hash
 
 
+def _route_child_identity_join_verified(value: Any) -> bool:
+    join = _first_deep_mapping(value, "identity_join")
+    return bool(
+        _truthy(join.get("route_identity_matches_latest_contract"))
+        and _truthy(join.get("read_receipt_lineage_present"))
+    )
+
+
 def _route_parent_child_startup_identity(
     value: Any,
     identity: dict[str, str],
+    *,
+    parent_identity_hint: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Normalize a truthful child startup event back to its parent route identity."""
 
@@ -2648,6 +2661,24 @@ def _route_parent_child_startup_identity(
         and parent_visible_manifest_hash == child_visible_manifest_hash
     )
     if not lineage_valid:
+        parent_hint = {
+            field: str(_mapping(parent_identity_hint).get(field) or "").strip()
+            for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+            if str(_mapping(parent_identity_hint).get(field) or "").strip()
+        }
+        if parent_hint and _route_child_identity_join_verified(value):
+            normalized = dict(parent_hint)
+            return normalized, {
+                "schema_version": "mf_subagent_startup_lineage_acceptance.v1",
+                "accepted": True,
+                "acceptance_source": "identity_join_latest_contract",
+                "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
+                "child_prompt_contract_id": child_prompt_contract_id,
+                "route_context_hash": parent_hint.get("route_context_hash", ""),
+                "child_route_context_hash": child_route_context_hash,
+                "read_receipt_lineage_present": True,
+                "route_identity_matches_latest_contract": True,
+            }
         return identity, {}
 
     normalized = {
@@ -2663,6 +2694,58 @@ def _route_parent_child_startup_identity(
         "child_prompt_contract_id": child_prompt_contract_id,
         "route_context_hash": parent_route_context_hash,
         "visible_injection_manifest_hash": parent_visible_manifest_hash,
+    }
+
+
+def _route_action_scoped_verification_identity(
+    value: Any,
+    identity: dict[str, str],
+    *,
+    parent_identity_hint: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Normalize protected QA action-scope evidence back to its parent route."""
+
+    if not identity:
+        return identity, {}
+    parent_hint = {
+        field: str(_mapping(parent_identity_hint).get(field) or "").strip()
+        for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+        if str(_mapping(parent_identity_hint).get(field) or "").strip()
+    }
+    if not parent_hint or _route_identity_key(identity) == _route_identity_key(parent_hint):
+        return identity, {}
+
+    route_token_ref = _first_deep_text(value, "route_token_ref")
+    route_identity = _first_deep_mapping(value, "route_identity")
+    allowed_action = str(
+        route_identity.get("allowed_action")
+        or route_identity.get("action")
+        or ""
+    ).strip()
+    meta_gate = _first_deep_mapping(value, "meta_contract_gate")
+    meta_role = str(meta_gate.get("role") or "").strip().lower()
+    meta_action = str(meta_gate.get("action") or "").strip().lower()
+    reviewer_role = _first_deep_text(value, "reviewer_role").lower()
+    protected_qa_append = bool(
+        route_token_ref
+        and allowed_action == "task_timeline_append"
+        and meta_role == "qa"
+        and meta_action in {"qa_verification", "independent_verification", "qa_review"}
+        and reviewer_role in {"qa", "independent_qa", "independent_verification"}
+    )
+    if not protected_qa_append:
+        return identity, {}
+
+    return dict(parent_hint), {
+        "schema_version": "independent_verification_action_scope_lineage.v1",
+        "accepted": True,
+        "acceptance_source": "protected_route_token_ref_action_scope",
+        "route_token_ref": route_token_ref,
+        "allowed_action": allowed_action,
+        "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
+        "child_route_context_hash": identity.get("route_context_hash", ""),
+        "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
+        "child_prompt_contract_id": identity.get("prompt_contract_id", ""),
     }
 
 
@@ -2727,6 +2810,74 @@ def _route_actual_startup_identity_present(event: dict[str, Any]) -> bool:
         and head_commit
         and _route_startup_fence_evidence_present(event)
     )
+
+
+def _mf_subagent_finish_gate_projection(event: dict[str, Any]) -> dict[str, Any]:
+    """Return close-gate-consumable finish evidence only after upstream gates pass."""
+
+    if not isinstance(event, dict):
+        return {}
+    gate = _mapping(_first_deep_mapping(event, "mf_subagent_finish_gate"))
+    if not gate:
+        return {}
+    if not _route_event_passed(event):
+        return {}
+    if _route_marker(event.get("event_kind") or event.get("event_type")) not in {
+        "mf_subagent_finish_gate",
+        "mf_subagent.finish_gate",
+    }:
+        marker = _route_marker(
+            gate.get("source_event_kind")
+            or gate.get("schema_version")
+            or event.get("phase")
+        )
+        if "mf_subagent_finish_gate" not in marker:
+            return {}
+    if not _truthy(gate.get("close_ready")):
+        return {}
+    receipt_gate = _mapping(gate.get("receipt_gate"))
+    startup_identity_gate = _mapping(gate.get("startup_worker_identity_gate"))
+    worker_attestation_gate = _mapping(gate.get("worker_self_attestation_gate"))
+    if str(receipt_gate.get("status") or "").strip().lower() not in MF_CLOSE_PASS_STATUSES:
+        return {}
+    if not (
+        _truthy(receipt_gate.get("read_receipt_present"))
+        and _truthy(receipt_gate.get("read_receipt_event_id_present"))
+        and _truthy(receipt_gate.get("startup_present"))
+        and _truthy(receipt_gate.get("observer_command_id_present"))
+    ):
+        return {}
+    if not _truthy(startup_identity_gate.get("passed")):
+        return {}
+    if not _truthy(worker_attestation_gate.get("passed")):
+        return {}
+    if not _string_list(gate.get("changed_files")):
+        return {}
+    if not (
+        _first_deep_text(gate, "head_commit")
+        or _first_deep_text(gate, "validated_head_commit")
+        or _first_deep_text(gate, "commit")
+    ):
+        return {}
+    startup_evidence = _mapping(gate.get("startup_evidence"))
+    if not startup_evidence or not _route_actual_startup_identity_present(
+        {"payload": {"startup_evidence": startup_evidence}}
+    ):
+        return {}
+    return gate
+
+
+def _mf_subagent_finish_gate_projected_event_kinds(
+    event: dict[str, Any],
+) -> set[str]:
+    gate = _mf_subagent_finish_gate_projection(event)
+    if not gate:
+        return set()
+    projected = {"implementation", "close_ready"}
+    test_results = _mapping(gate.get("test_results"))
+    if str(test_results.get("status") or "").strip().lower() in MF_CLOSE_PASS_STATUSES:
+        projected.add("verification")
+    return projected
 
 
 def _route_event_is_startup_adoption(event: dict[str, Any]) -> bool:
@@ -2802,8 +2953,13 @@ def _route_event_markers(event: dict[str, Any]) -> set[str]:
             "mf_subagent_dispatch_gate",
             "bounded_implementation_worker_dispatch",
             "mf_subagent_startup_gate",
+            "mf_subagent_finish_gate",
+            "finish_gate",
+            "finish_gate_result",
             "dispatch_evidence",
             "startup_evidence",
+            "lane_ownership_projection",
+            "route_prompt_contract",
             "contract_evidence",
             "route_identity_cleanup",
             "route_identity_recovery",
@@ -2832,6 +2988,15 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
     markers = _route_event_markers(event)
     normalized_markers = {_route_marker(marker) for marker in markers}
     categories: set[str] = set()
+    read_receipt_marker = bool(
+        normalized_markers.intersection(
+            {
+                "mf_subagent_read_receipt",
+                "mf_subagent.read_receipt",
+                "read_receipt",
+            }
+        )
+    )
     if markers.intersection(
         {
             "route_context",
@@ -2840,7 +3005,7 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
             "visible_injection_manifest",
             "visible_injection_manifest_hash",
         }
-    ):
+    ) and not read_receipt_marker:
         categories.add("route_context")
     if markers.intersection(
         {
@@ -2867,6 +3032,9 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
         }
     ):
         categories.add("bounded_implementation_worker_dispatch")
+    if _mf_subagent_finish_gate_projection(event):
+        categories.add("bounded_implementation_worker_dispatch")
+        categories.add("mf_subagent_startup")
     if markers.intersection(
         {
             "mf_subagent_startup",
@@ -2926,6 +3094,340 @@ def route_context_consumption_event_summary(
         "attempt_lineage": _route_attempt_lineage(row),
         "runtime_dispatch_evidence": _runtime_dispatch_evidence(row),
         "passed": _route_event_passed(row),
+    }
+
+
+def _is_mf_subagent_finish_gate_event(event: dict[str, Any]) -> bool:
+    marker = _event_marker(event)
+    if any(
+        token in marker
+        for token in (
+            "mf_subagent_finish_gate",
+            "mf_subagent_finish",
+            "finish_gate",
+            "handoff_gate",
+        )
+    ):
+        return "subagent" in marker or "mf_sub" in marker or "finish_gate" in marker
+    return _container_has_marker_key(
+        event,
+        {
+            "mf_subagent_finish_gate",
+            "finish_gate",
+            "finish_gate_result",
+        },
+    )
+
+
+def _event_deep_string_list(event: dict[str, Any], keys: set[str]) -> list[str]:
+    values: list[str] = []
+    for value in _event_field_values(event, keys):
+        if isinstance(value, list):
+            for item in value:
+                item_map = _mapping(item)
+                if item_map:
+                    text = (
+                        str(
+                            item_map.get("path")
+                            or item_map.get("file")
+                            or item_map.get("name")
+                            or ""
+                        )
+                        .strip()
+                    )
+                    if text:
+                        values.append(text)
+                elif str(item or "").strip():
+                    values.append(str(item).strip())
+        elif str(value or "").strip():
+            values.append(str(value).strip())
+    return list(dict.fromkeys(values))
+
+
+def _event_deep_truthy(event: dict[str, Any], keys: set[str]) -> bool:
+    return any(_truthy(value) for value in _event_field_values(event, keys))
+
+
+def _finish_gate_review_ready(event: dict[str, Any]) -> bool:
+    if _event_deep_truthy(event, {"review_ready"}):
+        return True
+    for value in _event_field_values(event, {"stop_state", "worker_status", "state"}):
+        if _normalize_token(value) in {"review_ready", "waiting_merge"}:
+            return True
+    lane_ids = _event_deep_string_list(
+        event,
+        {
+            "present_lane_ownership_ids",
+            "present_requirement_ids",
+            "evidence_ids",
+        },
+    )
+    return any(
+        _normalize_token(item)
+        in {
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent_review_ready",
+            "review_ready",
+            "waiting_merge",
+        }
+        for item in lane_ids
+    )
+
+
+def _finish_gate_close_ready(event: dict[str, Any]) -> bool:
+    if _event_deep_truthy(
+        event,
+        {
+            "close_ready",
+            "close_satisfying",
+            "close_ready_projection",
+        },
+    ):
+        return True
+    projected = _event_deep_string_list(
+        event,
+        {"present_event_kinds", "projected_event_kinds", "close_evidence_kinds"},
+    )
+    return "close_ready" in {_normalize_token(item) for item in projected}
+
+
+def _finish_gate_commit(event: dict[str, Any]) -> str:
+    return (
+        str(event.get("commit_sha") or "").strip()
+        or _first_event_string(
+            event,
+            {
+                "implementation_commit",
+                "commit_sha",
+                "commit",
+            },
+        )
+    )
+
+
+def _finish_gate_changed_files(event: dict[str, Any]) -> list[str]:
+    return _event_deep_string_list(
+        event,
+        {
+            "changed_files",
+            "owned_changed_files",
+            "modified_files",
+            "files_changed",
+        },
+    )
+
+
+def _finish_gate_observer_command_id(event: dict[str, Any]) -> str:
+    return _first_event_string(
+        event,
+        {"observer_command_id", "command_id", "originating_command_id"},
+    )
+
+
+def _finish_gate_fence_proof_present(event: dict[str, Any]) -> bool:
+    if _first_deep_text(event, "fence_token"):
+        return True
+    return _event_deep_truthy(
+        event,
+        {
+            "fence_token_matches",
+            "fence_token_present",
+            "actual_fence_token_present",
+        },
+    )
+
+
+def _finish_gate_missing_fields(
+    event: dict[str, Any],
+    *,
+    route_context_gate: Mapping[str, Any] | None = None,
+) -> list[str]:
+    missing: list[str] = []
+    if not _route_event_passed(event):
+        missing.append("finish_gate_passed")
+    identity = _route_identity(event)
+    if not identity:
+        missing.append("finish_gate_route_identity")
+    else:
+        gate = _mapping(route_context_gate)
+        cleanup = _mapping(gate.get("route_identity_cleanup"))
+        canonical = _mapping(
+            cleanup.get("route_identity")
+            if cleanup.get("applied")
+            else gate.get("route_identity")
+        )
+        normalized_identity = identity
+        if canonical and "mf_subagent_startup" in _route_event_categories(event):
+            normalized_identity, _lineage = _route_parent_child_startup_identity(
+                event,
+                identity,
+                parent_identity_hint=canonical,
+            )
+        if canonical and not _route_identity_matches_filter(normalized_identity, canonical):
+            missing.append("finish_gate_route_identity_matches_canonical_route")
+    lineage = _route_attempt_lineage(event)
+    for field in MF_ROUTE_ATTEMPT_LINEAGE_FIELDS:
+        if field == "fence_token" and _finish_gate_fence_proof_present(event):
+            continue
+        if not lineage.get(field):
+            missing.append(f"finish_gate_{field}")
+    if not _finish_gate_observer_command_id(event):
+        missing.append("finish_gate_observer_command_id")
+    if not _finish_gate_commit(event):
+        missing.append("finish_gate_implementation_commit")
+    if not _finish_gate_changed_files(event):
+        missing.append("finish_gate_changed_files")
+    if not _finish_gate_review_ready(event):
+        missing.append("finish_gate_review_ready")
+    if not _finish_gate_close_ready(event):
+        missing.append("finish_gate_close_ready")
+    return missing
+
+
+def _finish_gate_event_ref(
+    event: dict[str, Any],
+    missing: list[str] | None = None,
+) -> dict[str, Any]:
+    ref = {
+        "id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "event_type": event.get("event_type"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+    }
+    if missing:
+        ref["missing_fields"] = list(missing)
+    return {key: value for key, value in ref.items() if value not in (None, "", [])}
+
+
+def _finish_gate_projection_event(
+    source: dict[str, Any],
+    *,
+    event_kind: str,
+) -> dict[str, Any]:
+    identity = _route_identity(source)
+    lineage = _route_attempt_lineage(source)
+    changed_files = _finish_gate_changed_files(source)
+    commit = _finish_gate_commit(source)
+    observer_command_id = _finish_gate_observer_command_id(source)
+    graph_trace_ids = sorted(_event_graph_trace_ids(source))
+    source_event_id = source.get("id") or source.get("event_id")
+    payload = {
+        "schema_version": MF_SUBAGENT_FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION,
+        "source_event_kind": source.get("event_kind"),
+        "source_event_id": source_event_id,
+        "projected_from": "mf_subagent_finish_gate",
+        "observer_command_id": observer_command_id,
+        "commit_sha": commit,
+        "changed_files": changed_files,
+        "worker_role": _first_deep_text(source, "worker_role") or "mf_sub",
+        **identity,
+        **lineage,
+    }
+    if graph_trace_ids:
+        payload["graph_trace_ids"] = graph_trace_ids
+        payload["query_source"] = _first_deep_text(source, "query_source") or "mf_subagent"
+    return {
+        "id": (
+            f"{source_event_id}:finish_projection:{event_kind}"
+            if source_event_id not in ("", None)
+            else f"finish_projection:{event_kind}"
+        ),
+        "event_type": f"mf.finish_gate_projection.{event_kind}",
+        "event_kind": event_kind,
+        "phase": "close" if event_kind == "close_ready" else event_kind,
+        "status": "accepted",
+        "actor": _first_deep_text(source, "worker_slot_id")
+        or _first_deep_text(source, "worker_id")
+        or source.get("actor")
+        or "mf_subagent_finish_gate",
+        "backlog_id": source.get("backlog_id") or lineage.get("parent_task_id", ""),
+        "project_id": source.get("project_id") or _first_deep_text(source, "project_id"),
+        "task_id": source.get("task_id") or lineage.get("task_id", ""),
+        "commit_sha": commit,
+        "trace_id": source.get("trace_id") or "",
+        "payload": payload,
+        "verification": {
+            "projection_source": "mf_subagent_finish_gate",
+            "review_ready": True,
+            "close_ready": _finish_gate_close_ready(source),
+        },
+    }
+
+
+def mf_subagent_finish_gate_close_projection(
+    events: list[dict[str, Any]] | None,
+    *,
+    needed_event_kinds: set[str] | None = None,
+    route_context_gate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project worker-authored finish-gate evidence into close-counting facts."""
+
+    needed = {
+        str(item)
+        for item in (needed_event_kinds or set())
+        if str(item) in {"implementation", "close_ready"}
+    }
+    candidates = [
+        _mapping(event)
+        for event in (events or [])
+        if _mapping(event) and _is_mf_subagent_finish_gate_event(_mapping(event))
+    ]
+    required = bool(candidates and needed)
+    evaluated: list[dict[str, Any]] = []
+    for event in candidates:
+        missing = _finish_gate_missing_fields(
+            event,
+            route_context_gate=route_context_gate,
+        )
+        evaluated.append({
+            "event": _finish_gate_event_ref(event, missing),
+            "missing_fields": missing,
+            "source": event,
+        })
+
+    accepted = next((item for item in evaluated if not item["missing_fields"]), None)
+    if accepted is None and evaluated:
+        accepted = min(evaluated, key=lambda item: len(item["missing_fields"]))
+
+    passed = bool((not required) or (accepted and not accepted["missing_fields"]))
+    projected_event_kinds = sorted(needed) if required and passed else []
+    projected_events: list[dict[str, Any]] = []
+    if required and passed:
+        source = _mapping(accepted.get("source")) if accepted else candidates[0]
+        projected_events = [
+            _finish_gate_projection_event(source, event_kind=kind)
+            for kind in projected_event_kinds
+        ]
+
+    missing_fields = [] if passed else (
+        list(accepted.get("missing_fields") or []) if accepted else ["mf_subagent_finish_gate"]
+    )
+    return {
+        "schema_version": MF_SUBAGENT_FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION,
+        "required": required,
+        "passed": passed,
+        "status": (
+            "passed"
+            if passed and required
+            else ("not_applicable" if not required else "failed")
+        ),
+        "needed_event_kinds": sorted(needed),
+        "projected_event_kinds": projected_event_kinds,
+        "missing_requirement_ids": missing_fields,
+        "missing_fields": missing_fields,
+        "evidence_events": [
+            item["event"]
+            for item in evaluated
+            if item.get("event")
+        ],
+        "projected_events": projected_events,
+        "checks": {
+            "finish_gate_event_present": bool(candidates),
+            "finish_gate_projection_needed": bool(required),
+            "has_projected_implementation": "implementation" in projected_event_kinds,
+            "has_projected_close_ready": "close_ready" in projected_event_kinds,
+        },
     }
 
 
@@ -3125,7 +3627,20 @@ def mf_route_context_gate_verification(
     cleanup_event: dict[str, Any] = {}
     cleanup_identity: dict[str, str] = {}
     accepted_startup_lineages: list[dict[str, Any]] = []
+    accepted_action_scope_lineages: list[dict[str, Any]] = []
     attempt_lineage_candidates: list[dict[str, Any]] = []
+    parent_route_identity_hint: dict[str, str] = {}
+
+    for raw_event in rows:
+        event = _mapping(raw_event)
+        if not event or parent_route_identity_hint:
+            continue
+        categories = _route_event_categories(event)
+        if "route_context" not in categories:
+            continue
+        identity = _route_identity(event)
+        if identity and _route_event_passed(event):
+            parent_route_identity_hint = identity
 
     for raw_event in rows:
         event = _mapping(raw_event)
@@ -3174,9 +3689,26 @@ def mf_route_context_gate_verification(
             normalized_identity, lineage = _route_parent_child_startup_identity(
                 event,
                 identity,
+                parent_identity_hint=parent_route_identity_hint,
             )
             if lineage:
                 accepted_startup_lineages.append({
+                    **lineage,
+                    "event": {
+                        "id": event.get("id") or event.get("event_id"),
+                        "event_kind": event.get("event_kind"),
+                        "phase": event.get("phase"),
+                        "status": event.get("status") or event.get("decision"),
+                    },
+                })
+        if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in categories:
+            normalized_identity, lineage = _route_action_scoped_verification_identity(
+                event,
+                normalized_identity,
+                parent_identity_hint=parent_route_identity_hint,
+            )
+            if lineage:
+                accepted_action_scope_lineages.append({
                     **lineage,
                     "event": {
                         "id": event.get("id") or event.get("event_id"),
@@ -3328,6 +3860,7 @@ def mf_route_context_gate_verification(
         "attempt_lineage": current_attempt_lineage,
         "attempt_lineage_candidates": public_attempt_lineage_candidates,
         "accepted_startup_lineages": accepted_startup_lineages,
+        "accepted_action_scope_lineages": accepted_action_scope_lineages,
         "runtime_context_projection_evidence_fields": {
             "schema_version": "runtime_context.timeline_evidence_fields.v1",
             "startup": list(RUNTIME_CONTEXT_TIMELINE_STARTUP_FIELDS),
@@ -5399,39 +5932,56 @@ def mf_close_gate_verification(
 ) -> dict[str, Any]:
     """Validate the minimum observer/MF timeline evidence before backlog close."""
 
-    rows = events if isinstance(events, list) else []
+    raw_rows = events if isinstance(events, list) else []
     governance_policy = _governance_policy(contract)
     close_timeline_required = _policy_requires(governance_policy, "close_timeline")
     required_event_kinds = (
         set(MF_CLOSE_REQUIRED_EVENT_KINDS) if close_timeline_required else set()
     )
-    present: set[str] = set()
-    ignored: list[dict[str, Any]] = []
-    for event in rows:
-        if not isinstance(event, dict):
-            continue
-        kind = str(event.get("event_kind") or "").strip()
-        phase = str(event.get("phase") or "").strip()
-        status = str(event.get("status") or "").strip().lower()
-        key = kind or phase
-        if (
-            key not in MF_CLOSE_REQUIRED_EVENT_KINDS
-            and phase == "verification"
-            and kind in {"qa_verification", "independent_verification"}
-        ):
-            key = "verification"
-        if key in required_event_kinds and status in MF_CLOSE_PASS_STATUSES:
-            present.add(key)
-        elif key in required_event_kinds:
-            ignored.append({
-                "event_kind": kind,
-                "phase": phase,
-                "status": status,
-                "id": event.get("id"),
-            })
+
+    def _close_present(
+        close_rows: list[dict[str, Any]],
+    ) -> tuple[set[str], list[dict[str, Any]]]:
+        close_present: set[str] = set()
+        close_ignored: list[dict[str, Any]] = []
+        for event in close_rows:
+            if not isinstance(event, dict):
+                continue
+            kind = str(event.get("event_kind") or "").strip()
+            phase = str(event.get("phase") or "").strip()
+            status = str(event.get("status") or "").strip().lower()
+            key = kind or phase
+            if (
+                key not in MF_CLOSE_REQUIRED_EVENT_KINDS
+                and phase == "verification"
+                and kind in {"qa_verification", "independent_verification"}
+            ):
+                key = "verification"
+            if key in required_event_kinds and status in MF_CLOSE_PASS_STATUSES:
+                close_present.add(key)
+            elif key in required_event_kinds:
+                close_ignored.append({
+                    "event_kind": kind,
+                    "phase": phase,
+                    "status": status,
+                    "id": event.get("id"),
+                })
+        return close_present, close_ignored
+
+    raw_present, _raw_ignored = _close_present(raw_rows)
+    route_context_gate = mf_route_context_gate_verification(raw_rows, contract)
+    finish_gate_projection = mf_subagent_finish_gate_close_projection(
+        raw_rows,
+        needed_event_kinds=required_event_kinds - raw_present,
+        route_context_gate=route_context_gate,
+    )
+    rows = [
+        *raw_rows,
+        *_list(finish_gate_projection.get("projected_events")),
+    ]
+    present, ignored = _close_present(rows)
     missing = sorted(required_event_kinds - present)
     contract_gate = mf_contract_gate_verification(rows, contract)
-    route_context_gate = mf_route_context_gate_verification(rows, contract)
     lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
     worker_graph_trace_gate = _worker_graph_trace_gate(rows, governance_policy)
     independent_qa_gate = _independent_qa_gate(rows, governance_policy, contract=contract)
@@ -5466,6 +6016,16 @@ def mf_close_gate_verification(
             "label": "contract projection",
             "missing": contract_projection_gate.get("missing_requirement_ids", []),
             "next_action": "repair stale/divergent contract projection or record the worker read receipt before close",
+        }
+    if finish_gate_projection.get("required") and not finish_gate_projection.get("passed"):
+        groups["finish_gate_projection"] = {
+            "label": "finish-gate close projection",
+            "missing": finish_gate_projection.get("missing_fields", []),
+            "next_action": (
+                "record a passed mf_subagent_finish_gate with route identity, "
+                "worker lineage, observer command id, commit, changed files, "
+                "review_ready, and close_ready evidence"
+            ),
         }
     if (
         post_verification_actions_gate.get("required")
@@ -5555,11 +6115,15 @@ def mf_close_gate_verification(
         "close_timeline_required": close_timeline_required,
         "present_event_kinds": sorted(present),
         "missing_event_kinds": missing,
-        "event_count": len(rows),
+        "event_count": len(raw_rows),
+        "projected_event_count": len(
+            _list(finish_gate_projection.get("projected_events"))
+        ),
         "ignored_required_events": ignored,
         "governance_policy": governance_policy,
         "contract_gate": contract_gate,
         "route_context_gate": route_context_gate,
+        "finish_gate_projection": finish_gate_projection,
         "lane_ownership_gate": lane_ownership_gate,
         "worker_graph_trace_gate": worker_graph_trace_gate,
         "independent_qa_gate": independent_qa_gate,
@@ -5579,6 +6143,9 @@ def mf_close_gate_verification(
             "has_close_ready": "close_ready" in present,
             "has_contract_evidence": bool(contract_gate.get("passed")),
             "has_route_context_consumption": bool(route_context_gate.get("passed")),
+            "has_finish_gate_projection": bool(
+                finish_gate_projection.get("projected_event_kinds")
+            ),
             "has_lane_ownership": bool(lane_ownership_gate.get("passed")),
             "has_worker_graph_trace": bool(worker_graph_trace_gate.get("passed")),
             "has_independent_qa": bool(independent_qa_gate.get("passed")),
@@ -5630,6 +6197,7 @@ def compact_gate_summary(
     gate_keys = [
         "contract_gate",
         "route_context_gate",
+        "finish_gate_projection",
         "lane_ownership_gate",
         "worker_graph_trace_gate",
         "independent_qa_gate",
@@ -5661,6 +6229,7 @@ def compact_gate_summary(
                 for field in (
                     "diagnosis",
                     "reasons",
+                    "missing_fields",
                     "rejected_event_ids",
                     "relevant_event_ids",
                     "recommended_legal_action",
@@ -5723,6 +6292,7 @@ def compact_gate_summary(
 MF_REPAIR_GATE_KEYS = [
     "contract_gate",
     "route_context_gate",
+    "finish_gate_projection",
     "lane_ownership_gate",
     "worker_graph_trace_gate",
     "independent_qa_gate",
@@ -5806,6 +6376,29 @@ def _generic_repair_append_skeleton(gate_key: str, missing: list[str]) -> dict[s
                     "prompt_contract_hash": "<canonical_prompt_contract_hash>",
                     "visible_injection_manifest_hash": "<canonical_visible_manifest_hash>",
                 }
+            },
+        )
+    if gate_key == "finish_gate_projection":
+        return _repair_append_skeleton(
+            "mf_subagent_finish_gate",
+            phase="handoff_gate",
+            payload={
+                "close_ready": True,
+                "review_ready": True,
+                "observer_command_id": "<originating_observer_command_id>",
+                "commit_sha": "<implementation_commit_sha>",
+                "changed_files": [],
+                "route_prompt_contract": {
+                    "route_context_hash": "<canonical_route_context_hash>",
+                    "prompt_contract_id": "<canonical_prompt_contract_id>",
+                },
+                "startup_evidence": {
+                    "runtime_context_id": "<mfrctx-...>",
+                    "task_id": "<worker_task_id>",
+                    "parent_task_id": "<backlog_id>",
+                    "worker_slot_id": "<worker_slot_id>",
+                    "fence_token": "<fence_token>",
+                },
             },
         )
     if gate_key == "lane_ownership_gate":
@@ -6196,6 +6789,13 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             reasons.append(value)
     if missing:
         reasons.append("Missing required evidence: " + ", ".join(missing))
+    missing_fields = [
+        str(item)
+        for item in _list(gate.get("missing_fields"))
+        if str(item or "").strip()
+    ]
+    if missing_fields:
+        reasons.append("Missing fields: " + ", ".join(missing_fields))
     rejected_sources = {
         "rejected_evidence_events": gate.get("rejected_evidence_events"),
         "rejected_observer_resolutions": gate.get("rejected_observer_resolutions"),
@@ -6216,6 +6816,7 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
         "failed_gate_name": gate_key,
         "status": str(gate.get("status") or "failed"),
         "missing_requirement_ids": missing,
+        "missing_fields": missing_fields,
         "reasons": _unique_compact_values(reasons),
         "rejected_event_ids": _unique_compact_values(rejected_event_ids),
         "relevant_event_ids": _unique_compact_values(relevant_event_ids),

@@ -31,6 +31,9 @@ FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
 FINISH_GATE_LANE_OWNERSHIP_PROJECTION_SCHEMA_VERSION = (
     "mf_subagent_finish_gate_lane_ownership_projection.v1"
 )
+FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION = (
+    "mf_subagent_finish_gate_close_projection.v1"
+)
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION = "mf_subagent_runtime_contract_view.v1"
 AGENT_TASK_CONTRACT_SCHEMA_VERSION = "observer_owned_agent_task_contract.v1"
@@ -2767,6 +2770,31 @@ def _child_route_prompt_contract_from_payload(
     )
 
 
+def _merge_child_route_prompt_contract(
+    primary: Mapping[str, Any],
+    fallback: Mapping[str, Any],
+) -> dict[str, str]:
+    """Fill missing child route identity from another validated payload."""
+
+    fallback_contract = _child_route_prompt_contract_from_payload(fallback)
+    return _child_route_prompt_contract(
+        route_id=_string(primary.get("route_id"))
+        or _string(fallback_contract.get("route_id")),
+        route_context_hash=_string(primary.get("route_context_hash"))
+        or _string(fallback_contract.get("route_context_hash")),
+        prompt_contract_id=_string(primary.get("prompt_contract_id"))
+        or _string(fallback_contract.get("prompt_contract_id")),
+        prompt_contract_hash=_string(primary.get("prompt_contract_hash"))
+        or _string(fallback_contract.get("prompt_contract_hash")),
+        route_token_ref=_string(primary.get("route_token_ref"))
+        or _string(fallback_contract.get("route_token_ref")),
+        visible_injection_manifest_hash=_string(
+            primary.get("visible_injection_manifest_hash")
+        )
+        or _string(fallback_contract.get("visible_injection_manifest_hash")),
+    )
+
+
 def _mf_subagent_route_lineage(
     *,
     parent_route_lineage: Mapping[str, Any],
@@ -3621,6 +3649,14 @@ def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any
     ):
         if not container:
             continue
+        finish_gate = _nested_mapping(container, "mf_subagent_finish_gate")
+        if finish_gate:
+            startup_projection = _finish_gate_startup_close_projection(
+                event,
+                finish_gate,
+            )
+            if startup_projection:
+                return startup_projection
         for key in (
             "mf_subagent_startup_gate",
             "startup_evidence",
@@ -3636,6 +3672,71 @@ def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any
     ):
         return dict(event)
     return {}
+
+
+def _finish_gate_startup_close_projection(
+    event: Mapping[str, Any],
+    finish_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    status = _string(event.get("status") or event.get("decision")).lower()
+    if status and status not in (*_PASS_STATUSES, "accepted", "approved", "allowed", "allow"):
+        return {}
+    startup_identity_gate = _nested_mapping(finish_gate, "startup_worker_identity_gate")
+    worker_attestation_gate = _nested_mapping(finish_gate, "worker_self_attestation_gate")
+    if not (_bool(startup_identity_gate.get("passed")) and _bool(worker_attestation_gate.get("passed"))):
+        return {}
+    startup_evidence = dict(_nested_mapping(finish_gate, "startup_evidence"))
+    if not startup_evidence:
+        return {}
+    attestation = _nested_mapping(worker_attestation_gate, "attestation")
+    if not attestation:
+        attestation = _nested_mapping(finish_gate, "worker_self_attestation")
+    worker_session_id = _string(
+        worker_attestation_gate.get("worker_session_id")
+        or startup_identity_gate.get("worker_session_id")
+        or attestation.get("worker_session_id")
+        or startup_evidence.get("worker_session_id")
+    )
+    worker_transcript_path = _string(
+        worker_attestation_gate.get("worker_transcript_path")
+        or startup_identity_gate.get("worker_transcript_path")
+        or attestation.get("worker_transcript_path")
+        or startup_evidence.get("worker_transcript_path")
+    )
+    worker_transcript_ref = _string(
+        worker_attestation_gate.get("worker_transcript_ref")
+        or startup_identity_gate.get("worker_transcript_ref")
+        or attestation.get("worker_transcript_ref")
+        or startup_evidence.get("worker_transcript_ref")
+    )
+    harness_type = _string(
+        worker_attestation_gate.get("harness_type")
+        or startup_identity_gate.get("harness_type")
+        or attestation.get("harness_type")
+        or startup_evidence.get("harness_type")
+    )
+    filer_principal = _string(
+        attestation.get("filer_principal")
+        or worker_attestation_gate.get("filer_principal")
+        or startup_evidence.get("filer_principal")
+        or startup_evidence.get("actor")
+    )
+    startup_evidence.update(
+        {
+            "schema_version": "mf_subagent_startup_gate.v1",
+            "gate_kind": "mf_subagent.startup",
+            "close_satisfying": True,
+            "worker_self_attestation": dict(attestation),
+            "worker_session_id": worker_session_id,
+            "worker_transcript_path": worker_transcript_path,
+            "worker_transcript_ref": worker_transcript_ref,
+            "harness_type": harness_type,
+            "filer_principal": filer_principal,
+            "finish_gate_startup_projection": True,
+            "finish_gate_event_id": _string(event.get("id") or event.get("event_id")),
+        }
+    )
+    return startup_evidence
 
 
 def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
@@ -3840,6 +3941,22 @@ def _route_startup_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         gate = _timeline_startup_gate_from_event(event)
         if gate:
             candidate = dict(gate)
+            source_event_id = _string(
+                event.get("id")
+                or event.get("event_id")
+                or event.get("timeline_event_id")
+                or candidate.get("startup_event_id")
+                or candidate.get("event_id")
+                or candidate.get("id")
+            )
+            if source_event_id and not _string(candidate.get("startup_event_id")):
+                candidate["startup_event_id"] = source_event_id
+            source_event_kind = _string(event.get("event_kind") or event.get("event_type"))
+            if source_event_kind and not _string(candidate.get("startup_event_kind")):
+                candidate["startup_event_kind"] = source_event_kind
+            source_event_status = _string(event.get("status") or event.get("decision"))
+            if source_event_status and not _string(candidate.get("startup_event_status")):
+                candidate["startup_event_status"] = source_event_status
             event_actor = _string(event.get("actor"))
             if event_actor and not _string(candidate.get("actor")):
                 candidate["actor"] = event_actor
@@ -3921,6 +4038,10 @@ def _worker_self_attestation_close_gate(
         startup_evidence.get("worker_transcript_path")
         or attestation.get("worker_transcript_path")
     )
+    worker_transcript_ref = _string(
+        startup_evidence.get("worker_transcript_ref")
+        or attestation.get("worker_transcript_ref")
+    )
     harness_type = _string(
         startup_evidence.get("harness_type") or attestation.get("harness_type")
     )
@@ -3962,8 +4083,8 @@ def _worker_self_attestation_close_gate(
             blockers.append("worker_self_attestation_not_passed")
     if not worker_session_id:
         blockers.append("missing_worker_session_id")
-    if not worker_transcript_path:
-        blockers.append("missing_worker_transcript_path")
+    if not (worker_transcript_path or worker_transcript_ref):
+        blockers.append("missing_worker_transcript_ref_or_path")
     if harness_type not in {"claude", "codex"}:
         blockers.append("missing_or_unsupported_harness_type")
     passed = not blockers
@@ -3974,6 +4095,7 @@ def _worker_self_attestation_close_gate(
         "worker_self_attesting": passed,
         "worker_session_id": worker_session_id,
         "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
         "harness_type": harness_type,
         "blockers": blockers,
         "attestation": dict(attestation),
@@ -6777,6 +6899,11 @@ def validate_mf_subagent_finish_gate(
         close_satisfying_startup_evidence.get("read_receipt_event_id")
         or startup_evidence.get("read_receipt_event_id")
     )
+    if not read_receipt_hash:
+        read_receipt_hash = _string(
+            close_satisfying_startup_evidence.get("read_receipt_hash")
+            or startup_evidence.get("read_receipt_hash")
+        )
     if not startup_present:
         # Produce a structured reason for the refusal to aid debugging.
         is_surrogate = _startup_is_host_adapter_surrogate(startup_evidence)
@@ -6820,27 +6947,215 @@ def validate_mf_subagent_finish_gate(
             "before close-ready"
         )
 
-    route_lineage = _mf_subagent_route_lineage(
-        parent_route_lineage=parent_route_lineage,
-        child_route_prompt_contract=child_route_prompt_contract,
+    child_route_prompt_contract = _merge_child_route_prompt_contract(
+        child_route_prompt_contract,
+        close_satisfying_startup_evidence,
     )
-    lane_ownership_projection = {
-        "schema_version": FINISH_GATE_LANE_OWNERSHIP_PROJECTION_SCHEMA_VERSION,
-        "evidence_id": "bounded_implementation_subagent.review_ready",
-        "evidence_ids": [
-            "bounded_implementation_subagent.review_ready",
-            "bounded_implementation_subagent.waiting_merge",
-        ],
-        "review_ready": True,
-        "waiting_merge": True,
-        "worker_status": "waiting_merge",
-        "stop_state": "waiting_merge",
+    route_identity = {
+        "route_id": _string(child_route_prompt_contract.get("route_id")),
+        "route_context_hash": _string(
+            child_route_prompt_contract.get("route_context_hash")
+        ),
+        "prompt_contract_id": _string(
+            child_route_prompt_contract.get("prompt_contract_id")
+        ),
+        "prompt_contract_hash": _string(
+            child_route_prompt_contract.get("prompt_contract_hash")
+        ),
+        "route_token_ref": _string(child_route_prompt_contract.get("route_token_ref")),
+        "visible_injection_manifest_hash": _string(
+            child_route_prompt_contract.get("visible_injection_manifest_hash")
+        ),
+    }
+    if not parent_task_id:
+        parent_task_id = _string(
+            close_satisfying_startup_evidence.get("parent_task_id")
+            or startup_evidence.get("parent_task_id")
+        )
+    runtime_context_id = _string(
+        close_satisfying_startup_evidence.get("runtime_context_id")
+        or startup_evidence.get("runtime_context_id")
+    )
+    worker_id = _string(
+        close_satisfying_startup_evidence.get("worker_id")
+        or startup_evidence.get("worker_id")
+        or close_satisfying_startup_evidence.get("worker_slot_id")
+        or startup_evidence.get("worker_slot_id")
+        or getattr(context, "worker_id", "")
+    )
+    worker_slot_id = _string(
+        close_satisfying_startup_evidence.get("worker_slot_id")
+        or startup_evidence.get("worker_slot_id")
+        or worker_id
+        or getattr(context, "worker_slot_id", "")
+    )
+    agent_id = _string(
+        close_satisfying_startup_evidence.get("agent_id")
+        or startup_evidence.get("agent_id")
+        or getattr(context, "agent_id", "")
+    )
+    startup_worker_session_id = _string(
+        startup_worker_identity_gate.get("worker_session_id")
+        or close_satisfying_startup_evidence.get("worker_session_id")
+        or startup_evidence.get("worker_session_id")
+    )
+    finish_worker_session_id = _string(
+        worker_self_attestation_gate.get("worker_session_id")
+    )
+    worker_session_id = finish_worker_session_id or startup_worker_session_id
+    worker_transcript_ref = _string(
+        worker_self_attestation_gate.get("worker_transcript_ref")
+        or startup_worker_identity_gate.get("worker_transcript_ref")
+        or close_satisfying_startup_evidence.get("worker_transcript_ref")
+        or startup_evidence.get("worker_transcript_ref")
+    )
+    worker_transcript_path = _string(
+        worker_self_attestation_gate.get("worker_transcript_path")
+        or startup_worker_identity_gate.get("worker_transcript_path")
+        or close_satisfying_startup_evidence.get("worker_transcript_path")
+        or startup_evidence.get("worker_transcript_path")
+    )
+    harness_type = _string(
+        worker_self_attestation_gate.get("harness_type")
+        or startup_worker_identity_gate.get("harness_type")
+    )
+    real_worker_join = _nested_mapping(surrogate_join_gate, "real_worker_join")
+    startup_event_id = _string(
+        close_satisfying_startup_evidence.get("startup_event_id")
+        or startup_evidence.get("startup_event_id")
+        or real_worker_join.get("join_event_id")
+    )
+    startup_event_kind = _string(
+        close_satisfying_startup_evidence.get("startup_event_kind")
+        or startup_evidence.get("startup_event_kind")
+        or "mf_subagent_startup"
+    )
+    startup_lineage = {
+        "schema_version": "mf_subagent_finish_gate_startup_lineage.v1",
+        "startup_present": True,
+        "close_satisfying": True,
+        "startup_event_id": startup_event_id,
+        "startup_event_kind": startup_event_kind,
+        "startup_event_status": _string(
+            close_satisfying_startup_evidence.get("startup_event_status")
+            or startup_evidence.get("startup_event_status")
+            or close_satisfying_startup_evidence.get("status")
+            or startup_evidence.get("status")
+        ),
+        "gate_kind": _string(
+            close_satisfying_startup_evidence.get("gate_kind")
+            or startup_evidence.get("gate_kind")
+        ),
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": context.backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "worker_role": MF_SUB_ROLE,
+        "fence_token": context.fence_token,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "head_commit": _string(
+            close_satisfying_startup_evidence.get("head_commit")
+            or startup_evidence.get("head_commit")
+        ),
+        "route_identity": route_identity,
+        "observer_command_id": observer_command_id,
+        "read_receipt_hash": read_receipt_hash,
+        "read_receipt_event_id": read_receipt_event_id,
+        "surrogate_joined": _bool(real_worker_join.get("joined")),
+    }
+    worker_identity = {
+        "schema_version": "mf_subagent_finish_gate_worker_identity.v1",
         "worker_role": MF_SUB_ROLE,
         "role": MF_SUB_ROLE,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": agent_id,
+        "worker_session_id": worker_session_id,
+        "startup_worker_session_id": startup_worker_session_id,
+        "finish_worker_session_id": finish_worker_session_id,
+        "worker_transcript_path": worker_transcript_path,
+        "worker_transcript_ref": worker_transcript_ref,
+        "harness_type": harness_type,
+        "startup_identity_passed": True,
+        "finish_attestation_passed": True,
+    }
+    route_lineage = _mf_subagent_route_lineage(
+        parent_route_lineage=parent_route_lineage,
+        child_route_prompt_contract=child_route_prompt_contract,
+    )
+    close_gate_projection = {
+        "schema_version": FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION,
+        "producer": "mf_subagent_worker",
+        "source_event_kind": "mf_subagent_finish_gate",
+        "implementation": True,
+        "implementation_ready": True,
+        "review_ready": True,
+        "waiting_merge": True,
+        "close_ready": True,
+        "worker_status": "waiting_merge",
+        "stop_state": "waiting_merge",
+        "event_kinds_satisfied": ["implementation", "close_ready"],
+        "evidence_ids": [
+            "bounded_implementation_subagent.implementation",
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+            "bounded_implementation_subagent.close_ready",
+        ],
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
         "backlog_id": context.backlog_id,
-        "runtime_context_id": _string(startup_evidence.get("runtime_context_id")),
+        "runtime_context_id": runtime_context_id,
+        "checkpoint_id": checkpoint_id,
+        "commit": claimed_head or context.head_commit,
+        "head_commit": claimed_head or context.head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "fence_token": context.fence_token,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "changed_files": normalized["changed_files"],
+        "new_files": normalized["new_files"],
+        "test_results": normalized["test_results"],
+        "route_identity": route_identity,
+        "route_lineage": route_lineage,
+        "observer_command_id": observer_command_id,
+        "worker_identity": worker_identity,
+        "startup_lineage": startup_lineage,
+        "read_receipt_hash": read_receipt_hash,
+        "read_receipt_event_id": read_receipt_event_id,
+        "graph_trace_evidence": graph_trace_evidence,
+    }
+    lane_ownership_projection = {
+        "schema_version": FINISH_GATE_LANE_OWNERSHIP_PROJECTION_SCHEMA_VERSION,
+        "evidence_id": "bounded_implementation_subagent.review_ready",
+        "evidence_ids": [
+            "bounded_implementation_subagent.implementation",
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+            "bounded_implementation_subagent.close_ready",
+        ],
+        "implementation": True,
+        "implementation_ready": True,
+        "review_ready": True,
+        "waiting_merge": True,
+        "close_ready": True,
+        "worker_status": "waiting_merge",
+        "stop_state": "waiting_merge",
+        "worker_role": MF_SUB_ROLE,
+        "role": MF_SUB_ROLE,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": agent_id,
+        "worker_session_id": worker_session_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": context.backlog_id,
+        "runtime_context_id": runtime_context_id,
         "checkpoint_id": checkpoint_id,
         "merge_queue_id": context.merge_queue_id,
         "fence_token": context.fence_token,
@@ -6849,6 +7164,9 @@ def validate_mf_subagent_finish_gate(
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
         "head_commit": claimed_head or context.head_commit,
+        "commit": claimed_head or context.head_commit,
+        "changed_files": normalized["changed_files"],
+        "new_files": normalized["new_files"],
         "route_id": _string(child_route_prompt_contract.get("route_id")),
         "route_context_hash": _string(
             child_route_prompt_contract.get("route_context_hash")
@@ -6870,6 +7188,12 @@ def validate_mf_subagent_finish_gate(
         "parent_prompt_contract_id": _string(
             route_lineage.get("parent_prompt_contract_id")
         ),
+        "route_identity": route_identity,
+        "observer_command_id": observer_command_id,
+        "read_receipt_hash": read_receipt_hash,
+        "read_receipt_event_id": read_receipt_event_id,
+        "worker_identity": worker_identity,
+        "startup_lineage": startup_lineage,
         "producer": "mf_subagent_worker",
         "source_event_kind": "mf_subagent_finish_gate",
     }
@@ -6882,6 +7206,13 @@ def validate_mf_subagent_finish_gate(
         "target_project_id": context.target_project_id or context.project_id,
         "target_project_root": context.target_project_root,
         "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": MF_SUB_ROLE,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": agent_id,
+        "runtime_context_id": runtime_context_id,
+        "worker_session_id": worker_session_id,
         "observer_command_id": observer_command_id,
         "backlog_id": context.backlog_id,
         "branch_ref": context.branch_ref,
@@ -6895,14 +7226,32 @@ def validate_mf_subagent_finish_gate(
         "replay_source": FINISH_GATE_REPLAY_SOURCE,
         "finish_precheck": finish_precheck,
         "route_prompt_contract": child_route_prompt_contract,
+        "route_identity": route_identity,
+        "route_id": _string(child_route_prompt_contract.get("route_id")),
+        "route_context_hash": _string(
+            child_route_prompt_contract.get("route_context_hash")
+        ),
+        "prompt_contract_id": _string(
+            child_route_prompt_contract.get("prompt_contract_id")
+        ),
+        "prompt_contract_hash": _string(
+            child_route_prompt_contract.get("prompt_contract_hash")
+        ),
+        "route_token_ref": _string(child_route_prompt_contract.get("route_token_ref")),
+        "visible_injection_manifest_hash": _string(
+            child_route_prompt_contract.get("visible_injection_manifest_hash")
+        ),
         "parent_route_lineage": parent_route_lineage,
         "route_lineage": route_lineage,
         "governed_evidence_required": governed_evidence_required,
         "startup_evidence": startup_evidence,
+        "close_satisfying_startup_evidence": close_satisfying_startup_evidence,
+        "startup_lineage": startup_lineage,
         "surrogate_join_gate": surrogate_join_gate,
         "startup_worker_identity_gate": startup_worker_identity_gate,
         "worker_self_attestation_gate": worker_self_attestation_gate,
         "worker_self_attestation": worker_self_attestation_gate.get("attestation", {}),
+        "worker_identity": worker_identity,
         "read_receipt_hash": read_receipt_hash,
         "read_receipt_event_id": read_receipt_event_id,
         "gate_receipt_hash": gate_receipt_hash,
@@ -6926,9 +7275,13 @@ def validate_mf_subagent_finish_gate(
         "summary": normalized["summary"],
         "evidence": normalized["evidence"],
         "merge_queue_ready": True,
+        "implementation": True,
+        "implementation_ready": True,
         "review_ready": True,
+        "waiting_merge": True,
         "worker_status": "waiting_merge",
         "stop_state": "waiting_merge",
         "lane_ownership_projection": lane_ownership_projection,
+        "close_gate_projection": close_gate_projection,
         "close_ready": True,
     }

@@ -17,6 +17,7 @@ from agent.governance.mf_subagent_contract import (
     BACKEND_CONTRACT,
     DISPATCH_DEFAULT,
     DISPATCH_GATE_SCHEMA_VERSION,
+    FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION,
     FINISH_GATE_REPLAY_SOURCE,
     FINISH_GATE_SCHEMA_VERSION,
     BRANCH_RUNTIME_SCHEMA_VERSION,
@@ -2932,46 +2933,208 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["worker_self_attestation_gate"]["attestation_phase"] == "finish"
     assert gate["worker_self_attestation"]["finish_time_self_attesting"] is True
     assert gate["close_ready"] is True
+    assert gate["implementation"] is True
+    assert gate["implementation_ready"] is True
     assert gate["review_ready"] is True
+    assert gate["waiting_merge"] is True
     assert gate["worker_status"] == "waiting_merge"
     assert gate["stop_state"] == "waiting_merge"
-    assert gate["lane_ownership_projection"] == {
-        "schema_version": "mf_subagent_finish_gate_lane_ownership_projection.v1",
-        "evidence_id": "bounded_implementation_subagent.review_ready",
-        "evidence_ids": [
-            "bounded_implementation_subagent.review_ready",
-            "bounded_implementation_subagent.waiting_merge",
-        ],
-        "review_ready": True,
-        "waiting_merge": True,
-        "worker_status": "waiting_merge",
-        "stop_state": "waiting_merge",
+    assert gate["route_identity"] == {
+        "route_id": "route-finish-child",
+        "route_context_hash": "sha256:child-route-context",
+        "prompt_contract_id": "rprompt-child",
+        "prompt_contract_hash": "sha256:child-prompt",
+        "route_token_ref": "rtok-finish-visible",
+        "visible_injection_manifest_hash": "",
+    }
+    assert gate["route_prompt_contract"] == {
+        "route_context_hash": "sha256:child-route-context",
+        "prompt_contract_id": "rprompt-child",
+        "prompt_contract_hash": "sha256:child-prompt",
+        "route_id": "route-finish-child",
+        "route_token_ref": "rtok-finish-visible",
+    }
+    assert gate["runtime_context_id"] == "mfrctx-finish"
+    assert gate["worker_id"] == "codex-subagent-1"
+    assert gate["worker_slot_id"] == "codex-subagent-1"
+    assert gate["worker_session_id"] == "worker-session-codex-1"
+    assert gate["worker_identity"] == {
+        "schema_version": "mf_subagent_finish_gate_worker_identity.v1",
         "worker_role": "mf_sub",
         "role": "mf_sub",
         "task_id": "task-mf-sub-1",
         "parent_task_id": "",
-        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
         "runtime_context_id": "mfrctx-finish",
-        "checkpoint_id": "ckpt-finish",
-        "merge_queue_id": "mq-1",
-        "fence_token": "fence-2",
-        "branch_ref": "refs/heads/codex/task-mf-sub-1",
-        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
-        "base_commit": "base123",
-        "target_head_commit": "target123",
-        "head_commit": "head456",
-        "route_id": "",
-        "route_context_hash": "",
-        "prompt_contract_id": "",
-        "prompt_contract_hash": "",
-        "route_token_ref": "",
-        "visible_injection_manifest_hash": "",
-        "parent_route_id": "",
-        "parent_route_context_hash": "",
-        "parent_prompt_contract_id": "",
-        "producer": "mf_subagent_worker",
-        "source_event_kind": "mf_subagent_finish_gate",
+        "worker_id": "codex-subagent-1",
+        "worker_slot_id": "codex-subagent-1",
+        "agent_id": "codex",
+        "worker_session_id": "worker-session-codex-1",
+        "startup_worker_session_id": "worker-session-codex-1",
+        "finish_worker_session_id": "worker-session-codex-1",
+        "worker_transcript_path": "/tmp/worker-session-codex-1.jsonl",
+        "worker_transcript_ref": "codex-thread:worker-session-codex-1",
+        "harness_type": "codex",
+        "startup_identity_passed": True,
+        "finish_attestation_passed": True,
     }
+    assert gate["startup_lineage"]["schema_version"] == (
+        "mf_subagent_finish_gate_startup_lineage.v1"
+    )
+    assert gate["startup_lineage"]["startup_event_id"] == "evt-startup-test"
+    assert gate["startup_lineage"]["startup_event_kind"] == "mf_subagent_startup"
+    assert gate["startup_lineage"]["runtime_context_id"] == "mfrctx-finish"
+    assert gate["startup_lineage"]["observer_command_id"] == "cmd-finish"
+    assert gate["startup_lineage"]["read_receipt_event_id"] == "2873"
+    assert gate["startup_lineage"]["route_identity"] == gate["route_identity"]
+
+    projection = gate["lane_ownership_projection"]
+    assert projection["schema_version"] == (
+        "mf_subagent_finish_gate_lane_ownership_projection.v1"
+    )
+    assert projection["evidence_id"] == "bounded_implementation_subagent.review_ready"
+    assert projection["evidence_ids"] == [
+        "bounded_implementation_subagent.implementation",
+        "bounded_implementation_subagent.review_ready",
+        "bounded_implementation_subagent.waiting_merge",
+        "bounded_implementation_subagent.close_ready",
+    ]
+    assert projection["implementation"] is True
+    assert projection["review_ready"] is True
+    assert projection["waiting_merge"] is True
+    assert projection["close_ready"] is True
+    assert projection["worker_status"] == "waiting_merge"
+    assert projection["stop_state"] == "waiting_merge"
+    assert projection["task_id"] == "task-mf-sub-1"
+    assert projection["backlog_id"] == "ARCH-MF-SUBAGENT-BACKEND"
+    assert projection["runtime_context_id"] == "mfrctx-finish"
+    assert projection["checkpoint_id"] == "ckpt-finish"
+    assert projection["commit"] == "head456"
+    assert projection["changed_files"] == ["agent/governance/mf_subagent_contract.py"]
+    assert projection["route_identity"] == gate["route_identity"]
+    assert projection["observer_command_id"] == "cmd-finish"
+    assert projection["worker_identity"] == gate["worker_identity"]
+    assert projection["startup_lineage"] == gate["startup_lineage"]
+    assert projection["producer"] == "mf_subagent_worker"
+    assert projection["source_event_kind"] == "mf_subagent_finish_gate"
+
+    close_projection = gate["close_gate_projection"]
+    assert close_projection["schema_version"] == (
+        FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION
+    )
+    assert close_projection["implementation"] is True
+    assert close_projection["review_ready"] is True
+    assert close_projection["waiting_merge"] is True
+    assert close_projection["close_ready"] is True
+    assert close_projection["event_kinds_satisfied"] == [
+        "implementation",
+        "close_ready",
+    ]
+    assert close_projection["evidence_ids"] == [
+        "bounded_implementation_subagent.implementation",
+        "bounded_implementation_subagent.review_ready",
+        "bounded_implementation_subagent.waiting_merge",
+        "bounded_implementation_subagent.close_ready",
+    ]
+    assert close_projection["route_identity"] == gate["route_identity"]
+    assert close_projection["observer_command_id"] == "cmd-finish"
+    assert close_projection["worker_identity"] == gate["worker_identity"]
+    assert close_projection["startup_lineage"] == gate["startup_lineage"]
+    assert close_projection["commit"] == "head456"
+    assert close_projection["changed_files"] == [
+        "agent/governance/mf_subagent_contract.py"
+    ]
+
+
+def test_finish_gate_projects_close_fields_from_startup_lineage_for_close_gate() -> None:
+    startup = _finish_startup_evidence(
+        parent_task_id="ARCH-MF-SUBAGENT-BACKEND",
+        runtime_context_id="mfrctx-daily-planner",
+        worker_id="worker-b",
+        worker_slot_id="worker-slot-b",
+        agent_id="agent-b",
+        route_id="route-daily-child",
+        route_context_hash="sha256:daily-child-route",
+        prompt_contract_id="rprompt-daily-child",
+        prompt_contract_hash="sha256:daily-child-prompt",
+        route_token_ref="rtok-daily-child",
+        visible_injection_manifest_hash="sha256:daily-visible",
+        observer_command_id="cmd-e49d85248073",
+        read_receipt_hash="sha256:daily-read-receipt",
+        read_receipt_event_id="evt-daily-read-receipt",
+        **_self_attested_startup_fields(
+            worker_session_id="worker-session-daily",
+            transcript_path="/tmp/worker-session-daily.jsonl",
+            transcript_ref="codex-thread:worker-session-daily",
+            harness_type="codex",
+        ),
+    )
+
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "cae2641a58ef9fa13ba0462a90b146d5d9f4a864",
+            "status": "review_ready",
+            "changed_files": ["src/App.jsx", "src/styles.css"],
+            "owned_files": ["src/App.jsx", "src/styles.css"],
+            "test_results": {"status": "passed", "command": "npm test"},
+            "checkpoint_id": "ckpt-daily-finish",
+            "fence_token": "fence-2",
+            "summary": "Daily Planner demo worker ready for review.",
+            "real_startup_events": [_startup_event(startup, event_id="evt-daily-startup")],
+            "finish_time_worker_self_attestation": _finish_time_worker_attestation(
+                worker_session_id="worker-session-daily",
+                transcript_path="/tmp/worker-session-daily.jsonl",
+                transcript_ref="codex-thread:worker-session-daily",
+                harness_type="codex",
+            ),
+        },
+        context=_context(),
+    )
+
+    assert gate["observer_command_id"] == "cmd-e49d85248073"
+    assert gate["read_receipt_hash"] == "sha256:daily-read-receipt"
+    assert gate["read_receipt_event_id"] == "evt-daily-read-receipt"
+    assert gate["route_identity"] == {
+        "route_id": "route-daily-child",
+        "route_context_hash": "sha256:daily-child-route",
+        "prompt_contract_id": "rprompt-daily-child",
+        "prompt_contract_hash": "sha256:daily-child-prompt",
+        "route_token_ref": "rtok-daily-child",
+        "visible_injection_manifest_hash": "sha256:daily-visible",
+    }
+    assert gate["worker_identity"]["worker_id"] == "worker-b"
+    assert gate["worker_identity"]["worker_slot_id"] == "worker-slot-b"
+    assert gate["worker_identity"]["agent_id"] == "agent-b"
+    assert gate["worker_identity"]["worker_session_id"] == "worker-session-daily"
+    assert gate["startup_lineage"]["parent_task_id"] == "ARCH-MF-SUBAGENT-BACKEND"
+    assert gate["startup_lineage"]["startup_event_id"] == "evt-daily-startup"
+    assert gate["startup_lineage"]["runtime_context_id"] == "mfrctx-daily-planner"
+
+    close_projection = gate["close_gate_projection"]
+    assert close_projection["schema_version"] == (
+        FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION
+    )
+    assert close_projection["implementation"] is True
+    assert close_projection["review_ready"] is True
+    assert close_projection["waiting_merge"] is True
+    assert close_projection["close_ready"] is True
+    assert close_projection["event_kinds_satisfied"] == [
+        "implementation",
+        "close_ready",
+    ]
+    assert close_projection["commit"] == "cae2641a58ef9fa13ba0462a90b146d5d9f4a864"
+    assert close_projection["changed_files"] == ["src/App.jsx", "src/styles.css"]
+    assert close_projection["route_identity"] == gate["route_identity"]
+    assert close_projection["observer_command_id"] == "cmd-e49d85248073"
+    assert close_projection["worker_identity"] == gate["worker_identity"]
+    assert close_projection["startup_lineage"] == gate["startup_lineage"]
 
 
 def test_finish_gate_review_ready_projection_satisfies_lane_ownership_shape() -> None:
@@ -3088,6 +3251,47 @@ def test_finish_gate_rejects_caller_supplied_review_ready_bridge() -> None:
                     "worker_status": "waiting_merge",
                     "worker_role": "mf_sub",
                 },
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_caller_supplied_close_projection_without_startup() -> None:
+    with pytest.raises(MfSubagentContractError, match="mf_subagent_startup"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-caller-close-projection",
+                "fence_token": "fence-2",
+                "summary": "Caller-supplied close projection should not pass.",
+                "close_ready": True,
+                "implementation": True,
+                "review_ready": True,
+                "waiting_merge": True,
+                "close_gate_projection": {
+                    "schema_version": FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION,
+                    "implementation": True,
+                    "review_ready": True,
+                    "waiting_merge": True,
+                    "close_ready": True,
+                    "event_kinds_satisfied": ["implementation", "close_ready"],
+                },
+                "finish_time_worker_self_attestation": (
+                    _finish_time_worker_attestation()
+                ),
+                "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
             },
             context=_context(),
         )
@@ -3565,12 +3769,14 @@ def test_finish_gate_refuses_close_ready_without_startup_or_read_receipt() -> No
             context=_context(),
         )
 
+    startup_without_receipt = _finish_startup_evidence()
+    startup_without_receipt.pop("read_receipt_hash")
     with pytest.raises(MfSubagentContractError, match="mf_subagent_read_receipt"):
         validate_mf_subagent_finish_gate(
             {
                 **base_payload,
-                "mf_subagent_startup_gate": _finish_startup_evidence(),
-                "real_startup_events": [_startup_event(_finish_startup_evidence())],
+                "mf_subagent_startup_gate": startup_without_receipt,
+                "real_startup_events": [_startup_event(startup_without_receipt)],
                 "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
             },
             context=_context(),
@@ -4301,6 +4507,79 @@ def test_close_timeline_accepted_startup_overrides_demoted_history() -> None:
     assert normalized["startup_gate"]["passed"] is True
     assert normalized["events"][0]["status"] == "demoted"
     assert normalized["events"][1]["status"] == "accepted"
+
+
+def test_close_timeline_accepts_finish_gate_startup_projection_with_transcript_ref() -> None:
+    demoted_startup = _real_worker_startup_matching_lineage(
+        "evt-finish-projection-startup"
+    )
+    demoted_startup["close_satisfying"] = False
+    demoted_startup["worker_self_attesting"] = False
+    demoted_startup["worker_transcript_path"] = ""
+    demoted_startup["worker_transcript_ref"] = "multi_agent:worker-session-real"
+    demoted_startup["worker_self_attestation"] = {
+        **demoted_startup["worker_self_attestation"],
+        "status": "blocked",
+        "worker_self_attesting": False,
+        "self_attesting": False,
+        "worker_transcript_path": "",
+        "worker_transcript_ref": "multi_agent:worker-session-real",
+    }
+    startup_event = {
+        "id": "evt-finish-projection-startup",
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": demoted_startup},
+    }
+    finish_event = {
+        "id": "evt-finish-projection",
+        "event_kind": "mf_subagent_finish_gate",
+        "event_type": "mf_subagent.finish_gate",
+        "phase": "finish_gate",
+        "status": "passed",
+        "payload": {
+            "mf_subagent_finish_gate": {
+                "startup_evidence": demoted_startup,
+                "startup_worker_identity_gate": {
+                    "passed": True,
+                    "status": "passed",
+                    "worker_session_id": "worker-session-real",
+                    "worker_transcript_ref": "multi_agent:worker-session-real",
+                    "harness_type": "codex",
+                },
+                "worker_self_attestation_gate": {
+                    "passed": True,
+                    "status": "passed",
+                    "worker_session_id": "worker-session-real",
+                    "worker_transcript_ref": "multi_agent:worker-session-real",
+                    "harness_type": "codex",
+                    "attestation": {
+                        "attestation_phase": "finish",
+                        "status": "passed",
+                        "worker_self_attesting": True,
+                        "self_attesting": True,
+                        "finish_time_self_attesting": True,
+                        "finish_time_blockers": [],
+                        "worker_session_id": "worker-session-real",
+                        "filer_principal": "worker-session-real",
+                        "worker_transcript_ref": "multi_agent:worker-session-real",
+                        "harness_type": "codex",
+                    },
+                },
+            }
+        },
+    }
+
+    gate = close_timeline_startup_event_gate([startup_event, finish_event])
+
+    assert gate["passed"] is True
+    assert gate["demoted_startup_events"][0]["id"] == "evt-finish-projection-startup"
+    accepted = gate["accepted_startup_events"][0]
+    assert accepted["id"] == "evt-finish-projection"
+    assert accepted["worker_self_attestation_gate"]["worker_transcript_ref"] == (
+        "multi_agent:worker-session-real"
+    )
 
 
 def test_server_close_gate_check_uses_accepted_startup_gate_with_demoted_history() -> None:

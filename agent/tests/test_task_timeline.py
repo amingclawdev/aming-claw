@@ -649,6 +649,80 @@ def _runtime_contract_bounded_dispatch_event(
     }
 
 
+def _daily_planner_finish_gate_event(identity=None):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    commit = "cae2641a58ef9fa13ba0462a90b146d5d9f4a864"
+    backlog_id = "BUG-DPL-DEMO-LAUNCH-20260616"
+    task_id = "worker-a-daily-planner"
+    runtime_context_id = "mfrctx-daily-planner"
+    worker_slot_id = "worker-a"
+    fence_token = "fence-daily-planner"
+    return {
+        "id": 10,
+        "event_type": "mf_subagent.finish_gate",
+        "event_kind": "mf_subagent_finish_gate",
+        "phase": "handoff_gate",
+        "status": "passed",
+        "actor": "mf_sub",
+        "project_id": "daily-planner-lite-20260616211408-0613cead",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "payload": {
+            "finish_gate": {
+                "schema_version": "mf_subagent_finish_gate.v1",
+                "status": "passed",
+                "review_ready": True,
+                "close_ready": True,
+                "observer_command_id": "cmd-e49d85248073",
+                "route_prompt_contract": {
+                    **route_identity,
+                    "route_id": "route-daily-planner-demo",
+                    "visible_injection_manifest_hash": "sha256:dogfood-visible",
+                },
+                "startup_evidence": {
+                    **route_identity,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "worker_slot_id": worker_slot_id,
+                    "worker_id": worker_slot_id,
+                    "fence_token": fence_token,
+                    "actual_cwd": "/tmp/daily-planner/.worktrees/worker-a",
+                    "actual_git_root": "/tmp/daily-planner/.worktrees/worker-a",
+                    "worktree_path": "/tmp/daily-planner/.worktrees/worker-a",
+                    "branch": "refs/heads/codex/daily-planner-worker-a",
+                    "head_commit": commit,
+                    "base_commit": "base-daily-planner",
+                    "target_head_commit": "target-daily-planner",
+                },
+                "lane_ownership_projection": {
+                    **route_identity,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "worker_slot_id": worker_slot_id,
+                    "fence_token": fence_token,
+                    "present_lane_ownership_ids": [
+                        "bounded_implementation_subagent.dispatch",
+                        "bounded_implementation_subagent.review_ready",
+                    ],
+                    "review_ready": True,
+                },
+                "commit_sha": commit,
+                "changed_files": [
+                    "src/App.jsx",
+                    "src/planner.js",
+                    "tests/planner.spec.js",
+                ],
+                "graph_trace_ids": ["gqt-daily-planner-worker-a"],
+                "query_source": "mf_subagent",
+            }
+        },
+    }
+
+
 def _runtime_text_legacy_weak_startup_event(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     return {
@@ -6371,6 +6445,215 @@ class TestTaskTimeline(unittest.TestCase):
             ready["route_context_gate"]["present_requirement_ids"],
         )
 
+    def test_mf_parallel_close_gate_accepts_finish_gate_close_projection(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-DPL-DEMO-LAUNCH-20260616",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+            "required_lanes": [
+                {
+                    "id": "bounded_implementation_subagent",
+                    "role": "implementation_worker",
+                }
+            ],
+        }
+        route_context, route_action, dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        finish_gate = _daily_planner_finish_gate_event()
+        events = [
+            route_context,
+            route_action,
+            dispatch,
+            finish_gate,
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertNotIn("route_context_hash", finish_gate)
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["missing_event_kinds"], [])
+        self.assertEqual(
+            ready["present_event_kinds"],
+            ["close_ready", "implementation", "verification"],
+        )
+        self.assertEqual(
+            ready["finish_gate_projection"]["projected_event_kinds"],
+            ["close_ready", "implementation"],
+        )
+        self.assertEqual(
+            ready["route_context_gate"]["evidence_events"]["mf_subagent_startup"][
+                0
+            ]["event_kind"],
+            "mf_subagent_finish_gate",
+        )
+        self.assertEqual(
+            ready["lane_ownership_gate"]["present_lane_ownership_ids"],
+            [
+                "bounded_implementation_subagent.dispatch",
+                "bounded_implementation_subagent.review_ready",
+            ],
+        )
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertTrue(ready["independent_qa_gate"]["passed"])
+
+    def test_finish_gate_projection_accepts_fence_match_without_persisted_token(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-DPL-DEMO-LAUNCH-20260616",
+            "required_lanes": [
+                {
+                    "id": "bounded_implementation_subagent",
+                    "role": "implementation_worker",
+                }
+            ],
+        }
+        route_context, route_action, dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        finish_gate = json.loads(json.dumps(_daily_planner_finish_gate_event()))
+        gate_payload = finish_gate["payload"]["finish_gate"]
+        child_identity = {
+            "route_context_hash": "sha256:child-route-context",
+            "prompt_contract_id": "rprompt-child-route",
+            "prompt_contract_hash": "sha256:child-prompt-contract",
+        }
+        gate_payload["route_prompt_contract"].update(child_identity)
+        gate_payload["startup_evidence"].update(child_identity)
+        gate_payload["startup_evidence"]["identity_join"] = {
+            "route_identity_matches_latest_contract": True,
+            "read_receipt_lineage_present": True,
+        }
+        gate_payload["lane_ownership_projection"].update(child_identity)
+        gate_payload["startup_evidence"].pop("fence_token")
+        gate_payload["startup_evidence"]["fence_token_matches"] = True
+        gate_payload["lane_ownership_projection"].pop("fence_token")
+        read_receipt = {
+            "id": 6,
+            "event_kind": "mf_subagent_read_receipt",
+            "event_type": "mf_subagent.read_receipt",
+            "phase": "startup",
+            "status": "ok",
+            "payload": {
+                **child_identity,
+                "visible_injection_manifest_hash": "sha256:child-visible",
+                "runtime_context_id": "mfrctx-daily-planner",
+                "task_id": "worker-a-daily-planner",
+                "parent_task_id": "BUG-DPL-DEMO-LAUNCH-20260616",
+                "worker_slot_id": "worker-a",
+                "read_receipt_hash": "sha256:child-read-receipt",
+            },
+        }
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                route_context,
+                route_action,
+                read_receipt,
+                dispatch,
+                finish_gate,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["finish_gate_projection"]["passed"], ready)
+        self.assertNotIn(
+            "finish_gate_fence_token",
+            ready["finish_gate_projection"]["missing_fields"],
+        )
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(
+            ready["route_context_gate"]["accepted_startup_lineages"][0][
+                "acceptance_source"
+            ],
+            "identity_join_latest_contract",
+        )
+        self.assertTrue(ready["passed"], ready)
+
+    def test_finish_gate_projection_failure_reports_missing_fields(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-DPL-DEMO-LAUNCH-20260616",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        route_context, route_action, dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        finish_gate = json.loads(json.dumps(_daily_planner_finish_gate_event()))
+        gate_payload = finish_gate["payload"]["finish_gate"]
+        gate_payload.pop("observer_command_id")
+        gate_payload.pop("commit_sha")
+        gate_payload.pop("changed_files")
+        gate_payload["close_ready"] = False
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                route_context,
+                route_action,
+                dispatch,
+                finish_gate,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["missing_event_kinds"],
+            ["close_ready", "implementation"],
+        )
+        projection = blocked["finish_gate_projection"]
+        self.assertTrue(projection["required"])
+        self.assertFalse(projection["passed"])
+        self.assertIn(
+            "finish_gate_observer_command_id",
+            projection["missing_requirement_ids"],
+        )
+        self.assertIn(
+            "finish_gate_implementation_commit",
+            projection["missing_fields"],
+        )
+        self.assertIn("finish_gate_changed_files", projection["missing_fields"])
+        self.assertIn("finish_gate_close_ready", projection["missing_fields"])
+
+        compact = task_timeline.compact_gate_summary(blocked)
+        finish_gate_failure = next(
+            item
+            for item in compact["failed_gates"]
+            if item["gate"] == "finish_gate_projection"
+        )
+        self.assertTrue(finish_gate_failure["missing_requirement_ids"])
+        self.assertIn(
+            "finish_gate_close_ready",
+            finish_gate_failure["missing_fields"],
+        )
+
     def test_mf_parallel_close_gate_rejects_weak_startup_without_actual_identity(self):
         from agent.governance import task_timeline
 
@@ -6579,6 +6862,102 @@ class TestTaskTimeline(unittest.TestCase):
                 "independent_verification_lane"
             ][0]["event_kind"],
             "qa_verification",
+        )
+
+    def test_mf_parallel_close_gate_accepts_action_scoped_qa_route_token(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-QA-ACTION-SCOPE",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "independent_verification_required": True,
+            },
+        }
+        action_identity = {
+            "route_context_hash": "sha256:qa-action-route",
+            "prompt_contract_id": "rprompt-qa-action",
+            "prompt_contract_hash": "sha256:qa-action-contract",
+        }
+        qa_event = _route_context_qa_verification_event(action_identity)
+        qa_event["payload"] = {
+            "route_token_ref": "rtok-qa-action",
+            "meta_contract_gate": {
+                "action": "qa_verification",
+                "role": "qa",
+                "status": "passed",
+                "allowed": True,
+            },
+        }
+        qa_event["verification"]["route_identity"] = {
+            **action_identity,
+            "allowed_action": "task_timeline_append",
+            "route_id": "route-qa-action",
+        }
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+                {"event_kind": "verification", "phase": "verification", "status": "passed"},
+                {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+                *_route_context_consumption_events(),
+                qa_event,
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(
+            ready["route_context_gate"]["accepted_action_scope_lineages"][0][
+                "acceptance_source"
+            ],
+            "protected_route_token_ref_action_scope",
+        )
+        self.assertEqual(
+            ready["route_context_gate"]["route_identity"],
+            ROUTE_IDENTITY,
+        )
+
+    def test_mf_parallel_close_gate_rejects_unprotected_action_scoped_qa_route(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-QA-ACTION-SCOPE-BLOCKED",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "independent_verification_required": True,
+            },
+        }
+        action_identity = {
+            "route_context_hash": "sha256:qa-action-route",
+            "prompt_contract_id": "rprompt-qa-action",
+            "prompt_contract_hash": "sha256:qa-action-contract",
+        }
+        qa_event = _route_context_qa_verification_event(action_identity)
+        qa_event["verification"]["route_identity"] = {
+            **action_identity,
+            "allowed_action": "task_timeline_append",
+            "route_id": "route-qa-action",
+        }
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+                {"event_kind": "verification", "phase": "verification", "status": "passed"},
+                {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+                *_route_context_consumption_events(),
+                qa_event,
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn(
+            "route_identity_mismatch",
+            blocked["route_context_gate"]["missing_requirement_ids"],
         )
 
     def test_optional_architecture_review_lane_does_not_block_lightweight_close(self):
