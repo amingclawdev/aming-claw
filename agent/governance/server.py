@@ -52,6 +52,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 DASHBOARD_ROUTE_PREFIX = "/dashboard"
 
@@ -1401,6 +1402,361 @@ def handle_local_choose_directory(ctx: RequestContext):
         "path": selected,
         "manual_entry": False,
     }
+
+
+DEMO_ENVIRONMENT_TEMPLATE_ID = "daily-planner-lite"
+DEMO_ENVIRONMENT_MARKER = ".aming-claw-demo-environment.json"
+DEMO_ENVIRONMENT_MANAGED_BY = "aming-claw.demo-environments.v1"
+
+
+def _demo_environment_backend_url() -> str:
+    return os.environ.get("AMING_CLAW_DEMO_BACKEND_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
+
+
+def _demo_environment_root() -> Path:
+    configured = os.environ.get("AMING_CLAW_DEMO_ENV_ROOT")
+    root = Path(configured).expanduser() if configured else Path(tempfile.gettempdir()) / "aming-claw-demo-environments"
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _demo_environment_registry_dir(project_id: str) -> Path:
+    registry_dir = Path(_governance_scratch_dir(project_id)) / "demo-environments"
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    return registry_dir
+
+
+def _demo_environment_registry_path(project_id: str) -> Path:
+    return _demo_environment_registry_dir(project_id) / "registry.json"
+
+
+def _demo_environment_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": DEMO_ENVIRONMENT_TEMPLATE_ID,
+            "label": "Daily Planner Lite",
+            "description": "Small planner fixture with storage, reminders, tests, and graph/bootstrap evidence.",
+        }
+    ]
+
+
+def _read_demo_environment_registry(project_id: str) -> list[dict[str, Any]]:
+    path = _demo_environment_registry_path(project_id)
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    rows = payload.get("environments") if isinstance(payload, dict) else []
+    return [dict(row) for row in rows if isinstance(row, Mapping)]
+
+
+def _write_demo_environment_registry(project_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
+    path = _demo_environment_registry_path(project_id)
+    payload = {
+        "schema_version": "demo_environment_registry.v1",
+        "project_id": project_id,
+        "updated_at": _utc_now(),
+        "environments": [dict(row) for row in rows],
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _safe_demo_environment_root(fixture_root: str) -> tuple[bool, Path, str]:
+    if not fixture_root:
+        return False, Path(), "fixture_root is empty"
+    try:
+        root = Path(fixture_root).expanduser().resolve()
+        base = _demo_environment_root().resolve()
+        root.relative_to(base)
+        if root == base:
+            return False, root, f"fixture_root must be a child of managed demo root {base}"
+    except ValueError:
+        return False, root, f"fixture_root must be under managed demo root {base}"
+    except Exception as exc:
+        return False, Path(fixture_root), str(exc)
+    return True, root, ""
+
+
+def _demo_environment_marker_path(fixture_root: Path) -> Path:
+    return fixture_root / DEMO_ENVIRONMENT_MARKER
+
+
+def _write_demo_environment_marker(environment: Mapping[str, Any], owner_project_id: str) -> None:
+    fixture_root = Path(str(environment.get("fixture_root") or "")).resolve()
+    marker = {
+        "schema_version": "demo_environment_marker.v1",
+        "managed_by": DEMO_ENVIRONMENT_MANAGED_BY,
+        "owner_project_id": owner_project_id,
+        "environment_id": environment.get("id", ""),
+        "template_id": environment.get("template_id", ""),
+        "project_id": environment.get("project_id", ""),
+        "fixture_root": str(fixture_root),
+        "created_at": environment.get("created_at", ""),
+    }
+    _demo_environment_marker_path(fixture_root).write_text(
+        json.dumps(marker, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_demo_environment_marker(fixture_root: Path) -> dict[str, Any] | None:
+    marker_path = _demo_environment_marker_path(fixture_root)
+    if not marker_path.exists():
+        return None
+    with marker_path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _validate_managed_demo_environment(row: Mapping[str, Any], owner_project_id: str) -> tuple[bool, Path, str]:
+    safe, fixture_root, error = _safe_demo_environment_root(str(row.get("fixture_root") or ""))
+    if not safe:
+        return False, fixture_root, error
+    marker = _read_demo_environment_marker(fixture_root)
+    if not marker:
+        return False, fixture_root, f"managed marker {DEMO_ENVIRONMENT_MARKER} is missing"
+    expected = {
+        "managed_by": DEMO_ENVIRONMENT_MANAGED_BY,
+        "owner_project_id": owner_project_id,
+        "environment_id": str(row.get("id") or ""),
+        "template_id": str(row.get("template_id") or ""),
+        "project_id": str(row.get("project_id") or ""),
+        "fixture_root": str(fixture_root),
+    }
+    for key, value in expected.items():
+        if str(marker.get(key) or "") != value:
+            return False, fixture_root, f"managed marker field {key} does not match registry"
+    return True, fixture_root, ""
+
+
+def _demo_dashboard_url(target_project_id: str, view: str) -> str:
+    return (
+        f"{_demo_environment_backend_url()}/dashboard"
+        f"?project_id={target_project_id}&view={view}"
+    )
+
+
+def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
+    project_id = str(environment.get("project_id") or "")
+    fixture_root = str(environment.get("fixture_root") or "")
+    baseline_commit = str(environment.get("baseline_commit") or "")
+    dashboard_url = str(environment.get("dashboard_url") or "")
+    backlog_url = str(environment.get("backlog_url") or "")
+    timeline_url = str(environment.get("timeline_url") or "")
+    graph_url = str(environment.get("graph_url") or "")
+    planner_preview_url = str(environment.get("planner_preview_url") or "")
+    planner_preview_command = str(environment.get("planner_preview_command") or "")
+    return "\n".join([
+        "Daily Planner Lite demo launch",
+        "",
+        "Target project:",
+        f"project_id: {project_id}",
+        f"fixture_root: {fixture_root}",
+        f"baseline_commit: {baseline_commit}",
+        f"dashboard_url: {dashboard_url}",
+        f"backlog_url: {backlog_url}",
+        f"timeline_url: {timeline_url}",
+        f"graph_url: {graph_url}",
+        f"planner_preview_url: {planner_preview_url}",
+        f"planner_preview_command: {planner_preview_command}",
+        "",
+        "Governance source of truth:",
+        "1. Load Aming Claw current context and MF SOP before acting.",
+        "2. Check runtime_status, graph_status, and graph_operations_queue for the target project.",
+        "3. Use the dashboard, graph, backlog, and timeline URLs above as the source of truth.",
+        "4. Treat fixture setup as setup evidence only; do not claim worker completion from it.",
+        "",
+        "Demo work:",
+        "Create exactly one backlog row for the Daily Planner Lite demo task, then implement through governed bounded-worker or manual-fix evidence.",
+        "",
+        "Tests and visual smoke:",
+        "Run the planner tests plus a dashboard or browser visual smoke against the preview URL before reporting done.",
+        "",
+        "Evidence summary:",
+        "Return a compact summary with backlog id, changed files, tests, visual smoke result, commit, reconcile/graph status, and any risks.",
+    ])
+
+
+def _daily_planner_fixture_script() -> Path:
+    return Path(__file__).resolve().parents[2] / "frontend" / "dashboard" / "scripts" / "e2e-vibe-queue-fixture.mjs"
+
+
+def _run_daily_planner_lite_fixture(
+    *,
+    environment_id: str,
+    fixture_root: Path,
+    target_project_id: str,
+    preview_port: int,
+) -> dict[str, Any]:
+    script = _daily_planner_fixture_script()
+    if not script.exists():
+        raise RuntimeError(f"Daily Planner Lite fixture script is missing: {script}")
+    command = [
+        "node",
+        str(script),
+        "--run-id",
+        environment_id,
+        "--project-id",
+        target_project_id,
+        "--fixture-root",
+        str(fixture_root),
+        "--preview-port",
+        str(preview_port),
+        "--reset",
+        "--no-browser",
+    ]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=str(Path(__file__).resolve().parents[2]),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "fixture script failed").strip()[:1200])
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"fixture script returned invalid JSON: {exc}") from exc
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or "fixture script returned ok=false"))
+    return payload
+
+
+def _demo_environment_from_fixture(
+    *,
+    owner_project_id: str,
+    environment_id: str,
+    template_id: str,
+    fixture_root: Path,
+    created_at: str,
+    fixture_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    target_project_id = str(fixture_result.get("project_id") or f"{template_id}-{environment_id}")
+    dashboard_links = fixture_result.get("dashboard_links") if isinstance(fixture_result.get("dashboard_links"), Mapping) else {}
+    environment = {
+        "id": environment_id,
+        "template_id": template_id,
+        "label": "Daily Planner Lite",
+        "owner_project_id": owner_project_id,
+        "project_id": target_project_id,
+        "fixture_root": str(fixture_root),
+        "baseline_commit": str(fixture_result.get("baseline_commit") or ""),
+        "created_at": created_at,
+        "dashboard_url": str(fixture_result.get("dashboard_url") or _demo_dashboard_url(target_project_id, "backlog")),
+        "backlog_url": str(dashboard_links.get("backlog") or _demo_dashboard_url(target_project_id, "backlog")),
+        "timeline_url": str(dashboard_links.get("timeline") or _demo_dashboard_url(target_project_id, "timeline")),
+        "graph_url": str(dashboard_links.get("graph") or _demo_dashboard_url(target_project_id, "graph")),
+        "planner_preview_url": str(fixture_result.get("planner_preview_url") or ""),
+        "planner_preview_command": str(fixture_result.get("planner_preview_command") or ""),
+        "status": "ready",
+    }
+    environment["launch_prompt"] = _build_demo_launch_prompt(environment)
+    return environment
+
+
+def _visible_demo_environments(project_id: str) -> list[dict[str, Any]]:
+    visible: list[dict[str, Any]] = []
+    for row in _read_demo_environment_registry(project_id):
+        ok, _, _ = _validate_managed_demo_environment(row, project_id)
+        if ok:
+            environment = dict(row)
+            environment["status"] = environment.get("status") or "ready"
+            environment["launch_prompt"] = _build_demo_launch_prompt(environment)
+            visible.append(environment)
+    return visible
+
+
+@route("GET", "/api/projects/{project_id}/demo-environments")
+def handle_project_demo_environments_list(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "templates": _demo_environment_templates(),
+        "environments": _visible_demo_environments(project_id),
+    }
+
+
+@route("POST", "/api/projects/{project_id}/demo-environments")
+def handle_project_demo_environment_create(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    template_id = str(ctx.body.get("template_id") or "").strip()
+    if template_id != DEMO_ENVIRONMENT_TEMPLATE_ID:
+        return 400, {
+            "ok": False,
+            "error": "unsupported_demo_template",
+            "message": "Only template_id 'daily-planner-lite' is supported.",
+            "supported_template_ids": [DEMO_ENVIRONMENT_TEMPLATE_ID],
+        }
+    created_at = _utc_now()
+    environment_id = f"daily-planner-lite-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    target_project_id = project_service._normalize_project_id(environment_id)
+    fixture_root = (_demo_environment_root() / environment_id).resolve()
+    try:
+        preview_port = int(ctx.body.get("preview_port") or 4173)
+    except (TypeError, ValueError):
+        preview_port = 4173
+    try:
+        fixture_result = _run_daily_planner_lite_fixture(
+            environment_id=environment_id,
+            fixture_root=fixture_root,
+            target_project_id=target_project_id,
+            preview_port=preview_port,
+        )
+        environment = _demo_environment_from_fixture(
+            owner_project_id=project_id,
+            environment_id=environment_id,
+            template_id=template_id,
+            fixture_root=fixture_root,
+            created_at=created_at,
+            fixture_result=fixture_result,
+        )
+        _write_demo_environment_marker(environment, project_id)
+        rows = [
+            row for row in _read_demo_environment_registry(project_id)
+            if str(row.get("id") or "") != environment_id
+        ]
+        rows.append(environment)
+        _write_demo_environment_registry(project_id, rows)
+    except Exception as exc:
+        return 500, {
+            "ok": False,
+            "error": "demo_fixture_creation_failed",
+            "message": str(exc),
+            "next_action": "Check governance health, Node.js availability, and the Daily Planner Lite fixture script output.",
+        }
+    return 201, {"ok": True, "project_id": project_id, "environment": environment}
+
+
+@route("DELETE", "/api/projects/{project_id}/demo-environments/{environment_id}")
+def handle_project_demo_environment_delete(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    environment_id = str(ctx.path_params.get("environment_id") or "").strip()
+    rows = _read_demo_environment_registry(project_id)
+    row = next((item for item in rows if str(item.get("id") or "") == environment_id), None)
+    if not row:
+        return 404, {
+            "ok": False,
+            "error": "demo_environment_not_found",
+            "message": "No managed demo environment with that id is registered for this project.",
+        }
+    ok, fixture_root, error = _validate_managed_demo_environment(row, project_id)
+    if not ok:
+        return 409, {
+            "ok": False,
+            "error": "unmanaged_demo_environment_refused",
+            "message": f"Delete refused: {error}.",
+            "environment_id": environment_id,
+            "next_action": "Use the Demo Launch page to recreate managed environments or ask governance maintenance to repair the registry.",
+        }
+    shutil.rmtree(fixture_root)
+    remaining = [item for item in rows if str(item.get("id") or "") != environment_id]
+    _write_demo_environment_registry(project_id, remaining)
+    return {"ok": True, "project_id": project_id, "environment_id": environment_id, "deleted": True}
 
 
 @route("GET", "/api/project/list")
