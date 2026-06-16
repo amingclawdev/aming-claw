@@ -365,6 +365,7 @@ _RUNTIME_CONTEXT_EVENT_KIND_CLAUSES: dict[str, tuple[str, ...]] = {
     "verification": ("independent_verification",),
     "qa_verification": ("independent_verification",),
     "finish_gate": ("finish_gate",),
+    "mf_subagent_finish_gate": ("finish_gate",),
     "close_ready": ("close_ready",),
 }
 _RUNTIME_CONTEXT_FULFILLING_STATUSES = {
@@ -1968,6 +1969,64 @@ def _runtime_context_lane_resolved_refs(event: Mapping[str, Any]) -> list[str]:
     return _runtime_context_dedupe([ref for ref in refs if ref])
 
 
+def _runtime_context_finish_gate_lane_projection(event: Mapping[str, Any]) -> dict[str, Any]:
+    if not _runtime_context_is_worker_evidence(event):
+        return {}
+    payload = _runtime_context_mapping(event.get("payload"))
+    finish_gate = _runtime_context_nested_finish_gate_payload(payload)
+    if not finish_gate:
+        finish_gate = payload
+    projection = _runtime_context_mapping(finish_gate.get("lane_ownership_projection"))
+    if not projection:
+        return {}
+    worker_role = _runtime_context_lane_clause_id(
+        projection.get("worker_role")
+        or projection.get("role")
+        or finish_gate.get("worker_role")
+        or finish_gate.get("role")
+    )
+    if worker_role and worker_role != RUNTIME_CONTEXT_WORKER_ROLE:
+        return {}
+    if not (
+        projection.get("review_ready")
+        or projection.get("waiting_merge")
+        or _runtime_context_lane_clause_id(projection.get("worker_status"))
+        in {"review_ready", "waiting_merge"}
+        or _runtime_context_lane_clause_id(projection.get("stop_state"))
+        in {"review_ready", "waiting_merge"}
+    ):
+        return {}
+    return projection
+
+
+def _runtime_context_finish_gate_lane_projection_clauses(
+    event: Mapping[str, Any],
+) -> list[str]:
+    projection = _runtime_context_finish_gate_lane_projection(event)
+    if not projection:
+        return []
+    clauses: list[str] = []
+    clauses.extend(
+        _runtime_context_lane_clause_id(item)
+        for item in _runtime_context_string_list(projection.get("evidence_id"))
+    )
+    clauses.extend(
+        _runtime_context_lane_clause_id(item)
+        for item in _runtime_context_string_list(projection.get("evidence_ids"))
+    )
+    if projection.get("review_ready"):
+        clauses.append("bounded_implementation_subagent.review_ready")
+    if (
+        projection.get("waiting_merge")
+        or _runtime_context_lane_clause_id(projection.get("worker_status"))
+        == "waiting_merge"
+        or _runtime_context_lane_clause_id(projection.get("stop_state"))
+        == "waiting_merge"
+    ):
+        clauses.append("bounded_implementation_subagent.waiting_merge")
+    return _runtime_context_dedupe(clauses)
+
+
 def _runtime_context_lane_event_clauses(event: Mapping[str, Any]) -> list[str]:
     merged = _runtime_context_lane_event_mapping(event)
     explicit: list[str] = []
@@ -1986,7 +2045,12 @@ def _runtime_context_lane_event_clauses(event: Mapping[str, Any]) -> list[str]:
     if explicit:
         return _runtime_context_dedupe(explicit)
     event_kind = _runtime_context_lane_event_kind(event)
-    return list(_RUNTIME_CONTEXT_EVENT_KIND_CLAUSES.get(event_kind, ()))
+    return _runtime_context_dedupe(
+        [
+            *list(_RUNTIME_CONTEXT_EVENT_KIND_CLAUSES.get(event_kind, ())),
+            *_runtime_context_finish_gate_lane_projection_clauses(event),
+        ]
+    )
 
 
 def build_runtime_context_lane_plan_view(

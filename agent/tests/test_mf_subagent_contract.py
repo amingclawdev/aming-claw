@@ -2938,7 +2938,12 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["lane_ownership_projection"] == {
         "schema_version": "mf_subagent_finish_gate_lane_ownership_projection.v1",
         "evidence_id": "bounded_implementation_subagent.review_ready",
+        "evidence_ids": [
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+        ],
         "review_ready": True,
+        "waiting_merge": True,
         "worker_status": "waiting_merge",
         "stop_state": "waiting_merge",
         "worker_role": "mf_sub",
@@ -2949,6 +2954,23 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
         "runtime_context_id": "mfrctx-finish",
         "checkpoint_id": "ckpt-finish",
         "merge_queue_id": "mq-1",
+        "fence_token": "fence-2",
+        "branch_ref": "refs/heads/codex/task-mf-sub-1",
+        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "head_commit": "head456",
+        "route_id": "",
+        "route_context_hash": "",
+        "prompt_contract_id": "",
+        "prompt_contract_hash": "",
+        "route_token_ref": "",
+        "visible_injection_manifest_hash": "",
+        "parent_route_id": "",
+        "parent_route_context_hash": "",
+        "parent_prompt_contract_id": "",
+        "producer": "mf_subagent_worker",
+        "source_event_kind": "mf_subagent_finish_gate",
     }
 
 
@@ -2972,6 +2994,12 @@ def test_finish_gate_review_ready_projection_satisfies_lane_ownership_shape() ->
             "checkpoint_id": "ckpt-finish-lane-ready",
             "fence_token": "fence-2",
             "parent_task_id": "task-mf-parent",
+            "route_id": "route-finish-lane-ready",
+            "route_context_hash": "sha256:route-finish-lane-ready",
+            "prompt_contract_id": "rprompt-finish-lane-ready",
+            "prompt_contract_hash": "sha256:prompt-finish-lane-ready",
+            "route_token_ref": "rtok-finish-lane-ready",
+            "visible_injection_manifest_hash": "sha256:visible-finish-lane-ready",
             "summary": "Ready.",
             "worker_self_attestation": _finish_time_worker_attestation(),
             "mf_subagent_startup_gate": _finish_startup_evidence(),
@@ -3020,6 +3048,18 @@ def test_finish_gate_review_ready_projection_satisfies_lane_ownership_shape() ->
         "bounded_implementation_subagent.review_ready",
     ]
     assert lane_gate["missing_lane_ownership_ids"] == []
+    projection = gate["lane_ownership_projection"]
+    assert projection["fence_token"] == "fence-2"
+    assert projection["merge_queue_id"] == "mq-1"
+    assert projection["route_id"] == "route-finish-lane-ready"
+    assert projection["route_context_hash"] == "sha256:route-finish-lane-ready"
+    assert projection["prompt_contract_id"] == "rprompt-finish-lane-ready"
+    assert projection["prompt_contract_hash"] == "sha256:prompt-finish-lane-ready"
+    assert projection["route_token_ref"] == "rtok-finish-lane-ready"
+    assert projection["visible_injection_manifest_hash"] == (
+        "sha256:visible-finish-lane-ready"
+    )
+    assert projection["worker_role"] == "mf_sub"
 
 
 def test_finish_gate_rejects_caller_supplied_review_ready_bridge() -> None:
