@@ -6337,6 +6337,11 @@ def _runtime_context_worker_guide_response(
         or views.get("capability_boundary")
         or {}
     )
+    worker_execution_safety = dict(
+        worker_view.get("worker_execution_safety")
+        or capability_boundary.get("worker_execution_safety")
+        or {}
+    )
     graph_identity = dict(worker_view.get("graph_query_identity") or {})
     task = dict(worker_view.get("task") or {})
     route_identity = dict(worker_view.get("route_identity") or {})
@@ -6470,6 +6475,7 @@ def _runtime_context_worker_guide_response(
                 "route_context_hash",
                 "prompt_contract_id",
                 "prompt_contract_hash",
+                "route_token_ref",
                 "visible_injection_manifest_hash",
             ],
             "auth": _auth_guide("query.session_token"),
@@ -6741,6 +6747,7 @@ def _runtime_context_worker_guide_response(
                 "fence_token_redacted": True,
             },
             "route_identity": route_identity,
+            "worker_execution_safety": worker_execution_safety,
             "capability_boundary_hash": capability_boundary.get(
                 "capability_boundary_hash",
                 "",
@@ -6755,6 +6762,7 @@ def _runtime_context_worker_guide_response(
                 "close_precheck_gap_projection": dict(
                     control_plane.get("close_precheck_gap_projection") or {}
                 ),
+                "worker_execution_safety": worker_execution_safety,
             },
             "blocked_actions": [
                 "author_worker_evidence_as_observer",
@@ -7070,6 +7078,7 @@ def _runtime_context_mf_sub_write_context(
 
 def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
     from .parallel_branch_runtime import (
+        branch_contract_revision_to_dict,
         get_latest_branch_contract_revision,
         runtime_context_id_for_branch_context,
     )
@@ -7079,11 +7088,8 @@ def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
         getattr(context, "project_id", ""),
         runtime_context_id_for_branch_context(context),
     )
-    route_identity = (
-        revision.route_identity
-        if revision is not None and isinstance(revision.route_identity, Mapping)
-        else {}
-    )
+    revision_payload = branch_contract_revision_to_dict(revision) if revision else {}
+    route_identity = _parallel_branch_runtime_contract_route_identity(revision_payload)
     return dict(route_identity)
 
 

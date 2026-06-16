@@ -3165,6 +3165,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "route_context_hash",
                 "prompt_contract_id",
                 "prompt_contract_hash",
+                "route_token_ref",
                 "visible_injection_manifest_hash",
             },
             "auth_session_token_location": "query.session_token",
@@ -3195,6 +3196,16 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 assert set(actual_value) == expected_value
             else:
                 assert actual_value == expected_value
+
+    execution_safety = worker_guide["worker_execution_safety"]
+    assert execution_safety["status"] == "verified"
+    assert execution_safety["relative_patch_safe"] is True
+    assert execution_safety["assigned_worktree_path"] == (
+        "/repo/.worktrees/runtime-current-task"
+    )
+    assert worker_guide["control_plane_summary"]["worker_execution_safety"] == (
+        execution_safety
+    )
 
     write_guides = worker_guide["write_guides"]
     assert set(write_guides) == {
@@ -3709,6 +3720,9 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         payload={
             "target_files": ["agent/governance/server.py"],
             "acceptance_criteria": ["runtime context write facade happy path works"],
+            "route_identity": {
+                "route_token_ref": issued_route["route_token_ref"],
+            },
         },
         route_identity={
             "route_id": issued_route["route_id"],
@@ -3717,7 +3731,6 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             "prompt_contract_hash": issued_route["route_token"][
                 "prompt_contract_hash"
             ],
-            "route_token_ref": issued_route["route_token_ref"],
             "visible_injection_manifest_hash": issued_route[
                 "visible_injection_manifest_hash"
             ],

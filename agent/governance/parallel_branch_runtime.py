@@ -311,6 +311,9 @@ RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION = "runtime_context.control_plane.v1
 RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION = (
     "runtime_context.capability_boundary.v1"
 )
+RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION = (
+    "runtime_context.worker_execution_safety.v1"
+)
 RUNTIME_CONTEXT_ROLE_FILTER_POLICY_SCHEMA_VERSION = "runtime_context.role_filter_policy.v1"
 RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION = "runtime_context.content_address.v1"
 RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION = "runtime_context.access_audit.v1"
@@ -2713,6 +2716,12 @@ def _runtime_context_current_values(
         or startup_read_receipt.get("timeline_id")
         or startup_read_receipt.get("id")
     )
+    startup_actual_cwd = _runtime_context_text(
+        startup_gate.get("actual_cwd") or startup_gate.get("cwd")
+    )
+    startup_actual_git_root = _runtime_context_text(
+        startup_gate.get("actual_git_root") or startup_gate.get("git_root")
+    )
     worker_self_attesting = bool(worker_self_attestation) and bool(
         worker_self_attestation.get("worker_self_attesting")
         or worker_self_attestation.get("self_attesting")
@@ -2854,6 +2863,8 @@ def _runtime_context_current_values(
         ),
         "startup_read_receipt_hash": startup_read_receipt_hash,
         "startup_read_receipt_event_id": startup_read_receipt_event_id,
+        "startup_actual_cwd": startup_actual_cwd,
+        "startup_actual_git_root": startup_actual_git_root,
         "finish_gate_ref": _runtime_context_text(
             finish_gate.get("event_id")
             or finish_gate.get("source_ref")
@@ -5240,6 +5251,144 @@ def build_runtime_context_control_plane_view(
     }
 
 
+def _runtime_context_normalized_path(value: Any) -> str:
+    text = _runtime_context_text(value)
+    if not text:
+        return ""
+    try:
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return str(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return text.rstrip("/")
+
+
+def _runtime_context_path_matches(left: Any, right: Any) -> bool:
+    left_text = _runtime_context_normalized_path(left)
+    right_text = _runtime_context_normalized_path(right)
+    return bool(left_text and right_text and left_text == right_text)
+
+
+def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[str, Any]:
+    assigned_worktree = _runtime_context_text(values.get("worktree_path"))
+    target_project_root = _runtime_context_text(values.get("target_project_root"))
+    startup_event_ref = _runtime_context_text(values.get("startup_event_ref"))
+    startup_actual_cwd = _runtime_context_text(values.get("startup_actual_cwd"))
+    startup_actual_git_root = _runtime_context_text(values.get("startup_actual_git_root"))
+    cwd_matches = _runtime_context_path_matches(startup_actual_cwd, assigned_worktree)
+    git_root_matches = _runtime_context_path_matches(
+        startup_actual_git_root,
+        assigned_worktree,
+    )
+    verified_workdir = bool(
+        assigned_worktree
+        and startup_event_ref
+        and startup_actual_cwd
+        and startup_actual_git_root
+        and cwd_matches
+        and git_root_matches
+    )
+    blockers: list[dict[str, Any]] = []
+    if not assigned_worktree:
+        blockers.append(
+            {
+                "code": "assigned_worktree_missing",
+                "message": "branch runtime context is missing assigned worktree_path",
+                "next_action": "refresh_branch_runtime_context",
+            }
+        )
+    if not startup_event_ref:
+        blockers.append(
+            {
+                "code": "pre_edit_startup_missing",
+                "message": (
+                    "record real mf_subagent_startup with actual_cwd and "
+                    "actual_git_root before implementation edits"
+                ),
+                "next_action": "record_mf_subagent_startup",
+            }
+        )
+    elif not startup_actual_cwd or not startup_actual_git_root:
+        missing = []
+        if not startup_actual_cwd:
+            missing.append("actual_cwd")
+        if not startup_actual_git_root:
+            missing.append("actual_git_root")
+        blockers.append(
+            {
+                "code": "pre_edit_workdir_evidence_missing",
+                "message": "startup evidence does not prove the worker session workdir",
+                "missing": missing,
+                "next_action": "record_mf_subagent_startup",
+            }
+        )
+    else:
+        if not cwd_matches:
+            blockers.append(
+                {
+                    "code": "actual_cwd_not_assigned_worktree",
+                    "message": "startup actual_cwd does not match assigned worktree_path",
+                    "actual_cwd": startup_actual_cwd,
+                    "assigned_worktree_path": assigned_worktree,
+                    "next_action": "stop_and_relaunch_in_assigned_worktree",
+                }
+            )
+        if not git_root_matches:
+            blockers.append(
+                {
+                    "code": "actual_git_root_not_assigned_worktree",
+                    "message": "startup actual_git_root does not match assigned worktree_path",
+                    "actual_git_root": startup_actual_git_root,
+                    "assigned_worktree_path": assigned_worktree,
+                    "next_action": "stop_and_relaunch_in_assigned_worktree",
+                }
+            )
+    return {
+        "schema_version": RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION,
+        "status": "verified" if verified_workdir else "pre_edit_blocked",
+        "assigned_worktree_path": assigned_worktree,
+        "target_project_root": target_project_root,
+        "startup_event_ref": startup_event_ref,
+        "startup_actual_cwd": startup_actual_cwd,
+        "startup_actual_git_root": startup_actual_git_root,
+        "actual_cwd_matches_assigned_worktree": cwd_matches,
+        "actual_git_root_matches_assigned_worktree": git_root_matches,
+        "session_cwd_observed_by_runtime": bool(startup_actual_cwd),
+        "actual_git_root_observed_by_runtime": bool(startup_actual_git_root),
+        "relative_patch_safe": verified_workdir,
+        "apply_patch_relative_paths_allowed": verified_workdir,
+        "required_patch_path_mode": (
+            "verified_workdir_or_absolute_paths_under_assigned_worktree"
+        ),
+        "absolute_path_prefix": assigned_worktree,
+        "pre_edit_required_evidence": [
+            "mf_subagent_startup.actual_cwd",
+            "mf_subagent_startup.actual_git_root",
+            "mf_subagent_startup.worktree_path",
+        ],
+        "pre_edit_blockers": blockers,
+        "recovery_actions": [
+            {
+                "id": "verify_session_cwd",
+                "action": "verify_session_cwd",
+                "commands": ["pwd", "git rev-parse --show-toplevel"],
+                "expected_git_root": assigned_worktree,
+            },
+            {
+                "id": "record_startup_before_edit",
+                "action": "record_mf_subagent_startup",
+            },
+            {
+                "id": "use_absolute_paths",
+                "action": "apply edits using absolute paths under assigned_worktree_path",
+            },
+        ],
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+    }
+
+
 def build_runtime_context_capability_boundary_view(
     current_view: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -5293,6 +5442,7 @@ def build_runtime_context_capability_boundary_view(
         ),
     }
     fence_token_present = bool(values.get("fence_token_present"))
+    worker_execution_safety = _runtime_context_worker_execution_safety(values)
     boundary = {
         "schema_version": RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
@@ -5304,6 +5454,7 @@ def build_runtime_context_capability_boundary_view(
         "fence_token_hash": _runtime_context_text(values.get("fence_token_hash")),
         "fence_token_redacted": fence_token_present,
         "graph_query_scope": graph_scope,
+        "worker_execution_safety": worker_execution_safety,
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
     }
@@ -5435,6 +5586,9 @@ def build_runtime_context_worker_view(
         | {"raw_private_context_exposed": False},
         "work": dict(_runtime_context_mapping(current_view.get("work"))),
         "graph_query_identity": values.get("graph_query_identity", {}),
+        "worker_execution_safety": dict(
+            capability_boundary.get("worker_execution_safety") or {}
+        ),
         "capability_boundary": capability_boundary,
         "capability_boundary_hash": _runtime_context_text(
             capability_boundary.get("capability_boundary_hash")
@@ -5475,6 +5629,7 @@ def build_runtime_context_worker_view(
                 "work",
                 "lane_plan",
                 "graph_query_identity",
+                "worker_execution_safety",
                 "capability_boundary",
                 "next_required_evidence",
                 "gate_inputs",

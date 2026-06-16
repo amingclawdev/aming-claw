@@ -37,6 +37,7 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_FAILED,
@@ -1007,6 +1008,62 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert present_action["next_action"] == "none"
     assert present_action["read_receipt_event_ref"] == "timeline:read-runtime-context"
     assert present_action["ordered_worker_startup_bridge"]["status"] == "ready"
+
+
+def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_startup_cwd_verified() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    safety = projection["views"]["worker_view"]["worker_execution_safety"]
+    boundary_safety = projection["views"]["capability_boundary"][
+        "worker_execution_safety"
+    ]
+    assert safety == boundary_safety
+    assert safety["schema_version"] == RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION
+    assert safety["status"] == "pre_edit_blocked"
+    assert safety["assigned_worktree_path"] == (
+        "/repo/.worktrees/mf-sub-runtime-context"
+    )
+    assert safety["relative_patch_safe"] is False
+    assert safety["apply_patch_relative_paths_allowed"] is False
+    assert {item["code"] for item in safety["pre_edit_blockers"]} == {
+        "pre_edit_startup_missing"
+    }
+
+    verified_projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={"startup_event_ref": "timeline:startup"},
+        startup_gate={
+            "actual_cwd": "/repo/.worktrees/mf-sub-runtime-context",
+            "actual_git_root": "/repo/.worktrees/mf-sub-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    verified_safety = verified_projection["views"]["worker_view"][
+        "worker_execution_safety"
+    ]
+    assert verified_safety["status"] == "verified"
+    assert verified_safety["relative_patch_safe"] is True
+    assert verified_safety["apply_patch_relative_paths_allowed"] is True
+    assert verified_safety["pre_edit_blockers"] == []
 
 
 def test_runtime_context_action_plan_projects_ordered_merge_dependency_wait() -> None:
@@ -1980,6 +2037,8 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "route_token_ref": "rtok-runtime-context",
             "read_receipt_hash": "sha256:read-runtime-context",
             "read_receipt_event_id": "timeline:read-receipt",
+            "actual_cwd": "/repo/.worktrees/mf-sub-runtime-context",
+            "actual_git_root": "/repo/.worktrees/mf-sub-runtime-context",
             "worker_session_id": "session-runtime-context",
             "filer_principal": "session-runtime-context",
             "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
@@ -2052,6 +2111,8 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     assert boundary["fence_token_redacted"] is True
     assert boundary["raw_session_token_exposed"] is False
     assert boundary["raw_fence_token_exposed"] is False
+    assert boundary["worker_execution_safety"]["status"] == "verified"
+    assert boundary["worker_execution_safety"]["relative_patch_safe"] is True
     assert boundary["graph_query_scope"] == {
         "query_source": "mf_subagent",
         "query_purpose": "subagent_context_build",
