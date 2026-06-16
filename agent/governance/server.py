@@ -23437,9 +23437,17 @@ def _observer_root_route_close_gate_steps(
         for item in (route_context_gate.get("ignored_route_events") or [])
         if isinstance(item, Mapping)
     }
-    if "route_identity_mismatch" in missing_route or ignored_reasons.intersection(
-        {"superseded_route_identity", "route_identity_mismatch"}
-    ):
+    cleanup = route_context_gate.get("route_identity_cleanup") or {}
+    cleanup_applied = isinstance(cleanup, Mapping) and bool(cleanup.get("applied"))
+    cleanup_required = (
+        "route_identity_mismatch" in missing_route
+        or "route_identity_mismatch" in ignored_reasons
+        or (
+            "superseded_route_identity" in ignored_reasons
+            and not cleanup_applied
+        )
+    )
+    if cleanup_required:
         _add(
             "route_identity_cleanup",
             "record_route_identity_cleanup",
