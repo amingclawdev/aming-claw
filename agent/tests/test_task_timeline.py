@@ -7515,6 +7515,60 @@ class TestTaskTimeline(unittest.TestCase):
             ["close_ready", "implementation", "verification"],
         )
 
+    def test_backlog_timeline_gate_repair_view_reports_cross_ref_repair(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-MF-REPAIR-VIEW"
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": bug_id},
+                body={
+                    "title": "MF timeline repair view",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                },
+                method="POST",
+            )
+        )
+
+        for task_id, kind in (
+            ("root-task", "close_ready"),
+            ("worker-task", "implementation"),
+            ("root-task", "verification"),
+        ):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=task_id,
+                event_type=f"mf.{kind}",
+                phase="close" if kind == "close_ready" else kind,
+                event_kind=kind,
+                status="accepted",
+            )
+        self.conn.commit()
+
+        result = server.handle_backlog_timeline_gate(
+            _ctx({"view": "repair"}, path_params={"bug_id": bug_id})
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["can_close"])
+        self.assertIn("repair_summary", result)
+        self.assertNotIn("timeline_gate", result)
+        repairs = result["repair_summary"]["failed_gate_repairs"]
+        cross_ref = next(item for item in repairs if item["gate"] == "cross_ref_gate")
+        self.assertEqual(cross_ref["missing_requirement_ids"], [])
+        self.assertEqual(cross_ref["rejected_event_ids"], [2])
+        self.assertIn("task_id mismatch", cross_ref["diagnosis"])
+        self.assertEqual(cross_ref["suggested_event_kind"], "cross_ref_lineage_bridge")
+        skeleton = cross_ref["append_payload_skeleton"]
+        self.assertTrue(skeleton["advisory_only"])
+        self.assertFalse(skeleton["close_satisfying_by_itself"])
+        self.assertEqual(skeleton["event_kind"], "cross_ref_lineage_bridge")
+        self.assertEqual(skeleton["payload"]["rejected_event_ids"], [2])
+
     def test_observer_hotfix_aliases_upsert_as_mf_applicable_rows(self):
         from agent.governance import server
 
@@ -8214,6 +8268,38 @@ def test_close_gate_rejects_worker_scoped_implementation_without_cross_ref_bridg
     assert [item["id"] for item in rejected] == [11]
     assert rejected[0]["event_kind"] == "implementation"
     assert rejected[0]["reason"] == "cross_ref_identity_mismatch"
+
+
+def test_repair_gate_summary_explains_cross_ref_task_mismatch_with_empty_missing_ids():
+    from agent.governance import task_timeline
+
+    _, root_task, worker_implementation, _ = _cross_ref_worker_bridge_fixture()
+
+    gate = task_timeline.mf_close_gate_verification([root_task, worker_implementation])
+    cross_ref_gate = gate["cross_ref_gate"]
+    assert cross_ref_gate["passed"] is False
+    assert cross_ref_gate.get("missing_requirement_ids", []) == []
+
+    summary = task_timeline.repair_gate_summary(gate)
+    cross_ref = next(
+        item for item in summary["failed_gate_repairs"]
+        if item["gate"] == "cross_ref_gate"
+    )
+
+    assert cross_ref["missing_requirement_ids"] == []
+    assert cross_ref["rejected_event_ids"] == [11]
+    assert cross_ref["relevant_event_ids"] == [11]
+    assert "task_id mismatch" in cross_ref["diagnosis"]
+    assert cross_ref["suggested_event_kind"] == "cross_ref_lineage_bridge"
+    assert "sibling task_id" in cross_ref["reasons"][0]
+    skeleton = cross_ref["append_payload_skeleton"]
+    assert skeleton["advisory_only"] is True
+    assert skeleton["close_satisfying_by_itself"] is False
+    assert skeleton["event_kind"] == "cross_ref_lineage_bridge"
+    assert skeleton["payload"]["rejected_event_ids"] == [11]
+    bridged = skeleton["payload"]["bridged_identities"]
+    assert {"backlog_id": "AC-BRIDGE", "project_id": "aming-claw", "task_id": "root-task"} in bridged
+    assert {"backlog_id": "AC-BRIDGE", "project_id": "aming-claw", "task_id": "worker-task"} in bridged
 
 
 def test_close_gate_accepts_worker_scoped_implementation_with_cross_ref_bridge():

@@ -27263,6 +27263,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
     """Read-only MF close-gate precheck for backlog timeline evidence.
 
     Pass view=compact for a compact summary (can_close, failed_gates only).
+    Pass view=repair for compact advisory next-step repair payloads.
     Default (view omitted or view=full) returns the full gate tree — existing callers unaffected.
     """
     pid = ctx.path_params["project_id"]
@@ -27353,6 +27354,11 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 request_id=ctx.request_id,
             )
             result["gate_summary"] = compact_summary
+        elif view == "repair":
+            result["repair_summary"] = task_timeline.repair_gate_summary(
+                {**verification, "project_id": pid, "bug_id": bug_id, "applicable": applicable["is_mf"]},
+                request_id=ctx.request_id,
+            )
         else:
             result["timeline_gate"] = verification
         # Criterion 2: surface FIXED + can_close=false + no-waiver as a

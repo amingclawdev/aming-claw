@@ -611,6 +611,7 @@ def test_mcp_timeline_tools_route_to_governance_api():
         {
             "project_id": "aming-claw",
             "bug_id": "BUG-1",
+            "view": "repair",
             "include_events": True,
             "limit": 25,
         },
@@ -635,7 +636,7 @@ def test_mcp_timeline_tools_route_to_governance_api():
         ),
         (
             "GET",
-            "/api/backlog/aming-claw/BUG-1/timeline-gate?include_events=true&limit=25",
+            "/api/backlog/aming-claw/BUG-1/timeline-gate?view=repair&include_events=true&limit=25",
             None,
         ),
     ]

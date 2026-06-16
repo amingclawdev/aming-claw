@@ -28,6 +28,9 @@ OBSERVER_COORDINATOR_ROLE = "observer"
 INPUT_SCHEMA_VERSION = "mf_subagent_input.v1"
 RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
+FINISH_GATE_LANE_OWNERSHIP_PROJECTION_SCHEMA_VERSION = (
+    "mf_subagent_finish_gate_lane_ownership_projection.v1"
+)
 DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION = "mf_subagent_runtime_contract_view.v1"
 AGENT_TASK_CONTRACT_SCHEMA_VERSION = "observer_owned_agent_task_contract.v1"
@@ -6813,6 +6816,22 @@ def validate_mf_subagent_finish_gate(
             "before close-ready"
         )
 
+    lane_ownership_projection = {
+        "schema_version": FINISH_GATE_LANE_OWNERSHIP_PROJECTION_SCHEMA_VERSION,
+        "evidence_id": "bounded_implementation_subagent.review_ready",
+        "review_ready": True,
+        "worker_status": "waiting_merge",
+        "stop_state": "waiting_merge",
+        "worker_role": MF_SUB_ROLE,
+        "role": MF_SUB_ROLE,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": context.backlog_id,
+        "runtime_context_id": _string(startup_evidence.get("runtime_context_id")),
+        "checkpoint_id": checkpoint_id,
+        "merge_queue_id": context.merge_queue_id,
+    }
+
     return {
         "schema_version": FINISH_GATE_SCHEMA_VERSION,
         "role": MF_SUB_ROLE,
@@ -6868,5 +6887,9 @@ def validate_mf_subagent_finish_gate(
         "summary": normalized["summary"],
         "evidence": normalized["evidence"],
         "merge_queue_ready": True,
+        "review_ready": True,
+        "worker_status": "waiting_merge",
+        "stop_state": "waiting_merge",
+        "lane_ownership_projection": lane_ownership_projection,
         "close_ready": True,
     }

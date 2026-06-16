@@ -2932,6 +2932,162 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["worker_self_attestation_gate"]["attestation_phase"] == "finish"
     assert gate["worker_self_attestation"]["finish_time_self_attesting"] is True
     assert gate["close_ready"] is True
+    assert gate["review_ready"] is True
+    assert gate["worker_status"] == "waiting_merge"
+    assert gate["stop_state"] == "waiting_merge"
+    assert gate["lane_ownership_projection"] == {
+        "schema_version": "mf_subagent_finish_gate_lane_ownership_projection.v1",
+        "evidence_id": "bounded_implementation_subagent.review_ready",
+        "review_ready": True,
+        "worker_status": "waiting_merge",
+        "stop_state": "waiting_merge",
+        "worker_role": "mf_sub",
+        "role": "mf_sub",
+        "task_id": "task-mf-sub-1",
+        "parent_task_id": "",
+        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "runtime_context_id": "mfrctx-finish",
+        "checkpoint_id": "ckpt-finish",
+        "merge_queue_id": "mq-1",
+    }
+
+
+def test_finish_gate_review_ready_projection_satisfies_lane_ownership_shape() -> None:
+    from agent.governance import task_timeline
+
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-1",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": "ckpt-finish-lane-ready",
+            "fence_token": "fence-2",
+            "parent_task_id": "task-mf-parent",
+            "summary": "Ready.",
+            "worker_self_attestation": _finish_time_worker_attestation(),
+            "mf_subagent_startup_gate": _finish_startup_evidence(),
+            "real_startup_events": [_startup_event(_finish_startup_evidence())],
+            "read_receipt_hash": "sha256:read-finish",
+            "read_receipt_event_id": "2873",
+        },
+        context=_context(),
+    )
+    dispatch_event = {
+        "event_type": "mf_subagent.dispatch",
+        "phase": "bounded_subagent_dispatch",
+        "actor": "observer",
+        "status": "accepted",
+        "payload": {
+            "required_dispatch_key": "bounded_subagent_dispatch",
+            "worker_role": "mf_sub",
+            "task_id": "task-mf-sub-1",
+        },
+    }
+    finish_gate_event = {
+        "event_type": "mf_subagent.finish_gate",
+        "event_kind": "mf_subagent_finish_gate",
+        "phase": "finish_gate",
+        "actor": "worker-session-codex-1",
+        "status": "passed",
+        "task_id": "task-mf-sub-1",
+        "payload": {
+            "mf_subagent_finish_gate": gate,
+            "checkpoint_id": gate["checkpoint_id"],
+        },
+    }
+
+    lane_gate = task_timeline.mf_lane_ownership_gate_verification(
+        [dispatch_event, finish_gate_event],
+        contract={
+            "required_lanes": [
+                {"id": "bounded_implementation_subagent", "role": "mf_sub"}
+            ]
+        },
+    )
+
+    assert lane_gate["passed"] is True
+    assert lane_gate["present_lane_ownership_ids"] == [
+        "bounded_implementation_subagent.dispatch",
+        "bounded_implementation_subagent.review_ready",
+    ]
+    assert lane_gate["missing_lane_ownership_ids"] == []
+
+
+def test_finish_gate_rejects_caller_supplied_review_ready_bridge() -> None:
+    with pytest.raises(MfSubagentContractError, match="mf_subagent_startup"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-caller-bridge",
+                "fence_token": "fence-2",
+                "summary": "Observer-authored bridge should not pass.",
+                "review_ready": True,
+                "worker_status": "waiting_merge",
+                "lane_ownership_projection": {
+                    "review_ready": True,
+                    "worker_status": "waiting_merge",
+                    "worker_role": "mf_sub",
+                },
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_does_not_project_surrogate_startup_as_review_ready() -> None:
+    surrogate_startup = _finish_startup_evidence(
+        agent_id_match_mode="host_adapter_startup_token_surrogate",
+        session_token_evidence_type="surrogate",
+        session_token_hash="",
+        session_token_present=False,
+        host_adapter_startup_token_accepted=True,
+    )
+
+    with pytest.raises(MfSubagentContractError, match="surrogate-only"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "aming-claw",
+                "task_id": "task-mf-sub-1",
+                "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+                "branch_ref": "refs/heads/codex/task-mf-sub-1",
+                "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+                "base_commit": "base123",
+                "target_head_commit": "target123",
+                "merge_queue_id": "mq-1",
+                "head_commit": "head456",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/mf_subagent_contract.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-surrogate",
+                "fence_token": "fence-2",
+                "summary": "Surrogate startup should not pass.",
+                "mf_subagent_startup_gate": surrogate_startup,
+                "real_startup_events": [_startup_event(surrogate_startup)],
+                "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
+                "read_receipt_hash": "sha256:read-finish",
+                "read_receipt_event_id": "2873",
+            },
+            context=_context(),
+        )
 
 
 def test_finish_gate_accepts_startup_at_base_commit_with_finish_time_attestation() -> None:

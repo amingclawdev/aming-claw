@@ -120,6 +120,7 @@ MF_STALE_ROUTE_EVIDENCE_GATE_SCHEMA_VERSION = "mf_stale_route_evidence_gate.v1"
 MF_APPROVAL_SCOPE_GATE_SCHEMA_VERSION = "mf_close_approval_scope_gate.v1"
 MF_COMMAND_DISPOSITION_GATE_SCHEMA_VERSION = "mf_close_command_disposition_gate.v1"
 MF_FIXED_CLOSE_WAIVER_ALERT_SCHEMA_VERSION = "mf_fixed_close_waiver_alert.v1"
+MF_TIMELINE_REPAIR_SUMMARY_SCHEMA_VERSION = "mf_close_timeline_repair_summary.v1"
 
 # An explicit, recorded close-waiver marker. Distinct from a route_context
 # waiver: this authorizes the backlog_close action itself despite a failing
@@ -4770,6 +4771,8 @@ def mf_close_cross_ref_gate_verification(
                 "status": event.get("status") or event.get("decision"),
                 "reason": "cross_ref_identity_mismatch",
                 "mismatches": mismatches,
+                "event_ref_identity": identity,
+                "lane_identity": lane,
             })
     passed = not rejected
     return {
@@ -5414,6 +5417,385 @@ def compact_gate_summary(
             summary[opt_key] = full_result[opt_key]
     if route_identity:
         summary["route_identity"] = route_identity
+    if request_id:
+        summary["request_id"] = request_id
+    return summary
+
+
+MF_REPAIR_GATE_KEYS = [
+    "contract_gate",
+    "route_context_gate",
+    "lane_ownership_gate",
+    "worker_graph_trace_gate",
+    "independent_qa_gate",
+    "contract_projection_gate",
+    "post_verification_actions_gate",
+    "blocker_resolution_gate",
+    "cross_ref_gate",
+    "approval_scope_gate",
+    "command_disposition_gate",
+]
+
+
+def _unique_compact_values(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    result: list[Any] = []
+    for value in values:
+        if value in ("", None):
+            continue
+        marker = json.dumps(value, sort_keys=True, default=str)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(value)
+    return result
+
+
+def _event_ids_from_items(items: Any) -> list[Any]:
+    event_ids: list[Any] = []
+    for item in _list(items):
+        if not isinstance(item, dict):
+            continue
+        event_id = item.get("id") or item.get("event_id")
+        if event_id not in ("", None):
+            event_ids.append(event_id)
+    return _unique_compact_values(event_ids)
+
+
+def _repair_append_skeleton(
+    event_kind: str,
+    *,
+    phase: str = "repair",
+    payload: dict[str, Any] | None = None,
+    verification: dict[str, Any] | None = None,
+    status: str = "accepted",
+) -> dict[str, Any]:
+    skeleton: dict[str, Any] = {
+        "event_type": f"mf.{event_kind}",
+        "event_kind": event_kind,
+        "phase": phase,
+        "status": status,
+        "advisory_only": True,
+        "close_satisfying_by_itself": False,
+    }
+    if payload is not None:
+        skeleton["payload"] = payload
+    if verification is not None:
+        skeleton["verification"] = verification
+    return skeleton
+
+
+def _generic_repair_append_skeleton(gate_key: str, missing: list[str]) -> dict[str, Any]:
+    first_missing = missing[0] if missing else "<required_evidence_id>"
+    if gate_key == "contract_gate":
+        return _repair_append_skeleton(
+            "verification",
+            phase="verification",
+            verification={
+                "contract_evidence": [
+                    {"requirement_id": first_missing, "status": "passed"}
+                ]
+            },
+        )
+    if gate_key == "route_context_gate":
+        return _repair_append_skeleton(
+            "route_context",
+            phase="dispatch",
+            payload={
+                "route_context": {
+                    "route_context_hash": "<canonical_route_context_hash>",
+                    "prompt_contract_hash": "<canonical_prompt_contract_hash>",
+                    "visible_injection_manifest_hash": "<canonical_visible_manifest_hash>",
+                }
+            },
+        )
+    if gate_key == "lane_ownership_gate":
+        return _repair_append_skeleton(
+            "bounded_implementation_worker_dispatch",
+            phase="dispatch",
+            payload={"worker_task_id": "<mf_sub_task_id>", "owned_files": []},
+        )
+    if gate_key == "worker_graph_trace_gate":
+        return _repair_append_skeleton(
+            "worker_graph_trace",
+            phase="verification",
+            payload={"graph_trace_ids": ["<gqt-...>"]},
+        )
+    if gate_key == "independent_qa_gate":
+        return _repair_append_skeleton(
+            "qa_verification",
+            phase="verification",
+            verification={
+                "reviewer": "<independent_reviewer_id>",
+                "contract_evidence": [
+                    {
+                        "requirement_id": first_missing,
+                        "status": "passed",
+                        "reviewer_role": "qa",
+                    }
+                ],
+            },
+        )
+    if gate_key == "contract_projection_gate":
+        return _repair_append_skeleton(
+            "mf_subagent_read_receipt",
+            phase="startup",
+            payload={"read_receipt_hash": "<runtime_context_read_receipt_hash>"},
+        )
+    if gate_key == "post_verification_actions_gate":
+        return _repair_append_skeleton(
+            "post_verification_action",
+            phase="verification",
+            payload={"action_id": first_missing, "status": "completed"},
+        )
+    if gate_key == "blocker_resolution_gate":
+        return _repair_append_skeleton(
+            "blocker_resolution",
+            phase="judge_review",
+            payload={"resolution": "<judge_accepted_resolution>"},
+            verification={"reviewer": "<independent_judge_id>"},
+        )
+    if gate_key == "approval_scope_gate":
+        return _repair_append_skeleton(
+            "close_approval",
+            phase="close",
+            payload={"approval_text": "approved for backlog_close after review"},
+        )
+    if gate_key == "command_disposition_gate":
+        return _repair_append_skeleton(
+            "observer_command_disposition",
+            phase="close",
+            payload={"command_id": "<originating_observer_command_id>", "status": "completed"},
+        )
+    return _repair_append_skeleton(
+        "repair_evidence",
+        payload={"gate": gate_key, "requirement_id": first_missing},
+    )
+
+
+def _cross_ref_repair_diagnosis(
+    rejected: list[dict[str, Any]],
+) -> tuple[str, list[str], str]:
+    if not rejected:
+        return (
+            "missing lineage bridge",
+            [
+                "Cross-reference gate failed without rejected evidence details; inspect protected close evidence for a missing bridge or stale lineage."
+            ],
+            "lineage_bridge",
+        )
+
+    mismatch_fields: set[str] = set()
+    for item in rejected:
+        mismatch_fields.update(_mapping(item.get("mismatches")).keys())
+
+    if "task_id" in mismatch_fields:
+        return (
+            "task_id mismatch; missing lineage bridge",
+            [
+                "Protected close evidence was recorded under a sibling task_id that is not bridged into the row's accepted lane set."
+            ],
+            "cross_ref_lineage_bridge",
+        )
+    if "backlog_id" in mismatch_fields:
+        return (
+            "backlog_id mismatch",
+            [
+                "Protected close evidence references a different backlog_id; remove or re-record the evidence for this row, or record an explicit lineage bridge if this is an intentional row lineage repair."
+            ],
+            "lineage_bridge",
+        )
+    if {"route_id", "prompt_contract_id"} & mismatch_fields:
+        return (
+            "route identity mismatch",
+            [
+                "Protected close evidence was recorded under a different route identity; re-record evidence under the canonical route or add accepted lineage evidence for the transition."
+            ],
+            "lineage_bridge",
+        )
+    if "scope" in mismatch_fields:
+        return (
+            "scope mismatch",
+            [
+                "Protected close evidence declares a different scope; re-record scope-correct evidence or bridge an intentional sibling lane."
+            ],
+            "cross_ref_lineage_bridge",
+        )
+    return (
+        "rejected cross-ref evidence",
+        ["Protected close evidence does not match the row identity and lacks accepted bridge evidence."],
+        "lineage_bridge",
+    )
+
+
+def _cross_ref_append_payload_skeleton(
+    gate: dict[str, Any],
+    rejected: list[dict[str, Any]],
+    suggested_event_kind: str,
+) -> dict[str, Any]:
+    row_identity = _mapping(gate.get("row_identity"))
+    first = rejected[0] if rejected else {}
+    first_lane = _mapping(first.get("lane_identity"))
+    mismatches = _mapping(first.get("mismatches"))
+    expected_task = str(_mapping(mismatches.get("task_id")).get("expected") or "").strip()
+    actual_task = str(_mapping(mismatches.get("task_id")).get("actual") or "").strip()
+
+    bridged_identities: list[dict[str, Any]] = []
+    base_identity = {
+        "backlog_id": row_identity.get("backlog_id") or first_lane.get("backlog_id") or "<backlog_id>",
+        "project_id": first_lane.get("project_id") or "<project_id>",
+    }
+    if expected_task:
+        bridged_identities.append({**base_identity, "task_id": expected_task})
+    else:
+        bridged_identities.append({**base_identity, "task_id": "<row_or_root_task_id>"})
+    if actual_task:
+        bridged_identities.append({**base_identity, "task_id": actual_task})
+    elif first_lane:
+        bridged_identities.append({**base_identity, "task_id": first_lane.get("task_id") or "<sibling_task_id>"})
+    else:
+        bridged_identities.append({**base_identity, "task_id": "<sibling_task_id>"})
+
+    payload: dict[str, Any] = {
+        "bridge_reason": "repair_cross_ref_gate",
+        "rejected_event_ids": _event_ids_from_items(rejected),
+        "bridged_identities": bridged_identities,
+    }
+    if row_identity.get("backlog_id"):
+        payload["backlog_id"] = row_identity["backlog_id"]
+    for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
+        value = row_identity.get(field)
+        if value:
+            payload[field] = value
+    if suggested_event_kind == "lineage_bridge" and rejected:
+        actual_backlog = str(
+            _mapping(_mapping(first.get("mismatches")).get("backlog_id")).get("actual") or ""
+        ).strip()
+        if actual_backlog:
+            payload["bridged_backlog_id"] = actual_backlog
+
+    return _repair_append_skeleton(
+        suggested_event_kind,
+        phase="lineage",
+        payload=payload,
+    )
+
+
+def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
+    missing = list(gate.get("missing_requirement_ids") or [])
+    reasons: list[str] = []
+    relevant_event_ids: list[Any] = []
+    rejected_event_ids: list[Any] = []
+    recommended_action = str(gate.get("next_action") or "").strip()
+    suggested_event_kind = ""
+
+    if gate_key == "cross_ref_gate":
+        rejected = [_mapping(item) for item in _list(gate.get("rejected_cross_ref_evidence"))]
+        diagnosis, reasons, suggested_event_kind = _cross_ref_repair_diagnosis(rejected)
+        rejected_event_ids = _event_ids_from_items(rejected)
+        relevant_event_ids = list(rejected_event_ids)
+        recommended_action = (
+            "Record an accepted cross-ref lineage bridge for intentional sibling-lane evidence, "
+            "or remove/re-record the rejected evidence under the row's canonical identity."
+        )
+        append_payload_skeleton = _cross_ref_append_payload_skeleton(
+            gate,
+            rejected,
+            suggested_event_kind,
+        )
+        return {
+            "gate": gate_key,
+            "failed_gate_name": gate_key,
+            "status": str(gate.get("status") or "failed"),
+            "missing_requirement_ids": missing,
+            "diagnosis": diagnosis,
+            "reasons": reasons,
+            "rejected_event_ids": rejected_event_ids,
+            "relevant_event_ids": relevant_event_ids,
+            "recommended_legal_action": recommended_action,
+            "suggested_event_kind": suggested_event_kind,
+            "append_payload_skeleton": append_payload_skeleton,
+            "advisory_only": True,
+        }
+
+    for field in ("reason", "missing_reason", "failure_reason", "message"):
+        value = str(gate.get(field) or "").strip()
+        if value:
+            reasons.append(value)
+    if missing:
+        reasons.append("Missing required evidence: " + ", ".join(missing))
+    rejected_sources = {
+        "rejected_evidence_events": gate.get("rejected_evidence_events"),
+        "rejected_observer_resolutions": gate.get("rejected_observer_resolutions"),
+        "approvals_excluding_close": gate.get("approvals_excluding_close"),
+        "blocking_commands": gate.get("blocking_commands"),
+        "missing_actions": gate.get("missing_actions"),
+    }
+    for items in rejected_sources.values():
+        ids = _event_ids_from_items(items)
+        rejected_event_ids.extend(ids)
+        relevant_event_ids.extend(ids)
+    if not reasons:
+        reasons.append(f"{gate_key} status is {str(gate.get('status') or 'failed')}")
+    if not recommended_action:
+        recommended_action = "Record valid timeline evidence for this gate, then rerun the precheck."
+    return {
+        "gate": gate_key,
+        "failed_gate_name": gate_key,
+        "status": str(gate.get("status") or "failed"),
+        "missing_requirement_ids": missing,
+        "reasons": _unique_compact_values(reasons),
+        "rejected_event_ids": _unique_compact_values(rejected_event_ids),
+        "relevant_event_ids": _unique_compact_values(relevant_event_ids),
+        "recommended_legal_action": recommended_action,
+        "append_payload_skeleton": _generic_repair_append_skeleton(gate_key, missing),
+        "advisory_only": True,
+    }
+
+
+def repair_gate_summary(
+    full_result: dict[str, Any],
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Project failed MF close gates into compact, advisory repair steps."""
+
+    passed = bool(full_result.get("passed") or full_result.get("can_close"))
+    missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    failed_gate_repairs = []
+    for key in MF_REPAIR_GATE_KEYS:
+        gate = _mapping(full_result.get(key))
+        if not gate or bool(gate.get("passed")):
+            continue
+        failed_gate_repairs.append(_gate_repair_summary(key, gate))
+
+    missing_event_repairs = [
+        {
+            "event_kind": kind,
+            "recommended_legal_action": f"Record accepted {kind} evidence for this MF row.",
+            "append_payload_skeleton": _repair_append_skeleton(
+                kind,
+                phase="close" if kind == "close_ready" else kind,
+                payload={"requirement_id": kind},
+            ),
+            "advisory_only": True,
+        }
+        for kind in missing_event_kinds
+    ]
+
+    summary: dict[str, Any] = {
+        "schema_version": MF_TIMELINE_REPAIR_SUMMARY_SCHEMA_VERSION,
+        "ok": True,
+        "can_close": passed,
+        "advisory_only": True,
+        "missing_event_kinds": missing_event_kinds,
+        "missing_event_repairs": missing_event_repairs,
+        "failed_gate_repairs": failed_gate_repairs,
+        "failed_gate_count": len(failed_gate_repairs),
+        "event_count": int(full_result.get("event_count") or 0),
+    }
+    for opt_key in ("project_id", "bug_id", "applicable"):
+        if full_result.get(opt_key) is not None:
+            summary[opt_key] = full_result[opt_key]
     if request_id:
         summary["request_id"] = request_id
     return summary

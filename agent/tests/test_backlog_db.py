@@ -1188,6 +1188,11 @@ class TestMCPToolDefinitions(unittest.TestCase):
         self.assertIn("task_timeline_append", tool_names)
         self.assertIn("task_timeline_list", tool_names)
         self.assertIn("mf_timeline_precheck", tool_names)
+        precheck_tool = next(t for t in TOOLS if t["name"] == "mf_timeline_precheck")
+        self.assertEqual(
+            precheck_tool["inputSchema"]["properties"]["view"]["enum"],
+            ["full", "compact", "repair"],
+        )
 
     def test_dispatch_backlog_list(self):
         """_dispatch_tool routes backlog_list to HTTP call."""
@@ -1254,6 +1259,7 @@ class TestMCPToolDefinitions(unittest.TestCase):
             _dispatch_tool("mf_timeline_precheck", {
                 "project_id": "test",
                 "bug_id": "B1",
+                "view": "repair",
                 "include_events": True,
                 "limit": 25,
             })
@@ -1273,7 +1279,7 @@ class TestMCPToolDefinitions(unittest.TestCase):
             ))
             self.assertEqual(mock_http.call_args_list[2][0], (
                 "GET",
-                "/api/backlog/test/B1/timeline-gate?include_events=true&limit=25",
+                "/api/backlog/test/B1/timeline-gate?include_events=true&view=repair&limit=25",
             ))
 
 

@@ -415,6 +415,11 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "bug_id": {"type": "string"},
+                "view": {
+                    "type": "string",
+                    "enum": ["full", "compact", "repair"],
+                    "description": "Response projection: full gate tree, compact gate summary, or advisory repair payloads.",
+                },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
             },
@@ -697,6 +702,9 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         query = {}
         if "include_events" in args:
             query["include_events"] = "true" if args.get("include_events") else "false"
+        view = str(args.get("view") or "").strip().lower()
+        if view:
+            query["view"] = view
         if args.get("limit"):
             query["limit"] = str(_int_arg(args, "limit", 1000, minimum=1, maximum=1000))
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
