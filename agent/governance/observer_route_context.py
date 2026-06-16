@@ -141,6 +141,33 @@ REQUIRED_EVIDENCE: tuple[str, ...] = (
     "dirty_scope_check",
 )
 
+PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
+CHILD_ROUTE_LINEAGE_SCHEMA_VERSION = "child_route_lineage.v1"
+ROUTE_LINEAGE_SCHEMA_VERSION = "observer_route_parent_child_lineage.v1"
+
+_PARENT_ROUTE_REQUIRED_FIELDS: tuple[str, ...] = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+)
+_PARENT_ROUTE_OPTIONAL_FIELDS: tuple[str, ...] = (
+    "route_token_ref",
+    "selected_project",
+    "selected_backlog_id",
+)
+_PARENT_ROUTE_RAW_TOKEN_FIELDS: tuple[str, ...] = (
+    "route_token",
+    "raw_route_token",
+    "token",
+    "token_body",
+    "session_token",
+)
+_PARENT_ROUTE_CANONICAL_EVENT_IDS: tuple[str, ...] = (
+    "event.route_prompt_context.preview",
+)
+
 
 def _stable_digest(value: Any, *, length: int = 16) -> str:
     """Deterministic hex digest of a JSON-canonicalized value.
@@ -334,6 +361,13 @@ def build_observer_write_route_token(
     provider: Mapping[str, Any] | None = None,
     evidence_refs: Sequence[str] | None = None,
     project_root: Path | str | None = None,
+    parent_route_identity: Mapping[str, Any] | None = None,
+    parent_route_id: str = "",
+    parent_route_context_hash: str = "",
+    parent_prompt_contract_id: str = "",
+    parent_prompt_contract_hash: str = "",
+    parent_visible_injection_manifest_hash: str = "",
+    parent_route_token_ref: str = "",
 ) -> dict[str, Any]:
     """Mint an Aming-owned, write-authorizing observer route token.
 
@@ -380,6 +414,17 @@ def build_observer_write_route_token(
         dict(provider)
         if isinstance(provider, Mapping)
         else resolve_route_provider(project_id, root=project_root)
+    )
+    parent_lineage = build_parent_route_lineage(
+        parent_route_identity,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_route_id=parent_route_id,
+        parent_route_context_hash=parent_route_context_hash,
+        parent_prompt_contract_id=parent_prompt_contract_id,
+        parent_prompt_contract_hash=parent_prompt_contract_hash,
+        parent_visible_injection_manifest_hash=parent_visible_injection_manifest_hash,
+        parent_route_token_ref=parent_route_token_ref,
     )
 
     # Deterministic identity base. Date (not full timestamp) so same inputs on
@@ -448,6 +493,8 @@ def build_observer_write_route_token(
         "provider": provider_evidence,
         "issued_at": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if parent_lineage:
+        token["parent_route_lineage"] = parent_lineage
     return token
 
 
@@ -475,6 +522,17 @@ def derive_route_token_ref(token: Mapping[str, Any]) -> str:
         "expires_at": _string(token.get("expires_at") or token.get("expiry")),
         "scope": dict(token.get("scope") or {}),
     }
+    parent_lineage = token.get("parent_route_lineage")
+    if isinstance(parent_lineage, Mapping):
+        identity["parent_route_lineage_hash"] = _sha256(
+            {
+                field: _string(parent_lineage.get(field))
+                for field in (
+                    *_PARENT_ROUTE_REQUIRED_FIELDS,
+                    *_PARENT_ROUTE_OPTIONAL_FIELDS,
+                )
+            }
+        )
     if not identity["route_context_hash"] or not identity["prompt_contract_id"]:
         raise ValueError("token is missing route identity required to derive a ref")
     return "rtok-" + _stable_digest(identity, length=32)
@@ -489,6 +547,270 @@ def _normalized_action_list(value: Any) -> list[str]:
             out.append(normalized)
             seen.add(normalized)
     return out
+
+
+def _first_string(source: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        value = _string(source.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _merge_parent_route_field(
+    parent: dict[str, Any],
+    *,
+    field: str,
+    value: Any,
+) -> None:
+    token = _string(value)
+    if not token:
+        return
+    existing = _string(parent.get(field))
+    if existing and existing != token:
+        raise ValueError(
+            f"parent_route_identity mismatch for {field}: "
+            f"{existing!r} != {token!r}"
+        )
+    parent[field] = token
+
+
+def _validate_hash_field(lineage: Mapping[str, Any], field: str) -> None:
+    value = _string(lineage.get(field))
+    if not value.startswith("sha256:"):
+        raise ValueError(f"parent_route_identity {field} must be a sha256: hash")
+
+
+def _valid_parent_route_id(route_id: str) -> bool:
+    route_id = _string(route_id)
+    return route_id.startswith("route-") or route_id in _PARENT_ROUTE_CANONICAL_EVENT_IDS
+
+
+def _parent_route_identity_from_inputs(
+    parent_route_identity: Mapping[str, Any] | None,
+    *,
+    parent_route_id: str = "",
+    parent_route_context_hash: str = "",
+    parent_prompt_contract_id: str = "",
+    parent_prompt_contract_hash: str = "",
+    parent_visible_injection_manifest_hash: str = "",
+    parent_route_token_ref: str = "",
+) -> tuple[bool, dict[str, Any]]:
+    supplied = parent_route_identity is not None or any(
+        _string(value)
+        for value in (
+            parent_route_id,
+            parent_route_context_hash,
+            parent_prompt_contract_id,
+            parent_prompt_contract_hash,
+            parent_visible_injection_manifest_hash,
+            parent_route_token_ref,
+        )
+    )
+    if not supplied:
+        return False, {}
+    if parent_route_identity is not None and not isinstance(parent_route_identity, Mapping):
+        raise ValueError("parent_route_identity must be a mapping")
+
+    parent = dict(parent_route_identity or {})
+    for raw_key in _PARENT_ROUTE_RAW_TOKEN_FIELDS:
+        if _string(parent.get(raw_key)):
+            raise ValueError(
+                "parent_route_identity must not include raw route/session token bodies; "
+                "pass only route_token_ref when an opaque ref is available"
+            )
+
+    aliases = {
+        "route_id": _first_string(parent, "route_id", "parent_route_id"),
+        "route_context_hash": _first_string(
+            parent, "route_context_hash", "parent_route_context_hash"
+        ),
+        "prompt_contract_id": _first_string(
+            parent, "prompt_contract_id", "parent_prompt_contract_id"
+        ),
+        "prompt_contract_hash": _first_string(
+            parent, "prompt_contract_hash", "parent_prompt_contract_hash"
+        ),
+        "visible_injection_manifest_hash": _first_string(
+            parent,
+            "visible_injection_manifest_hash",
+            "parent_visible_injection_manifest_hash",
+        ),
+        "route_token_ref": _first_string(
+            parent, "route_token_ref", "parent_route_token_ref"
+        ),
+        "selected_project": _first_string(
+            parent, "selected_project", "project_id", "target_project_id"
+        ),
+        "selected_backlog_id": _first_string(
+            parent, "selected_backlog_id", "backlog_id", "bug_id"
+        ),
+    }
+    normalized: dict[str, Any] = {}
+    for field, value in aliases.items():
+        _merge_parent_route_field(normalized, field=field, value=value)
+    for field, value in (
+        ("route_id", parent_route_id),
+        ("route_context_hash", parent_route_context_hash),
+        ("prompt_contract_id", parent_prompt_contract_id),
+        ("prompt_contract_hash", parent_prompt_contract_hash),
+        ("visible_injection_manifest_hash", parent_visible_injection_manifest_hash),
+        ("route_token_ref", parent_route_token_ref),
+    ):
+        _merge_parent_route_field(normalized, field=field, value=value)
+    return True, normalized
+
+
+def build_parent_route_lineage(
+    parent_route_identity: Mapping[str, Any] | None,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_route_id: str = "",
+    parent_route_context_hash: str = "",
+    parent_prompt_contract_id: str = "",
+    parent_prompt_contract_hash: str = "",
+    parent_visible_injection_manifest_hash: str = "",
+    parent_route_token_ref: str = "",
+) -> dict[str, Any] | None:
+    """Normalize a complete public parent route identity into lineage evidence.
+
+    The parent binding is intentionally fail-closed: once the caller supplies
+    any parent identity field, the public canonical identity must be complete
+    and must not contradict the child issue scope. Raw token bodies are refused;
+    only opaque ``rtok-`` references may be carried.
+    """
+
+    supplied, parent = _parent_route_identity_from_inputs(
+        parent_route_identity,
+        parent_route_id=parent_route_id,
+        parent_route_context_hash=parent_route_context_hash,
+        parent_prompt_contract_id=parent_prompt_contract_id,
+        parent_prompt_contract_hash=parent_prompt_contract_hash,
+        parent_visible_injection_manifest_hash=parent_visible_injection_manifest_hash,
+        parent_route_token_ref=parent_route_token_ref,
+    )
+    if not supplied:
+        return None
+
+    missing = [
+        field for field in _PARENT_ROUTE_REQUIRED_FIELDS if not _string(parent.get(field))
+    ]
+    if missing:
+        raise ValueError(
+            "parent_route_identity incomplete; missing required fields: "
+            + ", ".join(missing)
+        )
+    if not _valid_parent_route_id(_string(parent.get("route_id"))):
+        raise ValueError(
+            "parent_route_identity route_id must be a public canonical route id "
+            "(route-* or event.route_prompt_context.preview)"
+        )
+    if not _string(parent.get("prompt_contract_id")).startswith("rprompt-"):
+        raise ValueError(
+            "parent_route_identity prompt_contract_id must be a canonical rprompt-* id"
+        )
+    for field in (
+        "route_context_hash",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        _validate_hash_field(parent, field)
+
+    selected_project = _string(parent.get("selected_project"))
+    if selected_project and selected_project != project_id:
+        raise ValueError(
+            "parent_route_identity project mismatch: "
+            f"{selected_project!r} != {project_id!r}"
+        )
+    selected_backlog = _string(parent.get("selected_backlog_id"))
+    if selected_backlog and selected_backlog != backlog_id:
+        raise ValueError(
+            "parent_route_identity backlog mismatch: "
+            f"{selected_backlog!r} != {backlog_id!r}"
+        )
+    route_token_ref = _string(parent.get("route_token_ref"))
+    if route_token_ref and not route_token_ref.startswith("rtok-"):
+        raise ValueError("parent_route_token_ref must be an opaque rtok-* reference")
+
+    lineage = {
+        "schema_version": PARENT_ROUTE_LINEAGE_SCHEMA_VERSION,
+        "route_id": _string(parent.get("route_id")),
+        "route_context_hash": _string(parent.get("route_context_hash")),
+        "prompt_contract_id": _string(parent.get("prompt_contract_id")),
+        "prompt_contract_hash": _string(parent.get("prompt_contract_hash")),
+        "visible_injection_manifest_hash": _string(
+            parent.get("visible_injection_manifest_hash")
+        ),
+        "selected_project": selected_project or project_id,
+        "selected_backlog_id": selected_backlog or backlog_id,
+        "binding_status": "parent_bound",
+        "binding_source": "parent_route_identity",
+    }
+    if route_token_ref:
+        lineage["route_token_ref"] = route_token_ref
+    return lineage
+
+
+def _child_route_lineage(
+    token: Mapping[str, Any],
+    *,
+    route_token_ref: str = "",
+    merge_queue_id: str = "",
+) -> dict[str, Any]:
+    scope = dict(token.get("scope") or {})
+    lineage = {
+        "schema_version": CHILD_ROUTE_LINEAGE_SCHEMA_VERSION,
+        "route_id": _string(token.get("route_id")),
+        "route_context_hash": _string(token.get("route_context_hash")),
+        "prompt_contract_id": _string(token.get("prompt_contract_id")),
+        "prompt_contract_hash": _string(token.get("prompt_contract_hash")),
+        "visible_injection_manifest_hash": _string(
+            token.get("visible_injection_manifest_hash")
+        ),
+        "project_id": _string(scope.get("project_id")),
+        "backlog_id": _string(scope.get("backlog_id")),
+        "task_id": _string(scope.get("task_id")),
+        "caller_role": _string(token.get("caller_role")),
+        "allowed_actions": list(token.get("allowed_actions") or []),
+        "blocked_actions": list(token.get("blocked_actions") or []),
+    }
+    if route_token_ref:
+        lineage["route_token_ref"] = _string(route_token_ref)
+    if merge_queue_id:
+        lineage["merge_queue_id"] = _string(merge_queue_id)
+    return lineage
+
+
+def _attach_route_lineage(
+    token: dict[str, Any],
+    *,
+    route_token_ref: str = "",
+    merge_queue_id: str = "",
+) -> None:
+    parent = token.get("parent_route_lineage")
+    if not isinstance(parent, Mapping):
+        return
+    child = _child_route_lineage(
+        token,
+        route_token_ref=route_token_ref,
+        merge_queue_id=merge_queue_id,
+    )
+    token["child_route_lineage"] = child
+    token["route_lineage"] = {
+        "schema_version": ROUTE_LINEAGE_SCHEMA_VERSION,
+        "status": "parent_bound",
+        "parent_route_id": _string(parent.get("route_id")),
+        "parent_route_context_hash": _string(parent.get("route_context_hash")),
+        "parent_prompt_contract_id": _string(parent.get("prompt_contract_id")),
+        "child_route_id": child["route_id"],
+        "child_route_context_hash": child["route_context_hash"],
+        "child_prompt_contract_id": child["prompt_contract_id"],
+        "parent_route_lineage": dict(parent),
+        "child_route_lineage": child,
+        "raw_route_token_persisted": False,
+        "raw_session_token_persisted": False,
+    }
 
 
 def derive_merge_queue_id(token: Mapping[str, Any]) -> str:
@@ -525,7 +847,7 @@ def build_execute_backlog_row_payload(
     The raw token body is intentionally NOT included (only the opaque ref).
     """
     scope = dict(token.get("scope") or {})
-    return {
+    payload = {
         "backlog_id": _string(scope.get("backlog_id")),
         "task_id": _string(scope.get("task_id")),
         "merge_queue_id": _string(merge_queue_id),
@@ -539,6 +861,11 @@ def build_execute_backlog_row_payload(
         ),
         "caller_role": CALLER_ROLE,
     }
+    for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
+        value = token.get(key)
+        if isinstance(value, Mapping):
+            payload[key] = dict(value)
+    return payload
 
 
 def issue_observer_write_route_context(
@@ -553,6 +880,13 @@ def issue_observer_write_route_context(
     provider: Mapping[str, Any] | None = None,
     evidence_refs: Sequence[str] | None = None,
     project_root: Path | str | None = None,
+    parent_route_identity: Mapping[str, Any] | None = None,
+    parent_route_id: str = "",
+    parent_route_context_hash: str = "",
+    parent_prompt_contract_id: str = "",
+    parent_prompt_contract_hash: str = "",
+    parent_visible_injection_manifest_hash: str = "",
+    parent_route_token_ref: str = "",
 ) -> dict[str, Any]:
     """Native Aming-owned issuance entrypoint for an observer session.
 
@@ -581,15 +915,27 @@ def issue_observer_write_route_context(
         provider=provider,
         evidence_refs=evidence_refs,
         project_root=project_root,
+        parent_route_identity=parent_route_identity,
+        parent_route_id=parent_route_id,
+        parent_route_context_hash=parent_route_context_hash,
+        parent_prompt_contract_id=parent_prompt_contract_id,
+        parent_prompt_contract_hash=parent_prompt_contract_hash,
+        parent_visible_injection_manifest_hash=parent_visible_injection_manifest_hash,
+        parent_route_token_ref=parent_route_token_ref,
     )
     route_token_ref = derive_route_token_ref(token)
     merge_queue_id = derive_merge_queue_id(token)
+    _attach_route_lineage(
+        token,
+        route_token_ref=route_token_ref,
+        merge_queue_id=merge_queue_id,
+    )
     execute_payload = build_execute_backlog_row_payload(
         token,
         route_token_ref=route_token_ref,
         merge_queue_id=merge_queue_id,
     )
-    return {
+    result = {
         "schema_version": ISSUE_SCHEMA_VERSION,
         "ok": True,
         "owner": OWNER,
@@ -609,6 +955,11 @@ def issue_observer_write_route_context(
         ),
         "expires_at": token.get("expires_at", ""),
     }
+    for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
+        value = token.get(key)
+        if isinstance(value, Mapping):
+            result[key] = dict(value)
+    return result
 
 
 # ---------------------------------------------------------------------------

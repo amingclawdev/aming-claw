@@ -586,6 +586,52 @@ TOOLS: list[dict] = [
                     "type": "number",
                     "description": "Token lifetime in hours (default 24, clamped to a max).",
                 },
+                "parent_route_identity": {
+                    "type": "object",
+                    "description": (
+                        "Optional public-only canonical parent route identity to bind "
+                        "the issued worker route as a child. Accepts public fields such "
+                        "as route_id (route-* or event.route_prompt_context.preview), "
+                        "route_context_hash, prompt_contract_id, prompt_contract_hash, "
+                        "visible_injection_manifest_hash, selected_project, "
+                        "selected_backlog_id, and opaque route_token_ref. Raw route or "
+                        "session token bodies are rejected by the issuer."
+                    ),
+                    "properties": {
+                        "route_id": {"type": "string"},
+                        "route_context_hash": {"type": "string"},
+                        "prompt_contract_id": {"type": "string"},
+                        "prompt_contract_hash": {"type": "string"},
+                        "visible_injection_manifest_hash": {"type": "string"},
+                        "selected_project": {"type": "string"},
+                        "selected_backlog_id": {"type": "string"},
+                        "route_token_ref": {"type": "string"},
+                    },
+                },
+                "parent_route_id": {
+                    "type": "string",
+                    "description": "Explicit public parent route id (route-* or event.route_prompt_context.preview).",
+                },
+                "parent_route_context_hash": {
+                    "type": "string",
+                    "description": "Explicit parent route_context_hash; must be sha256:...",
+                },
+                "parent_prompt_contract_id": {
+                    "type": "string",
+                    "description": "Explicit parent prompt contract id; must be rprompt-*.",
+                },
+                "parent_prompt_contract_hash": {
+                    "type": "string",
+                    "description": "Explicit parent prompt contract hash; must be sha256:...",
+                },
+                "parent_visible_injection_manifest_hash": {
+                    "type": "string",
+                    "description": "Explicit parent visible injection manifest hash; must be sha256:...",
+                },
+                "parent_route_token_ref": {
+                    "type": "string",
+                    "description": "Optional opaque parent route token reference (rtok-*), never a raw token body.",
+                },
             },
             "required": ["project_id", "backlog_id", "task_id", "target_files"],
         },

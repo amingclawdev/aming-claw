@@ -36,6 +36,22 @@ _TARGET_FILES = [
     "agent/governance/server.py",
 ]
 _NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+_PARENT_ROUTE_IDENTITY = {
+    "route_id": "event.route_prompt_context.preview",
+    "route_context_hash": (
+        "sha256:7125c02c654a700e97fb9dc1b8f98ff0d17bd8ee5c87bf5d719e9e99e17fcf0a"
+    ),
+    "prompt_contract_id": "rprompt-aming-91fa67fa58d0ae34",
+    "prompt_contract_hash": (
+        "sha256:91fa67fa58d0ae3457f2dd4d0f35059c07a9392c8a02882a80441f7e748fda92"
+    ),
+    "visible_injection_manifest_hash": (
+        "sha256:da5eec8c1af2bf002628037de2fe9bc4cbfb9290ea60a6057004edb050379396"
+    ),
+    "route_token_ref": "rtok-e66f150c6cf5672dbaad43886bb7368f",
+    "selected_project": _PROJECT,
+    "selected_backlog_id": _BACKLOG,
+}
 
 
 def _token(**overrides):
@@ -60,6 +76,23 @@ def _issue(**overrides):
     )
     kwargs.update(overrides)
     return observer_route_context.issue_observer_write_route_context(**kwargs)
+
+
+def _assert_no_raw_token_keys(value):
+    raw_keys = {
+        "route_token",
+        "raw_route_token",
+        "token",
+        "token_body",
+        "session_token",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert key not in raw_keys
+            _assert_no_raw_token_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_no_raw_token_keys(item)
 
 
 # --- AC2: gate acceptance ---------------------------------------------------
@@ -530,6 +563,153 @@ def test_issue_is_deterministic():
     assert a["merge_queue_id"] == b["merge_queue_id"]
 
 
+# --- AC8: parent/child route lineage for worker issuance --------------------
+
+
+def test_issue_without_parent_route_lineage_is_backward_compatible():
+    issued = _issue()
+    token = issued["route_token"]
+    payload = issued["execute_backlog_row_payload"]
+
+    assert "parent_route_lineage" not in token
+    assert "child_route_lineage" not in token
+    assert "route_lineage" not in token
+    assert "parent_route_lineage" not in payload
+    assert "child_route_lineage" not in payload
+    assert "route_lineage" not in payload
+
+    result = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="execute_backlog_row",
+        project_id=_PROJECT,
+        backlog_id=_BACKLOG,
+        task_id=_TASK,
+        now=_NOW,
+    )
+    assert result["decision"] == "route_token"
+
+
+def test_issue_with_complete_parent_records_parent_and_child_lineage():
+    issued = _issue(parent_route_identity=_PARENT_ROUTE_IDENTITY)
+    token = issued["route_token"]
+    payload = issued["execute_backlog_row_payload"]
+
+    parent = token["parent_route_lineage"]
+    child = token["child_route_lineage"]
+    route_lineage = token["route_lineage"]
+
+    assert parent["schema_version"] == "parent_route_lineage.v1"
+    assert parent["binding_status"] == "parent_bound"
+    assert parent["route_id"] == _PARENT_ROUTE_IDENTITY["route_id"]
+    assert parent["route_context_hash"] == _PARENT_ROUTE_IDENTITY["route_context_hash"]
+    assert parent["prompt_contract_id"] == _PARENT_ROUTE_IDENTITY["prompt_contract_id"]
+    assert parent["route_token_ref"] == _PARENT_ROUTE_IDENTITY["route_token_ref"]
+
+    assert child["schema_version"] == "child_route_lineage.v1"
+    assert child["route_id"] == token["route_id"]
+    assert child["route_context_hash"] == token["route_context_hash"]
+    assert child["prompt_contract_id"] == token["prompt_contract_id"]
+    assert child["project_id"] == _PROJECT
+    assert child["backlog_id"] == _BACKLOG
+    assert child["task_id"] == _TASK
+    assert child["allowed_actions"] == token["allowed_actions"]
+    assert child["route_token_ref"] == issued["route_token_ref"]
+    assert child["merge_queue_id"] == issued["merge_queue_id"]
+
+    assert route_lineage["status"] == "parent_bound"
+    assert route_lineage["parent_route_id"] == parent["route_id"]
+    assert route_lineage["child_route_id"] == child["route_id"]
+    assert route_lineage["raw_route_token_persisted"] is False
+    assert route_lineage["raw_session_token_persisted"] is False
+
+    assert payload["parent_route_lineage"] == parent
+    assert payload["child_route_lineage"] == child
+    assert payload["route_lineage"] == route_lineage
+    assert "route_token" not in payload
+    _assert_no_raw_token_keys(payload["parent_route_lineage"])
+    _assert_no_raw_token_keys(payload["child_route_lineage"])
+    _assert_no_raw_token_keys(payload["route_lineage"])
+
+
+def test_parent_lineage_also_accepts_generated_route_id():
+    generated_parent = dict(_PARENT_ROUTE_IDENTITY)
+    generated_parent["route_id"] = "route-20260616-7125c02c654a700e"
+
+    issued = _issue(parent_route_identity=generated_parent)
+
+    assert issued["parent_route_lineage"]["route_id"] == generated_parent["route_id"]
+
+
+def test_incomplete_or_mismatched_parent_route_identity_fails_closed():
+    incomplete = {
+        "route_id": _PARENT_ROUTE_IDENTITY["route_id"],
+        "route_context_hash": _PARENT_ROUTE_IDENTITY["route_context_hash"],
+    }
+    with pytest.raises(ValueError, match="incomplete"):
+        _issue(parent_route_identity=incomplete)
+
+    mismatched_backlog = dict(_PARENT_ROUTE_IDENTITY)
+    mismatched_backlog["selected_backlog_id"] = "AC-SOME-OTHER-BACKLOG-20260616"
+    with pytest.raises(ValueError, match="backlog mismatch"):
+        _issue(parent_route_identity=mismatched_backlog)
+
+    with pytest.raises(ValueError, match="mismatch for route_id"):
+        _issue(
+            parent_route_identity=_PARENT_ROUTE_IDENTITY,
+            parent_route_id="route-20260616-conflicting",
+        )
+
+    raw_token_parent = dict(_PARENT_ROUTE_IDENTITY)
+    raw_token_parent["route_token"] = {"raw": "must-not-persist"}
+    with pytest.raises(ValueError, match="raw route/session token"):
+        _issue(parent_route_identity=raw_token_parent)
+
+    invalid_route = dict(_PARENT_ROUTE_IDENTITY)
+    invalid_route["route_id"] = "task.route_context.preview"
+    with pytest.raises(ValueError, match="public canonical route id"):
+        _issue(parent_route_identity=invalid_route)
+
+    invalid_prompt_id = dict(_PARENT_ROUTE_IDENTITY)
+    invalid_prompt_id["prompt_contract_id"] = "prompt-contract-1"
+    with pytest.raises(ValueError, match="rprompt"):
+        _issue(parent_route_identity=invalid_prompt_id)
+
+    invalid_hash = dict(_PARENT_ROUTE_IDENTITY)
+    invalid_hash["route_context_hash"] = "not-a-sha256"
+    with pytest.raises(ValueError, match="sha256"):
+        _issue(parent_route_identity=invalid_hash)
+
+
+def test_parent_lineage_route_token_ref_is_opaque_and_stable():
+    a = _issue(parent_route_identity=_PARENT_ROUTE_IDENTITY)
+    b = _issue(parent_route_identity=_PARENT_ROUTE_IDENTITY)
+    assert a["route_token_ref"] == b["route_token_ref"]
+    assert a["merge_queue_id"] == b["merge_queue_id"]
+
+    ref = a["route_token_ref"]
+    token = a["route_token"]
+    assert ref.startswith("rtok-")
+    assert len(ref) < 64
+    assert token["route_context_hash"] not in ref
+    assert token["prompt_contract_hash"] not in ref
+    assert _PARENT_ROUTE_IDENTITY["route_context_hash"] not in ref
+    assert _PARENT_ROUTE_IDENTITY["prompt_contract_hash"] not in ref
+    assert "route-" not in ref
+
+    different_parent = dict(_PARENT_ROUTE_IDENTITY)
+    different_parent.update(
+        {
+            "route_id": "route-20260616-differentparent",
+            "route_context_hash": "sha256:" + ("a" * 64),
+            "prompt_contract_id": "rprompt-aming-differentparent",
+            "prompt_contract_hash": "sha256:" + ("b" * 64),
+            "visible_injection_manifest_hash": "sha256:" + ("c" * 64),
+        }
+    )
+    c = _issue(parent_route_identity=different_parent)
+    assert c["route_token_ref"] != ref
+
+
 # --- AC7 / dogfood: redaction — raw token never persisted in the ref --------
 
 
@@ -657,6 +837,17 @@ class _Ctx:
         return _PROJECT
 
 
+def _endpoint_body(**overrides):
+    body = {
+        "caller_role": "observer",
+        "backlog_id": _BACKLOG,
+        "task_id": _TASK,
+        "target_files": _TARGET_FILES,
+    }
+    body.update(overrides)
+    return body
+
+
 def test_endpoint_rejects_non_observer_caller_role():
     """The issuance handler must 403 a non-observer caller.
 
@@ -697,14 +888,7 @@ def test_endpoint_accepts_observer_caller_role():
     from agent.governance import server
 
     result = server.handle_observer_route_context_issue(
-        _Ctx(
-            {
-                "caller_role": "observer",
-                "backlog_id": _BACKLOG,
-                "task_id": _TASK,
-                "target_files": _TARGET_FILES,
-            }
-        )
+        _Ctx(_endpoint_body())
     )
     # Success path returns a plain dict (200), not a (code, body) tuple.
     assert isinstance(result, dict)
@@ -714,6 +898,160 @@ def test_endpoint_accepts_observer_caller_role():
     assert result["merge_queue_id"]
     assert result["execute_backlog_row_payload"]["route_token_ref"] == result[
         "route_token_ref"
+    ]
+
+
+def test_endpoint_accepts_parent_route_identity_and_returns_lineage():
+    from agent.governance import server
+
+    result = server.handle_observer_route_context_issue(
+        _Ctx(_endpoint_body(parent_route_identity=dict(_PARENT_ROUTE_IDENTITY)))
+    )
+
+    assert isinstance(result, dict)
+    assert result["ok"] is True
+    assert result["parent_route_lineage"]["route_id"] == "event.route_prompt_context.preview"
+    assert result["parent_route_lineage"] == result["route_token"]["parent_route_lineage"]
+    assert result["child_route_lineage"] == result["route_token"]["child_route_lineage"]
+    assert result["route_lineage"] == result["route_token"]["route_lineage"]
+    assert (
+        result["execute_backlog_row_payload"]["parent_route_lineage"]
+        == result["parent_route_lineage"]
+    )
+    assert result["route_lineage"]["parent_route_id"] == "event.route_prompt_context.preview"
+    assert result["route_lineage"]["child_route_id"] == result["route_token"]["route_id"]
+    assert result["route_lineage"]["raw_route_token_persisted"] is False
+    _assert_no_raw_token_keys(result["parent_route_lineage"])
+    _assert_no_raw_token_keys(result["child_route_lineage"])
+    _assert_no_raw_token_keys(result["route_lineage"])
+
+
+def test_endpoint_rejects_bad_parent_route_identity_inputs():
+    from agent.governance import server
+
+    incomplete = {
+        "route_id": _PARENT_ROUTE_IDENTITY["route_id"],
+        "route_context_hash": _PARENT_ROUTE_IDENTITY["route_context_hash"],
+    }
+    code, payload = server.handle_observer_route_context_issue(
+        _Ctx(_endpoint_body(parent_route_identity=incomplete))
+    )
+    assert code == 400
+    assert "incomplete" in payload["error"]
+
+    raw_parent = dict(_PARENT_ROUTE_IDENTITY)
+    raw_parent["session_token"] = "raw-session-token"
+    code, payload = server.handle_observer_route_context_issue(
+        _Ctx(_endpoint_body(parent_route_identity=raw_parent))
+    )
+    assert code == 400
+    assert "raw route/session token" in payload["error"]
+
+    code, payload = server.handle_observer_route_context_issue(
+        _Ctx(_endpoint_body(parent_route_token={"raw": "must-not-accept"}))
+    )
+    assert code == 400
+    assert "raw route/session token" in payload["error"]
+
+    code, payload = server.handle_observer_route_context_issue(
+        _Ctx(
+            _endpoint_body(
+                parent_route_identity=dict(_PARENT_ROUTE_IDENTITY),
+                parent_route_id="route-20260616-conflicting",
+            )
+        )
+    )
+    assert code == 400
+    assert "mismatch for route_id" in payload["error"]
+
+
+def test_endpoint_accepts_explicit_parent_route_identity_fields():
+    from agent.governance import server
+
+    result = server.handle_observer_route_context_issue(
+        _Ctx(
+            _endpoint_body(
+                parent_route_id=_PARENT_ROUTE_IDENTITY["route_id"],
+                parent_route_context_hash=_PARENT_ROUTE_IDENTITY["route_context_hash"],
+                parent_prompt_contract_id=_PARENT_ROUTE_IDENTITY["prompt_contract_id"],
+                parent_prompt_contract_hash=_PARENT_ROUTE_IDENTITY[
+                    "prompt_contract_hash"
+                ],
+                parent_visible_injection_manifest_hash=_PARENT_ROUTE_IDENTITY[
+                    "visible_injection_manifest_hash"
+                ],
+                parent_route_token_ref=_PARENT_ROUTE_IDENTITY["route_token_ref"],
+            )
+        )
+    )
+
+    assert isinstance(result, dict)
+    assert result["parent_route_lineage"]["route_id"] == "event.route_prompt_context.preview"
+    assert result["route_lineage"]["status"] == "parent_bound"
+
+
+def test_mcp_route_context_issue_schema_exposes_parent_identity_fields():
+    from agent.governance import mcp_server
+
+    tool = next(
+        item for item in mcp_server.TOOLS if item.get("name") == "observer_route_context_issue"
+    )
+    props = tool["inputSchema"]["properties"]
+    parent_props = props["parent_route_identity"]["properties"]
+
+    assert props["parent_route_identity"]["type"] == "object"
+    assert "event.route_prompt_context.preview" in props["parent_route_id"]["description"]
+    for key in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    ):
+        assert key in parent_props
+        assert f"parent_{key}" in props
+    for raw_key in ("route_token", "session_token", "token", "token_body"):
+        assert raw_key not in parent_props
+
+
+def test_mcp_route_context_issue_forwards_public_parent_identity(monkeypatch):
+    from agent.governance import mcp_server
+
+    calls = []
+
+    def fake_http(method, path, body):
+        calls.append((method, path, body))
+        return {"ok": True, "data": body}
+
+    monkeypatch.setattr(mcp_server, "_http", fake_http)
+
+    result = mcp_server._dispatch_tool(
+        "observer_route_context_issue",
+        {
+            "project_id": _PROJECT,
+            "backlog_id": _BACKLOG,
+            "task_id": _TASK,
+            "target_files": _TARGET_FILES,
+            "parent_route_identity": dict(_PARENT_ROUTE_IDENTITY),
+            "parent_route_id": _PARENT_ROUTE_IDENTITY["route_id"],
+        },
+    )
+
+    assert result["ok"] is True
+    assert calls == [
+        (
+            "POST",
+            f"/api/projects/{_PROJECT}/observer/route-context/issue",
+            {
+                "backlog_id": _BACKLOG,
+                "task_id": _TASK,
+                "target_files": _TARGET_FILES,
+                "parent_route_identity": _PARENT_ROUTE_IDENTITY,
+                "parent_route_id": "event.route_prompt_context.preview",
+                "caller_role": "observer",
+            },
+        )
     ]
 
 
