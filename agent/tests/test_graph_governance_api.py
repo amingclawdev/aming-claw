@@ -48,6 +48,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_MERGE_FAILED,
     STATE_WORKTREE_READY,
     append_branch_contract_revision,
+    build_runtime_context_lane_plan_view,
     get_branch_context,
     get_latest_branch_contract_revision,
     mf_subagent_session_token_hash,
@@ -4631,6 +4632,99 @@ def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_event
         recorded_events[-1]["id"]
     )
     assert "runtime-lane-plan-sibling" not in json.dumps(lane_plan, sort_keys=True)
+
+
+def test_runtime_context_lane_plan_projects_worker_finish_gate_review_ready_only() -> None:
+    finish_projection = {
+        "schema_version": "mf_subagent_finish_gate_lane_ownership_projection.v1",
+        "evidence_id": "bounded_implementation_subagent.review_ready",
+        "evidence_ids": [
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+        ],
+        "review_ready": True,
+        "waiting_merge": True,
+        "worker_status": "waiting_merge",
+        "stop_state": "waiting_merge",
+        "worker_role": "mf_sub",
+        "task_id": "runtime-finish-projection-task",
+        "parent_task_id": "AC-RUNTIME-FINISH-PROJECTION",
+        "runtime_context_id": "mfrctx-runtime-finish-projection",
+        "fence_token": "fence-runtime-finish-projection",
+        "merge_queue_id": "mq-runtime-finish-projection",
+        "route_id": "route-runtime-finish-projection",
+        "route_context_hash": "sha256:route-runtime-finish-projection",
+        "prompt_contract_id": "rprompt-runtime-finish-projection",
+        "prompt_contract_hash": "sha256:prompt-runtime-finish-projection",
+        "route_token_ref": "rtok-runtime-finish-projection",
+    }
+    worker_finish_gate_event = {
+        "id": "finish-worker",
+        "event_type": "mf_subagent.finish_gate",
+        "event_kind": "mf_subagent_finish_gate",
+        "phase": "finish_gate",
+        "actor": "worker-session-runtime-finish-projection",
+        "status": "passed",
+        "task_id": "runtime-finish-projection-task",
+        "payload": {
+            "mf_subagent_finish_gate": {
+                "worker_role": "mf_sub",
+                "task_id": "runtime-finish-projection-task",
+                "parent_task_id": "AC-RUNTIME-FINISH-PROJECTION",
+                "runtime_context_id": "mfrctx-runtime-finish-projection",
+                "fence_token": "fence-runtime-finish-projection",
+                "merge_queue_id": "mq-runtime-finish-projection",
+                "lane_ownership_projection": finish_projection,
+            }
+        },
+    }
+    observer_authored_finish_gate_event = {
+        **worker_finish_gate_event,
+        "id": "finish-observer",
+        "actor": "observer",
+    }
+
+    worker_lane_plan = build_runtime_context_lane_plan_view(
+        [observer_authored_finish_gate_event, worker_finish_gate_event],
+        required_clauses=[
+            "finish_gate",
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+        ],
+        lane_id="runtime-finish-projection-task",
+        generated_at="2026-06-16T14:00:00Z",
+    )
+
+    fulfilled = {item["clause"]: item for item in worker_lane_plan["fulfilled"]}
+    assert worker_lane_plan["current_state"]["status"] == "ready"
+    assert set(fulfilled) == {
+        "finish_gate",
+        "bounded_implementation_subagent.review_ready",
+        "bounded_implementation_subagent.waiting_merge",
+    }
+    assert (
+        fulfilled["bounded_implementation_subagent.review_ready"]["event_ref"]
+        == "finish-worker"
+    )
+    assert (
+        fulfilled["bounded_implementation_subagent.waiting_merge"]["event_ref"]
+        == "finish-worker"
+    )
+
+    observer_lane_plan = build_runtime_context_lane_plan_view(
+        [observer_authored_finish_gate_event],
+        required_clauses=[
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+        ],
+        lane_id="runtime-finish-projection-task",
+        generated_at="2026-06-16T14:00:00Z",
+    )
+    assert observer_lane_plan["current_state"]["status"] == "missing_required_clauses"
+    assert {item["clause"] for item in observer_lane_plan["missing"]} == {
+        "bounded_implementation_subagent.review_ready",
+        "bounded_implementation_subagent.waiting_merge",
+    }
 
 
 def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):

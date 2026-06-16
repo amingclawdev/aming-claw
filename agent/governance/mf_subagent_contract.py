@@ -6816,10 +6816,19 @@ def validate_mf_subagent_finish_gate(
             "before close-ready"
         )
 
+    route_lineage = _mf_subagent_route_lineage(
+        parent_route_lineage=parent_route_lineage,
+        child_route_prompt_contract=child_route_prompt_contract,
+    )
     lane_ownership_projection = {
         "schema_version": FINISH_GATE_LANE_OWNERSHIP_PROJECTION_SCHEMA_VERSION,
         "evidence_id": "bounded_implementation_subagent.review_ready",
+        "evidence_ids": [
+            "bounded_implementation_subagent.review_ready",
+            "bounded_implementation_subagent.waiting_merge",
+        ],
         "review_ready": True,
+        "waiting_merge": True,
         "worker_status": "waiting_merge",
         "stop_state": "waiting_merge",
         "worker_role": MF_SUB_ROLE,
@@ -6830,6 +6839,35 @@ def validate_mf_subagent_finish_gate(
         "runtime_context_id": _string(startup_evidence.get("runtime_context_id")),
         "checkpoint_id": checkpoint_id,
         "merge_queue_id": context.merge_queue_id,
+        "fence_token": context.fence_token,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "head_commit": claimed_head or context.head_commit,
+        "route_id": _string(child_route_prompt_contract.get("route_id")),
+        "route_context_hash": _string(
+            child_route_prompt_contract.get("route_context_hash")
+        ),
+        "prompt_contract_id": _string(
+            child_route_prompt_contract.get("prompt_contract_id")
+        ),
+        "prompt_contract_hash": _string(
+            child_route_prompt_contract.get("prompt_contract_hash")
+        ),
+        "route_token_ref": _string(child_route_prompt_contract.get("route_token_ref")),
+        "visible_injection_manifest_hash": _string(
+            child_route_prompt_contract.get("visible_injection_manifest_hash")
+        ),
+        "parent_route_id": _string(route_lineage.get("parent_route_id")),
+        "parent_route_context_hash": _string(
+            route_lineage.get("parent_route_context_hash")
+        ),
+        "parent_prompt_contract_id": _string(
+            route_lineage.get("parent_prompt_contract_id")
+        ),
+        "producer": "mf_subagent_worker",
+        "source_event_kind": "mf_subagent_finish_gate",
     }
 
     return {
@@ -6854,10 +6892,7 @@ def validate_mf_subagent_finish_gate(
         "finish_precheck": finish_precheck,
         "route_prompt_contract": child_route_prompt_contract,
         "parent_route_lineage": parent_route_lineage,
-        "route_lineage": _mf_subagent_route_lineage(
-            parent_route_lineage=parent_route_lineage,
-            child_route_prompt_contract=child_route_prompt_contract,
-        ),
+        "route_lineage": route_lineage,
         "governed_evidence_required": governed_evidence_required,
         "startup_evidence": startup_evidence,
         "surrogate_join_gate": surrogate_join_gate,
