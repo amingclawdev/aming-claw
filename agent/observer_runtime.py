@@ -130,6 +130,9 @@ WORKER_LAUNCH_PACK_REQUIRED_FIELDS = (
     "graph_query_schema_trace_id",
     "context_pack_refs",
     "context_pack_status",
+    "local_runtime_context_bridge",
+    "runtime_context_entrypoints",
+    "cli_runtime_requirements",
     "worker_guide_ref",
     "worker_guide_hash",
     "worker_guide_status",
@@ -763,6 +766,34 @@ def _normalize_path(path: str) -> str:
     if not token:
         return ""
     return str(Path(token).expanduser().resolve())
+
+
+def _runtime_text_git_dir(worktree_path: str) -> str:
+    token = str(worktree_path or "").strip()
+    if not token:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", token, "rev-parse", "--git-dir"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    git_dir = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    if not git_dir:
+        return ""
+    path = Path(git_dir)
+    if not path.is_absolute():
+        path = Path(token) / path
+    try:
+        return str(path.expanduser().resolve())
+    except OSError:
+        return ""
 
 
 def _git_head(path: Path) -> str:
@@ -3652,6 +3683,16 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
                 f"see Runtime contract JSON above under branch_runtime_evidence; hash {bre_hash}"
             )
         compact_payload["dispatch_gate"] = deduped_gate
+    runtime_context = (
+        payload.get("runtime_context")
+        if isinstance(payload.get("runtime_context"), Mapping)
+        else {}
+    )
+    local_bridge = _runtime_text_local_bridge_path(
+        worktree_path=str(runtime_context.get("worktree_path") or ""),
+        runtime_context_id=str(payload.get("runtime_context_id") or ""),
+    )
+    local_bridge_path = str(local_bridge.get("path") or "")
 
     return (
         "You are a bounded mf_sub implementation worker for Aming Claw.\n\n"
@@ -3678,6 +3719,19 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "Every lookup must carry task_id, parent_task_id, worker_role=mf_sub, "
         "fence_token, and runtime_context_id when available. Echo parent_task_id "
         "in mf_subagent_read_receipt and mf_subagent_startup evidence.\n\n"
+        "If the HTTP runtime contract or MCP runtime_context_worker_guide is "
+        "unavailable before read receipt, read the local bounded bridge file "
+        f"in the assigned worktree instead: `{local_bridge_path}`. The local "
+        "bridge is a read-only startup map, not timeline evidence and not a "
+        "gate bypass; when the assigned worktree is a git repo it is stored "
+        "under the git private directory so it does not dirty owned-file scope. "
+        "If you still cannot record mf_subagent_read_receipt or "
+        "mf_subagent_startup through governance, stop before implementation "
+        "and report blocker governance_io_unavailable_before_read_receipt. "
+        "For Codex CLI workers, prefer launching with "
+        "`--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`; "
+        "`--sandbox workspace-write` may prevent localhost governance or "
+        "noninteractive MCP access.\n\n"
         "Before handing off review_ready, run the local task precheck when "
         "available, normally `python -m agent.cli mf precommit-check --json-output` "
         "from the assigned worktree. Include the precheck command, exit code, "
@@ -3707,6 +3761,68 @@ def _runtime_text_context_pack_status(
     if not status:
         status = "not_required" if not refs and not resolution else "ready"
     return refs, status, resolution
+
+
+def _runtime_text_local_bridge_path(
+    *,
+    worktree_path: str,
+    runtime_context_id: str,
+) -> dict[str, Any]:
+    safe_id = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "-"
+        for char in str(runtime_context_id or "").strip()
+    ).strip(".-_")
+    if not safe_id:
+        safe_id = "runtime-context"
+    safe_id = safe_id[:96]
+    filename = f"{safe_id}.worker-launch-pack.json"
+    git_private_relative_path = f"aming-claw/runtime-context/{filename}"
+    git_dir = _runtime_text_git_dir(worktree_path)
+    if git_dir:
+        relative_path = git_private_relative_path
+        path = str(Path(git_dir) / git_private_relative_path)
+        storage = "git_private_dir"
+        worktree_status_visible = False
+        dirty_scope_impact = "none"
+    else:
+        relative_path = f".aming-claw/runtime-context/{filename}"
+        path = str(Path(worktree_path) / relative_path) if worktree_path else ""
+        storage = "worktree_metadata_fallback"
+        worktree_status_visible = True
+        dirty_scope_impact = "would_create_untracked_file"
+    return {
+        "schema_version": "observer_worker_launch_pack.local_bridge.v1",
+        "status": "planned",
+        "path": path,
+        "relative_path": relative_path,
+        "git_private_relative_path": git_private_relative_path,
+        "storage": storage,
+        "git_dir": git_dir,
+        "format": "json",
+        "writer": "observer_runtime_text_prepare",
+        "network_dependency": False,
+        "worktree_status_visible": worktree_status_visible,
+        "dirty_scope_impact": dirty_scope_impact,
+        "raw_launch_text_persisted": False,
+        "contains": [
+            "worker_launch_pack",
+            "startup_recording",
+            "self_contract_lookup",
+            "graph_first_obligations",
+            "finish_gate_contract",
+            "route_identity",
+        ],
+        "fallback_for": [
+            "runtime_contract_http_unavailable_before_read_receipt",
+            "runtime_context_worker_guide_mcp_unavailable_before_read_receipt",
+        ],
+        "purpose": (
+            "Local bounded runtime-context bridge for CLI workers that cannot "
+            "reach HTTP/MCP before startup. It is not timeline evidence and "
+            "does not bypass server-side gates. Git worktrees store it under "
+            "the git private directory so it does not dirty the worker scope."
+        ),
+    }
 
 
 def _runtime_text_worker_launch_pack(
@@ -3740,6 +3856,65 @@ def _runtime_text_worker_launch_pack(
         project_id=request.project_id,
         runtime_context_id=runtime_context_id,
     )
+    local_bridge = _runtime_text_local_bridge_path(
+        worktree_path=str(getattr(context, "worktree_path", "") or ""),
+        runtime_context_id=runtime_context_id,
+    )
+    runtime_context_entrypoints = [
+        {
+            "id": "local_worker_launch_pack",
+            "priority": 1,
+            "method": "file",
+            "path": local_bridge["path"],
+            "relative_path": local_bridge["relative_path"],
+            "available_after": "observer_runtime_text_prepare",
+            "use_when": (
+                "Use this first when the CLI worker cannot reach localhost "
+                "governance or MCP tool approval is unavailable before the "
+                "read receipt."
+            ),
+            "not_a_substitute_for": [
+                "task_timeline_append",
+                "parallel_branch_startup",
+                "runtime_context_implementation_evidence",
+            ],
+        },
+        {
+            "id": "http_runtime_contract",
+            "priority": 2,
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/runtime-contract"
+            ),
+            "requires_governance_network": True,
+        },
+        {
+            "id": "mcp_runtime_context_worker_guide",
+            "priority": 3,
+            "method": "MCP",
+            "tool": "runtime_context_worker_guide",
+            "requires_mcp_tool_approval": True,
+        },
+    ]
+    cli_runtime_requirements = {
+        "schema_version": "observer_worker_launch_pack.cli_runtime_requirements.v1",
+        "governance_url_env": "AMING_GOVERNANCE_URL",
+        "worker_session_token_env": "AMING_WORKER_SESSION_TOKEN",
+        "governance_network_required_for_timeline_writes": True,
+        "recommended_codex_exec_flags": [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+        ],
+        "workspace_write_warning": (
+            "Codex CLI launched with --sandbox workspace-write may be unable to "
+            "reach localhost governance or use noninteractive MCP tools. If the "
+            "worker cannot record mf_subagent_read_receipt before implementation, "
+            "stop and relaunch with the recommended flags instead of patching."
+        ),
+        "failure_blocker": "governance_io_unavailable_before_read_receipt",
+        "raw_session_token_persisted": False,
+    }
     worker_guide_status = str(request.worker_guide_status or "ready").strip()
     next_legal_action = str(
         request.worker_next_legal_action or "submit_mf_subagent_read_receipt"
@@ -3794,6 +3969,7 @@ def _runtime_text_worker_launch_pack(
             "owned_files": list(owned_files),
         },
         "worker_next_moves": [
+            "read_local_worker_launch_pack_if_http_or_mcp_unavailable",
             "submit_mf_subagent_read_receipt",
             "record_mf_subagent_startup",
             "run_worker_graph_query",
@@ -3817,6 +3993,7 @@ def _runtime_text_worker_launch_pack(
         },
         "tests_to_run": list(request.test_commands),
         "evidence_to_file": required_evidence,
+        "runtime_context_entrypoints": runtime_context_entrypoints,
         "done_state": ["review_ready", "waiting_merge"],
     }
     worker_guide_hash = request.worker_guide_hash or _stable_json_hash(worker_guide)
@@ -3966,6 +4143,9 @@ def _runtime_text_worker_launch_pack(
         "context_pack_refs": context_pack_refs,
         "context_pack_status": context_pack_status,
         "context_pack_resolution": context_pack_resolution,
+        "local_runtime_context_bridge": local_bridge,
+        "runtime_context_entrypoints": runtime_context_entrypoints,
+        "cli_runtime_requirements": cli_runtime_requirements,
         "worker_guide_ref": worker_guide_ref,
         "worker_guide_hash": worker_guide_hash,
         "worker_guide_status": worker_guide_status,
@@ -4556,6 +4736,10 @@ def build_observer_runtime_text_context(
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
         "worker_launch_pack": worker_launch_pack,
+        "local_runtime_context_bridge": worker_launch_pack.get(
+            "local_runtime_context_bridge",
+            {},
+        ),
         "startup_token_join_gaps": startup_token_join_gaps,
         "next_legal_action": dispatch_gate_validation.get("next_legal_action") or {},
         "branch_identity": launch_payload["branch_identity"],

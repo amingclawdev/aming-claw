@@ -2124,6 +2124,8 @@ def test_parallel_branch_allocate_blocks_same_owner_token_for_identity_mismatch(
 
 def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(conn, tmp_path):
     worktree = tmp_path / "worker"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
     upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -2186,6 +2188,42 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert evidence["registered"] is True
     assert evidence["registration_source"] == "persisted_branch_runtime_context"
     assert evidence["context"]["worktree_path"] == str(worktree)
+    bridge_write = prepared["local_runtime_context_bridge"]
+    assert bridge_write["status"] == "written"
+    bridge_path = Path(bridge_write["path"])
+    git_dir = worktree / ".git"
+    assert bridge_path.is_relative_to(git_dir.resolve())
+    assert bridge_path.exists()
+    bridge_payload = json.loads(bridge_path.read_text(encoding="utf-8"))
+    assert bridge_payload["schema_version"] == (
+        "observer_worker_launch_pack.local_bridge_payload.v1"
+    )
+    assert bridge_payload["runtime_context_id"] == "mfrctx-runtime-text-api"
+    assert bridge_payload["worker_launch_pack"]["task_id"] == "runtime-text-task"
+    planned_bridge_path = Path(
+        bridge_payload["worker_launch_pack"]["local_runtime_context_bridge"]["path"]
+    )
+    assert planned_bridge_path.resolve() == bridge_path
+    assert bridge_payload["startup_recording"]["event_kind"] == "mf_subagent_startup"
+    assert "launch_text" not in bridge_payload
+    assert bridge_payload["raw_launch_text_persisted"] is False
+    assert bridge_write["worktree_status_visible"] is False
+    status = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=all"],
+        cwd=worktree,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert status.stdout == ""
+    full_payload = json.loads(Path(prepared["full_payload_path"]).read_text(encoding="utf-8"))
+    assert "launch_text" not in full_payload
+    assert full_payload["launch_text_redacted"] is True
+    assert full_payload["raw_launch_text_persisted"] is False
+    assert full_payload["launch_text_hash"] == prepared["launch_text_hash"]
+    assert prepared["persistent_evidence"]["local_runtime_context_bridge"][
+        "status"
+    ] == "written"
 
 
 def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref(conn, tmp_path):

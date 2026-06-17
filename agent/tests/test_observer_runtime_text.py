@@ -310,6 +310,23 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert launch_pack["graph_query_schema_trace_id"] == "gqt-runtime-text"
     assert launch_pack["context_pack_refs"] == []
     assert launch_pack["context_pack_status"] == "not_required"
+    bridge = launch_pack["local_runtime_context_bridge"]
+    assert bridge["schema_version"] == "observer_worker_launch_pack.local_bridge.v1"
+    assert bridge["path"].endswith(
+        ".aming-claw/runtime-context/mfrctx-runtime-text.worker-launch-pack.json"
+    )
+    assert bridge["network_dependency"] is False
+    assert bridge["raw_launch_text_persisted"] is False
+    entrypoints = launch_pack["runtime_context_entrypoints"]
+    assert entrypoints[0]["id"] == "local_worker_launch_pack"
+    assert entrypoints[0]["method"] == "file"
+    assert entrypoints[1]["id"] == "http_runtime_contract"
+    assert entrypoints[2]["id"] == "mcp_runtime_context_worker_guide"
+    cli_requirements = launch_pack["cli_runtime_requirements"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in cli_requirements[
+        "recommended_codex_exec_flags"
+    ]
+    assert cli_requirements["governance_network_required_for_timeline_writes"] is True
     assert launch_pack["worker_guide_status"] == "ready"
     assert launch_pack["worker_guide_ref"].endswith("/worker-guide")
     assert launch_pack["worker_guide_hash"].startswith("sha256:")
@@ -327,6 +344,12 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert result["persistent_evidence"]["worker_launch_pack_hash"] == (
         launch_pack["worker_launch_pack_hash"]
     )
+    assert result["local_runtime_context_bridge"]["path"] == bridge["path"]
+    assert bridge["path"] in result["launch_text"]
+    assert "governance_io_unavailable_before_read_receipt" in result["launch_text"]
+    assert "`--sandbox workspace-write` may prevent localhost governance" in result[
+        "launch_text"
+    ]
 
 
 def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):

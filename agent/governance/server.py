@@ -667,6 +667,179 @@ def _persist_full_payload(project_id: str, name: str, request_id: str, payload: 
     return path, digest
 
 
+def _git_private_dir_for_worktree(worktree_path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "--git-dir"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    git_dir = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    if not git_dir:
+        return None
+    path = Path(git_dir)
+    if not path.is_absolute():
+        path = worktree_path / path
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _observer_runtime_text_prepare_persistable_payload(
+    prepared: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return scratch-safe runtime-text payload without raw launch text."""
+
+    launch_text_hash = str(prepared.get("launch_text_hash") or "")
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            for key, nested in value.items():
+                if key == "launch_text":
+                    result["launch_text_redacted"] = True
+                    if launch_text_hash and not result.get("launch_text_hash"):
+                        result["launch_text_hash"] = launch_text_hash
+                    continue
+                result[str(key)] = scrub(nested)
+            return result
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, tuple):
+            return [scrub(item) for item in value]
+        return value
+
+    payload = scrub(prepared)
+    if isinstance(payload, dict):
+        payload["launch_text_redacted"] = True
+        payload["raw_launch_text_persisted"] = False
+        if launch_text_hash:
+            payload["launch_text_hash"] = launch_text_hash
+    return payload if isinstance(payload, dict) else {}
+
+
+def _persist_worker_launch_bridge(prepared: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist a bounded worker startup bridge inside the assigned worktree."""
+
+    worker_launch_pack = (
+        prepared.get("worker_launch_pack")
+        if isinstance(prepared.get("worker_launch_pack"), Mapping)
+        else {}
+    )
+    local_bridge = (
+        worker_launch_pack.get("local_runtime_context_bridge")
+        if isinstance(worker_launch_pack.get("local_runtime_context_bridge"), Mapping)
+        else {}
+    )
+    bridge_path = str(local_bridge.get("path") or "").strip()
+    worktree_path = str(worker_launch_pack.get("worktree_path") or "").strip()
+    result = {
+        "schema_version": "observer_worker_launch_pack.local_bridge_write.v1",
+        "status": "skipped",
+        "path": bridge_path,
+        "relative_path": str(local_bridge.get("relative_path") or ""),
+        "raw_launch_text_persisted": False,
+    }
+    if not prepared.get("ok"):
+        return {**result, "reason": "prepare_not_ok"}
+    if not bridge_path or not worktree_path:
+        return {**result, "reason": "missing_bridge_or_worktree_path"}
+    try:
+        worktree = Path(worktree_path).expanduser().resolve()
+        target = Path(bridge_path).expanduser().resolve()
+    except OSError as exc:
+        return {**result, "status": "error", "reason": "path_resolution_failed", "error": str(exc)}
+    if not worktree.exists():
+        return {
+            **result,
+            "status": "skipped",
+            "reason": "assigned_worktree_missing",
+            "worktree_path": str(worktree),
+        }
+    storage = str(local_bridge.get("storage") or "").strip()
+    worktree_status_visible = bool(local_bridge.get("worktree_status_visible"))
+    if storage != "git_private_dir":
+        return {
+            **result,
+            "status": "skipped",
+            "reason": "git_private_metadata_unavailable",
+            "worktree_path": str(worktree),
+            "worktree_status_visible": worktree_status_visible,
+        }
+    git_dir = _git_private_dir_for_worktree(worktree)
+    if git_dir is None:
+        return {
+            **result,
+            "status": "skipped",
+            "reason": "git_private_metadata_unavailable",
+            "worktree_path": str(worktree),
+            "worktree_status_visible": worktree_status_visible,
+        }
+    try:
+        target.relative_to(git_dir)
+    except ValueError:
+        return {
+            **result,
+            "status": "blocked",
+            "reason": "bridge_path_outside_git_private_dir",
+            "worktree_path": str(worktree),
+            "git_dir": str(git_dir),
+        }
+
+    payload = {
+        "schema_version": "observer_worker_launch_pack.local_bridge_payload.v1",
+        "project_id": str(prepared.get("project_id") or ""),
+        "backlog_id": str(prepared.get("backlog_id") or ""),
+        "runtime_context_id": str(prepared.get("runtime_context_id") or ""),
+        "observer_command_id": str(prepared.get("observer_command_id") or ""),
+        "worker_launch_pack": dict(worker_launch_pack),
+        "startup_recording": dict(prepared.get("startup_recording") or {}),
+        "self_contract_lookup": dict(prepared.get("self_contract_lookup") or {}),
+        "graph_first_obligations": dict(prepared.get("graph_first_obligations") or {}),
+        "finish_gate_contract": dict(prepared.get("finish_gate_contract") or {}),
+        "route_identity": dict(prepared.get("route_identity") or {}),
+        "usage": {
+            "read_before": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+                "worker_graph_query",
+                "implementation",
+            ],
+            "not_a_substitute_for": [
+                "task_timeline_append",
+                "parallel_branch_startup",
+                "runtime_context_implementation_evidence",
+                "mf_subagent_finish_gate",
+            ],
+            "failure_blocker": "governance_io_unavailable_before_read_receipt",
+        },
+        "raw_launch_text_persisted": False,
+    }
+    raw = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(raw, encoding="utf-8")
+    except OSError as exc:
+        return {**result, "status": "error", "reason": "write_failed", "error": str(exc)}
+    return {
+        **result,
+        "status": "written",
+        "path": str(target),
+        "worktree_path": str(worktree),
+        "git_dir": str(git_dir),
+        "worktree_status_visible": False,
+        "sha256": "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "bytes": len(raw.encode("utf-8")),
+    }
+
+
 # --- Route Registry ---
 ROUTES = []
 
@@ -26651,12 +26824,18 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
             dispatch_timeline_event.get("status") in {"recorded", "already_recorded"}
         ),
     }
+    local_runtime_context_bridge = _persist_worker_launch_bridge(prepared)
+    prepared["local_runtime_context_bridge_write"] = local_runtime_context_bridge
+    prepared["persistent_evidence"] = {
+        **dict(prepared.get("persistent_evidence") or {}),
+        "local_runtime_context_bridge": local_runtime_context_bridge,
+    }
     # AC3: Persist full payload to scratch; return compact response.
     full_payload_path, full_payload_sha256 = _persist_full_payload(
         project_id,
         "observer-runtime-text-prepare",
         str(ctx.request_id),
-        prepared,
+        _observer_runtime_text_prepare_persistable_payload(prepared),
     )
     dispatch_gate_validation = dict(prepared.get("dispatch_gate_validation") or {})
     dispatch_verdict = {
@@ -26681,6 +26860,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
         "worker_launch_pack": dict(prepared.get("worker_launch_pack") or {}),
+        "local_runtime_context_bridge": local_runtime_context_bridge,
         "dispatch_timeline_event": dispatch_timeline_event,
         "full_payload_path": full_payload_path,
         "full_payload_sha256": full_payload_sha256,
