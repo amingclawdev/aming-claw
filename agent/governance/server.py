@@ -1464,6 +1464,13 @@ def _write_demo_environment_registry(project_id: str, rows: Sequence[Mapping[str
     os.replace(tmp, path)
 
 
+def _demo_environment_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(row.get("created_at") or ""),
+        str(row.get("id") or ""),
+    )
+
+
 def _safe_demo_environment_root(fixture_root: str) -> tuple[bool, Path, str]:
     if not fixture_root:
         return False, Path(), "fixture_root is empty"
@@ -1697,6 +1704,7 @@ def _visible_demo_environments(project_id: str) -> list[dict[str, Any]]:
             environment["status"] = environment.get("status") or "ready"
             environment["launch_prompt"] = _build_demo_launch_prompt(environment)
             visible.append(environment)
+    visible.sort(key=_demo_environment_sort_key, reverse=True)
     return visible
 
 

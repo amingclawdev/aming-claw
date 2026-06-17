@@ -550,6 +550,66 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert [row["id"] for row in registry_rows] == [environment["id"]]
 
 
+def test_demo_environments_list_returns_newest_first_with_governance_links(tmp_path, monkeypatch):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+
+    def environment_row(env_id: str, created_at: str) -> dict:
+        project_id = f"project-{env_id}"
+        fixture_root = demo_root / env_id
+        fixture_root.mkdir(parents=True, exist_ok=True)
+        row = {
+            "id": env_id,
+            "template_id": "daily-planner-lite",
+            "label": "Daily Planner Lite",
+            "owner_project_id": "aming-claw",
+            "project_id": project_id,
+            "fixture_root": str(fixture_root),
+            "baseline_commit": env_id,
+            "created_at": created_at,
+            "dashboard_url": (
+                f"http://127.0.0.1:40000/dashboard?project_id={project_id}&view=backlog"
+            ),
+            "backlog_url": (
+                f"http://127.0.0.1:40000/dashboard?project_id={project_id}&view=backlog"
+            ),
+            "timeline_url": (
+                f"http://127.0.0.1:40000/dashboard?project_id={project_id}&view=timeline"
+            ),
+            "graph_url": (
+                f"http://127.0.0.1:40000/dashboard?project_id={project_id}&view=graph"
+            ),
+            "planner_preview_url": f"http://127.0.0.1:4173/{env_id}/",
+            "planner_preview_command": f"python3 -m http.server 4173 --directory {fixture_root}",
+            "status": "ready",
+        }
+        server._write_demo_environment_marker(row, "aming-claw")
+        return row
+
+    old_env = environment_row("daily-planner-lite-old", "2026-06-16T21:14:08Z")
+    newest_env = environment_row("daily-planner-lite-new", "2026-06-17T01:07:54Z")
+    middle_env = environment_row("daily-planner-lite-middle", "2026-06-17T00:56:48Z")
+    server._write_demo_environment_registry(
+        "aming-claw",
+        [old_env, middle_env, newest_env],
+    )
+
+    payload = server.handle_project_demo_environments_list(
+        _ctx({"project_id": "aming-claw"})
+    )
+
+    assert [env["id"] for env in payload["environments"]] == [
+        "daily-planner-lite-new",
+        "daily-planner-lite-middle",
+        "daily-planner-lite-old",
+    ]
+    first = payload["environments"][0]
+    assert "project_id=project-daily-planner-lite-new" in first["dashboard_url"]
+    assert "project_id=project-daily-planner-lite-new" in first["backlog_url"]
+    assert "project_id=project-daily-planner-lite-new" in first["timeline_url"]
+    assert "project_id=project-daily-planner-lite-new" in first["graph_url"]
+    assert "project_id: project-daily-planner-lite-new" in first["launch_prompt"]
+
+
 def test_demo_environment_delete_refuses_unmanaged_and_arbitrary_paths(tmp_path, monkeypatch):
     demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
 
