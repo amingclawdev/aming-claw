@@ -60,8 +60,9 @@ def test_supersede_requires_observer_decision():
         assert r[1]["recommended_action"] == "supersede"
         assert r[1]["triage"]["evidence"]["candidates"][0]["bug_id"] == "OLD-2"
 
-def test_confirmed_supersede_closes_old_row():
-    with patch("governance.server.get_connection", return_value=_conn([{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}])):
+def test_confirmed_supersede_marks_old_row_superseded_not_fixed():
+    conn = _conn([{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}])
+    with patch("governance.server.get_connection", return_value=conn):
         from governance.server import handle_backlog_upsert
         r = handle_backlog_upsert(_ctx(
             title="New",
@@ -71,6 +72,9 @@ def test_confirmed_supersede_closes_old_row():
             actor="observer",
         ))
         assert r["action"] == "superseded" and "OLD-2" in r["closed_bugs"]
+        update_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
+        assert any("status='SUPERSEDED'" in sql for sql in update_sql)
+        assert not any("status='FIXED'" in sql for sql in update_sql)
 
 def test_reject_dup_returns_409():
     with patch("governance.server.get_connection", return_value=_conn([{"bug_id": "OLD-1", "title": "Dup Bug", "target_files": "[]"}])):

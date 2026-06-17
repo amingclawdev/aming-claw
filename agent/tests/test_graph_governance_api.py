@@ -1625,6 +1625,12 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert allocation_evidence["source_ref"].endswith("/parallel-branches/allocate")
     assert allocation_evidence["runtime_context_id"] == context["runtime_context_id"]
     assert allocation_evidence["context"]["worktree_path"] == context["worktree_path"]
+    dispatch_event = created["dispatch_timeline_event"]
+    assert dispatch_event["status"] == "skipped"
+    assert dispatch_event["reason"] == "bounded_worker_dispatch_evidence_incomplete"
+    assert "route_context_hash" in dispatch_event["missing_fields"]
+    assert "prompt_contract_id" in dispatch_event["missing_fields"]
+    assert "owned_files" in dispatch_event["missing_fields"]
     assert created["worktree"]["created"] is True
     assert created["worktree"]["branch_graph"]["status"] == "ready"
 
@@ -2114,6 +2120,24 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert worker_view["prompt_contract_hash"] == "sha256:prompt-api"
     assert worker_view["visible_injection_manifest_hash"] == "sha256:visible-api"
     assert worker_view["target_files"] == ["agent/observer_runtime.py"]
+    dispatch_event = prepared["dispatch_timeline_event"]
+    assert dispatch_event["status"] == "recorded"
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TEXT",
+        task_id=context["task_id"],
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["runtime_context_id"] == context["runtime_context_id"]
+    assert dispatch_payload["route_context_hash"] == "sha256:route-api"
+    assert dispatch_payload["prompt_contract_id"] == "rprompt-api"
+    assert dispatch_payload["owned_files"] == ["agent/observer_runtime.py"]
+    assert dispatch_payload["raw_private_context_exposed"] is False
 
     contract = server.handle_graph_governance_parallel_branch_runtime_contract_by_context(
         _ctx_with_role(

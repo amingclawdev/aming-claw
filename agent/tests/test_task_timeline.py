@@ -1,5 +1,6 @@
 """Tests for task implementation timeline evidence."""
 
+import copy
 import hashlib
 import json
 import os
@@ -133,6 +134,18 @@ def _route_context_consumption_events(identity=None):
                     "actual_git_root": "/repo/.worktrees/mf-sub-test",
                     "branch": "refs/heads/codex/mf-sub-test",
                     "head_commit": "head-test",
+                    "close_satisfying": True,
+                    "worker_session_id": "mf-sub-test-session",
+                    "worker_transcript_ref": "codex-thread:mf-sub-test-session",
+                    "harness_type": "codex",
+                    "filer_principal": "mf-sub-test-session",
+                    "worker_self_attestation": {
+                        "status": "passed",
+                        "worker_self_attesting": True,
+                        "worker_session_id": "mf-sub-test-session",
+                        "worker_transcript_ref": "codex-thread:mf-sub-test-session",
+                        "harness_type": "codex",
+                    },
                 }
             },
         },
@@ -532,6 +545,18 @@ def _runtime_text_actual_startup_event(identity=None):
                 "head_commit": "target123",
                 "base_commit": "base123",
                 "target_head_commit": "target123",
+                "close_satisfying": True,
+                "worker_session_id": "codex-session-runtime-text",
+                "worker_transcript_ref": "codex-thread:codex-session-runtime-text",
+                "harness_type": "codex",
+                "filer_principal": "codex-session-runtime-text",
+                "worker_self_attestation": {
+                    "status": "passed",
+                    "worker_self_attesting": True,
+                    "worker_session_id": "codex-session-runtime-text",
+                    "worker_transcript_ref": "codex-thread:codex-session-runtime-text",
+                    "harness_type": "codex",
+                },
             }
         },
     }
@@ -6445,6 +6470,81 @@ class TestTaskTimeline(unittest.TestCase):
             ready["route_context_gate"]["present_requirement_ids"],
         )
 
+    def test_mf_parallel_close_gate_keeps_non_close_startup_visible(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-RUNTIME-TEXT-STARTUP",
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+        route_context, route_action, dispatch, _manual_startup = (
+            _route_context_consumption_events()
+        )
+        startup = copy.deepcopy(_runtime_text_actual_startup_event())
+        startup_gate = startup["payload"]["mf_subagent_startup_gate"]
+        startup_gate["close_satisfying"] = False
+        startup_gate.pop("worker_self_attestation", None)
+        startup_gate.pop("worker_session_id", None)
+        startup_gate.pop("worker_transcript_ref", None)
+        startup_gate.pop("harness_type", None)
+        startup_gate["filer_principal"] = "mf_sub"
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                route_context,
+                route_action,
+                dispatch,
+                startup,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertIn(
+            "mf_subagent_startup",
+            blocked["route_context_gate"]["present_requirement_ids"],
+        )
+        self.assertFalse(blocked["close_timeline_startup_gate"]["passed"])
+        self.assertIn(
+            "startup_close_satisfying",
+            blocked["missing_evidence_groups"]["groups"],
+        )
+
+    def test_mf_close_gate_fails_closed_when_startup_subgate_errors(self):
+        from agent.governance import mf_subagent_contract, task_timeline
+
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        with mock.patch.object(
+            mf_subagent_contract,
+            "close_timeline_startup_event_gate",
+            side_effect=RuntimeError("startup gate unavailable"),
+        ):
+            blocked = task_timeline.mf_close_gate_verification(events)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["close_timeline_startup_gate"]["status"], "error")
+        self.assertEqual(
+            blocked["close_timeline_startup_gate"]["reason"],
+            "close_timeline_startup_gate_error",
+        )
+        self.assertIn(
+            "startup_close_satisfying",
+            blocked["missing_evidence_groups"]["groups"],
+        )
+
     def test_mf_parallel_close_gate_accepts_finish_gate_close_projection(self):
         from agent.governance import task_timeline
 
@@ -8112,15 +8212,12 @@ class TestTaskTimeline(unittest.TestCase):
         ready = server.handle_backlog_timeline_gate(
             _ctx(path_params={"bug_id": "BUG-MF-CONTRACT-PRECHECK"})
         )
-        self.assertFalse(ready["can_close"], ready)
+        self.assertTrue(ready["can_close"], ready)
         self.assertEqual(
             ready["timeline_gate"]["route_context_gate"]["missing_requirement_ids"],
-            ["mf_subagent_startup"],
+            [],
         )
-        self.assertEqual(
-            ready["timeline_gate"]["route_context_gate"]["ignored_route_events"][0]["reason"],
-            "non_passing_route_evidence",
-        )
+        self.assertEqual(ready["timeline_gate"]["route_context_gate"]["ignored_route_events"], [])
         self.assertTrue(ready["timeline_gate"]["contract_gate"]["passed"])
 
     def test_backlog_close_handler_loads_instantiated_contract(self):

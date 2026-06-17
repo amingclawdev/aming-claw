@@ -36,7 +36,17 @@ type ContractEvidenceStatus = "passed" | "missing" | "failed" | "bypassed" | "in
 
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
-const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED", "WAIVED"]);
+const CLOSED_STATUSES = new Set([
+  "FIXED",
+  "CLOSED",
+  "DONE",
+  "RESOLVED",
+  "CANCELLED",
+  "MERGED",
+  "SUPERSEDED",
+  "WAIVED",
+  "VOID",
+]);
 const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);
 const BACKLOG_URL_PARAM = "backlog";
 const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;

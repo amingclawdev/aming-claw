@@ -5990,6 +5990,29 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
         }
+        try:
+            response["dispatch_timeline_event"] = _record_bounded_worker_dispatch_event(
+                conn,
+                project_id,
+                body=ctx.body or {},
+                prepared={
+                    "runtime_context_id": saved.runtime_context_id,
+                    "task_id": saved.task_id,
+                    "backlog_id": saved.backlog_id,
+                    "parent_task_id": saved.root_task_id or saved.backlog_id,
+                },
+                branch_runtime_evidence=response["branch_runtime_evidence"],
+                source="parallel_branch_allocate",
+                request_id=str(ctx.request_id),
+            )
+        except Exception as exc:
+            log.debug("bounded worker dispatch timeline auto-record failed", exc_info=True)
+            response["dispatch_timeline_event"] = {
+                "ok": False,
+                "status": "error",
+                "reason": "bounded_worker_dispatch_auto_record_failed",
+                "error": str(exc),
+            }
         if same_owner_worker_session:
             response["same_owner_worker_session"] = same_owner_worker_session
         return 201, response
@@ -25158,6 +25181,255 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
     )
 
 
+def _record_bounded_worker_dispatch_event(
+    conn,
+    project_id: str,
+    *,
+    body: Mapping[str, Any],
+    prepared: Mapping[str, Any] | None = None,
+    branch_runtime_evidence: Mapping[str, Any] | None = None,
+    source: str,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Record service-generated bounded worker dispatch evidence when complete."""
+
+    from . import task_timeline
+
+    prepared = prepared if isinstance(prepared, Mapping) else {}
+    branch_runtime_evidence = (
+        branch_runtime_evidence
+        if isinstance(branch_runtime_evidence, Mapping)
+        else {}
+    )
+    context = (
+        branch_runtime_evidence.get("context")
+        if isinstance(branch_runtime_evidence.get("context"), Mapping)
+        else {}
+    )
+    route_identity = _parallel_branch_runtime_contract_route_identity(prepared, body)
+
+    def _first_text(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _string_values(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> list[str]:
+        for source_map in sources:
+            if not isinstance(source_map, Mapping):
+                continue
+            for key in keys:
+                values = _runtime_context_service_query_values(source_map, key)
+                if values:
+                    return values
+        return []
+
+    task_id = _first_text(
+        prepared.get("task_id"),
+        context.get("task_id"),
+        body.get("task_id"),
+    )
+    backlog_id = _first_text(
+        prepared.get("backlog_id"),
+        context.get("backlog_id"),
+        body.get("backlog_id"),
+    )
+    parent_task_id = _first_text(
+        body.get("parent_task_id"),
+        prepared.get("parent_task_id"),
+        context.get("root_task_id"),
+        context.get("chain_id"),
+        context.get("backlog_id"),
+        backlog_id,
+    )
+    runtime_context_id = _first_text(
+        prepared.get("runtime_context_id"),
+        context.get("runtime_context_id"),
+        branch_runtime_evidence.get("runtime_context_id"),
+        body.get("runtime_context_id"),
+    )
+    worker_slot_id = _first_text(
+        body.get("worker_slot_id"),
+        body.get("worker_id"),
+        prepared.get("worker_slot_id"),
+        prepared.get("worker_id"),
+        context.get("worker_slot_id"),
+        context.get("worker_id"),
+    )
+    branch_ref = _first_text(
+        body.get("branch"),
+        body.get("branch_ref"),
+        prepared.get("branch"),
+        prepared.get("branch_ref"),
+        context.get("branch_ref"),
+    )
+    worktree_path = _first_text(
+        body.get("worktree_path"),
+        body.get("assigned_worktree"),
+        prepared.get("worktree_path"),
+        prepared.get("assigned_worktree"),
+        context.get("worktree_path"),
+    )
+    owned_files = _string_values(
+        body,
+        prepared,
+        context,
+        keys=("owned_files", "target_files"),
+    )
+    dispatch = {
+        "schema_version": "bounded_implementation_worker_dispatch.v1",
+        "source": source,
+        "service_generated": True,
+        "raw_private_context_exposed": False,
+        **(
+            dict(route_identity)
+            if isinstance(route_identity, Mapping)
+            else {}
+        ),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "worker_role": "mf_sub",
+        "worker_slot_id": worker_slot_id,
+        "worker_id": worker_slot_id,
+        "fence_token": _first_text(
+            body.get("fence_token"),
+            prepared.get("fence_token"),
+            context.get("fence_token"),
+        ),
+        "worktree_path": worktree_path,
+        "branch": branch_ref,
+        "branch_ref": branch_ref,
+        "base_commit": _first_text(
+            body.get("base_commit"),
+            prepared.get("base_commit"),
+            context.get("base_commit"),
+        ),
+        "target_head_commit": _first_text(
+            body.get("target_head_commit"),
+            prepared.get("target_head_commit"),
+            context.get("target_head_commit"),
+        ),
+        "merge_queue_id": _first_text(
+            body.get("merge_queue_id"),
+            prepared.get("merge_queue_id"),
+            context.get("merge_queue_id"),
+        ),
+        "owned_files": owned_files,
+        "read_receipt_event_id": _first_text(
+            body.get("read_receipt_event_id"),
+            prepared.get("read_receipt_event_id"),
+        ),
+        "startup_event_id": _first_text(
+            body.get("startup_event_id"),
+            prepared.get("startup_event_id"),
+        ),
+    }
+    for key in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        if not dispatch.get(key):
+            dispatch[key] = _first_text(body.get(key), prepared.get(key))
+
+    required = (
+        "route_context_hash",
+        "prompt_contract_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_slot_id",
+        "fence_token",
+        "worktree_path",
+        "branch",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "owned_files",
+    )
+    missing = [
+        field for field in required if dispatch.get(field) in ("", None, [], {})
+    ]
+    if missing:
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": "bounded_worker_dispatch_evidence_incomplete",
+            "missing_fields": missing,
+            "close_satisfying": False,
+        }
+
+    existing = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+        limit=200,
+    )
+    for event in existing:
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        marker = (
+            payload.get("bounded_implementation_worker_dispatch")
+            if isinstance(payload.get("bounded_implementation_worker_dispatch"), Mapping)
+            else payload
+        )
+        if (
+            str(marker.get("runtime_context_id") or "") == runtime_context_id
+            and str(marker.get("prompt_contract_id") or "")
+            == str(dispatch.get("prompt_contract_id") or "")
+            and str(marker.get("route_context_hash") or "")
+            == str(dispatch.get("route_context_hash") or "")
+        ):
+            return {
+                "ok": True,
+                "status": "already_recorded",
+                "event_id": event.get("id"),
+                "event_kind": event.get("event_kind"),
+                "runtime_context_id": runtime_context_id,
+            }
+
+    payload = {
+        **dispatch,
+        "bounded_implementation_worker_dispatch": dispatch,
+        "dispatch_source": source,
+        "request_id": request_id,
+    }
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        attempt_num=int(context.get("attempt") or body.get("attempt") or 0),
+        event_type="mf_subagent.dispatch",
+        phase="dispatch",
+        event_kind="bounded_implementation_worker_dispatch",
+        actor=source,
+        status="accepted",
+        payload=payload,
+        artifact_refs={
+            "runtime_context_id": runtime_context_id,
+            "source": source,
+            "raw_private_context_exposed": False,
+        },
+        commit_sha=str(context.get("head_commit") or body.get("head_commit") or ""),
+    )
+    conn.commit()
+    return {
+        "ok": True,
+        "status": "recorded",
+        "event_id": event.get("id"),
+        "event_kind": event.get("event_kind"),
+        "runtime_context_id": runtime_context_id,
+    }
+
+
 def _observer_runtime_text_contract_revision_payload(
     body: Mapping[str, Any],
     prepared: Mapping[str, Any],
@@ -25562,6 +25834,35 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
             "contract_revision_id": revision.get("revision_id", ""),
             "contract_revision_persisted": True,
         }
+    dispatch_timeline_event: dict[str, Any] = {}
+    conn = get_connection(project_id)
+    try:
+        dispatch_timeline_event = _record_bounded_worker_dispatch_event(
+            conn,
+            project_id,
+            body=body,
+            prepared=prepared,
+            branch_runtime_evidence=branch_runtime_evidence,
+            source="observer_runtime_text_prepare",
+            request_id=str(ctx.request_id),
+        )
+    except Exception as exc:
+        log.debug("bounded worker dispatch timeline auto-record failed", exc_info=True)
+        dispatch_timeline_event = {
+            "ok": False,
+            "status": "error",
+            "reason": "bounded_worker_dispatch_auto_record_failed",
+            "error": str(exc),
+        }
+    finally:
+        conn.close()
+    prepared["persistent_evidence"] = {
+        **dict(prepared.get("persistent_evidence") or {}),
+        "dispatch_timeline_event": dispatch_timeline_event,
+        "bounded_worker_dispatch_event_recorded": (
+            dispatch_timeline_event.get("status") in {"recorded", "already_recorded"}
+        ),
+    }
     # AC3: Persist full payload to scratch; return compact response.
     full_payload_path, full_payload_sha256 = _persist_full_payload(
         project_id,
@@ -25592,6 +25893,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
         "worker_launch_pack": dict(prepared.get("worker_launch_pack") or {}),
+        "dispatch_timeline_event": dispatch_timeline_event,
         "full_payload_path": full_payload_path,
         "full_payload_sha256": full_payload_sha256,
         "request_id": str(ctx.request_id),
@@ -28994,7 +29296,10 @@ def handle_backlog_upsert(ctx: RequestContext):
         # Supersede: close old rows after inserting new one
         if decision and decision.get("action") == "supersede":
             for old_id in decision.get("related_bug_ids", []):
-                conn.execute("UPDATE backlog_bugs SET status='FIXED', updated_at=? WHERE bug_id=?", (now, old_id))
+                conn.execute(
+                    "UPDATE backlog_bugs SET status='SUPERSEDED', updated_at=? WHERE bug_id=?",
+                    (now, old_id),
+                )
             try:
                 audit_service.record(
                     conn, pid, "backlog_triage_decision",
@@ -29734,14 +30039,12 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
 
 def _mf_close_gate_verification(events: list[dict] | None, contract: dict | None = None) -> dict:
     from . import task_timeline
-    from .mf_subagent_contract import close_timeline_events_for_verification
 
-    normalized = close_timeline_events_for_verification(events or [])
     verification = task_timeline.mf_close_gate_verification(
-        normalized.get("events") or [],
+        events or [],
         contract=contract,
     )
-    startup_gate = normalized.get("startup_gate")
+    startup_gate = verification.get("close_timeline_startup_gate")
     if isinstance(startup_gate, dict) and (
         startup_gate.get("demoted_startup_events")
         or startup_gate.get("accepted_startup_events")

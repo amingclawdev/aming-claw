@@ -5117,11 +5117,13 @@ def test_info01_fence_token_unconditional_check_documented() -> None:
 # AC-STARTUP-TOKEN-EVIDENCE-SERVER-VERIFICATION-20260610
 # ---------------------------------------------------------------------------
 
-def test_f4_task_timeline_core_stays_generic_while_server_applies_startup_policy() -> None:
-    """F4: task_timeline stays generic; server close paths apply startup policy.
+def test_f4_close_gate_keeps_route_startup_raw_while_applying_close_startup_policy() -> None:
+    """F4: route checks see raw startup rows; close checks apply startup policy.
 
-    The shared verifier only checks event categories.  The server close path
-    filters explicit surrogate/non-owner startup events before invoking it.
+    The shared verifier first evaluates route-context evidence from original
+    rows, then applies the close-only startup subgate. This keeps precheck
+    messages from claiming the startup row is missing when it is merely not
+    close-satisfying.
     """
     import inspect
     from agent.governance import task_timeline
@@ -5135,10 +5137,11 @@ def test_f4_task_timeline_core_stays_generic_while_server_applies_startup_policy
     )
     assert "surrogate_startup_evidence_gate" not in source, (
         "mf_close_gate_verification must not call surrogate_startup_evidence_gate; "
-        "server close-gate wiring applies close_timeline_events_for_verification"
+        "close_timeline_startup_event_gate remains the close-only adapter"
     )
+    assert "close_timeline_startup_event_gate" in source
     server_source = inspect.getsource(server_module._mf_close_gate_verification)
-    assert "close_timeline_events_for_verification" in server_source
+    assert "close_timeline_events_for_verification" not in server_source
     # The finish gate DOES reference surrogate logic — confirm it is the boundary
     finish_source = inspect.getsource(validate_mf_subagent_finish_gate)
     assert "surrogate_startup_evidence_gate" in finish_source, (

@@ -2951,7 +2951,7 @@ def test_reissue_mf_sub_runtime_session_token_rotates_hash_and_fails_closed(
 
     assert result["ok"] is True
     assert result["ttl_seconds"] == MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS
-    assert result["expires_at"] == "2999-01-01T02:00:00Z"
+    assert result["expires_at"] == "2999-01-01T08:00:00Z"
     assert result["session_token_persisted"] is False
     assert result["raw_session_token_persisted"] is False
     assert result["session_token_lease"]["lease_remaining_ttl_seconds"] == (

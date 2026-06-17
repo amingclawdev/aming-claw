@@ -5933,6 +5933,22 @@ def mf_close_gate_verification(
     """Validate the minimum observer/MF timeline evidence before backlog close."""
 
     raw_rows = events if isinstance(events, list) else []
+    try:
+        from .mf_subagent_contract import close_timeline_startup_event_gate
+
+        close_timeline_startup_gate = close_timeline_startup_event_gate(raw_rows)
+    except Exception as exc:
+        log.debug("close timeline startup gate projection failed", exc_info=True)
+        close_timeline_startup_gate = {
+            "schema_version": "mf_close_timeline_startup_gate.v1",
+            "passed": False,
+            "status": "error",
+            "accepted_startup_events": [],
+            "demoted_startup_events": [],
+            "demoted_startup_event_indexes": [],
+            "reason": "close_timeline_startup_gate_error",
+            "error": str(exc),
+        }
     governance_policy = _governance_policy(contract)
     close_timeline_required = _policy_requires(governance_policy, "close_timeline")
     required_event_kinds = (
@@ -6083,6 +6099,15 @@ def mf_close_gate_verification(
                 "before/at backlog close"
             ),
         }
+    if close_timeline_startup_gate and not close_timeline_startup_gate.get("passed"):
+        groups["startup_close_satisfying"] = {
+            "label": "actual worker startup close-satisfying evidence",
+            "missing": close_timeline_startup_gate.get("demoted_startup_events", []),
+            "next_action": (
+                "record a valid finish-time worker attestation/finish gate, or "
+                "start a fresh bounded worker when the old fence is no longer current"
+            ),
+        }
     missing_evidence_groups["groups"] = groups
     route_context_reminder = mf_route_context_reminder(
         route_context_gate,
@@ -6101,6 +6126,10 @@ def mf_close_gate_verification(
         and bool(cross_ref_gate.get("passed"))
         and bool(approval_scope_gate.get("passed"))
         and bool(command_disposition_gate.get("passed"))
+        and (
+            not close_timeline_startup_gate
+            or bool(close_timeline_startup_gate.get("passed"))
+        )
         # Stale-route evidence invalidation is already enforced by the route
         # context gate (it ignores superseded-identity evidence and requires
         # canonical re-recording). The stale_route_evidence_gate below is the
@@ -6135,6 +6164,7 @@ def mf_close_gate_verification(
         "stale_route_evidence_gate": stale_route_evidence_gate,
         "approval_scope_gate": approval_scope_gate,
         "command_disposition_gate": command_disposition_gate,
+        "close_timeline_startup_gate": close_timeline_startup_gate,
         "missing_evidence_groups": missing_evidence_groups,
         "route_context_reminder": route_context_reminder,
         "checks": {
@@ -6164,6 +6194,11 @@ def mf_close_gate_verification(
             "approval_authorizes_close": bool(approval_scope_gate.get("passed")),
             "originating_command_terminal": bool(
                 command_disposition_gate.get("passed")
+            ),
+            "mf_subagent_startup_close_satisfying": (
+                True
+                if not close_timeline_startup_gate
+                else bool(close_timeline_startup_gate.get("passed"))
             ),
             "mf_subagent_read_receipt_gate": str(
                 _mapping(contract_projection.get("read_receipt_gate")).get("status") or ""
