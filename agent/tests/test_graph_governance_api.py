@@ -537,6 +537,12 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert "runtime_status" in prompt
     assert "graph_status" in prompt
     assert "graph_operations_queue" in prompt
+    assert "Look then act:" in prompt
+    assert "next legal action" in prompt
+    assert "observer_command status is failed" in prompt
+    assert "runtime_context_worker_guide" in prompt
+    assert "distinct verifier lane/session" in prompt
+    assert "Observer-authored visual smoke" in prompt
     assert "visual smoke" in prompt
     marker = Path(environment["fixture_root"]) / server.DEMO_ENVIRONMENT_MARKER
     assert marker.exists()
