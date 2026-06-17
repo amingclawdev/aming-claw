@@ -702,8 +702,8 @@ TOOLS: list[dict] = [
                 "bug_id": {"type": "string"},
                 "view": {
                     "type": "string",
-                    "enum": ["compact", "full"],
-                    "description": "compact returns can_close + failed_gates only (gate_summary). full (default) returns the complete timeline_gate tree. Existing callers unaffected when view is omitted.",
+                    "enum": ["compact", "full", "repair"],
+                    "description": "compact returns a ledger-sized gate_summary. repair returns advisory next-step payloads. full (default) returns the complete timeline_gate tree.",
                 },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},

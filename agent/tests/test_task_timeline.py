@@ -8927,6 +8927,41 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert compact_cross_ref["missing_requirement_ids"] == []
     assert compact_cross_ref["rejected_event_ids"] == [22]
     assert "route-token child lineage" in compact_cross_ref["diagnosis"]
+    assert "append_payload_skeleton" not in compact_cross_ref
+    assert compact_cross_ref["append_payload_hint"]["event_kind"] == "cross_ref_lineage_bridge"
+    assert compact_cross_ref["append_payload_hint"]["rejected_event_ids"] == [22]
+    assert compact_cross_ref["repair_view_hint"]
+
+    route_blocked = {
+        **full_gate,
+        "route_context_gate": {
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": [
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+            ],
+        },
+    }
+    compact_route_blocked = task_timeline.compact_gate_summary(route_blocked)
+    route_failure = next(
+        item for item in compact_route_blocked["failed_gates"]
+        if item["gate"] == "route_context_gate"
+    )
+    assert route_failure["diagnosis"] == "worker evidence present but rejected by cross_ref_gate"
+    assert route_failure["rejected_event_ids"] == [22]
+    assert "Do not append route_context" in route_failure["recommended_legal_action"]
+    assert route_failure["suggested_event_kind"] == "bounded_worker_rerun"
+    assert "append_payload_skeleton" not in route_failure
+
+    route_repair = task_timeline.repair_gate_summary(route_blocked)
+    route_repair_item = next(
+        item for item in route_repair["failed_gate_repairs"]
+        if item["gate"] == "route_context_gate"
+    )
+    assert route_repair_item["diagnosis"] == "worker evidence present but rejected by cross_ref_gate"
+    assert route_repair_item["rejected_event_ids"] == [22]
+    assert "append_payload_skeleton" not in route_repair_item
 
 
 def test_repair_gate_summary_explains_cross_ref_task_mismatch_with_empty_missing_ids():

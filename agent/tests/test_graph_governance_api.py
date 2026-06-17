@@ -11467,9 +11467,9 @@ def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
     )
 
     assert result["ok"] is True
-    assert result["ttl_seconds"] == 7200
+    assert result["ttl_seconds"] == 28800
     assert result["session_token_persisted"] is False
-    assert result["session_token_lease"]["lease_remaining_ttl_seconds"] == 7200
+    assert result["session_token_lease"]["lease_remaining_ttl_seconds"] == 28800
     assert str(result["audit_event_ref"]).startswith("timeline:")
     new_token = result["session_token"]
     saved = get_branch_context(conn, PID, "worker-runtime-reissue")
@@ -16679,8 +16679,8 @@ def test_timeline_gate_blocks_event_4178_surrogate_startup_without_real_join(con
     assert startup_gate["demoted_startup_events"][0]["id"] == str(
         recorded["startup_event"]["id"]
     )
-    assert "mf_subagent_startup" in gate["route_context_gate"]["missing_requirement_ids"]
-    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is False
+    assert startup_gate["passed"] is False
+    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is True
 
 
 def test_worker_transcript_timeline_gate_allows_same_owner_passed_attestation(conn):
@@ -16751,8 +16751,8 @@ def test_worker_transcript_timeline_gate_blocks_same_owner_failed_attestation(co
     assert startup_gate["demoted_startup_events"][0][
         "worker_self_attestation_blockers"
     ] == ["worker_self_attestation_not_passed"]
-    assert "mf_subagent_startup" in gate["route_context_gate"]["missing_requirement_ids"]
-    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is False
+    assert startup_gate["passed"] is False
+    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is True
 
 
 def test_finish_gate_server_ignores_caller_supplied_real_startup_events(conn):

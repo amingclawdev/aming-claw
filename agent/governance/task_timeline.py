@@ -6261,6 +6261,8 @@ def compact_gate_summary(
             except Exception:
                 repair = {}
             if repair:
+                repair = _gate_repair_with_cross_ref_context(key, repair, full_result)
+                compact_repair = _compact_gate_repair_projection(repair)
                 for field in (
                     "diagnosis",
                     "reasons",
@@ -6269,10 +6271,11 @@ def compact_gate_summary(
                     "relevant_event_ids",
                     "recommended_legal_action",
                     "suggested_event_kind",
-                    "append_payload_skeleton",
+                    "append_payload_hint",
+                    "repair_view_hint",
                     "advisory_only",
                 ):
-                    value = repair.get(field)
+                    value = compact_repair.get(field)
                     if value not in ("", [], {}, None):
                         failed_gate[field] = value
             failed_gates.append(failed_gate)
@@ -6740,6 +6743,118 @@ def _cross_ref_append_payload_skeleton(
     )
 
 
+def _gate_repair_with_cross_ref_context(
+    gate_key: str,
+    repair: dict[str, Any],
+    full_result: dict[str, Any],
+) -> dict[str, Any]:
+    if gate_key != "route_context_gate":
+        return repair
+    missing = {str(item) for item in _list(repair.get("missing_requirement_ids"))}
+    if not {"bounded_implementation_worker_dispatch", "mf_subagent_startup"} & missing:
+        return repair
+    cross_ref_gate = _mapping(full_result.get("cross_ref_gate"))
+    if not cross_ref_gate or bool(cross_ref_gate.get("passed")):
+        return repair
+    rejected = [_mapping(item) for item in _list(cross_ref_gate.get("rejected_cross_ref_evidence"))]
+    if not rejected:
+        return repair
+
+    diagnosis, cross_ref_reasons, _ = _cross_ref_repair_diagnosis(rejected)
+    rejected_event_ids = _event_ids_from_items(rejected)
+    event_label = ", ".join(str(item) for item in rejected_event_ids) or "the rejected worker events"
+    next_reasons = [
+        (
+            "Worker close evidence appears in timeline event(s) "
+            f"{event_label}, but it is not close-satisfying because cross_ref_gate "
+            f"rejected it: {diagnosis}."
+        ),
+        *cross_ref_reasons,
+        *[
+            str(item)
+            for item in _list(repair.get("reasons"))
+            if str(item or "").strip()
+        ],
+    ]
+    contextual = dict(repair)
+    contextual["diagnosis"] = "worker evidence present but rejected by cross_ref_gate"
+    contextual["reasons"] = _unique_compact_values(next_reasons)
+    contextual["rejected_event_ids"] = _unique_compact_values(
+        [*_list(repair.get("rejected_event_ids")), *rejected_event_ids]
+    )
+    contextual["relevant_event_ids"] = _unique_compact_values(
+        [*_list(repair.get("relevant_event_ids")), *rejected_event_ids]
+    )
+    contextual["recommended_legal_action"] = (
+        "Do not append route_context, close_ready, audit-close, or an advisory bridge as "
+        "a substitute. Re-run or re-record the bounded worker through the runtime context "
+        "facades so dispatch/startup/implementation carry route_token_ref, parent_task_id, "
+        "runtime_context_id, worker_slot_id, observer_command_id, canonical parent route "
+        "scope, and registry-backed active token proof."
+    )
+    contextual["suggested_event_kind"] = "bounded_worker_rerun"
+    contextual.pop("append_payload_skeleton", None)
+    return contextual
+
+
+def _compact_append_payload_hint(skeleton: dict[str, Any]) -> dict[str, Any]:
+    if not skeleton:
+        return {}
+    payload = _mapping(skeleton.get("payload"))
+    bridge_scope = _mapping(payload.get("bridge_scope"))
+    lineage = _mapping(bridge_scope.get("route_token_child_lineage"))
+    hint: dict[str, Any] = {
+        "event_kind": skeleton.get("event_kind"),
+        "advisory_only": bool(skeleton.get("advisory_only")),
+        "close_satisfying_by_itself": bool(skeleton.get("close_satisfying_by_itself")),
+    }
+    for field in (
+        "bridge_reason",
+        "rejected_event_ids",
+        "backlog_id",
+        "observer_command_id",
+    ):
+        value = payload.get(field)
+        if value not in ("", [], {}, None):
+            hint[field] = value
+    bridged = _list(payload.get("bridged_identities"))
+    if bridged:
+        hint["bridged_identity_count"] = len(bridged)
+    missing_fields = _list(lineage.get("missing_fields"))
+    if missing_fields:
+        hint["missing_fields"] = _unique_compact_values(
+            [str(item) for item in missing_fields if str(item or "").strip()]
+        )
+    registry_required = _list(bridge_scope.get("registry_proof_required"))
+    if registry_required:
+        hint["requires_registry_proof"] = True
+    return {key: value for key, value in hint.items() if value not in ("", [], {}, None)}
+
+
+def _compact_gate_repair_projection(repair: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for field in (
+        "diagnosis",
+        "reasons",
+        "missing_fields",
+        "rejected_event_ids",
+        "relevant_event_ids",
+        "recommended_legal_action",
+        "suggested_event_kind",
+        "advisory_only",
+    ):
+        value = repair.get(field)
+        if value not in ("", [], {}, None):
+            compact[field] = value
+    hint = _compact_append_payload_hint(_mapping(repair.get("append_payload_skeleton")))
+    if hint:
+        compact["append_payload_hint"] = hint
+        compact["repair_view_hint"] = (
+            "Call mf_timeline_precheck(view='repair') for the advisory append payload skeleton."
+        )
+    return compact
+
+
 def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
     missing = list(gate.get("missing_requirement_ids") or [])
     reasons: list[str] = []
@@ -6878,7 +6993,10 @@ def repair_gate_summary(
         gate = _mapping(full_result.get(key))
         if not gate or bool(gate.get("passed")):
             continue
-        failed_gate_repairs.append(_gate_repair_summary(key, gate))
+        repair = _gate_repair_summary(key, gate)
+        failed_gate_repairs.append(
+            _gate_repair_with_cross_ref_context(key, repair, full_result)
+        )
 
     missing_event_repairs = [
         {

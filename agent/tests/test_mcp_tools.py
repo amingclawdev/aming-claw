@@ -15,6 +15,11 @@ def _tool_properties(name: str) -> dict:
     return tool["inputSchema"]["properties"]
 
 
+def test_mf_timeline_precheck_schema_exposes_repair_view():
+    view = _tool_properties("mf_timeline_precheck")["view"]
+    assert "repair" in view["enum"]
+
+
 class _Recorder:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []
