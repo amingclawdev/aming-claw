@@ -2667,6 +2667,15 @@ def _runtime_context_timeline_derived_evidence(
                 payload=payload,
             )
         )
+        is_worker_lane_evidence = (
+            _runtime_context_is_worker_evidence(event)
+            and _runtime_context_event_lane_bound(
+                event,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                fence_token=fence_token,
+            )
+        )
         for key in (
             "route_id",
             "route_context_hash",
@@ -2702,6 +2711,7 @@ def _runtime_context_timeline_derived_evidence(
             verification_refs.append(event_ref)
         if (
             is_finish_time_worker_attestation
+            and is_worker_lane_evidence
             and not finish_gate
         ):
             finish_gate = {
@@ -2747,13 +2757,7 @@ def _runtime_context_timeline_derived_evidence(
                 }
         if (
             (event_kind in graph_kinds or is_finish_time_worker_attestation)
-            and _runtime_context_is_worker_evidence(event)
-            and _runtime_context_event_lane_bound(
-                event,
-                runtime_context_id=runtime_context_id,
-                task_id=task_id,
-                fence_token=fence_token,
-            )
+            and is_worker_lane_evidence
         ):
             ids: list[str] = []
             for key in (

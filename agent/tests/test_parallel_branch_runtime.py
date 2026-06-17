@@ -1798,6 +1798,78 @@ def test_runtime_context_current_values_read_worker_progress_finish_time_attesta
     assert "finish_gate" in next_required_ids
 
 
+def test_runtime_context_finish_time_attestation_requires_worker_owned_evidence() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+            "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        timeline_events=[
+            {
+                "id": 5264,
+                "project_id": PROJECT_ID,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "mf_subagent.finish_time_worker_attestation",
+                "event_kind": "worker_progress",
+                "phase": "finish_time_worker_attestation",
+                "status": "passed",
+                "actor": "qa",
+                "payload": {
+                    "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+                    "action": "record_finish_time_worker_attestation",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    "worker_role": "mf_sub",
+                    "worker_session_id": "worker-runtime-context-finish",
+                    "filer_principal": "qa",
+                    "graph_trace_ids": ["gqt-runtime-context"],
+                    "test_results": {"status": "passed", "passed": True},
+                    "finish_time_worker_self_attestation": {
+                        "schema_version": "worker_transcript_self_attestation.v1",
+                        "status": "passed",
+                        "attestation_phase": "finish",
+                        "worker_self_attesting": True,
+                        "self_attesting": True,
+                        "finish_time_self_attesting": True,
+                        "finish_time_blockers": [],
+                        "worker_session_id": "worker-runtime-context-finish",
+                        "filer_principal": "qa",
+                        "worker_transcript_ref": "codex:test-runtime-context",
+                        "harness_type": "codex",
+                    },
+                },
+            }
+        ],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        generated_at=NOW,
+    ).to_dict()
+
+    current_values = projection["views"]["current"]["current_values"]
+    next_required_ids = {
+        item["id"]
+        for item in projection["views"]["action_plan"]["next_required_evidence"]
+    }
+
+    assert current_values["worker_self_attesting"] is False
+    assert current_values["worker_self_attestation"] == {}
+    assert "finish_time_worker_attestation" in next_required_ids
+
+
 def test_runtime_context_current_values_read_nested_finish_gate_attestation() -> None:
     context = _runtime_projection_context(checkpoint_id="")
     worker_attestation = {
