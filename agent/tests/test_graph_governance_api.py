@@ -1631,6 +1631,14 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert "route_context_hash" in dispatch_event["missing_fields"]
     assert "prompt_contract_id" in dispatch_event["missing_fields"]
     assert "owned_files" in dispatch_event["missing_fields"]
+    assert dispatch_event["actionable"] is True
+    assert dispatch_event["recovery"]["next_action"] == (
+        "prepare_runtime_text_with_dispatch_evidence"
+    )
+    assert dispatch_event["recovery"]["endpoint"]["path"].endswith(
+        "/observer/runtime-text/prepare"
+    )
+    assert "owned_files or target_files" in dispatch_event["recovery"]["required_fields"]
     assert created["worktree"]["created"] is True
     assert created["worktree"]["branch_graph"]["status"] == "ready"
 
@@ -1664,6 +1672,100 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["status"] == "worktree_ready"
     assert lanes[0]["worktree_path"] == context["worktree_path"]
     assert lanes[0]["graph_epoch"]["base_commit"]
+
+
+def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_worker_guide(
+    conn,
+    tmp_path,
+):
+    workspace = tmp_path / "workers"
+    worktree = workspace / "contract-worker" / "allocate-contract-task"
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "allocate-contract-task",
+                "parent_task_id": "AC-ALLOCATE-CONTRACT",
+                "backlog_id": "AC-ALLOCATE-CONTRACT",
+                "observer_command_id": "cmd-allocate-contract",
+                "workspace_root": str(workspace),
+                "worktree_path": str(worktree),
+                "worker_id": "contract-worker",
+                "fence_token": "fence-allocate-contract",
+                "base_commit": "base-allocate-contract",
+                "target_head_commit": "target-allocate-contract",
+                "merge_queue_id": "mq-allocate-contract",
+                "route_id": "route-allocate-contract",
+                "route_context_hash": "sha256:route-allocate-contract",
+                "prompt_contract_id": "rprompt-allocate-contract",
+                "prompt_contract_hash": "sha256:prompt-allocate-contract",
+                "route_token_ref": "rtok-allocate-contract",
+                "visible_injection_manifest_hash": "sha256:visible-allocate-contract",
+                "owned_files": ["agent/governance/server.py"],
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["ok"] is True
+    context = created["context"]
+    revision = created["runtime_contract_revision"]
+    assert revision["route_identity"]["route_token_ref"] == "rtok-allocate-contract"
+    assert revision["payload"]["observer_command_id"] == "cmd-allocate-contract"
+    assert revision["payload"]["owned_files"] == ["agent/governance/server.py"]
+
+    latest = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context["runtime_context_id"],
+    )
+    assert latest is not None
+    assert latest.revision_id == revision["revision_id"]
+    assert latest.route_identity["route_token_ref"] == "rtok-allocate-contract"
+    assert latest.payload["owned_files"] == ["agent/governance/server.py"]
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "AC-ALLOCATE-CONTRACT",
+                "fence_token": "fence-allocate-contract",
+            },
+        )
+    )
+    worker_view = current_state["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["route_identity"]["route_token_ref"] == "rtok-allocate-contract"
+    assert worker_view["observer_command_id"] == "cmd-allocate-contract"
+    assert worker_view["owned_files"] == ["agent/governance/server.py"]
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "AC-ALLOCATE-CONTRACT",
+                "fence_token": "fence-allocate-contract",
+            },
+        )
+    )
+    worker_guide = guide["worker_guide"]
+    assert worker_guide["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert worker_guide["control_plane_summary"]["route_token_action"][
+        "canonical_route_identity"
+    ]["route_token_ref"] == "rtok-allocate-contract"
+    assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
+        "worker_constraints"
+    ]["scope"]["owned_files"] == ["agent/governance/server.py"]
 
 
 def test_parallel_branch_allocate_issues_same_owner_scoped_session_token(conn, tmp_path):
@@ -1944,6 +2046,82 @@ def test_parallel_branch_allocate_without_worktree_preserves_materialized_runtim
     assert reloaded.checkpoint_id == "checkpoint-existing"
 
 
+def test_parallel_branch_allocate_blocks_same_owner_token_for_identity_mismatch(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="adopt-mismatch-task",
+            runtime_context_id="mfrctx-adopt-mismatch",
+            batch_id="PB-adopt-mismatch",
+            backlog_id="AC-ADOPT-MISMATCH",
+            root_task_id="root-adopt-mismatch",
+            stage_task_id="adopt-mismatch-task",
+            stage_type="mf_sub",
+            agent_id="adopt-worker",
+            worker_id="adopt-worker",
+            allocation_owner="adopt-worker",
+            worker_slot_id="adopt-worker",
+            fence_token="fence-existing",
+            branch_ref="refs/heads/codex/adopt-mismatch-task",
+            worktree_id="wt-adopt-mismatch-task",
+            worktree_path="/repo/.worktrees/adopt-worker/adopt-mismatch-task",
+            base_commit="base-existing",
+            head_commit="head-existing",
+            target_head_commit="target-existing",
+            merge_queue_id="mq-existing",
+            status=STATE_WORKTREE_READY,
+        ),
+        now_iso="2026-06-17T07:10:00Z",
+    )
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "adopt-mismatch-task",
+                "parent_task_id": "root-adopt-mismatch",
+                "backlog_id": "AC-ADOPT-MISMATCH",
+                "worker_id": "adopt-worker",
+                "agent_id": "adopt-worker",
+                "allocation_owner": "adopt-worker",
+                "workspace_root": "/repo",
+                "worktree_path": "/repo/.worktrees/adopt-worker/new-task",
+                "fence_token": "fence-new",
+                "base_commit": "base-new",
+                "head_commit": "head-new",
+                "target_head_commit": "target-new",
+                "merge_queue_id": "mq-new",
+                "issue_same_owner_session_token": True,
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 409
+    assert allocated["ok"] is False
+    assert allocated["status"] == "runtime_context_identity_mismatch"
+    assert "same_owner_worker_session" not in allocated
+    fields = {item["field"] for item in allocated["mismatches"]}
+    assert {
+        "fence_token",
+        "worktree_path",
+        "base_commit",
+        "head_commit",
+        "target_head_commit",
+        "merge_queue_id",
+    }.issubset(fields)
+    assert allocated["repair"]["runtime_text_prepare"]["runtime_context_id"] == (
+        "mfrctx-adopt-mismatch"
+    )
+
+    reloaded = get_branch_context(conn, PID, "adopt-mismatch-task")
+    assert reloaded is not None
+    assert reloaded.fence_token == "fence-existing"
+    assert reloaded.session_token_hash == ""
+
+
 def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(conn, tmp_path):
     worktree = tmp_path / "worker"
     upsert_branch_context(
@@ -2080,7 +2258,10 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert revision["route_identity"]["visible_injection_manifest_hash"] == (
         "sha256:visible-api"
     )
+    assert revision["route_identity"]["route_token_ref"] == "rtok-api"
     assert revision["payload"]["target_files"] == ["agent/observer_runtime.py"]
+    assert revision["payload"]["owned_files"] == ["agent/observer_runtime.py"]
+    assert revision["payload"]["observer_command_id"] == "cmd-runtime-text-api"
     assert prepared["worker_launch_pack"]["owned_files"] == [
         "agent/observer_runtime.py"
     ]
@@ -2106,20 +2287,26 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert current["route_identity"]["visible_injection_manifest_hash"] == (
         "sha256:visible-api"
     )
+    assert current["route_identity"]["route_token_ref"] == "rtok-api"
     assert current["identity"]["observer_command_id"] == "cmd-runtime-text-api"
     assert current["work"]["target_files"] == ["agent/observer_runtime.py"]
+    assert current["current_values"]["owned_files"] == ["agent/observer_runtime.py"]
     assert gate_inputs["route_context_hash"] == "sha256:route-api"
     assert gate_inputs["observer_command_id"] == "cmd-runtime-text-api"
     assert gate_inputs["prompt_contract_id"] == "rprompt-api"
     assert gate_inputs["prompt_contract_hash"] == "sha256:prompt-api"
     assert gate_inputs["visible_injection_manifest_hash"] == "sha256:visible-api"
+    assert gate_inputs["route_token_ref"] == "rtok-api"
     assert gate_inputs["target_files"] == ["agent/observer_runtime.py"]
+    assert gate_inputs["owned_files"] == ["agent/observer_runtime.py"]
     assert worker_view["route_context_hash"] == "sha256:route-api"
     assert worker_view["observer_command_id"] == "cmd-runtime-text-api"
     assert worker_view["prompt_contract_id"] == "rprompt-api"
     assert worker_view["prompt_contract_hash"] == "sha256:prompt-api"
     assert worker_view["visible_injection_manifest_hash"] == "sha256:visible-api"
+    assert worker_view["route_identity"]["route_token_ref"] == "rtok-api"
     assert worker_view["target_files"] == ["agent/observer_runtime.py"]
+    assert worker_view["owned_files"] == ["agent/observer_runtime.py"]
     dispatch_event = prepared["dispatch_timeline_event"]
     assert dispatch_event["status"] == "recorded"
     recorded_dispatch = task_timeline.list_events(
@@ -2164,7 +2351,34 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert contract["prompt_contract_id"] == "rprompt-api"
     assert contract["prompt_contract_hash"] == "sha256:prompt-api"
     assert contract["visible_injection_manifest_hash"] == "sha256:visible-api"
+    assert contract["route_identity"]["route_token_ref"] == "rtok-api"
     assert contract["target_files"] == ["agent/observer_runtime.py"]
+    assert contract["owned_files"] == ["agent/observer_runtime.py"]
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": context["root_task_id"],
+                "fence_token": context["fence_token"],
+            },
+        )
+    )
+    worker_guide = guide["worker_guide"]
+    assert worker_guide["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert worker_guide["control_plane_summary"]["route_token_action"][
+        "route_token_ref_present"
+    ] is True
+    assert worker_guide["control_plane_summary"]["route_token_action"][
+        "canonical_route_identity"
+    ]["route_token_ref"] == "rtok-api"
+    assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
+        "worker_constraints"
+    ]["scope"]["owned_files"] == ["agent/observer_runtime.py"]
 
 
 def test_observer_runtime_text_prepare_persists_registered_host_identity_for_startup(

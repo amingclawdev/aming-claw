@@ -5844,6 +5844,199 @@ def _parallel_branch_allocate_normalize_worktree_path(
     return context
 
 
+def _parallel_branch_allocate_identity_mismatches(
+    existing: Any,
+    planned: Any,
+    body: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Return explicit requested identity fields that conflict with persisted state."""
+
+    def _text(value: Any) -> str:
+        return str(value or "").strip()
+
+    def _path_text(value: Any) -> str:
+        text = _text(value)
+        return os.path.normpath(text) if text else ""
+
+    explicit_worktree = _text(
+        body.get("worktree_path")
+        or body.get("worker_worktree_path")
+        or body.get("assigned_worktree")
+    )
+    requested = {
+        "fence_token": _text(body.get("fence_token") or getattr(planned, "fence_token", "")),
+        "worktree_path": _path_text(
+            explicit_worktree or getattr(planned, "worktree_path", "")
+        ),
+        "base_commit": _text(body.get("base_commit") or getattr(planned, "base_commit", "")),
+        "head_commit": _text(body.get("head_commit") or body.get("branch_head")),
+        "target_head_commit": _text(
+            body.get("target_head_commit")
+            or getattr(planned, "target_head_commit", "")
+        ),
+        "merge_queue_id": _text(
+            body.get("merge_queue_id") or getattr(planned, "merge_queue_id", "")
+        ),
+    }
+    persisted = {
+        "fence_token": _text(getattr(existing, "fence_token", "")),
+        "worktree_path": _path_text(getattr(existing, "worktree_path", "")),
+        "base_commit": _text(getattr(existing, "base_commit", "")),
+        "head_commit": _text(getattr(existing, "head_commit", "")),
+        "target_head_commit": _text(getattr(existing, "target_head_commit", "")),
+        "merge_queue_id": _text(getattr(existing, "merge_queue_id", "")),
+    }
+    return [
+        {
+            "field": field,
+            "requested": requested_value,
+            "persisted": persisted.get(field, ""),
+        }
+        for field, requested_value in requested.items()
+        if requested_value and persisted.get(field) and requested_value != persisted[field]
+    ]
+
+
+def _parallel_branch_allocate_identity_repair_payload(
+    *,
+    project_id: str,
+    task_id: str,
+    existing: Any,
+    planned: Any,
+    mismatches: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    from .parallel_branch_runtime import branch_context_to_dict
+
+    runtime_context_id = str(getattr(existing, "runtime_context_id", "") or "").strip()
+    return {
+        "ok": False,
+        "status": "runtime_context_identity_mismatch",
+        "error": "persisted_runtime_context_identity_mismatch",
+        "message": (
+            "A materialized branch runtime context already exists for this task, "
+            "but the requested worker identity does not match it. No worker "
+            "session token was issued."
+        ),
+        "project_id": project_id,
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+        "mismatches": [dict(item) for item in mismatches],
+        "persisted_context": branch_context_to_dict(existing),
+        "requested_context": branch_context_to_dict(planned),
+        "repair": {
+            "schema_version": "parallel_branch_allocate.identity_repair.v1",
+            "recoverable": True,
+            "next_actions": [
+                "retry allocation with identity fields matching persisted_context",
+                "or prepare runtime text against the persisted runtime_context_id",
+                "or allocate a new task_id/worktree for the requested identity",
+            ],
+            "runtime_text_prepare": {
+                "method": "POST",
+                "path": f"/api/projects/{project_id}/observer/runtime-text/prepare",
+                "required_fields": [
+                    "task_id",
+                    "parent_task_id",
+                    "runtime_context_id",
+                    "fence_token",
+                    "worktree_path",
+                    "base_commit",
+                    "target_head_commit",
+                    "merge_queue_id",
+                    "owned_files or target_files",
+                    "route_token_ref",
+                ],
+                "runtime_context_id": runtime_context_id,
+            },
+        },
+    }
+
+
+def _parallel_branch_allocate_contract_revision_payload(
+    body: Mapping[str, Any],
+    saved_context: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+    owned_files: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "parallel_branch_allocate_contract_revision.v1",
+        "source": "parallel_branch_allocate",
+        "source_of_truth": "Contract/Revision/Event",
+        "runtime_context_id": str(saved_context.get("runtime_context_id") or ""),
+        "observer_command_id": str(body.get("observer_command_id") or ""),
+        "merge_queue_id": str(
+            body.get("merge_queue_id") or saved_context.get("merge_queue_id") or ""
+        ),
+        "route_identity": dict(route_identity),
+        "target_files": list(owned_files),
+        "owned_files": list(owned_files),
+        "acceptance_criteria": _runtime_context_service_query_values(
+            body,
+            "acceptance_criteria",
+            "acceptance",
+        ),
+        "test_commands": _runtime_context_service_query_values(
+            body,
+            "test_commands",
+            "test_command",
+        ),
+        "branch_ref": str(body.get("branch_ref") or saved_context.get("branch_ref") or ""),
+        "worktree_path": str(
+            body.get("worktree_path")
+            or body.get("assigned_worktree")
+            or saved_context.get("worktree_path")
+            or ""
+        ),
+        "base_commit": str(
+            body.get("base_commit") or saved_context.get("base_commit") or ""
+        ),
+        "target_head_commit": str(
+            body.get("target_head_commit")
+            or saved_context.get("target_head_commit")
+            or ""
+        ),
+        "raw_launch_text_persisted": False,
+    }
+
+
+def _parallel_branch_allocate_route_gate(
+    body: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "parallel_branch_allocate_route_gate.v1",
+        "source": "parallel_branch_allocate",
+        "decision": "allocated",
+        "caller_role": str(body.get("caller_role") or "observer"),
+        "allowed_action": "parallel_branch_allocate",
+        **dict(route_identity),
+        "raw_private_context_exposed": False,
+    }
+
+
+def _parallel_branch_allocate_should_persist_contract_revision(
+    body: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    route_identity = _parallel_branch_runtime_contract_route_identity(body)
+    owned_files = _runtime_context_service_query_values(
+        body,
+        "owned_files",
+        "target_files",
+    )
+    required_route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    )
+    if not owned_files:
+        return {}, []
+    if not all(str(route_identity.get(field) or "").strip() for field in required_route_fields):
+        return {}, []
+    return route_identity, owned_files
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
 def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     """Allocate and optionally materialize one parallel branch runtime context."""
@@ -5851,10 +6044,13 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     from . import batch_jobs
     from .db import sqlite_write_lock
     from .parallel_branch_runtime import (
+        append_branch_contract_revision,
         branch_context_to_dict,
+        branch_contract_revision_to_dict,
         branch_runtime_allocation_evidence,
         get_branch_context,
         issue_mf_subagent_session_token,
+        is_materialized_branch_context,
         materialize_branch_worktree,
         plan_branch_runtime_context,
         preserve_materialized_context_for_allocation,
@@ -5939,17 +6135,12 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         "issue_same_owner_session_token",
         True,
     )
-    if (
+    should_issue_same_owner_session_token = (
         issue_same_owner_session_token
         and requested_agent_id
         and allocation_owner
         and requested_agent_id == allocation_owner
-    ):
-        same_owner_worker_session = issue_mf_subagent_session_token(context)
-        context = replace(
-            context,
-            session_token_hash=str(same_owner_worker_session["session_token_hash"]),
-        )
+    )
 
     conn = get_connection(project_id)
     try:
@@ -5957,6 +6148,23 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         with sqlite_write_lock():
             if not _query_bool(ctx.body, "create_worktree", False):
                 existing = get_branch_context(conn, project_id, task_id)
+                if (
+                    should_issue_same_owner_session_token
+                    and is_materialized_branch_context(existing)
+                ):
+                    mismatches = _parallel_branch_allocate_identity_mismatches(
+                        existing,
+                        context,
+                        ctx.body or {},
+                    )
+                    if mismatches:
+                        return 409, _parallel_branch_allocate_identity_repair_payload(
+                            project_id=project_id,
+                            task_id=task_id,
+                            existing=existing,
+                            planned=context,
+                            mismatches=mismatches,
+                        )
                 context = preserve_materialized_context_for_allocation(existing, context)
             saved = upsert_branch_context(
                 conn,
@@ -5978,6 +6186,53 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             conn.commit()
             saved = get_branch_context(conn, project_id, task_id) or saved
 
+        if should_issue_same_owner_session_token:
+            same_owner_worker_session = issue_mf_subagent_session_token(saved)
+            with sqlite_write_lock():
+                saved = upsert_branch_context(
+                    conn,
+                    replace(
+                        saved,
+                        session_token_hash=str(
+                            same_owner_worker_session["session_token_hash"]
+                        ),
+                    ),
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+                conn.commit()
+
+        runtime_contract_revision: dict[str, Any] = {}
+        route_identity_for_revision, owned_files_for_revision = (
+            _parallel_branch_allocate_should_persist_contract_revision(ctx.body or {})
+        )
+        if route_identity_for_revision and owned_files_for_revision:
+            saved_context = branch_context_to_dict(saved)
+            route_gate = _parallel_branch_allocate_route_gate(
+                ctx.body or {},
+                route_identity_for_revision,
+            )
+            with sqlite_write_lock():
+                revision = append_branch_contract_revision(
+                    conn,
+                    saved,
+                    contract_version=str(
+                        ctx.body.get("contract_version") or "mf_parallel.v1"
+                    ),
+                    payload=_parallel_branch_allocate_contract_revision_payload(
+                        ctx.body or {},
+                        saved_context,
+                        route_identity_for_revision,
+                        owned_files_for_revision,
+                    ),
+                    route_gate=route_gate,
+                    route_identity=route_identity_for_revision,
+                    route_evidence_type="parallel_branch_allocate",
+                    actor="parallel_branch_allocate",
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+                conn.commit()
+            runtime_contract_revision = branch_contract_revision_to_dict(revision)
+
         response = {
             "ok": True,
             "project_id": project_id,
@@ -5990,6 +6245,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
         }
+        if runtime_contract_revision:
+            response["runtime_contract_revision"] = runtime_contract_revision
         try:
             response["dispatch_timeline_event"] = _record_bounded_worker_dispatch_event(
                 conn,
@@ -6012,6 +6269,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 "status": "error",
                 "reason": "bounded_worker_dispatch_auto_record_failed",
                 "error": str(exc),
+                "actionable": True,
+                "recovery": _bounded_worker_dispatch_recovery_payload(
+                    project_id=project_id,
+                    error=str(exc),
+                ),
             }
         if same_owner_worker_session:
             response["same_owner_worker_session"] = same_owner_worker_session
@@ -25181,6 +25443,62 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
     )
 
 
+def _bounded_worker_dispatch_recovery_payload(
+    *,
+    project_id: str,
+    missing_fields: Sequence[str] | None = None,
+    error: str = "",
+) -> dict[str, Any]:
+    missing = [str(item) for item in (missing_fields or []) if str(item or "").strip()]
+    return {
+        "schema_version": "bounded_worker_dispatch_recovery.v1",
+        "recoverable": True,
+        "next_action": "prepare_runtime_text_with_dispatch_evidence",
+        "message": (
+            "Supply the missing bounded-worker dispatch fields through runtime-text "
+            "prepare; the service will retry dispatch evidence auto-recording."
+        ),
+        "endpoint": {
+            "method": "POST",
+            "path": f"/api/projects/{project_id}/observer/runtime-text/prepare",
+        },
+        "missing_fields": missing,
+        "required_fields": [
+            "route_context_hash",
+            "prompt_contract_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id or worker_slot_id",
+            "fence_token",
+            "worktree_path or assigned_worktree",
+            "branch or branch_ref",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+            "owned_files or target_files",
+        ],
+        "payload_shape": {
+            "runtime_context_id": "<mfrctx-...>",
+            "task_id": "<worker-task-id>",
+            "parent_task_id": "<observer-or-root-task-id>",
+            "observer_command_id": "<observer-command-id>",
+            "route_context_hash": "<sha256:...>",
+            "prompt_contract_id": "<rprompt-...>",
+            "prompt_contract_hash": "<sha256:...>",
+            "route_token_ref": "<rtok-...>",
+            "owned_files": ["<repo-relative-owned-file>"],
+            "fence_token": "<fence-token>",
+            "worktree_path": "<absolute-worker-worktree>",
+            "branch_ref": "<refs/heads/...>",
+            "base_commit": "<base-sha>",
+            "target_head_commit": "<target-head-sha>",
+            "merge_queue_id": "<merge-queue-id>",
+        },
+        "error": error,
+    }
+
+
 def _record_bounded_worker_dispatch_event(
     conn,
     project_id: str,
@@ -25363,6 +25681,11 @@ def _record_bounded_worker_dispatch_event(
             "reason": "bounded_worker_dispatch_evidence_incomplete",
             "missing_fields": missing,
             "close_satisfying": False,
+            "actionable": True,
+            "recovery": _bounded_worker_dispatch_recovery_payload(
+                project_id=project_id,
+                missing_fields=missing,
+            ),
         }
 
     existing = task_timeline.list_events(
@@ -25853,6 +26176,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
             "status": "error",
             "reason": "bounded_worker_dispatch_auto_record_failed",
             "error": str(exc),
+            "actionable": True,
+            "recovery": _bounded_worker_dispatch_recovery_payload(
+                project_id=project_id,
+                error=str(exc),
+            ),
         }
     finally:
         conn.close()
