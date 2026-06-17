@@ -2546,6 +2546,25 @@ def _runtime_context_event_kind_token(event: Mapping[str, Any]) -> str:
     )
 
 
+def _runtime_context_is_finish_time_worker_attestation_event(
+    event: Mapping[str, Any],
+    *,
+    event_kind: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    event_type = _runtime_context_text(event.get("event_type")).lower().replace("-", "_")
+    raw_event_kind = _runtime_context_text(event.get("event_kind")).lower().replace("-", "_")
+    phase = _runtime_context_text(event.get("phase")).lower().replace("-", "_")
+    action = _runtime_context_text(payload.get("action")).lower()
+    schema_version = _runtime_context_text(payload.get("schema_version")).lower()
+    haystack = " ".join((event_type, raw_event_kind, phase, event_kind, action))
+    return (
+        action == "record_finish_time_worker_attestation"
+        or "finish_time_worker_attestation" in haystack
+        or schema_version == "runtime_context.finish_time_worker_attestation.v1"
+    )
+
+
 def _runtime_context_is_worker_evidence(event: Mapping[str, Any]) -> bool:
     actor = _runtime_context_text(event.get("actor")).lower()
     if actor in {
@@ -2640,6 +2659,14 @@ def _runtime_context_timeline_derived_evidence(
             continue
         event_ref = _runtime_context_event_ref(event)
         event_kind = _runtime_context_event_kind_token(event)
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        is_finish_time_worker_attestation = (
+            _runtime_context_is_finish_time_worker_attestation_event(
+                event,
+                event_kind=event_kind,
+                payload=payload,
+            )
+        )
         for key in (
             "route_id",
             "route_context_hash",
@@ -2673,10 +2700,8 @@ def _runtime_context_timeline_derived_evidence(
             and event_ref
         ):
             verification_refs.append(event_ref)
-        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         if (
-            event_kind == "worker_progress"
-            and payload.get("action") == "record_finish_time_worker_attestation"
+            is_finish_time_worker_attestation
             and not finish_gate
         ):
             finish_gate = {
@@ -2684,7 +2709,16 @@ def _runtime_context_timeline_derived_evidence(
                 "worker_self_attestation": public_contract_revision_payload(
                     payload.get("finish_time_worker_self_attestation") or {}
                 ),
-                "attestation_event_id": event_ref,
+                "worker_self_attestation_gate": {
+                    "schema_version": "runtime_context.finish_time_worker_attestation_gate.v1",
+                    "status": "passed",
+                    "passed": True,
+                    "close_satisfying": True,
+                },
+                "test_results": public_contract_revision_payload(
+                    payload.get("test_results") or {}
+                ),
+                "attestation_event_ref": event_ref,
             }
         if event_kind in {
             "finish_gate",
@@ -2712,7 +2746,7 @@ def _runtime_context_timeline_derived_evidence(
                     ),
                 }
         if (
-            event_kind in graph_kinds
+            (event_kind in graph_kinds or is_finish_time_worker_attestation)
             and _runtime_context_is_worker_evidence(event)
             and _runtime_context_event_lane_bound(
                 event,

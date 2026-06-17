@@ -6016,6 +6016,251 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn, worker_status)
     assert finished["context"]["replay_source"] == "mf_sub_finish_gate"
 
 
+def test_finish_gate_derives_parent_route_lineage_and_reads_worker_progress_attestation(conn):
+    task_id = "finish-dogfood-attestation-task"
+    parent_task_id = "finish-dogfood-parent"
+    backlog_id = "AC-FINISH-DOGFOOD"
+    fence_token = "fence-finish-dogfood"
+    worktree_path = "/tmp/nonexistent-finish-dogfood"
+    branch_ref = "refs/heads/codex/finish-dogfood"
+    trace_id = "gqt-finish-dogfood"
+    worker_session_id = "worker-finish-dogfood"
+    route_identity = {
+        "route_id": "route-finish-dogfood",
+        "route_context_hash": "sha256:route-finish-dogfood",
+        "prompt_contract_id": "rprompt-finish-dogfood",
+        "prompt_contract_hash": "sha256:prompt-finish-dogfood",
+        "route_token_ref": "rtok-finish-dogfood",
+        "visible_injection_manifest_hash": "sha256:visible-finish-dogfood",
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            branch_ref=branch_ref,
+            status=STATE_WORKTREE_READY,
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-finish-dogfood",
+            head_commit="base-finish-dogfood",
+            target_head_commit="target-finish-dogfood",
+            merge_queue_id="mergeq-finish-dogfood",
+        ),
+        now_iso="2026-06-17T09:00:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "observer_command_id": "cmd-finish-dogfood",
+            "target_files": ["agent/governance/server.py"],
+            "owned_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+        route_gate={
+            "decision": "prepared",
+            **route_identity,
+            "allowed_actions": ["finish_gate"],
+            "blocked_actions": ["merge", "push"],
+            "required_lanes": [
+                "observer_coordinator",
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+                "observer_merge_close_gate",
+            ],
+            "required_evidence": [
+                "runtime_context_read_receipt",
+                "mf_subagent_startup",
+                "finish_time_worker_attestation",
+                "finish_gate",
+            ],
+        },
+        actor="observer_runtime_text_prepare",
+        now_iso="2026-06-17T09:00:01Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit="head-finish-dogfood",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id_for_branch_context(context),
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(task_id, fence_token),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="passed",
+        actor=worker_session_id,
+        payload={
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": runtime_context_id_for_branch_context(context),
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": backlog_id,
+            "worker_role": "mf_sub",
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "graph_trace_ids": [trace_id],
+            "test_results": {"status": "passed", "passed": True},
+            "finish_time_worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "ok": True,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": worker_session_id,
+                "filer_principal": worker_session_id,
+                "worker_transcript_ref": "codex:test-finish-dogfood",
+                "harness_type": "codex",
+                "blockers": [],
+            },
+        },
+    )
+    conn.commit()
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+            },
+            "observer",
+            query={"view": "current"},
+        )
+    )
+    current_values = current_state["runtime_context_service"]["views"]["current"][
+        "current_values"
+    ]
+    assert current_values["route_token_ref"] == "rtok-finish-dogfood"
+    assert current_values["worker_self_attesting"] is True
+    assert current_values["finish_gate_ref"] == ""
+    assert current_values["checkpoint_id"] == ""
+
+    body = {
+        "project_id": PID,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "branch_ref": branch_ref,
+        "worktree_path": worktree_path,
+        "base_commit": "base-finish-dogfood",
+        "target_head_commit": "target-finish-dogfood",
+        "head_commit": "head-finish-dogfood",
+        "merge_queue_id": "mergeq-finish-dogfood",
+        "status": "review_ready",
+        "changed_files": ["agent/governance/server.py"],
+        "test_results": {"status": "passed", "passed": True},
+        "checkpoint_id": "ckpt-finish-dogfood",
+        "fence_token": fence_token,
+        "worker_role": "mf_sub",
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "graph_trace_ids": [trace_id],
+        "route_prompt_contract": route_identity,
+        "parent_route_lineage": {"parent_task_id": parent_task_id},
+        "evidence": _finish_gate_evidence(
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            branch_ref=branch_ref,
+            head_commit="head-finish-dogfood",
+        ),
+    }
+    finished = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
+    )
+
+    assert finished["ok"] is True
+    assert finished["gate"]["checkpoint_id"] == "ckpt-finish-dogfood"
+    assert finished["gate"]["parent_route_lineage"]["route_token_ref"] == (
+        "rtok-finish-dogfood"
+    )
+    assert finished["gate"]["parent_route_lineage"]["selected_backlog_id"] == (
+        backlog_id
+    )
+    assert finished["context"]["checkpoint_id"] == "ckpt-finish-dogfood"
+    assert finished["timeline_event_recorded"]["event_kind"] == (
+        "mf_subagent_finish_gate"
+    )
+
+
+def test_finish_gate_parent_route_lineage_gap_returns_actionable_repair(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="finish-parent-lineage-gap",
+            root_task_id="finish-parent-lineage-parent",
+            backlog_id="AC-FINISH-PARENT-LINEAGE-GAP",
+            branch_ref="refs/heads/codex/finish-parent-lineage-gap",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-parent-lineage-gap",
+            worktree_path="/tmp/nonexistent-parent-lineage-gap",
+            base_commit="base-parent-lineage-gap",
+            head_commit="base-parent-lineage-gap",
+            target_head_commit="target-parent-lineage-gap",
+            merge_queue_id="mergeq-parent-lineage-gap",
+        ),
+        now_iso="2026-06-17T09:10:00Z",
+    )
+
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": "finish-parent-lineage-gap",
+                "parent_task_id": "finish-parent-lineage-parent",
+                "backlog_id": "AC-FINISH-PARENT-LINEAGE-GAP",
+                "branch_ref": "refs/heads/codex/finish-parent-lineage-gap",
+                "worktree_path": "/tmp/nonexistent-parent-lineage-gap",
+                "base_commit": "base-parent-lineage-gap",
+                "target_head_commit": "target-parent-lineage-gap",
+                "head_commit": "head-parent-lineage-gap",
+                "merge_queue_id": "mergeq-parent-lineage-gap",
+                "status": "review_ready",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "passed": True},
+                "checkpoint_id": "ckpt-parent-lineage-gap",
+                "fence_token": "fence-parent-lineage-gap",
+                "parent_route_lineage": {"parent_task_id": "finish-parent-lineage-parent"},
+            },
+        )
+    )
+
+    assert status == 422
+    assert payload["ok"] is False
+    assert payload["error"] == "parent_route_lineage_missing"
+    assert payload["recoverable"] is True
+    assert "route_id" in payload["missing_fields"]
+    assert "payload_shape" in payload["repair"]
+    assert payload["repair"]["source"] == "latest_runtime_contract_revision.route_identity"
+
+
 def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_path):
     worktree = tmp_path / "worker-startup"
     worktree.mkdir()
@@ -17173,6 +17418,203 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     assert graph_trace["worker_role"] == "mf_sub"
     assert graph_trace["missing_trace_ids"] == []
     assert graph_trace["identity_mismatches"] == []
+
+
+def test_finish_gate_derives_parent_lineage_from_runtime_contract_route_ref(conn):
+    task_id = "dogfood-runtime-context-adoption-refresh-20260617-d"
+    parent_task_id = "dogfood-worker-handoff-20260617"
+    backlog_id = "AC-OBSERVER-JUDGER-ROUTE-CONTEXT-20260530"
+    fence_token = "fence-dogfood-runtime-context"
+    worktree_path = "/tmp/nonexistent-dogfood-runtime-context"
+    branch_ref = "refs/heads/codex/dogfood-runtime-context"
+    trace_id = "gqt-dogfood-runtime-context"
+
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            worker_id="runtime-context-adoption-refresh-worker",
+            worker_slot_id="runtime-context-adoption-refresh-worker",
+            agent_id="runtime-context-adoption-refresh-worker",
+            allocation_owner="runtime-context-adoption-refresh-worker",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-dogfood-runtime-context",
+            head_commit=f"head-{task_id}",
+            target_head_commit="target-dogfood-runtime-context",
+            merge_queue_id="mq-dogfood-runtime-context",
+        ),
+        now_iso="2026-06-17T12:00:00Z",
+    )
+
+    from agent.governance import observer_route_context
+
+    issued_route = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:5258", "timeline:5264"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued_route["route_token_ref"],
+        token=issued_route["route_token"],
+    )
+    route_identity = {
+        "route_id": issued_route["route_id"],
+        "route_context_hash": issued_route["route_context_hash"],
+        "prompt_contract_id": issued_route["prompt_contract_id"],
+        "prompt_contract_hash": issued_route["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": issued_route[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": issued_route["route_token_ref"],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-dogfood-runtime-context",
+        contract_version="mf_parallel.v1",
+        payload={
+            "target_files": ["agent/governance/server.py"],
+            "acceptance_criteria": ["finish gate derives public parent lineage"],
+            "route_identity": {"route_token_ref": issued_route["route_token_ref"]},
+        },
+        route_identity=route_identity,
+        route_gate=issued_route["route_token"],
+        now_iso="2026-06-17T12:01:00Z",
+    )
+
+    real_event_payload = _make_real_startup_timeline_event(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    real_event_payload.update(
+        {
+            **route_identity,
+            "runtime_context_id": runtime_context_id_for_branch_context(context),
+            "parent_task_id": parent_task_id,
+            "worker_id": "runtime-context-adoption-refresh-worker",
+            "worker_slot_id": "runtime-context-adoption-refresh-worker",
+            "read_receipt_hash": f"sha256:rr-{fence_token}",
+        }
+    )
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor="mf_sub",
+        payload={"mf_subagent_startup_gate": real_event_payload},
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id_for_branch_context(context),
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(task_id, fence_token),
+    )
+    conn.commit()
+
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    body.update(
+        {
+            "parent_task_id": parent_task_id,
+            "changed_files": ["agent/governance/server.py"],
+            "graph_trace_ids": [trace_id],
+        }
+    )
+    assert "parent_route_lineage" not in body
+
+    result = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert result["ok"] is True
+    assert result["context"]["checkpoint_id"] == f"ckpt-{task_id}"
+    lineage = result["gate"]["parent_route_lineage"]
+    assert lineage["source"] == "runtime_contract_revision.route_token_ref"
+    assert lineage["route_token_ref"] == issued_route["route_token_ref"]
+    assert lineage["selected_backlog_id"] == backlog_id
+    assert lineage["required_lanes"] == [
+        "observer_coordinator",
+        "bounded_implementation_worker",
+        "independent_verification_lane",
+        "observer_merge_close_gate",
+    ]
+    assert result["timeline_event_recorded"]["event_kind"] == "mf_subagent_finish_gate"
+
+
+def test_finish_gate_missing_parent_lineage_returns_actionable_repair(conn):
+    task_id = "dogfood-missing-parent-lineage"
+    fence_token = "fence-missing-parent-lineage"
+    worktree_path = "/tmp/nonexistent-missing-parent-lineage"
+    branch_ref = "refs/heads/codex/missing-parent-lineage"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-OBSERVER-JUDGER-ROUTE-CONTEXT-20260530",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-missing-parent-lineage",
+            head_commit=f"head-{task_id}",
+            target_head_commit="target-missing-parent-lineage",
+            merge_queue_id="mq-missing-parent-lineage",
+        ),
+        now_iso="2026-06-17T12:05:00Z",
+    )
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    body["parent_route_required"] = True
+
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert status == 422
+    assert payload["recoverable"] is True
+    assert payload["error"] == "parent_route_lineage_missing"
+    assert "route_id" in payload["missing_fields"]
+    assert payload["repair"]["payload_shape"]["parent_route_lineage"][
+        "required_lanes"
+    ] == [
+        "observer_coordinator",
+        "bounded_implementation_worker",
+        "independent_verification_lane",
+        "observer_merge_close_gate",
+    ]
+    assert payload["repair"]["server_derived_candidate"] == {}
 
 
 def test_finish_gate_server_flags_caller_supplied_ignored(conn):

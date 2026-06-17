@@ -6491,6 +6491,7 @@ def _runtime_context_service_timeline_refs(
     }
     startup_event: dict[str, Any] = {}
     finish_event: dict[str, Any] = {}
+    finish_attestation: dict[str, Any] = {}
     close_event: dict[str, Any] = {}
     timeline_graph_trace_ids: list[str] = []
     for event in events:
@@ -6500,11 +6501,18 @@ def _runtime_context_service_timeline_refs(
         event_type = str(event.get("event_type") or "")
         event_kind = str(event.get("event_kind") or "")
         phase = str(event.get("phase") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         event_type_normalized = event_type.strip().lower().replace("-", "_")
         event_kind_normalized = event_kind.strip().lower().replace("-", "_")
         phase_normalized = phase.strip().lower().replace("-", "_")
+        action_normalized = str(payload.get("action") or "").strip().lower()
         haystack = " ".join(
-            (event_type_normalized, event_kind_normalized, phase_normalized)
+            (
+                event_type_normalized,
+                event_kind_normalized,
+                phase_normalized,
+                action_normalized,
+            )
         )
         ref = _runtime_context_event_ref(event)
         if not ref:
@@ -6535,6 +6543,31 @@ def _runtime_context_service_timeline_refs(
         if not refs.get("finish_event_ref") and is_finish_gate:
             refs["finish_event_ref"] = ref
             finish_event = dict(event)
+        is_finish_time_worker_attestation = (
+            action_normalized == "record_finish_time_worker_attestation"
+            or "finish_time_worker_attestation" in haystack
+            or str(payload.get("schema_version") or "").strip().lower()
+            == "runtime_context.finish_time_worker_attestation.v1"
+        )
+        if is_finish_time_worker_attestation and not finish_attestation:
+            from .parallel_branch_runtime import public_contract_revision_payload
+
+            finish_attestation = {
+                "payload": public_contract_revision_payload(payload),
+                "worker_self_attestation": public_contract_revision_payload(
+                    payload.get("finish_time_worker_self_attestation") or {}
+                ),
+                "worker_self_attestation_gate": {
+                    "schema_version": "runtime_context.finish_time_worker_attestation_gate.v1",
+                    "status": "passed",
+                    "passed": True,
+                    "close_satisfying": True,
+                },
+                "test_results": public_contract_revision_payload(
+                    payload.get("test_results") or {}
+                ),
+                "attestation_event_ref": ref,
+            }
         if (
             not refs.get("close_ready_event_ref")
             and event_kind_normalized == "close_ready"
@@ -6552,10 +6585,7 @@ def _runtime_context_service_timeline_refs(
         if (
             is_verification
             or is_finish_gate
-            or (
-                event_kind_normalized == "worker_progress"
-                and "finish_time_worker_attestation" in haystack
-            )
+            or is_finish_time_worker_attestation
             or event_kind_normalized == "close_ready"
         ):
             timeline_graph_trace_ids.extend(
@@ -6568,7 +6598,9 @@ def _runtime_context_service_timeline_refs(
     return (
         refs,
         _runtime_context_event_payload(startup_event),
-        _runtime_context_event_payload(finish_event),
+        _runtime_context_event_payload(finish_event)
+        if finish_event
+        else finish_attestation,
         _runtime_context_event_payload(close_event),
     )
 
@@ -7891,18 +7923,7 @@ def _runtime_context_mf_sub_write_context(
 
 
 def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
-    from .parallel_branch_runtime import (
-        branch_contract_revision_to_dict,
-        get_latest_branch_contract_revision,
-        runtime_context_id_for_branch_context,
-    )
-
-    revision = get_latest_branch_contract_revision(
-        conn,
-        getattr(context, "project_id", ""),
-        runtime_context_id_for_branch_context(context),
-    )
-    revision_payload = branch_contract_revision_to_dict(revision) if revision else {}
+    revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
     route_identity = _parallel_branch_runtime_contract_route_identity(revision_payload)
     return dict(route_identity)
 
@@ -9367,6 +9388,391 @@ def handle_graph_governance_parallel_branch_checkpoint(ctx: RequestContext):
         conn.close()
 
 
+_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "visible_injection_manifest_hash",
+    "selected_project",
+    "selected_backlog_id",
+    "allowed_actions",
+    "blocked_actions",
+    "required_lanes",
+    "required_evidence",
+)
+
+_FINISH_GATE_PARENT_ROUTE_DEFAULT_BLOCKED_ACTIONS = (
+    "merge",
+    "push",
+    "activate_graph",
+    "release_gate",
+    "create_task",
+    "delete_worktree",
+    "modify_merge_queue",
+)
+
+_FINISH_GATE_PARENT_ROUTE_DEFAULT_REQUIRED_LANES = (
+    "observer_coordinator",
+    "bounded_implementation_worker",
+    "independent_verification_lane",
+    "observer_merge_close_gate",
+)
+
+_FINISH_GATE_PARENT_ROUTE_DEFAULT_REQUIRED_EVIDENCE = (
+    "runtime_context_read_receipt",
+    "mf_subagent_startup",
+    "mf_subagent_graph_query_trace",
+    "implementation",
+    "verification",
+    "finish_time_worker_attestation",
+    "finish_gate",
+)
+
+
+def _runtime_context_latest_contract_revision_payload(conn, context) -> dict[str, Any]:
+    from .parallel_branch_runtime import (
+        branch_contract_revision_to_dict,
+        get_latest_branch_contract_revision,
+        runtime_context_id_for_branch_context,
+    )
+
+    revision = get_latest_branch_contract_revision(
+        conn,
+        getattr(context, "project_id", ""),
+        runtime_context_id_for_branch_context(context),
+    )
+    return branch_contract_revision_to_dict(revision) if revision else {}
+
+
+def _parallel_branch_finish_gate_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    route_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
+    if not route_token_ref:
+        return {}, ""
+    try:
+        from . import observer_route_context
+
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            route_id=str(route_identity.get("route_id") or ""),
+            route_context_hash=str(route_identity.get("route_context_hash") or ""),
+            task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        )
+    except Exception as exc:
+        return {}, str(exc)
+    return dict(resolved or {}), ""
+
+
+def _parallel_branch_finish_gate_parent_route_lineage_payload(
+    *,
+    project_id: str,
+    context: Any,
+    route_identity: Mapping[str, Any],
+    contract_revision: Mapping[str, Any] | None = None,
+    route_token_binding: Mapping[str, Any] | None = None,
+    supplied: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    supplied_lineage = dict(supplied or {}) if isinstance(supplied, Mapping) else {}
+    contract = (
+        dict(contract_revision or {})
+        if isinstance(contract_revision, Mapping)
+        else {}
+    )
+    token_binding = (
+        dict(route_token_binding or {})
+        if isinstance(route_token_binding, Mapping)
+        else {}
+    )
+
+    def _first_text(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _string_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, Mapping):
+            for key in ("id", "lane_id", "action", "name", "field"):
+                text = str(value.get(key) or "").strip()
+                if text:
+                    return [text]
+            return []
+        if isinstance(value, str):
+            pieces = value.replace("\r", "\n").replace(",", "\n").split("\n")
+            return [piece.strip() for piece in pieces if piece.strip()]
+        if isinstance(value, Sequence) and not isinstance(
+            value,
+            (bytes, bytearray),
+        ):
+            result: list[str] = []
+            seen: set[str] = set()
+            for item in value:
+                for text in _string_list(item):
+                    if text and text not in seen:
+                        seen.add(text)
+                        result.append(text)
+            return result
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    def _nested_mappings(source: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        mappings: list[Mapping[str, Any]] = [source]
+        for key in (
+            "route_machine_context",
+            "machine_context",
+            "route_gate",
+            "route_token_gate",
+            "route_token",
+            "route_identity",
+            "prompt_contract",
+            "payload",
+            "contract_revision",
+            "runtime_contract_revision",
+            "revision",
+        ):
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                mappings.append(value)
+        return mappings
+
+    def _first_present_list(*field_names: str) -> tuple[list[str], bool]:
+        for source in (supplied_lineage, contract, token_binding, route_identity):
+            if not isinstance(source, Mapping):
+                continue
+            seen_sources: set[int] = set()
+            stack = list(_nested_mappings(source))
+            while stack:
+                current = stack.pop(0)
+                marker = id(current)
+                if marker in seen_sources:
+                    continue
+                seen_sources.add(marker)
+                for field_name in field_names:
+                    if field_name in current:
+                        value = current.get(field_name)
+                        if value is not None:
+                            return _string_list(value), True
+                for nested in _nested_mappings(current)[1:]:
+                    stack.append(nested)
+        return [], False
+
+    route_id = _first_text(
+        supplied_lineage.get("route_id"),
+        route_identity.get("route_id"),
+        token_binding.get("route_id"),
+    )
+    route_context_hash = _first_text(
+        supplied_lineage.get("route_context_hash"),
+        route_identity.get("route_context_hash"),
+        token_binding.get("route_context_hash"),
+    )
+    prompt_contract_id = _first_text(
+        supplied_lineage.get("prompt_contract_id"),
+        route_identity.get("prompt_contract_id"),
+        token_binding.get("prompt_contract_id"),
+    )
+    prompt_contract_hash = _first_text(
+        supplied_lineage.get("prompt_contract_hash"),
+        route_identity.get("prompt_contract_hash"),
+        token_binding.get("prompt_contract_hash"),
+    )
+    visible_manifest = _first_text(
+        supplied_lineage.get("visible_injection_manifest_hash"),
+        route_identity.get("visible_injection_manifest_hash"),
+        token_binding.get("visible_injection_manifest_hash"),
+    )
+    route_token_ref = _first_text(
+        supplied_lineage.get("route_token_ref"),
+        route_identity.get("route_token_ref"),
+        token_binding.get("route_token_ref"),
+    )
+    selected_project = _first_text(
+        supplied_lineage.get("selected_project"),
+        route_identity.get("selected_project"),
+        token_binding.get("selected_project"),
+        project_id,
+    )
+    selected_backlog_id = _first_text(
+        supplied_lineage.get("selected_backlog_id"),
+        route_identity.get("selected_backlog_id"),
+        token_binding.get("selected_backlog_id"),
+        (token_binding.get("scope") or {}).get("backlog_id")
+        if isinstance(token_binding.get("scope"), Mapping)
+        else "",
+        getattr(context, "backlog_id", ""),
+    )
+    if not all(
+        (
+            route_id,
+            route_context_hash,
+            prompt_contract_id,
+            visible_manifest,
+            selected_project,
+            selected_backlog_id,
+        )
+    ):
+        return supplied_lineage
+
+    allowed_actions, allowed_present = _first_present_list("allowed_actions")
+    blocked_actions, blocked_present = _first_present_list("blocked_actions")
+    required_lanes, lanes_present = _first_present_list("required_lanes")
+    required_evidence, evidence_present = _first_present_list(
+        "required_evidence",
+        "required_evidence_ids",
+        "evidence_required",
+        "evidence_requirements",
+    )
+    route_ref_resolved = bool(token_binding.get("resolved_from_ref"))
+    lane_aliases = {
+        "observer_intent_capture": "observer_coordinator",
+        "bounded_implementation_subagent": "bounded_implementation_worker",
+        "independent_verification_subagent": "independent_verification_lane",
+        "observer_merge_close_gate": "observer_merge_close_gate",
+    }
+    if required_lanes:
+        required_lanes = [lane_aliases.get(lane, lane) for lane in required_lanes]
+    if not allowed_present:
+        allowed_actions = ["finish_gate"]
+        allowed_present = True
+    if not blocked_present:
+        blocked_actions = list(_FINISH_GATE_PARENT_ROUTE_DEFAULT_BLOCKED_ACTIONS)
+        blocked_present = True
+    if not lanes_present:
+        required_lanes = list(_FINISH_GATE_PARENT_ROUTE_DEFAULT_REQUIRED_LANES)
+        lanes_present = True
+    if not evidence_present:
+        required_evidence = list(_FINISH_GATE_PARENT_ROUTE_DEFAULT_REQUIRED_EVIDENCE)
+        evidence_present = True
+
+    candidate = {
+        **supplied_lineage,
+        "schema_version": "parent_route_lineage.v1",
+        "source": (
+            "runtime_contract_revision.route_token_ref"
+            if route_ref_resolved
+            else "runtime_contract_revision"
+        ),
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "route_token_ref": route_token_ref,
+        "visible_injection_manifest_hash": visible_manifest,
+        "selected_project": selected_project,
+        "selected_backlog_id": selected_backlog_id,
+    }
+    if allowed_present:
+        candidate["allowed_actions"] = allowed_actions
+    if blocked_present:
+        candidate["blocked_actions"] = blocked_actions
+    if lanes_present:
+        candidate["required_lanes"] = required_lanes
+    if evidence_present:
+        candidate["required_evidence"] = required_evidence
+    if not all((allowed_present, blocked_present, lanes_present, evidence_present)):
+        return candidate
+
+    return {
+        **candidate,
+        "allowed_actions": allowed_actions,
+        "blocked_actions": blocked_actions,
+        "required_lanes": required_lanes,
+        "required_evidence": required_evidence,
+    }
+
+
+def _parallel_branch_finish_gate_parent_lineage_missing_fields(message: str) -> list[str]:
+    prefix = "parent_route_lineage missing required fields:"
+    if prefix not in message:
+        if "parent_route_lineage is required" in message:
+            return list(_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS)
+        return []
+    _, missing = message.split(prefix, 1)
+    return [item.strip() for item in missing.split(",") if item.strip()]
+
+
+def _parallel_branch_finish_gate_parent_lineage_repair_response(
+    *,
+    project_id: str,
+    context: Any,
+    route_identity: Mapping[str, Any],
+    contract_revision: Mapping[str, Any] | None = None,
+    route_token_binding: Mapping[str, Any] | None = None,
+    route_token_ref_error: str = "",
+    message: str,
+) -> tuple[int, dict[str, Any]] | None:
+    missing_fields = _parallel_branch_finish_gate_parent_lineage_missing_fields(message)
+    if not missing_fields:
+        return None
+    runtime_context_id = (
+        str(getattr(context, "runtime_context_id", "") or "").strip()
+        or str(getattr(context, "task_id", "") or "").strip()
+    )
+    derived_payload = _parallel_branch_finish_gate_parent_route_lineage_payload(
+        project_id=project_id,
+        context=context,
+        route_identity=route_identity,
+        contract_revision=contract_revision,
+        route_token_binding=route_token_binding,
+    )
+    if route_token_ref_error and isinstance(derived_payload, dict):
+        derived_payload["route_token_ref_resolution_error"] = route_token_ref_error
+    return 422, {
+        "ok": False,
+        "status": "finish_gate_repair_required",
+        "error": "parent_route_lineage_missing",
+        "message": message,
+        "recoverable": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "missing_fields": missing_fields,
+        "repair": {
+            "schema_version": "parallel_branch_finish_gate.parent_route_lineage_repair.v1",
+            "next_action": (
+                "refresh_runtime_contract_revision_or_retry_finish_gate_with_parent_route_lineage"
+            ),
+            "required_fields": list(_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS),
+            "payload_shape": {
+                "parent_route_lineage": {
+                    "schema_version": "parent_route_lineage.v1",
+                    "route_id": "<route-id>",
+                    "route_context_hash": "<sha256:...>",
+                    "prompt_contract_id": "<rprompt-...>",
+                    "visible_injection_manifest_hash": "<sha256:...>",
+                    "selected_project": project_id,
+                    "selected_backlog_id": str(getattr(context, "backlog_id", "") or ""),
+                    "allowed_actions": ["finish_gate"],
+                    "blocked_actions": ["merge", "push"],
+                    "required_lanes": list(
+                        _FINISH_GATE_PARENT_ROUTE_DEFAULT_REQUIRED_LANES
+                    ),
+                    "required_evidence": [
+                        "runtime_context_read_receipt",
+                        "mf_subagent_startup",
+                        "finish_time_worker_attestation",
+                        "finish_gate",
+                    ],
+                }
+            },
+            "server_derived_candidate": derived_payload,
+            "route_token_ref_resolution_error": route_token_ref_error,
+            "source": "latest_runtime_contract_revision.route_identity",
+        },
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/finish-gate")
 def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
     """Validate an mf_sub worker finish claim and record a checkpoint."""
@@ -9514,7 +9920,61 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     explicit_trace_ids=_explicit_graph_trace_ids,
                 )
             )
-            gate = validate_mf_subagent_finish_gate(_sanitized_body, context=context)
+            latest_contract_revision = _runtime_context_latest_contract_revision_payload(
+                conn,
+                context,
+            )
+            route_identity = _parallel_branch_runtime_contract_route_identity(
+                latest_contract_revision,
+            )
+            route_token_binding, route_token_ref_error = (
+                _parallel_branch_finish_gate_route_token_binding(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    route_identity=route_identity,
+                )
+            )
+            supplied_parent_lineage = (
+                _sanitized_body.get("parent_route_lineage")
+                if isinstance(_sanitized_body.get("parent_route_lineage"), Mapping)
+                else {}
+            )
+            parent_route_lineage = _parallel_branch_finish_gate_parent_route_lineage_payload(
+                project_id=project_id,
+                context=context,
+                route_identity=route_identity,
+                contract_revision=latest_contract_revision,
+                route_token_binding=route_token_binding,
+                supplied=supplied_parent_lineage,
+            )
+            if parent_route_lineage:
+                _sanitized_body["parent_route_lineage"] = parent_route_lineage
+            try:
+                gate = validate_mf_subagent_finish_gate(_sanitized_body, context=context)
+            except MfSubagentContractError as exc:
+                repair_response = _parallel_branch_finish_gate_parent_lineage_repair_response(
+                    project_id=project_id,
+                    context=context,
+                    route_identity=route_identity,
+                    contract_revision=latest_contract_revision,
+                    route_token_binding=route_token_binding,
+                    route_token_ref_error=route_token_ref_error,
+                    message=str(exc),
+                )
+                if repair_response is not None:
+                    return repair_response
+                raise
+            if parent_route_lineage and isinstance(
+                gate.get("parent_route_lineage"),
+                Mapping,
+            ):
+                enriched_parent_lineage = dict(gate.get("parent_route_lineage") or {})
+                for optional_field in ("route_token_ref", "prompt_contract_hash", "source"):
+                    optional_value = str(parent_route_lineage.get(optional_field) or "").strip()
+                    if optional_value and not enriched_parent_lineage.get(optional_field):
+                        enriched_parent_lineage[optional_field] = optional_value
+                gate["parent_route_lineage"] = enriched_parent_lineage
             if _caller_supplied:
                 gate["caller_supplied_real_startup_events_ignored"] = True
             if _caller_supplied_startup_evidence:
