@@ -7094,7 +7094,372 @@ def _observer_command_terminal_events(
             values = [item for item in values if item]
             if values:
                 return values
+        for key in (
+            "mf_timeline_precheck",
+            "timeline_precheck",
+            "timeline_gate_precheck",
+            "timeline_gate_result",
+        ):
+            nested = _mapping(source.get(key))
+            for nested_key in ("timeline_events", "events", "task_timeline_events"):
+                values = [_mapping(item) for item in _list(nested.get(nested_key))]
+                values = [item for item in values if item]
+                if values:
+                    return values
     return []
+
+
+def _observer_command_int(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+_OBSERVER_COMMAND_CLOSED_BACKLOG_STATUSES = {
+    "fixed",
+    "closed",
+    "complete",
+    "completed",
+    "done",
+}
+
+_OBSERVER_COMMAND_AUTHORITATIVE_CLOSE_GATE_SCHEMAS = {
+    "mf_close_timeline_gate.v1",
+}
+
+_OBSERVER_COMMAND_AUTHORITATIVE_TIMELINE_SOURCE_KEYS = {
+    "mf_timeline_precheck",
+    "timeline_precheck",
+    "timeline_gate",
+    "timeline_gate_precheck",
+    "timeline_gate_result",
+}
+
+_OBSERVER_COMMAND_AUTHORITATIVE_TIMELINE_SOURCE_TOKENS = {
+    "mf_close_timeline_gate",
+    "mf_timeline_precheck",
+    "timeline_precheck",
+    "timeline_gate",
+    "timeline_gate_precheck",
+    "timeline_gate_result",
+}
+
+
+def _observer_command_close_status(source: dict[str, Any]) -> str:
+    return (
+        str(
+            source.get("backlog_status")
+            or source.get("new_status")
+            or source.get("bug_status")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
+
+
+def _observer_command_explicit_close_gate_source(
+    source_name: str,
+    source: dict[str, Any],
+) -> bool:
+    schema = str(source.get("schema_version") or "").strip()
+    if schema in _OBSERVER_COMMAND_AUTHORITATIVE_CLOSE_GATE_SCHEMAS:
+        return True
+    source_parts = {
+        _normalize_token(part)
+        for part in source_name.split(".")
+        if str(part or "").strip()
+    }
+    if source_parts & _OBSERVER_COMMAND_AUTHORITATIVE_TIMELINE_SOURCE_KEYS:
+        return True
+    for key in ("source", "gate_source", "evidence_source", "precheck_source", "kind"):
+        token = _normalize_token(source.get(key))
+        if token in _OBSERVER_COMMAND_AUTHORITATIVE_TIMELINE_SOURCE_TOKENS:
+            return True
+    return False
+
+
+def _observer_command_authoritative_backlog_close_source(
+    source_name: str,
+    source: dict[str, Any],
+) -> bool:
+    source_parts = {
+        _normalize_token(part)
+        for part in source_name.split(".")
+        if str(part or "").strip()
+    }
+    return bool(
+        source_parts & {"backlog_close", "backlog_close_result", "close_result"}
+        and _truthy(source.get("ok"))
+        and _observer_command_close_status(source)
+        in _OBSERVER_COMMAND_CLOSED_BACKLOG_STATUSES
+    )
+
+
+def _observer_command_close_gate_passed_source(
+    evidence: dict[str, Any],
+    result_payload: dict[str, Any] | None,
+    close_gate: dict[str, Any],
+) -> dict[str, Any]:
+    result = _mapping(result_payload)
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    if close_gate:
+        candidates.append(("close_gate", close_gate))
+    roots: list[tuple[str, dict[str, Any]]]
+    if evidence is result:
+        roots = [("result", result)]
+    else:
+        roots = [("canonical_close_evidence", evidence), ("result", result)]
+    for root_label, root in roots:
+        if not root:
+            continue
+        if _observer_command_explicit_close_gate_source(root_label, root):
+            candidates.append((root_label, root))
+        for key in (
+            "close_gate",
+            "timeline_gate",
+            "mf_timeline_precheck",
+            "timeline_precheck",
+            "timeline_gate_precheck",
+            "timeline_gate_result",
+            "repair_summary",
+            "backlog_close",
+            "backlog_close_result",
+            "close_result",
+        ):
+            nested = _mapping(root.get(key))
+            if nested:
+                candidates.append((f"{root_label}.{key}", nested))
+                repair_summary = _mapping(nested.get("repair_summary"))
+                if repair_summary:
+                    candidates.append((f"{root_label}.{key}.repair_summary", repair_summary))
+
+    for source_name, source in candidates:
+        status = str(source.get("status") or "").strip().lower()
+        if (
+            _observer_command_explicit_close_gate_source(source_name, source)
+            and status != "failed"
+            and (bool(source.get("passed")) or _truthy(source.get("can_close")))
+        ):
+            return {"source": source_name, "status": status or "passed"}
+        if _observer_command_authoritative_backlog_close_source(source_name, source):
+            return {
+                "source": source_name,
+                "status": status or "passed",
+                "backlog_status": str(
+                    source.get("backlog_status")
+                    or source.get("new_status")
+                    or source.get("bug_status")
+                    or ""
+                ),
+                "request_id": str(source.get("request_id") or ""),
+            }
+    return {}
+
+
+def _observer_command_event_ref_from_value(kind: str, value: Any) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    if isinstance(value, Mapping):
+        ref_id = value.get("id") or value.get("event_id")
+        if ref_id not in (None, ""):
+            ref = {
+                "event_kind": str(value.get("event_kind") or kind),
+                "status": str(value.get("status") or value.get("decision") or "accepted"),
+            }
+            parsed_id = _observer_command_int(ref_id)
+            if parsed_id is not None:
+                ref["id"] = parsed_id
+            else:
+                ref["ref"] = str(ref_id)
+            refs.append(ref)
+        return refs
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            refs.extend(_observer_command_event_ref_from_value(kind, item))
+        return refs
+    text = str(value or "").strip()
+    if not text:
+        return refs
+    if text.startswith("timeline:"):
+        parsed_id = _observer_command_int(text.split(":", 1)[1])
+    else:
+        parsed_id = _observer_command_int(text)
+    ref: dict[str, Any] = {"event_kind": kind, "status": "accepted"}
+    if parsed_id is not None:
+        ref["id"] = parsed_id
+    else:
+        ref["ref"] = text
+    refs.append(ref)
+    return refs
+
+
+def _observer_command_compact_event_refs(
+    evidence: dict[str, Any],
+    result_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    result = _mapping(result_payload)
+    refs: list[dict[str, Any]] = []
+    key_to_kind = {
+        "accepted_close_ready": "close_ready",
+        "close_ready": "close_ready",
+        "close_ready_event_id": "close_ready",
+        "post_merge_verification": "verification",
+        "accepted_verification": "verification",
+        "verification": "verification",
+        "verification_event_id": "verification",
+        "backlog_close": "backlog_close",
+        "backlog_close_event_id": "backlog_close",
+        "route_identity_cleanup": "route_identity_cleanup",
+        "route_identity_cleanup_event_id": "route_identity_cleanup",
+    }
+    for root in (evidence, result):
+        if not root:
+            continue
+        timeline_events = _mapping(root.get("timeline_events"))
+        for key, value in timeline_events.items():
+            kind = key_to_kind.get(str(key), str(key))
+            refs.extend(_observer_command_event_ref_from_value(kind, value))
+        for key, kind in key_to_kind.items():
+            if key in root:
+                refs.extend(_observer_command_event_ref_from_value(kind, root.get(key)))
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in refs:
+        ref_key = json.dumps(ref, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if ref_key in seen:
+            continue
+        seen.add(ref_key)
+        deduped.append(ref)
+    return deduped
+
+
+def _observer_command_has_accepted_close_ready(
+    *,
+    close_gate: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> bool:
+    if "close_ready" in set(close_gate.get("present_event_kinds") or []):
+        return True
+    for event in events:
+        kind = str(event.get("event_kind") or event.get("event_type") or "").strip()
+        status = str(event.get("status") or event.get("decision") or "").strip().lower()
+        if kind == "close_ready" and status in MF_CLOSE_PASS_STATUSES:
+            return True
+    return False
+
+
+def _observer_command_public_route_identity(value: Any) -> dict[str, str]:
+    identity = _route_identity(value)
+    if not identity:
+        return {}
+    for field in ("route_id", "visible_injection_manifest_hash", "route_token_ref"):
+        token = _first_deep_text(value, field)
+        if token:
+            identity[field] = token
+    return identity
+
+
+def _observer_command_canonical_route_identity(
+    *,
+    evidence: dict[str, Any],
+    result_payload: dict[str, Any] | None,
+    route_context_gate: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, str]:
+    result = _mapping(result_payload)
+    candidates: list[dict[str, str]] = []
+
+    def add(value: Any) -> None:
+        identity = _observer_command_public_route_identity(value)
+        if identity:
+            candidates.append(identity)
+
+    add(evidence.get("canonical_route_identity"))
+    add(route_context_gate.get("route_identity"))
+    add(_mapping(route_context_gate.get("route_identity_cleanup")).get("route_identity"))
+    for event in sorted(
+        events,
+        key=lambda item: _observer_command_int(item.get("id") or item.get("event_id")) or 0,
+        reverse=True,
+    ):
+        kind = str(event.get("event_kind") or event.get("event_type") or "")
+        if kind == "route_identity_cleanup":
+            add(event)
+    for root in (evidence, result):
+        for key in (
+            "canonical_route_identity",
+            "observer_claim_evidence",
+            "durable_mf_sub_evidence",
+            "route_token_gate",
+            "close_gate",
+            "backlog_close",
+            "backlog_close_result",
+        ):
+            add(_mapping(root.get(key)))
+
+    return candidates[0] if candidates else {}
+
+
+def _observer_command_missing_evidence_details(
+    missing: list[str],
+    *,
+    close_gate_source: dict[str, Any],
+    compact_refs: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    command_identity: dict[str, str],
+    canonical_identity: dict[str, str],
+) -> list[dict[str, Any]]:
+    event_refs = [_observer_command_event_ref(event) for event in events]
+    event_refs = [ref for ref in event_refs if ref]
+    details: list[dict[str, Any]] = []
+    for requirement_id in missing:
+        detail: dict[str, Any] = {
+            "requirement_id": requirement_id,
+            "actionable": True,
+        }
+        if requirement_id == "canonical_close_gate_passed":
+            detail.update({
+                "expected": "mf_timeline_precheck.can_close true or mf_close_timeline_gate passed",
+                "observed_close_gate_source": close_gate_source,
+                "next_action": "rerun mf_timeline_precheck(view=repair) and include its gate/events in observer_command_complete",
+            })
+        elif requirement_id == "accepted_close_ready":
+            detail.update({
+                "expected_event_kind": "close_ready",
+                "observed_event_refs": [
+                    ref for ref in compact_refs + event_refs if ref.get("event_kind") == "close_ready"
+                ],
+                "next_action": "include the accepted close_ready timeline event or an authoritative timeline gate that already verified it",
+            })
+        elif requirement_id == "canonical_backlog_fixed_or_closed":
+            detail.update({
+                "expected": "backlog_close ok with backlog status FIXED/CLOSED/DONE",
+                "next_action": "include backlog_close response with final backlog status",
+            })
+        elif requirement_id == "canonical_route_identity":
+            detail.update({
+                "expected_fields": list(MF_ROUTE_IDENTITY_FIELDS),
+                "observed_event_refs": [
+                    ref
+                    for ref in compact_refs + event_refs
+                    if ref.get("event_kind") in {"route_identity_cleanup", "route_context", "route_token_gate"}
+                ],
+                "next_action": "include canonical_route_identity or route_identity_cleanup/route-token evidence",
+            })
+        elif requirement_id == "superseding_route_or_contract_relation":
+            detail.update({
+                "command_route_identity": command_identity,
+                "canonical_route_identity": canonical_identity,
+                "observed_event_refs": [
+                    ref
+                    for ref in compact_refs + event_refs
+                    if ref.get("event_kind") == "route_identity_cleanup"
+                ],
+                "next_action": "include accepted route_identity_cleanup or parent-child route lineage evidence",
+            })
+        details.append(detail)
+    return details
 
 
 def _observer_command_backlog_close_state(
@@ -7263,9 +7628,18 @@ def observer_command_terminal_projection_from_close_evidence(
         else mf_close_gate_verification(events, contract=contract)
     )
     route_context_gate = _mapping(close_gate.get("route_context_gate"))
-    canonical_identity = _mapping(
-        evidence.get("canonical_route_identity")
-        or route_context_gate.get("route_identity")
+    compact_refs = _observer_command_compact_event_refs(evidence, result)
+    close_gate_source = _observer_command_close_gate_passed_source(
+        evidence,
+        result,
+        close_gate,
+    )
+    close_gate_passed = bool(close_gate_source)
+    canonical_identity = _observer_command_canonical_route_identity(
+        evidence=evidence,
+        result_payload=result,
+        route_context_gate=route_context_gate,
+        events=events,
     )
     explicit_canonical = _mapping(evidence.get("canonical_route_identity"))
     if canonical_identity and explicit_canonical.get("route_id"):
@@ -7285,11 +7659,17 @@ def observer_command_terminal_projection_from_close_evidence(
         route_context_gate,
         backlog_close_state,
     )
+    for ref in compact_refs:
+        if ref not in terminal_refs:
+            terminal_refs.append(ref)
 
     missing: list[str] = []
-    if not bool(close_gate.get("passed")):
+    if not close_gate_passed:
         missing.append("canonical_close_gate_passed")
-    if "close_ready" not in set(close_gate.get("present_event_kinds") or []):
+    if not _observer_command_has_accepted_close_ready(
+        close_gate=close_gate,
+        events=events,
+    ):
         missing.append("accepted_close_ready")
     if not backlog_close_state["closed"]:
         missing.append("canonical_backlog_fixed_or_closed")
@@ -7328,6 +7708,15 @@ def observer_command_terminal_projection_from_close_evidence(
         "superseded_route_identity": superseded_identity,
         "terminal_evidence_refs": terminal_refs,
         "missing_requirement_ids": missing,
+        "missing_evidence": _observer_command_missing_evidence_details(
+            missing,
+            close_gate_source=close_gate_source,
+            compact_refs=compact_refs,
+            events=events,
+            command_identity=command_identity,
+            canonical_identity=canonical_identity,
+        ),
+        "close_gate_passed_source": close_gate_source,
         "close_gate_status": str(close_gate.get("status") or ""),
         "backlog_close_request_id": str(backlog_close_state.get("request_id") or ""),
         "backlog_status": str(backlog_close_state.get("status") or ""),

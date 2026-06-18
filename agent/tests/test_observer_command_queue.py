@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,6 +21,89 @@ def _conn() -> sqlite3.Connection:
     observer_session.ensure_schema(conn)
     raw_requirement.ensure_schema(conn)
     return conn
+
+
+def _ensure_backlog_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS backlog_bugs (
+            bug_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            priority TEXT NOT NULL DEFAULT 'P3',
+            target_files TEXT NOT NULL DEFAULT '[]',
+            test_files TEXT NOT NULL DEFAULT '[]',
+            acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+            chain_task_id TEXT NOT NULL DEFAULT '',
+            "commit" TEXT NOT NULL DEFAULT '',
+            fixed_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+
+def _insert_backlog_row(
+    conn: sqlite3.Connection,
+    *,
+    bug_id: str,
+    status: str = "FIXED",
+) -> None:
+    _ensure_backlog_table(conn)
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (bug_id, title, status, "commit", fixed_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            bug_id,
+            "Dogfood row",
+            status,
+            "ac1f12e72b8cdaa2e59b4a72554486facb31b78a",
+            "2026-06-18T04:56:06Z",
+            "2026-06-18T04:01:39Z",
+            "2026-06-18T04:56:06Z",
+        ),
+    )
+
+
+def _record_timeline_events(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    events: list[dict],
+) -> None:
+    task_timeline.ensure_schema(conn)
+    for event in events:
+        conn.execute(
+            """
+            INSERT INTO task_timeline_events (
+                project_id, backlog_id, mf_id, task_id, attempt_num, event_type,
+                phase, event_kind, scenario_id, parent_event_id, correlation_id,
+                severity, decision, schema_version, actor, status, payload_json,
+                verification_json, artifact_refs_json, trace_id, commit_sha, created_at
+            ) VALUES (?, ?, '', ?, ?, ?, ?, ?, '', 0, '', '', '', 2, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                backlog_id,
+                str(event.get("task_id") or ""),
+                int(event.get("attempt_num") or 0),
+                str(event.get("event_type") or event.get("event_kind") or ""),
+                str(event.get("phase") or ""),
+                str(event.get("event_kind") or ""),
+                str(event.get("actor") or ""),
+                str(event.get("status") or ""),
+                json.dumps(dict(event.get("payload") or {})),
+                json.dumps(dict(event.get("verification") or {})),
+                json.dumps(dict(event.get("artifact_refs") or {})),
+                str(event.get("trace_id") or ""),
+                str(event.get("commit_sha") or ""),
+                str(event.get("created_at") or "2026-06-18T04:56:06Z"),
+            ),
+        )
 
 
 def _register(conn: sqlite3.Connection, project_id: str = "demo") -> dict:
@@ -257,6 +341,66 @@ def _canonical_close_evidence(*, include_close_ready: bool = True, include_clean
             },
         }
     }
+
+
+def _dogfood_compact_close_result(
+    payload: dict,
+    *,
+    include_timeline_gate: bool = False,
+) -> dict:
+    route_identity = {
+        key: payload[key]
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        )
+        if key in payload
+    }
+    result = {
+        "ok": True,
+        "schema_version": "observer_command_complete_result.v1",
+        "backlog_id": "DPL-FOCUS-REMINDERS-20260618",
+        "backlog_status": "FIXED",
+        "close_gate": {
+            "backlog_close_status": "FIXED",
+            "can_close": True,
+            "failed_gate_count": 0,
+            "used_audit_close_or_waiver": False,
+        },
+        "backlog_close": {
+            "ok": True,
+            "request_id": "req-dogfood-close",
+            "backlog_status": "FIXED",
+            "route_token_gate": {
+                **route_identity,
+                "decision": "route_token_ref_resolved",
+                "status": "accepted",
+            },
+        },
+        "timeline_events": {
+            "post_merge_verification": 29,
+            "close_ready": 31,
+        },
+        "observer_claim_evidence": {
+            "route_identity": route_identity,
+        },
+    }
+    if include_timeline_gate:
+        result["timeline_gate"] = {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": True,
+            "status": "passed",
+            "present_event_kinds": ["implementation", "verification", "close_ready"],
+            "route_context_gate": {
+                "passed": True,
+                "status": "passed",
+                "route_identity": route_identity,
+            },
+        }
+    return result
 
 
 def _insert_legacy_execute_command(
@@ -1059,6 +1203,294 @@ def test_execute_backlog_row_completion_projects_terminal_from_canonical_close_e
     )
 
 
+def test_execute_backlog_row_stale_takeover_completes_from_compact_fixed_closeout():
+    conn = _conn()
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-original",
+        now="2026-06-18T04:14:16Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-takeover",
+        now="2026-06-18T04:57:00Z",
+    )
+    payload = {
+        **_execute_backlog_row_payload(),
+        "backlog_id": "DPL-FOCUS-REMINDERS-20260618",
+        "merge_queue_id": "mq-b4bc3500a7c7ff3f08026c72",
+        "route_id": "route-20260618-fc84b093e49c792d",
+        "route_context_hash": "sha256:fc84b093e49c792d7878960e554470d8afed23aa0a424bde19bd797aa9a0a35f",
+        "prompt_contract_id": "rprompt-aming-8f648289188a37c7",
+        "route_token_ref": "rtok-09be1a797e1cad608c244ed2816e0971",
+        "visible_injection_manifest_hash": "sha256:d4b39bc2dcccb34e4b628b97449a47bc62df9cbec5d3cf9c7f498e297a1c22cb",
+    }
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        command_id="cmd-178d315dd3c0",
+        created_by="judgment_brain",
+        notify=True,
+        now="2026-06-18T04:09:55Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-18T04:14:16Z",
+    )
+    takeover = observer_session.takeover_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        reason="already FIXED through mf_timeline_precheck and backlog_close",
+        now="2026-06-18T04:57:04Z",
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        result={
+            **_dogfood_compact_close_result(payload, include_timeline_gate=True),
+            "takeover": takeover["takeover"],
+        },
+        now="2026-06-18T04:57:30Z",
+    )
+
+    command_after = completed["command"]
+    projection = command_after["result"]["terminal_contract_projection"]
+    assert completed["ok"] is True
+    assert command_after["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert command_after["error"] == ""
+    assert projection["passed"] is True
+    assert projection["command_projection_status"] == "completed"
+    assert projection["close_gate_passed_source"]["source"] == "close_gate"
+    assert {"event_kind": "close_ready", "status": "accepted", "id": 31} in projection[
+        "terminal_evidence_refs"
+    ]
+    assert command_after["command_projection_status"] == "completed"
+
+
+def test_execute_backlog_row_complete_rejects_bare_passed_true_closeout():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    rejected = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "passed": True,
+            "backlog_id": payload["backlog_id"],
+            "backlog_status": "FIXED",
+            "timeline_events": {"close_ready": 31},
+            "observer_claim_evidence": {"route_identity": payload},
+        },
+    )
+
+    command_after = rejected["command"]
+    projection = rejected["terminal_contract_projection"]
+    assert rejected["ok"] is False
+    assert command_after["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert command_after["error"] == ""
+    assert "canonical_close_gate_passed" in projection["missing_requirement_ids"]
+    assert "accepted_close_ready" in projection["missing_requirement_ids"]
+    assert projection["close_gate_passed_source"] == {}
+
+
+def test_execute_backlog_row_complete_hydrates_close_ready_from_db_events():
+    conn = _conn()
+    session = _register(conn)
+    backlog_id = "DPL-FOCUS-REMINDERS-20260618"
+    payload = {
+        **_execute_backlog_row_payload(),
+        "backlog_id": backlog_id,
+        **CANONICAL_A3_ROUTE,
+    }
+    _insert_backlog_row(conn, bug_id=backlog_id, status="FIXED")
+    _record_timeline_events(
+        conn,
+        project_id="demo",
+        backlog_id=backlog_id,
+        events=_canonical_close_evidence()["canonical_close_evidence"]["timeline_events"],
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    completed = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "backlog_id": backlog_id,
+            "backlog_close": {
+                "ok": True,
+                "request_id": "req-dogfood-close",
+                "backlog_status": "FIXED",
+            },
+            "observer_claim_evidence": {"route_identity": CANONICAL_A3_ROUTE},
+        },
+    )
+
+    command_after = completed["command"]
+    projection = command_after["result"]["terminal_contract_projection"]
+    assert completed["ok"] is True
+    assert command_after["status"] == observer_session.COMMAND_STATUS_COMPLETED
+    assert projection["passed"] is True
+    assert any(
+        ref.get("event_kind") == "close_ready" and ref.get("status") == "accepted"
+        for ref in projection["terminal_evidence_refs"]
+    )
+
+
+def test_execute_backlog_row_complete_rejects_unverified_compact_close_ready_ref():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    rejected = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "backlog_id": payload["backlog_id"],
+            "backlog_close": {
+                "ok": True,
+                "request_id": "req-dogfood-close",
+                "backlog_status": "FIXED",
+            },
+            "timeline_events": {"close_ready": 31},
+            "observer_claim_evidence": {"route_identity": payload},
+        },
+    )
+
+    command_after = rejected["command"]
+    projection = rejected["terminal_contract_projection"]
+    assert rejected["ok"] is False
+    assert command_after["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert command_after["error"] == ""
+    assert projection["close_gate_passed_source"]["source"] == "result.backlog_close"
+    assert "accepted_close_ready" in projection["missing_requirement_ids"]
+    assert "canonical_close_gate_passed" not in projection["missing_requirement_ids"]
+    assert {"event_kind": "close_ready", "status": "accepted", "id": 31} in projection[
+        "terminal_evidence_refs"
+    ]
+
+
+def test_execute_backlog_row_complete_does_not_trust_compact_can_close_alone():
+    conn = _conn()
+    session = _register(conn)
+    payload = _execute_backlog_row_payload()
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=payload,
+        created_by="judgment_brain",
+        notify=True,
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+    )
+
+    rejected = observer_session.complete_command(
+        conn,
+        project_id="demo",
+        session_id=session["session_id"],
+        session_token=session["session_token"],
+        command_id=command["command_id"],
+        result={
+            "ok": True,
+            "backlog_id": payload["backlog_id"],
+            "backlog_status": "FIXED",
+            "close_gate": {"can_close": True, "failed_gate_count": 0},
+            "timeline_events": {"close_ready": 31},
+            "observer_claim_evidence": {"route_identity": payload},
+        },
+    )
+
+    command_after = rejected["command"]
+    projection = rejected["terminal_contract_projection"]
+    assert rejected["ok"] is False
+    assert command_after["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert command_after["error"] == ""
+    assert "canonical_close_gate_passed" in projection["missing_requirement_ids"]
+    close_ready_detail = next(
+        item for item in projection["missing_evidence"] if item["requirement_id"] == "accepted_close_ready"
+    )
+    assert close_ready_detail["observed_event_refs"] == [
+        {"event_kind": "close_ready", "status": "accepted", "id": 31}
+    ]
+
+
 def test_execute_backlog_row_completion_does_not_project_without_closed_backlog_state():
     conn = _conn()
     session = _register(conn)
@@ -1091,11 +1523,15 @@ def test_execute_backlog_row_completion_does_not_project_without_closed_backlog_
     )
 
     command_after = completed["command"]
-    projection = command_after["result"]["terminal_contract_projection"]
-    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
-    assert command_after["error"] == "missing_canonical_backlog_fixed_or_closed"
+    projection = completed["terminal_contract_projection"]
+    assert completed["ok"] is False
+    assert command_after["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert command_after["error"] == ""
     assert projection["command_projection_status"] == "unresolved"
     assert "canonical_backlog_fixed_or_closed" in projection["missing_requirement_ids"]
+    assert completed["error"] == (
+        "missing_canonical_close_gate_passed_and_canonical_backlog_fixed_or_closed"
+    )
 
 
 def test_execute_backlog_row_completion_keeps_blocker_without_superseding_route_relation():
@@ -1128,13 +1564,16 @@ def test_execute_backlog_row_completion_keeps_blocker_without_superseding_route_
     )
 
     command_after = completed["command"]
-    projection = command_after["result"]["terminal_contract_projection"]
-    assert command_after["status"] == observer_session.COMMAND_STATUS_FAILED
-    assert command_after["error"] == (
-        "missing_canonical_close_gate_passed_and_superseding_route_or_contract_relation"
-    )
+    projection = completed["terminal_contract_projection"]
+    assert completed["ok"] is False
+    assert command_after["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert command_after["error"] == ""
+    assert completed["error"] == "missing_superseding_route_or_contract_relation"
     assert projection["command_projection_status"] == "unresolved"
     assert "superseding_route_or_contract_relation" in projection["missing_requirement_ids"]
+    assert projection["missing_evidence"][0]["requirement_id"] == (
+        "superseding_route_or_contract_relation"
+    )
 
 
 def test_execute_backlog_row_rejects_missing_route_payload_fields():

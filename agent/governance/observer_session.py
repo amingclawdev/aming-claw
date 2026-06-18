@@ -1867,6 +1867,119 @@ def _hydrate_result_with_persisted_mf_sub_evidence(
         result["durable_mf_sub_evidence"] = evidence
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _result_has_timeline_event_list(result: dict[str, Any]) -> bool:
+    roots = [
+        result,
+        _mapping(result.get("canonical_close_evidence")),
+        _mapping(result.get("canonical_contract_close_evidence")),
+        _mapping(result.get("contract_close_projection")),
+        _mapping(result.get("task_contract_close_projection")),
+        _mapping(result.get("mf_timeline_precheck")),
+        _mapping(result.get("timeline_precheck")),
+        _mapping(result.get("timeline_gate_precheck")),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        for key in ("timeline_events", "events", "task_timeline_events"):
+            if isinstance(root.get(key), list) and root.get(key):
+                return True
+    return False
+
+
+def _backlog_row_close_state(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+) -> dict[str, Any]:
+    if not backlog_id:
+        return {}
+    try:
+        row = conn.execute(
+            """
+            SELECT status, "commit", fixed_at
+            FROM backlog_bugs
+            WHERE bug_id = ?
+            """,
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    data = dict(row)
+    return {
+        "source": "backlog_bugs",
+        "backlog_status": str(data.get("status") or ""),
+        "commit": str(data.get("commit") or ""),
+        "fixed_at": str(data.get("fixed_at") or ""),
+    }
+
+
+def _hydrate_result_with_canonical_close_evidence(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    if not _result_has_canonical_close_evidence(result):
+        return
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    backlog_id = (
+        str(result.get("backlog_id") or "").strip()
+        or _first_nested_text(result, "backlog_id")
+        or str(payload.get("backlog_id") or "").strip()
+    )
+    if not backlog_id:
+        return
+
+    evidence = result.get("canonical_close_evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+        result["canonical_close_evidence"] = evidence
+
+    events: list[dict[str, Any]] = []
+    if not _result_has_timeline_event_list(result):
+        try:
+            from . import task_timeline
+
+            events = task_timeline.list_events(
+                conn,
+                project_id,
+                backlog_id=backlog_id,
+                limit=1000,
+            )
+        except Exception:
+            events = []
+        if events:
+            evidence["timeline_events"] = events
+    elif isinstance(evidence.get("timeline_events"), list):
+        events = [item for item in evidence.get("timeline_events") or [] if isinstance(item, dict)]
+
+    if events and not isinstance(evidence.get("timeline_gate"), dict):
+        try:
+            from . import task_timeline
+
+            contract = _mapping(evidence.get("contract") or evidence.get("task_contract"))
+            evidence["timeline_gate"] = task_timeline.mf_close_gate_verification(
+                events,
+                contract=contract,
+            )
+        except Exception:
+            pass
+
+    backlog_state = _backlog_row_close_state(conn, backlog_id=backlog_id)
+    if backlog_state:
+        result.setdefault("backlog_status", backlog_state["backlog_status"])
+        if not isinstance(evidence.get("backlog_close"), dict):
+            evidence["backlog_close"] = backlog_state
+
+
 def _mapping_has_graph_trace_progress(value: Mapping[str, Any]) -> dict[str, Any]:
     trace_ids = _string_list_from_any(
         value.get("trace_ids")
@@ -2285,6 +2398,38 @@ def _attach_command_terminal_projection(
 ) -> None:
     result["terminal_contract_projection"] = projection
     _apply_command_terminal_projection_fields(result, projection)
+
+
+def _command_completion_projection_rejected_response(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    session_id: str,
+    command_id: str,
+    result_payload: dict[str, Any],
+    terminal_projection: dict[str, Any],
+) -> dict[str, Any]:
+    error = str(
+        terminal_projection.get("divergence_reason")
+        or "canonical_close_projection_unresolved"
+    )
+    result_payload["ok"] = False
+    result_payload.setdefault("status", "unresolved")
+    result_payload["completion_rejected"] = True
+    result_payload["completion_rejected_reason"] = error
+    return {
+        "ok": False,
+        "project_id": project_id,
+        "observer_session_id": session_id,
+        "command": get_command(conn, project_id=project_id, command_id=command_id),
+        "error": error,
+        "completion_rejected": True,
+        "terminal_contract_projection": terminal_projection,
+        "missing_requirement_ids": list(
+            terminal_projection.get("missing_requirement_ids") or []
+        ),
+        "missing_evidence": list(terminal_projection.get("missing_evidence") or []),
+    }
 
 
 def _missing_startup_surface_blocker(command: dict[str, Any], *, now: str) -> dict[str, Any]:
@@ -4165,6 +4310,12 @@ def complete_command(
             command=command,
             result=result_payload,
         )
+        _hydrate_result_with_canonical_close_evidence(
+            conn,
+            project_id=pid,
+            command=command,
+            result=result_payload,
+        )
     if (
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and not _result_has_startup_or_blocker_evidence(result_payload)
@@ -4187,6 +4338,15 @@ def complete_command(
             else:
                 if terminal_projection:
                     _attach_command_terminal_projection(result_payload, terminal_projection)
+                    if _result_has_canonical_close_evidence(result_payload):
+                        return _command_completion_projection_rejected_response(
+                            conn,
+                            project_id=pid,
+                            session_id=sid,
+                            command_id=command_id,
+                            result_payload=result_payload,
+                            terminal_projection=terminal_projection,
+                        )
                 blocker = _missing_startup_surface_blocker(command, now=timestamp)
                 result_payload["ok"] = False
                 result_payload["startup_surface_blocker"] = blocker
@@ -4221,33 +4381,14 @@ def complete_command(
         if terminal_projection:
             _attach_command_terminal_projection(result_payload, terminal_projection)
             if not terminal_projection.get("passed"):
-                result_payload["ok"] = False
-                result_payload["status"] = "failed"
-                error = str(
-                    terminal_projection.get("divergence_reason")
-                    or "canonical_close_projection_unresolved"
+                return _command_completion_projection_rejected_response(
+                    conn,
+                    project_id=pid,
+                    session_id=sid,
+                    command_id=command_id,
+                    result_payload=result_payload,
+                    terminal_projection=terminal_projection,
                 )
-                conn.execute(
-                    """UPDATE observer_command_queue
-                          SET status = ?, completed_at = ?, result_json = ?, error = ?
-                        WHERE project_id = ? AND command_id = ?""",
-                    (
-                        COMMAND_STATUS_FAILED,
-                        timestamp,
-                        _json_dumps(result_payload),
-                        error,
-                        pid,
-                        command_id,
-                    ),
-                )
-                conn.commit()
-                return {
-                    "ok": True,
-                    "project_id": pid,
-                    "observer_session_id": sid,
-                    "command": get_command(conn, project_id=pid, command_id=command_id),
-                    "terminal_contract_projection": terminal_projection,
-                }
     if (
         str(command.get("command_type") or "") == COMMAND_TYPE_EXECUTE_BACKLOG_ROW
         and _contains_actual_startup_evidence(result_payload)
