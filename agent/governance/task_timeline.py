@@ -6524,6 +6524,46 @@ def _generic_repair_append_skeleton(gate_key: str, missing: list[str]) -> dict[s
     )
 
 
+def _finish_gate_facade_payload_skeleton() -> dict[str, Any]:
+    path = (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-gate"
+    )
+    return {
+        "schema_version": "runtime_context.finish_gate_submission.repair_skeleton.v1",
+        "action": "record_finish_gate",
+        "name": "record_finish_gate",
+        "next_legal_action": "record_finish_gate",
+        "method": "POST",
+        "endpoint": "runtime_context.finish_gate",
+        "path": path,
+        "body": {
+            "runtime_context_id": "<same_mfrctx_as_startup_and_attestation>",
+            "task_id": "<same_worker_task_id_as_startup_and_attestation>",
+            "parent_task_id": "<same_parent_task_id_as_startup_and_attestation>",
+            "fence_token": "<assigned_lane_fence_token>",
+            "session_token": "<current_runtime_context_session_token>",
+            "target_project_root": "<assigned_worker_worktree_or_project_root>",
+            "checkpoint_id": "<finish-gate-checkpoint-id>",
+            "head_commit": "<worker_worktree_head_commit>",
+            "changed_files": ["<owned-file>"],
+            "status": "review_ready",
+            "test_results": {"status": "passed", "passed": True},
+            "graph_trace_ids": ["<worker_owned_gqt_id>"],
+            "read_receipt_event_id": "<accepted_read_receipt_event_id>",
+            "read_receipt_hash": "<accepted_read_receipt_hash>",
+            "finish_time_worker_self_attestation": (
+                "<accepted_finish_time_worker_self_attestation>"
+            ),
+        },
+        "reminders": {
+            "canonical_finish_gate_required": True,
+            "raw_finish_time_attestation_alone_close_satisfying": False,
+            "use_runtime_context_facade": True,
+        },
+    }
+
+
 def _startup_identity_missing_fields(gate: dict[str, Any]) -> list[str]:
     missing = _list(gate.get("missing_fields") or gate.get("missing_required_fields") or [])
     blocker_values: list[Any] = [
@@ -6971,6 +7011,19 @@ def _compact_gate_repair_projection(repair: dict[str, Any]) -> dict[str, Any]:
         compact["repair_view_hint"] = (
             "Call mf_timeline_precheck(view='repair') for the advisory append payload skeleton."
         )
+    facade = _mapping(repair.get("finish_gate_facade_payload_skeleton"))
+    if facade:
+        compact["finish_gate_facade_payload_hint"] = {
+            "action": facade.get("action"),
+            "method": facade.get("method"),
+            "path": facade.get("path"),
+            "endpoint": facade.get("endpoint"),
+            "canonical_finish_gate_required": True,
+        }
+        compact["repair_view_hint"] = (
+            "Call mf_timeline_precheck(view='repair') for the runtime-context "
+            "finish-gate facade payload skeleton."
+        )
     return compact
 
 
@@ -7045,18 +7098,23 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             reasons.append("Startup evidence is not close-satisfying.")
         if needs_finish_time_projection:
             recommended_action = (
-                "Record or repair worker-authored finish-time attestation and finish "
-                "gate evidence under the same runtime_context_id, task_id, "
-                "worker_session_id, read receipt, and route identity. Include "
-                "graph_trace_ids from the worker-owned graph query; close consumes "
-                "the canonical mf_subagent_finish_gate projection, not raw "
-                "finish-time attestation by itself. Do not record another startup, "
-                "observer-backfill worker evidence, or use audit archive to pretend "
-                "finish evidence exists. If accepted implementation evidence cannot "
-                "normal-close because historical finish evidence is non-reconstructable, "
-                "use backlog_audit_archive as WAIVED recovery with independent QA."
+                "An accepted finish-time worker attestation is an input to the "
+                "finish gate, but it is not close-satisfying by itself. Record "
+                "the canonical runtime-context finish-gate facade under the same "
+                "runtime_context_id, task_id, worker_session_id, read receipt, "
+                "route identity, and worker-owned graph_trace_ids so close can "
+                "consume the mf_subagent_finish_gate projection. Do not record "
+                "another startup, observer-backfill worker evidence, or use audit "
+                "archive to pretend finish evidence exists. If accepted "
+                "implementation evidence cannot normal-close because historical "
+                "finish evidence is non-reconstructable, use backlog_audit_archive "
+                "as WAIVED recovery with independent QA."
             )
             suggested_event_kind = "mf_subagent_finish_gate"
+            reasons.append(
+                "Accepted finish-time attestation alone remains non-close-satisfying "
+                "until mf_subagent_finish_gate is recorded and validated."
+            )
             append_skeleton = _repair_append_skeleton(
                 suggested_event_kind,
                 phase="finish_gate",
@@ -7087,6 +7145,7 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                     },
                 },
             )
+            finish_gate_facade_skeleton = _finish_gate_facade_payload_skeleton()
             diagnosis = "startup evidence needs later worker finish-time proof"
         else:
             recommended_action = (
@@ -7104,8 +7163,9 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                 gate_key,
                 startup_missing or missing,
             )
+            finish_gate_facade_skeleton = {}
             diagnosis = "startup evidence missing real worker identity fields"
-        return {
+        result = {
             "gate": gate_key,
             "failed_gate_name": gate_key,
             "status": str(gate.get("status") or "failed"),
@@ -7120,6 +7180,9 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             "append_payload_skeleton": append_skeleton,
             "advisory_only": True,
         }
+        if finish_gate_facade_skeleton:
+            result["finish_gate_facade_payload_skeleton"] = finish_gate_facade_skeleton
+        return result
 
     if gate_key == "cross_ref_gate":
         rejected = [_mapping(item) for item in _list(gate.get("rejected_cross_ref_evidence"))]
@@ -7130,7 +7193,10 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             "Prefer route-token canonical child lineage: re-record rejected worker "
             "evidence with route_token_ref, parent_task_id/root backlog, runtime_context_id, "
             "worker_slot_id, observer command scope, canonical parent route scope, "
-            "and registry-backed active token proof. "
+            "and registry-backed active token proof. If the rejected worker evidence "
+            "is finish or handoff evidence and the lane can still legally act, prefer "
+            "re-recording through the canonical runtime-context finish-gate facade "
+            "before using a manual lineage bridge. "
             "A cross-ref bridge skeleton is advisory and is not close-satisfying "
             "worker evidence by itself."
         )

@@ -5100,11 +5100,11 @@ def _runtime_context_next_legal_action(
         if isinstance(item, Mapping)
     }
     for field, action in (
+        ("graph_trace_ids", "run_worker_graph_query"),
+        ("worker_self_attesting", "record_finish_time_worker_attestation"),
         ("finish_gate_ref", "record_finish_gate"),
         ("checkpoint_id", "record_checkpoint"),
         ("verification_event_refs", "record_independent_verification"),
-        ("graph_trace_ids", "run_worker_graph_query"),
-        ("worker_self_attesting", "record_finish_time_worker_attestation"),
         ("close_ready_event_ref", "record_close_ready"),
     ):
         if field in missing_fields:
@@ -5342,7 +5342,31 @@ def _runtime_context_next_required_evidence(
             status="blocked",
             worker_owned=False,
         )
+    item_by_id = {
+        _runtime_context_text(item.get("id")): item
+        for item in items
+        if isinstance(item, Mapping)
+    }
+    finish_attestation_item = item_by_id.get("finish_time_worker_attestation")
+    finish_gate_item = item_by_id.get("finish_gate")
+    if finish_attestation_item and finish_gate_item:
+        finish_attestation_item["next_after_success"] = "record_finish_gate"
+        finish_attestation_item["sequence_note"] = (
+            "After this finish-time worker attestation is accepted, refresh "
+            "current-state/worker-guide; finish_gate becomes the first "
+            "worker-owned next_required_evidence item."
+        )
+        finish_gate_item["waits_for"] = "finish_time_worker_attestation"
+        finish_gate_item["sequence_note"] = (
+            "Do not record finish_gate until finish_time_worker_attestation is "
+            "accepted; raw attestation alone is not close-satisfying."
+        )
+        requires = list(finish_gate_item.get("requires") or [])
+        if "finish_time_worker_attestation" not in requires:
+            requires.append("finish_time_worker_attestation")
+        finish_gate_item["requires"] = requires
     for index, item in enumerate(items):
+        item["sequence_index"] = index
         item["is_next"] = index == 0
     return items
 

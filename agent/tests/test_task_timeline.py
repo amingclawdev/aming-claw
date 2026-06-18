@@ -9043,12 +9043,36 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
     assert "graph_trace_ids" in close_repair["missing_fields"]
     assert "finish_time_worker_self_attestation" in close_repair["missing_fields"]
     assert close_repair["suggested_event_kind"] == "mf_subagent_finish_gate"
+    assert "not close-satisfying by itself" in close_repair[
+        "recommended_legal_action"
+    ]
+    assert "runtime-context finish-gate facade" in close_repair[
+        "recommended_legal_action"
+    ]
     assert "Do not record another startup" in close_repair["recommended_legal_action"]
     assert "backlog_audit_archive" in close_repair["recommended_legal_action"]
     assert "WAIVED recovery" in close_repair["recommended_legal_action"]
+    assert any(
+        "Accepted finish-time attestation alone" in reason
+        for reason in close_repair["reasons"]
+    )
     assert close_repair["append_payload_skeleton"]["payload"][
         "mf_subagent_finish_gate"
     ]["graph_trace_ids"] == ["<worker_owned_gqt_id>"]
+    facade_skeleton = close_repair["finish_gate_facade_payload_skeleton"]
+    assert facade_skeleton["action"] == "record_finish_gate"
+    assert facade_skeleton["endpoint"] == "runtime_context.finish_gate"
+    assert facade_skeleton["path"] == (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-gate"
+    )
+    assert facade_skeleton["body"]["finish_time_worker_self_attestation"] == (
+        "<accepted_finish_time_worker_self_attestation>"
+    )
+    assert facade_skeleton["body"]["graph_trace_ids"] == ["<worker_owned_gqt_id>"]
+    assert facade_skeleton["reminders"][
+        "raw_finish_time_attestation_alone_close_satisfying"
+    ] is False
     audit_recovery = repair["audit_archive_recovery"]
     assert audit_recovery["body_skeleton"]["timeline_precheck"]["failed_gates"] == [
         "close_timeline_startup_gate"
@@ -9239,6 +9263,9 @@ def test_repair_gate_summary_explains_cross_ref_task_mismatch_with_empty_missing
     assert "task_id mismatch" in cross_ref["diagnosis"]
     assert cross_ref["suggested_event_kind"] == "cross_ref_lineage_bridge"
     assert "sibling task_id" in cross_ref["reasons"][0]
+    assert "canonical runtime-context finish-gate facade" in cross_ref[
+        "recommended_legal_action"
+    ]
     skeleton = cross_ref["append_payload_skeleton"]
     assert skeleton["advisory_only"] is True
     assert skeleton["close_satisfying_by_itself"] is False

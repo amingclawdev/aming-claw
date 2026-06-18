@@ -3332,7 +3332,9 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     control_plane = observer_views["control_plane"]
     capability_boundary = observer_views["capability_boundary"]
     assert control_plane["schema_version"] == "runtime_context.control_plane.v1"
-    assert control_plane["next_legal_action"] == "record_finish_gate"
+    assert control_plane["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
     gate_projection = observer_views["gate_projection"]
     assert gate_projection["schema_version"] == "runtime_context.gate_projection.v1"
     assert gate_projection["projection_only"] is True
@@ -3582,6 +3584,9 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "finish_gate",
     ]
     assert next_required[0]["next_action"] == "record_finish_time_worker_attestation"
+    assert next_required[0]["next_after_success"] == "record_finish_gate"
+    assert next_required[1]["waits_for"] == "finish_time_worker_attestation"
+    assert "finish_time_worker_attestation" in next_required[1]["requires"]
     assert next_required[1]["runtime_context_id"] == context.runtime_context_id
     assert "current_values" not in worker_view
     assert "fence-current" not in json.dumps(worker_result, sort_keys=True)
@@ -3958,6 +3963,32 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         )
         assert auth["x_gov_token"]["header"] == "X-Gov-Token"
         assert auth["x_gov_token"]["role_required"] == "mf_sub"
+
+    finish_time_submission = write_guides["finish_time_worker_attestation"][
+        "finish_gate_submission"
+    ]
+    assert finish_time_submission["action"] == "record_finish_gate"
+    assert finish_time_submission["name"] == "record_finish_gate"
+    assert finish_time_submission["endpoint"] == "runtime_context.finish_gate"
+    assert finish_time_submission["path"] == (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-gate"
+    )
+    assert finish_time_submission["runtime_context_id"] == context.runtime_context_id
+    assert finish_time_submission["task_id"] == "runtime-current-task"
+    assert finish_time_submission["parent_task_id"] == "runtime-current-parent"
+    assert finish_time_submission["target_project_root"] == (
+        "/repo/.worktrees/runtime-current-task"
+    )
+    assert finish_time_submission["body"]["finish_time_worker_self_attestation"] == (
+        "<returned finish_time_worker_self_attestation>"
+    )
+    assert finish_time_submission["reminders"][
+        "raw_finish_time_attestation_alone_close_satisfying"
+    ] is False
+    assert write_guides["finish_gate"]["finish_gate_submission"]["action"] == (
+        "record_finish_gate"
+    )
 
     assert worker_guide["graph_query_identity"]["fence_token_hash"] == fence_hash
     assert worker_guide["graph_query_identity"]["fence_token_redacted"] is True
@@ -4742,11 +4773,93 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert finish_attestation["finish_time_worker_self_attestation"][
         "attestation_phase"
     ] == "finish"
-    assert finish_attestation["finish_gate_submission"] == {
-        "finish_time_worker_self_attestation": finish_attestation[
-            "finish_time_worker_self_attestation"
-        ]
-    }
+    assert finish_attestation["next_legal_action"] == "record_finish_gate"
+    finish_gate_submission = finish_attestation["finish_gate_submission"]
+    assert finish_gate_submission["action"] == "record_finish_gate"
+    assert finish_gate_submission["name"] == "record_finish_gate"
+    assert finish_gate_submission["method"] == "POST"
+    assert finish_gate_submission["endpoint"] == "runtime_context.finish_gate"
+    assert finish_gate_submission["path"] == (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-gate"
+    )
+    assert finish_gate_submission["concrete_path"] == (
+        f"/api/graph-governance/{PID}/runtime-contexts/"
+        f"{runtime_context_id}/finish-gate"
+    )
+    assert finish_gate_submission["runtime_context_id"] == runtime_context_id
+    assert finish_gate_submission["task_id"] == context.task_id
+    assert finish_gate_submission["parent_task_id"] == "runtime-facade-parent"
+    assert finish_gate_submission["target_project_root"] == str(worktree)
+    assert finish_gate_submission["checkpoint_id"] == "ckpt-runtime-facade"
+    assert finish_gate_submission["head_commit"] == head_commit
+    assert finish_gate_submission["changed_files"] == [changed_path]
+    assert finish_gate_submission["test_results"] == (
+        finish_attestation_body["test_results"]
+    )
+    assert finish_gate_submission["graph_trace_ids"] == [graph_trace_id]
+    assert finish_gate_submission["read_receipt_event_id"] == str(
+        read_receipt["timeline_event"]["id"]
+    )
+    assert finish_gate_submission["read_receipt_hash"] == "sha256:read-facade"
+    assert finish_gate_submission["finish_time_worker_self_attestation"] == (
+        finish_attestation["finish_time_worker_self_attestation"]
+    )
+    submission_body = finish_gate_submission["body"]
+    assert submission_body["finish_time_worker_self_attestation"] == (
+        finish_attestation["finish_time_worker_self_attestation"]
+    )
+    assert submission_body["checkpoint_id"] == "ckpt-runtime-facade"
+    assert submission_body["fence_token"].startswith("<same fence_token")
+    assert submission_body["session_token"].startswith("<same runtime_context")
+    assert finish_gate_submission["reminders"][
+        "raw_finish_time_attestation_alone_close_satisfying"
+    ] is False
+    assert "fence-facade" not in json.dumps(finish_gate_submission, sort_keys=True)
+    assert "facade-session" not in json.dumps(finish_gate_submission, sort_keys=True)
+
+    after_attestation_current = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                query={**common_body, "view": "all"},
+            )
+        )
+    )
+    after_worker_view = after_attestation_current["runtime_context_service"][
+        "views"
+    ]["worker_view"]
+    assert after_worker_view["action_plan"]["next_legal_action"] == (
+        "record_finish_gate"
+    )
+    after_required_ids = [
+        item["id"] for item in after_worker_view["next_required_evidence"]
+    ]
+    assert after_required_ids[0] == "finish_gate"
+    assert "finish_time_worker_attestation" not in after_required_ids
+
+    after_attestation_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                query={**common_body, "view": "current"},
+            )
+        )
+    )
+    assert after_attestation_guide["worker_guide"]["next_legal_action"] == (
+        "record_finish_gate"
+    )
+    assert after_attestation_guide["worker_guide"]["next_required_evidence"][0][
+        "id"
+    ] == "finish_gate"
     stored_attestation = conn.execute(
         "SELECT payload_json FROM task_timeline_events WHERE id = ?",
         (finish_attestation["timeline_event"]["id"],),
@@ -4761,6 +4874,49 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_attestation_payload["meta_contract_gate"]["action"] == (
         "worker_progress"
     )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="passed",
+        actor="conflicting-worker-session-facade",
+        payload={
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": "runtime-facade-parent",
+            "worker_role": "mf_sub",
+            "worker_session_id": "conflicting-worker-session-facade",
+            "filer_principal": "conflicting-worker-session-facade",
+            "head_commit": head_commit,
+            "changed_files": [changed_path],
+            "graph_trace_ids": [graph_trace_id],
+            "read_receipt_hash": "sha256:conflicting-read-facade",
+            "read_receipt_event_id": "999999",
+            "test_results": finish_attestation_body["test_results"],
+            "finish_time_worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "ok": True,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "conflicting-worker-session-facade",
+                "filer_principal": "conflicting-worker-session-facade",
+                "worker_transcript_path": str(transcript_path),
+                "harness_type": "codex",
+                "blockers": [],
+            },
+        },
+        commit_sha=head_commit,
+    )
 
     finish_body = {
         **common_body,
@@ -4774,6 +4930,8 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "checkpoint_id": "ckpt-runtime-facade-finish",
         "head_commit": head_commit,
         "agent_id": "agent-runtime-facade",
+        "worker_session_id": "worker-session-facade",
+        "filer_principal": "worker-session-facade",
         "actual_cwd": str(worktree),
         "actual_git_root": str(worktree),
         "owned_files": [changed_path],
@@ -4808,6 +4966,9 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     ]["worker_session_id"] == (
         "worker-session-facade"
     )
+    assert stored_finish_gate_payload["mf_subagent_finish_gate"][
+        "worker_self_attestation"
+    ]["worker_session_id"] != "conflicting-worker-session-facade"
     assert finish["context"]["replay_source"] == "mf_sub_finish_gate"
     assert finish["context"]["status"] == "validated"
 
