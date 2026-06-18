@@ -264,10 +264,25 @@ def test_work_mode_transition_requires_event_and_bound_precheck(transition_marke
     wrong_precheck = {
         "event_kind": "route_action_precheck",
         "status": "allowed",
-        "payload": {"route_id": "route-OTHER", "route_context_hash": "sha256:ctx"},
+        "payload": {
+            "route_id": "route-OTHER",
+            "route_context_hash": "sha256:ctx",
+            "prompt_contract_id": "rprompt-1",
+        },
     }
     assert observer_session.work_mode_transition_gate(
         [transition_event, wrong_precheck], canonical_route_identity=identity
+    )["allowed"] is False
+
+    # A requested source precheck records the request, but is not allowed proof.
+    requested_precheck = {
+        "event_kind": "route_action_precheck",
+        "event_type": "route.action.requested",
+        "status": "requested",
+        "payload": dict(identity),
+    }
+    assert observer_session.work_mode_transition_gate(
+        [transition_event, requested_precheck], canonical_route_identity=identity
     )["allowed"] is False
 
     # Transition event + precheck bound to canonical identity unlocks it.
@@ -281,6 +296,363 @@ def test_work_mode_transition_requires_event_and_bound_precheck(transition_marke
     )
     assert allowed["allowed"] is True
     assert allowed["missing"] == []
+
+    pre_mutation_precheck = {
+        "event_type": "route.action.pre_mutation",
+        "status": "allowed",
+        "payload": dict(identity),
+    }
+    allowed_pre_mutation = observer_session.work_mode_transition_gate(
+        [transition_event, pre_mutation_precheck], canonical_route_identity=identity
+    )
+    assert allowed_pre_mutation["allowed"] is True
+    assert allowed_pre_mutation["missing"] == []
+
+
+def test_work_mode_transition_accepts_allowed_service_child_nested_identity():
+    identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": "sha256:ctx-dpl",
+        "prompt_contract_id": "rprompt-dpl",
+        "prompt_contract_hash": "sha256:prompt-dpl",
+        "visible_injection_manifest_hash": "sha256:visible-dpl",
+    }
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    source_precheck = {
+        "id": 9,
+        "event_type": "route.action.requested",
+        "event_kind": "route_action_precheck",
+        "status": "requested",
+        "payload": {
+            "action": "dispatch_bounded_worker",
+            "route_context_hash": identity["route_context_hash"],
+            "prompt_contract_id": identity["prompt_contract_id"],
+            "prompt_contract_hash": identity["prompt_contract_hash"],
+            "visible_injection_manifest_hash": identity[
+                "visible_injection_manifest_hash"
+            ],
+        },
+        "verification": dict(identity),
+    }
+    service_child = {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "status": "allowed",
+        "decision": "allow",
+        "parent_event_id": 9,
+        "payload": {
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.action_precheck",
+            "source_event_id": "9",
+            "source_event_type": "route.action.requested",
+            "route_evidence": {
+                "contract_evidence": [
+                    {
+                        "service_id": "route.action_precheck",
+                        "event_kind": "route.action.requested",
+                        "route_id": "event.route_action.pre_mutation",
+                        "route_context_hash": identity["route_context_hash"],
+                        "prompt_contract_id": identity["prompt_contract_id"],
+                        "prompt_contract_hash": identity["prompt_contract_hash"],
+                        "status": "passed",
+                        "decision": "allow",
+                    }
+                ],
+            },
+            "result": {
+                "bundle": {
+                    "route": {"route_id": "route-repair-dpl"},
+                    "prompt_contract": {
+                        "prompt_contract_id": identity["prompt_contract_id"],
+                        "route_identity": {"route_id": "route-repair-dpl"},
+                    },
+                    "prompt_contract_hash": identity["prompt_contract_hash"],
+                },
+                "route_id": "event.route_action.pre_mutation",
+                "service_id": "route.action_precheck",
+                "status": "allowed",
+                "route_action_gate": {
+                    "allowed": True,
+                    "route_context_hash": identity["route_context_hash"],
+                    "prompt_contract_id": identity["prompt_contract_id"],
+                    "prompt_contract_hash": identity["prompt_contract_hash"],
+                },
+            },
+        },
+        "verification": {
+            "contract_evidence": [
+                {
+                    "service_id": "route.action_precheck",
+                    "event_kind": "route.action.requested",
+                    "route_id": "event.route_action.pre_mutation",
+                    "route_context_hash": identity["route_context_hash"],
+                    "prompt_contract_id": identity["prompt_contract_id"],
+                    "prompt_contract_hash": identity["prompt_contract_hash"],
+                    "status": "passed",
+                    "decision": "allow",
+                }
+            ]
+        },
+    }
+
+    gate = observer_session.work_mode_transition_gate(
+        [transition_event, source_precheck, service_child],
+        canonical_route_identity=identity,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["has_bound_route_action_precheck"] is True
+    assert gate["missing"] == []
+
+
+def test_work_mode_transition_accepts_service_child_nested_allowed_proof():
+    identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": "sha256:ctx-nested-allow",
+        "prompt_contract_id": "rprompt-nested-allow",
+        "prompt_contract_hash": "sha256:prompt-nested-allow",
+    }
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    service_child = {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "status": "completed",
+        "payload": {
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.action_precheck",
+            "result": {
+                "route_action_gate": {
+                    "allowed": True,
+                    "route_context_hash": identity["route_context_hash"],
+                    "prompt_contract_id": identity["prompt_contract_id"],
+                    "prompt_contract_hash": identity["prompt_contract_hash"],
+                }
+            },
+        },
+        "verification": {
+            "contract_evidence": [
+                {
+                    "route_context_hash": identity["route_context_hash"],
+                    "prompt_contract_id": identity["prompt_contract_id"],
+                    "prompt_contract_hash": identity["prompt_contract_hash"],
+                    "status": "passed",
+                    "decision": "allow",
+                }
+            ]
+        },
+    }
+
+    gate = observer_session.work_mode_transition_gate(
+        [transition_event, service_child],
+        canonical_route_identity=identity,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["missing"] == []
+
+
+def test_work_mode_transition_rejects_service_child_identity_mismatch():
+    identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": "sha256:ctx-dpl",
+        "prompt_contract_id": "rprompt-dpl",
+        "prompt_contract_hash": "sha256:prompt-dpl",
+    }
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    service_child = {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "status": "allowed",
+        "decision": "allow",
+        "payload": {
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.action_precheck",
+            "route_evidence": {
+                "contract_evidence": [
+                    {
+                        "route_id": "event.route_action.pre_mutation",
+                        "route_context_hash": "sha256:other-ctx",
+                        "prompt_contract_id": identity["prompt_contract_id"],
+                        "prompt_contract_hash": identity["prompt_contract_hash"],
+                        "status": "passed",
+                        "decision": "allow",
+                    }
+                ]
+            },
+        },
+    }
+
+    gate = observer_session.work_mode_transition_gate(
+        [transition_event, service_child],
+        canonical_route_identity=identity,
+    )
+
+    assert gate["allowed"] is False
+    assert gate["missing"] == ["route_action_precheck_bound_to_canonical_route"]
+
+
+def test_work_mode_transition_rejects_service_child_mixed_identity_conflict():
+    identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": "sha256:ctx-dpl",
+        "prompt_contract_id": "rprompt-dpl",
+        "prompt_contract_hash": "sha256:prompt-dpl",
+    }
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    service_child = {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "status": "allowed",
+        "decision": "allow",
+        "payload": {
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.action_precheck",
+            "route_context_hash": identity["route_context_hash"],
+            "prompt_contract_id": identity["prompt_contract_id"],
+            "prompt_contract_hash": identity["prompt_contract_hash"],
+            "result": {
+                "route_action_gate": {
+                    "allowed": True,
+                    "route_context_hash": "sha256:other-ctx",
+                    "prompt_contract_id": identity["prompt_contract_id"],
+                    "prompt_contract_hash": "sha256:other-prompt",
+                }
+            },
+        },
+    }
+
+    gate = observer_session.work_mode_transition_gate(
+        [transition_event, service_child],
+        canonical_route_identity=identity,
+    )
+
+    assert gate["allowed"] is False
+    assert gate["missing"] == ["route_action_precheck_bound_to_canonical_route"]
+
+
+def test_work_mode_transition_rejects_non_allowed_service_diagnostic():
+    identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": "sha256:ctx-dpl",
+        "prompt_contract_id": "rprompt-dpl",
+        "prompt_contract_hash": "sha256:prompt-dpl",
+    }
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    service_diagnostic = {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "status": "blocked",
+        "decision": "block",
+        "payload": {
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.action_precheck",
+            "route_evidence": {
+                "contract_evidence": [
+                    {
+                        "route_context_hash": identity["route_context_hash"],
+                        "prompt_contract_id": identity["prompt_contract_id"],
+                        "prompt_contract_hash": identity["prompt_contract_hash"],
+                        "status": "failed",
+                        "decision": "block",
+                    }
+                ]
+            },
+        },
+    }
+
+    gate = observer_session.work_mode_transition_gate(
+        [transition_event, service_diagnostic],
+        canonical_route_identity=identity,
+    )
+
+    assert gate["allowed"] is False
+    assert gate["missing"] == ["route_action_precheck_bound_to_canonical_route"]
+
+
+def test_work_mode_transition_rejects_non_precheck_service_with_pre_mutation_route():
+    identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": "sha256:ctx-dpl",
+        "prompt_contract_id": "rprompt-dpl",
+        "prompt_contract_hash": "sha256:prompt-dpl",
+    }
+    transition_event = {
+        "event_kind": "observer_work_mode_transition",
+        "status": "accepted",
+        "payload": {
+            "from_work_mode": "observer_look_before_act",
+            "to_work_mode": "observer_execution_supervisor",
+        },
+    }
+    service_diagnostic = {
+        "event_type": "service.route.completed",
+        "event_kind": "service_route",
+        "status": "allowed",
+        "decision": "allow",
+        "payload": {
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.prompt_alert_bundle",
+            "route_context_hash": identity["route_context_hash"],
+            "prompt_contract_id": identity["prompt_contract_id"],
+            "prompt_contract_hash": identity["prompt_contract_hash"],
+            "route_evidence": {
+                "contract_evidence": [
+                    {
+                        "service_id": "route.action_precheck",
+                        "route_id": "event.route_action.pre_mutation",
+                        "route_context_hash": identity["route_context_hash"],
+                        "prompt_contract_id": identity["prompt_contract_id"],
+                        "prompt_contract_hash": identity["prompt_contract_hash"],
+                        "status": "passed",
+                        "decision": "allow",
+                    }
+                ]
+            },
+        },
+    }
+
+    gate = observer_session.work_mode_transition_gate(
+        [transition_event, service_diagnostic],
+        canonical_route_identity=identity,
+    )
+
+    assert gate["allowed"] is False
+    assert gate["missing"] == ["route_action_precheck_bound_to_canonical_route"]
 
 
 # ---------------------------------------------------------------------------

@@ -936,9 +936,10 @@ def _insert_startup_timeline_event(conn, bug_id: str, route_identity: dict, even
         event_type="mf_subagent.startup",
         phase="startup",
         event_kind="mf_subagent_startup",
-        actor="observer-test",
+        actor="observer-on-behalf-of:mf-sub-test",
         status="passed",
         payload={
+            "on_behalf_of": "mf-sub-test",
             "mf_subagent_startup_gate": {
                 "route_context_hash": route_identity.get("route_context_hash", ""),
                 "prompt_contract_id": route_identity.get("prompt_contract_id", ""),

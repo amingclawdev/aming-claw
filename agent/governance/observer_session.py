@@ -423,44 +423,220 @@ def _work_mode_transition_event_matches(
     return True
 
 
-def _work_mode_first_deep_text(value: Any, key: str) -> str:
+def _work_mode_deep_text_values(value: Any, key: str) -> list[str]:
     if isinstance(value, Mapping):
+        values: list[str] = []
         token = str(value.get(key) or "").strip()
         if token:
-            return token
+            values.append(token)
         for child in value.values():
-            found = _work_mode_first_deep_text(child, key)
-            if found:
-                return found
-    elif isinstance(value, list):
+            values.extend(_work_mode_deep_text_values(child, key))
+        return values
+    if isinstance(value, list):
+        values: list[str] = []
         for child in value:
-            found = _work_mode_first_deep_text(child, key)
-            if found:
-                return found
-    return ""
+            values.extend(_work_mode_deep_text_values(child, key))
+        return values
+    return []
 
 
-def _work_mode_event_is_route_action_precheck(event: Mapping[str, Any]) -> bool:
-    marker = " ".join(
-        str(event.get(key) or "")
-        for key in ("event_kind", "event_type", "phase")
-    ).strip().lower().replace("-", "_").replace(".", "_")
-    if "route_action_precheck" in marker:
-        return True
-    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
-    service_id = (
-        str(payload.get("service_id") or "").strip().lower().replace("-", "_").replace(".", "_")
-    )
-    action = (
-        str(payload.get("action") or payload.get("requested_action") or "")
+def _work_mode_norm_route_token(value: Any) -> str:
+    return (
+        str(value or "")
         .strip()
         .lower()
         .replace("-", "_")
         .replace(".", "_")
+        .replace(" ", "_")
     )
-    return service_id in {"route_action_precheck", "route_action_pre_mutation"} or (
-        service_id.startswith("route_action") and "precheck" in service_id
-    ) or action in {"route_action_precheck", "route_action_pre_mutation"}
+
+
+def _work_mode_route_action_marker(value: Any) -> bool:
+    token = _work_mode_norm_route_token(value)
+    if "route_action_precheck" in token or "route_action_pre_mutation" in token:
+        return True
+    return "route_action" in token and (
+        "precheck" in token or "pre_mutation" in token
+    )
+
+
+def _work_mode_route_action_source_marker(value: Any) -> bool:
+    token = _work_mode_norm_route_token(value)
+    return "route_action_precheck" in token or token in {
+        "route_action_requested",
+        "route_action_request",
+        "route_action_pre_mutation",
+    }
+
+
+def _work_mode_service_route_id(value: Any) -> bool:
+    token = _work_mode_norm_route_token(value)
+    return "route_action" in token and (
+        "precheck" in token or "pre_mutation" in token
+    )
+
+
+def _work_mode_event_is_service_route(event: Mapping[str, Any]) -> bool:
+    containers: list[Mapping[str, Any]] = [event]
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        containers.append(payload)
+    marker_keys = ("event_kind", "event_type", "phase", "kind", "service_id")
+    return any(
+        "service_route" in _work_mode_norm_route_token(container.get(key))
+        or "service_router" in _work_mode_norm_route_token(container.get(key))
+        for container in containers
+        for key in marker_keys
+    )
+
+
+def _work_mode_service_field_is_route_action_precheck(event: Mapping[str, Any]) -> bool:
+    service_keys = (
+        "service_id",
+        "route_service",
+        "route_service_id",
+        "service",
+        "service_name",
+    )
+    containers: list[Mapping[str, Any]] = [event]
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        containers.append(payload)
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            containers.append(result)
+    result = event.get("result")
+    if isinstance(result, Mapping):
+        containers.append(result)
+    return any(
+        _work_mode_route_action_marker(container.get(key))
+        for container in containers
+        for key in service_keys
+    )
+
+
+def _work_mode_event_is_route_action_precheck(event: Mapping[str, Any]) -> bool:
+    if _work_mode_event_is_service_route(event):
+        return _work_mode_service_field_is_route_action_precheck(event)
+
+    return any(
+        _work_mode_route_action_source_marker(event.get(key))
+        for key in ("event_kind", "event_type")
+    )
+
+
+def _work_mode_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _work_mode_norm_route_token(value) in {
+        "1",
+        "true",
+        "yes",
+        "allow",
+        "allowed",
+        "passed",
+        "accepted",
+        "ok",
+        "approved",
+    }
+
+
+def _work_mode_allowed_status(value: Any) -> bool:
+    return _work_mode_norm_route_token(value) in {
+        "allow",
+        "allowed",
+        "passed",
+        "accepted",
+        "ok",
+        "approved",
+    }
+
+
+def _work_mode_route_action_gate_allowed(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        gate = value.get("route_action_gate")
+        if isinstance(gate, Mapping) and (
+            _work_mode_truthy(gate.get("allowed"))
+            or _work_mode_allowed_status(gate.get("decision"))
+            or _work_mode_allowed_status(gate.get("status"))
+        ):
+            return True
+        return any(_work_mode_route_action_gate_allowed(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_work_mode_route_action_gate_allowed(child) for child in value)
+    return False
+
+
+def _work_mode_contract_evidence_allowed(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        evidence = value.get("contract_evidence")
+        if isinstance(evidence, list):
+            for item in evidence:
+                if not isinstance(item, Mapping):
+                    continue
+                if _work_mode_allowed_status(item.get("status")) and (
+                    _work_mode_allowed_status(item.get("decision"))
+                    or _work_mode_truthy(item.get("allowed"))
+                ):
+                    return True
+        return any(_work_mode_contract_evidence_allowed(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_work_mode_contract_evidence_allowed(child) for child in value)
+    return False
+
+
+def _work_mode_route_precheck_allowed(event: Mapping[str, Any]) -> bool:
+    if _work_mode_allowed_status(event.get("status")) or _work_mode_allowed_status(
+        event.get("decision")
+    ):
+        return True
+    return _work_mode_route_action_gate_allowed(
+        event
+    ) or _work_mode_contract_evidence_allowed(event)
+
+
+def _work_mode_route_identity_matches(
+    event: Mapping[str, Any],
+    expected: Mapping[str, str],
+) -> bool:
+    if not expected:
+        return True
+
+    required_fields = ["route_context_hash", "prompt_contract_id"]
+    if expected.get("prompt_contract_hash"):
+        required_fields.append("prompt_contract_hash")
+
+    for key in required_fields:
+        want = expected.get(key, "")
+        if not want:
+            continue
+        values = _work_mode_deep_text_values(event, key)
+        if not values or any(value != want for value in values):
+            return False
+
+    for key in ("visible_injection_manifest_hash",):
+        want = expected.get(key, "")
+        if not want:
+            continue
+        values = _work_mode_deep_text_values(event, key)
+        if values and any(value != want for value in values):
+            return False
+
+    want_route_id = expected.get("route_id", "")
+    if want_route_id:
+        route_ids = _work_mode_deep_text_values(event, "route_id")
+        if want_route_id in route_ids:
+            return True
+        if _work_mode_event_is_service_route(event):
+            return True
+        canonical_route_ids = [
+            route_id
+            for route_id in route_ids
+            if not _work_mode_service_route_id(route_id)
+        ]
+        if canonical_route_ids:
+            return False
+    return True
 
 
 def _route_action_precheck_bound_to_identity(
@@ -471,32 +647,21 @@ def _route_action_precheck_bound_to_identity(
         return False
     if not _work_mode_event_is_route_action_precheck(event):
         return False
-    status = str(event.get("status") or event.get("decision") or "").strip().lower()
-    if status not in {"allow", "allowed", "passed", "accepted", "ok", "approved"}:
+    if not _work_mode_route_precheck_allowed(event):
         return False
     identity = canonical_route_identity if isinstance(canonical_route_identity, Mapping) else {}
     expected = {
         key: str(identity.get(key) or "").strip()
-        for key in ("route_id", "route_context_hash", "prompt_contract_id")
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
         if str(identity.get(key) or "").strip()
     }
-    if not expected:
-        # No canonical identity supplied: a passing precheck is sufficient.
-        return True
-    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
-    verification = (
-        event.get("verification") if isinstance(event.get("verification"), Mapping) else {}
-    )
-    for key, want in expected.items():
-        got = ""
-        for source in (event, payload, verification):
-            candidate = _work_mode_first_deep_text(source, key)
-            if candidate:
-                got = candidate
-                break
-        if got != want:
-            return False
-    return True
+    return _work_mode_route_identity_matches(event, expected)
 
 
 def work_mode_transition_gate(
