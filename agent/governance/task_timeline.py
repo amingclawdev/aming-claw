@@ -5905,20 +5905,23 @@ def mf_fixed_close_waiver_alert(
     status: Any,
     can_close: Any,
     events: list[dict[str, Any]] | None,
+    *,
+    applicable: Any = True,
 ) -> dict[str, Any]:
     """Governance alert for FIXED rows lacking close authorization.
 
     Criterion 2: a row in FIXED status with can_close=false and no explicit,
     visible close-waiver marker is a governance integrity alert (FIXED implies
-    can_close=true OR a visible waiver marker).
+    can_close=true OR a visible waiver marker) when the MF close gate applies.
     """
 
     normalized_status = _normalize_token(status)
     is_fixed = normalized_status == "fixed"
+    applicable_bool = _truthy(applicable)
     can_close_bool = _truthy(can_close)
     waiver_state = mf_close_waiver_state(events)
     has_waiver = bool(waiver_state.get("has_close_waiver"))
-    alert = is_fixed and not can_close_bool and not has_waiver
+    alert = applicable_bool and is_fixed and not can_close_bool and not has_waiver
     return {
         "schema_version": MF_FIXED_CLOSE_WAIVER_ALERT_SCHEMA_VERSION,
         "alert": alert,

@@ -8115,6 +8115,72 @@ class TestTaskTimeline(unittest.TestCase):
                 ["close_ready", "implementation", "verification"],
             )
 
+    def test_fixed_close_waiver_alert_suppressed_for_fixed_non_mf_compact_precheck(self):
+        from agent.governance import server
+
+        bug_id = "BUG-NON-MF-FIXED-PRECHECK"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, created_at, updated_at)
+               VALUES (?, ?, 'FIXED', '2026-06-18T00:00:00Z', '2026-06-18T00:00:00Z')""",
+            (bug_id, "Fixed non-MF compact precheck"),
+        )
+        self.conn.commit()
+
+        result = server.handle_backlog_timeline_gate(
+            _ctx({"view": "compact"}, path_params={"bug_id": bug_id})
+        )
+
+        self.assertFalse(result["applicable"], result)
+        self.assertEqual(result["reason"], "not an MF/observer backlog row")
+        self.assertFalse(result["can_close"])
+        self.assertNotIn("governance_alert", result)
+        fixed_alert = result["fixed_close_waiver_alert"]
+        self.assertFalse(fixed_alert["alert"], fixed_alert)
+        self.assertEqual(fixed_alert["status"], "ok")
+        self.assertEqual(fixed_alert["reason"], "")
+        summary = result["gate_summary"]
+        self.assertFalse(summary["applicable"], summary)
+        self.assertFalse(summary["can_close"])
+        self.assertEqual(
+            summary["repair_reasons"][0]["code"],
+            "timeline_gate_not_applicable",
+        )
+        self.assertIn("appropriate workflow", summary["next_legal_actions"][0])
+        self.assertIn("close_ready/can_close success", summary["next_legal_actions"][0])
+
+    def test_fixed_close_waiver_alert_still_flags_fixed_mf_compact_precheck(self):
+        from agent.governance import server
+
+        bug_id = "BUG-MF-FIXED-PRECHECK"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+               VALUES (?, ?, 'FIXED', 'chain_rescue', ?, '2026-06-18T00:00:00Z',
+                       '2026-06-18T00:00:00Z')""",
+            (
+                bug_id,
+                "Fixed MF compact precheck",
+                json.dumps({"mf_type": "chain_rescue"}),
+            ),
+        )
+        self.conn.commit()
+
+        result = server.handle_backlog_timeline_gate(
+            _ctx({"view": "compact"}, path_params={"bug_id": bug_id})
+        )
+
+        self.assertTrue(result["applicable"], result)
+        self.assertFalse(result["can_close"])
+        fixed_alert = result["fixed_close_waiver_alert"]
+        self.assertTrue(fixed_alert["alert"], fixed_alert)
+        self.assertEqual(fixed_alert["status"], "alert")
+        self.assertEqual(
+            fixed_alert["reason"],
+            "fixed_row_without_can_close_or_close_waiver",
+        )
+        self.assertEqual(result["governance_alert"], fixed_alert)
+
     def test_backlog_timeline_gate_precheck_uses_instantiated_contract(self):
         from agent.governance import server, task_timeline
 

@@ -30586,6 +30586,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             _row_get(row, "status", ""),
             can_close,
             events,
+            applicable=applicable["is_mf"],
         )
         result["fixed_close_waiver_alert"] = fixed_close_alert
         if fixed_close_alert.get("alert"):
