@@ -15,6 +15,7 @@ DIRTY_IGNORE_PREFIXES = (
     "build/", "build\\",
     "docs/dev/", "docs/dev\\",
     ".recent-tasks.json",
+    ".aming-claw-demo-environment.json",
     ".governance-cache/", ".governance-cache\\",
     ".observer-cache/", ".observer-cache\\",
     ".aming-claw/cache/", ".aming-claw\\cache\\",
