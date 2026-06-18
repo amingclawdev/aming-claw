@@ -8451,6 +8451,197 @@ def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
     return dict(route_identity)
 
 
+def _runtime_context_child_route_token(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _runtime_context_route_identity_from_child_token(
+    token: Mapping[str, Any],
+    *,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    child_lineage = (
+        token.get("child_route_lineage")
+        if isinstance(token.get("child_route_lineage"), Mapping)
+        else {}
+    )
+    return {
+        "route_id": str(token.get("route_id") or child_lineage.get("route_id") or "").strip(),
+        "route_context_hash": str(
+            token.get("route_context_hash") or child_lineage.get("route_context_hash") or ""
+        ).strip(),
+        "prompt_contract_id": str(
+            token.get("prompt_contract_id") or child_lineage.get("prompt_contract_id") or ""
+        ).strip(),
+        "prompt_contract_hash": str(
+            token.get("prompt_contract_hash") or child_lineage.get("prompt_contract_hash") or ""
+        ).strip(),
+        "route_token_ref": str(
+            route_token_ref
+            or token.get("route_token_ref")
+            or child_lineage.get("route_token_ref")
+            or ""
+        ).strip(),
+        "visible_injection_manifest_hash": str(
+            token.get("visible_injection_manifest_hash")
+            or child_lineage.get("visible_injection_manifest_hash")
+            or ""
+        ).strip(),
+    }
+
+
+def _runtime_context_route_identity_mismatch_fields(
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+    *,
+    prefix: str = "",
+) -> list[dict[str, str]]:
+    mismatches: list[dict[str, str]] = []
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        expected_value = str(expected.get(field) or "").strip()
+        if not expected_value:
+            continue
+        actual_value = str(actual.get(field) or "").strip()
+        if actual_value != expected_value:
+            mismatches.append(
+                {
+                    "field": f"{prefix}{field}" if prefix else field,
+                    "expected": expected_value,
+                    "actual": actual_value,
+                }
+            )
+    return mismatches
+
+
+def _runtime_context_raise_child_route_lineage_error(
+    *,
+    code: str,
+    runtime_context_id: str,
+    context,
+    parent_route_identity: Mapping[str, Any],
+    child_route_identity: Mapping[str, Any],
+    mismatched_fields: list[dict[str, str]] | None = None,
+) -> None:
+    raise GovernanceError(
+        code,
+        "runtime-context implementation evidence child route token is not bound to the latest runtime contract route",
+        422,
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": getattr(context, "task_id", ""),
+            "backlog_id": getattr(context, "backlog_id", ""),
+            "recoverable": True,
+            "next_legal_action": (
+                "reissue_child_route_token_from_latest_runtime_contract_parent_route"
+            ),
+            "repair": {
+                "action": "refresh_runtime_contract_or_reissue_child_route_token",
+                "detail": (
+                    "Use a parent-bound child route token whose parent_route_lineage "
+                    "matches the latest runtime contract route identity, or use the "
+                    "canonical parent route_token_ref path."
+                ),
+                "required_payload": {
+                    "route_token": {
+                        "parent_route_lineage": _route_identity_public_summary(
+                            parent_route_identity
+                        ),
+                        "child_route_lineage": "<child route identity>",
+                    }
+                },
+            },
+            "parent_route_identity": _route_identity_public_summary(parent_route_identity),
+            "child_route_identity": _route_identity_public_summary(child_route_identity),
+            "mismatched_fields": mismatched_fields or [],
+        },
+    )
+
+
+def _runtime_context_implementation_event_route_identity(
+    body: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    context,
+    parent_route_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    token = _runtime_context_child_route_token(body.get("route_token"))
+    if not token:
+        return dict(parent_route_identity), {}
+
+    child_route_identity = _runtime_context_route_identity_from_child_token(
+        token,
+        route_token_ref=str(body.get("route_token_ref") or "").strip(),
+    )
+    token_parent_mismatches = _runtime_context_route_identity_mismatch_fields(
+        parent_route_identity,
+        child_route_identity,
+    )
+    token_matches_parent = not [
+        item for item in token_parent_mismatches if item.get("field") != "route_token_ref"
+    ]
+    parent_lineage = (
+        token.get("parent_route_lineage")
+        if isinstance(token.get("parent_route_lineage"), Mapping)
+        else {}
+    )
+    if not parent_lineage:
+        if token_matches_parent:
+            return dict(parent_route_identity), {}
+        _runtime_context_raise_child_route_lineage_error(
+            code="parent_route_lineage_missing",
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_route_identity=parent_route_identity,
+            child_route_identity=child_route_identity,
+        )
+
+    mismatches = _runtime_context_route_identity_mismatch_fields(
+        parent_route_identity,
+        parent_lineage,
+        prefix="parent_route_lineage.",
+    )
+    if mismatches:
+        _runtime_context_raise_child_route_lineage_error(
+            code="parent_route_lineage_mismatch",
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_route_identity=parent_route_identity,
+            child_route_identity=child_route_identity,
+            mismatched_fields=mismatches,
+        )
+
+    child_lineage = (
+        dict(token.get("child_route_lineage"))
+        if isinstance(token.get("child_route_lineage"), Mapping)
+        else _route_identity_public_summary(child_route_identity)
+    )
+    if child_route_identity.get("route_token_ref") and not child_lineage.get("route_token_ref"):
+        child_lineage["route_token_ref"] = child_route_identity["route_token_ref"]
+    route_lineage = (
+        dict(token.get("route_lineage"))
+        if isinstance(token.get("route_lineage"), Mapping)
+        else {
+            "schema_version": "runtime_context.implementation_route_lineage.v1",
+            "status": "parent_bound",
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+        }
+    )
+    return child_route_identity, {
+        "parent_route_lineage": dict(parent_lineage),
+        "child_route_lineage": dict(child_lineage),
+        "route_lineage": route_lineage,
+    }
+
+
 def _runtime_context_forward_request(
     ctx: RequestContext,
     *,
@@ -9700,11 +9891,22 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         route_identity = _runtime_context_latest_route_identity(conn, context)
     finally:
         conn.close()
+    event_route_identity, route_lineage_payload = (
+        _runtime_context_implementation_event_route_identity(
+            body,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_route_identity=route_identity,
+        )
+    )
 
     supplied_payload = (
         body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
     )
     payload = _strip_top_level_timeline_role_fields(supplied_payload)
+    for key, value in route_lineage_payload.items():
+        if value:
+            payload[key] = value
     parent_task_id = (
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
@@ -9731,8 +9933,8 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "route_token_ref",
         "visible_injection_manifest_hash",
     ):
-        if route_identity.get(key):
-            payload[key] = route_identity.get(key)
+        if event_route_identity.get(key):
+            payload[key] = event_route_identity.get(key)
     for key in ("changed_files", "tests", "test_results", "risk", "summary"):
         if key in body:
             payload[key] = body.get(key)
@@ -9742,11 +9944,11 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     event_body = {
         "task_id": context.task_id,
         "backlog_id": context.backlog_id,
-        "route_id": route_identity.get("route_id") or "",
-        "route_context_hash": route_identity.get("route_context_hash") or "",
-        "prompt_contract_id": route_identity.get("prompt_contract_id") or "",
-        "prompt_contract_hash": route_identity.get("prompt_contract_hash") or "",
-        "route_token_ref": route_identity.get("route_token_ref") or "",
+        "route_id": event_route_identity.get("route_id") or "",
+        "route_context_hash": event_route_identity.get("route_context_hash") or "",
+        "prompt_contract_id": event_route_identity.get("prompt_contract_id") or "",
+        "prompt_contract_hash": event_route_identity.get("prompt_contract_hash") or "",
+        "route_token_ref": event_route_identity.get("route_token_ref") or "",
         "event_type": body.get("event_type") or "mf.implementation",
         "event_kind": body.get("event_kind") or "implementation",
         "phase": body.get("phase") or "implementation",
@@ -9771,7 +9973,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         gate = dict(body.get("route_token_gate") or {})
         mismatched = _runtime_context_gate_identity_mismatches(
             gate,
-            route_identity,
+            event_route_identity,
             expected_scope={
                 "project_id": project_id,
                 "backlog_id": context.backlog_id,

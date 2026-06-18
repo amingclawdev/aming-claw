@@ -4988,6 +4988,285 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         assert "raw-route-token-facade" not in response_json
 
 
+def test_runtime_context_implementation_evidence_accepts_parent_bound_child_route_token(
+    conn,
+    tmp_path,
+):
+    from agent.governance import observer_route_context
+
+    target_root = tmp_path / "runtime-child-route-token"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="runtime-child-route-token-task",
+            root_task_id="runtime-child-route-token-parent",
+            backlog_id="AC-RUNTIME-CHILD-ROUTE-TOKEN",
+            stage_task_id="runtime-child-route-token-task",
+            worker_id="worker-child-route-token",
+            worker_slot_id="slot-child-route-token",
+            branch_ref="refs/heads/codex/runtime-child-route-token-task",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-child-route-token",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-child-route-token"
+            ),
+        ),
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-runtime-parent-route-token"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_route_identity = {
+        "route_id": parent_issue["route_id"],
+        "route_context_hash": parent_issue["route_context_hash"],
+        "prompt_contract_id": parent_issue["prompt_contract_id"],
+        "prompt_contract_hash": parent_issue["route_token"]["prompt_contract_hash"],
+        "route_token_ref": parent_issue["route_token_ref"],
+        "visible_injection_manifest_hash": parent_issue[
+            "visible_injection_manifest_hash"
+        ],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-child-parent",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=parent_route_identity,
+    )
+    child_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-runtime-child-route-token"],
+        parent_route_identity={
+            **parent_route_identity,
+            "selected_project": PID,
+            "selected_backlog_id": context.backlog_id,
+        },
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_issue["route_token_ref"],
+        token=child_issue["route_token"],
+    )
+
+    parent_response = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": context.root_task_id,
+                    "fence_token": "fence-child-route-token",
+                    "session_token": "session-child-route-token",
+                    "target_project_root": str(target_root),
+                    "changed_files": ["agent/governance/server.py"],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "payload": {"worker_role": "mf_sub", "summary": "parent token path"},
+                    "route_token": parent_issue["route_token"],
+                },
+            )
+        )
+    )
+    assert parent_response["ok"] is True
+    assert parent_response["route_token_gate"]["decision"] == "route_token"
+    parent_stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (parent_response["timeline_event"]["id"],),
+    ).fetchone()
+    parent_payload = json.loads(parent_stored["payload_json"])
+    assert parent_payload["route_id"] == parent_route_identity["route_id"]
+    assert "parent_route_lineage" not in parent_payload
+
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": context.root_task_id,
+                "fence_token": "fence-child-route-token",
+                "session_token": "session-child-route-token",
+                "target_project_root": str(target_root),
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {"worker_role": "mf_sub", "summary": "child token path"},
+                "route_token": child_issue["route_token"],
+                "route_token_ref": child_issue["route_token_ref"],
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["timeline_event"]["event_kind"] == "implementation"
+    assert response["route_token_gate"]["decision"] == "route_token"
+    assert response["route_token_gate"]["route_token_ref"] == child_issue["route_token_ref"]
+
+    stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (response["timeline_event"]["id"],),
+    ).fetchone()
+    payload = json.loads(stored["payload_json"])
+    child_route = child_issue["route_token"]
+    assert payload["route_id"] == child_route["route_id"]
+    assert payload["route_context_hash"] == child_route["route_context_hash"]
+    assert payload["prompt_contract_id"] == child_route["prompt_contract_id"]
+    assert payload["route_token_ref"] == child_issue["route_token_ref"]
+    assert payload["parent_route_lineage"]["route_id"] == parent_route_identity["route_id"]
+    assert payload["parent_route_lineage"]["route_token_ref"] == (
+        parent_route_identity["route_token_ref"]
+    )
+    assert payload["child_route_lineage"]["route_id"] == child_route["route_id"]
+    assert payload["child_route_lineage"]["route_token_ref"] == (
+        child_issue["route_token_ref"]
+    )
+    assert payload["route_lineage"]["parent_route_lineage"]["route_id"] == (
+        parent_route_identity["route_id"]
+    )
+    assert payload["meta_contract_gate"]["action"] == "implementation"
+
+
+def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_lineage(
+    conn,
+    tmp_path,
+):
+    from agent.governance import observer_route_context
+
+    target_root = tmp_path / "runtime-child-route-reject"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="runtime-child-route-reject-task",
+            root_task_id="runtime-child-route-reject-parent",
+            backlog_id="AC-RUNTIME-CHILD-ROUTE-REJECT",
+            stage_task_id="runtime-child-route-reject-task",
+            worker_id="worker-child-route-reject",
+            worker_slot_id="slot-child-route-reject",
+            branch_ref="refs/heads/codex/runtime-child-route-reject-task",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-child-route-reject",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-child-route-reject"
+            ),
+        ),
+    )
+    parent_route_identity = {
+        "route_id": "route-runtime-child-reject-parent",
+        "route_context_hash": "sha256:route-runtime-child-reject-parent",
+        "prompt_contract_id": "rprompt-runtime-child-reject-parent",
+        "prompt_contract_hash": "sha256:prompt-runtime-child-reject-parent",
+        "route_token_ref": "rtok-runtime-child-reject-parent",
+        "visible_injection_manifest_hash": "sha256:visible-runtime-child-reject-parent",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-child-reject-parent",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=parent_route_identity,
+    )
+    unrelated_parent = {
+        **parent_route_identity,
+        "route_id": "route-runtime-child-unrelated-parent",
+        "route_context_hash": "sha256:route-runtime-child-unrelated-parent",
+    }
+    unrelated_child = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        parent_route_identity={
+            **unrelated_parent,
+            "selected_project": PID,
+            "selected_backlog_id": context.backlog_id,
+        },
+    )
+    token_without_parent = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+    )
+    common_body = {
+        "parent_task_id": context.root_task_id,
+        "fence_token": "fence-child-route-reject",
+        "session_token": "session-child-route-reject",
+        "target_project_root": str(target_root),
+        "changed_files": ["agent/governance/server.py"],
+        "tests": [{"command": "pytest -q", "status": "passed"}],
+        "payload": {"worker_role": "mf_sub"},
+    }
+
+    with pytest.raises(GovernanceError) as mismatch:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "route_token": unrelated_child["route_token"],
+                    "route_token_ref": unrelated_child["route_token_ref"],
+                },
+            )
+        )
+    assert mismatch.value.code == "parent_route_lineage_mismatch"
+    assert mismatch.value.status == 422
+    assert mismatch.value.details["next_legal_action"] == (
+        "reissue_child_route_token_from_latest_runtime_contract_parent_route"
+    )
+    assert mismatch.value.details["mismatched_fields"][0]["field"] == (
+        "parent_route_lineage.route_id"
+    )
+
+    with pytest.raises(GovernanceError) as missing:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "route_token": token_without_parent["route_token"],
+                    "route_token_ref": token_without_parent["route_token_ref"],
+                },
+            )
+        )
+    assert missing.value.code == "parent_route_lineage_missing"
+    assert missing.value.status == 422
+    assert missing.value.details["repair"]["action"] == (
+        "refresh_runtime_contract_or_reissue_child_route_token"
+    )
+
+
 def test_runtime_context_finish_gate_facade_preserves_contract_error_tuple(conn):
     context = upsert_branch_context(
         conn,
