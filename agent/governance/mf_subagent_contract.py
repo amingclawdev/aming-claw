@@ -3640,7 +3640,7 @@ def surrogate_startup_evidence_gate(
     }
 
 
-def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+def _finish_gate_payload_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
     for container in (
         _nested_mapping(event, "payload"),
         _nested_mapping(event, "verification"),
@@ -3649,14 +3649,33 @@ def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any
     ):
         if not container:
             continue
-        finish_gate = _nested_mapping(container, "mf_subagent_finish_gate")
-        if finish_gate:
-            startup_projection = _finish_gate_startup_close_projection(
-                event,
-                finish_gate,
-            )
-            if startup_projection:
-                return startup_projection
+        for key in ("mf_subagent_finish_gate", "finish_gate", "finish_gate_result"):
+            finish_gate = _nested_mapping(container, key)
+            if finish_gate:
+                return finish_gate
+        if _string(container.get("schema_version")) == FINISH_GATE_SCHEMA_VERSION:
+            return dict(container)
+    return {}
+
+
+def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    finish_gate = _finish_gate_payload_from_event(event)
+    if finish_gate:
+        startup_projection = _finish_gate_startup_close_projection(
+            event,
+            finish_gate,
+        )
+        if startup_projection:
+            return startup_projection
+
+    for container in (
+        _nested_mapping(event, "payload"),
+        _nested_mapping(event, "verification"),
+        _nested_mapping(event, "artifact_refs"),
+        event,
+    ):
+        if not container:
+            continue
         for key in (
             "mf_subagent_startup_gate",
             "startup_evidence",
@@ -3738,7 +3757,6 @@ def _finish_gate_startup_close_projection(
     )
     return startup_evidence
 
-
 def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
     """Evaluate close-timeline startup events for close-satisfying evidence.
 
@@ -3782,6 +3800,9 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
         worker_self_attestation_gate = _worker_self_attestation_close_gate(
             close_satisfying_startup
         )
+        startup_worker_identity_gate = _startup_worker_identity_close_gate(
+            close_satisfying_startup
+        )
         event_ref = {
             "index": index,
             "id": _string(event.get("id") or event.get("event_id")),
@@ -3791,7 +3812,11 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
             "reason": surrogate_gate.get("reason", ""),
             "real_worker_join": surrogate_gate.get("real_worker_join", {}),
             "worker_self_attestation_gate": worker_self_attestation_gate,
+            "startup_worker_identity_gate": startup_worker_identity_gate,
         }
+        if _bool(gate.get("finish_gate_startup_projection")):
+            event_ref["projection"] = "finish_gate_startup_projection"
+            event_ref["finish_gate_event_id"] = _string(gate.get("finish_gate_event_id"))
         if surrogate_gate.get("close_satisfying") and worker_self_attestation_gate.get("passed"):
             accepted.append(event_ref)
         else:

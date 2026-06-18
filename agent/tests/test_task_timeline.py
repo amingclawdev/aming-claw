@@ -8964,6 +8964,228 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert "append_payload_skeleton" not in route_repair_item
 
 
+def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap():
+    from agent.governance import task_timeline
+
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "missing_event_kinds": [],
+        "event_count": 2,
+        "close_timeline_startup_gate": {
+            "schema_version": "mf_close_timeline_startup_gate.v1",
+            "passed": False,
+            "status": "failed",
+            "demoted_startup_events": [
+                {
+                    "id": 5300,
+                    "event_kind": "mf_subagent_startup",
+                    "phase": "startup_gate",
+                    "status": "passed",
+                    "reason": "worker_self_attestation_not_close_satisfying",
+                    "worker_self_attestation_blockers": [
+                        "worker_self_attestation_not_passed"
+                    ],
+                    "worker_self_attestation_gate": {
+                        "status": "blocked",
+                        "passed": False,
+                        "blockers": ["worker_self_attestation_not_passed"],
+                        "attestation": {
+                            "status": "blocked",
+                            "blockers": [
+                                "graph_trace_ids_not_db_verified",
+                                "missing_mf_subagent_graph_trace_ids",
+                            ],
+                        },
+                    },
+                    "startup_worker_identity_gate": {
+                        "status": "passed",
+                        "passed": True,
+                        "blockers": [],
+                    },
+                }
+            ],
+            "demoted_startup_event_indexes": [0],
+        },
+    }
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+    close_repair = next(
+        item
+        for item in repair["failed_gate_repairs"]
+        if item["gate"] == "close_timeline_startup_gate"
+    )
+
+    assert close_repair["rejected_event_ids"] == [5300]
+    assert close_repair["relevant_event_ids"] == [5300]
+    assert "graph_trace_ids" in close_repair["missing_fields"]
+    assert "finish_time_worker_self_attestation" in close_repair["missing_fields"]
+    assert close_repair["suggested_event_kind"] == "mf_subagent_finish_gate"
+    assert "Do not record another startup" in close_repair["recommended_legal_action"]
+    assert close_repair["append_payload_skeleton"]["payload"][
+        "mf_subagent_finish_gate"
+    ]["graph_trace_ids"] == ["<worker_owned_gqt_id>"]
+
+
+def test_close_gate_startup_gate_consumes_canonical_finish_gate_projection():
+    from agent.governance import task_timeline
+
+    route_identity = {
+        **ROUTE_IDENTITY,
+        "route_id": "route-r7",
+        "visible_injection_manifest_hash": "sha256:visible-r7",
+        "route_token_ref": "rtok-r7",
+    }
+    runtime_context_id = "mfrctx-adb2e7b48aeabadb"
+    task_id = "observer-command-close-projection-worker-20260618-r7"
+    parent_task_id = "AC-OBSERVER-COMMAND-EXECUTE-BACKLOG-ROW-20260602"
+    worker_session_id = "019ed92d-f34d-70e2-a97a-d384aa817b61"
+    startup_gate = {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "bounded": True,
+        "close_satisfying": False,
+        **route_identity,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_session_id,
+        "worker_slot_id": worker_session_id,
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "fence_token": "fence-r7",
+        "actual_cwd": "/repo/.worktrees/r7",
+        "actual_git_root": "/repo/.worktrees/r7",
+        "worktree_path": "/repo/.worktrees/r7",
+        "branch": "refs/heads/codex/r7",
+        "head_commit": "38a397a7997c945ffb0e638e44576efee1823000",
+        "worker_transcript_ref": "codex-thread:r7",
+        "harness_type": "codex",
+        "read_receipt_hash": "sha256:read-r7",
+        "read_receipt_event_id": "5299",
+        "observer_command_id": "cmd-r7",
+        "worker_self_attestation": {
+            "status": "blocked",
+            "worker_self_attesting": False,
+            "self_attesting": False,
+            "worker_session_id": worker_session_id,
+            "worker_transcript_ref": "codex-thread:r7",
+            "harness_type": "codex",
+            "blockers": [
+                "graph_trace_ids_not_db_verified",
+                "missing_mf_subagent_graph_trace_ids",
+            ],
+        },
+    }
+    finish_attestation = {
+        "attestation_phase": "finish",
+        "status": "passed",
+        "ok": True,
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "finish_time_self_attesting": True,
+        "finish_time_blockers": [],
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "worker_transcript_ref": "codex-thread:r7",
+        "harness_type": "codex",
+        "blockers": [],
+    }
+    finish_gate = {
+        "id": 5302,
+        "event_type": "mf_subagent.finish_gate",
+        "event_kind": "mf_subagent_finish_gate",
+        "phase": "finish_gate",
+        "status": "passed",
+        "actor": worker_session_id,
+        "task_id": task_id,
+        "backlog_id": parent_task_id,
+        "payload": {
+            "mf_subagent_finish_gate": {
+                "schema_version": "mf_subagent_finish_gate.v1",
+                "status": "passed",
+                "review_ready": True,
+                "close_ready": True,
+                "observer_command_id": "cmd-r7",
+                "startup_evidence": startup_gate,
+                "startup_worker_identity_gate": {
+                    "status": "passed",
+                    "passed": True,
+                    "worker_session_id": worker_session_id,
+                    "worker_transcript_ref": "codex-thread:r7",
+                    "harness_type": "codex",
+                },
+                "worker_self_attestation_gate": {
+                    "status": "passed",
+                    "passed": True,
+                    "worker_session_id": worker_session_id,
+                    "worker_transcript_ref": "codex-thread:r7",
+                    "harness_type": "codex",
+                    "attestation": finish_attestation,
+                },
+                "receipt_gate": {
+                    "status": "passed",
+                    "read_receipt_present": True,
+                    "read_receipt_event_id_present": True,
+                    "startup_present": True,
+                    "observer_command_id_present": True,
+                },
+                "route_prompt_contract": route_identity,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_slot_id": worker_session_id,
+                "fence_token": "fence-r7",
+                "changed_files": ["agent/governance/task_timeline.py"],
+                "head_commit": "38a397a7997c945ffb0e638e44576efee1823000",
+                "commit_sha": "38a397a7997c945ffb0e638e44576efee1823000",
+                "test_results": {"status": "passed", "passed": True},
+                "graph_trace_ids": ["gqt-20260618-663eec801f"],
+                "query_source": "mf_subagent",
+            }
+        },
+    }
+    route_context, route_action, dispatch, _startup = _route_context_consumption_events(
+        route_identity
+    )
+    startup_event = {
+        "id": 5300,
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": startup_gate},
+    }
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "governance_policy": {
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": False,
+            }
+        },
+    }
+
+    result = task_timeline.mf_close_gate_verification(
+        [route_context, route_action, dispatch, startup_event, finish_gate],
+        contract=contract,
+    )
+
+    startup_close_gate = result["close_timeline_startup_gate"]
+    assert startup_close_gate["passed"] is True
+    assert startup_close_gate["demoted_startup_events"][0]["id"] == "5300"
+    assert any(
+        item.get("projection") == "finish_gate_startup_projection"
+        for item in startup_close_gate["accepted_startup_events"]
+    )
+    assert result["finish_gate_projection"]["projected_event_kinds"] == [
+        "close_ready",
+        "implementation",
+    ]
+
+
 def test_repair_gate_summary_explains_cross_ref_task_mismatch_with_empty_missing_ids():
     from agent.governance import task_timeline
 

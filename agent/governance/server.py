@@ -8232,15 +8232,18 @@ def _runtime_context_write_response(
     runtime_context_id: str,
     context,
     legacy_endpoint: str,
-    result: Mapping[str, Any] | None = None,
+    result: Mapping[str, Any] | tuple[Any, ...] | None = None,
     event: Mapping[str, Any] | None = None,
     gate: Mapping[str, Any] | None = None,
     updated_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    result = result if isinstance(result, Mapping) else {}
+    status_code, result = _runtime_context_result_payload(result)
     event_summary = _runtime_context_timeline_event_summary(event)
-    return {
-        "ok": bool(result.get("ok", True)),
+    ok = bool(result.get("ok", True))
+    if status_code is not None and status_code >= 400 and "ok" not in result:
+        ok = False
+    response = {
+        "ok": ok,
         "schema_version": "runtime_context.write_facade_response.v1",
         "project_id": project_id,
         "runtime_context_id": runtime_context_id,
@@ -8263,6 +8266,38 @@ def _runtime_context_write_response(
             "raw_fence_token_exposed": False,
         },
     }
+    if status_code is not None:
+        response["status_code"] = status_code
+    for key in (
+        "status",
+        "error",
+        "code",
+        "message",
+        "recoverable",
+        "missing",
+        "missing_fields",
+        "blockers",
+        "actionable_fields",
+        "next_legal_action",
+        "repair",
+    ):
+        if key in result:
+            response[key] = result[key]
+    return response
+
+
+def _runtime_context_result_payload(
+    result: Mapping[str, Any] | tuple[Any, ...] | None,
+) -> tuple[int | None, dict[str, Any]]:
+    if isinstance(result, tuple) and len(result) >= 2:
+        if isinstance(result[0], int):
+            payload = result[1]
+            return int(result[0]), dict(payload) if isinstance(payload, Mapping) else {}
+        if isinstance(result[1], int):
+            payload = result[0]
+            return int(result[1]), dict(payload) if isinstance(payload, Mapping) else {}
+        return None, {}
+    return None, dict(result) if isinstance(result, Mapping) else {}
 
 
 _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS = (
@@ -9256,7 +9291,8 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
     result = handle_graph_governance_parallel_branch_finish_gate(
         _runtime_context_forward_request(ctx, body=finish_body)
     )
-    return _runtime_context_write_response(
+    result_status, result_payload = _runtime_context_result_payload(result)
+    response = _runtime_context_write_response(
         action="finish_gate",
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -9265,12 +9301,15 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
             "/api/graph-governance/{project_id}/parallel-branches/finish-gate"
         ),
         result=result,
-        event=result.get("timeline_event_recorded")
-        if isinstance(result, Mapping)
+        event=result_payload.get("timeline_event_recorded"),
+        gate=result_payload.get("gate") if isinstance(result_payload, Mapping) else None,
+        updated_context=result_payload.get("context")
+        if isinstance(result_payload, Mapping)
         else None,
-        gate=result.get("gate") if isinstance(result, Mapping) else None,
-        updated_context=result.get("context") if isinstance(result, Mapping) else None,
     )
+    if result_status is not None and result_status >= 400:
+        return result_status, response
+    return response
 
 
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/implementation-evidence")
@@ -9946,6 +9985,258 @@ def _parallel_branch_finish_gate_parent_lineage_repair_response(
     }
 
 
+def _parallel_branch_finish_gate_contract_error_details(
+    message: str,
+) -> dict[str, Any]:
+    normalized = message.strip()
+    lowered = normalized.lower()
+    code = "mf_subagent_contract_error"
+    missing_fields: list[str] = []
+    blockers: list[str] = []
+    actionable_fields: list[str] = []
+    next_legal_action = "repair_finish_gate_payload_and_retry"
+
+    def _add_missing(*fields: str) -> None:
+        for field in fields:
+            if field and field not in missing_fields:
+                missing_fields.append(field)
+
+    def _add_actionable(*fields: str) -> None:
+        for field in fields:
+            if field and field not in actionable_fields:
+                actionable_fields.append(field)
+
+    if "next legal action:" in lowered:
+        _, tail = normalized.split("next legal action:", 1)
+        explicit_action = tail.split(")", 1)[0].strip()
+        if explicit_action:
+            next_legal_action = explicit_action
+
+    if "stale fence_token mismatch" in lowered or (
+        "fence_token" in lowered and "mismatch" in lowered
+    ):
+        code = "stale_fence_token_mismatch"
+        blockers.append("stale_fence_token_mismatch")
+        _add_actionable("task_id", "fence_token")
+        if next_legal_action == "repair_finish_gate_payload_and_retry":
+            next_legal_action = "verify_task_id_and_fence_token_match_allocated_lane"
+    elif "actual mf_subagent_startup evidence" in lowered:
+        code = "missing_mf_subagent_startup"
+        blockers.append("missing_actual_mf_subagent_startup")
+        _add_missing("mf_subagent_startup")
+        _add_actionable(
+            "mf_subagent_startup",
+            "startup_evidence",
+            "runtime_context_id",
+            "task_id",
+            "fence_token",
+        )
+        next_legal_action = "record_actual_mf_subagent_startup_then_retry_finish_gate"
+    elif "finish-time worker_self_attestation" in lowered:
+        code = "missing_finish_time_worker_self_attestation"
+        blockers.append("missing_finish_time_worker_self_attestation")
+        _add_missing("finish_time_worker_self_attestation")
+        _add_actionable(
+            "finish_time_worker_self_attestation",
+            "worker_session_id",
+            "filer_principal",
+        )
+        next_legal_action = (
+            "record_finish_time_worker_attestation_then_retry_finish_gate"
+        )
+    elif "real startup worker identity" in lowered:
+        code = "missing_real_startup_worker_identity"
+        blockers.append("missing_real_startup_worker_identity")
+        _add_missing("worker_session_id", "worker_transcript_ref_or_path")
+        _add_actionable(
+            "mf_subagent_startup",
+            "worker_session_id",
+            "worker_transcript_ref",
+            "worker_transcript_path",
+        )
+        next_legal_action = "record_real_worker_startup_identity_then_retry_finish_gate"
+    elif "observer_command_id" in lowered:
+        code = "missing_observer_command_id"
+        blockers.append("missing_observer_command_id")
+        _add_missing("observer_command_id")
+        _add_actionable("observer_command_id")
+        next_legal_action = "supply_observer_command_lineage_then_retry_finish_gate"
+    elif "mf_subagent_read_receipt event lineage" in lowered:
+        code = "missing_mf_subagent_read_receipt_event_lineage"
+        blockers.append("missing_mf_subagent_read_receipt_event_lineage")
+        _add_missing("read_receipt_event_id")
+        _add_actionable("read_receipt_event_id", "mf_subagent_read_receipt")
+        next_legal_action = "record_read_receipt_event_lineage_then_retry_finish_gate"
+    elif "mf_subagent_read_receipt" in lowered:
+        code = "missing_mf_subagent_read_receipt"
+        blockers.append("missing_mf_subagent_read_receipt")
+        _add_missing("read_receipt_hash")
+        _add_actionable("read_receipt_hash", "mf_subagent_read_receipt")
+        next_legal_action = "record_read_receipt_then_retry_finish_gate"
+    elif "checkpoint_id is required" in lowered:
+        code = "missing_checkpoint_id"
+        blockers.append("missing_checkpoint_id")
+        _add_missing("checkpoint_id")
+        _add_actionable("checkpoint_id")
+    elif "not merge-queue ready" in lowered:
+        code = "finish_gate_not_merge_queue_ready"
+        blockers.append("finish_gate_not_merge_queue_ready")
+        _add_missing("status", "test_results")
+        _add_actionable("status", "test_results", "blockers")
+        next_legal_action = "mark_worker_review_ready_and_include_passing_tests_then_retry_finish_gate"
+    elif "graph trace" in lowered:
+        code = "missing_worker_graph_trace_evidence"
+        blockers.append("missing_worker_graph_trace_evidence")
+        _add_missing("graph_trace_ids")
+        _add_actionable("graph_trace_ids", "query_source", "worker_role", "fence_token")
+        next_legal_action = "run_worker_scoped_graph_query_then_retry_finish_gate"
+    elif "identity mismatch" in lowered:
+        code = "finish_gate_identity_mismatch"
+        blockers.append("finish_gate_identity_mismatch")
+        _, _, tail = normalized.partition(":")
+        mismatch_fields = [item.strip() for item in tail.split(",") if item.strip()]
+        _add_actionable(*mismatch_fields)
+        if not mismatch_fields:
+            _add_actionable("task_id", "backlog_id", "branch_ref", "worktree_path")
+        next_legal_action = "retry_with_server_resolved_runtime_context_identity"
+    elif "missing required fields:" in lowered:
+        _, tail = normalized.split("missing required fields:", 1)
+        fields = [item.strip() for item in tail.split(",") if item.strip()]
+        if fields:
+            code = "missing_finish_gate_required_fields"
+            blockers.append("missing_finish_gate_required_fields")
+            _add_missing(*fields)
+            _add_actionable(*fields)
+
+    if not blockers:
+        blockers.append(code)
+    if not actionable_fields:
+        _add_actionable(
+            "task_id",
+            "fence_token",
+            "checkpoint_id",
+            "status",
+            "changed_files",
+            "test_results",
+            "finish_time_worker_self_attestation",
+            "mf_subagent_startup",
+            "read_receipt_hash",
+            "read_receipt_event_id",
+        )
+
+    return {
+        "code": code,
+        "missing_fields": missing_fields,
+        "blockers": blockers,
+        "actionable_fields": actionable_fields,
+        "next_legal_action": next_legal_action,
+    }
+
+
+def _parallel_branch_finish_gate_contract_error_repair_response(
+    *,
+    project_id: str,
+    context: Any,
+    message: str,
+) -> tuple[int, dict[str, Any]]:
+    details = _parallel_branch_finish_gate_contract_error_details(message)
+    runtime_context_id = (
+        str(getattr(context, "runtime_context_id", "") or "").strip()
+        or str(getattr(context, "task_id", "") or "").strip()
+    )
+    task_id = str(getattr(context, "task_id", "") or "")
+    parent_task_id = str(
+        getattr(context, "root_task_id", "")
+        or getattr(context, "chain_id", "")
+        or getattr(context, "stage_task_id", "")
+        or task_id
+        or ""
+    )
+    missing_fields = list(details["missing_fields"])
+    blockers = list(details["blockers"])
+    actionable_fields = list(details["actionable_fields"])
+    next_legal_action = str(details["next_legal_action"] or "")
+    code = str(details["code"] or "mf_subagent_contract_error")
+    return 422, {
+        "ok": False,
+        "status": "finish_gate_repair_required",
+        "error": code,
+        "code": code,
+        "message": message,
+        "recoverable": True,
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "missing": missing_fields,
+        "missing_fields": missing_fields,
+        "blockers": blockers,
+        "actionable_fields": actionable_fields,
+        "next_legal_action": next_legal_action,
+        "repair": {
+            "schema_version": "parallel_branch_finish_gate.contract_error_repair.v1",
+            "next_action": next_legal_action,
+            "next_legal_action": next_legal_action,
+            "required_fields": [
+                "task_id",
+                "fence_token",
+                "checkpoint_id",
+                "status",
+                "changed_files",
+                "test_results",
+                "finish_time_worker_self_attestation",
+                "graph_trace_ids",
+                "mf_subagent_startup",
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+            ],
+            "missing_fields": missing_fields,
+            "blockers": blockers,
+            "actionable_fields": actionable_fields,
+            "expected_context": {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+                "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+                "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+                "base_commit": str(getattr(context, "base_commit", "") or ""),
+                "target_head_commit": str(
+                    getattr(context, "target_head_commit", "") or ""
+                ),
+                "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+                "fence_token_required": bool(
+                    str(getattr(context, "fence_token", "") or "").strip()
+                ),
+            },
+            "payload_shape": {
+                "task_id": task_id or "<task-id>",
+                "fence_token": "<assigned-lane-fence-token>",
+                "checkpoint_id": "<checkpoint-id>",
+                "status": "review_ready",
+                "changed_files": ["<owned-file>"],
+                "test_results": {"status": "passed"},
+                "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+                "finish_time_worker_self_attestation": {
+                    "schema_version": "worker_transcript_self_attestation.v1",
+                    "attestation_phase": "finish",
+                    "status": "passed",
+                    "worker_self_attesting": True,
+                },
+            },
+            "security_model": {
+                "canonical_finish_gate_required": True,
+                "caller_supplied_real_startup_events_ignored": True,
+                "caller_supplied_startup_evidence_not_trusted": True,
+                "finish_time_worker_self_attestation_must_be_worker_authored": True,
+                "observer_authored_surrogate_evidence_not_close_satisfying": True,
+            },
+        },
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/finish-gate")
 def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
     """Validate an mf_sub worker finish claim and record a checkpoint."""
@@ -9998,12 +10289,16 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     "resolved lane; lane may be misconfigured — contact the observer"
                 )
             if body_fence_token != context.fence_token:
-                raise MfSubagentContractError(
-                    "stale fence_token mismatch: body fence_token does not match "
-                    "server-side runtime context for the resolved lane; "
-                    "ensure task_id and fence_token identify the same lane "
-                    "(next legal action: verify task_id and fence_token match "
-                    "the lane allocated for this worker)"
+                return _parallel_branch_finish_gate_contract_error_repair_response(
+                    project_id=project_id,
+                    context=context,
+                    message=(
+                        "stale fence_token mismatch: body fence_token does not match "
+                        "server-side runtime context for the resolved lane; "
+                        "ensure task_id and fence_token identify the same lane "
+                        "(next legal action: verify task_id and fence_token match "
+                        "the lane allocated for this worker)"
+                    ),
                 )
 
             # F2 security fix: caller-supplied real_startup_events MUST be ignored.
@@ -10137,7 +10432,11 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 )
                 if repair_response is not None:
                     return repair_response
-                raise
+                return _parallel_branch_finish_gate_contract_error_repair_response(
+                    project_id=project_id,
+                    context=context,
+                    message=str(exc),
+                )
             if parent_route_lineage and isinstance(
                 gate.get("parent_route_lineage"),
                 Mapping,

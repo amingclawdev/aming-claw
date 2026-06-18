@@ -4582,6 +4582,95 @@ def test_close_timeline_accepts_finish_gate_startup_projection_with_transcript_r
     )
 
 
+def test_close_timeline_does_not_accept_raw_finish_time_attestation_after_startup() -> None:
+    worker_session_id = "worker-session-r7"
+    startup = _finish_startup_evidence(
+        **_self_attested_startup_fields(
+            worker_session_id=worker_session_id,
+            transcript_path="/tmp/worker-session-r7.jsonl",
+            transcript_ref="codex-thread:worker-session-r7",
+        ),
+        close_satisfying=False,
+        worker_self_attesting=False,
+        self_attesting=False,
+        runtime_context_id="mfrctx-adb2e7b48aeabadb",
+        task_id="observer-command-close-projection-worker-20260618-r7",
+        parent_task_id="AC-OBSERVER-COMMAND-EXECUTE-BACKLOG-ROW-20260602",
+        worker_id="019ed92d-f34d-70e2-a97a-d384aa817b61",
+        worker_slot_id="019ed92d-f34d-70e2-a97a-d384aa817b61",
+        session_token_evidence_type="server_verified",
+        server_issued_session_token_verified=True,
+        agent_id_match_mode="same_as_allocation_owner",
+    )
+    startup["worker_self_attestation"] = {
+        **startup["worker_self_attestation"],
+        "status": "blocked",
+        "worker_self_attesting": False,
+        "self_attesting": False,
+        "finish_time_self_attesting": False,
+        "blockers": [
+            "graph_trace_ids_not_db_verified",
+            "missing_mf_subagent_graph_trace_ids",
+        ],
+    }
+    startup_event = {
+        "id": 5300,
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {"mf_subagent_startup_gate": startup},
+    }
+    finish_event = {
+        "id": 5301,
+        "event_type": "mf_subagent.finish_time_worker_attestation",
+        "event_kind": "worker_progress",
+        "phase": "finish_time_worker_attestation",
+        "status": "passed",
+        "actor": worker_session_id,
+        "payload": {
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": "mfrctx-adb2e7b48aeabadb",
+            "task_id": "observer-command-close-projection-worker-20260618-r7",
+            "parent_task_id": "AC-OBSERVER-COMMAND-EXECUTE-BACKLOG-ROW-20260602",
+            "worker_id": "019ed92d-f34d-70e2-a97a-d384aa817b61",
+            "worker_slot_id": "019ed92d-f34d-70e2-a97a-d384aa817b61",
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "route_id": startup["route_id"],
+            "route_context_hash": startup["route_context_hash"],
+            "prompt_contract_id": startup["prompt_contract_id"],
+            "prompt_contract_hash": startup["prompt_contract_hash"],
+            "route_token_ref": startup["route_token_ref"],
+            "read_receipt_hash": startup["read_receipt_hash"],
+            "read_receipt_event_id": startup["read_receipt_event_id"],
+            "graph_trace_ids": ["gqt-20260618-663eec801f"],
+            "test_results": {
+                "status": "passed",
+                "passed": True,
+                "summary": "284 passed, 16 subtests passed",
+            },
+            "finish_time_worker_self_attestation": _finish_time_worker_attestation(
+                worker_session_id=worker_session_id,
+                transcript_path="/tmp/worker-session-r7.jsonl",
+                transcript_ref="codex-thread:worker-session-r7",
+            ),
+        },
+    }
+
+    gate = close_timeline_startup_event_gate([startup_event, finish_event])
+
+    assert gate["passed"] is False
+    assert gate["demoted_startup_events"][0]["id"] == "5300"
+    assert gate["demoted_startup_events"][0]["worker_self_attestation_gate"][
+        "attestation"
+    ]["blockers"] == [
+        "graph_trace_ids_not_db_verified",
+        "missing_mf_subagent_graph_trace_ids",
+    ]
+    assert gate["accepted_startup_events"] == []
+
+
 def test_server_close_gate_check_uses_accepted_startup_gate_with_demoted_history() -> None:
     from agent.governance import server as server_module
 

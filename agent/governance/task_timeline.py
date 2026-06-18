@@ -2817,7 +2817,11 @@ def _mf_subagent_finish_gate_projection(event: dict[str, Any]) -> dict[str, Any]
 
     if not isinstance(event, dict):
         return {}
-    gate = _mapping(_first_deep_mapping(event, "mf_subagent_finish_gate"))
+    gate = (
+        _mapping(_first_deep_mapping(event, "mf_subagent_finish_gate"))
+        or _mapping(_first_deep_mapping(event, "finish_gate"))
+        or _mapping(_first_deep_mapping(event, "finish_gate_result"))
+    )
     if not gate:
         return {}
     if not _route_event_passed(event):
@@ -3305,6 +3309,7 @@ def _finish_gate_projection_event(
     *,
     event_kind: str,
 ) -> dict[str, Any]:
+    finish_gate = _mf_subagent_finish_gate_projection(source)
     identity = _route_identity(source)
     lineage = _route_attempt_lineage(source)
     changed_files = _finish_gate_changed_files(source)
@@ -3327,6 +3332,8 @@ def _finish_gate_projection_event(
     if graph_trace_ids:
         payload["graph_trace_ids"] = graph_trace_ids
         payload["query_source"] = _first_deep_text(source, "query_source") or "mf_subagent"
+    if finish_gate:
+        payload["mf_subagent_finish_gate"] = finish_gate
     return {
         "id": (
             f"{source_event_id}:finish_projection:{event_kind}"
@@ -5933,22 +5940,6 @@ def mf_close_gate_verification(
     """Validate the minimum observer/MF timeline evidence before backlog close."""
 
     raw_rows = events if isinstance(events, list) else []
-    try:
-        from .mf_subagent_contract import close_timeline_startup_event_gate
-
-        close_timeline_startup_gate = close_timeline_startup_event_gate(raw_rows)
-    except Exception as exc:
-        log.debug("close timeline startup gate projection failed", exc_info=True)
-        close_timeline_startup_gate = {
-            "schema_version": "mf_close_timeline_startup_gate.v1",
-            "passed": False,
-            "status": "error",
-            "accepted_startup_events": [],
-            "demoted_startup_events": [],
-            "demoted_startup_event_indexes": [],
-            "reason": "close_timeline_startup_gate_error",
-            "error": str(exc),
-        }
     governance_policy = _governance_policy(contract)
     close_timeline_required = _policy_requires(governance_policy, "close_timeline")
     required_event_kinds = (
@@ -5995,6 +5986,22 @@ def mf_close_gate_verification(
         *raw_rows,
         *_list(finish_gate_projection.get("projected_events")),
     ]
+    try:
+        from .mf_subagent_contract import close_timeline_startup_event_gate
+
+        close_timeline_startup_gate = close_timeline_startup_event_gate(rows)
+    except Exception as exc:
+        log.debug("close timeline startup gate projection failed", exc_info=True)
+        close_timeline_startup_gate = {
+            "schema_version": "mf_close_timeline_startup_gate.v1",
+            "passed": False,
+            "status": "error",
+            "accepted_startup_events": [],
+            "demoted_startup_events": [],
+            "demoted_startup_event_indexes": [],
+            "reason": "close_timeline_startup_gate_error",
+            "error": str(exc),
+        }
     present, ignored = _close_present(rows)
     missing = sorted(required_event_kinds - present)
     contract_gate = mf_contract_gate_verification(rows, contract)
@@ -6519,20 +6526,40 @@ def _generic_repair_append_skeleton(gate_key: str, missing: list[str]) -> dict[s
 
 def _startup_identity_missing_fields(gate: dict[str, Any]) -> list[str]:
     missing = _list(gate.get("missing_fields") or gate.get("missing_required_fields") or [])
-    blockers = _unique_compact_values(
-        [
-            *_list(gate.get("blockers")),
-            *_list(_mapping(gate.get("worker_self_attestation")).get("blockers")),
-            *_list(_mapping(gate.get("startup_worker_identity_gate")).get("blockers")),
-            *_list(_mapping(gate.get("worker_identity_gate")).get("blockers")),
-        ]
-    )
+    blocker_values: list[Any] = [
+        *_list(gate.get("blockers")),
+        *_list(_mapping(gate.get("worker_self_attestation")).get("blockers")),
+        *_list(_mapping(gate.get("startup_worker_identity_gate")).get("blockers")),
+        *_list(_mapping(gate.get("worker_identity_gate")).get("blockers")),
+    ]
+    for item in _list(gate.get("demoted_startup_events")):
+        event_ref = _mapping(item)
+        worker_gate = _mapping(event_ref.get("worker_self_attestation_gate"))
+        startup_gate = _mapping(event_ref.get("startup_worker_identity_gate"))
+        attestation = _mapping(worker_gate.get("attestation"))
+        blocker_values.extend(_list(event_ref.get("worker_self_attestation_blockers")))
+        blocker_values.extend(_list(worker_gate.get("blockers")))
+        blocker_values.extend(_list(worker_gate.get("finish_time_blockers")))
+        blocker_values.extend(_list(attestation.get("blockers")))
+        blocker_values.extend(_list(attestation.get("finish_time_blockers")))
+        blocker_values.extend(_list(startup_gate.get("blockers")))
+    blockers = _unique_compact_values(blocker_values)
     blocker_to_field = {
         "missing_worker_session_id": "worker_session_id",
         "missing_worker_transcript_path": "worker_transcript_path",
         "missing_worker_transcript_ref_or_path": "worker_transcript_ref_or_worker_transcript_path",
         "missing_or_unsupported_harness_type": "harness_type",
         "unsupported_or_missing_harness_type": "harness_type",
+        "graph_trace_ids_not_db_verified": "graph_trace_ids",
+        "missing_mf_subagent_graph_trace_ids": "graph_trace_ids",
+        "missing_graph_trace_ids": "graph_trace_ids",
+        "graph_trace_evidence_missing": "graph_trace_ids",
+        "missing_worker_self_attestation": "finish_time_worker_self_attestation",
+        "missing_finish_time_worker_self_attestation": "finish_time_worker_self_attestation",
+        "worker_self_attestation_not_passed": "finish_time_worker_self_attestation",
+        "finish_time_self_attestation_not_passed": "finish_time_worker_self_attestation",
+        "finish_time_blockers_present": "finish_time_worker_self_attestation",
+        "attestation_phase_startup_not_finish": "finish_time_worker_self_attestation",
     }
     for blocker in blockers:
         field = blocker_to_field.get(str(blocker))
@@ -6865,11 +6892,58 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
 
     if gate_key == "close_timeline_startup_gate":
         startup_missing = _startup_identity_missing_fields(gate)
+        demoted_events = [_mapping(item) for item in _list(gate.get("demoted_startup_events"))]
+        rejected_event_ids = _event_ids_from_items(demoted_events)
+        relevant_event_ids = list(rejected_event_ids)
+        demoted_blockers = _unique_compact_values(
+            [
+                *[
+                    blocker
+                    for item in demoted_events
+                    for blocker in _list(item.get("worker_self_attestation_blockers"))
+                ],
+                *[
+                    blocker
+                    for item in demoted_events
+                    for blocker in _list(
+                        _mapping(item.get("worker_self_attestation_gate")).get("blockers")
+                    )
+                ],
+                *[
+                    blocker
+                    for item in demoted_events
+                    for blocker in _list(
+                        _mapping(
+                            _mapping(item.get("worker_self_attestation_gate")).get(
+                                "attestation"
+                            )
+                        ).get("blockers")
+                    )
+                ],
+            ]
+        )
+        finish_time_fields = {
+            "finish_time_worker_self_attestation",
+            "graph_trace_ids",
+        }
+        needs_finish_time_projection = bool(
+            finish_time_fields.intersection(set(startup_missing))
+        )
         reasons = []
         if startup_missing:
             reasons.append(
                 "Startup evidence is missing close-sensitive worker fields: "
                 + ", ".join(startup_missing)
+            )
+        if rejected_event_ids:
+            reasons.append(
+                "Startup event ids rejected for close satisfaction: "
+                + ", ".join(str(item) for item in rejected_event_ids)
+            )
+        if demoted_blockers:
+            reasons.append(
+                "Startup close blockers: "
+                + ", ".join(str(item) for item in demoted_blockers)
             )
         for field in ("reason", "missing_reason", "failure_reason", "message"):
             value = str(gate.get(field) or "").strip()
@@ -6877,26 +6951,75 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                 reasons.append(value)
         if not reasons:
             reasons.append("Startup evidence is not close-satisfying.")
+        if needs_finish_time_projection:
+            recommended_action = (
+                "Record or repair worker-authored finish-time attestation and finish "
+                "gate evidence under the same runtime_context_id, task_id, "
+                "worker_session_id, read receipt, and route identity. Include "
+                "graph_trace_ids from the worker-owned graph query; close consumes "
+                "the canonical mf_subagent_finish_gate projection, not raw "
+                "finish-time attestation by itself. Do not record another startup, "
+                "observer-backfill worker evidence, or audit-close as a substitute."
+            )
+            suggested_event_kind = "mf_subagent_finish_gate"
+            append_skeleton = _repair_append_skeleton(
+                suggested_event_kind,
+                phase="finish_gate",
+                payload={
+                    "mf_subagent_finish_gate": {
+                        "runtime_context_id": "<same_mfrctx_as_startup>",
+                        "task_id": "<same_worker_task_id_as_startup>",
+                        "parent_task_id": "<same_parent_task_id_as_startup>",
+                        "startup_evidence": "<server_verified_startup_event_payload>",
+                        "graph_trace_ids": ["<worker_owned_gqt_id>"],
+                        "test_results": {"status": "passed", "passed": True},
+                        "startup_worker_identity_gate": {"status": "passed", "passed": True},
+                        "worker_self_attestation_gate": {
+                            "status": "passed",
+                            "passed": True,
+                            "attestation": {
+                                "attestation_phase": "finish",
+                                "status": "passed",
+                                "worker_self_attesting": True,
+                                "finish_time_self_attesting": True,
+                                "finish_time_blockers": [],
+                                "worker_session_id": "<same_worker_session_id_as_startup>",
+                                "filer_principal": "<same_worker_session_id>",
+                                "worker_transcript_ref": "<host_transcript_ref>",
+                                "harness_type": "codex",
+                            },
+                        },
+                    },
+                },
+            )
+            diagnosis = "startup evidence needs later worker finish-time proof"
+        else:
+            recommended_action = (
+                "Record a new worker-authored mf_subagent_startup through the "
+                "runtime/parallel startup facade with worker_session_id, "
+                "worker_transcript_ref or worker_transcript_path, harness_type, "
+                "and filer_principal. Do not observer-backfill or audit-close "
+                "as a substitute for worker startup evidence."
+            )
+            suggested_event_kind = "mf_subagent_startup"
+            append_skeleton = _generic_repair_append_skeleton(
+                gate_key,
+                startup_missing or missing,
+            )
+            diagnosis = "startup evidence missing real worker identity fields"
         return {
             "gate": gate_key,
             "failed_gate_name": gate_key,
             "status": str(gate.get("status") or "failed"),
             "missing_requirement_ids": missing,
             "missing_fields": startup_missing,
-            "diagnosis": "startup evidence missing real worker identity fields",
+            "diagnosis": diagnosis,
             "reasons": _unique_compact_values(reasons),
-            "recommended_legal_action": (
-                "Record a new worker-authored mf_subagent_startup through the "
-                "runtime/parallel startup facade with worker_session_id, "
-                "worker_transcript_ref or worker_transcript_path, harness_type, "
-                "and filer_principal. Do not observer-backfill or audit-close "
-                "as a substitute for worker startup evidence."
-            ),
-            "suggested_event_kind": "mf_subagent_startup",
-            "append_payload_skeleton": _generic_repair_append_skeleton(
-                gate_key,
-                startup_missing or missing,
-            ),
+            "rejected_event_ids": rejected_event_ids,
+            "relevant_event_ids": relevant_event_ids,
+            "recommended_legal_action": recommended_action,
+            "suggested_event_kind": suggested_event_kind,
+            "append_payload_skeleton": append_skeleton,
             "advisory_only": True,
         }
 

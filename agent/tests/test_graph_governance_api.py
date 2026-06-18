@@ -4988,6 +4988,74 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         assert "raw-route-token-facade" not in response_json
 
 
+def test_runtime_context_finish_gate_facade_preserves_contract_error_tuple(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-facade-error-task",
+            root_task_id="runtime-facade-error-parent",
+            backlog_id="AC-RUNTIME-FACADE-ERROR",
+            worker_id="worker-runtime-facade-error",
+            worker_slot_id="worker-runtime-facade-error",
+            agent_id="agent-runtime-facade-error",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-facade-error-task",
+            worktree_path="/tmp/nonexistent-runtime-facade-error",
+            base_commit="base-runtime-facade-error",
+            head_commit="head-runtime-facade-error",
+            target_head_commit="target-runtime-facade-error",
+            snapshot_id="scope-runtime-facade-error",
+            projection_id="semproj-runtime-facade-error",
+            merge_queue_id="mq-runtime-facade-error",
+            fence_token="fence-runtime-facade-error",
+            status=STATE_WORKTREE_READY,
+        ),
+        now_iso="2026-06-18T06:30:00Z",
+    )
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+
+    status, response = server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": "runtime-facade-error-parent",
+                "fence_token": "fence-runtime-facade-error",
+                "status": "review_ready",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "passed": True},
+                "checkpoint_id": "ckpt-runtime-facade-error",
+                "head_commit": "head-runtime-facade-error",
+                "agent_id": "agent-runtime-facade-error",
+            },
+        )
+    )
+
+    assert status == 422
+    assert response["ok"] is False
+    assert response["status_code"] == 422
+    assert response["schema_version"] == "runtime_context.write_facade_response.v1"
+    assert response["action"] == "finish_gate"
+    assert response["error"] == "missing_mf_subagent_startup"
+    assert response["code"] == "missing_mf_subagent_startup"
+    assert response["recoverable"] is True
+    assert "mf_subagent_startup" in response["missing_fields"]
+    assert response["next_legal_action"] == (
+        "record_actual_mf_subagent_startup_then_retry_finish_gate"
+    )
+    assert response["repair"]["schema_version"] == (
+        "parallel_branch_finish_gate.contract_error_repair.v1"
+    )
+    assert response["context"]["runtime_context_id"] == runtime_context_id
+    assert response["context"]["fence_token_redacted"] is True
+
+
 def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_events(conn):
     context = upsert_branch_context(
         conn,
@@ -6299,6 +6367,244 @@ def test_finish_gate_parent_route_lineage_gap_returns_actionable_repair(conn):
     assert payload["repair"]["source"] == "latest_runtime_contract_revision.route_identity"
 
 
+def test_finish_gate_missing_status_returns_contract_error_repair_payload(conn):
+    task_id = "finish-contract-repair-missing-status"
+    fence_token = "fence-contract-repair-status"
+    worktree_path = "/tmp/nonexistent-contract-repair-status"
+    branch_ref = "refs/heads/codex/contract-repair-status"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-FINISH-CONTRACT-REPAIR",
+            branch_ref=branch_ref,
+            status=STATE_WORKTREE_READY,
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-contract-repair-status",
+            head_commit="base-contract-repair-status",
+            target_head_commit="target-contract-repair-status",
+            merge_queue_id="mergeq-contract-repair-status",
+        ),
+        now_iso="2026-06-18T09:10:00Z",
+    )
+
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": task_id,
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "passed": True},
+                "checkpoint_id": "ckpt-contract-repair-status",
+                "fence_token": fence_token,
+            },
+        )
+    )
+
+    assert status == 422
+    assert payload["error"] == "missing_finish_gate_required_fields"
+    assert payload["recoverable"] is True
+    assert "status" in payload["missing_fields"]
+    assert payload["repair"]["schema_version"] == (
+        "parallel_branch_finish_gate.contract_error_repair.v1"
+    )
+
+
+def test_finish_gate_missing_finish_time_attestation_returns_contract_error_repair_payload(conn):
+    task_id = "finish-contract-repair-missing-attestation"
+    fence_token = "fence-contract-repair-attestation"
+    worktree_path = "/tmp/nonexistent-contract-repair-attestation"
+    branch_ref = "refs/heads/codex/contract-repair-attestation"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-FINISH-CONTRACT-REPAIR",
+            branch_ref=branch_ref,
+            status=STATE_WORKTREE_READY,
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-contract-repair-attestation",
+            head_commit="base-contract-repair-attestation",
+            target_head_commit="target-contract-repair-attestation",
+            merge_queue_id="mergeq-contract-repair-attestation",
+        ),
+        now_iso="2026-06-18T09:20:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id="AC-FINISH-CONTRACT-REPAIR",
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit="head-contract-repair-attestation",
+    )
+    evidence = _finish_gate_evidence(
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit="head-contract-repair-attestation",
+    )
+    evidence.pop("finish_time_worker_self_attestation")
+
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": task_id,
+                "status": "review_ready",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "passed": True},
+                "checkpoint_id": "ckpt-contract-repair-attestation",
+                "fence_token": fence_token,
+                "head_commit": "head-contract-repair-attestation",
+                "evidence": evidence,
+            },
+        )
+    )
+
+    assert status == 422
+    assert payload["error"] == "missing_finish_time_worker_self_attestation"
+    assert "finish_time_worker_self_attestation" in payload["missing_fields"]
+    assert payload["repair"]["payload_shape"]["finish_time_worker_self_attestation"][
+        "attestation_phase"
+    ] == "finish"
+
+
+def test_finish_gate_missing_graph_trace_returns_contract_error_repair_payload(conn):
+    task_id = "finish-contract-repair-missing-graph"
+    parent_task_id = "finish-contract-repair-parent"
+    backlog_id = "AC-FINISH-CONTRACT-REPAIR"
+    fence_token = "fence-contract-repair-graph"
+    worktree_path = "/tmp/nonexistent-contract-repair-graph"
+    branch_ref = "refs/heads/codex/contract-repair-graph"
+    route_identity = {
+        "route_id": "route-contract-repair-graph",
+        "route_context_hash": "sha256:route-contract-repair-graph",
+        "prompt_contract_id": "rprompt-contract-repair-graph",
+        "prompt_contract_hash": "sha256:prompt-contract-repair-graph",
+        "route_token_ref": "rtok-contract-repair-graph",
+        "visible_injection_manifest_hash": "sha256:visible-contract-repair-graph",
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            branch_ref=branch_ref,
+            status=STATE_WORKTREE_READY,
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-contract-repair-graph",
+            head_commit="base-contract-repair-graph",
+            target_head_commit="target-contract-repair-graph",
+            merge_queue_id="mergeq-contract-repair-graph",
+        ),
+        now_iso="2026-06-18T09:30:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "observer_command_id": "cmd-contract-repair-graph",
+            "target_files": ["agent/governance/server.py"],
+            "owned_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+        route_gate={
+            "decision": "prepared",
+            **route_identity,
+            "allowed_actions": ["finish_gate"],
+            "blocked_actions": ["merge", "push"],
+            "required_lanes": [
+                "observer_coordinator",
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+                "observer_merge_close_gate",
+            ],
+            "required_evidence": [
+                "runtime_context_read_receipt",
+                "mf_subagent_startup",
+                "finish_time_worker_attestation",
+                "finish_gate",
+            ],
+        },
+        actor="observer_runtime_text_prepare",
+        now_iso="2026-06-18T09:30:01Z",
+    )
+    startup = _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit="head-contract-repair-graph",
+    )
+    startup.update(
+        {
+            **route_identity,
+            "runtime_context_id": runtime_context_id_for_branch_context(context),
+            "parent_task_id": parent_task_id,
+            "read_receipt_hash": f"sha256:read-{fence_token}",
+        }
+    )
+    conn.commit()
+    evidence = _finish_gate_evidence(
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit="head-contract-repair-graph",
+    )
+
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "backlog_id": backlog_id,
+                "branch_ref": branch_ref,
+                "worktree_path": worktree_path,
+                "base_commit": "base-contract-repair-graph",
+                "target_head_commit": "target-contract-repair-graph",
+                "head_commit": "head-contract-repair-graph",
+                "merge_queue_id": "mergeq-contract-repair-graph",
+                "status": "review_ready",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "passed": True},
+                "checkpoint_id": "ckpt-contract-repair-graph",
+                "fence_token": fence_token,
+                "worker_role": "mf_sub",
+                "evidence": evidence,
+                "route_prompt_contract": route_identity,
+            },
+        )
+    )
+
+    assert status == 422
+    assert payload["error"] == "missing_worker_graph_trace_evidence"
+    assert "graph_trace_ids" in payload["missing_fields"]
+    assert payload["repair"]["payload_shape"]["graph_trace_ids"] == [
+        "<worker-owned-graph-query-trace-id>"
+    ]
+
+
 def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_path):
     worktree = tmp_path / "worker-startup"
     worktree.mkdir()
@@ -7102,7 +7408,7 @@ def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tm
     )
 
 
-def test_parallel_branch_finish_gate_rejects_stale_fence(conn):
+def test_parallel_branch_finish_gate_stale_fence_returns_actionable_repair(conn):
     upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -7120,21 +7426,33 @@ def test_parallel_branch_finish_gate_rejects_stale_fence(conn):
         now_iso="2026-05-17T07:30:00Z",
     )
 
-    with pytest.raises(MfSubagentContractError, match="stale"):
-        server.handle_graph_governance_parallel_branch_finish_gate(
-            _ctx(
-                {"project_id": PID},
-                method="POST",
-                body={
-                    "task_id": "finish-stale-task",
-                    "status": "succeeded",
-                    "changed_files": ["agent/governance/server.py"],
-                    "test_results": {"status": "passed"},
-                    "checkpoint_id": "ckpt-stale",
-                    "fence_token": "fence-old",
-                },
-            )
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "finish-stale-task",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-stale",
+                "fence_token": "fence-old",
+            },
         )
+    )
+
+    assert status == 422
+    assert payload["ok"] is False
+    assert payload["recoverable"] is True
+    assert payload["error"] == "stale_fence_token_mismatch"
+    assert payload["code"] == "stale_fence_token_mismatch"
+    assert payload["next_legal_action"]
+    assert "task_id" in payload["actionable_fields"]
+    assert "fence_token" in payload["actionable_fields"]
+    assert payload["repair"]["schema_version"] == (
+        "parallel_branch_finish_gate.contract_error_repair.v1"
+    )
+    assert payload["repair"]["security_model"]["canonical_finish_gate_required"] is True
 
 
 def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_path):
@@ -17299,10 +17617,22 @@ def test_finish_gate_server_ignores_caller_supplied_real_startup_events(conn):
     )
 
     # Must be refused because DB has no real startup; caller-supplied events ignored.
-    with pytest.raises(MfSubagentContractError, match="actual mf_subagent_startup evidence"):
-        server.handle_graph_governance_parallel_branch_finish_gate(
-            _ctx({"project_id": PID}, method="POST", body=body)
-        )
+    status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert status == 422
+    assert payload["ok"] is False
+    assert payload["recoverable"] is True
+    assert payload["error"] == "missing_mf_subagent_startup"
+    assert payload["code"] == "missing_mf_subagent_startup"
+    assert "mf_subagent_startup" in payload["missing_fields"]
+    assert payload["blockers"] == ["missing_actual_mf_subagent_startup"]
+    assert payload["next_legal_action"] == (
+        "record_actual_mf_subagent_startup_then_retry_finish_gate"
+    )
+    assert payload["repair"]["security_model"][
+        "caller_supplied_real_startup_events_ignored"
+    ] is True
 
 
 def test_finish_gate_server_accepts_db_sourced_real_startup_events(conn):
