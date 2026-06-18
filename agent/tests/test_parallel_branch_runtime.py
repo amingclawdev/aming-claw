@@ -36,7 +36,9 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_CONTENT_ADDRESS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_GATE_PROJECTION_SCHEMA_VERSION,
     RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION,
+    RUNTIME_CONTEXT_TIMELINE_GATE_PROJECTION_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS,
@@ -1281,6 +1283,212 @@ def test_runtime_context_action_plan_projects_close_precheck_gaps() -> None:
     assert "reconcile_target_graph" in close_projection["next_actions"]
     assert "query_graph_as_mf_subagent" in close_projection["next_actions"]
     assert gap_codes <= blocking_codes
+
+
+def test_runtime_context_gate_projection_is_projection_only_and_actionable() -> None:
+    projection = build_runtime_context_projection(
+        _runtime_projection_context(),
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "raw_route_token": "raw-route-token-secret",
+        },
+        contract_revision={
+            "revision_id": "crev-runtime-context-gate-projection",
+            "contract_version": "mf_parallel.v1",
+            "payload": {
+                "worker_session_token": "raw-worker-session-token",
+                "fence_token": "fence-runtime-context",
+                "close_precheck": {
+                    "independent_verification_required": True,
+                },
+            },
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    views = projection["views"]
+    gate_projection = views["gate_projection"]
+    serialized = json.dumps(gate_projection, sort_keys=True)
+
+    assert gate_projection["schema_version"] == (
+        RUNTIME_CONTEXT_GATE_PROJECTION_SCHEMA_VERSION
+    )
+    assert gate_projection["projection_only"] is True
+    assert gate_projection["must_revalidate_on_write"] is True
+    assert gate_projection["raw_session_token_exposed"] is False
+    assert gate_projection["raw_route_token_exposed"] is False
+    assert gate_projection["raw_fence_token_exposed"] is False
+    assert gate_projection["redaction"]["observer_only_authority_exposed"] is False
+    assert "raw-worker-session-token" not in serialized
+    assert "raw-route-token-secret" not in serialized
+    assert "fence-runtime-context" not in serialized
+
+    assert gate_projection["projection_status"] == "diagnostic_blocked"
+    assert gate_projection["diagnostic_status"] == "missing_required_evidence"
+    assert gate_projection["next_legal_action"] == "refresh_route_token_ref"
+    assert any(
+        item["id"] == "route_token_ref"
+        for item in gate_projection["next_required_evidence"]
+    )
+    assert any(
+        item.get("field") == "route_token_ref"
+        for item in gate_projection["missing_evidence"]
+    )
+    assert any(
+        item.get("field") == "route_token_ref"
+        for item in gate_projection["close_gate_missing"]
+    )
+    assert any(
+        item["code"] == "route_token_missing"
+        for item in gate_projection["blocking_reasons"]
+    )
+    close_gap_codes = {
+        item["code"]
+        for item in gate_projection["close_precheck_gap_projection"]["gaps"]
+    }
+    assert "independent_verification_required" in close_gap_codes
+    assert gate_projection["audit_archive_action"]["ordinary_close_gate_claimed"] is False
+    assert "can_close" not in serialized
+    assert "normal_close_gate_passed" not in serialized
+    assert "close_ready_emitted" not in serialized
+    assert views["control_plane"]["gate_projection"] == gate_projection
+    assert views["worker_view"]["gate_projection"] == gate_projection
+    assert views["worker_view"]["control_plane"]["gate_projection"] == gate_projection
+
+
+def test_runtime_context_gate_projection_close_gate_ready_still_revalidates_on_write() -> None:
+    projection = build_runtime_context_projection(
+        _runtime_projection_context(checkpoint_id="checkpoint-runtime-context"),
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        timeline_refs={
+            "finish_event_ref": "timeline:finish-runtime-context",
+            "verification_event_refs": ["timeline:verify-runtime-context"],
+        },
+        finish_gate={
+            "event_id": "timeline:finish-runtime-context",
+            "checkpoint_id": "checkpoint-runtime-context",
+            "worker_self_attestation": {
+                "status": "passed",
+                "worker_self_attesting": True,
+                "finish_time_self_attesting": True,
+                "attestation_phase": "finish",
+            },
+            "worker_self_attestation_gate": {
+                "status": "passed",
+                "passed": True,
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    views = projection["views"]
+    close_gate = views["close_gate_view"]
+    gate_projection = views["gate_projection"]
+    diagnostic = gate_projection["close_gate_diagnostic"]
+
+    assert close_gate["ready"] is True
+    assert close_gate["status"] == "ready"
+    assert diagnostic["close_gate_projection_ready"] is True
+    assert diagnostic["projection_status"] == "diagnostic_ready"
+    assert diagnostic["ready_view_is_diagnostic_only"] is True
+    assert diagnostic["write_authorization_provided"] is False
+    assert diagnostic["authoritative_close_authorization"] == "not_evaluated"
+    assert diagnostic["must_revalidate_on_write"] is True
+    assert gate_projection["projection_only"] is True
+    assert gate_projection["must_revalidate_on_write"] is True
+    assert gate_projection["write_boundary"][
+        "protected_endpoints_must_rerun_authoritative_gates"
+    ] is True
+    assert gate_projection["write_boundary"][
+        "projection_fields_accepted_as_close_evidence"
+    ] is False
+    assert not {"can_close", "close_ready", "close_satisfying"} & set(
+        gate_projection
+    )
+
+
+def test_runtime_context_gate_projection_consumes_authoritative_timeline_gate_summary() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        timeline_events=[
+            {
+                "id": 4511,
+                "event_kind": "implementation",
+                "actor": "mf_sub",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "changed_files": ["agent/governance/parallel_branch_runtime.py"],
+                },
+            },
+            {
+                "id": 4512,
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "qa",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                },
+                "verification": {
+                    "tests_run": ["pytest agent/tests/test_parallel_branch_runtime.py"],
+                },
+            },
+        ],
+        generated_at=NOW,
+    ).to_dict()
+
+    gate_projection = projection["views"]["gate_projection"]
+    timeline_gate = gate_projection["authoritative_timeline_gate"]
+    serialized = json.dumps(timeline_gate, sort_keys=True)
+
+    assert timeline_gate["schema_version"] == (
+        RUNTIME_CONTEXT_TIMELINE_GATE_PROJECTION_SCHEMA_VERSION
+    )
+    assert timeline_gate["projection_only"] is True
+    assert timeline_gate["must_revalidate_on_write"] is True
+    assert timeline_gate["source"] == "task_timeline.mf_close_gate_verification"
+    assert timeline_gate["available"] is True
+    assert timeline_gate["status"] == "failed"
+    assert timeline_gate["diagnostic_result"] == "failed"
+    assert "close_ready" in timeline_gate["missing_event_kinds"]
+    assert any(
+        repair["event_kind"] == "close_ready"
+        for repair in timeline_gate["missing_event_repairs"]
+    )
+    assert timeline_gate["can_authorize_write"] is False
+    assert timeline_gate["can_authorize_close"] is False
+    assert timeline_gate["authoritative_close_verdict_redacted"] is True
+    assert "can_close" not in serialized
+    assert gate_projection["source_view_status"]["authoritative_timeline_gate"] == (
+        "failed"
+    )
 
 
 def test_runtime_context_worker_view_control_plane_is_role_scoped_without_raw_tokens() -> None:
@@ -2720,6 +2928,7 @@ def test_runtime_context_projection_content_address_is_stable_and_redacted() -> 
         "capability_boundary",
         "control_plane",
         "current",
+        "gate_projection",
         "gate_inputs",
         "worker_view",
         "observer_view",

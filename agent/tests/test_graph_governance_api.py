@@ -3314,6 +3314,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert {
         "current",
         "gate_inputs",
+        "gate_projection",
         "action_plan",
         "control_plane",
         "capability_boundary",
@@ -3332,6 +3333,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     capability_boundary = observer_views["capability_boundary"]
     assert control_plane["schema_version"] == "runtime_context.control_plane.v1"
     assert control_plane["next_legal_action"] == "record_finish_gate"
+    gate_projection = observer_views["gate_projection"]
+    assert gate_projection["schema_version"] == "runtime_context.gate_projection.v1"
+    assert gate_projection["projection_only"] is True
+    assert gate_projection["must_revalidate_on_write"] is True
+    assert gate_projection["raw_route_token_exposed"] is False
+    assert control_plane["gate_projection"] == gate_projection
     assert capability_boundary["schema_version"] == "runtime_context.capability_boundary.v1"
     assert capability_boundary["owned_files"] == ["agent/governance/server.py"]
     assert capability_boundary["fence_token_hash"] == (
@@ -3373,6 +3380,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "capability_boundary",
         "control_plane",
         "current",
+        "gate_projection",
         "gate_inputs",
         "worker_view",
         "close_gate_view",
@@ -3404,6 +3412,44 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert observer_audit_row["projection_hash"] == observer_audit["projection_hash"]
     assert "must-not-leak" not in observer_audit_row["nodes_read_json"]
     assert "must-not-leak" not in observer_audit_row["metadata_json"]
+
+    observer_gate_projection_result = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "observer",
+                query={
+                    "graph_trace_id": "gqt-runtime-current",
+                    "view": "gate_projection",
+                },
+            )
+        )
+    )
+    assert observer_gate_projection_result["ok"] is True
+    assert observer_gate_projection_result["role_scope"] == "observer"
+    observer_gate_projection_views = observer_gate_projection_result[
+        "runtime_context_service"
+    ]["views"]
+    assert set(observer_gate_projection_views) == {"gate_projection"}
+    observer_gate_projection = observer_gate_projection_views["gate_projection"]
+    assert observer_gate_projection["projection_only"] is True
+    assert observer_gate_projection["must_revalidate_on_write"] is True
+    assert "can_close" not in json.dumps(
+        observer_gate_projection,
+        sort_keys=True,
+    )
+    assert "raw-route-token-current" not in json.dumps(
+        observer_gate_projection_result,
+        sort_keys=True,
+    )
+    assert set(
+        observer_gate_projection_result["runtime_context_service"][
+            "content_address"
+        ]["nodes"]
+    ) == {"gate_projection"}
 
     audit_count_before_denied = conn.execute(
         "SELECT COUNT(*) FROM parallel_branch_runtime_access_audit"
@@ -3542,6 +3588,40 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert "runtime-current-session" not in json.dumps(worker_result, sort_keys=True)
     assert "raw-route-token-current" not in json.dumps(worker_result, sort_keys=True)
     assert "must-not-leak" not in json.dumps(worker_result, sort_keys=True)
+    worker_gate_projection_result = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "runtime-current-parent",
+                    "fence_token": "fence-current",
+                    "session_token": "runtime-current-session",
+                    "graph_trace_id": "gqt-runtime-current",
+                    "view": "gate_projection",
+                },
+            )
+        )
+    )
+    assert worker_gate_projection_result["ok"] is True
+    assert worker_gate_projection_result["role_scope"] == "worker"
+    worker_gate_projection_views = worker_gate_projection_result[
+        "runtime_context_service"
+    ]["views"]
+    assert set(worker_gate_projection_views) == {"worker_view"}
+    worker_gate_projection_view = worker_gate_projection_views["worker_view"][
+        "gate_projection"
+    ]
+    assert worker_gate_projection_view["role_scope"] == "mf_sub"
+    assert worker_gate_projection_view["projection_only"] is True
+    assert worker_gate_projection_view["must_revalidate_on_write"] is True
+    assert "raw-route-token-current" not in json.dumps(
+        worker_gate_projection_result,
+        sort_keys=True,
+    )
     worker_guide_result = (
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
             _ctx_with_role(
@@ -17709,6 +17789,45 @@ def test_backlog_close_bypass_timeline_gate_is_rejected_for_ai_reachable_callers
     )
     assert len(events) == 1
     assert events[0]["payload"]["bypass_timeline_gate"] is True
+
+
+def test_backlog_close_rejects_runtime_gate_projection_as_close_evidence(conn):
+    backlog_id = "AC-GATE-PROJECTION-CANNOT-CLOSE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx_with_role(
+                {"project_id": PID, "bug_id": backlog_id},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "gate_projection": {
+                        "schema_version": "runtime_context.gate_projection.v1",
+                        "projection_only": True,
+                        "must_revalidate_on_write": True,
+                        "authoritative_timeline_gate": {
+                            "diagnostic_result": "passed"
+                        },
+                    },
+                    "route_waiver": _route_waiver(
+                        "backlog_close",
+                        backlog_id=backlog_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "mf_timeline_gate_failed"
+    assert "implementation" in exc.value.message
+    assert "verification" in exc.value.message
+    assert "close_ready" in exc.value.message
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
 
 
 def test_hotfix_enter_records_timeline_event(conn):

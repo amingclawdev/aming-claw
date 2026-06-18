@@ -310,6 +310,10 @@ RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION = "runtime_context.gate_inputs.v1"
 RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION = "runtime_context.worker_view.v1"
 RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION = "runtime_context.close_gate_view.v1"
 RUNTIME_CONTEXT_ACTION_PLAN_SCHEMA_VERSION = "runtime_context.action_plan.v1"
+RUNTIME_CONTEXT_GATE_PROJECTION_SCHEMA_VERSION = "runtime_context.gate_projection.v1"
+RUNTIME_CONTEXT_TIMELINE_GATE_PROJECTION_SCHEMA_VERSION = (
+    "runtime_context.timeline_gate_projection.v1"
+)
 RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION = "runtime_context.control_plane.v1"
 RUNTIME_CONTEXT_CAPABILITY_BOUNDARY_SCHEMA_VERSION = (
     "runtime_context.capability_boundary.v1"
@@ -706,6 +710,7 @@ class RuntimeContextProjection:
     current: dict[str, Any]
     gate_inputs: dict[str, Any]
     action_plan: dict[str, Any]
+    gate_projection: dict[str, Any]
     control_plane: dict[str, Any]
     capability_boundary: dict[str, Any]
     worker_view: dict[str, Any]
@@ -719,6 +724,7 @@ class RuntimeContextProjection:
             "current": self.current,
             "gate_inputs": self.gate_inputs,
             "action_plan": self.action_plan,
+            "gate_projection": self.gate_projection,
             "control_plane": self.control_plane,
             "capability_boundary": self.capability_boundary,
             "worker_view": self.worker_view,
@@ -5496,10 +5502,347 @@ def build_runtime_context_action_plan_view(
     }
 
 
+def build_runtime_context_timeline_gate_projection(
+    *,
+    timeline_events: Sequence[Mapping[str, Any]] | None,
+    contract_revision: BranchRuntimeContractRevision | Mapping[str, Any] | None = None,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Project authoritative MF timeline-gate output into safe diagnostics."""
+
+    safe_events = [
+        public_contract_revision_payload(event)
+        for event in timeline_events or ()
+        if isinstance(event, Mapping)
+    ]
+    base_projection = {
+        "schema_version": RUNTIME_CONTEXT_TIMELINE_GATE_PROJECTION_SCHEMA_VERSION,
+        "projection_only": True,
+        "must_revalidate_on_write": True,
+        "source": "task_timeline.mf_close_gate_verification",
+        "compact_source": "task_timeline.compact_gate_summary",
+        "repair_source": "task_timeline.repair_gate_summary",
+        "can_authorize_write": False,
+        "can_authorize_close": False,
+        "authoritative_close_verdict_redacted": True,
+    }
+    if not safe_events:
+        return {
+            **base_projection,
+            "available": False,
+            "status": "unavailable",
+            "reason": "timeline_events_unavailable",
+            "event_count": 0,
+            "missing_event_kinds": [],
+            "failed_gates": [],
+            "repair_reasons": [],
+            "next_legal_actions": [],
+            "missing_event_repairs": [],
+            "failed_gate_repairs": [],
+        }
+    try:
+        from . import task_timeline
+
+        contract = _runtime_context_revision_mapping(contract_revision)
+        full_gate = task_timeline.mf_close_gate_verification(
+            safe_events,
+            contract=contract,
+        )
+        compact = task_timeline.compact_gate_summary(
+            full_gate,
+            request_id=request_id,
+        )
+        repair = task_timeline.repair_gate_summary(
+            full_gate,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        return {
+            **base_projection,
+            "available": False,
+            "status": "error",
+            "reason": "timeline_gate_projection_error",
+            "error": str(exc),
+            "event_count": len(safe_events),
+            "missing_event_kinds": [],
+            "failed_gates": [],
+            "repair_reasons": [],
+            "next_legal_actions": [],
+            "missing_event_repairs": [],
+            "failed_gate_repairs": [],
+        }
+
+    audit_archive_recovery = _runtime_context_mapping(
+        repair.get("audit_archive_recovery")
+    )
+    sanitized_audit_archive_recovery: dict[str, Any] = {}
+    if audit_archive_recovery:
+        body_skeleton = _runtime_context_mapping(
+            audit_archive_recovery.get("body_skeleton")
+        )
+        sanitized_audit_archive_recovery = {
+            "schema_version": _runtime_context_text(
+                audit_archive_recovery.get("schema_version")
+                or "mf_audit_archive_recovery.v1"
+            ),
+            "recommended_legal_action": (
+                "Use backlog_audit_archive only for accepted work whose "
+                "ordinary MF close evidence is non-reconstructable; it records "
+                "WAIVED audit state and is not normal close authorization."
+            ),
+            "mcp_tool": _runtime_context_text(
+                audit_archive_recovery.get("mcp_tool")
+            ),
+            "http_method": _runtime_context_text(
+                audit_archive_recovery.get("http_method")
+            ),
+            "http_path": _runtime_context_text(
+                audit_archive_recovery.get("http_path")
+            ),
+            "row_status": _runtime_context_text(
+                audit_archive_recovery.get("row_status")
+            ),
+            "normal_close_authorization": False,
+            "close_satisfying_by_itself": bool(
+                audit_archive_recovery.get("close_satisfying_by_itself")
+            ),
+            "requires_independent_qa": bool(
+                audit_archive_recovery.get("requires_independent_qa")
+            ),
+            "requires_non_reconstructable_evidence_reason": bool(
+                audit_archive_recovery.get(
+                    "requires_non_reconstructable_evidence_reason"
+                )
+            ),
+            "body_required_fields": sorted(body_skeleton) if body_skeleton else [],
+        }
+    return {
+        **base_projection,
+        "available": True,
+        "status": _runtime_context_text(full_gate.get("status")),
+        "diagnostic_result": "passed" if full_gate.get("passed") else "failed",
+        "event_count": int(full_gate.get("event_count") or len(safe_events)),
+        "projected_event_count": int(full_gate.get("projected_event_count") or 0),
+        "missing_event_kinds": list(compact.get("missing_event_kinds") or []),
+        "failed_gates": copy.deepcopy(list(compact.get("failed_gates") or [])),
+        "repair_reasons": copy.deepcopy(list(compact.get("repair_reasons") or [])),
+        "next_legal_actions": _runtime_context_dedupe(
+            list(compact.get("next_legal_actions") or [])
+            + list(repair.get("next_legal_actions") or [])
+        ),
+        "missing_event_repairs": copy.deepcopy(
+            list(repair.get("missing_event_repairs") or [])
+        ),
+        "failed_gate_repairs": copy.deepcopy(
+            list(repair.get("failed_gate_repairs") or [])
+        ),
+        "failed_gate_count": int(repair.get("failed_gate_count") or 0),
+        "route_identity": copy.deepcopy(dict(compact.get("route_identity") or {})),
+        "audit_archive_recovery": sanitized_audit_archive_recovery,
+        "request_id": request_id,
+    }
+
+
+def build_runtime_context_gate_projection_view(
+    *,
+    gate_inputs_view: Mapping[str, Any],
+    close_gate_view: Mapping[str, Any],
+    action_plan_view: Mapping[str, Any],
+    timeline_gate_projection: Mapping[str, Any] | None = None,
+    viewer_role: str = RUNTIME_CONTEXT_WORKER_ROLE,
+) -> dict[str, Any]:
+    """Aggregate gate diagnostics without minting a write/close verdict."""
+
+    gate_inputs = dict(gate_inputs_view)
+    close_gate = dict(close_gate_view)
+    action_plan = dict(action_plan_view)
+    timeline_gate = (
+        dict(timeline_gate_projection)
+        if isinstance(timeline_gate_projection, Mapping)
+        else build_runtime_context_timeline_gate_projection(
+            timeline_events=None,
+            contract_revision=None,
+        )
+    )
+    audit_archive_action = _runtime_context_mapping(
+        action_plan.get("audit_archive_action")
+    )
+    audit_archive_entrypoint = _runtime_context_mapping(
+        audit_archive_action.get("entrypoint")
+    )
+    sanitized_audit_archive_action = {
+        "schema_version": _runtime_context_text(
+            audit_archive_action.get("schema_version")
+            or "runtime_context.audit_archive_action.v1"
+        ),
+        "status": _runtime_context_text(audit_archive_action.get("status")),
+        "next_action": _runtime_context_text(
+            audit_archive_action.get("next_action")
+        ),
+        "archive_action": _runtime_context_text(
+            audit_archive_action.get("archive_action")
+        ),
+        "ordinary_close_gate_claimed": bool(
+            audit_archive_action.get("ordinary_close_gate_claimed")
+        ),
+        "entrypoint": {
+            key: copy.deepcopy(audit_archive_entrypoint.get(key))
+            for key in (
+                "method",
+                "path",
+                "mcp_tool",
+                "required_public_fields",
+                "request_template",
+            )
+            if key in audit_archive_entrypoint
+        },
+        "blocker_codes": list(audit_archive_action.get("blocker_codes") or []),
+        "projection_note": (
+            "Audit archive is presented as a recovery option only; normal "
+            "close authorization remains owned by protected close gates."
+        ),
+    }
+    gate_inputs_missing = [
+        copy.deepcopy(item)
+        for item in gate_inputs.get("missing") or []
+        if isinstance(item, Mapping)
+    ]
+    close_gate_missing = [
+        copy.deepcopy(item)
+        for item in close_gate.get("missing") or []
+        if isinstance(item, Mapping)
+    ]
+    missing_evidence = [
+        copy.deepcopy(item)
+        for item in action_plan.get("missing_evidence") or []
+        if isinstance(item, Mapping)
+    ]
+    next_required_evidence = [
+        copy.deepcopy(item)
+        for item in action_plan.get("next_required_evidence") or []
+        if isinstance(item, Mapping)
+    ]
+    blocking_reasons = [
+        copy.deepcopy(item)
+        for item in action_plan.get("blocking_reasons") or []
+        if isinstance(item, Mapping)
+    ]
+    close_gaps = [
+        copy.deepcopy(item)
+        for item in _runtime_context_mapping(
+            action_plan.get("close_precheck_gap_projection")
+        ).get("gaps")
+        or []
+        if isinstance(item, Mapping)
+    ]
+    blocked = bool(
+        gate_inputs_missing
+        or close_gate_missing
+        or missing_evidence
+        or next_required_evidence
+        or blocking_reasons
+        or close_gaps
+    )
+    close_projection_ready = bool(close_gate.get("ready"))
+    projection_status = (
+        "diagnostic_blocked"
+        if blocked or not close_projection_ready
+        else "diagnostic_clear_requires_write_revalidation"
+    )
+    return {
+        "schema_version": RUNTIME_CONTEXT_GATE_PROJECTION_SCHEMA_VERSION,
+        "projection_only": True,
+        "must_revalidate_on_write": True,
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "role_scope": _runtime_context_text(viewer_role) or RUNTIME_CONTEXT_WORKER_ROLE,
+        "viewer_role": _runtime_context_text(viewer_role) or RUNTIME_CONTEXT_WORKER_ROLE,
+        "runtime_context_id": _runtime_context_text(
+            action_plan.get("runtime_context_id")
+            or gate_inputs.get("runtime_context_id")
+            or close_gate.get("runtime_context_id")
+        ),
+        "task_id": _runtime_context_text(
+            action_plan.get("task_id")
+            or gate_inputs.get("task_id")
+            or close_gate.get("task_id")
+        ),
+        "projection_status": projection_status,
+        "diagnostic_status": (
+            "missing_required_evidence"
+            if blocked or not close_projection_ready
+            else "no_known_projection_gaps"
+        ),
+        "source_views": [
+            "gate_inputs",
+            "close_gate_view",
+            "action_plan",
+            "task_timeline",
+        ],
+        "authoritative_timeline_gate": timeline_gate,
+        "source_view_status": {
+            "gate_inputs": _runtime_context_text(gate_inputs.get("status")),
+            "close_gate_view": _runtime_context_text(close_gate.get("status")),
+            "action_plan": _runtime_context_text(
+                action_plan.get("schema_version")
+            ),
+            "authoritative_timeline_gate": _runtime_context_text(
+                timeline_gate.get("status")
+            ),
+        },
+        "next_legal_action": _runtime_context_text(
+            action_plan.get("next_legal_action")
+        ),
+        "gate_inputs_missing": gate_inputs_missing,
+        "close_gate_missing": close_gate_missing,
+        "next_required_evidence": next_required_evidence,
+        "missing_evidence": missing_evidence,
+        "blocking_reasons": blocking_reasons,
+        "audit_archive_action": sanitized_audit_archive_action,
+        "close_precheck_gap_projection": copy.deepcopy(
+            dict(action_plan.get("close_precheck_gap_projection") or {})
+        ),
+        "close_gate_diagnostic": {
+            "schema_version": "runtime_context.gate_projection.close_gate_diagnostic.v1",
+            "projection_status": "diagnostic_ready"
+            if close_projection_ready
+            else "diagnostic_blocked",
+            "diagnostic_status": _runtime_context_text(close_gate.get("status")),
+            "close_gate_projection_ready": close_projection_ready,
+            "ready_view_is_diagnostic_only": True,
+            "write_authorization_provided": False,
+            "authoritative_close_authorization": "not_evaluated",
+            "must_revalidate_on_write": True,
+            "message": (
+                "close_gate_view readiness is a Runtime Context diagnostic; "
+                "protected write and close endpoints must rerun authoritative gates."
+            ),
+        },
+        "write_boundary": {
+            "protected_endpoints_must_rerun_authoritative_gates": True,
+            "projection_fields_accepted_as_write_evidence": False,
+            "projection_fields_accepted_as_close_evidence": False,
+            "blocked_actions": [
+                "treat_gate_projection_as_authoritative_close_authorization",
+                "treat_gate_projection_as_normal_close_evidence",
+                "treat_gate_projection_as_worker_startup_or_finish_acceptance",
+            ],
+        },
+        "redaction": {
+            "raw_session_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "observer_only_authority_exposed": False,
+        },
+    }
+
+
 def build_runtime_context_control_plane_view(
     action_plan_view: Mapping[str, Any],
     *,
     capability_boundary_view: Mapping[str, Any] | None = None,
+    gate_projection_view: Mapping[str, Any] | None = None,
     viewer_role: str = RUNTIME_CONTEXT_WORKER_ROLE,
 ) -> dict[str, Any]:
     """Expose the action plan under a stable Runtime Context control-plane view."""
@@ -5511,6 +5854,21 @@ def build_runtime_context_control_plane_view(
         if isinstance(capability_boundary_view, Mapping)
         else {}
     )
+    gate_projection = (
+        dict(gate_projection_view)
+        if isinstance(gate_projection_view, Mapping)
+        else build_runtime_context_gate_projection_view(
+            gate_inputs_view=action_plan.get("gate_inputs") or {},
+            close_gate_view=action_plan.get("close_gate_view") or {},
+            action_plan_view=action_plan,
+            viewer_role=normalized_viewer_role,
+        )
+    )
+    gate_projection["role_scope"] = normalized_viewer_role
+    gate_projection["viewer_role"] = normalized_viewer_role
+    gate_projection["raw_session_token_exposed"] = False
+    gate_projection["raw_route_token_exposed"] = False
+    gate_projection["raw_fence_token_exposed"] = False
     return {
         "schema_version": RUNTIME_CONTEXT_CONTROL_PLANE_SCHEMA_VERSION,
         "role_scope": normalized_viewer_role,
@@ -5527,6 +5885,7 @@ def build_runtime_context_control_plane_view(
         ),
         "missing_evidence": list(action_plan.get("missing_evidence") or []),
         "blocking_reasons": list(action_plan.get("blocking_reasons") or []),
+        "gate_projection": gate_projection,
         "route_token_action": dict(action_plan.get("route_token_action") or {}),
         "read_receipt_hash_action": dict(
             action_plan.get("read_receipt_hash_action") or {}
@@ -5790,6 +6149,7 @@ def build_runtime_context_worker_view(
     action_plan_view: Mapping[str, Any] | None = None,
     control_plane_view: Mapping[str, Any] | None = None,
     capability_boundary_view: Mapping[str, Any] | None = None,
+    gate_projection_view: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the mf_sub-safe role-filtered view for one worker/fence/task."""
 
@@ -5830,14 +6190,31 @@ def build_runtime_context_worker_view(
         if isinstance(capability_boundary_view, Mapping)
         else build_runtime_context_capability_boundary_view(current_view)
     )
+    gate_projection = (
+        dict(gate_projection_view)
+        if isinstance(gate_projection_view, Mapping)
+        else build_runtime_context_gate_projection_view(
+            gate_inputs_view=gate_inputs,
+            close_gate_view=close_gate,
+            action_plan_view=action_plan,
+            viewer_role=RUNTIME_CONTEXT_WORKER_ROLE,
+        )
+    )
+    gate_projection["role_scope"] = RUNTIME_CONTEXT_WORKER_ROLE
+    gate_projection["viewer_role"] = RUNTIME_CONTEXT_WORKER_ROLE
+    gate_projection["raw_session_token_exposed"] = False
+    gate_projection["raw_route_token_exposed"] = False
+    gate_projection["raw_fence_token_exposed"] = False
     control_plane = (
         dict(control_plane_view)
         if isinstance(control_plane_view, Mapping)
         else build_runtime_context_control_plane_view(
             action_plan,
             capability_boundary_view=capability_boundary,
+            gate_projection_view=gate_projection,
         )
     )
+    control_plane["gate_projection"] = gate_projection
     return {
         "schema_version": RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
         "role": RUNTIME_CONTEXT_WORKER_ROLE,
@@ -5930,6 +6307,7 @@ def build_runtime_context_worker_view(
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,
         "action_plan": action_plan,
+        "gate_projection": gate_projection,
         "control_plane": control_plane,
         "evidence_refs": {
             key: _runtime_context_mapping(current_view.get("evidence_refs")).get(
@@ -5963,6 +6341,7 @@ def build_runtime_context_worker_view(
                 "gate_inputs",
                 "close_gate_view",
                 "action_plan",
+                "gate_projection",
                 "control_plane",
                 "evidence_refs",
             ],
@@ -6002,6 +6381,14 @@ def _runtime_context_role_scoped_view(
     control_plane["raw_session_token_exposed"] = False
     control_plane["raw_route_token_exposed"] = False
     control_plane["raw_fence_token_exposed"] = False
+    gate_projection = dict(role_view.get("gate_projection") or {})
+    gate_projection["role_scope"] = normalized_role
+    gate_projection["viewer_role"] = normalized_role
+    gate_projection["raw_session_token_exposed"] = False
+    gate_projection["raw_route_token_exposed"] = False
+    gate_projection["raw_fence_token_exposed"] = False
+    role_view["gate_projection"] = gate_projection
+    control_plane["gate_projection"] = gate_projection
     role_view["control_plane"] = control_plane
 
     role_filter_policy = dict(role_view.get("role_filter_policy") or {})
@@ -6060,9 +6447,22 @@ def build_runtime_context_projection(
         close_gate_view=close_gate,
     )
     capability_boundary = build_runtime_context_capability_boundary_view(current)
+    timeline_gate_projection = build_runtime_context_timeline_gate_projection(
+        timeline_events=timeline_events,
+        contract_revision=contract_revision,
+        request_id=runtime_context_id_for_branch_context(context),
+    )
+    gate_projection = build_runtime_context_gate_projection_view(
+        gate_inputs_view=gate_inputs,
+        close_gate_view=close_gate,
+        action_plan_view=action_plan,
+        timeline_gate_projection=timeline_gate_projection,
+        viewer_role=RUNTIME_CONTEXT_WORKER_ROLE,
+    )
     control_plane = build_runtime_context_control_plane_view(
         action_plan,
         capability_boundary_view=capability_boundary,
+        gate_projection_view=gate_projection,
     )
     worker_view = build_runtime_context_worker_view(
         current,
@@ -6074,6 +6474,7 @@ def build_runtime_context_projection(
         action_plan_view=action_plan,
         control_plane_view=control_plane,
         capability_boundary_view=capability_boundary,
+        gate_projection_view=gate_projection,
     )
     observer_view = _runtime_context_role_scoped_view(worker_view, role="observer")
     qa_view = _runtime_context_role_scoped_view(worker_view, role="qa")
@@ -6084,6 +6485,7 @@ def build_runtime_context_projection(
         current=current,
         gate_inputs=gate_inputs,
         action_plan=action_plan,
+        gate_projection=gate_projection,
         control_plane=control_plane,
         capability_boundary=capability_boundary,
         worker_view=worker_view,

@@ -7209,6 +7209,7 @@ def _runtime_context_projection_response(
         allowed_views = {
             "current",
             "gate_inputs",
+            "gate_projection",
             "action_plan",
             "control_plane",
             "capability_boundary",
