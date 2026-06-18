@@ -6813,15 +6813,107 @@ def _gate_repair_with_cross_ref_context(
         [*_list(repair.get("relevant_event_ids")), *rejected_event_ids]
     )
     contextual["recommended_legal_action"] = (
-        "Do not append route_context, close_ready, audit-close, or an advisory bridge as "
-        "a substitute. Re-run or re-record the bounded worker through the runtime context "
+        "Do not append route_context, close_ready, or an advisory bridge as a normal-close "
+        "substitute. Re-run or re-record the bounded worker through the runtime context "
         "facades so dispatch/startup/implementation carry route_token_ref, parent_task_id, "
         "runtime_context_id, worker_slot_id, observer_command_id, canonical parent route "
-        "scope, and registry-backed active token proof."
+        "scope, and registry-backed active token proof. If the implementation is already "
+        "accepted but historical worker evidence cannot be legally reconstructed, use "
+        "backlog_audit_archive as the audited WAIVED recovery path; do not claim can_close, "
+        "close_ready, or reconstructed worker evidence."
     )
     contextual["suggested_event_kind"] = "bounded_worker_rerun"
     contextual.pop("append_payload_skeleton", None)
     return contextual
+
+
+def _audit_archive_recovery_summary(
+    full_result: dict[str, Any],
+    *,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Return the audited recovery path for rows that cannot normal-close."""
+
+    if bool(full_result.get("passed") or full_result.get("can_close")):
+        return {}
+
+    missing_event_kinds = [
+        str(item)
+        for item in _list(full_result.get("missing_event_kinds"))
+        if str(item or "").strip()
+    ]
+    failed_gates = []
+    for key in MF_REPAIR_GATE_KEYS:
+        gate = _mapping(full_result.get(key))
+        if gate and not bool(gate.get("passed")):
+            failed_gates.append(key)
+    repair_reasons = _list(full_result.get("repair_reasons"))
+    if not missing_event_kinds and not failed_gates and not repair_reasons:
+        return {}
+
+    timeline_precheck: dict[str, Any] = {
+        "can_close": False,
+        "missing_event_kinds": missing_event_kinds,
+        "failed_gates": failed_gates,
+    }
+    if request_id:
+        timeline_precheck["request_id"] = request_id
+
+    return {
+        "schema_version": "mf_audit_archive_recovery.v1",
+        "recommended_legal_action": (
+            "When the implementation is accepted but the normal MF close evidence is "
+            "non-reconstructable, call backlog_audit_archive. This records a WAIVED "
+            "audit archive and must not claim can_close, close_ready, startup, or worker "
+            "evidence was reconstructed."
+        ),
+        "mcp_tool": "backlog_audit_archive",
+        "http_method": "POST",
+        "http_path": "/api/backlog/{project_id}/{bug_id}/audit-archive",
+        "row_status": "WAIVED",
+        "normal_close_gate_can_close": False,
+        "close_satisfying_by_itself": False,
+        "requires_independent_qa": True,
+        "requires_non_reconstructable_evidence_reason": True,
+        "body_skeleton": {
+            "commit": "<implementation_commit_sha>",
+            "reason": (
+                "<why ordinary MF close cannot legally pass and why audit archive "
+                "is being used>"
+            ),
+            "timeline_precheck": timeline_precheck,
+            "failure_audit": {
+                "what_happened": "<what happened during the failed normal close>",
+                "non_reconstructable_evidence_reason": (
+                    "<why startup/worker/close_ready evidence cannot be reconstructed "
+                    "without fabricating append-only facts>"
+                ),
+                "historical_evidence_reconstructed": False,
+                "startup_or_close_ready_backfilled": False,
+            },
+            "qa_acceptance": {
+                "passed": True,
+                "reviewer": "<independent_qa_reviewer>",
+                "reviewer_role": "qa",
+                "tests": ["<focused test command>"],
+                "artifacts": ["<artifact or timeline ref>"],
+            },
+            "verification": {
+                "tests": ["<focused test command>"],
+                "artifacts": ["<artifact or timeline ref>"],
+            },
+            "graph_snapshot": {
+                "snapshot_id": "<current_graph_snapshot_id>",
+                "commit_sha": "<current_graph_commit_sha>",
+            },
+            "runtime_context": {
+                "route_token_ref": "<route_token_ref for backlog_audit_archive>",
+                "route_context_hash": "<route_context_hash or empty if unavailable>",
+                "prompt_contract_id": "<prompt_contract_id or empty if unavailable>",
+            },
+            "actor": "observer",
+        },
+    }
 
 
 def _compact_append_payload_hint(skeleton: dict[str, Any]) -> dict[str, Any]:
@@ -6959,7 +7051,10 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                 "graph_trace_ids from the worker-owned graph query; close consumes "
                 "the canonical mf_subagent_finish_gate projection, not raw "
                 "finish-time attestation by itself. Do not record another startup, "
-                "observer-backfill worker evidence, or audit-close as a substitute."
+                "observer-backfill worker evidence, or use audit archive to pretend "
+                "finish evidence exists. If accepted implementation evidence cannot "
+                "normal-close because historical finish evidence is non-reconstructable, "
+                "use backlog_audit_archive as WAIVED recovery with independent QA."
             )
             suggested_event_kind = "mf_subagent_finish_gate"
             append_skeleton = _repair_append_skeleton(
@@ -6998,8 +7093,11 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                 "Record a new worker-authored mf_subagent_startup through the "
                 "runtime/parallel startup facade with worker_session_id, "
                 "worker_transcript_ref or worker_transcript_path, harness_type, "
-                "and filer_principal. Do not observer-backfill or audit-close "
-                "as a substitute for worker startup evidence."
+                "and filer_principal. Do not observer-backfill or use audit archive "
+                "to pretend startup evidence exists. If accepted implementation "
+                "evidence cannot normal-close because startup evidence is "
+                "non-reconstructable, use backlog_audit_archive as WAIVED recovery "
+                "with independent QA."
             )
             suggested_event_kind = "mf_subagent_startup"
             append_skeleton = _generic_repair_append_skeleton(
@@ -7168,6 +7266,12 @@ def repair_gate_summary(
         summary["repair_reasons"] = repair_reasons
     if next_legal_actions:
         summary["next_legal_actions"] = next_legal_actions
+    audit_archive_recovery = _audit_archive_recovery_summary(
+        full_result,
+        request_id=request_id,
+    )
+    if audit_archive_recovery:
+        summary["audit_archive_recovery"] = audit_archive_recovery
     for opt_key in ("project_id", "bug_id", "applicable"):
         if full_result.get(opt_key) is not None:
             summary[opt_key] = full_result[opt_key]

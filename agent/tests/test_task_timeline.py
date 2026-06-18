@@ -8951,10 +8951,15 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert route_failure["diagnosis"] == "worker evidence present but rejected by cross_ref_gate"
     assert route_failure["rejected_event_ids"] == [22]
     assert "Do not append route_context" in route_failure["recommended_legal_action"]
+    assert "backlog_audit_archive" in route_failure["recommended_legal_action"]
+    assert "WAIVED recovery" in route_failure["recommended_legal_action"]
     assert route_failure["suggested_event_kind"] == "bounded_worker_rerun"
     assert "append_payload_skeleton" not in route_failure
 
-    route_repair = task_timeline.repair_gate_summary(route_blocked)
+    route_repair = task_timeline.repair_gate_summary(
+        route_blocked,
+        request_id="req-route-repair",
+    )
     route_repair_item = next(
         item for item in route_repair["failed_gate_repairs"]
         if item["gate"] == "route_context_gate"
@@ -8962,6 +8967,23 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert route_repair_item["diagnosis"] == "worker evidence present but rejected by cross_ref_gate"
     assert route_repair_item["rejected_event_ids"] == [22]
     assert "append_payload_skeleton" not in route_repair_item
+    audit_recovery = route_repair["audit_archive_recovery"]
+    assert audit_recovery["mcp_tool"] == "backlog_audit_archive"
+    assert audit_recovery["row_status"] == "WAIVED"
+    assert audit_recovery["normal_close_gate_can_close"] is False
+    assert audit_recovery["close_satisfying_by_itself"] is False
+    body = audit_recovery["body_skeleton"]
+    assert body["timeline_precheck"]["can_close"] is False
+    assert body["timeline_precheck"]["request_id"] == "req-route-repair"
+    assert body["timeline_precheck"]["failed_gates"] == [
+        "route_context_gate",
+        "cross_ref_gate",
+    ]
+    assert body["failure_audit"]["historical_evidence_reconstructed"] is False
+    assert body["qa_acceptance"]["reviewer_role"] == "qa"
+    assert body["runtime_context"]["route_token_ref"] == (
+        "<route_token_ref for backlog_audit_archive>"
+    )
 
 
 def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap():
@@ -9022,9 +9044,18 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
     assert "finish_time_worker_self_attestation" in close_repair["missing_fields"]
     assert close_repair["suggested_event_kind"] == "mf_subagent_finish_gate"
     assert "Do not record another startup" in close_repair["recommended_legal_action"]
+    assert "backlog_audit_archive" in close_repair["recommended_legal_action"]
+    assert "WAIVED recovery" in close_repair["recommended_legal_action"]
     assert close_repair["append_payload_skeleton"]["payload"][
         "mf_subagent_finish_gate"
     ]["graph_trace_ids"] == ["<worker_owned_gqt_id>"]
+    audit_recovery = repair["audit_archive_recovery"]
+    assert audit_recovery["body_skeleton"]["timeline_precheck"]["failed_gates"] == [
+        "close_timeline_startup_gate"
+    ]
+    assert audit_recovery["body_skeleton"]["graph_snapshot"]["snapshot_id"] == (
+        "<current_graph_snapshot_id>"
+    )
 
 
 def test_close_gate_startup_gate_consumes_canonical_finish_gate_projection():
