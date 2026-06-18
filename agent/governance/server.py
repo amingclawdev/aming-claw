@@ -5425,6 +5425,21 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         exc_details = getattr(exc, "details", None)
         if isinstance(exc_details, Mapping):
             details.update(exc_details)
+        details.update(
+            _runtime_context_worker_recovery_details(
+                ctx,
+                conn,
+                project_id=governance_project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+                fence_token=fence_token,
+                session_token=session_token,
+                target_project_root=target_project_root,
+                route_identity=route_identity,
+                reason=reason,
+            )
+        )
         if reason == "runtime_session_token_expired":
             raise GovernanceError(
                 "runtime_session_token_expired",
@@ -5438,6 +5453,30 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             403,
             details,
         ) from exc
+    recovery_details = _runtime_context_worker_recovery_details(
+        ctx,
+        conn,
+        project_id=context.project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=fence_token,
+        session_token=session_token,
+        target_project_root=target_project_root,
+        route_identity=route_identity,
+        reason="runtime_context_sequence_check",
+        context=context,
+    )
+    if runtime_context_id and recovery_details.get("next_legal_action") in {
+        "submit_mf_subagent_read_receipt",
+        "record_mf_subagent_startup",
+    }:
+        raise GovernanceError(
+            "runtime_context_sequence_incomplete",
+            "mf_subagent graph query requires ordered read receipt and startup evidence",
+            403,
+            recovery_details,
+        )
     fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
     body["task_id"] = context.task_id
     body["parent_task_id"] = (
@@ -5455,8 +5494,13 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     body["fence_token"] = fence_token
     body["governance_project_id"] = context.governance_project_id or context.project_id
     body["target_project_id"] = context.target_project_id or ctx.get_project_id()
-    if context.target_project_root and not body.get("target_project_root"):
-        body["target_project_root"] = context.target_project_root
+    target_root = _runtime_context_effective_target_project_root(context)
+    if target_root and not body.get("target_project_root"):
+        body["target_project_root"] = target_root
+    if target_root and not body.get("project_root"):
+        body["project_root"] = target_root
+    if target_root and not body.get("repo_root"):
+        body["repo_root"] = target_root
     body["query_source"] = "mf_subagent"
     body["run_id"] = str(body.get("run_id") or "") or f"mf_subagent:{context.task_id}:fence:{fence_hash}"
     return session
@@ -7206,6 +7250,7 @@ def _runtime_context_projection_response(
         or branch_view_for_summary.get("session_token_lease")
         or {}
     )
+    target_project_root = _runtime_context_effective_target_project_root(context)
     audit = record_runtime_context_access_audit(
         conn,
         project_id=context_project_id,
@@ -7229,6 +7274,10 @@ def _runtime_context_projection_response(
         "project_id": project_id,
         "governance_project_id": context_project_id,
         "target_project_id": getattr(context, "target_project_id", "") or project_id,
+        "target_project_root": target_project_root,
+        "project_root": target_project_root,
+        "repo_root": target_project_root,
+        "worktree_path": getattr(context, "worktree_path", "") or target_project_root,
         "runtime_context_id": runtime_context_id,
         "task_id": getattr(context, "task_id", ""),
         "role_scope": role_scope,
@@ -7297,6 +7346,36 @@ def _runtime_context_worker_guide_response(
     )
     task = dict(worker_view.get("task") or {})
     route_identity = dict(worker_view.get("route_identity") or {})
+    target_project_root = str(
+        graph_identity.get("target_project_root")
+        or task.get("target_project_root")
+        or current_state_response.get("target_project_root")
+        or branch_view.get("worktree_path")
+        or ""
+    )
+    project_root = str(
+        graph_identity.get("project_root")
+        or task.get("project_root")
+        or current_state_response.get("project_root")
+        or target_project_root
+    )
+    repo_root = str(
+        graph_identity.get("repo_root")
+        or task.get("repo_root")
+        or current_state_response.get("repo_root")
+        or target_project_root
+    )
+    graph_payload_shape = dict(graph_identity.get("payload_shape") or {})
+    if target_project_root:
+        graph_payload_shape["target_project_root"] = target_project_root
+    if project_root:
+        graph_payload_shape["project_root"] = project_root
+    if repo_root:
+        graph_payload_shape["repo_root"] = repo_root
+    graph_identity["target_project_root"] = target_project_root
+    graph_identity["project_root"] = project_root
+    graph_identity["repo_root"] = repo_root
+    graph_identity["payload_shape"] = graph_payload_shape
     runtime_context_id = str(current_state_response.get("runtime_context_id") or "")
     project_id = str(current_state_response.get("project_id") or "")
     task_id = str(current_state_response.get("task_id") or task.get("task_id") or "")
@@ -7689,6 +7768,10 @@ def _runtime_context_worker_guide_response(
         "project_id": project_id,
         "governance_project_id": current_state_response.get("governance_project_id"),
         "target_project_id": current_state_response.get("target_project_id"),
+        "target_project_root": target_project_root,
+        "project_root": project_root,
+        "repo_root": repo_root,
+        "worktree_path": branch_view.get("worktree_path") or target_project_root,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "role_scope": current_state_response.get("role_scope"),
@@ -7697,6 +7780,10 @@ def _runtime_context_worker_guide_response(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "project_root": project_root,
+            "repo_root": repo_root,
+            "worktree_path": branch_view.get("worktree_path") or target_project_root,
             "next_legal_action": next_legal_action,
             "next_required_evidence": next_required_evidence,
             "missing_evidence": list(
@@ -7726,19 +7813,15 @@ def _runtime_context_worker_guide_response(
                     or current_state_response.get("target_project_id")
                     or project_id
                 ),
-                "target_project_root": graph_identity.get("target_project_root") or "",
+                "target_project_root": target_project_root,
                 "fence_token_hash": graph_identity.get("fence_token_hash") or "",
                 "fence_token_redacted": True,
-                "project_root": graph_identity.get("project_root")
-                or graph_identity.get("target_project_root")
-                or "",
-                "repo_root": graph_identity.get("repo_root")
-                or graph_identity.get("target_project_root")
-                or "",
+                "project_root": project_root,
+                "repo_root": repo_root,
                 "required_route_identity_fields": list(
                     graph_identity.get("required_route_identity_fields") or []
                 ),
-                "payload_shape": dict(graph_identity.get("payload_shape") or {}),
+                "payload_shape": graph_payload_shape,
             },
             "route_identity": route_identity,
             "session_token_lease": session_token_lease,
@@ -7837,6 +7920,256 @@ def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
     query = ctx.query if isinstance(ctx.query, Mapping) else {}
     return str(body.get(key) or query.get(key) or "").strip()
+
+
+def _runtime_context_effective_target_project_root(context) -> str:
+    from .parallel_branch_runtime import runtime_context_effective_target_project_root
+
+    return runtime_context_effective_target_project_root(context)
+
+
+def _runtime_context_worker_recovery_details(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    runtime_context_id: str = "",
+    task_id: str = "",
+    parent_task_id: str = "",
+    fence_token: str = "",
+    session_token: str = "",
+    target_project_root: str = "",
+    route_identity: Mapping[str, Any] | None = None,
+    reason: str = "",
+    context=None,
+) -> dict[str, Any]:
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+        mf_subagent_session_token_hash,
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
+    )
+
+    requested_runtime_context_id = str(runtime_context_id or "").strip()
+    requested_task_id = str(task_id or "").strip()
+    query = ctx.query if isinstance(ctx.query, Mapping) else {}
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    caller_omitted_target_root = not any(
+        str(source.get(key) or "").strip()
+        for source in (body, query)
+        for key in (
+            "target_project_root",
+            "target_graph_root",
+            "project_root",
+            "workspace_path",
+            "repo_root",
+        )
+    )
+    if context is None and requested_runtime_context_id:
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            requested_runtime_context_id,
+        )
+    if context is None and requested_task_id:
+        context = get_branch_context(conn, project_id, requested_task_id)
+
+    supplied_route_identity = dict(route_identity or {})
+    requested_target_root = str(target_project_root or "").strip()
+    next_legal_action = "verify_runtime_context_identity"
+    recovery_action_id = "retry_with_matching_runtime_context_identity"
+    recoverable = bool(context)
+    diagnostics: dict[str, Any] = {
+        "reason": reason or "fence_invalidated_or_unknown",
+        "caller_omitted_target_project_root": caller_omitted_target_root,
+        "requested": {
+            "runtime_context_id": requested_runtime_context_id,
+            "task_id": requested_task_id,
+            "parent_task_id": str(parent_task_id or "").strip(),
+            "worker_role": "mf_sub",
+            "target_project_root": requested_target_root,
+            "session_token_present": bool(session_token),
+            "fence_token_present": bool(fence_token),
+        },
+        "expected": {},
+        "matches": {},
+        "route_identity_presence": {
+            "supplied": {
+                field: bool(str(supplied_route_identity.get(field) or "").strip())
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            },
+            "expected": {},
+        },
+        "session_token": {
+            "presented": bool(session_token),
+            "matches_recorded_hash": None,
+            "raw_session_token_exposed": False,
+        },
+    }
+    if context is not None:
+        expected_runtime_context_id = runtime_context_id_for_branch_context(context)
+        expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+        expected_target_root = _runtime_context_effective_target_project_root(context)
+        expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+        lease_view = runtime_context_session_token_lease_view(context)
+        supplied_session_hash = (
+            mf_subagent_session_token_hash(session_token) if session_token else ""
+        )
+        session_matches = bool(
+            getattr(context, "session_token_hash", "")
+            and supplied_session_hash
+            and supplied_session_hash == getattr(context, "session_token_hash", "")
+        )
+        try:
+            fence_matches = bool(
+                getattr(context, "fence_token", "")
+                and fence_token
+                and hashlib.sha256(str(fence_token).encode("utf-8")).hexdigest()
+                == hashlib.sha256(
+                    str(getattr(context, "fence_token", "")).encode("utf-8")
+                ).hexdigest()
+            )
+        except Exception:
+            fence_matches = False
+        diagnostics["expected"] = {
+            "runtime_context_id": expected_runtime_context_id,
+            "task_id": getattr(context, "task_id", ""),
+            "parent_task_id": expected_parent_task_id,
+            "worker_id": getattr(context, "worker_id", ""),
+            "worker_slot_id": (
+                getattr(context, "worker_slot_id", "")
+                or getattr(context, "worker_id", "")
+            ),
+            "agent_id": getattr(context, "agent_id", ""),
+            "allocation_owner": getattr(context, "allocation_owner", ""),
+            "target_project_root": expected_target_root,
+            "target_project_root_source": (
+                "context.target_project_root"
+                if getattr(context, "target_project_root", "")
+                else "context.worktree_path"
+                if getattr(context, "worktree_path", "")
+                else ""
+            ),
+            "worktree_path": getattr(context, "worktree_path", ""),
+            "route_identity_present": bool(expected_route_identity),
+            "session_token_hash_recorded": bool(getattr(context, "session_token_hash", "")),
+            "fence_token_recorded": bool(getattr(context, "fence_token", "")),
+        }
+        diagnostics["matches"] = {
+            "runtime_context_id": (
+                not requested_runtime_context_id
+                or requested_runtime_context_id == expected_runtime_context_id
+            ),
+            "task_id": (
+                not requested_task_id
+                or requested_task_id == getattr(context, "task_id", "")
+            ),
+            "parent_task_id": (
+                not parent_task_id
+                or str(parent_task_id).strip() == expected_parent_task_id
+            ),
+            "target_project_root": (
+                not requested_target_root
+                or not expected_target_root
+                or requested_target_root == expected_target_root
+            ),
+            "fence_token": fence_matches,
+            "session_token": session_matches,
+        }
+        identity_failure = reason not in {
+            "",
+            "runtime_context_sequence_check",
+            "runtime_session_token_expired",
+        }
+        identity_failure = identity_failure or any(
+            diagnostics["matches"].get(field) is False
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "target_project_root",
+                "fence_token",
+            )
+        )
+        identity_failure = identity_failure or bool(
+            getattr(context, "session_token_hash", "")
+            and not diagnostics["matches"].get("session_token")
+        )
+        diagnostics["route_identity_presence"]["expected"] = {
+            field: bool(str(expected_route_identity.get(field) or "").strip())
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        diagnostics["session_token"].update(
+            {
+                "matches_recorded_hash": session_matches,
+                "lease": lease_view,
+                "lease_status": lease_view.get("status"),
+                "lease_expired": lease_view.get("expired"),
+                "expiry_reason": (
+                    "expired"
+                    if lease_view.get("expired")
+                    else "missing"
+                    if not lease_view.get("has_lease")
+                    else ""
+                ),
+            }
+        )
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=getattr(context, "project_id", project_id),
+            task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        )
+        timeline_refs, _startup_gate, _finish_gate, _close_evidence = (
+            _runtime_context_service_timeline_refs(
+                conn,
+                project_id=getattr(context, "project_id", project_id),
+                task_id=str(getattr(context, "task_id", "") or ""),
+                backlog_id=str(getattr(context, "backlog_id", "") or ""),
+                timeline_events=timeline_events,
+            )
+        )
+        diagnostics["timeline"] = {
+            "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
+            "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
+        }
+        if identity_failure:
+            next_legal_action = "verify_runtime_context_identity"
+            recovery_action_id = "retry_with_matching_runtime_context_identity"
+        elif not timeline_refs.get("read_receipt_event_ref"):
+            next_legal_action = "submit_mf_subagent_read_receipt"
+            recovery_action_id = "post_runtime_context_read_receipt"
+        elif not timeline_refs.get("startup_event_ref"):
+            next_legal_action = "record_mf_subagent_startup"
+            recovery_action_id = "post_runtime_context_startup"
+        elif lease_view.get("expired"):
+            next_legal_action = "reissue_runtime_session_token"
+            recovery_action_id = "post_runtime_context_session_token_reissue"
+        elif caller_omitted_target_root and expected_target_root:
+            next_legal_action = "retry_with_target_project_root"
+            recovery_action_id = "copy_projected_target_project_root"
+    recovery_actions = [
+        {
+            "id": recovery_action_id,
+            "action": next_legal_action,
+            "description": "Perform the next legal runtime-context worker step, then retry.",
+        },
+        {
+            "id": "refresh_worker_guide",
+            "action": "read_runtime_context_worker_guide",
+            "description": "Refresh current-state/worker-guide and copy the projected identity fields.",
+        },
+    ]
+    return {
+        "recoverable": recoverable,
+        "next_legal_action": next_legal_action,
+        "recovery_actions": recovery_actions,
+        "diagnostics": diagnostics,
+        "fail_closed": True,
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
 
 
 def _runtime_context_anonymous_token_free_fallback(
@@ -7959,6 +8292,24 @@ def _runtime_context_validate_mf_sub_lookup(
         exc_details = getattr(exc, "details", None)
         if isinstance(exc_details, Mapping):
             details.update(exc_details)
+        details.update(
+            _runtime_context_worker_recovery_details(
+                ctx,
+                conn,
+                project_id=(
+                    _runtime_context_request_value(ctx, "governance_project_id")
+                    or _runtime_context_request_value(ctx, "backlog_project_id")
+                    or project_id
+                ),
+                runtime_context_id=runtime_context_id,
+                task_id=_runtime_context_request_value(ctx, "task_id"),
+                parent_task_id=_runtime_context_request_value(ctx, "parent_task_id"),
+                fence_token=fence_token,
+                session_token=session_token,
+                target_project_root=target_project_root,
+                reason=reason,
+            )
+        )
         if reason == "runtime_session_token_expired":
             raise GovernanceError(
                 "runtime_session_token_expired",
@@ -8009,7 +8360,6 @@ def _runtime_context_mf_sub_read_context(
             project_id=project_id,
             runtime_context_id=runtime_context_id,
             require_session_token=True,
-            require_target_project_root=True,
         )
         session = _runtime_context_scoped_mf_sub_session(
             project_id=project_id,
@@ -8673,6 +9023,24 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                 ttl_seconds=body.get("ttl_seconds"),
             )
         except BranchRuntimeFenceError as exc:
+            reason = str(exc) or "fence_invalidated_or_unknown"
+            recovery_details = _runtime_context_worker_recovery_details(
+                ctx,
+                conn,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=str(body.get("task_id") or "").strip(),
+                parent_task_id=str(body.get("parent_task_id") or "").strip(),
+                fence_token=str(body.get("fence_token") or "").strip(),
+                session_token=str(body.get("session_token") or "").strip(),
+                target_project_root=str(
+                    body.get("target_project_root")
+                    or body.get("project_root")
+                    or body.get("repo_root")
+                    or ""
+                ).strip(),
+                reason=reason,
+            )
             raise GovernanceError(
                 "fence_invalidated_or_unknown",
                 "mf_subagent session token reissue requires active matching runtime/fence/session identity",
@@ -8681,8 +9049,9 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                     "runtime_context_id": runtime_context_id,
                     "task_id": str(body.get("task_id") or ""),
                     "parent_task_id": str(body.get("parent_task_id") or ""),
-                    "reason": str(exc) or "fence_invalidated_or_unknown",
+                    "reason": reason,
                     "fail_closed": True,
+                    **recovery_details,
                 },
             ) from exc
 
@@ -8731,6 +9100,7 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
 
     payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
     payload = dict(payload)
+    target_project_root = _runtime_context_effective_target_project_root(context)
     parent_task_id = (
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
@@ -8745,7 +9115,7 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "worker_slot_id": context.worker_slot_id or context.worker_id,
         "governance_project_id": context.governance_project_id or project_id,
         "target_project_id": context.target_project_id or project_id,
-        "target_project_root": context.target_project_root,
+        "target_project_root": target_project_root,
     }.items():
         if value:
             payload[key] = value
@@ -8822,6 +9192,7 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
     )
+    target_project_root = _runtime_context_effective_target_project_root(context)
     startup_body = {
         **body,
         "task_id": context.task_id,
@@ -8840,7 +9211,7 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
         "merge_queue_id": context.merge_queue_id,
         "governance_project_id": context.governance_project_id or project_id,
         "target_project_id": context.target_project_id or project_id,
-        "target_project_root": context.target_project_root,
+        "target_project_root": target_project_root,
     }
     for key in (
         "route_id",
@@ -14895,6 +15266,14 @@ def handle_graph_governance_query(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query")
+        if root is None and (
+            body.get("project_root")
+            or body.get("target_project_root")
+            or body.get("target_graph_root")
+            or body.get("workspace_path")
+            or body.get("repo_root")
+        ):
+            root = _graph_governance_project_root(project_id, body)
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
         try:
             with sqlite_write_lock():

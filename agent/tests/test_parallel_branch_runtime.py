@@ -1342,6 +1342,51 @@ def test_runtime_context_worker_view_control_plane_is_role_scoped_without_raw_to
     assert graph_payload["route_identity"]["route_token_ref"] == "rtok-runtime-context"
 
 
+def test_runtime_context_projection_uses_worktree_when_target_root_is_empty() -> None:
+    context = _runtime_projection_context(
+        target_project_root="",
+        worktree_path="/repo/.worktrees/mf-sub-runtime-context",
+    )
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    current = projection["views"]["current"]
+    current_values = current["current_values"]
+    worker_view = projection["views"]["worker_view"]
+    graph_identity = worker_view["graph_query_identity"]
+    graph_payload = graph_identity["payload_shape"]
+    capability = worker_view["capability_boundary"]
+
+    assert current_values["target_project_root"] == context.worktree_path
+    assert current_values["target_project_root_source"] == "context.worktree_path"
+    assert current_values["project_root"] == context.worktree_path
+    assert current_values["repo_root"] == context.worktree_path
+    assert worker_view["task"]["target_project_root"] == context.worktree_path
+    assert worker_view["task"]["project_root"] == context.worktree_path
+    assert worker_view["task"]["repo_root"] == context.worktree_path
+    assert graph_identity["target_project_root"] == context.worktree_path
+    assert graph_identity["project_root"] == context.worktree_path
+    assert graph_identity["repo_root"] == context.worktree_path
+    assert graph_payload["target_project_root"] == context.worktree_path
+    assert graph_payload["project_root"] == context.worktree_path
+    assert graph_payload["repo_root"] == context.worktree_path
+    assert capability["graph_query_scope"]["target_project_root"] == context.worktree_path
+    assert capability["graph_query_scope"]["project_root"] == context.worktree_path
+    assert capability["graph_query_scope"]["repo_root"] == context.worktree_path
+    assert capability["worker_execution_safety"]["target_project_root"] == (
+        context.worktree_path
+    )
+
+
 def test_runtime_context_distinguishes_terminal_complete_from_merge_eligible() -> None:
     complete_but_waiting = MergeQueueItem(
         project_id=PROJECT_ID,
@@ -2313,6 +2358,8 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         "governance_project_id": PROJECT_ID,
         "target_project_id": PROJECT_ID,
         "target_project_root": "/repo",
+        "project_root": "/repo",
+        "repo_root": "/repo",
     }
     assert boundary["capability_boundary_hash"] == runtime_context_content_hash(
         {key: value for key, value in boundary.items() if key != "capability_boundary_hash"}

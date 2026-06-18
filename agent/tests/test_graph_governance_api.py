@@ -12085,6 +12085,84 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
         "target_project_root": str(target_root),
         **route_identity,
     }
+    with pytest.raises(GovernanceError) as missing_read_receipt:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+    assert missing_read_receipt.value.code == "runtime_context_sequence_incomplete"
+    assert missing_read_receipt.value.details["next_legal_action"] == (
+        "submit_mf_subagent_read_receipt"
+    )
+    assert missing_read_receipt.value.details["recoverable"] is True
+    assert missing_read_receipt.value.details["diagnostics"]["expected"][
+        "target_project_root"
+    ] == str(target_root)
+
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="worker-runtime-context",
+        backlog_id="AC-RUNTIME-CONTEXT-GRAPH-QUERY",
+        event_type="mf_subagent_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="startup_read_receipt",
+        status="ok",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": "worker-runtime-context",
+            "parent_task_id": "parent-runtime-context",
+            "read_receipt_hash": "sha256:read-runtime-context",
+        },
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as missing_startup:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+    assert missing_startup.value.code == "runtime_context_sequence_incomplete"
+    assert missing_startup.value.details["next_legal_action"] == (
+        "record_mf_subagent_startup"
+    )
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="worker-runtime-context",
+        backlog_id="AC-RUNTIME-CONTEXT-GRAPH-QUERY",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        payload={
+            "mf_subagent_startup_gate": {
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": "worker-runtime-context",
+                "parent_task_id": "parent-runtime-context",
+                "fence_token_present": True,
+                "status": "passed",
+                "actual_startup_recorded": True,
+                "actual_cwd": str(target_root),
+                "actual_git_root": str(target_root),
+                "worktree_path": str(target_root),
+                "worker_role": "mf_sub",
+                "worker_id": "worker-runtime-context",
+                "read_receipt_event_id": read_receipt["id"],
+                "read_receipt_hash": "sha256:read-runtime-context",
+                **route_identity,
+            }
+        },
+    )
+    conn.commit()
     queried = server.handle_graph_governance_query(
         _ctx_with_role(
             {"project_id": PID},
@@ -12317,6 +12395,145 @@ def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
             )
         )
     assert wrong_token.value.code == "fence_invalidated_or_unknown"
+
+
+def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_context(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "allocated-worker-root"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root="",
+            task_id="worker-empty-target-root",
+            root_task_id="parent-empty-target-root",
+            backlog_id="AC-EMPTY-TARGET-ROOT",
+            stage_task_id="worker-empty-target-root",
+            worker_id="worker-empty-target-root",
+            worker_slot_id="slot-empty-target-root",
+            branch_ref="refs/heads/codex/worker-empty-target-root",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-empty-target-root",
+            session_token_hash=mf_subagent_session_token_hash("empty-target-session"),
+            lease_id="lease-empty-target-root",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-empty-target-root",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity={
+            "route_id": "route-empty-target-root",
+            "route_context_hash": "sha256:route-empty-target-root",
+            "prompt_contract_id": "rprompt-empty-target-root",
+            "prompt_contract_hash": "sha256:prompt-empty-target-root",
+            "route_token_ref": "rtok-empty-target-root",
+            "visible_injection_manifest_hash": "sha256:visible-empty-target-root",
+        },
+    )
+    conn.commit()
+    query_without_target_root = {
+        "parent_task_id": "parent-empty-target-root",
+        "fence_token": "fence-empty-target-root",
+        "session_token": "empty-target-session",
+        "view": "all",
+    }
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            query=query_without_target_root,
+        )
+    )
+
+    assert current["ok"] is True
+    assert current["target_project_root"] == str(target_root)
+    assert current["project_root"] == str(target_root)
+    assert current["repo_root"] == str(target_root)
+    worker_view = current["runtime_context_service"]["views"]["worker_view"]
+    graph_identity = worker_view["graph_query_identity"]
+    graph_payload = graph_identity["payload_shape"]
+    assert worker_view["task"]["target_project_root"] == str(target_root)
+    assert worker_view["task"]["project_root"] == str(target_root)
+    assert worker_view["task"]["repo_root"] == str(target_root)
+    assert graph_identity["target_project_root"] == str(target_root)
+    assert graph_identity["project_root"] == str(target_root)
+    assert graph_identity["repo_root"] == str(target_root)
+    assert graph_payload["target_project_root"] == str(target_root)
+    assert graph_payload["project_root"] == str(target_root)
+    assert graph_payload["repo_root"] == str(target_root)
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            query=query_without_target_root,
+        )
+    )
+
+    worker_guide = guide["worker_guide"]
+    assert guide["target_project_root"] == str(target_root)
+    assert worker_guide["target_project_root"] == str(target_root)
+    assert worker_guide["project_root"] == str(target_root)
+    assert worker_guide["repo_root"] == str(target_root)
+    assert worker_guide["graph_query_identity"]["payload_shape"][
+        "target_project_root"
+    ] == str(target_root)
+
+    read_receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            method="POST",
+            body={
+                "parent_task_id": "parent-empty-target-root",
+                "fence_token": "fence-empty-target-root",
+                "session_token": "empty-target-session",
+                "target_project_root": worker_guide["target_project_root"],
+                "launch_text_hash": "sha256:empty-target-launch",
+                "actor": "slot-empty-target-root",
+            },
+        )
+    )
+
+    assert read_receipt["ok"] is True
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-empty-target-root",
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert events[-1]["payload"]["target_project_root"] == str(target_root)
+
+    for bad_query in (
+        {**query_without_target_root, "target_project_root": str(target_root / "wrong")},
+        {**query_without_target_root, "session_token": "wrong-empty-target-session"},
+        {**query_without_target_root, "fence_token": "wrong-empty-target-fence"},
+    ):
+        with pytest.raises(GovernanceError) as denied:
+            server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+                _ctx(
+                    {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                    query=bad_query,
+                )
+            )
+        assert denied.value.code == "fence_invalidated_or_unknown"
+        assert denied.value.details["recoverable"] is True
+        assert denied.value.details["fail_closed"] is True
+        assert denied.value.details["next_legal_action"] in {
+            "record_mf_subagent_startup",
+            "verify_runtime_context_identity",
+        }
+        diagnostics = denied.value.details["diagnostics"]
+        assert diagnostics["expected"]["target_project_root"] == str(target_root)
+        assert diagnostics["expected"]["worktree_path"] == str(target_root)
+        assert diagnostics["session_token"]["raw_session_token_exposed"] is False
 
 
 def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):

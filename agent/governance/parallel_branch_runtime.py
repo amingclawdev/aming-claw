@@ -1937,6 +1937,17 @@ def _runtime_context_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def runtime_context_effective_target_project_root(
+    context: "BranchTaskRuntimeContext",
+) -> str:
+    """Return the assigned worker root projected to runtime-context callers."""
+
+    return _runtime_context_text(
+        getattr(context, "target_project_root", "")
+        or getattr(context, "worktree_path", "")
+    )
+
+
 def _runtime_context_startup_gate_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
     payload = public_contract_revision_payload(value or {})
     event_payload = payload.get("payload")
@@ -2994,11 +3005,20 @@ def _runtime_context_current_values(
         worker_self_attestation.get("attestation_phase")
     ).lower() != "startup"
     fence_token_hash = runtime_context_secret_hash(context.fence_token)
+    target_project_root = runtime_context_effective_target_project_root(context)
+    target_project_root_source = ""
+    if _runtime_context_text(context.target_project_root):
+        target_project_root_source = "context.target_project_root"
+    elif _runtime_context_text(context.worktree_path):
+        target_project_root_source = "context.worktree_path"
     return {
         "project_id": context.project_id,
         "governance_project_id": context.governance_project_id or context.project_id,
         "target_project_id": context.target_project_id or context.project_id,
-        "target_project_root": context.target_project_root,
+        "target_project_root": target_project_root,
+        "target_project_root_source": target_project_root_source,
+        "project_root": target_project_root,
+        "repo_root": target_project_root,
         "runtime_context_id": runtime_context_id,
         "observer_command_id": observer_command_id,
         "task_id": context.task_id,
@@ -3059,9 +3079,9 @@ def _runtime_context_current_values(
             "governance_project_id": context.governance_project_id
             or context.project_id,
             "target_project_id": context.target_project_id or context.project_id,
-            "target_project_root": context.target_project_root,
-            "project_root": context.target_project_root,
-            "repo_root": context.target_project_root,
+            "target_project_root": target_project_root,
+            "project_root": target_project_root,
+            "repo_root": target_project_root,
             "required_route_identity_fields": [
                 "route_id",
                 "route_context_hash",
@@ -3080,9 +3100,9 @@ def _runtime_context_current_values(
                 "task_id": context.task_id,
                 "parent_task_id": parent_task_id,
                 "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
-                "target_project_root": context.target_project_root,
-                "project_root": context.target_project_root,
-                "repo_root": context.target_project_root,
+                "target_project_root": target_project_root,
+                "project_root": target_project_root,
+                "repo_root": target_project_root,
                 "route_identity": {
                     "route_id": _runtime_context_text(route_identity.get("route_id")),
                     "route_context_hash": _runtime_context_text(
@@ -5555,7 +5575,9 @@ def _runtime_context_path_matches(left: Any, right: Any) -> bool:
 
 def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[str, Any]:
     assigned_worktree = _runtime_context_text(values.get("worktree_path"))
-    target_project_root = _runtime_context_text(values.get("target_project_root"))
+    target_project_root = _runtime_context_text(
+        values.get("target_project_root") or assigned_worktree
+    )
     startup_event_ref = _runtime_context_text(values.get("startup_event_ref"))
     startup_actual_cwd = _runtime_context_text(values.get("startup_actual_cwd"))
     startup_actual_git_root = _runtime_context_text(values.get("startup_actual_git_root"))
@@ -5690,6 +5712,11 @@ def build_runtime_context_capability_boundary_view(
     owned_files = _runtime_context_dedupe(
         _runtime_context_string_list(values.get("owned_files")) or target_files
     )
+    target_project_root = _runtime_context_text(
+        graph_identity.get("target_project_root")
+        or values.get("target_project_root")
+        or values.get("worktree_path")
+    )
     graph_scope = {
         "query_source": _runtime_context_text(
             graph_identity.get("query_source") or "mf_subagent"
@@ -5719,9 +5746,16 @@ def build_runtime_context_capability_boundary_view(
             or values.get("target_project_id")
             or values.get("project_id")
         ),
-        "target_project_root": _runtime_context_text(
-            graph_identity.get("target_project_root")
-            or values.get("target_project_root")
+        "target_project_root": target_project_root,
+        "project_root": _runtime_context_text(
+            graph_identity.get("project_root")
+            or values.get("project_root")
+            or target_project_root
+        ),
+        "repo_root": _runtime_context_text(
+            graph_identity.get("repo_root")
+            or values.get("repo_root")
+            or target_project_root
         ),
     }
     fence_token_present = bool(values.get("fence_token_present"))
@@ -5828,6 +5862,8 @@ def build_runtime_context_worker_view(
                 "governance_project_id",
                 "target_project_id",
                 "target_project_root",
+                "project_root",
+                "repo_root",
                 "task_id",
                 "parent_task_id",
                 "backlog_id",
@@ -6321,7 +6357,9 @@ def reissue_mf_subagent_runtime_session_token(
     if mf_subagent_session_token_hash(presented_token) != context.session_token_hash:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     requested_target_root = _startup_path_text(target_project_root)
-    context_target_root = _startup_path_text(context.target_project_root)
+    context_target_root = _startup_path_text(
+        runtime_context_effective_target_project_root(context)
+    )
     if requested_target_root and context_target_root and requested_target_root != context_target_root:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     parent = str(parent_task_id or "").strip()
@@ -7266,7 +7304,9 @@ def validate_mf_subagent_graph_query_identity(
     if requested_target_project_id != context_target_project_id:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     requested_target_root = _startup_path_text(target_project_root)
-    context_target_root = _startup_path_text(context.target_project_root)
+    context_target_root = _startup_path_text(
+        runtime_context_effective_target_project_root(context)
+    )
     if requested_target_root and context_target_root and requested_target_root != context_target_root:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
@@ -9035,7 +9075,9 @@ def validate_mf_subagent_runtime_context_lookup(
     if requested_target_project_id != context_target_project_id:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     requested_target_root = _startup_path_text(target_project_root)
-    context_target_root = _startup_path_text(context.target_project_root)
+    context_target_root = _startup_path_text(
+        runtime_context_effective_target_project_root(context)
+    )
     if requested_target_root and context_target_root and requested_target_root != context_target_root:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
