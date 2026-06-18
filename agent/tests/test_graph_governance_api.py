@@ -7679,7 +7679,16 @@ def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tm
         event_kind="mf_subagent_startup_refusal",
     )
     assert blocked["ok"] is False
+    assert blocked["status"] == "blocked"
+    assert blocked["blocked"] is True
+    assert blocked["must_stop"] is True
+    assert blocked["event_kind"] == "mf_subagent_startup_refusal"
+    assert blocked["startup_accepted"] is False
+    assert blocked["refusal"]["event_kind"] == "mf_subagent_startup_refusal"
     assert blocked["blocker_id"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert "owned_files" in blocked["missing_required_fields"]
+    assert blocked["next_action"]["payload_source"] == "worker_launch_pack.startup_recording"
+    assert "owned_files" in blocked["next_action"]["required_fields"]
     assert blocked["terminal_dispatch_blocker"] is True
     assert len(events) == 1
     assert events[0]["payload"]["mf_subagent_startup_refusal"]["blocker_id"] == (

@@ -559,6 +559,9 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     startup_status = blocker["startup_read_receipt_recording_status"]
     assert startup_status["startup_prepared"] is True
     assert startup_status["startup_recorded"] is True
+    assert startup_status["startup_close_satisfying"] is False
+    assert startup_status["startup_counts_as_real_worker_evidence"] is False
+    assert startup_status["startup_surrogate_not_close_satisfying"] is True
     assert startup_status["read_receipt_prepared"] is True
     assert startup_status["read_receipt_recorded"] is True
     assert startup_status["read_receipt_recorded_before_implementation_wait"] is True
@@ -580,10 +583,19 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert result["startup_recording"]["recorded"] is True
     assert result["startup_recording"]["appendable"] is False
     assert result["startup_recording"]["actual_startup_recorded"] is True
+    assert result["startup_recording"]["close_satisfying"] is False
+    assert result["startup_recording"]["counts_as_real_worker_evidence"] is False
+    assert (
+        result["startup_recording"]["host_adapter_startup_surrogate_not_close_satisfying"]
+        is True
+    )
     assert result["startup_timeline_event"]["parent_task_id"] == (
         "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
     )
-    assert result["startup_timeline_event"]["status"] == "passed"
+    assert result["startup_timeline_event"]["status"] == "accepted"
+    assert result["startup_timeline_event"]["decision"] == (
+        "host_adapter_surrogate_recorded_not_close_satisfying"
+    )
 
     assert len(recorded_events) == 3
     read_project_id, read_event = recorded_events[0]
@@ -597,10 +609,14 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert startup_project_id == "aming-claw"
     assert startup_event["event_type"] == "mf_subagent.startup"
     assert startup_event["event_kind"] == "mf_subagent_startup"
-    assert startup_event["status"] == "passed"
+    assert startup_event["status"] == "accepted"
     startup_gate = startup_event["payload"]["mf_subagent_startup_gate"]
     assert startup_gate["actual_startup_recorded"] is True
     assert startup_gate["host_adapter_startup_token_accepted"] is True
+    assert startup_gate["close_satisfying"] is False
+    assert startup_gate["counts_as_real_worker_evidence"] is False
+    assert startup_gate["host_adapter_startup_surrogate_not_close_satisfying"] is True
+    assert startup_gate["surrogate_startup_evidence_gate"]["status"] == "demoted"
     assert startup_gate["read_receipt"]["timeline_event_id"] == 17
 
     project_id, event = recorded_events[2]
@@ -622,6 +638,10 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     )
     assert payload["timeout_no_progress"]["blocker_id"] == (
         "codex_cli_timeout_no_output_no_finish"
+    )
+    assert (
+        "mf_subagent_startup_surrogate_recorded_not_close_satisfying"
+        in payload["command_projection"]["terminal_evidence_refs"]
     )
     assert payload["command_projection"]["command_projection_status"] == "failed"
     assert payload["worktree_diff_scope"]["no_diff"] is True

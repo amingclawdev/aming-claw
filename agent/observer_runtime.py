@@ -28,6 +28,7 @@ try:
     from governance.mf_subagent_contract import (
         MfSubagentContractError,
         build_mf_subagent_input,
+        surrogate_startup_evidence_gate,
         validate_mf_subagent_dispatch_gate,
     )
     from governance import batch_jobs
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - package import path
     from agent.governance.mf_subagent_contract import (
         MfSubagentContractError,
         build_mf_subagent_input,
+        surrogate_startup_evidence_gate,
         validate_mf_subagent_dispatch_gate,
     )
     from agent.governance import batch_jobs
@@ -932,6 +934,10 @@ def _startup_read_receipt_recording_status(
     startup_event = startup_event if isinstance(startup_event, Mapping) else {}
     startup_recording = observer_result.get("startup_recording")
     startup_recording = startup_recording if isinstance(startup_recording, Mapping) else {}
+    startup_payload = startup_event.get("payload")
+    startup_payload = startup_payload if isinstance(startup_payload, Mapping) else {}
+    startup_gate = startup_payload.get("mf_subagent_startup_gate")
+    startup_gate = startup_gate if isinstance(startup_gate, Mapping) else {}
     read_receipt = observer_result.get("read_receipt")
     read_receipt = read_receipt if isinstance(read_receipt, Mapping) else {}
     startup_recording_append = observer_result.get("startup_recording_append")
@@ -969,6 +975,18 @@ def _startup_read_receipt_recording_status(
         ),
         "startup_event_kind": str(startup_event.get("event_kind") or ""),
         "startup_status": str(startup_event.get("status") or ""),
+        "startup_close_satisfying": bool(
+            startup_recording.get("close_satisfying")
+            or startup_gate.get("close_satisfying")
+        ),
+        "startup_counts_as_real_worker_evidence": bool(
+            startup_recording.get("counts_as_real_worker_evidence")
+            or startup_gate.get("counts_as_real_worker_evidence")
+        ),
+        "startup_surrogate_not_close_satisfying": bool(
+            startup_recording.get("host_adapter_startup_surrogate_not_close_satisfying")
+            or startup_gate.get("host_adapter_startup_surrogate_not_close_satisfying")
+        ),
         "read_receipt_prepared": bool(read_receipt),
         "read_receipt_recorded": bool(observer_result.get("read_receipt_recorded")),
         "read_receipt_recorded_before_implementation_wait": bool(
@@ -2904,9 +2922,12 @@ def _dogfood_host_adapter_startup_evidence(
         "timeline_event_recorded": True,
         "timeline_event_id": read_receipt_event_id,
     }
+    surrogate_gate = surrogate_startup_evidence_gate(startup_gate)
+    surrogate_not_close_satisfying = not bool(surrogate_gate.get("close_satisfying"))
     startup_event_to_record = {
         **startup_event,
-        "status": "passed",
+        "status": "accepted",
+        "decision": "host_adapter_surrogate_recorded_not_close_satisfying",
         "recorded": True,
         "actual_startup_recorded": True,
         "timeline_event_recorded": True,
@@ -2921,9 +2942,19 @@ def _dogfood_host_adapter_startup_evidence(
                 "actual_startup_appendable": False,
                 "actual_startup_required": False,
                 "timeline_event_recorded": True,
-                "startup_evidence_kind": "host_adapter_startup",
+                "startup_evidence_kind": "host_adapter_startup_surrogate",
                 "startup_timing": "actual_worker_started",
-                "close_satisfying": True,
+                "close_satisfying": False,
+                "counts_as_real_worker_evidence": False,
+                "counts_as_independent_qa_evidence": False,
+                "worker_self_attesting": False,
+                "self_attesting": False,
+                "finish_time_self_attesting": False,
+                "worker_self_attestation_required": True,
+                "host_adapter_startup_surrogate_not_close_satisfying": (
+                    surrogate_not_close_satisfying
+                ),
+                "surrogate_startup_evidence_gate": surrogate_gate,
                 "read_receipt": recorded_read_receipt,
             },
             "read_receipt": recorded_read_receipt,
@@ -2931,8 +2962,10 @@ def _dogfood_host_adapter_startup_evidence(
         "artifact_refs": {
             **dict(startup_event.get("artifact_refs") or {}),
             "read_receipt_event_id": read_receipt_event_id,
-            "startup_evidence_kind": "host_adapter_startup",
+            "startup_evidence_kind": "host_adapter_startup_surrogate",
             "timeline_event_recorded": True,
+            "close_satisfying": False,
+            "counts_as_real_worker_evidence": False,
         },
     }
     startup_append = _append_dogfood_startup_read_receipt_event(
@@ -2974,6 +3007,13 @@ def _dogfood_host_adapter_startup_evidence(
         "read_receipt_event_id": read_receipt_event_id,
         "append_tool": "task_timeline.record_event",
         "event_kind": "mf_subagent_startup",
+        "startup_evidence_kind": "host_adapter_startup_surrogate",
+        "close_satisfying": False,
+        "counts_as_real_worker_evidence": False,
+        "host_adapter_startup_surrogate_not_close_satisfying": (
+            surrogate_not_close_satisfying
+        ),
+        "surrogate_startup_evidence_gate": surrogate_gate,
     }
     return {
         "startup_recording": recorded_startup_recording,
@@ -2985,9 +3025,14 @@ def _dogfood_host_adapter_startup_evidence(
         "actual_startup_recorded": True,
         "read_receipt_recorded": True,
         "read_receipt_recorded_before_implementation_wait": True,
-        "startup_evidence_kind": "host_adapter_startup",
+        "startup_evidence_kind": "host_adapter_startup_surrogate",
         "startup_evidence_appendable": False,
         "timeline_event_recorded": True,
+        "startup_close_satisfying": False,
+        "startup_counts_as_real_worker_evidence": False,
+        "host_adapter_startup_surrogate_not_close_satisfying": (
+            surrogate_not_close_satisfying
+        ),
         "startup_timeline_event_id": startup_event_id,
         "read_receipt_timeline_event_id": read_receipt_event_id,
     }
@@ -3016,6 +3061,7 @@ def _dogfood_cli_timeout_blocker(
         startup_status.get("startup_recorded")
         and startup_status.get("read_receipt_recorded")
     )
+    startup_close_satisfying = bool(startup_status.get("startup_close_satisfying"))
     if invocation_blocker_id:
         blocker_id = invocation_blocker_id
     else:
@@ -3053,7 +3099,11 @@ def _dogfood_cli_timeout_blocker(
         "command_projection_status": "failed",
         "divergence_reason": blocker_id,
         "terminal_evidence_refs": [
-            "mf_subagent_startup_recorded"
+            (
+                "mf_subagent_startup_close_satisfying"
+                if startup_close_satisfying
+                else "mf_subagent_startup_surrogate_recorded_not_close_satisfying"
+            )
             if durable_startup_read_receipt
             else "mf_subagent_startup_prepared",
             "mf_subagent_read_receipt_recorded"
@@ -3732,6 +3782,17 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "`--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`; "
         "`--sandbox workspace-write` may prevent localhost governance or "
         "noninteractive MCP access.\n\n"
+        "Record mf_subagent_startup by submitting the `startup_recording` "
+        "object from the Runtime contract JSON to parallel_branch_startup; do "
+        "not omit `owned_files`, route identity, observer_command_id, or "
+        "read_receipt fields from that canonical payload. After any startup "
+        "attempt, inspect the response body before acting. If `ok=false`, "
+        "`status=blocked`, `blocked=true`, `must_stop=true`, `blocker_id` is "
+        "present, `event_kind` ends in `_refusal`, or "
+        "`timeline_event_recorded.event_kind=mf_subagent_startup_refusal`, "
+        "stop before graph queries or implementation and report the blocker. "
+        "Do not treat an event id for `mf_subagent_startup_refusal` as startup "
+        "acceptance.\n\n"
         "Before handing off review_ready, run the local task precheck when "
         "available, normally `python -m agent.cli mf precommit-check --json-output` "
         "from the assigned worktree. Include the precheck command, exit code, "
@@ -3919,6 +3980,42 @@ def _runtime_text_worker_launch_pack(
     next_legal_action = str(
         request.worker_next_legal_action or "submit_mf_subagent_read_receipt"
     ).strip()
+    startup_refusal_policy = {
+        "schema_version": "observer_worker_launch_pack.startup_refusal_policy.v1",
+        "fail_closed": True,
+        "stop_before": [
+            "graph_query",
+            "implementation",
+            "verification",
+            "finish_gate",
+        ],
+        "refusal_indicators": [
+            "ok=false",
+            "status=blocked",
+            "blocked=true",
+            "must_stop=true",
+            "blocker_id_present",
+            "event_kind_suffix=_refusal",
+            "timeline_event_recorded.event_kind=mf_subagent_startup_refusal",
+        ],
+        "accepted_startup_event_kind": "mf_subagent_startup",
+        "refusal_event_kind": "mf_subagent_startup_refusal",
+        "canonical_retry_payload": "startup_recording",
+        "required_retry_fields": [
+            "owned_files",
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "observer_command_id",
+            "read_receipt_hash",
+            "read_receipt_event_id",
+        ],
+        "operator_instruction": (
+            "A recorded refusal event id is not startup acceptance; stop and "
+            "report the blocker instead of continuing implementation."
+        ),
+    }
     required_evidence = [
         {
             "id": "runtime_context_read_receipt",
@@ -3991,6 +4088,7 @@ def _runtime_text_worker_launch_pack(
             "raw_tokens_persisted": False,
             "worker_evidence_substitution_allowed": False,
         },
+        "startup_refusal_policy": startup_refusal_policy,
         "tests_to_run": list(request.test_commands),
         "evidence_to_file": required_evidence,
         "runtime_context_entrypoints": runtime_context_entrypoints,
@@ -4154,6 +4252,7 @@ def _runtime_text_worker_launch_pack(
         "blocked_actions": list(WORKER_LAUNCH_PACK_BLOCKED_ACTIONS),
         "next_legal_action": next_legal_action,
         "startup_preflight": startup_preflight,
+        "startup_refusal_policy": startup_refusal_policy,
         "required_evidence": required_evidence,
         "transcript_refs": _runtime_text_items(request.transcript_refs),
         "transcript_digests": _runtime_text_items(request.transcript_digests),
@@ -5186,12 +5285,26 @@ def build_dogfood_observer_run_plan(
                 or "observer dogfood could not record durable startup/read receipt"
             )
             return result
+        startup_close_satisfying = bool(
+            startup_recording_status.get("startup_close_satisfying")
+        )
         result["dispatch_gate_validation"] = {
             **result["dispatch_gate_validation"],
             "actual_startup_recorded": True,
-            "startup_evidence": "mf_subagent_startup_recorded",
+            "startup_evidence": (
+                "mf_subagent_startup_close_satisfying"
+                if startup_close_satisfying
+                else "mf_subagent_startup_surrogate_recorded_not_close_satisfying"
+            ),
             "startup_evidence_appendable": False,
             "timeline_event_recorded": True,
+            "startup_close_satisfying": startup_close_satisfying,
+            "startup_counts_as_real_worker_evidence": bool(
+                startup_recording_status.get("startup_counts_as_real_worker_evidence")
+            ),
+            "startup_surrogate_not_close_satisfying": bool(
+                startup_recording_status.get("startup_surrogate_not_close_satisfying")
+            ),
             "read_receipt_hash": startup_evidence["read_receipt"]["read_receipt_hash"],
             "startup_timeline_event_id": startup_recording_status.get(
                 "startup_timeline_event_id"

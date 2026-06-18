@@ -308,6 +308,11 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert launch_pack["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
     assert launch_pack["merge_queue_id"] == "mq-runtime-text"
     assert launch_pack["graph_query_schema_trace_id"] == "gqt-runtime-text"
+    startup_refusal_policy = launch_pack["startup_refusal_policy"]
+    assert startup_refusal_policy["fail_closed"] is True
+    assert startup_refusal_policy["canonical_retry_payload"] == "startup_recording"
+    assert "owned_files" in startup_refusal_policy["required_retry_fields"]
+    assert "event_kind_suffix=_refusal" in startup_refusal_policy["refusal_indicators"]
     assert launch_pack["context_pack_refs"] == []
     assert launch_pack["context_pack_status"] == "not_required"
     bridge = launch_pack["local_runtime_context_bridge"]
@@ -346,6 +351,10 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     )
     assert result["local_runtime_context_bridge"]["path"] == bridge["path"]
     assert bridge["path"] in result["launch_text"]
+    assert "mf_subagent_startup_refusal" in result["launch_text"]
+    assert "Do not treat an event id for `mf_subagent_startup_refusal` as startup acceptance" in result[
+        "launch_text"
+    ]
     assert "governance_io_unavailable_before_read_receipt" in result["launch_text"]
     assert "`--sandbox workspace-write` may prevent localhost governance" in result[
         "launch_text"

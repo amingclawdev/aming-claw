@@ -7961,22 +7961,42 @@ def _startup_blocker(
     missing: tuple[str, ...] = (),
     details: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    missing_fields = list(missing)
     payload: dict[str, Any] = {
         "ok": False,
         "schema_version": MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION,
         "status": "blocked",
+        "blocked": True,
         "blocker": blocker_id,
         "blocker_id": blocker_id,
         "dispatch_blocker": True,
         "terminal_dispatch_blocker": True,
         "actual_startup_recorded": False,
         "actual_startup_required": True,
+        "startup_accepted": False,
+        "startup_recorded": False,
+        "must_stop": True,
         "close_ready": False,
         "message": message,
-        "missing": list(missing),
+        "missing": missing_fields,
+        "next_action": {
+            "action": "retry_parallel_branch_startup_with_required_fields"
+            if missing_fields
+            else "inspect_startup_blocker_and_stop",
+            "tool": "parallel_branch_startup",
+            "description": (
+                "Stop before implementation. Retry actual mf_sub startup only with "
+                "the canonical startup_recording payload from the worker launch pack "
+                "or runtime contract, preserving owned_files and route identity."
+                if missing_fields
+                else "Stop before implementation and inspect the startup blocker."
+            ),
+            "required_fields": missing_fields,
+            "payload_source": "worker_launch_pack.startup_recording",
+        },
     }
     if missing:
-        payload["missing_required_fields"] = list(missing)
+        payload["missing_required_fields"] = missing_fields
     lineage_missing = {
         "observer_command_id",
         "read_receipt_hash",
@@ -8095,11 +8115,16 @@ def _startup_refusal_timeline_event(
         "gate_kind": "mf_subagent.startup",
         "status": "blocked",
         "ok": False,
+        "blocked": True,
         "decision": "refused",
+        "must_stop": True,
         "blocker_id": str(result.get("blocker_id") or result.get("blocker") or ""),
         "message": str(result.get("message") or ""),
         "missing": missing,
         "missing_required_fields": missing,
+        "next_action": result.get("next_action")
+        if isinstance(result.get("next_action"), Mapping)
+        else {},
         "project_id": project_id,
         "backlog_id": (
             context.backlog_id if context is not None else str(payload.get("backlog_id") or "")
@@ -8230,6 +8255,46 @@ def _startup_blocker_with_timeline(
         token_evidence=token_evidence,
         registered_host_adapter_identity=registered_host_adapter_identity,
         expected_runtime_context_id=expected_runtime_context_id,
+    )
+    event = result["timeline_event"]
+    refusal = (
+        event.get("payload", {}).get("mf_subagent_startup_refusal")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    refusal = refusal if isinstance(refusal, Mapping) else {}
+    result.update(
+        {
+            "ok": False,
+            "status": "blocked",
+            "blocked": True,
+            "decision": "refused",
+            "event_kind": "mf_subagent_startup_refusal",
+            "startup_accepted": False,
+            "startup_recorded": False,
+            "actual_startup_recorded": False,
+            "must_stop": True,
+            "stop_reason": str(result.get("blocker_id") or result.get("blocker") or ""),
+            "missing_required_fields": list(
+                result.get("missing_required_fields") or result.get("missing") or []
+            ),
+            "refusal": {
+                "event_kind": "mf_subagent_startup_refusal",
+                "status": "blocked",
+                "ok": False,
+                "blocked": True,
+                "must_stop": True,
+                "blocker_id": str(refusal.get("blocker_id") or result.get("blocker_id") or ""),
+                "missing_required_fields": list(
+                    refusal.get("missing_required_fields")
+                    or result.get("missing_required_fields")
+                    or result.get("missing")
+                    or []
+                ),
+                "next_action": refusal.get("next_action") or result.get("next_action") or {},
+                "message": str(refusal.get("message") or result.get("message") or ""),
+            },
+        }
     )
     return result
 
