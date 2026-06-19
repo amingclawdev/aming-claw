@@ -10965,6 +10965,164 @@ _CLOSE_BASE_EVENTS = [
 ]
 
 
+def _close_commit_events(commit: str):
+    return [
+        {
+            "id": 1,
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "accepted",
+            "commit_sha": commit,
+        },
+        {
+            "id": 2,
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "commit_sha": commit,
+        },
+        {
+            "id": 3,
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "commit_sha": commit,
+        },
+    ]
+
+
+def test_close_gate_blocks_when_close_commit_lacks_timeline_evidence():
+    """Regression: close cannot use old evidence for a newer close commit."""
+    from agent.governance import task_timeline
+
+    evidence_commit = "de32274600000000000000000000000000000000"
+    close_commit = "a643d3ff00000000000000000000000000000000"
+    contract = {"close_context": {"close_commit": close_commit}}
+
+    gate = task_timeline.mf_close_gate_verification(
+        [
+            {
+                "id": 0,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "commit_sha": close_commit,
+            },
+            *_close_commit_events(evidence_commit),
+        ],
+        contract=contract,
+    )
+
+    assert gate["passed"] is False, gate
+    commit_gate = gate["close_commit_evidence_gate"]
+    assert commit_gate["passed"] is False
+    assert commit_gate["close_commit"] == close_commit
+    assert commit_gate["latest_evidence_commit"] == evidence_commit
+    assert commit_gate["missing_requirement_ids"] == [
+        "matching_close_commit_timeline_evidence"
+    ]
+    assert close_commit in commit_gate["message"]
+    assert evidence_commit in commit_gate["message"]
+    assert "missing matching evidence" in commit_gate["message"]
+    assert "close_commit_evidence" in gate["missing_evidence_groups"]["groups"]
+
+    compact = task_timeline.compact_gate_summary(gate)
+    failed = {
+        item["gate"]: item
+        for item in compact["failed_gates"]
+    }
+    assert "close_commit_evidence_gate" in failed
+    assert failed["close_commit_evidence_gate"]["missing_requirement_ids"] == [
+        "matching_close_commit_timeline_evidence"
+    ]
+
+    repair = task_timeline.repair_gate_summary(gate)
+    repair_item = next(
+        item
+        for item in repair["failed_gate_repairs"]
+        if item["gate"] == "close_commit_evidence_gate"
+    )
+    assert close_commit in " ".join(repair_item["reasons"])
+    assert "record close-satisfying implementation" in (
+        repair_item["recommended_legal_action"]
+    )
+
+
+def test_close_gate_allows_matching_close_commit_evidence():
+    from agent.governance import task_timeline
+
+    close_commit = "a643d3ff"
+    evidence_commit = "a643d3ff00000000000000000000000000000000"
+    contract = {"close_context": {"close_commit": close_commit}}
+
+    gate = task_timeline.mf_close_gate_verification(
+        _close_commit_events(evidence_commit),
+        contract=contract,
+    )
+
+    assert gate["close_commit_evidence_gate"]["passed"] is True, gate
+    assert gate["passed"] is True, gate
+
+
+def test_close_gate_preserves_legacy_rows_without_supplied_close_commit():
+    from agent.governance import task_timeline
+
+    gate = task_timeline.mf_close_gate_verification(_CLOSE_BASE_EVENTS)
+
+    assert gate["close_commit_evidence_gate"]["status"] == "not_applicable"
+    assert gate["passed"] is True, gate
+
+
+def test_close_gate_uses_stored_backlog_close_event_commit():
+    from agent.governance import task_timeline
+
+    evidence_commit = "de32274600000000000000000000000000000000"
+    close_commit = "a643d3ff00000000000000000000000000000000"
+    events = [
+        *_close_commit_events(evidence_commit),
+        {
+            "id": 4,
+            "event_type": "route_token_gate.backlog_close",
+            "event_kind": "route_token_gate",
+            "phase": "route_gate",
+            "status": "accepted",
+            "commit_sha": close_commit,
+            "payload": {"route_token_gate": {"action": "backlog_close"}},
+        },
+    ]
+
+    gate = task_timeline.mf_close_gate_verification(events)
+
+    assert gate["passed"] is False, gate
+    commit_gate = gate["close_commit_evidence_gate"]
+    assert commit_gate["close_commit"] == close_commit
+    assert commit_gate["close_commit_source"] == "timeline.close_commit_event"
+    assert commit_gate["close_commit_event"]["id"] == 4
+    assert commit_gate["latest_evidence_commit"] == evidence_commit
+
+
+def test_server_close_contract_includes_body_or_row_close_commit():
+    from agent.governance import server
+
+    row = {
+        "priority": "P0",
+        "target_files": '["agent/governance/task_timeline.py"]',
+        "test_files": '["agent/tests/test_task_timeline.py"]',
+        "acceptance_criteria": '["close commit parity"]',
+        "commit": "a643d3ff",
+    }
+
+    from_row = server._mf_close_contract_with_route_context({}, row, {})
+    assert from_row["close_context"]["close_commit"] == "a643d3ff"
+
+    from_body = server._mf_close_contract_with_route_context(
+        {},
+        row,
+        {"commit": "de322746"},
+    )
+    assert from_body["close_context"]["close_commit"] == "de322746"
+
+
 def test_close_gate_rejects_when_cited_approval_excludes_backlog_close():
     """Criterion 1: a close whose own cited approval forbids close is rejected."""
     from agent.governance import task_timeline

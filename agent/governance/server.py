@@ -33773,6 +33773,31 @@ def _mf_close_contract_with_route_context(contract: dict, row, body: Mapping[str
             value = _string_list_field(value)
         if value not in (None, "", [], {}):
             close_context[key] = value
+    close_commit = ""
+    if isinstance(body, Mapping):
+        for key in (
+            "close_commit",
+            "commit",
+            "commit_sha",
+            "target_head_commit",
+            "head_commit",
+        ):
+            close_commit = str(body.get(key) or "").strip()
+            if close_commit:
+                break
+    if not close_commit:
+        for key in (
+            "commit",
+            "commit_sha",
+            "fixed_commit",
+            "target_head_commit",
+            "head_commit",
+        ):
+            close_commit = str(_row_get(row, key, "") or "").strip()
+            if close_commit:
+                break
+    if close_commit:
+        close_context["close_commit"] = close_commit
     if close_context:
         existing = enriched.get("close_context")
         if isinstance(existing, Mapping):

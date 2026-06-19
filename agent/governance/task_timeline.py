@@ -122,6 +122,7 @@ MF_CROSS_REF_GATE_SCHEMA_VERSION = "mf_close_cross_ref_gate.v1"
 MF_STALE_ROUTE_EVIDENCE_GATE_SCHEMA_VERSION = "mf_stale_route_evidence_gate.v1"
 MF_APPROVAL_SCOPE_GATE_SCHEMA_VERSION = "mf_close_approval_scope_gate.v1"
 MF_COMMAND_DISPOSITION_GATE_SCHEMA_VERSION = "mf_close_command_disposition_gate.v1"
+MF_CLOSE_COMMIT_EVIDENCE_GATE_SCHEMA_VERSION = "mf_close_commit_evidence_gate.v1"
 MF_FIXED_CLOSE_WAIVER_ALERT_SCHEMA_VERSION = "mf_fixed_close_waiver_alert.v1"
 MF_TIMELINE_REPAIR_SUMMARY_SCHEMA_VERSION = "mf_close_timeline_repair_summary.v1"
 
@@ -3923,6 +3924,257 @@ def _finish_gate_commit(event: dict[str, Any]) -> str:
     )
 
 
+def _evaluable_commit(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{7,40}", text):
+        return text
+    return ""
+
+
+def _commit_values_match(left: str, right: str) -> bool:
+    left_commit = _evaluable_commit(left)
+    right_commit = _evaluable_commit(right)
+    if not left_commit or not right_commit:
+        return False
+    if left_commit == right_commit:
+        return True
+    short_len = min(len(left_commit), len(right_commit))
+    return short_len >= 7 and left_commit[:short_len] == right_commit[:short_len]
+
+
+def _close_context_commit(contract: dict[str, Any] | None) -> tuple[str, str]:
+    raw_contract = _mapping(contract)
+    close_context = _mapping(raw_contract.get("close_context"))
+    for source_name, source, keys in (
+        (
+            "contract.close_context",
+            close_context,
+            (
+                "close_commit",
+                "close_commit_sha",
+                "requested_close_commit",
+                "requested_commit",
+                "stored_close_commit",
+                "stored_commit",
+                "backlog_commit",
+                "commit",
+                "commit_sha",
+                "implementation_commit",
+                "target_head_commit",
+                "head_commit",
+            ),
+        ),
+        (
+            "contract",
+            raw_contract,
+            (
+                "close_commit",
+                "close_commit_sha",
+                "requested_close_commit",
+                "stored_close_commit",
+                "backlog_commit",
+            ),
+        ),
+    ):
+        for key in keys:
+            commit = _evaluable_commit(_mapping(source).get(key))
+            if commit:
+                return commit, f"{source_name}.{key}"
+    return "", ""
+
+
+def _close_evidence_commit(event: dict[str, Any]) -> str:
+    return _evaluable_commit(
+        str(event.get("commit_sha") or "").strip()
+        or _first_event_string(
+            event,
+            {
+                "commit_sha",
+                "commit",
+                "implementation_commit",
+                "validated_head_commit",
+                "head_commit",
+                "target_head_commit",
+            },
+        )
+    )
+
+
+def _close_commit_event_ref(
+    event: Mapping[str, Any],
+    *,
+    commit: str = "",
+) -> dict[str, Any]:
+    ref = {
+        "id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "event_type": event.get("event_type"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+        "commit_sha": commit or _close_evidence_commit(_mapping(event)),
+    }
+    return {key: value for key, value in ref.items() if value not in ("", None, [])}
+
+
+def _is_close_commit_event(event: Mapping[str, Any]) -> bool:
+    row = _mapping(event)
+    marker = _normalize_token(
+        row.get("event_type") or row.get("event_kind") or row.get("phase")
+    )
+    kind = _normalize_token(row.get("event_kind"))
+    phase = _normalize_token(row.get("phase"))
+    if marker in {
+        "backlog_close",
+        "hotfix_backlog_close",
+        "close_result",
+        "backlog_close_result",
+        "route_token_gate.backlog_close",
+    }:
+        return True
+    if kind in {"backlog_close", "hotfix_backlog_close"}:
+        return True
+    if phase == "backlog_close":
+        return True
+    if kind == "route_token_gate":
+        route_gate = _mapping(_first_deep_mapping(row, "route_token_gate"))
+        return _normalize_token(route_gate.get("action")) == "backlog_close"
+    return False
+
+
+def _stored_close_commit_from_events(
+    rows: list[dict[str, Any]],
+) -> tuple[str, str, dict[str, Any]]:
+    close_commit = ""
+    close_source = ""
+    close_event: dict[str, Any] = {}
+    for event in rows if isinstance(rows, list) else []:
+        row = _mapping(event)
+        if not row or not _is_close_commit_event(row):
+            continue
+        commit = _close_evidence_commit(row)
+        if not commit:
+            continue
+        close_commit = commit
+        close_source = "timeline.close_commit_event"
+        close_event = _close_commit_event_ref(row, commit=commit)
+    return close_commit, close_source, close_event
+
+
+def _close_evidence_kind(event: Mapping[str, Any]) -> str:
+    row = _mapping(event)
+    kind = str(row.get("event_kind") or "").strip()
+    phase = str(row.get("phase") or "").strip()
+    key = kind or phase
+    if (
+        key not in MF_CLOSE_REQUIRED_EVENT_KINDS
+        and phase == "verification"
+        and kind in {"qa_verification", "independent_verification"}
+    ):
+        return "verification"
+    if key in MF_CLOSE_REQUIRED_EVENT_KINDS:
+        return key
+    if _mf_subagent_finish_gate_projected_event_kinds(row):
+        return "mf_subagent_finish_gate"
+    return ""
+
+
+def _close_evidence_commit_refs(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    evidence_events: list[dict[str, Any]] = []
+    for index, event in enumerate(rows if isinstance(rows, list) else []):
+        row = _mapping(event)
+        if not row or not _route_event_passed(row):
+            continue
+        evidence_kind = _close_evidence_kind(row)
+        if not evidence_kind:
+            continue
+        commit = _close_evidence_commit(row)
+        if not commit:
+            continue
+        ref = _close_commit_event_ref(row, commit=commit)
+        ref["evidence_kind"] = evidence_kind
+        ref["row_index"] = index
+        evidence_events.append(ref)
+    return evidence_events
+
+
+def mf_close_commit_evidence_gate_verification(
+    rows: list[dict[str, Any]],
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Require close evidence for the actual commit being closed."""
+
+    close_commit, close_commit_source = _close_context_commit(contract)
+    close_commit_event: dict[str, Any] = {}
+    if not close_commit:
+        close_commit, close_commit_source, close_commit_event = (
+            _stored_close_commit_from_events(rows)
+        )
+    if not close_commit:
+        return {
+            "schema_version": MF_CLOSE_COMMIT_EVIDENCE_GATE_SCHEMA_VERSION,
+            "passed": True,
+            "status": "not_applicable",
+            "reason": "close_commit_not_supplied",
+        }
+
+    evidence_events = _close_evidence_commit_refs(rows)
+    evidence_commits = list(
+        dict.fromkeys(
+            str(item.get("commit_sha") or "")
+            for item in evidence_events
+            if str(item.get("commit_sha") or "").strip()
+        )
+    )
+    latest_evidence_event = evidence_events[-1] if evidence_events else {}
+    latest_evidence_commit = str(latest_evidence_event.get("commit_sha") or "")
+
+    passed = bool(
+        latest_evidence_commit
+        and _commit_values_match(close_commit, latest_evidence_commit)
+    )
+    if passed:
+        return {
+            "schema_version": MF_CLOSE_COMMIT_EVIDENCE_GATE_SCHEMA_VERSION,
+            "passed": True,
+            "status": "passed",
+            "close_commit": close_commit,
+            "close_commit_source": close_commit_source,
+            "close_commit_event": close_commit_event,
+            "latest_evidence_commit": latest_evidence_commit,
+            "latest_evidence_event": latest_evidence_event,
+            "evidence_commits": evidence_commits,
+            "evidence_events": evidence_events,
+        }
+
+    evidence_label = latest_evidence_commit or "<none>"
+    return {
+        "schema_version": MF_CLOSE_COMMIT_EVIDENCE_GATE_SCHEMA_VERSION,
+        "passed": False,
+        "status": "blocked",
+        "reason": "missing_matching_close_commit_timeline_evidence",
+        "message": (
+            f"close commit {close_commit} does not match latest close-satisfying "
+            f"timeline evidence commit {evidence_label}; missing matching evidence "
+            f"for close commit {close_commit}"
+        ),
+        "missing_requirement_ids": ["matching_close_commit_timeline_evidence"],
+        "close_commit": close_commit,
+        "close_commit_source": close_commit_source,
+        "close_commit_event": close_commit_event,
+        "evidence_commits": evidence_commits,
+        "latest_evidence_commit": latest_evidence_commit,
+        "latest_evidence_event": latest_evidence_event,
+        "evidence_events": evidence_events,
+        "next_action": (
+            "record close-satisfying implementation, verification, finish-gate, "
+            f"or close_ready evidence for close commit {close_commit} before "
+            "retrying backlog_close"
+        ),
+    }
+
+
 def _finish_gate_changed_files(event: dict[str, Any]) -> list[str]:
     return _event_deep_string_list(
         event,
@@ -4150,7 +4402,6 @@ def mf_subagent_finish_gate_close_projection(
             "has_projected_close_ready": "close_ready" in projected_event_kinds,
         },
     }
-
 
 def _route_owned_event_ref(event: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -7295,6 +7546,10 @@ def mf_close_gate_verification(
     stale_route_evidence_gate = mf_stale_route_evidence_gate_verification(rows, contract)
     approval_scope_gate = mf_close_approval_scope_gate_verification(rows)
     command_disposition_gate = mf_close_command_disposition_gate_verification(rows)
+    close_commit_evidence_gate = mf_close_commit_evidence_gate_verification(
+        rows,
+        contract,
+    )
     missing_evidence_groups = mf_close_missing_evidence_groups(
         missing,
         route_context_gate,
@@ -7381,6 +7636,21 @@ def mf_close_gate_verification(
                 "start a fresh bounded worker when the old fence is no longer current"
             ),
         }
+    if not close_commit_evidence_gate.get("passed"):
+        groups["close_commit_evidence"] = {
+            "label": "close commit timeline evidence",
+            "missing": close_commit_evidence_gate.get("missing_requirement_ids", []),
+            "reason": close_commit_evidence_gate.get("reason", ""),
+            "close_commit": close_commit_evidence_gate.get("close_commit", ""),
+            "latest_evidence_commit": close_commit_evidence_gate.get(
+                "latest_evidence_commit",
+                "",
+            ),
+            "next_action": close_commit_evidence_gate.get(
+                "next_action",
+                "record accepted close evidence for the actual close commit",
+            ),
+        }
     missing_evidence_groups["groups"] = groups
     route_context_reminder = mf_route_context_reminder(
         route_context_gate,
@@ -7399,6 +7669,7 @@ def mf_close_gate_verification(
         and bool(cross_ref_gate.get("passed"))
         and bool(approval_scope_gate.get("passed"))
         and bool(command_disposition_gate.get("passed"))
+        and bool(close_commit_evidence_gate.get("passed"))
         and (
             not close_timeline_startup_gate
             or bool(close_timeline_startup_gate.get("passed"))
@@ -7437,6 +7708,7 @@ def mf_close_gate_verification(
         "stale_route_evidence_gate": stale_route_evidence_gate,
         "approval_scope_gate": approval_scope_gate,
         "command_disposition_gate": command_disposition_gate,
+        "close_commit_evidence_gate": close_commit_evidence_gate,
         "close_timeline_startup_gate": close_timeline_startup_gate,
         "missing_evidence_groups": missing_evidence_groups,
         "route_context_reminder": route_context_reminder,
@@ -7467,6 +7739,9 @@ def mf_close_gate_verification(
             "approval_authorizes_close": bool(approval_scope_gate.get("passed")),
             "originating_command_terminal": bool(
                 command_disposition_gate.get("passed")
+            ),
+            "close_commit_has_timeline_evidence": bool(
+                close_commit_evidence_gate.get("passed")
             ),
             "mf_subagent_startup_close_satisfying": (
                 True
@@ -7515,6 +7790,7 @@ def compact_gate_summary(
         "cross_ref_gate",
         "approval_scope_gate",
         "command_disposition_gate",
+        "close_commit_evidence_gate",
         "close_timeline_startup_gate",
     ]
     failed_gates = []
@@ -7613,6 +7889,7 @@ MF_REPAIR_GATE_KEYS = [
     "cross_ref_gate",
     "approval_scope_gate",
     "command_disposition_gate",
+    "close_commit_evidence_gate",
     "close_timeline_startup_gate",
 ]
 
@@ -8656,6 +8933,42 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             "recommended_legal_action": recommended_action,
             "suggested_event_kind": suggested_event_kind,
             "append_payload_skeleton": append_payload_skeleton,
+            "advisory_only": True,
+        }
+
+    if gate_key == "close_commit_evidence_gate":
+        close_commit = str(gate.get("close_commit") or "").strip()
+        latest_evidence_commit = str(gate.get("latest_evidence_commit") or "").strip()
+        evidence_events = [_mapping(item) for item in _list(gate.get("evidence_events"))]
+        relevant_event_ids = _event_ids_from_items(evidence_events)
+        if close_commit:
+            reasons.append(f"Close commit has no close-satisfying timeline evidence: {close_commit}")
+        if latest_evidence_commit:
+            reasons.append(f"Latest close-satisfying evidence commit: {latest_evidence_commit}")
+        if not reasons:
+            reasons.append("Close commit timeline evidence is missing.")
+        return {
+            "gate": gate_key,
+            "failed_gate_name": gate_key,
+            "status": str(gate.get("status") or "failed"),
+            "missing_requirement_ids": missing,
+            "reasons": _unique_compact_values(reasons),
+            "relevant_event_ids": relevant_event_ids,
+            "recommended_legal_action": (
+                recommended_action
+                or "Record accepted implementation, verification, and close_ready "
+                "timeline evidence for the actual close commit; then rerun "
+                "mf_timeline_precheck before backlog_close."
+            ),
+            "suggested_event_kind": "implementation",
+            "append_payload_skeleton": _repair_append_skeleton(
+                "implementation",
+                phase="implementation",
+                payload={
+                    "commit_sha": close_commit or "<close_commit_sha>",
+                    "also_required_before_close": ["verification", "close_ready"],
+                },
+            ),
             "advisory_only": True,
         }
 
