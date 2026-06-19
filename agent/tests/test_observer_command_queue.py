@@ -34,8 +34,18 @@ def _ensure_backlog_table(conn: sqlite3.Connection) -> None:
             target_files TEXT NOT NULL DEFAULT '[]',
             test_files TEXT NOT NULL DEFAULT '[]',
             acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+            details_md TEXT NOT NULL DEFAULT '',
             chain_task_id TEXT NOT NULL DEFAULT '',
             "commit" TEXT NOT NULL DEFAULT '',
+            chain_stage TEXT NOT NULL DEFAULT '',
+            runtime_state TEXT NOT NULL DEFAULT '',
+            current_task_id TEXT NOT NULL DEFAULT '',
+            root_task_id TEXT NOT NULL DEFAULT '',
+            worktree_path TEXT NOT NULL DEFAULT '',
+            worktree_branch TEXT NOT NULL DEFAULT '',
+            mf_type TEXT NOT NULL DEFAULT '',
+            required_docs TEXT NOT NULL DEFAULT '[]',
+            provenance_paths TEXT NOT NULL DEFAULT '[]',
             fixed_at TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT ''
@@ -2433,6 +2443,323 @@ def test_active_owner_old_execute_without_startup_can_be_taken_over_and_failed()
     )
 
 
+def test_consumer_recovery_keeps_takeover_claim_visible_before_worker_startup_timeout():
+    conn = _conn()
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    observer_session.heartbeat_session(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        now="2026-06-03T00:03:00Z",
+    )
+    observer_session.takeover_command(
+        conn,
+        project_id="demo",
+        session_id=fallback["session_id"],
+        session_token=fallback["session_token"],
+        command_id=command["command_id"],
+        reason="fallback observer prepares real worker launch",
+        now="2026-06-03T00:03:01Z",
+    )
+
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:30Z",
+    )
+    summary = observer_session.command_summary(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:30Z",
+    )
+
+    assert recovery["notified_execute_backlog_row_count"] == 0
+    assert recovery["status"] == "waiting"
+    assert recovery["classification"] == "claimed_execute_missing_startup"
+    assert recovery["computed_status"] == (
+        observer_session.CLAIMED_EXECUTE_WAITING_FOR_STARTUP_STATUS
+    )
+    assert recovery["recovery_required"] is False
+    assert recovery["blocked_command_id"] == command["command_id"]
+    assert recovery["claimed_by_session_id"] == fallback["session_id"]
+    assert recovery["claimed_owner_status"] == observer_session.SESSION_STATUS_ACTIVE
+    assert recovery["claimed_age_sec"] == 29.0
+    assert recovery["timeout_sec"] == observer_session.CLAIMED_TO_STARTUP_TIMEOUT_SEC
+    assert recovery["next_expected_evidence"] == (
+        "mf_subagent_read_receipt_plus_mf_subagent_startup_or_terminal_dispatch_blocker"
+    )
+    assert "blocker" not in recovery
+    next_action = recovery["next_legal_action"]
+    assert next_action["tool"] == "observer_runtime_text_prepare"
+    assert next_action["action"] == "prepare_runtime_text_launch_worker_record_startup"
+    assert "launch the worker now" in next_action["description"]
+    assert next_action["requires_session_token"] is False
+    assert next_action["followup_sequence"] == [
+        "observer_runtime_text_prepare",
+        "launch_worker_now",
+        "mf_subagent_read_receipt",
+        "record_mf_subagent_startup",
+    ]
+    assert next_action["alternate_followup"] == "fail_with_terminal_dispatch_blocker"
+    assert next_action["terminal_after_timeout"] is True
+    assert summary["observer_consumer_recovery"]["computed_status"] == (
+        observer_session.CLAIMED_EXECUTE_WAITING_FOR_STARTUP_STATUS
+    )
+
+
+def test_consumer_recovery_exposes_claimed_startup_wait_when_notified_queue_exists():
+    conn = _conn()
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    claimed = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=claimed["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    notified = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload={
+            **_execute_backlog_row_payload(),
+            "backlog_id": "AC-UNRELATED-NOTIFIED",
+        },
+        notify=True,
+        now="2026-06-03T00:00:03Z",
+    )
+
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:00:30Z",
+    )
+    summary = observer_session.command_summary(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:00:30Z",
+    )
+
+    assert recovery["notified_execute_backlog_row_count"] == 1
+    assert recovery["latest_notified_command"]["command_id"] == notified["command_id"]
+    assert recovery["classification"] == "claimed_execute_missing_startup"
+    assert recovery["computed_status"] == (
+        observer_session.CLAIMED_EXECUTE_WAITING_FOR_STARTUP_STATUS
+    )
+    assert recovery["blocked_command_id"] == claimed["command_id"]
+    assert recovery["next_legal_action"]["tool"] == "observer_runtime_text_prepare"
+    assert recovery["notified_execute_backlog_row_diagnosis"]["command_id"] == (
+        notified["command_id"]
+    )
+    assert summary["observer_consumer_recovery"]["blocked_command_id"] == (
+        claimed["command_id"]
+    )
+
+
+def test_current_task_exposes_claimed_startup_recovery_without_runtime_or_timeline():
+    from agent.governance import server
+
+    conn = _conn()
+    _insert_backlog_row(conn, bug_id="AC-ROUTE-HANDOFF", status="OPEN")
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={},
+        body={},
+        get_project_id=lambda: "demo",
+    )
+
+    with (
+        patch("agent.governance.server.get_connection", return_value=conn),
+        patch(
+            "agent.governance.observer_session._utc_now",
+            return_value="2026-06-03T00:00:30Z",
+        ),
+    ):
+        response = server.handle_backlog_current_task(ctx)
+
+    assert response["ok"] is True
+    assert response["active"] is True
+    assert response["source"] == "observer_command_recovery"
+    assert response["backlog_id"] == "AC-ROUTE-HANDOFF"
+    assert response["task_id"] == "AC-ROUTE-HANDOFF"
+    recovery = response["observer_command_recovery"]
+    assert recovery["classification"] == "claimed_execute_missing_startup"
+    assert recovery["blocked_command_id"] == command["command_id"]
+    assert recovery["next_legal_action"]["tool"] == "observer_runtime_text_prepare"
+    assert response["observer_command_projection"]["command_id"] == (
+        command["command_id"]
+    )
+    assert response["bug"]["observer_command_projection"]["recovery"] == recovery
+    assert response["active_backlog"][0]["observer_command_projection"][
+        "recovery"
+    ]["next_legal_action"]["action"] == (
+        "prepare_runtime_text_launch_worker_record_startup"
+    )
+
+
+def test_runtime_text_launch_handoff_names_fence_env_and_launch_text_sources(tmp_path):
+    from agent.ai_invocation import RoutePromptContract
+    from agent.observer_runtime import (
+        ObserverRuntimeTextPrepareRequest,
+        build_observer_runtime_text_context,
+    )
+
+    raw_fence_token = "raw-fence-secret-worker-handoff"
+    main = tmp_path / "main"
+    main.mkdir(parents=True, exist_ok=True)
+    worker_root = tmp_path / "workers"
+    worktree_path = worker_root / ".worktrees" / "worker-route-handoff"
+    branch_runtime_evidence = {
+        "schema_version": "mf_subagent_branch_runtime.v1",
+        "status": "worktree_ready",
+        "ok": True,
+        "present": True,
+        "registered": True,
+        "allocation_required": False,
+        "source_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        "registration_ref": "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        "runtime_context_id": "mfrctx-route-handoff",
+        "context": {
+            "runtime_context_id": "mfrctx-route-handoff",
+            "task_id": "AC-ROUTE-HANDOFF-impl-1",
+            "parent_task_id": "AC-ROUTE-HANDOFF",
+            "backlog_id": "AC-ROUTE-HANDOFF",
+            "fence_token": raw_fence_token,
+            "worktree_path": str(worktree_path),
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "merge_queue_id": "mq-route-handoff",
+            "branch_ref": "refs/heads/runtime-text/route-handoff",
+            "worktree_id": "wt-route-handoff",
+        },
+    }
+    request = ObserverRuntimeTextPrepareRequest(
+        project_id="aming-claw",
+        backlog_id="AC-ROUTE-HANDOFF",
+        route=RoutePromptContract(
+            route_context_hash="sha256:route-handoff",
+            prompt_contract_id="rprompt-route-handoff",
+            prompt_contract_hash="sha256:prompt-route-handoff",
+            route_token_ref="rtok-route-handoff",
+        ),
+        main_worktree=str(main),
+        workspace_root=str(worker_root),
+        owned_files=("agent/observer_runtime.py",),
+        observer_command_id="cmd-route-handoff",
+        task_id="AC-ROUTE-HANDOFF-impl-1",
+        parent_task_id="AC-ROUTE-HANDOFF",
+        worker_id="worker-route-handoff",
+        merge_queue_id="mq-route-handoff",
+        fence_token=raw_fence_token,
+        graph_trace_ids=("gqt-route-handoff",),
+        branch_runtime_registration_ref=branch_runtime_evidence["registration_ref"],
+        branch_runtime_evidence=branch_runtime_evidence,
+        base_commit="base123",
+        target_head_commit="target123",
+        route_id="route-20260619-handoff",
+        visible_injection_manifest_hash="sha256:visible-route-handoff",
+    )
+
+    result = build_observer_runtime_text_context(request)
+
+    assert result["ok"] is True
+    executable = result["executable_worker_launch"]
+    handoff = executable["handoff_packet"]
+    expected_sources = {
+        "env.AMING_WORKER_SESSION_TOKEN",
+        "env.AMING_WORKER_FENCE_TOKEN",
+        "response.launch_text",
+    }
+    assert expected_sources.issubset(set(executable["operator_must_fill"]))
+    assert expected_sources.issubset(set(handoff["operator_must_fill"]))
+    assert handoff["stdin"]["source"] == "response.launch_text"
+    assert handoff["env_placeholders"]["AMING_WORKER_FENCE_TOKEN"] == (
+        "<read from env:AMING_WORKER_FENCE_TOKEN at launch time>"
+    )
+    assert handoff["fence_token"] == (
+        "<read from env:AMING_WORKER_FENCE_TOKEN at submission time>"
+    )
+    assert handoff["fence_token_hash"].startswith("sha256:")
+    assert handoff["raw_fence_token_persisted"] is False
+
+    public_handoff_json = json.dumps(
+        {
+            "command_display": executable["command_display"],
+            "operator_must_fill": executable["operator_must_fill"],
+            "payload": executable["payload"],
+            "repair": executable["repair"],
+            "handoff_packet": handoff,
+            "persistent_handoff_packet": result["persistent_evidence"][
+                "executable_handoff_packet"
+            ],
+        },
+        sort_keys=True,
+    )
+    assert raw_fence_token not in public_handoff_json
+    assert result["persistent_evidence"]["raw_launch_text_persisted"] is False
+
+
 def test_consumer_recovery_reports_claimed_execute_missing_startup_without_notified_commands():
     from agent.governance import server
 
@@ -2524,7 +2851,7 @@ def test_consumer_recovery_reports_claimed_execute_missing_startup_without_notif
     assert recovery["startup_evidence_present"] is False
     assert recovery["terminal_dispatch_blocker_present"] is False
     assert recovery["next_expected_evidence"] == (
-        "mf_subagent_startup_or_terminal_dispatch_blocker"
+        "mf_subagent_read_receipt_plus_mf_subagent_startup_or_terminal_dispatch_blocker"
     )
     assert recovery["blocker"]["blocker_id"] == (
         "no_truthful_bounded_mf_sub_startup_surface_available"

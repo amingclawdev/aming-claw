@@ -172,6 +172,54 @@ def _route_context_qa_verification_event(identity=None):
     }
 
 
+def _attach_server_action_scope_route_token_lineage(
+    event,
+    child_identity,
+    *,
+    parent_identity=None,
+    route_token_ref="rtok-qa-action",
+    acceptance_source="protected_route_token_ref_action_scope",
+):
+    parent = dict(parent_identity or ROUTE_IDENTITY)
+    child = dict(child_identity)
+    payload = dict(event.get("payload") or {})
+    payload.update({
+        "route_token_ref": route_token_ref,
+        "route_token_gate": {
+            **child,
+            "schema_version": "route_token_gate.v1",
+            "decision": "route_token_ref_resolved",
+            "status": "passed",
+            "allowed": True,
+            "action": "task_timeline_append",
+            "route_token_ref": route_token_ref,
+            "resolved_from_ref": True,
+            "server_issued_binding": True,
+            "binding_source": "observer_route_token_refs",
+        },
+        "route_action_scope_lineage": {
+            "schema_version": "route_action_scope_lineage.v1",
+            "accepted": True,
+            "status": "accepted",
+            "source": acceptance_source,
+            "acceptance_source": acceptance_source,
+            "projected_by": "handle_task_timeline_append",
+            "server_projected": True,
+            "server_issued_binding": True,
+            "registry_verified": True,
+            "resolved_from_ref": True,
+            "binding_source": "observer_route_token_refs",
+            "route_token_ref": route_token_ref,
+            "parent_route_identity": parent,
+            "child_route_identity": child,
+            "parent_route_lineage": parent,
+            "child_route_lineage": child,
+        },
+    })
+    event["payload"] = payload
+    return event
+
+
 def _route_owned_source_event(identity=None, *, source_event_id="route-source-1"):
     route_identity = dict(identity or ROUTE_IDENTITY)
     return {
@@ -377,6 +425,86 @@ def test_route_startup_gate_reports_runtime_context_projection_evidence_fields()
     assert "actual_git_root" in fields["startup"]
     assert "prompt_contract_hash" in fields["route_identity"]
     assert "mf_subagent_startup" in fields["required_evidence_ids"]
+
+
+def test_route_context_gate_accepts_registry_backed_child_startup_lineage():
+    from agent.governance import task_timeline
+
+    parent_identity = {
+        **ROUTE_IDENTITY,
+        "route_id": "route-runtime-parent",
+        "visible_injection_manifest_hash": _fake_sha("parent-visible"),
+    }
+    child_identity = {
+        **parent_identity,
+        "route_id": "route-runtime-child",
+        "route_context_hash": _fake_sha("child-runtime-route"),
+        "prompt_contract_id": "rprompt-runtime-child",
+        "prompt_contract_hash": _fake_sha("child-runtime-prompt"),
+    }
+    startup = {
+        "id": 4,
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {
+            **child_identity,
+            "route_token_ref": "rtok-runtime-child",
+            "runtime_context_id": "mfrctx-runtime-child",
+            "task_id": "worker-runtime-child",
+            "parent_task_id": "AC-RUNTIME-PARENT",
+            "worker_slot_id": "worker-runtime-slot",
+            "observer_command_id": "cmd-runtime-parent",
+            "actual_cwd": "/repo/.worktrees/worker-runtime-child",
+            "actual_git_root": "/repo/.worktrees/worker-runtime-child",
+            "branch": "refs/heads/codex/runtime-child",
+            "head_commit": "head-runtime-child",
+            "fence_token": "fence-runtime-child",
+        },
+    }
+    startup = _attach_server_action_scope_route_token_lineage(
+        startup,
+        child_identity,
+        parent_identity=parent_identity,
+        route_token_ref="rtok-runtime-child",
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+    events = [
+        {
+            "id": 1,
+            "event_kind": "route_context",
+            "phase": "dispatch",
+            "status": "passed",
+            "payload": {"route_context": parent_identity},
+        },
+        {
+            "id": 2,
+            "event_kind": "route_action_precheck",
+            "phase": "pre_mutation",
+            "status": "allowed",
+            "payload": parent_identity,
+        },
+        {
+            "id": 3,
+            "event_kind": "bounded_implementation_worker_dispatch",
+            "phase": "dispatch",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        startup,
+    ]
+
+    gate = task_timeline.mf_route_context_gate_verification(
+        events,
+        contract={"contract_instance_id": "AC-RUNTIME-PARENT"},
+    )
+
+    assert gate["passed"] is True
+    assert gate["missing_requirement_ids"] == []
+    assert gate["same_route_identity"] is True
+    startup_lineage = gate["accepted_startup_lineages"][0]
+    assert startup_lineage["acceptance_source"] == "registry_backed_runtime_context_lineage"
+    assert startup_lineage["server_lineage"]["registry_verified"] is True
 
 
 def test_precheck_startup_projection_requirements_name_missing_field():
@@ -2170,21 +2298,29 @@ class TestTaskTimeline(unittest.TestCase):
             _ctx(
                 body={
                     "backlog_id": "BUG-TL-WAIVER",
-                    "event_type": "mf.verification",
-                    "event_kind": "verification",
-                    "status": "passed",
+                    "event_type": "mf.record_blocker",
+                    "event_kind": "record_blocker",
+                    "status": "accepted",
+                    "payload": {
+                        "reason": "observer verification failed before QA",
+                        "blocked_event_kind": "verification",
+                    },
                     "route_waiver": _route_waiver("task_timeline_append", "BUG-TL-WAIVER"),
                 },
                 method="POST",
             )
         )
 
-        self.assertEqual(result["route_token_gate"]["decision"], "route_waiver")
+        self.assertEqual(result["event_kind"], "record_blocker")
+        self.assertEqual(
+            result["payload"]["meta_contract_gate"]["action"],
+            "record_blocker",
+        )
         count = self.conn.execute(
             "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
             ("BUG-TL-WAIVER",),
         ).fetchone()["c"]
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 1)
 
     def test_mf_parallel_timeline_rejects_generic_waiver_for_protected_evidence(self):
         from agent.governance import server
@@ -4671,10 +4807,8 @@ class TestTaskTimeline(unittest.TestCase):
             "plain_observer_no_independent_reviewer",
         )
 
-    def test_observer_on_behalf_with_independent_reviewer_counts(self):
-        """Observer-on-behalf transport with independent reviewer DOES count.
-        This is the established daily pattern — breaking it would brick every close.
-        """
+    def test_observer_on_behalf_with_same_timeline_verdict_ref_counts(self):
+        """Observer-on-behalf transport counts only through legitimate QA refs."""
         from agent.governance import task_timeline
 
         worker_id = "codex-worker-impl-01"
@@ -4682,10 +4816,19 @@ class TestTaskTimeline(unittest.TestCase):
         events = [
             self._startup_event(worker_id),
             {
+                "id": "evt-123",
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": reviewer_id,
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
                 "event_kind": "qa_verification",
                 "phase": "verification",
                 "actor": f"observer-on-behalf-of:{reviewer_id}",
                 "status": "passed",
+                "backlog_id": "BUG-IV-TEST",
                 "payload": {
                     "qa_verdict_refs": ["evt-123"],
                 },
@@ -4695,11 +4838,17 @@ class TestTaskTimeline(unittest.TestCase):
         result = task_timeline._independent_qa_gate(events, policy)
         self.assertTrue(result["required"], result)
         self.assertTrue(result["passed"], result)
-        self.assertEqual(len(result["evidence_events"]), 1)
-        self.assertEqual(result["evidence_events"][0]["reviewer_identity"], reviewer_id)
+        transported = [
+            event
+            for event in result["evidence_events"]
+            if event.get("actor") == f"observer-on-behalf-of:{reviewer_id}"
+        ]
+        self.assertEqual(len(transported), 1)
+        self.assertEqual(transported[0]["reviewer_identity"], reviewer_id)
+        self.assertEqual(transported[0]["resolved_qa_verdict_refs"], ["evt-123"])
 
-    def test_payload_reviewer_with_independent_identity_counts(self):
-        """Observer transport with payload.reviewer set to independent reviewer counts."""
+    def test_payload_reviewer_with_same_timeline_verdict_ref_counts(self):
+        """Observer transport with payload.reviewer still needs a QA verdict ref."""
         from agent.governance import task_timeline
 
         worker_id = "codex-worker-impl-01"
@@ -4707,10 +4856,19 @@ class TestTaskTimeline(unittest.TestCase):
         events = [
             self._startup_event(worker_id),
             {
+                "id": "evt-456",
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": reviewer_id,
+                "status": "accepted",
+                "backlog_id": "BUG-IV-TEST",
+            },
+            {
                 "event_kind": "qa_verification",
                 "phase": "verification",
                 "actor": "observer",  # plain observer transport
                 "status": "passed",
+                "backlog_id": "BUG-IV-TEST",
                 "payload": {
                     "reviewer": reviewer_id,
                     "qa_verdict_refs": ["evt-456"],
@@ -4871,8 +5029,6 @@ class TestTaskTimeline(unittest.TestCase):
                 "#4898",
                 "event:4899",
                 "evt-string-id",
-                "timeline:4900",
-                "#4901",
             ],
             [
                 event.get("resolved_qa_verdict_refs")
@@ -5028,6 +5184,59 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(
             non_qa["rejected_evidence_events"][0]["reason"],
             "plain_observer_no_resolving_qa_verdict_ref",
+        )
+
+    def test_observer_verdict_refs_reject_foreign_independent_reviewer_qa(self):
+        """Even real independent QA refs must come from the same row/project."""
+        from agent.governance import task_timeline
+
+        foreign_qa = {
+            "id": "evt-foreign-independent-qa",
+            "event_kind": "qa_review",
+            "phase": "verification",
+            "actor": "qa-independent-reviewer",
+            "status": "accepted",
+            "backlog_id": "BUG-FOREIGN-QA",
+            "project_id": "foreign-project",
+        }
+        observer_transport = {
+            "event_kind": "qa_verification",
+            "phase": "verification",
+            "actor": "observer",
+            "status": "passed",
+            "backlog_id": "BUG-IV-TEST",
+            "project_id": "aming-claw",
+            "payload": {"qa_verdict_refs": ["evt-foreign-independent-qa"]},
+        }
+        events_by_ref = {
+            ref: foreign_qa
+            for ref in task_timeline._independent_qa_event_ref_tokens(foreign_qa)
+        }
+
+        resolved = task_timeline._independent_qa_resolved_verdict_refs(
+            observer_transport,
+            events_by_ref,
+            set(),
+        )
+        rejected = task_timeline._independent_qa_verdict_ref_rejection_reasons(
+            observer_transport,
+            events_by_ref,
+            set(),
+        )
+
+        self.assertEqual(resolved, [])
+        self.assertIn(
+            {
+                "verdict_ref": "evt-foreign-independent-qa",
+                "reason": "qa_verdict_ref_scope_mismatch",
+            },
+            [
+                {
+                    "verdict_ref": event.get("verdict_ref"),
+                    "reason": event.get("reason"),
+                }
+                for event in rejected
+            ],
         )
 
     def test_close_gate_passes_for_fixed_rows_without_iv_topology(self):
@@ -7256,13 +7465,13 @@ class TestTaskTimeline(unittest.TestCase):
             },
         }
         action_identity = {
+            "route_id": "route-qa-action",
             "route_context_hash": "sha256:qa-action-route",
             "prompt_contract_id": "rprompt-qa-action",
             "prompt_contract_hash": "sha256:qa-action-contract",
         }
         qa_event = _route_context_qa_verification_event(action_identity)
         qa_event["payload"] = {
-            "route_token_ref": "rtok-qa-action",
             "meta_contract_gate": {
                 "action": "qa_verification",
                 "role": "qa",
@@ -7270,10 +7479,14 @@ class TestTaskTimeline(unittest.TestCase):
                 "allowed": True,
             },
         }
+        _attach_server_action_scope_route_token_lineage(
+            qa_event,
+            action_identity,
+            acceptance_source="protected_route_token_ref_action_scope",
+        )
         qa_event["verification"]["route_identity"] = {
             **action_identity,
             "allowed_action": "task_timeline_append",
-            "route_id": "route-qa-action",
         }
 
         ready = task_timeline.mf_close_gate_verification(
@@ -9501,6 +9714,170 @@ def test_cross_ref_keeps_unproven_route_token_child_lineage_advisory():
     assert lineage["close_satisfying_by_itself"] is False
 
 
+def test_cross_ref_accepts_registry_backed_route_token_child_lineage_without_bridge():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    worker_implementation = copy.deepcopy(worker_implementation)
+    canonical = route_context_gate["route_identity"]
+    child = {
+        field: worker_implementation["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    worker_implementation = _attach_server_action_scope_route_token_lineage(
+        worker_implementation,
+        child,
+        parent_identity=canonical,
+        route_token_ref=worker_implementation["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+    raw_fence = worker_implementation["payload"].pop("fence_token")
+    worker_implementation["payload"]["fence_token_hash"] = _fake_sha(raw_fence)
+    worker_implementation["payload"]["fence_token_redacted"] = True
+    worker_implementation["payload"]["raw_fence_token_persisted"] = False
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+    assert [item["event_id"] for item in gate["accepted_route_token_child_lineages"]] == [22]
+    accepted = gate["accepted_route_token_child_lineages"][0]
+    assert accepted["registry_verified"] is True
+    assert accepted["advisory_only"] is False
+    assert accepted["missing_fields"] == []
+    assert accepted["fence_proof"]["proof_type"] == "redacted_fence_token_hash"
+    assert accepted["fence_proof"]["fence_token_hash"] == _fake_sha(raw_fence)
+    assert "fence_token" not in accepted
+    assert accepted["close_satisfying_by_itself"] is True
+    assert gate["advisory_route_token_child_lineages"] == []
+    assert raw_fence not in json.dumps(gate, sort_keys=True)
+    assert "AC-ROUTE-TOKEN-CHILD|aming-claw|worker-a-task" in gate[
+        "bridged_lane_membership"
+    ]
+
+
+def test_cross_ref_rejects_registry_backed_child_lineage_route_id_mismatch():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    worker_implementation = copy.deepcopy(worker_implementation)
+    canonical = dict(route_context_gate["route_identity"])
+    wrong_parent = {
+        **canonical,
+        "route_id": "route-wrong-parent",
+    }
+    child = {
+        field: worker_implementation["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    worker_implementation = _attach_server_action_scope_route_token_lineage(
+        worker_implementation,
+        child,
+        parent_identity=wrong_parent,
+        route_token_ref=worker_implementation["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is False
+    assert gate["accepted_route_token_child_lineages"] == []
+    rejected = gate["rejected_cross_ref_evidence"]
+    assert [item["id"] for item in rejected] == [22]
+    lineage = rejected[0]["route_token_child_lineage"]
+    assert lineage["accepted"] is False
+    assert "route_token_registry_proof" in lineage["missing_fields"]
+
+
+def test_cross_ref_same_backlog_siblings_do_not_block_canonical_registry_child_lane():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    canonical_worker = copy.deepcopy(worker_implementation)
+    canonical = route_context_gate["route_identity"]
+    child = {
+        field: canonical_worker["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    canonical_worker = _attach_server_action_scope_route_token_lineage(
+        canonical_worker,
+        child,
+        parent_identity=canonical,
+        route_token_ref=canonical_worker["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+    historical_sibling = copy.deepcopy(worker_implementation)
+    historical_sibling["id"] = 23
+    historical_sibling["task_id"] = "historical-worker-task"
+    historical_sibling["payload"]["task_id"] = "historical-worker-task"
+
+    same_backlog_gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, historical_sibling, canonical_worker],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert same_backlog_gate["passed"] is True
+    assert same_backlog_gate["rejected_cross_ref_evidence"] == []
+    assert [item["event_id"] for item in same_backlog_gate[
+        "accepted_route_token_child_lineages"
+    ]] == [22]
+    assert [item["event_id"] for item in same_backlog_gate[
+        "advisory_route_token_child_lineages"
+    ]] == [23]
+
+    foreign = copy.deepcopy(historical_sibling)
+    foreign["id"] = 24
+    foreign["backlog_id"] = "AC-FOREIGN"
+    foreign["project_id"] = "foreign-project"
+    foreign["payload"]["backlog_id"] = "AC-FOREIGN"
+    foreign["payload"]["project_id"] = "foreign-project"
+
+    foreign_gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, canonical_worker, foreign],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert foreign_gate["passed"] is False
+    rejected = foreign_gate["rejected_cross_ref_evidence"]
+    assert [item["id"] for item in rejected] == [24]
+    assert "backlog_id" in rejected[0]["mismatches"]
+    assert "project_id" in rejected[0]["mismatches"]
+
+
 def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     from agent.governance import task_timeline
 
@@ -10458,9 +10835,33 @@ def test_validate_receipt_accepts_launch_text_hash_without_read_receipt_hash():
     assert status == "ok"
 
 
+def test_validate_receipt_accepts_redacted_fence_hash_lineage():
+    """Runtime-context facade receipts may persist fence hash lineage without raw fence."""
+    from agent.governance import task_timeline
+
+    payload = _well_formed_receipt_payload()
+    payload.pop("fence_token")
+    payload["fence_token_hash"] = _fake_sha("receipt-fence-token")
+    payload["fence_token_redacted"] = True
+    payload["raw_fence_token_persisted"] = False
+
+    kind, status, p = task_timeline.validate_and_normalize_mf_read_receipt_append(
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        actor="mf_sub:worker",
+        status="ok",
+        payload=payload,
+    )
+    assert kind == "mf_subagent_read_receipt"
+    assert status == "ok"
+    assert "fence_token" not in p
+    assert p["fence_token_hash"] == _fake_sha("receipt-fence-token")
+    assert p["fence_token_redacted"] is True
+
+
 def test_validate_receipt_rejects_missing_lineage_fields():
     """A receipt missing lineage fields (runtime_context_id, task_id,
-    parent_task_id, fence_token) is rejected with those field names in the error."""
+    parent_task_id, fence token lineage) is rejected with those field names in the error."""
     from agent.governance import task_timeline
 
     payload = {"read_receipt_hash": "sha256:test", "worker_slot_id": "slot-1"}

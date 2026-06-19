@@ -75,6 +75,9 @@ OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION = "observer_runtime_text_context.v1"
 OBSERVER_RUNTIME_TEXT_SERVICE_SCHEMA_VERSION = "observer_runtime_text_service.v1"
 OBSERVER_WORKER_LAUNCH_PACK_SCHEMA_VERSION = "observer_worker_launch_pack.v1"
 OBSERVER_EXECUTABLE_WORKER_LAUNCH_SCHEMA_VERSION = "observer_executable_worker_launch.v1"
+OBSERVER_EXECUTABLE_HANDOFF_PACKET_SCHEMA_VERSION = (
+    "observer_runtime_text.executable_handoff_packet.v1"
+)
 OBSERVER_RUNTIME_TEXT_NEXT_LEGAL_ACTION_SCHEMA_VERSION = (
     "observer_runtime_text.next_legal_action.v1"
 )
@@ -142,7 +145,8 @@ WORKER_LAUNCH_PACK_REQUIRED_FIELDS = (
     "worktree_path",
     "base_commit",
     "target_head_commit",
-    "fence_token",
+    "fence_token_hash",
+    "fence_token_env",
     "owned_files",
     "merge_queue_id",
     "graph_query_schema_trace_id",
@@ -179,7 +183,8 @@ EXECUTABLE_WORKER_LAUNCH_REQUIRED_FIELDS = (
     "branch",
     "base_commit",
     "target_head_commit",
-    "fence_token",
+    "fence_token_hash",
+    "fence_token_env",
     "merge_queue_id",
     "owned_files",
     "launch_text_hash",
@@ -821,6 +826,13 @@ def _stable_suffix(*parts: str, length: int = 12) -> str:
 def _stable_json_hash(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _runtime_text_secret_hash(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _normalize_path(path: str) -> str:
@@ -3657,6 +3669,10 @@ def _runtime_text_same_owner_session_token_startup(
         or ""
     ).strip()
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    fence_token_hash = _runtime_text_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
     return {
         "schema_version": "mf_subagent_same_owner_session_token_startup.v1",
         "startup_mode": "same_owner_session_token",
@@ -3686,7 +3702,10 @@ def _runtime_text_same_owner_session_token_startup(
         "worker_transcript_ref": "<fill worker_transcript_ref>",
         "filer_principal": "<fill filer_principal>",
         "harness_type": "<fill harness_type>",
-        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "fence_token_hash": fence_token_hash,
+        "fence_token_env": fence_token_env,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_fence_token_persisted": False,
         "branch": str(getattr(context, "branch_ref", "") or ""),
         "branch_ref": str(getattr(context, "branch_ref", "") or ""),
         "worktree_path": worktree_path,
@@ -3745,6 +3764,10 @@ def _runtime_text_host_adapter_surrogate_startup(
         or ""
     ).strip()
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    fence_token_hash = _runtime_text_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
     return {
         "schema_version": "mf_subagent_host_adapter_surrogate_startup.v1",
         "startup_mode": "host_adapter_surrogate",
@@ -3773,7 +3796,10 @@ def _runtime_text_host_adapter_surrogate_startup(
         "host_startup_id": str(identity.get("host_startup_id") or ""),
         "host_session_id": str(identity.get("host_session_id") or ""),
         "session_token_surrogate": str(identity.get("session_token_surrogate") or ""),
-        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "fence_token_hash": fence_token_hash,
+        "fence_token_env": fence_token_env,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_fence_token_persisted": False,
         "branch": str(getattr(context, "branch_ref", "") or ""),
         "branch_ref": str(getattr(context, "branch_ref", "") or ""),
         "worktree_path": worktree_path,
@@ -3881,6 +3907,7 @@ def _runtime_text_worker_launch_pack(
         "schema_version": "observer_worker_launch_pack.cli_runtime_requirements.v1",
         "governance_url_env": "AMING_GOVERNANCE_URL",
         "worker_session_token_env": "AMING_WORKER_SESSION_TOKEN",
+        "worker_fence_token_env": "AMING_WORKER_FENCE_TOKEN",
         "governance_network_required_for_timeline_writes": True,
         "recommended_codex_exec_flags": [
             "--dangerously-bypass-approvals-and-sandbox",
@@ -3894,7 +3921,12 @@ def _runtime_text_worker_launch_pack(
         ),
         "failure_blocker": "governance_io_unavailable_before_read_receipt",
         "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
     }
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    fence_token_hash = _runtime_text_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
     launch_env_additions = {
         "AMING_GOVERNANCE_URL": "http://localhost:40000",
         "AMING_WORKER_SESSION_TOKEN": "<server-issued-worker-session-token>",
@@ -3903,7 +3935,7 @@ def _runtime_text_worker_launch_pack(
         "AMING_WORKER_TASK_ID": str(
             getattr(context, "task_id", "") or request.task_id or ""
         ),
-        "AMING_WORKER_FENCE_TOKEN": str(getattr(context, "fence_token", "") or ""),
+        fence_token_env: f"<read from env:{fence_token_env} at launch time>",
     }
     launch_env_policy = _runtime_text_executable_launch_env_policy(
         launch_env_additions
@@ -4229,7 +4261,10 @@ def _runtime_text_worker_launch_pack(
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
-        "fence_token": context.fence_token,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_env": fence_token_env,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_fence_token_persisted": False,
         "owned_files": list(owned_files),
         "merge_queue_id": context.merge_queue_id,
         "graph_query_schema_trace_id": graph_query_schema_trace_id,
@@ -4466,13 +4501,17 @@ def _runtime_text_executable_worker_launch(
         unsupported_backend = requested_backend_mode or "missing_backend_mode"
 
     session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    fence_token_hash = _runtime_text_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
     env_template = {
         "AMING_GOVERNANCE_URL": "http://localhost:40000",
         session_token_env: "<server-issued-worker-session-token>",
         "AMING_RUNTIME_CONTEXT_ID": runtime_context_id,
         "AMING_OBSERVER_COMMAND_ID": observer_command_id,
         "AMING_WORKER_TASK_ID": str(getattr(context, "task_id", "") or request.task_id or ""),
-        "AMING_WORKER_FENCE_TOKEN": str(getattr(context, "fence_token", "") or ""),
+        fence_token_env: f"<read from env:{fence_token_env} at launch time>",
     }
     env_policy = _runtime_text_executable_launch_env_policy(env_template)
     startup_identity_policy = (
@@ -4509,7 +4548,10 @@ def _runtime_text_executable_worker_launch(
         "branch_ref": str(getattr(context, "branch_ref", "") or ""),
         "base_commit": str(getattr(context, "base_commit", "") or ""),
         "target_head_commit": str(getattr(context, "target_head_commit", "") or ""),
-        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "fence_token_hash": fence_token_hash,
+        "fence_token_env": fence_token_env,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_fence_token_persisted": False,
         "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
         "owned_files": list(owned_files),
         "launch_text_hash": launch_text_hash,
@@ -4539,6 +4581,211 @@ def _runtime_text_executable_worker_launch(
             f"{key}={shlex.quote(value)}" for key, value in env_template.items()
         )
         command_display = f"{env_prefix} {shlex.join(command)}"
+    public_env_template = {
+        key: (
+            f"<read from env:{key} at launch time>"
+            if key in {session_token_env, fence_token_env}
+            else value
+        )
+        for key, value in env_template.items()
+    }
+    public_command_skeleton = ""
+    if command:
+        public_env_prefix = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in public_env_template.items()
+        )
+        public_command_skeleton = f"{public_env_prefix} {shlex.join(command)}"
+    transcript_path_suggestion = str(
+        Path(output_path).with_suffix(".transcript.jsonl")
+    )
+    worker_guide_ref = str(worker_launch_pack.get("worker_guide_ref") or "")
+    worker_guide_url = (
+        f"{env_template['AMING_GOVERNANCE_URL']}{worker_guide_ref}"
+        if worker_guide_ref.startswith("/")
+        else worker_guide_ref
+    )
+    target_project_root = (
+        str(request.target_project_root or "")
+        or str(getattr(context, "target_project_root", "") or "")
+        or worktree_path
+    )
+    read_receipt_path = (
+        f"/api/graph-governance/{request.project_id}/runtime-contexts/"
+        f"{runtime_context_id}/read-receipts"
+    )
+    startup_path = (
+        f"/api/graph-governance/{request.project_id}/runtime-contexts/"
+        f"{runtime_context_id}/startup"
+    )
+    session_token_placeholder = (
+        f"<read from env:{session_token_env} at submission time>"
+    )
+    fence_token_placeholder = (
+        f"<read from env:{fence_token_env} at submission time>"
+    )
+    read_receipt_persisted_payload_skeleton = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": payload["task_id"],
+        "parent_task_id": parent_task_id,
+        "fence_token_env": fence_token_env,
+        "session_token_env": session_token_env,
+        "target_project_root": target_project_root,
+        "observer_command_id": observer_command_id,
+        "worker_role": "mf_sub",
+        "worker_id": str(
+            worker_launch_pack.get("worker_id")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "worker_slot_id": str(
+            worker_launch_pack.get("worker_id")
+            or getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "launch_text_hash": launch_text_hash,
+        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        "raw_session_token_persisted": False,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_fence_token_persisted": False,
+    }
+    read_receipt_body_skeleton = {
+        "runtime_context_id": runtime_context_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": fence_token_placeholder,
+        "session_token": session_token_placeholder,
+        "fence_token_env": fence_token_env,
+        "session_token_env": session_token_env,
+        "target_project_root": target_project_root,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "launch_text_hash": launch_text_hash,
+        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        "payload": dict(read_receipt_persisted_payload_skeleton),
+    }
+    read_receipt_payload_skeleton = {
+        "method": "POST",
+        "path": read_receipt_path,
+        "facade": "runtime_context.read_receipts",
+        "auth_fields": {
+            "session_token": session_token_placeholder,
+            "session_token_env": session_token_env,
+            "fence_token": fence_token_placeholder,
+            "fence_token_env": fence_token_env,
+        },
+        "body": read_receipt_body_skeleton,
+        "payload": read_receipt_persisted_payload_skeleton,
+    }
+    startup_persisted_payload_skeleton = {
+        "mf_subagent_startup_gate": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": payload["task_id"],
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "observer_command_id": observer_command_id,
+            "fence_token_env": fence_token_env,
+            "session_token_env": session_token_env,
+            "target_project_root": target_project_root,
+            "worker_session_id": "<actual Codex worker session id>",
+            "worker_transcript_path": transcript_path_suggestion,
+            "harness_type": "codex",
+            "actual_cwd": worktree_path,
+            "actual_git_root": worktree_path,
+            "fence_token_hash": fence_token_hash,
+            "fence_token_redacted": bool(fence_token_hash),
+            "raw_fence_token_persisted": False,
+            "branch": payload["branch"],
+            "base_commit": payload["base_commit"],
+            "target_head_commit": payload["target_head_commit"],
+            "read_receipt_hash": "<accepted-read-receipt-hash>",
+            "read_receipt_event_id": "<accepted-read-receipt-event-id>",
+            "raw_session_token_persisted": False,
+        }
+    }
+    startup_body_skeleton = {
+        "runtime_context_id": runtime_context_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "observer_command_id": observer_command_id,
+        "fence_token": fence_token_placeholder,
+        "session_token": session_token_placeholder,
+        "fence_token_env": fence_token_env,
+        "session_token_env": session_token_env,
+        "target_project_root": target_project_root,
+        "worker_session_id": "<actual Codex worker session id>",
+        "worker_transcript_path": transcript_path_suggestion,
+        "harness_type": "codex",
+        "filer_principal": "<actual Codex worker principal>",
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "branch": payload["branch"],
+        "head_commit": "<worker worktree HEAD after launch>",
+        "base_commit": payload["base_commit"],
+        "target_head_commit": payload["target_head_commit"],
+        "read_receipt_hash": "<accepted-read-receipt-hash>",
+        "read_receipt_event_id": "<accepted-read-receipt-event-id>",
+    }
+    startup_payload_skeleton = {
+        "method": "POST",
+        "path": startup_path,
+        "facade": "runtime_context.startup",
+        "legacy_tool": "parallel_branch_startup",
+        "auth_fields": {
+            "session_token": session_token_placeholder,
+            "session_token_env": session_token_env,
+            "fence_token": fence_token_placeholder,
+            "fence_token_env": fence_token_env,
+        },
+        "body": startup_body_skeleton,
+        "payload": startup_persisted_payload_skeleton,
+    }
+    handoff_packet = {
+        "schema_version": OBSERVER_EXECUTABLE_HANDOFF_PACKET_SCHEMA_VERSION,
+        "public_safe": True,
+        "raw_launch_text_persisted": False,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "cwd": worktree_path,
+        "worktree_path": worktree_path,
+        "transcript_path_suggestion": transcript_path_suggestion,
+        "env_var_names": list(env_template.keys()),
+        "env_placeholders": dict(public_env_template),
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "operator_must_fill": [
+            f"env.{session_token_env}",
+            f"env.{fence_token_env}",
+            "response.launch_text",
+        ],
+        "command_skeleton": public_command_skeleton,
+        "argv_skeleton": list(command),
+        "stdin": {
+            "source": "response.launch_text",
+            "sha256": launch_text_hash,
+            "raw_launch_text_persisted": False,
+        },
+        "runtime_context_id": runtime_context_id,
+        "task_id": payload["task_id"],
+        "parent_task_id": parent_task_id,
+        "fence_token": fence_token_placeholder,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(fence_token_hash),
+        "observer_command_id": observer_command_id,
+        "worker_guide_ref": worker_guide_ref,
+        "worker_guide_url": worker_guide_url,
+        "read_receipt_facade_payload_skeleton": read_receipt_payload_skeleton,
+        "startup_facade_payload_skeleton": startup_payload_skeleton,
+        "next_step": {
+            "action": "launch_worker_now",
+            "description": (
+                "Launch the worker now with this argv/env/stdin packet, then "
+                "submit the read receipt facade payload and the startup facade payload."
+            ),
+        },
+    }
     return {
         "schema_version": OBSERVER_EXECUTABLE_WORKER_LAUNCH_SCHEMA_VERSION,
         "status": "ready" if command and not missing_fields else "blocked",
@@ -4546,8 +4793,18 @@ def _runtime_text_executable_worker_launch(
         "backend_mode": backend_mode,
         "requested_backend_mode": requested_backend_mode,
         "command": command,
-        "command_display": command_display,
+        "command_display": public_command_skeleton,
+        "command_display_public_safe": True,
+        "secret_launch_envelope": {
+            "public_safe": False,
+            "command": list(command),
+            "env_source": "response.executable_worker_launch.env",
+            "raw_launch_text_source": "response.launch_text",
+        },
+        "argv_skeleton": list(command),
         "cwd": worktree_path,
+        "worktree_path": worktree_path,
+        "transcript_path_suggestion": transcript_path_suggestion,
         "stdin": {
             "source": "response.launch_text",
             "sha256": launch_text_hash,
@@ -4557,7 +4814,11 @@ def _runtime_text_executable_worker_launch(
         "env_additions": dict(env_template),
         "env_policy": env_policy,
         "environment_policy": env_policy,
-        "operator_must_fill": [f"env.{session_token_env}"],
+        "operator_must_fill": [
+            f"env.{session_token_env}",
+            f"env.{fence_token_env}",
+            "response.launch_text",
+        ],
         "payload": payload,
         "required_fields": list(EXECUTABLE_WORKER_LAUNCH_REQUIRED_FIELDS),
         "missing_fields": missing_fields,
@@ -4569,14 +4830,17 @@ def _runtime_text_executable_worker_launch(
             worker_launch_pack.get("worker_launch_pack_hash") or ""
         ),
         "worker_launch_pack": dict(worker_launch_pack),
+        "handoff_packet": handoff_packet,
+        "public_safe_executable_handoff_packet": handoff_packet,
         "shell_safe": True,
         "raw_launch_text_persisted": False,
         "raw_session_token_persisted": False,
         "repair": {
-            "copyable_command": command_display,
+            "copyable_command": public_command_skeleton,
             "payload_source": "response.executable_worker_launch.payload",
             "stdin_source": "response.launch_text",
             "env_policy_source": "response.executable_worker_launch.env_policy",
+            "handoff_packet_source": "response.executable_worker_launch.handoff_packet",
             "missing_fields": missing_fields,
         },
     }
@@ -4601,6 +4865,11 @@ def _runtime_text_observer_next_legal_action(
     payload = (
         executable_worker_launch.get("payload")
         if isinstance(executable_worker_launch.get("payload"), Mapping)
+        else {}
+    )
+    handoff_packet = (
+        executable_worker_launch.get("handoff_packet")
+        if isinstance(executable_worker_launch.get("handoff_packet"), Mapping)
         else {}
     )
     env_policy = (
@@ -4658,13 +4927,23 @@ def _runtime_text_observer_next_legal_action(
         "status": status,
         "allowed": status == "ready",
         "source": "executable_worker_launch",
+        "description": (
+            "Launch the worker now, then submit mf_subagent_read_receipt and "
+            "mf_subagent_startup using the facade payload skeletons."
+        ),
         "launch_command_source": "executable_worker_launch",
         "payload_source": "response.executable_worker_launch.payload",
+        "handoff_packet_source": "response.executable_worker_launch.handoff_packet",
+        "handoff_packet": dict(handoff_packet),
         "startup_payload_source": str(
             executable_worker_launch.get("startup_payload_source") or "startup_recording"
         ),
         "stdin_source": str(stdin.get("source") or "response.launch_text"),
-        "command_display": str(executable_worker_launch.get("command_display") or ""),
+        "command_display": str(
+            handoff_packet.get("command_skeleton")
+            or executable_worker_launch.get("command_display")
+            or ""
+        ),
         "env_policy": dict(env_policy),
         "env_policy_source": "response.executable_worker_launch.env_policy",
         "backend_mode": str(executable_worker_launch.get("backend_mode") or ""),
@@ -4679,10 +4958,15 @@ def _runtime_text_observer_next_legal_action(
         "route_token_ref": str(payload.get("route_token_ref") or ""),
         "worktree_path": str(payload.get("worktree_path") or ""),
         "branch": str(payload.get("branch") or payload.get("branch_ref") or ""),
-        "fence_token": str(payload.get("fence_token") or ""),
+        "fence_token": str(handoff_packet.get("fence_token") or ""),
+        "fence_token_env": str(handoff_packet.get("fence_token_env") or ""),
         "merge_queue_id": str(payload.get("merge_queue_id") or ""),
         "owned_files": list(payload.get("owned_files") or []),
-        "payload": dict(payload),
+        "payload": {
+            "source": "response.executable_worker_launch.payload",
+            "public_safe": False,
+            "raw_fence_token_persisted_in_next_legal_action": False,
+        },
         "startup_identity_policy": dict(startup_identity_policy),
         "missing_fields": missing_fields,
         "worker_next_legal_action": str(
@@ -4694,11 +4978,19 @@ def _runtime_text_observer_next_legal_action(
         "worker_launch_pack_preflight_status": str(preflight.get("status") or ""),
         "worker_launch_pack_preflight_allowed": bool(preflight.get("allowed")),
         "blockers": blockers,
+        "next_step": {
+            "action": "launch_worker_now",
+            "description": (
+                "Launch the worker now with response.executable_worker_launch, "
+                "then record read receipt and startup through the runtime-context facades."
+            ),
+        },
         "repair": {
             "payload_source": "response.executable_worker_launch.payload",
-            "command_source": "response.executable_worker_launch.command_display",
+            "command_source": "response.executable_worker_launch.handoff_packet.command_skeleton",
             "stdin_source": str(stdin.get("source") or "response.launch_text"),
             "env_policy_source": "response.executable_worker_launch.env_policy",
+            "handoff_packet_source": "response.executable_worker_launch.handoff_packet",
             "missing_fields": missing_fields,
         },
     }
@@ -5218,7 +5510,12 @@ def build_observer_runtime_text_context(
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "worker_slot_id": context.worker_slot_id or worker_id,
-        "fence_token": context.fence_token,
+        "fence_token_hash": _runtime_text_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        ),
+        "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
+        "fence_token_redacted": bool(str(getattr(context, "fence_token", "") or "")),
+        "raw_fence_token_persisted": False,
         "branch": context.branch_ref,
         "branch_ref": context.branch_ref,
         "worktree_path": context.worktree_path,
@@ -5326,6 +5623,11 @@ def build_observer_runtime_text_context(
         worker_launch_pack=worker_launch_pack,
         dispatch_gate_validation=dispatch_gate_validation,
     )
+    executable_handoff_packet = (
+        executable_worker_launch.get("handoff_packet")
+        if isinstance(executable_worker_launch.get("handoff_packet"), Mapping)
+        else {}
+    )
     dispatch_gate_validation = {
         **dispatch_gate_validation,
         "startup_intent_event_generated": bool(ok),
@@ -5386,6 +5688,7 @@ def build_observer_runtime_text_context(
             "startup_recording": startup_recording,
             "startup_intent_event": startup_intent_event,
             "executable_worker_launch": executable_worker_launch,
+            "executable_handoff_packet": dict(executable_handoff_packet),
             "next_legal_action": observer_next_legal_action,
             "worker_launch_pack_hash": worker_launch_pack.get(
                 "worker_launch_pack_hash",
@@ -5401,6 +5704,7 @@ def build_observer_runtime_text_context(
         "startup_identity": same_owner_session_token_startup,
         "registered_host_adapter_spawn": registered_host_adapter_spawn,
         "executable_worker_launch": executable_worker_launch,
+        "executable_handoff_packet": dict(executable_handoff_packet),
         "read_receipt_identity": read_receipt_identity,
         "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
         "read_receipt_hash": str(read_receipt_identity.get("read_receipt_hash") or ""),

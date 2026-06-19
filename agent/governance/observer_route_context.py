@@ -1239,6 +1239,7 @@ def resolve_route_token_ref(
     route_token_ref: str,
     route_id: str = "",
     route_context_hash: str = "",
+    prompt_contract_id: str = "",
     task_id: str = "",
     backlog_id: str = "",
     now: datetime | None = None,
@@ -1253,8 +1254,8 @@ def resolve_route_token_ref(
     - Unknown ref → ``None`` (caller must treat as gate failure).
     - ``status != 'active'`` (superseded / expired) → raises
       ``RouteTokenRefError`` with the status.
-    - Identity mismatch (route_id / route_context_hash / task_id / backlog_id
-      when supplied) → raises ``RouteTokenRefError``.
+    - Identity mismatch (route_id / route_context_hash / prompt_contract_id /
+      task_id / backlog_id when supplied) → raises ``RouteTokenRefError``.
     - Expired (``expires_at`` in the past) → raises ``RouteTokenRefError``.
     """
     project_id = _string(project_id)
@@ -1310,6 +1311,17 @@ def resolve_route_token_ref(
         if stored_rch != _string(route_context_hash):
             raise RouteTokenRefError(
                 "route_token_ref identity mismatch: route_context_hash does not match"
+            )
+    if prompt_contract_id:
+        stored_prompt = _string(row_dict.get("prompt_contract_id"))
+        if not stored_prompt:
+            raise RouteTokenRefError(
+                "route_token_ref binding cannot be corroborated: prompt_contract_id "
+                "was supplied but the registered entry has no stored prompt_contract_id"
+            )
+        if stored_prompt != _string(prompt_contract_id):
+            raise RouteTokenRefError(
+                "route_token_ref identity mismatch: prompt_contract_id does not match"
             )
     if task_id:
         stored_task = _string(row_dict.get("task_id"))

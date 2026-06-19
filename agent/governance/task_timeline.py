@@ -262,6 +262,10 @@ MF_ROUTE_IDENTITY_FIELDS = (
     "route_context_hash",
     "prompt_contract_id",
 )
+MF_ROUTE_LINEAGE_IDENTITY_FIELDS = (
+    "route_id",
+    *MF_ROUTE_IDENTITY_FIELDS,
+)
 MF_ROUTE_OPTIONAL_IDENTITY_FIELDS = ("prompt_contract_hash",)
 MF_ROUTE_ATTEMPT_LINEAGE_FIELDS = (
     "runtime_context_id",
@@ -281,6 +285,7 @@ RUNTIME_CONTEXT_TIMELINE_IDENTITY_FIELDS = (
     "parent_task_id",
     "worker_slot_id",
     "fence_token",
+    "fence_token_hash",
 )
 RUNTIME_CONTEXT_TIMELINE_ROUTE_FIELDS = (
     "route_context_hash",
@@ -369,12 +374,15 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
             "bounded_implementation_worker_dispatch",
             "checkpoint",
             "checkpoint_branch_task",
+            "dispatch_bounded_worker",
             "evidence_checkpoint",
             "evidence_export",
             "export",
+            "finish_gate",
             "independent_verification",
             "mf_subagent_dispatch",
             "mf_subagent_dispatch_gate",
+            "mf_subagent_finish_gate",
             "mf_subagent_startup",
             "mf_subagent_startup_adoption",
             "mf_subagent_startup_adoption_gate",
@@ -1260,6 +1268,49 @@ def _independent_qa_resolved_verdict_refs(
     return resolved
 
 
+def _independent_qa_verdict_ref_rejection_reasons(
+    event: dict[str, Any],
+    events_by_ref: dict[str, dict[str, Any]],
+    worker_slot_ids: set[str],
+) -> list[dict[str, Any]]:
+    rejections: list[dict[str, Any]] = []
+    for ref in _independent_qa_verdict_refs(event):
+        target = events_by_ref.get(ref)
+        if not target:
+            rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_not_found"})
+            continue
+        status = _text(target.get("status") or target.get("decision")).lower()
+        if status not in MF_CLOSE_PASS_STATUSES:
+            rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_not_passing"})
+            continue
+        if not _independent_qa_event_kind_matches(target):
+            rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_not_qa_event"})
+            continue
+        if not _independent_qa_same_timeline_scope(event, target):
+            rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_scope_mismatch"})
+            continue
+        reviewer_identity = _independent_qa_reviewer_identity(target)
+        reviewer_lower = reviewer_identity.lower()
+        if reviewer_identity in worker_slot_ids:
+            rejections.append({
+                "verdict_ref": ref,
+                "reason": "reviewer_is_known_worker",
+                "reviewer_identity": reviewer_identity,
+            })
+            continue
+        if (
+            _is_independent_qa_observer_transport(target)
+            or not reviewer_identity
+            or reviewer_lower in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+        ):
+            rejections.append({
+                "verdict_ref": ref,
+                "reason": "qa_verdict_ref_not_independent_reviewer",
+                "reviewer_identity": reviewer_identity,
+            })
+    return rejections
+
+
 def _independent_qa_gate(
     rows: list[dict[str, Any]],
     policy: Mapping[str, Any],
@@ -1277,8 +1328,9 @@ def _independent_qa_gate(
     - Evidence whose *reviewer identity* is the same as any known worker_slot_id
       in the timeline does NOT count (live incidents #3750/#3811: workers
       self-appended IV lane events).
-    - Observer-authored/on-behalf verification events do NOT count, even when
-      they carry payload.reviewer or an observer-on-behalf reviewer suffix.
+    - Observer-authored/on-behalf verification transport counts only when it
+      references same-timeline QA verdict events authored by a legitimate
+      independent reviewer.  The transport itself is never enough.
     - Direct qa_review / qa_verification / independent_verification events with a
       non-worker, non-plain-observer actor count normally.
     """
@@ -1352,18 +1404,58 @@ def _independent_qa_gate(
         # Derive the effective reviewer identity.
         reviewer_identity = _independent_qa_reviewer_identity(event)
         reviewer_lower = reviewer_identity.lower()
+        unresolved_verdict_refs = _independent_qa_verdict_refs(event)
+        resolved_verdict_refs = _independent_qa_resolved_verdict_refs(
+            event,
+            events_by_ref,
+            worker_slot_ids,
+        )
 
-        # REJECT: observer-authored transport may relay facts but cannot itself
-        # satisfy the independent QA gate.
+        # Observer-authored transport may relay facts, but it only satisfies
+        # independent QA when its verdict refs resolve to legitimate same-row QA.
         if _is_independent_qa_observer_transport(event):
+            if resolved_verdict_refs:
+                evidence = {
+                    "id": event.get("id"),
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "actor": event.get("actor"),
+                    "reviewer_identity": reviewer_identity,
+                    "status": event.get("status"),
+                    "resolved_qa_verdict_refs": resolved_verdict_refs,
+                }
+                evidence_events.append(evidence)
+                continue
+            reason = (
+                "plain_observer_no_resolving_qa_verdict_ref"
+                if unresolved_verdict_refs
+                else (
+                    "plain_observer_no_independent_reviewer"
+                    if reviewer_lower in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+                    else "observer_transport_not_independent_qa"
+                )
+            )
             rejected_events.append({
                 "id": event.get("id"),
                 "event_kind": event.get("event_kind"),
                 "actor": event.get("actor"),
                 "status": event.get("status"),
-                "reason": "observer_transport_not_independent_qa",
+                "reason": reason,
                 "reviewer_identity": reviewer_identity,
+                "verdict_refs": unresolved_verdict_refs,
             })
+            for rejected_ref in _independent_qa_verdict_ref_rejection_reasons(
+                event,
+                events_by_ref,
+                worker_slot_ids,
+            ):
+                rejected_events.append({
+                    "id": event.get("id"),
+                    "event_kind": event.get("event_kind"),
+                    "actor": event.get("actor"),
+                    "status": event.get("status"),
+                    **rejected_ref,
+                })
             continue
 
         # REJECT: reviewer is a known worker (self-appended IV — incidents #3750/#3811).
@@ -1379,14 +1471,7 @@ def _independent_qa_gate(
             continue
 
         # REJECT: plain observer token without an independent reviewer identity.
-        resolved_verdict_refs: list[str] = []
         if reviewer_lower in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS:
-            unresolved_verdict_refs = _independent_qa_verdict_refs(event)
-            resolved_verdict_refs = _independent_qa_resolved_verdict_refs(
-                event,
-                events_by_ref,
-                worker_slot_ids,
-            )
             if not resolved_verdict_refs:
                 rejected_events.append({
                     "id": event.get("id"),
@@ -1503,7 +1588,8 @@ def _is_mf_subagent_read_receipt_event(event: dict[str, Any]) -> bool:
 # look up what the close gate expects.
 _RECEIPT_PROJECTION_SCHEMA = "runtime_context.timeline_evidence_fields.v1"
 # Fields the close gate requires on a read-receipt event.
-_RECEIPT_LINEAGE_REQUIRED = ("runtime_context_id", "task_id", "parent_task_id", "fence_token")
+_RECEIPT_LINEAGE_REQUIRED = ("runtime_context_id", "task_id", "parent_task_id")
+_RECEIPT_FENCE_LINEAGE_FIELDS = ("fence_token", "fence_token_hash")
 # At least one of these hash fields must be present.
 _RECEIPT_HASH_FIELDS = ("read_receipt_hash", "launch_text_hash")
 
@@ -1538,8 +1624,9 @@ def validate_and_normalize_mf_read_receipt_append(
     - status must be non-empty and a passing status (see MF_CLOSE_PASS_STATUSES).
     - at least one of read_receipt_hash or launch_text_hash must be present in
       the payload.
-    - runtime_context_id, task_id, parent_task_id, and fence_token must all be
-      present in the payload (lineage required by the close-gate projection).
+    - runtime_context_id, task_id, parent_task_id, and either legacy
+      fence_token or redacted fence_token_hash lineage must be present in the
+      payload (lineage required by the close-gate projection).
     """
     p = dict(payload or {})
     _ensure_cross_ref_bridge_meta_contract_aliases()
@@ -1584,6 +1671,17 @@ def validate_and_normalize_mf_read_receipt_append(
     for field in _RECEIPT_LINEAGE_REQUIRED:
         if not str(p.get(field) or "").strip():
             missing.append(field)
+    has_fence_lineage = any(
+        str(p.get(field) or "").strip() for field in _RECEIPT_FENCE_LINEAGE_FIELDS
+    )
+    if not has_fence_lineage:
+        missing.append("fence_token or fence_token_hash")
+    elif (
+        str(p.get("fence_token_hash") or "").strip()
+        and not str(p.get("fence_token") or "").strip()
+        and not _truthy(p.get("fence_token_redacted"))
+    ):
+        missing.append("fence_token_redacted")
 
     # worker_slot_id must now be present (after normalization attempt).
     if not str(p.get("worker_slot_id") or "").strip():
@@ -1595,7 +1693,7 @@ def validate_and_normalize_mf_read_receipt_append(
             f"for {_RECEIPT_PROJECTION_SCHEMA}: {', '.join(missing)}. "
             "Required fields: status (passing), "
             + ", ".join(_RECEIPT_LINEAGE_REQUIRED)
-            + ", worker_slot_id, and at least one of "
+            + ", fence_token or fence_token_hash, worker_slot_id, and at least one of "
             + "/".join(_RECEIPT_HASH_FIELDS)
             + "."
         )
@@ -2517,11 +2615,21 @@ def _first_deep_text(value: Any, key: str) -> str:
 
 def _route_identity(value: Any) -> dict[str, str]:
     identity = {field: _first_deep_text(value, field) for field in MF_ROUTE_IDENTITY_FIELDS}
+    route_id = _first_deep_text(value, "route_id")
+    if route_id:
+        identity["route_id"] = route_id
     for field in MF_ROUTE_OPTIONAL_IDENTITY_FIELDS:
         optional = _first_deep_text(value, field)
         if optional:
             identity[field] = optional
     return identity if all(identity.values()) else {}
+
+
+def _shared_route_identity_route_id(identity: Mapping[str, str]) -> str:
+    route_id = str(identity.get("route_id") or "").strip()
+    if route_id.startswith("event."):
+        return ""
+    return route_id
 
 
 def _route_attempt_lineage(value: Any) -> dict[str, str]:
@@ -2607,7 +2715,21 @@ def _route_identity_matches_filter(
     if _route_identity_key(identity) != _route_identity_key(filter_identity):
         return False
     expected_prompt_hash = filter_identity.get("prompt_contract_hash", "")
-    return not expected_prompt_hash or identity.get("prompt_contract_hash", "") == expected_prompt_hash
+    if expected_prompt_hash and identity.get("prompt_contract_hash", "") != expected_prompt_hash:
+        return False
+    expected_route_id = str(filter_identity.get("route_id") or "").strip()
+    return not expected_route_id or (
+        str(identity.get("route_id") or "").strip() == expected_route_id
+    )
+
+
+def _route_lineage_identity_hint(value: Mapping[str, Any] | None) -> dict[str, str]:
+    source = _mapping(value)
+    return {
+        field: str(source.get(field) or "").strip()
+        for field in (*MF_ROUTE_LINEAGE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+        if str(source.get(field) or "").strip()
+    }
 
 
 def _route_child_identity_join_verified(value: Any) -> bool:
@@ -2623,6 +2745,7 @@ def _route_parent_child_startup_identity(
     identity: dict[str, str],
     *,
     parent_identity_hint: Mapping[str, Any] | None = None,
+    expected_parent_task_id: str = "",
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Normalize a truthful child startup event back to its parent route identity."""
 
@@ -2677,9 +2800,8 @@ def _route_parent_child_startup_identity(
     )
     if not lineage_valid:
         parent_hint = {
-            field: str(_mapping(parent_identity_hint).get(field) or "").strip()
-            for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
-            if str(_mapping(parent_identity_hint).get(field) or "").strip()
+            field: token
+            for field, token in _route_lineage_identity_hint(parent_identity_hint).items()
         }
         if parent_hint and _route_child_identity_join_verified(value):
             normalized = dict(parent_hint)
@@ -2694,6 +2816,50 @@ def _route_parent_child_startup_identity(
                 "read_receipt_lineage_present": True,
                 "route_identity_matches_latest_contract": True,
             }
+        route_token_ref = _first_deep_text(value, "route_token_ref")
+        route_lineage = _route_action_scope_server_lineage(
+            value,
+            identity,
+            parent_hint,
+            route_token_ref,
+        )
+        if route_lineage:
+            parent_task_id = _first_deep_text(value, "parent_task_id")
+            expected_parent = str(expected_parent_task_id or "").strip()
+            runtime_context_id = _first_deep_text(value, "runtime_context_id")
+            task_id = _first_deep_text(value, "task_id")
+            worker_slot_id = (
+                _first_deep_text(value, "worker_slot_id")
+                or _first_deep_text(value, "worker_id")
+            )
+            observer_command_id = _first_deep_text(value, "observer_command_id")
+            if all(
+                (
+                    runtime_context_id,
+                    task_id,
+                    parent_task_id,
+                    worker_slot_id,
+                    observer_command_id,
+                    route_token_ref,
+                    not expected_parent or parent_task_id == expected_parent,
+                )
+            ):
+                return dict(parent_hint), {
+                    "schema_version": "mf_subagent_startup_lineage_acceptance.v1",
+                    "accepted": True,
+                    "acceptance_source": "registry_backed_runtime_context_lineage",
+                    "route_token_ref": route_token_ref,
+                    "server_lineage": route_lineage,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "worker_slot_id": worker_slot_id,
+                    "observer_command_id": observer_command_id,
+                    "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
+                    "child_route_context_hash": child_route_context_hash,
+                    "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
+                    "child_prompt_contract_id": child_prompt_contract_id,
+                }
         return identity, {}
 
     normalized = {
@@ -2737,9 +2903,8 @@ def _route_parent_child_dispatch_identity(
     if not identity:
         return identity, {}
     parent_hint = {
-        field: str(_mapping(parent_identity_hint).get(field) or "").strip()
-        for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
-        if str(_mapping(parent_identity_hint).get(field) or "").strip()
+        field: token
+        for field, token in _route_lineage_identity_hint(parent_identity_hint).items()
     }
     if not parent_hint or _route_identity_key(identity) == _route_identity_key(parent_hint):
         return identity, {}
@@ -2924,7 +3089,7 @@ def _route_action_scope_route_token_gate(
     ):
         return False, {}
     mismatches: list[dict[str, str]] = []
-    for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS):
+    for field in (*MF_ROUTE_LINEAGE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS):
         expected = str(identity.get(field) or "").strip()
         actual = str(gate.get(field) or "").strip()
         if expected and actual and actual != expected:
@@ -2943,6 +3108,23 @@ def _route_action_scope_route_token_gate(
     }
 
 
+def _route_action_scope_allowed_action(value: Any, lineage: Mapping[str, Any]) -> str:
+    action = str(
+        lineage.get("allowed_action")
+        or lineage.get("action")
+        or lineage.get("allowed_route_action")
+        or ""
+    ).strip()
+    route_token_gate = _first_deep_mapping(value, "route_token_gate")
+    gate_action = str(
+        route_token_gate.get("allowed_action")
+        or route_token_gate.get("action")
+        or route_token_gate.get("allowed_route_action")
+        or ""
+    ).strip()
+    return action or gate_action or _first_deep_text(value, "allowed_action")
+
+
 def _lineage_route_identity(
     lineage: Mapping[str, Any],
     prefix: str,
@@ -2955,7 +3137,7 @@ def _lineage_route_identity(
             nested = candidate
             break
     identity: dict[str, str] = {}
-    for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS):
+    for field in (*MF_ROUTE_LINEAGE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS):
         token = str(
             nested.get(field)
             or lineage.get(f"{prefix}_{field}")
@@ -2972,6 +3154,10 @@ def _lineage_identity_matches(
 ) -> bool:
     for field in MF_ROUTE_IDENTITY_FIELDS:
         if str(actual.get(field) or "").strip() != str(expected.get(field) or "").strip():
+            return False
+    expected_route_id = str(expected.get("route_id") or "").strip()
+    if expected_route_id:
+        if str(actual.get("route_id") or "").strip() != expected_route_id:
             return False
     expected_prompt_hash = str(expected.get("prompt_contract_hash") or "").strip()
     return not expected_prompt_hash or (
@@ -3009,28 +3195,35 @@ def _route_action_scope_server_lineage(
             or lineage.get("projected_by")
             or provenance.get("source")
         )
+        binding_source = str(lineage.get("binding_source") or "").strip()
         server_backed = bool(
             _truthy(lineage.get("resolved_from_ref"))
             or _truthy(lineage.get("server_issued_binding"))
             or _truthy(lineage.get("registry_verified"))
             or _truthy(lineage.get("server_projected"))
             or _truthy(provenance.get("server_projected"))
+            or binding_source == "observer_route_token_refs"
         )
         source_ok = bool(
-            source
-            and (
-                source in {
-                    "route_token_ref_resolved",
-                    "observer_route_token_refs",
-                    "server_route_token_action_scope",
-                    "server_backed_route_token_action_scope",
-                    "protected_route_token_ref_action_scope",
-                    "route_token_gate",
-                }
-                or "server" in source
-                or "registry" in source
+            (
+                source
+                and (
+                    source in {
+                        "route_token_ref_resolved",
+                        "observer_route_token_refs",
+                        "server_route_token_action_scope",
+                        "server_backed_route_token_action_scope",
+                        "protected_route_token_ref_action_scope",
+                        "route_token_gate",
+                    }
+                    or "server" in source
+                    or "registry" in source
+                )
             )
+            or binding_source == "observer_route_token_refs"
         )
+        allowed_action = _route_action_scope_allowed_action(value, lineage)
+        action_ok = allowed_action in {"", "task_timeline_append"}
         lineage_ref = str(lineage.get("route_token_ref") or "").strip()
         parent_identity = _lineage_route_identity(
             lineage,
@@ -3046,6 +3239,7 @@ def _route_action_scope_server_lineage(
             passed
             and server_backed
             and source_ok
+            and action_ok
             and route_token_ref
             and lineage_ref == route_token_ref
             and _lineage_identity_matches(parent_identity, parent_hint)
@@ -3055,9 +3249,16 @@ def _route_action_scope_server_lineage(
         return {
             "schema_version": "route_action_scope_server_lineage.v1",
             "accepted": True,
-            "acceptance_source": source,
+            "acceptance_source": source or binding_source,
             "route_token_ref": lineage_ref,
+            "allowed_action": allowed_action,
             "server_backed": True,
+            "registry_verified": bool(_truthy(lineage.get("registry_verified"))),
+            "server_issued_binding": bool(_truthy(lineage.get("server_issued_binding"))),
+            "resolved_from_ref": bool(_truthy(lineage.get("resolved_from_ref"))),
+            "binding_source": binding_source,
+            "parent_route_identity": parent_identity,
+            "child_route_identity": child_identity,
             "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
             "child_route_context_hash": identity.get("route_context_hash", ""),
             "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
@@ -3077,9 +3278,8 @@ def _route_action_scoped_verification_identity(
     if not identity:
         return identity, {}
     parent_hint = {
-        field: str(_mapping(parent_identity_hint).get(field) or "").strip()
-        for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
-        if str(_mapping(parent_identity_hint).get(field) or "").strip()
+        field: token
+        for field, token in _route_lineage_identity_hint(parent_identity_hint).items()
     }
     if not parent_hint or _route_identity_key(identity) == _route_identity_key(parent_hint):
         return identity, {}
@@ -3428,6 +3628,7 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
             "mf_subagent.dispatch",
             "mf_subagent_dispatch_gate",
             "bounded_implementation_worker_dispatch",
+            "dispatch_bounded_worker",
             "dispatch_evidence",
         }
     ):
@@ -4035,6 +4236,7 @@ def mf_route_context_gate_verification(
     accepted_action_scope_lineages: list[dict[str, Any]] = []
     attempt_lineage_candidates: list[dict[str, Any]] = []
     parent_route_identity_hint: dict[str, str] = {}
+    route_identity_mismatch_seen = False
     expected_parent_task_id = str(
         _contract_root(contract).get("contract_instance_id") or ""
     ).strip()
@@ -4122,6 +4324,7 @@ def mf_route_context_gate_verification(
                 event,
                 identity,
                 parent_identity_hint=parent_route_identity_hint,
+                expected_parent_task_id=expected_parent_task_id,
             )
             if lineage:
                 accepted_startup_lineages.append({
@@ -4230,6 +4433,7 @@ def mf_route_context_gate_verification(
                 "reason": "independent_verification_route_lineage_untrusted",
                 "categories": [MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID],
             })
+            route_identity_mismatch_seen = True
             categories = set(categories)
             categories.discard(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
             if not categories:
@@ -4260,9 +4464,34 @@ def mf_route_context_gate_verification(
         for identity in identities[category_id]
         if identity.get("prompt_contract_hash")
     }
+    route_ids = {
+        _shared_route_identity_route_id(identity)
+        for category_id in required_requirement_ids
+        for identity in identities[category_id]
+        if _shared_route_identity_route_id(identity)
+    }
+    route_identity_count = sum(
+        1
+        for category_id in required_requirement_ids
+        for identity in identities[category_id]
+        if identity
+    )
+    route_id_present_count = sum(
+        1
+        for category_id in required_requirement_ids
+        for identity in identities[category_id]
+        if _shared_route_identity_route_id(identity)
+    )
     same_route_identity = len(identity_keys) <= 1
     same_optional_prompt_contract_hash = len(prompt_hashes) <= 1
-    if required and identity_keys and not (same_route_identity and same_optional_prompt_contract_hash):
+    same_optional_route_id = len(route_ids) <= 1
+    if required and identity_keys and not (
+        same_route_identity
+        and same_optional_prompt_contract_hash
+        and same_optional_route_id
+    ):
+        missing.append("route_identity_mismatch")
+    if required and route_identity_mismatch_seen and "route_identity_mismatch" not in missing:
         missing.append("route_identity_mismatch")
     passed = (not required) or (
         not missing and same_route_identity and same_optional_prompt_contract_hash
@@ -4276,6 +4505,12 @@ def mf_route_context_gate_verification(
         }
         if len(prompt_hashes) == 1:
             route_identity["prompt_contract_hash"] = next(iter(prompt_hashes))
+        if (
+            len(route_ids) == 1
+            and route_identity_count
+            and route_id_present_count == route_identity_count
+        ):
+            route_identity["route_id"] = next(iter(route_ids))
     current_attempt_lineage: dict[str, Any] = {}
     if attempt_lineage_candidates:
         selected_attempt = max(
@@ -4323,7 +4558,7 @@ def mf_route_context_gate_verification(
             "read_receipt": list(RUNTIME_CONTEXT_TIMELINE_READ_RECEIPT_FIELDS),
             "attempt_lineage": list(RUNTIME_CONTEXT_TIMELINE_IDENTITY_FIELDS),
             "route_identity": list(
-                (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
+                (*MF_ROUTE_LINEAGE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
             ),
             "required_evidence_ids": list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS),
         },
@@ -4347,6 +4582,7 @@ def mf_route_context_gate_verification(
                 present.get(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
             ),
             "same_route_identity": same_route_identity,
+            "same_optional_route_id": same_optional_route_id,
             "same_optional_prompt_contract_hash": same_optional_prompt_contract_hash,
             "route_identity_cleanup_applied": bool(cleanup_identity),
         },
@@ -5775,6 +6011,34 @@ def _cross_ref_row_anchor(
     return anchor
 
 
+def _cross_ref_fence_proof(event: dict[str, Any]) -> dict[str, Any]:
+    raw_fence = _first_deep_text(event, "fence_token")
+    fence_hash = _first_deep_text(event, "fence_token_hash")
+    fence_redacted = _truthy(_first_deep_value(event, "fence_token_redacted"))
+    if raw_fence and not fence_hash:
+        fence_hash = "sha256:" + hashlib.sha256(raw_fence.encode("utf-8")).hexdigest()
+    legacy_raw_present = bool(raw_fence)
+    accepted = bool(legacy_raw_present or (fence_hash and fence_redacted))
+    if legacy_raw_present:
+        proof_type = "legacy_fence_token"
+    elif fence_hash and fence_redacted:
+        proof_type = "redacted_fence_token_hash"
+    elif fence_hash:
+        proof_type = "fence_token_hash_without_redaction_flag"
+    else:
+        proof_type = "missing"
+    return {
+        "accepted": accepted,
+        "proof_type": proof_type,
+        "fence_token_hash": fence_hash,
+        "fence_token_redacted": bool(
+            fence_hash and (fence_redacted or legacy_raw_present)
+        ),
+        "legacy_raw_fence_token_present": legacy_raw_present,
+        "raw_fence_token_value_exposed": False,
+    }
+
+
 def _cross_ref_route_token_child_lineage_diagnosis(
     event: dict[str, Any],
     anchor: Mapping[str, Any],
@@ -5789,14 +6053,22 @@ def _cross_ref_route_token_child_lineage_diagnosis(
         _first_deep_text(event, "worker_slot_id")
         or _first_deep_text(event, "worker_id")
     )
+    fence_proof = _cross_ref_fence_proof(event)
     route_scope = _cross_ref_public_route_scope(event)
     command = _cross_ref_bridge_command(event)
+    row_command = str(anchor.get("command") or "").strip()
     missing: list[str] = []
 
+    if not lane.get("backlog_id"):
+        missing.append("backlog_id")
     if row_backlog and lane.get("backlog_id") and lane["backlog_id"] != row_backlog:
         missing.append("row_backlog_id_match")
+    if not lane.get("project_id"):
+        missing.append("project_id")
     if row_project and lane.get("project_id") and lane["project_id"] != row_project:
         missing.append("row_project_id_match")
+    if not lane.get("task_id"):
+        missing.append("task_id")
     if not route_scope.get("route_token_ref"):
         missing.append("route_token_ref")
     if not route_scope.get("route_id"):
@@ -5813,34 +6085,52 @@ def _cross_ref_route_token_child_lineage_diagnosis(
         missing.append("runtime_context_id")
     if not worker_slot_id:
         missing.append("worker_slot_id")
+    if not fence_proof.get("accepted"):
+        missing.append("fence_token or fence_token_hash")
+        if fence_proof.get("fence_token_hash") and not fence_proof.get(
+            "fence_token_redacted"
+        ):
+            missing.append("fence_token_redacted")
     if not command:
         missing.append("observer_command_id")
+    elif row_command and command != row_command:
+        missing.append("observer_command_id_matches_row")
     if not canonical_route_scope.get("route_context_hash"):
         missing.append("canonical_parent_route_context_hash")
     if not canonical_route_scope.get("prompt_contract_id"):
         missing.append("canonical_parent_prompt_contract_id")
-    # Event payloads can describe child lineage but cannot prove the route-token
-    # registry state. Close-satisfying admission needs a server-side registry
-    # check that the active, non-superseded token ref belongs to this canonical
-    # parent and matches the worker lane.
-    missing.append("route_token_registry_proof")
-    event_scope_complete = missing == ["route_token_registry_proof"]
+    parent_hint = _route_lineage_identity_hint(canonical_route_scope)
+    route_lineage: dict[str, Any] = {}
+    if not missing:
+        route_lineage = _route_action_scope_server_lineage(
+            event,
+            route_scope,
+            parent_hint,
+            route_scope.get("route_token_ref", ""),
+        )
+        if not route_lineage:
+            missing.append("route_token_registry_proof")
+        elif route_lineage.get("allowed_action") not in {"", "task_timeline_append"}:
+            missing.append("allowed_action")
+    accepted = bool(route_lineage and not missing)
+    event_scope_complete = bool(accepted or missing == ["route_token_registry_proof"])
+    registry_verified = bool(accepted and route_lineage.get("server_backed"))
 
     return {
         "schema_version": "mf_cross_ref_route_token_child_lineage.v1",
         "event_id": event.get("id") or event.get("event_id"),
         "event_kind": event.get("event_kind"),
-        "accepted": False,
-        "registry_verified": False,
+        "accepted": accepted,
+        "registry_verified": registry_verified,
         "event_scope_complete": event_scope_complete,
-        "advisory_only": True,
+        "advisory_only": not accepted,
         "missing_fields": missing,
         "registry_proof_required": [
             "active_non_superseded_route_token_ref",
             "canonical_parent_backlog_id",
             "worker_task_id",
             "runtime_context_id",
-            "fence_token",
+            "fence_token or fence_token_hash",
             "worker_slot_id",
             "allowed_action",
             "canonical_parent_route_identity",
@@ -5850,6 +6140,7 @@ def _cross_ref_route_token_child_lineage_diagnosis(
         "parent_task_id": parent_task_id,
         "runtime_context_id": runtime_context_id,
         "worker_slot_id": worker_slot_id,
+        "fence_proof": fence_proof,
         "child_route_scope": route_scope,
         "canonical_parent_route_scope": {
             field: str(canonical_route_scope.get(field) or "").strip()
@@ -5860,16 +6151,21 @@ def _cross_ref_route_token_child_lineage_diagnosis(
             key: value
             for key, value in {
                 "observer_command_id": command,
-                "row_command": str(anchor.get("command") or "").strip(),
+                "row_command": row_command,
             }.items()
             if value
         },
         "reason": (
-            "route_token_child_lineage_unproven_registry"
-            if event_scope_complete
-            else "route_token_child_lineage_missing_required_scope"
+            "registry_backed_route_token_child_lineage"
+            if accepted
+            else (
+                "route_token_child_lineage_unproven_registry"
+                if event_scope_complete
+                else "route_token_child_lineage_missing_required_scope"
+            )
         ),
-        "close_satisfying_by_itself": False,
+        "server_lineage": route_lineage,
+        "close_satisfying_by_itself": accepted,
     }
 
 
@@ -5878,18 +6174,9 @@ def _cross_ref_route_token_child_diagnostics(
     anchor: dict[str, str],
     route_context_gate: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    """Return route-token child diagnostics without granting close membership.
-
-    ``task_timeline`` receives timeline events, not the authoritative route-token
-    registry. Self-declared child-route fields are therefore advisory until a
-    server-side registry check proves active/non-superseded token ownership.
-    """
+    """Return route-token child diagnostics from canonical route scope evidence."""
 
     gate = _mapping(route_context_gate)
-    cleanup = _mapping(gate.get("route_identity_cleanup"))
-    if not cleanup.get("applied"):
-        return []
-
     canonical_route_scope = _cross_ref_canonical_route_scope(rows, gate)
     if not canonical_route_scope:
         return []
@@ -6092,11 +6379,38 @@ def mf_close_cross_ref_gate_verification(
         route_context_gate=route_context_gate,
     )
     lane_membership = _cross_ref_bridge_scope_membership(rows, anchor)
-    advisory_route_token_child_lineages = _cross_ref_route_token_child_diagnostics(
+    route_token_child_lineages = _cross_ref_route_token_child_diagnostics(
         rows,
         anchor,
         route_context_gate,
     )
+    accepted_route_token_child_lineages = [
+        item for item in route_token_child_lineages if item.get("accepted")
+    ]
+    advisory_route_token_child_lineages = [
+        item for item in route_token_child_lineages if not item.get("accepted")
+    ]
+    row_backlog = str(anchor.get("backlog_id") or "").strip()
+    row_project = str(anchor.get("project_id") or "").strip()
+    for lineage in accepted_route_token_child_lineages:
+        lane = _mapping(lineage.get("lane_identity"))
+        lane_backlog = str(lane.get("backlog_id") or "").strip()
+        lane_project = str(lane.get("project_id") or "").strip()
+        lane_task = str(lane.get("task_id") or "").strip()
+        if row_backlog and lane_backlog and lane_backlog != row_backlog:
+            continue
+        if row_project and lane_project and lane_project != row_project:
+            continue
+        lane_membership.add((
+            row_backlog or lane_backlog,
+            row_project or lane_project,
+            lane_task,
+        ))
+        lane_membership.add((
+            row_backlog or lane_backlog,
+            row_project or lane_project,
+            "",
+        ))
     child_diagnostics_by_event_id = {
         str(item.get("event_id") or ""): item
         for item in advisory_route_token_child_lineages
@@ -6117,10 +6431,30 @@ def mf_close_cross_ref_gate_verification(
         if lane_key in lane_membership:
             continue
         aggregate_key = (lane_key[0], lane_key[1], "")
-        if aggregate_key in lane_membership and lane_key[2] == "":
+        if aggregate_key in lane_membership:
             continue
         mismatches: dict[str, dict[str, str]] = {}
         anchor_task = str(anchor.get("task_id") or "").strip()
+        if (
+            row_backlog
+            and lane_key[0]
+            and lane_key[0] != row_backlog
+            and f"backlog_id={lane_key[0]}" not in bridged
+        ):
+            mismatches["backlog_id"] = {
+                "expected": row_backlog,
+                "actual": lane_key[0],
+            }
+        if (
+            row_project
+            and lane_key[1]
+            and lane_key[1] != row_project
+            and f"project_id={lane_key[1]}" not in bridged
+        ):
+            mismatches["project_id"] = {
+                "expected": row_project,
+                "actual": lane_key[1],
+            }
         if lane_key[2] and anchor_task and lane_key[2] != anchor_task:
             mismatches["task_id"] = {
                 "expected": anchor_task,
@@ -6165,7 +6499,7 @@ def mf_close_cross_ref_gate_verification(
         "bridged_lane_membership": sorted(
             {"|".join(key) for key in lane_membership}
         ),
-        "accepted_route_token_child_lineages": [],
+        "accepted_route_token_child_lineages": accepted_route_token_child_lineages,
         "advisory_route_token_child_lineages": advisory_route_token_child_lineages,
         "ignored_route_token_child_lineages": advisory_route_token_child_lineages,
         "rejected_cross_ref_evidence": rejected,
@@ -7380,7 +7714,7 @@ def _cross_ref_append_payload_skeleton(
             "canonical_parent_backlog_id",
             "worker_task_id",
             "runtime_context_id",
-            "fence_token",
+            "fence_token or fence_token_hash",
             "worker_slot_id",
             "allowed_action",
             "canonical_parent_route_identity",

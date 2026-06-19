@@ -21,6 +21,7 @@ IDLE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2
 STALE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 4
 CLAIMED_TO_STARTUP_TIMEOUT_SEC = STALE_AFTER_SEC
 CLAIMED_TO_STARTUP_TIMEOUT_STATUS = "claimed_to_startup_timeout"
+CLAIMED_EXECUTE_WAITING_FOR_STARTUP_STATUS = "waiting_for_worker_startup"
 CLAIMED_TO_PROGRESS_TIMEOUT_SEC = STALE_AFTER_SEC
 CLAIMED_TO_PROGRESS_TIMEOUT_STATUS = "claimed_to_progress_timeout"
 NOTIFIED_UNCLAIMED_RECOVERY_THRESHOLD_SEC = HEARTBEAT_INTERVAL_SEC
@@ -3518,24 +3519,48 @@ def _claimed_execute_missing_startup_recovery(
 ) -> dict[str, Any]:
     commands = _latest_owned_execute_commands(conn, project_id=project_id, limit=limit)
     stale: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    waiting: list[tuple[dict[str, Any], float | None]] = []
     for command in commands:
-        if _timeline_actual_startup_event_for_command(
+        result = _command_result(command)
+        if _persisted_mf_sub_evidence_for_command(
             conn,
             project_id=project_id,
             command=command,
+            result=result,
         ):
+            continue
+        if _contains_terminal_dispatch_blocker(result) or _result_is_terminal_blocked(result):
             continue
         timeout = _claimed_execute_takeover_timeout(conn, command, now=now)
         if str(timeout.get("status") or "") != CLAIMED_TO_STARTUP_TIMEOUT_STATUS:
+            if not _command_has_startup_or_blocker_evidence(command):
+                waiting.append((command, _command_claim_age_sec(command, now=now)))
             continue
         stale.append((command, timeout))
-    if not stale:
+    if not stale and not waiting:
         return {}
 
-    diagnosed, timeout = max(
-        stale,
-        key=lambda item: float(item[1].get("age_sec") or 0.0),
-    )
+    if stale:
+        diagnosed, timeout = max(
+            stale,
+            key=lambda item: float(item[1].get("age_sec") or 0.0),
+        )
+        status = "blocked"
+        computed_status = CLAIMED_TO_STARTUP_TIMEOUT_STATUS
+        recovery_required = True
+        claimed_age_sec = timeout.get("age_sec")
+        timeout_sec = timeout.get("timeout_sec") or CLAIMED_TO_STARTUP_TIMEOUT_SEC
+        timeout_kind = timeout.get("timeout_kind") or "startup_timeout"
+    else:
+        diagnosed, claimed_age_sec = max(
+            waiting,
+            key=lambda item: float(item[1] or 0.0),
+        )
+        status = "waiting"
+        computed_status = CLAIMED_EXECUTE_WAITING_FOR_STARTUP_STATUS
+        recovery_required = False
+        timeout_sec = CLAIMED_TO_STARTUP_TIMEOUT_SEC
+        timeout_kind = "startup_wait"
     claimed_by = str(diagnosed.get("claimed_by_session_id") or "")
     sessions = list_sessions(conn, project_id=project_id, limit=100, now=now)
     active_recovery_session_ids = [
@@ -3543,23 +3568,23 @@ def _claimed_execute_missing_startup_recovery(
         for session_id in _active_recovery_session_ids(sessions, diagnosed)
         if session_id != claimed_by
     ]
-    blocker = _missing_startup_surface_blocker(diagnosed, now=now)
+    blocker = _missing_startup_surface_blocker(diagnosed, now=now) if stale else {}
     diagnosed_summary = _observer_command_summary_item(diagnosed, now=now)
     diagnosed_claimed_command = {
         **diagnosed_summary,
         "claimed_by_session_id": claimed_by,
         "claimed_at": str(diagnosed.get("claimed_at") or ""),
-        "claimed_age_sec": timeout.get("age_sec"),
+        "claimed_age_sec": claimed_age_sec,
         "startup_evidence_present": False,
         "terminal_dispatch_blocker_present": False,
-        "computed_status": CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
+        "computed_status": computed_status,
     }
 
-    return {
-        "status": "blocked",
+    response = {
+        "status": status,
         "classification": "claimed_execute_missing_startup",
-        "computed_status": CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
-        "recovery_required": True,
+        "computed_status": computed_status,
+        "recovery_required": recovery_required,
         "blocked_command_id": str(diagnosed.get("command_id") or ""),
         "diagnosed_claimed_command": diagnosed_claimed_command,
         "claimed_by_session_id": claimed_by,
@@ -3571,19 +3596,25 @@ def _claimed_execute_missing_startup_recovery(
             now=now,
             command=diagnosed,
         ),
-        "claimed_age_sec": timeout.get("age_sec"),
-        "timeout_sec": timeout.get("timeout_sec") or CLAIMED_TO_STARTUP_TIMEOUT_SEC,
-        "timeout_kind": timeout.get("timeout_kind") or "startup_timeout",
+        "claimed_age_sec": claimed_age_sec,
+        "timeout_sec": timeout_sec,
+        "timeout_kind": timeout_kind,
         "startup_evidence_present": False,
         "terminal_dispatch_blocker_present": False,
-        "next_expected_evidence": "mf_subagent_startup_or_terminal_dispatch_blocker",
+        "next_expected_evidence": (
+            "mf_subagent_read_receipt_plus_mf_subagent_startup_or_terminal_dispatch_blocker"
+        ),
         "owned_execute_backlog_row_count": len(commands),
         "stale_claimed_execute_backlog_row_count": len(stale),
+        "waiting_claimed_execute_backlog_row_count": len(waiting),
         "latest_owned_command": diagnosed_summary,
         "diagnosed_command": diagnosed_summary,
         "active_recovery_session_ids": active_recovery_session_ids,
-        "blocker": blocker,
-        "next_legal_action": {
+    }
+    if blocker:
+        response["blocker"] = blocker
+    if stale:
+        response["next_legal_action"] = {
             "tool": "observer_command_takeover",
             "action": "takeover_claimed_command",
             "description": (
@@ -3605,8 +3636,30 @@ def _claimed_execute_missing_startup_recovery(
                 "record_mf_subagent_startup",
             ],
             "alternate_followup": "fail_with_terminal_dispatch_blocker",
-        },
-    }
+        }
+    else:
+        response["next_legal_action"] = {
+            "tool": "observer_runtime_text_prepare",
+            "action": "prepare_runtime_text_launch_worker_record_startup",
+            "description": (
+                "Prepare runtime text from this claimed execute_backlog_row command, "
+                "launch the worker now, then record mf_subagent_read_receipt and "
+                "mf_subagent_startup for the same observer command."
+            ),
+            "command_id": str(diagnosed.get("command_id") or ""),
+            "observer_command_id": str(diagnosed.get("command_id") or ""),
+            "claimed_by_session_id": claimed_by,
+            "requires_session_token": False,
+            "followup_sequence": [
+                "observer_runtime_text_prepare",
+                "launch_worker_now",
+                "mf_subagent_read_receipt",
+                "record_mf_subagent_startup",
+            ],
+            "alternate_followup": "fail_with_terminal_dispatch_blocker",
+            "terminal_after_timeout": True,
+        }
+    return response
 
 
 def observer_command_consumer_recovery(
@@ -3652,16 +3705,20 @@ def observer_command_consumer_recovery(
         ),
         "recovery_required": bool(diagnosed and diagnosed in stale_commands),
     }
+    claimed_recovery = _claimed_execute_missing_startup_recovery(
+        conn,
+        project_id=pid,
+        now=timestamp,
+        limit=limit,
+    )
+    if claimed_recovery:
+        if diagnosed:
+            base["notified_execute_backlog_row_diagnosis"] = (
+                _observer_command_summary_item(diagnosed, now=timestamp)
+            )
+        base.update(claimed_recovery)
+        return base
     if not diagnosed:
-        claimed_recovery = _claimed_execute_missing_startup_recovery(
-            conn,
-            project_id=pid,
-            now=timestamp,
-            limit=limit,
-        )
-        if claimed_recovery:
-            base.update(claimed_recovery)
-            return base
         base.update(
             {
                 "status": "idle",

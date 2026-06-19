@@ -529,7 +529,7 @@ _META_ACTION_ALIASES = {
     "observer_visual_smoke": "observer_visual_smoke",
     "visual_smoke": "observer_visual_smoke",
     "independent_verification": "independent_verification",
-    "verification": "qa_verification",
+    "verification": "observer_command",
     "qa_verification": "qa_verification",
     "qa_review": "qa_review",
     "hotfix_entered": "hotfix_entered",
@@ -3697,6 +3697,29 @@ def _timeline_startup_gate_from_event(event: Mapping[str, Any]) -> dict[str, Any
     return {}
 
 
+def _startup_gate_is_close_relevant(gate: Mapping[str, Any]) -> bool:
+    """Return true when startup evidence claims close-sensitive worker identity."""
+
+    if not gate:
+        return False
+    has_runtime_context_lineage = bool(
+        _string(gate.get("runtime_context_id"))
+        and _string(gate.get("task_id"))
+        and _string(gate.get("parent_task_id"))
+    )
+    return bool(
+        _bool(gate.get("close_satisfying"))
+        or _bool(gate.get("finish_gate_startup_projection"))
+        or has_runtime_context_lineage
+        or _nested_mapping(gate, "worker_self_attestation")
+        or _string(gate.get("worker_session_id"))
+        or _string(gate.get("worker_transcript_path"))
+        or _string(gate.get("worker_transcript_ref"))
+        or _string(gate.get("session_token_evidence_type"))
+        or _string(gate.get("session_token_hash"))
+    )
+
+
 def _finish_gate_startup_close_projection(
     event: Mapping[str, Any],
     finish_gate: Mapping[str, Any],
@@ -3787,10 +3810,21 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
     ]
     demoted: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
     startup_event_count = 0
     for index, event in enumerate(rows):
         gate = _timeline_startup_gate_from_event(event)
         if not gate:
+            continue
+        if not _startup_gate_is_close_relevant(gate):
+            ignored.append({
+                "index": index,
+                "id": _string(event.get("id") or event.get("event_id")),
+                "event_kind": _string(event.get("event_kind")),
+                "phase": _string(event.get("phase")),
+                "status": _string(event.get("status") or event.get("decision")),
+                "reason": "startup_event_is_route_context_only",
+            })
             continue
         startup_event_count += 1
         surrogate_gate = surrogate_startup_evidence_gate(
@@ -3837,6 +3871,7 @@ def close_timeline_startup_event_gate(events: Any) -> dict[str, Any]:
         "status": "passed" if passed else "failed",
         "accepted_startup_events": accepted,
         "demoted_startup_events": demoted,
+        "ignored_startup_events": ignored,
         "demoted_startup_event_indexes": [item["index"] for item in demoted],
     }
 
@@ -5361,11 +5396,75 @@ def _meta_contract_containers(event: Mapping[str, Any]) -> list[Mapping[str, Any
     return containers
 
 
+_META_ROUTE_AUTHORIZATION_CONTAINER_KEYS = {
+    "route_token",
+    "route_token_gate",
+    "route_token_gate_refusal",
+    "route_waiver",
+    "route_token_waiver",
+    "protected_route_waiver",
+}
+
+
+def _meta_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _meta_evidence_containers(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Containers that describe the evidence being appended, not its route auth."""
+
+    containers: list[Mapping[str, Any]] = [event]
+    for key in ("payload", "verification", "artifact_refs"):
+        nested = event.get(key)
+        if not isinstance(nested, Mapping):
+            continue
+        containers.append(nested)
+        for nested_key in (
+            "mf_subagent_dispatch_gate",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup_gate",
+            "startup_evidence",
+            "bounded_startup_evidence",
+            "mf_subagent_finish_gate",
+            "finish_gate",
+            "finish_gate_result",
+            "contract_evidence",
+            "qa_evidence_gate_review",
+            "architecture_review_lane",
+            "architecture_review",
+        ):
+            if nested_key in _META_ROUTE_AUTHORIZATION_CONTAINER_KEYS:
+                continue
+            child = nested.get(nested_key)
+            if isinstance(child, Mapping):
+                containers.append(child)
+            for item in _meta_list(child):
+                if isinstance(item, Mapping):
+                    containers.append(item)
+    return containers
+
+
 def _meta_first_string(
     event: Mapping[str, Any],
     keys: Sequence[str],
 ) -> str:
     for container in _meta_contract_containers(event):
+        for key in keys:
+            token = _string(container.get(key))
+            if token:
+                return token
+    return ""
+
+
+def _meta_first_evidence_string(
+    event: Mapping[str, Any],
+    keys: Sequence[str],
+) -> str:
+    for container in _meta_evidence_containers(event):
         for key in keys:
             token = _string(container.get(key))
             if token:
@@ -5398,8 +5497,24 @@ def _meta_event_markers(event: Mapping[str, Any]) -> list[str]:
     return _dedupe_strings(markers)
 
 
+def _meta_generic_verification_is_qa(event: Mapping[str, Any]) -> bool:
+    actor_role = _meta_normalize_role(event.get("actor"))
+    if actor_role == "qa":
+        return True
+    for key in ("reviewer_role", "qa_role", "verifier_role", "lane_role", "role"):
+        if _meta_normalize_role(_meta_first_evidence_string(event, (key,))) == "qa":
+            return True
+    return False
+
+
 def _meta_action_from_event(event: Mapping[str, Any]) -> str:
     for marker in _meta_event_markers(event):
+        if marker == "verification":
+            return (
+                "qa_verification"
+                if _meta_generic_verification_is_qa(event)
+                else "observer_command"
+            )
         if marker in _META_ACTION_ALIASES:
             return _META_ACTION_ALIASES[marker]
         if "work_mode_transition" in marker:
@@ -5454,6 +5569,43 @@ def _meta_normalize_role(value: Any) -> str:
     return role
 
 
+_META_WORKER_AUTHORED_ACTIONS = {
+    "implementation",
+    "mf_subagent_startup",
+    "read_receipt",
+    "review_ready",
+    "record_finish_time_worker_attestation",
+    "worker_progress",
+    "patch",
+}
+_META_QA_ACTIONS = {"independent_verification", "qa_verification", "qa_review"}
+
+
+def _meta_worker_evidence_present(event: Mapping[str, Any]) -> bool:
+    for container in _meta_evidence_containers(event):
+        for key in (
+            "worker_id",
+            "worker_slot_id",
+            "agent_id",
+            "runtime_context_id",
+            "mf_subagent_startup_gate",
+            "mf_subagent_finish_gate",
+            "read_receipt_hash",
+            "launch_text_hash",
+        ):
+            value = container.get(key)
+            if isinstance(value, Mapping) or _string(value):
+                return True
+    return False
+
+
+def _meta_explicit_qa_marker(event: Mapping[str, Any]) -> bool:
+    for marker in _meta_event_markers(event):
+        if marker.startswith("qa_") or "independent_verification" in marker:
+            return True
+    return False
+
+
 def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
     actor = _normalized_action(event.get("actor"))
     if actor.startswith("observer_on_behalf_of"):
@@ -5473,24 +5625,33 @@ def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
         "patch",
     }:
         for key in ("worker_role", "lane_role", "actor_role", "role", "caller_role"):
-            role = _meta_normalize_role(_meta_first_string(event, (key,)))
+            role = _meta_normalize_role(_meta_first_evidence_string(event, (key,)))
             if role:
                 return role
+        if _meta_worker_evidence_present(event):
+            return MF_SUB_ROLE
+
+    if action == "dispatch_bounded_worker":
+        return actor_role or OBSERVER_COORDINATOR_ROLE
+
+    if action in _META_QA_ACTIONS:
+        for key in ("reviewer_role", "qa_role", "verifier_role", "lane_role", "role"):
+            role = _meta_normalize_role(_meta_first_evidence_string(event, (key,)))
+            if role == "qa":
+                return "qa"
+        reviewer = _meta_first_evidence_string(
+            event,
+            ("reviewer", "reviewer_id", "reviewer_identity", "qa_reviewer"),
+        )
+        if reviewer or _meta_explicit_qa_marker(event):
+            return "qa"
+        return actor_role or OBSERVER_COORDINATOR_ROLE
 
     for key in ("caller_role", "role", "worker_role", "actor_role", "lane_role"):
-        role = _meta_normalize_role(_meta_first_string(event, (key,)))
+        role = _meta_normalize_role(_meta_first_evidence_string(event, (key,)))
         if role:
             return role
-    if action in {"independent_verification", "qa_verification", "qa_review"}:
-        return "qa"
-    if action in {
-        "implementation",
-        "mf_subagent_startup",
-        "read_receipt",
-        "review_ready",
-        "worker_progress",
-        "patch",
-    }:
+    if action in _META_WORKER_AUTHORED_ACTIONS:
         return MF_SUB_ROLE
     if action == "forbidden_attempt_recorded" and actor_role not in {
         OBSERVER_COORDINATOR_ROLE,

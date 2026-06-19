@@ -695,25 +695,128 @@ def _git_private_dir_for_worktree(worktree_path: Path) -> Path | None:
 def _observer_runtime_text_prepare_persistable_payload(
     prepared: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return scratch-safe runtime-text payload without raw launch text."""
+    """Return scratch-safe runtime-text payload without raw launch or tokens."""
 
     launch_text_hash = str(prepared.get("launch_text_hash") or "")
+
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    def _secret_placeholder(env_name: str, *, usage: str = "submission") -> str:
+        return f"<read from env:{env_name} at {usage} time>"
+
+    def _looks_like_placeholder(value: Any) -> bool:
+        return str(value or "").strip().startswith("<read from env:")
+
+    raw_launch_text = str(prepared.get("launch_text") or "")
+    raw_fence_values: set[str] = set()
+    raw_session_values: set[str] = set()
+
+    def collect_raw_secrets(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                key_text = str(key)
+                nested_text = str(nested or "").strip()
+                if (
+                    key_text == "fence_token"
+                    and nested_text
+                    and not _looks_like_placeholder(nested_text)
+                ):
+                    raw_fence_values.add(nested_text)
+                elif (
+                    key_text == "session_token"
+                    and nested_text
+                    and not _looks_like_placeholder(nested_text)
+                ):
+                    raw_session_values.add(nested_text)
+                collect_raw_secrets(nested)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_raw_secrets(item)
+
+    collect_raw_secrets(prepared)
+
+    def scrub_text(value: str) -> str:
+        text = str(value or "")
+        if raw_launch_text and text == raw_launch_text:
+            return "<redacted:launch_text>"
+        for secret in sorted(raw_fence_values, key=len, reverse=True):
+            if not secret:
+                continue
+            replacement = runtime_context_secret_hash(secret)
+            if text == secret:
+                return replacement
+            if secret in text:
+                text = text.replace(secret, replacement)
+        for secret in sorted(raw_session_values, key=len, reverse=True):
+            if not secret:
+                continue
+            replacement = _secret_placeholder("AMING_WORKER_SESSION_TOKEN")
+            if text == secret:
+                return replacement
+            if secret in text:
+                text = text.replace(secret, replacement)
+        return text
 
     def scrub(value: Any) -> Any:
         if isinstance(value, Mapping):
             result: dict[str, Any] = {}
             for key, nested in value.items():
-                if key == "launch_text":
+                key_text = str(key)
+                if key_text == "launch_text":
                     result["launch_text_redacted"] = True
                     if launch_text_hash and not result.get("launch_text_hash"):
                         result["launch_text_hash"] = launch_text_hash
                     continue
-                result[str(key)] = scrub(nested)
+                if key_text == "session_token":
+                    if _looks_like_placeholder(nested):
+                        result["session_token"] = str(nested or "").strip()
+                    result["session_token_env"] = str(
+                        value.get("session_token_env") or "AMING_WORKER_SESSION_TOKEN"
+                    )
+                    result["session_token_redacted"] = True
+                    result["raw_session_token_persisted"] = False
+                    continue
+                if key_text == "fence_token":
+                    fence_text = str(nested or "").strip()
+                    if _looks_like_placeholder(fence_text):
+                        result["fence_token"] = fence_text
+                        result["fence_token_redacted"] = True
+                        result["raw_fence_token_persisted"] = False
+                    else:
+                        fence_hash = runtime_context_secret_hash(fence_text)
+                        if fence_hash:
+                            result["fence_token_hash"] = fence_hash
+                        result["fence_token_redacted"] = bool(fence_hash)
+                        result["raw_fence_token_persisted"] = False
+                    result["fence_token_env"] = str(
+                        value.get("fence_token_env") or "AMING_WORKER_FENCE_TOKEN"
+                    )
+                    continue
+                if key_text in {"env", "env_additions", "env_template"} and isinstance(
+                    nested,
+                    Mapping,
+                ):
+                    redacted_env = dict(scrub(nested))
+                    if "AMING_WORKER_SESSION_TOKEN" in redacted_env:
+                        redacted_env["AMING_WORKER_SESSION_TOKEN"] = _secret_placeholder(
+                            "AMING_WORKER_SESSION_TOKEN",
+                            usage="launch",
+                        )
+                    if "AMING_WORKER_FENCE_TOKEN" in redacted_env:
+                        redacted_env["AMING_WORKER_FENCE_TOKEN"] = _secret_placeholder(
+                            "AMING_WORKER_FENCE_TOKEN",
+                            usage="launch",
+                        )
+                    result[key_text] = redacted_env
+                    continue
+                result[key_text] = scrub(nested)
             return result
         if isinstance(value, list):
             return [scrub(item) for item in value]
         if isinstance(value, tuple):
             return [scrub(item) for item in value]
+        if isinstance(value, str):
+            return scrub_text(value)
         return value
 
     payload = scrub(prepared)
@@ -836,6 +939,7 @@ def _persist_worker_launch_bridge(prepared: Mapping[str, Any]) -> dict[str, Any]
         },
         "raw_launch_text_persisted": False,
     }
+    payload = _observer_runtime_text_prepare_persistable_payload(payload)
     raw = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2379,7 +2483,12 @@ def _build_observer_repair_run_plan_from_body(
                     _row_get(row, "chain_trigger_json", "{}")
                 )
                 contract = _mf_close_contract_with_route_context(contract, row, {})
-                verification = _mf_close_gate_verification(events, contract=contract)
+                verification = _mf_close_gate_verification(
+                    events,
+                    contract=contract,
+                    conn=conn,
+                    project_id=project_id,
+                )
             else:
                 verification = {"passed": True, "missing_event_kinds": []}
             timeline_prechecks.append(
@@ -8726,6 +8835,146 @@ def _runtime_context_implementation_event_route_identity(
     }
 
 
+def _runtime_context_implementation_observer_command_id(
+    body: Mapping[str, Any],
+    *,
+    context,
+    runtime_context_id: str,
+    revision_payload: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    event_candidates: list[Mapping[str, Any]] = []
+    preferred_kinds = (
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "mf_subagent_finish_gate",
+        "worker_progress",
+        "close_ready",
+    )
+    for kind in preferred_kinds:
+        for raw in reversed(list(timeline_events or ())):
+            event = raw if isinstance(raw, Mapping) else {}
+            if str(event.get("event_kind") or "").strip() != kind:
+                continue
+            event_runtime_context_id = _timeline_first_deep_text(
+                event,
+                "runtime_context_id",
+            )
+            event_task_id = (
+                str(event.get("task_id") or "").strip()
+                or _timeline_first_deep_text(event, "task_id")
+            )
+            if runtime_context_id and event_runtime_context_id == runtime_context_id:
+                event_candidates.append(event)
+                continue
+            if task_id and event_task_id == task_id:
+                event_candidates.append(event)
+    candidates = (
+        revision_payload,
+        getattr(context, "startup_gate", {}),
+        getattr(context, "dispatch", {}),
+        *event_candidates,
+        body,
+        body.get("payload") if isinstance(body.get("payload"), Mapping) else {},
+    )
+    for source in candidates:
+        command = _timeline_first_deep_text(source, "observer_command_id")
+        if command:
+            return command
+    return ""
+
+
+def _runtime_context_implementation_fence_hash(
+    ctx: RequestContext,
+    *,
+    context,
+    body: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> str:
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    supplied_hash = (
+        str(body.get("fence_token_hash") or "").strip()
+        or _timeline_first_deep_text(payload, "fence_token_hash")
+    )
+    if supplied_hash:
+        return supplied_hash
+    raw_fence = (
+        _runtime_context_request_value(ctx, "fence_token")
+        or _timeline_first_deep_text(payload, "fence_token")
+        or str(getattr(context, "fence_token", "") or "").strip()
+    )
+    return runtime_context_secret_hash(raw_fence)
+
+
+def _runtime_context_scrub_implementation_payload(
+    value: Any,
+    *,
+    raw_fence_token: str,
+    fence_token_hash: str,
+    raw_session_token: str,
+) -> Any:
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, nested in value.items():
+            key_text = str(key)
+            if key_text == "fence_token":
+                nested_hash = fence_token_hash
+                nested_text = str(nested or "").strip()
+                if nested_text and not nested_hash:
+                    from .parallel_branch_runtime import runtime_context_secret_hash
+
+                    nested_hash = runtime_context_secret_hash(nested_text)
+                if nested_hash and not result.get("fence_token_hash"):
+                    result["fence_token_hash"] = nested_hash
+                result["fence_token_redacted"] = bool(nested_hash)
+                result["raw_fence_token_persisted"] = False
+                continue
+            if key_text == "session_token":
+                result["session_token_env"] = "AMING_WORKER_SESSION_TOKEN"
+                result["raw_session_token_persisted"] = False
+                continue
+            result[key_text] = _runtime_context_scrub_implementation_payload(
+                nested,
+                raw_fence_token=raw_fence_token,
+                fence_token_hash=fence_token_hash,
+                raw_session_token=raw_session_token,
+            )
+        return result
+    if isinstance(value, list):
+        return [
+            _runtime_context_scrub_implementation_payload(
+                item,
+                raw_fence_token=raw_fence_token,
+                fence_token_hash=fence_token_hash,
+                raw_session_token=raw_session_token,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _runtime_context_scrub_implementation_payload(
+                item,
+                raw_fence_token=raw_fence_token,
+                fence_token_hash=fence_token_hash,
+                raw_session_token=raw_session_token,
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        text = value
+        if raw_fence_token and raw_fence_token in text:
+            text = text.replace(raw_fence_token, fence_token_hash)
+        if raw_session_token and raw_session_token in text:
+            text = text.replace(
+                raw_session_token,
+                "<read from env:AMING_WORKER_SESSION_TOKEN at submission time>",
+            )
+        return text
+    return value
+
+
 def _runtime_context_forward_request(
     ctx: RequestContext,
     *,
@@ -9546,11 +9795,50 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
     )
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
+    raw_session_token = _runtime_context_request_value(ctx, "session_token")
+    fence_token_hash = runtime_context_secret_hash(
+        raw_fence_token or getattr(context, "fence_token", "")
+    )
+
+    def _scrub_receipt_payload(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            for key, nested in value.items():
+                key_text = str(key)
+                if key_text in {"fence_token", "session_token"}:
+                    continue
+                result[key_text] = _scrub_receipt_payload(nested)
+            return result
+        if isinstance(value, list):
+            return [_scrub_receipt_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return [_scrub_receipt_payload(item) for item in value]
+        if isinstance(value, str):
+            text = value
+            if raw_fence_token and raw_fence_token in text:
+                text = text.replace(raw_fence_token, fence_token_hash)
+            if raw_session_token and raw_session_token in text:
+                text = text.replace(
+                    raw_session_token,
+                    "<read from env:AMING_WORKER_SESSION_TOKEN at submission time>",
+                )
+            return text
+        return value
+
+    payload = _scrub_receipt_payload(payload)
     for key, value in {
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
-        "fence_token": _runtime_context_request_value(ctx, "fence_token"),
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(fence_token_hash),
+        "fence_token_env": str(body.get("fence_token_env") or "AMING_WORKER_FENCE_TOKEN"),
+        "session_token_env": str(body.get("session_token_env") or "AMING_WORKER_SESSION_TOKEN"),
+        "raw_fence_token_persisted": False,
+        "raw_session_token_persisted": False,
         "worker_role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
@@ -9560,6 +9848,9 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
     }.items():
         if value:
             payload[key] = value
+    payload["raw_fence_token_persisted"] = False
+    payload["raw_session_token_persisted"] = False
+    payload["fence_token_redacted"] = bool(fence_token_hash)
     for key in (
         "route_id",
         "route_context_hash",
@@ -10258,6 +10549,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             allow_validated=True,
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
+        revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
+        from . import task_timeline
+
+        timeline_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=getattr(context, "backlog_id", ""),
+            limit=1000,
+        )
     finally:
         conn.close()
     event_route_identity, route_lineage_payload = (
@@ -10273,6 +10573,20 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
     )
     payload = _strip_top_level_timeline_role_fields(supplied_payload)
+    raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
+    raw_session_token = _runtime_context_request_value(ctx, "session_token")
+    fence_token_hash = _runtime_context_implementation_fence_hash(
+        ctx,
+        context=context,
+        body=body,
+        payload=payload,
+    )
+    payload = _runtime_context_scrub_implementation_payload(
+        payload,
+        raw_fence_token=raw_fence_token,
+        fence_token_hash=fence_token_hash,
+        raw_session_token=raw_session_token,
+    )
     for key, value in route_lineage_payload.items():
         if value:
             payload[key] = value
@@ -10280,10 +10594,22 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
     )
+    observer_command_id = _runtime_context_implementation_observer_command_id(
+        body,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        revision_payload=revision_payload,
+        timeline_events=timeline_events,
+    )
     for key, value in {
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
+        "observer_command_id": observer_command_id,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_fence_token_persisted": False,
+        "raw_session_token_persisted": False,
         "worker_role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
@@ -10294,6 +10620,9 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     }.items():
         if value:
             payload[key] = value
+    payload["raw_fence_token_persisted"] = False
+    payload["raw_session_token_persisted"] = False
+    payload["fence_token_redacted"] = bool(fence_token_hash)
     for key in (
         "route_id",
         "route_context_hash",
@@ -23906,13 +24235,26 @@ def _timeline_event_has_action_scope_verification_marker(
     return bool(
         tokens.intersection(
             {
+                "bounded_implementation_worker_dispatch",
+                "close_ready",
+                "dispatch_bounded_worker",
+                "finish_gate",
+                "implementation",
                 "independent_verification",
                 "independent_verification_lane",
                 "independent_qa",
+                "mf_subagent_dispatch",
+                "mf_subagent_dispatch_gate",
+                "mf_subagent_finish_gate",
+                "mf_subagent_startup",
+                "mf_subagent_startup_adoption",
+                "mf_subagent_startup_adoption_gate",
+                "mf_subagent_startup_gate",
                 "qa",
                 "qa_lane",
                 "qa_review",
                 "qa_verification",
+                "verification",
             }
         )
     )
@@ -23931,6 +24273,45 @@ def _route_gate_lineage_mapping(
         if isinstance(nested, Mapping):
             return dict(nested)
     return {}
+
+
+def _deep_route_public_text(value: Any, field: str) -> str:
+    if isinstance(value, Mapping):
+        if field in value and str(value.get(field) or "").strip():
+            return str(value.get(field) or "").strip()
+        for key, child in value.items():
+            if key in _ROUTE_ACTION_SCOPE_LINEAGE_KEYS:
+                continue
+            found = _deep_route_public_text(child, field)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _deep_route_public_text(item, field)
+            if found:
+                return found
+    return ""
+
+
+def _route_request_identity_value(body: Mapping[str, Any], field: str) -> str:
+    if not isinstance(body, Mapping):
+        return ""
+    direct = str(body.get(field) or "").strip()
+    if direct:
+        return direct
+    for key in ("payload", "verification", "artifact_refs"):
+        value = body.get(key)
+        if isinstance(value, Mapping):
+            found = _deep_route_public_text(
+                _strip_route_action_scope_lineage_value(value),
+                field,
+            )
+            if found:
+                return found
+    route_identity = body.get("route_identity")
+    if isinstance(route_identity, Mapping):
+        return str(route_identity.get(field) or "").strip()
+    return ""
 
 
 def _server_route_action_scope_lineage(
@@ -24001,6 +24382,7 @@ def _resolve_route_token_ref_server_side(
     task_id: str = "",
     route_id: str = "",
     route_context_hash: str = "",
+    prompt_contract_id: str = "",
 ) -> dict | None:
     """Attempt server-side resolution of a route_token_ref in the request body.
 
@@ -24046,6 +24428,7 @@ def _resolve_route_token_ref_server_side(
             task_id=task_id,
             route_id=route_id,
             route_context_hash=route_context_hash,
+            prompt_contract_id=prompt_contract_id,
         )
     finally:
         try:
@@ -24148,11 +24531,16 @@ def _require_route_token_mutation_gate(
     # forward them into the resolution call so that identity-binding checks are
     # actually enforced.  An identity-mismatched ref will raise RouteTokenRefError
     # (fail closed) instead of silently skipping the check.
-    _req_route_id = str(body.get("route_id") or "").strip()
-    _req_route_context_hash = str(body.get("route_context_hash") or "").strip()
-    _req_prompt_contract_id = str(body.get("prompt_contract_id") or "").strip()
     # Also check nested route_token / route_waiver structures for the fields.
     _rt_scope = body.get("route_token") if isinstance(body.get("route_token"), dict) else {}
+    if _rt_scope:
+        _req_route_id = str(_rt_scope.get("route_id") or "").strip()
+        _req_route_context_hash = str(_rt_scope.get("route_context_hash") or "").strip()
+        _req_prompt_contract_id = str(_rt_scope.get("prompt_contract_id") or "").strip()
+    else:
+        _req_route_id = _route_request_identity_value(body, "route_id")
+        _req_route_context_hash = _route_request_identity_value(body, "route_context_hash")
+        _req_prompt_contract_id = _route_request_identity_value(body, "prompt_contract_id")
     if not _req_route_id:
         _req_route_id = str(_rt_scope.get("route_id") or "").strip()
     if not _req_route_context_hash:
@@ -24180,6 +24568,7 @@ def _require_route_token_mutation_gate(
                 task_id=task_id,
                 route_id=_req_route_id,
                 route_context_hash=_req_route_context_hash,
+                prompt_contract_id=_req_prompt_contract_id,
             )
             if resolved is not None:
                 resolved_from_ref = True
@@ -26695,7 +27084,12 @@ def _observer_root_route_context_state(
         events, contract=contract
     )
     route_identity = route_context_gate.get("route_identity") or {}
-    close_gate = _mf_close_gate_verification(events, contract=contract)
+    close_gate = _mf_close_gate_verification(
+        events,
+        contract=contract,
+        conn=conn,
+        project_id=project_id,
+    )
 
     # Graph query_schema trace id: if the caller supplied a plausible trace id
     # (a fresh session that already ran query_schema passes its own gqt-* id),
@@ -28430,6 +28824,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         if isinstance(prepared.get("next_legal_action"), Mapping)
         else {}
     )
+    executable_handoff_packet = (
+        prepared.get("executable_handoff_packet")
+        if isinstance(prepared.get("executable_handoff_packet"), Mapping)
+        else {}
+    )
     compact = {
         "ok": bool(prepared.get("ok")),
         "status": str(prepared.get("status") or ""),
@@ -28451,6 +28850,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "executable_worker_launch": dict(
             prepared.get("executable_worker_launch") or {}
         ),
+        "executable_handoff_packet": dict(executable_handoff_packet),
         "startup_alternatives": dict(prepared.get("startup_alternatives") or {}),
         "same_owner_session_token_startup": dict(
             prepared.get("same_owner_session_token_startup") or {}
@@ -28471,7 +28871,10 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
     }
     if revision:
         compact["runtime_contract_revision"] = revision
-    return compact
+    public_compact = _observer_runtime_text_prepare_persistable_payload(compact)
+    public_compact["launch_text"] = compact.get("launch_text")
+    public_compact["launch_text_protected_submission_body"] = True
+    return public_compact
 
 
 @route("POST", "/api/task/{project_id}/progress")
@@ -29990,7 +30393,11 @@ def _backlog_contract_summary(value: Any) -> dict:
 def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) -> dict[str, Any]:
     if not isinstance(recovery, Mapping):
         return {}
-    if str(recovery.get("classification") or "") != "target_session_recovery_required":
+    classification = str(recovery.get("classification") or "")
+    if classification not in {
+        "target_session_recovery_required",
+        "claimed_execute_missing_startup",
+    }:
         return {}
     blocker = recovery.get("blocker") if isinstance(recovery.get("blocker"), Mapping) else {}
     next_action = (
@@ -30018,7 +30425,8 @@ def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) ->
     return {
         "schema_version": "observer_command_recovery_projection.v1",
         "status": str(recovery.get("status") or ""),
-        "classification": str(recovery.get("classification") or ""),
+        "classification": classification,
+        "computed_status": str(recovery.get("computed_status") or ""),
         "blocked_command_id": str(
             recovery.get("blocked_command_id")
             or blocker.get("blocked_command_id")
@@ -30035,8 +30443,13 @@ def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) ->
             or blocker.get("target_session_status")
             or ""
         ),
+        "claimed_by_session_id": str(recovery.get("claimed_by_session_id") or ""),
+        "claimed_owner_status": str(recovery.get("claimed_owner_status") or ""),
+        "claimed_age_sec": recovery.get("claimed_age_sec"),
         "notified_age_sec": blocker.get("notified_age_sec"),
         "threshold_sec": recovery.get("threshold_sec"),
+        "timeout_sec": recovery.get("timeout_sec"),
+        "next_expected_evidence": str(recovery.get("next_expected_evidence") or ""),
         "affected_newer_notified_commands": safe_affected,
         "next_legal_action": {
             "tool": str(next_action.get("tool") or ""),
@@ -30045,6 +30458,11 @@ def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) ->
             "followup_tool": str(next_action.get("followup_tool") or ""),
             "command_id": str(next_action.get("command_id") or ""),
             "target_session_id": str(next_action.get("target_session_id") or ""),
+            "claimed_by_session_id": str(next_action.get("claimed_by_session_id") or ""),
+            "followup_sequence": [
+                str(item) for item in (next_action.get("followup_sequence") or [])
+            ],
+            "alternate_followup": str(next_action.get("alternate_followup") or ""),
             "requires_session_token": bool(next_action.get("requires_session_token")),
         },
     }
@@ -30113,7 +30531,11 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
             if not backlog_projection["command_projection_status"]:
                 backlog_projection["command_projection_status"] = recovery_projection["classification"]
             if not backlog_projection["divergence_reason"]:
-                backlog_projection["divergence_reason"] = "target_session_unavailable"
+                backlog_projection["divergence_reason"] = (
+                    "worker_startup_waiting"
+                    if recovery_projection["classification"] == "claimed_execute_missing_startup"
+                    else "target_session_unavailable"
+                )
         projections[backlog_id] = backlog_projection
     for bug in bugs:
         projection = projections.get(str(bug.get("bug_id") or "").strip())
@@ -30546,6 +30968,88 @@ def _current_task_timeline_candidate(
     return {}
 
 
+def _current_task_observer_command_recovery_candidate(conn, project_id: str) -> dict:
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id=project_id,
+    )
+    projection = _observer_command_recovery_projection(recovery)
+    if projection.get("classification") != "claimed_execute_missing_startup":
+        return {}
+    command_id = str(projection.get("blocked_command_id") or "").strip()
+    if not command_id:
+        return {}
+    command = observer_session.get_command(
+        conn,
+        project_id=project_id,
+        command_id=command_id,
+    )
+    if not command:
+        return {}
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    backlog_id = str(payload.get("backlog_id") or payload.get("bug_id") or "").strip()
+    if not backlog_id:
+        return {}
+    placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+    bug = conn.execute(
+        f"""SELECT rowid AS _rowid, * FROM backlog_bugs
+            WHERE bug_id = ?
+              AND UPPER(status) NOT IN ({placeholders})""",
+        [backlog_id, *_BACKLOG_CLOSED_STATUSES],
+    ).fetchone()
+    if not bug:
+        return {}
+    evidence_at = str(
+        command.get("claimed_at")
+        or command.get("notified_at")
+        or command.get("created_at")
+        or recovery.get("generated_at")
+        or ""
+    )
+    task_id = str(
+        payload.get("task_id")
+        or payload.get("parent_task_id")
+        or payload.get("backlog_id")
+        or command_id
+    )
+    command_projection = {
+        "schema_version": "observer_command_backlog_projection.v1",
+        "source_of_truth": "ObserverCommand/RecoveryProjection",
+        "command_id": command_id,
+        "command_status": str(command.get("status") or ""),
+        "command_error": str(command.get("error") or ""),
+        "projection": {},
+        "canonical_contract_state": str(command.get("canonical_contract_state") or ""),
+        "command_projection_status": str(projection.get("classification") or ""),
+        "divergence_reason": "worker_startup_waiting",
+        "canonical_route_identity": command.get("canonical_route_identity", {}),
+        "superseded_route_identity": command.get("superseded_route_identity", {}),
+        "terminal_evidence_refs": command.get("terminal_evidence_refs", []),
+        "recovery": projection,
+    }
+    return {
+        "source": "observer_command_recovery",
+        "bug": bug,
+        "task_id": task_id,
+        "latest_event": {
+            "id": 0,
+            "event_type": "observer_command_recovery",
+            "event_kind": str(projection.get("classification") or ""),
+            "phase": str(projection.get("computed_status") or ""),
+            "status": str(projection.get("status") or ""),
+            "task_id": task_id,
+            "backlog_id": backlog_id,
+            "actor": str(projection.get("claimed_by_session_id") or ""),
+            "created_at": evidence_at,
+            "payload": projection,
+        },
+        "evidence_at": evidence_at,
+        "event_id": 0,
+        "rowid": int(_row_get(bug, "_rowid", 0) or 0),
+        "observer_command_projection": command_projection,
+    }
+
+
 # TTL for aging out zero-event candidates with no live heartbeat.
 # Candidates whose only timestamp is a backlog-row updated_at older than
 # this threshold AND whose timeline event count is 0 are excluded from the
@@ -30583,6 +31087,8 @@ def _current_task_candidate_is_aged_out(candidate: Mapping[str, Any], event_coun
     - Its evidence_at timestamp is parseable and older than the TTL.
     The TTL can be overridden via AMING_CURRENT_TASK_ZERO_EVENT_STALE_TTL_SECS.
     """
+    if str(candidate.get("source") or "") == "observer_command_recovery":
+        return False
     if event_count > 0:
         return False
     evidence_at = str(candidate.get("evidence_at") or "").strip()
@@ -30650,6 +31156,15 @@ def _current_task_runtime_candidates(rows: list[sqlite3.Row]) -> list[dict]:
     return candidates
 
 
+def _current_task_candidate_compact_bug(candidate: Mapping[str, Any]) -> dict:
+    bug = candidate.get("bug")
+    compact = _backlog_compact_bug(bug) if bug is not None else {}
+    projection = candidate.get("observer_command_projection")
+    if isinstance(projection, Mapping):
+        compact["observer_command_projection"] = dict(projection)
+    return compact
+
+
 def _current_task_candidate_sort_key(
     candidate: Mapping[str, Any],
     event_counts: dict[str, int] | None = None,
@@ -30704,7 +31219,7 @@ def _current_task_active_backlog(
         if not bug_id or bug_id in seen:
             continue
         seen.add(bug_id)
-        active.append(_backlog_compact_bug(bug))
+        active.append(_current_task_candidate_compact_bug(candidate))
     return active
 
 
@@ -30731,6 +31246,9 @@ def handle_backlog_current_task(ctx: RequestContext):
         timeline_candidate = _current_task_timeline_candidate(conn, pid, limit)
         if timeline_candidate:
             all_candidates.append(timeline_candidate)
+        recovery_candidate = _current_task_observer_command_recovery_candidate(conn, pid)
+        if recovery_candidate:
+            all_candidates.append(recovery_candidate)
 
         if not all_candidates:
             return {
@@ -30777,6 +31295,12 @@ def handle_backlog_current_task(ctx: RequestContext):
         primary_bug = primary["bug"]
         active_rows = _current_task_active_backlog(bindable, primary, event_counts)
         competing = _current_task_competing_candidates_metadata(bindable, event_counts)
+        observer_command_projection = (
+            primary.get("observer_command_projection")
+            if isinstance(primary.get("observer_command_projection"), Mapping)
+            else {}
+        )
+        primary_bug_payload = _current_task_candidate_compact_bug(primary)
         return {
             "ok": True,
             "project_id": pid,
@@ -30784,10 +31308,16 @@ def handle_backlog_current_task(ctx: RequestContext):
             "source": primary["source"],
             "backlog_id": _row_get(primary_bug, "bug_id", ""),
             "task_id": str(primary.get("task_id") or ""),
-            "bug": _backlog_compact_bug(primary_bug),
+            "bug": primary_bug_payload,
             "active_backlog": active_rows,
             "active_count": len(active_rows),
             "latest_event": _current_task_event_summary(primary.get("latest_event")),
+            "observer_command_projection": dict(observer_command_projection),
+            "observer_command_recovery": dict(
+                observer_command_projection.get("recovery")
+                if isinstance(observer_command_projection.get("recovery"), Mapping)
+                else {}
+            ),
             "governance_policy": policy,
             "single_active_task": _single_active_task_summary(policy, len(active_rows)),
             "competing_candidates": competing,
@@ -30854,7 +31384,12 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         if applicable["is_mf"]:
             contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
             contract = _mf_close_contract_with_route_context(contract, row, ctx.query)
-            verification = _mf_close_gate_verification(events, contract=contract)
+            verification = _mf_close_gate_verification(
+                events,
+                contract=contract,
+                conn=conn,
+                project_id=pid,
+            )
         else:
             repair_reason = {
                 "code": "timeline_gate_not_applicable",
@@ -32552,6 +33087,27 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
             "bypass_timeline_gate": True,
             "reason": reason,
         }
+        if not reason:
+            task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                backlog_id=bug_id,
+                event_type="mf_timeline_gate_bypass_rejected",
+                phase="close",
+                event_kind="mf_timeline_gate_bypass_rejected",
+                actor=str(body.get("actor") or "observer"),
+                status="rejected",
+                payload={"bypass_timeline_gate": True, "reason": reason},
+                verification=verification,
+                commit_sha=str(body.get("commit") or ""),
+            )
+            conn.commit()
+            raise GovernanceError(
+                "mf_timeline_bypass_reason_required",
+                "bypass_timeline_gate requires timeline_bypass_reason",
+                422,
+                verification,
+            )
         task_timeline.record_event(
             conn,
             project_id=project_id,
@@ -32576,7 +33132,12 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
     contract = _mf_close_contract_with_route_context(contract, row, body)
-    verification = _mf_close_gate_verification(events, contract=contract)
+    verification = _mf_close_gate_verification(
+        events,
+        contract=contract,
+        conn=conn,
+        project_id=project_id,
+    )
     if not verification.get("passed"):
         missing_event_kinds = verification.get("missing_event_kinds") or []
         contract_gate = verification.get("contract_gate") if isinstance(verification.get("contract_gate"), dict) else {}
@@ -32609,11 +33170,253 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
     return verification
 
 
-def _mf_close_gate_verification(events: list[dict] | None, contract: dict | None = None) -> dict:
+def _event_route_token_ref(event: Mapping[str, Any]) -> str:
+    return (
+        str(event.get("route_token_ref") or "").strip()
+        or _route_request_identity_value(event, "route_token_ref")
+    )
+
+
+def _route_gate_from_resolved_ref(
+    resolved: Mapping[str, Any],
+    *,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    allowed_actions = [
+        str(item or "").strip()
+        for item in (resolved.get("allowed_actions") or [])
+        if str(item or "").strip()
+    ]
+    gate = {
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "accepted": True,
+        "status": "passed",
+        "decision": "route_token_ref_resolved",
+        "action": "task_timeline_append",
+        "route_token_ref": route_token_ref,
+        "resolved_from_ref": True,
+        "server_issued_binding": True,
+        "registry_verified": True,
+        "binding_source": "observer_route_token_refs",
+        "route_id": str(resolved.get("route_id") or ""),
+        "route_context_hash": str(resolved.get("route_context_hash") or ""),
+        "prompt_contract_id": str(resolved.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(resolved.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            resolved.get("visible_injection_manifest_hash") or ""
+        ),
+        "allowed_actions": allowed_actions,
+        "scope": resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {},
+    }
+    for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
+        value = resolved.get(key)
+        if isinstance(value, Mapping):
+            gate[key] = dict(value)
+    return gate
+
+
+def _route_lineage_enrichment_event_ref(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+    }
+
+
+def _enrich_timeline_events_with_route_token_lineage(
+    conn,
+    *,
+    project_id: str,
+    events: list[dict],
+) -> tuple[list[dict], dict[str, Any]]:
+    from . import observer_route_context as _orc
     from . import task_timeline
 
+    rows = events if isinstance(events, list) else []
+    if conn is None or not project_id:
+        return rows, {
+            "schema_version": "server_route_lineage_enrichment.v1",
+            "attempted_event_count": 0,
+            "enriched_event_count": 0,
+            "skipped_reason": "registry_unavailable",
+        }
+
+    enriched_rows: list[dict] = []
+    enriched_events: list[dict[str, Any]] = []
+    failed_events: list[dict[str, Any]] = []
+    attempted = 0
+    for raw in rows:
+        event = dict(raw) if isinstance(raw, Mapping) else raw
+        if not isinstance(event, dict):
+            enriched_rows.append(event)
+            continue
+        if not task_timeline.is_protected_close_evidence(event):
+            enriched_rows.append(event)
+            continue
+        stripped = _strip_route_action_scope_lineage_value(event)
+        event = dict(stripped) if isinstance(stripped, Mapping) else dict(event)
+        route_token_ref = _event_route_token_ref(event)
+        if not route_token_ref:
+            enriched_rows.append(event)
+            continue
+        attempted += 1
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        payload = dict(payload)
+        event_ref = _route_lineage_enrichment_event_ref(event)
+        route_id = _route_request_identity_value(event, "route_id")
+        route_context_hash = _route_request_identity_value(event, "route_context_hash")
+        prompt_contract_id = _route_request_identity_value(event, "prompt_contract_id")
+        missing_identity = [
+            field
+            for field, value in (
+                ("route_id", route_id),
+                ("route_context_hash", route_context_hash),
+                ("prompt_contract_id", prompt_contract_id),
+            )
+            if not value
+        ]
+        if missing_identity:
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "failed",
+                "reason": "missing_child_route_identity",
+                "missing_fields": missing_identity,
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            failed_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+                "reason": "missing_child_route_identity",
+                "missing_fields": missing_identity,
+            })
+            enriched_rows.append(event)
+            continue
+        try:
+            resolved = _orc.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+                backlog_id=str(event.get("backlog_id") or ""),
+                task_id=str(event.get("task_id") or ""),
+                route_id=route_id,
+                route_context_hash=route_context_hash,
+                prompt_contract_id=prompt_contract_id,
+            )
+        except _orc.RouteTokenRefError as exc:
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "failed",
+                "reason": str(exc),
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            failed_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+                "reason": str(exc),
+            })
+            enriched_rows.append(event)
+            continue
+        if not resolved:
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "failed",
+                "reason": "route_token_ref_unknown",
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            failed_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+                "reason": "route_token_ref_unknown",
+            })
+            enriched_rows.append(event)
+            continue
+        allowed_actions = {
+            str(item or "").strip()
+            for item in (resolved.get("allowed_actions") or [])
+            if str(item or "").strip()
+        }
+        if "task_timeline_append" not in allowed_actions:
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "failed",
+                "reason": "route_token_ref_action_not_allowed",
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            failed_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+                "reason": "route_token_ref_action_not_allowed",
+            })
+            enriched_rows.append(event)
+            continue
+        route_gate = _route_gate_from_resolved_ref(
+            resolved,
+            route_token_ref=route_token_ref,
+        )
+        payload["route_token_gate"] = _route_gate_public_summary(route_gate)
+        event["payload"] = payload
+        lineage = _server_route_action_scope_lineage(event, event, route_gate)
+        if lineage:
+            lineage = dict(lineage)
+            lineage["projected_by"] = "server_timeline_precheck_enrichment"
+            payload["route_action_scope_lineage"] = lineage
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "passed",
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            enriched_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+            })
+        else:
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "failed",
+                "reason": "registry_lineage_incomplete",
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            failed_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+                "reason": "registry_lineage_incomplete",
+            })
+        enriched_rows.append(event)
+
+    return enriched_rows, {
+        "schema_version": "server_route_lineage_enrichment.v1",
+        "attempted_event_count": attempted,
+        "enriched_event_count": len(enriched_events),
+        "failed_event_count": len(failed_events),
+        "enriched_events": enriched_events,
+        "failed_events": failed_events,
+    }
+
+
+def _mf_close_gate_verification(
+    events: list[dict] | None,
+    contract: dict | None = None,
+    *,
+    conn=None,
+    project_id: str = "",
+) -> dict:
+    from . import task_timeline
+
+    enriched_events, enrichment = _enrich_timeline_events_with_route_token_lineage(
+        conn,
+        project_id=project_id,
+        events=events or [],
+    )
     verification = task_timeline.mf_close_gate_verification(
-        events or [],
+        enriched_events,
         contract=contract,
     )
     startup_gate = verification.get("close_timeline_startup_gate")
@@ -32628,6 +33431,9 @@ def _mf_close_gate_verification(events: list[dict] | None, contract: dict | None
             startup_gate.get("passed")
         )
         verification["checks"] = checks
+    if enrichment.get("attempted_event_count"):
+        verification = dict(verification)
+        verification["server_route_lineage_enrichment"] = enrichment
     return verification
 
 

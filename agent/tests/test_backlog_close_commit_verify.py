@@ -600,7 +600,7 @@ def test_mf_close_rejects_route_waiver_identity_mismatch_before_status_update(
 
 @patch("agent.governance.server.subprocess.run")
 def test_mf_close_timeline_gate_explicit_bypass_requires_reason(_mock_subprocess, _mock_db, _mock_audit):
-    """Emergency bypass is explicit and records timeline evidence."""
+    """Timeline bypass is forbidden even for system_recovery rows."""
     from agent.governance.errors import GovernanceError
     from agent.governance.server import handle_backlog_close
 
@@ -622,9 +622,8 @@ def test_mf_close_timeline_gate_explicit_bypass_requires_reason(_mock_subprocess
 
     ctx.body["timeline_bypass_reason"] = "system recovery bootstrap could not write normal timeline"
     with patch("agent.governance.task_timeline.record_event") as record_event:
-        result = handle_backlog_close(ctx)
+        with pytest.raises(GovernanceError) as forbidden:
+            handle_backlog_close(ctx)
 
-    assert result["ok"] is True
-    assert result["gate_summary"]["ok"] is True
-    assert result["gate_summary"]["can_close"] is True
-    assert record_event.call_count == 2
+    assert forbidden.value.code == "mf_timeline_bypass_forbidden"
+    assert record_event.call_count == 1

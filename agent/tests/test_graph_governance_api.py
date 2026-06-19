@@ -2127,6 +2127,8 @@ def test_parallel_branch_allocate_blocks_same_owner_token_for_identity_mismatch(
 
 
 def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(conn, tmp_path):
+    raw_fence_token = "fence-runtime-text-api"
+    raw_session_token = "runtime-text-session-secret"
     worktree = tmp_path / "worker"
     worktree.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
@@ -2142,7 +2144,7 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
             stage_type="mf_sub",
             worker_id="worker-api",
             attempt=1,
-            fence_token="fence-runtime-text-api",
+            fence_token=raw_fence_token,
             branch_ref="refs/heads/codex/runtime-text-task",
             worktree_id="wt-runtime-text-task",
             worktree_path=str(worktree),
@@ -2165,7 +2167,8 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
                 "task_id": "runtime-text-task",
                 "parent_task_id": "AC-RUNTIME-TEXT",
                 "runtime_context_id": "mfrctx-runtime-text-api",
-                "fence_token": "fence-runtime-text-api",
+                "fence_token": raw_fence_token,
+                "session_token": raw_session_token,
                 "worktree_path": str(worktree),
                 "base_commit": "base-api",
                 "target_head_commit": "target-api",
@@ -2263,6 +2266,116 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     ]
     assert registered == bridge_payload["registered_host_adapter_spawn"]
     assert registered["session_token_surrogate"].startswith("host-adapter:")
+    executable = prepared["executable_worker_launch"]
+    handoff = prepared["executable_handoff_packet"]
+    assert executable["handoff_packet"] == handoff
+    assert handoff["schema_version"] == (
+        "observer_runtime_text.executable_handoff_packet.v1"
+    )
+    assert handoff["public_safe"] is True
+    assert handoff["raw_launch_text_persisted"] is False
+    assert handoff["raw_session_token_persisted"] is False
+    assert handoff["fence_token_hash"] == _fake_sha(raw_fence_token)
+    assert handoff["fence_token_redacted"] is True
+    assert handoff["cwd"] == str(worktree)
+    assert handoff["worktree_path"] == str(worktree)
+    assert handoff["transcript_path_suggestion"].endswith(".transcript.jsonl")
+    assert "AMING_WORKER_SESSION_TOKEN" in handoff["env_var_names"]
+    assert "AMING_RUNTIME_CONTEXT_ID" in handoff["env_var_names"]
+    assert handoff["fence_token_env"] == "AMING_WORKER_FENCE_TOKEN"
+    assert handoff["env_placeholders"]["AMING_WORKER_FENCE_TOKEN"].startswith(
+        "<read from env:"
+    )
+    assert "codex exec" in handoff["command_skeleton"]
+    assert raw_fence_token not in handoff["command_skeleton"]
+    assert handoff["argv_skeleton"] == executable["command"]
+    assert handoff["stdin"]["source"] == "response.launch_text"
+    assert handoff["stdin"]["sha256"] == prepared["launch_text_hash"]
+    assert handoff["runtime_context_id"] == "mfrctx-runtime-text-api"
+    assert handoff["task_id"] == "runtime-text-task"
+    assert handoff["parent_task_id"] == "AC-RUNTIME-TEXT"
+    assert handoff["fence_token"].startswith(
+        "<read from env:AMING_WORKER_FENCE_TOKEN"
+    )
+    assert handoff["observer_command_id"] == "cmd-runtime-text-api"
+    handoff_json = json.dumps(handoff, sort_keys=True)
+    assert raw_fence_token not in handoff_json
+    assert raw_session_token not in handoff_json
+    assert prepared["launch_text"] not in handoff_json
+    executable_json = json.dumps(
+        prepared["executable_worker_launch"],
+        sort_keys=True,
+    )
+    assert raw_fence_token not in executable_json
+    assert raw_session_token not in executable_json
+    assert prepared["launch_text"] not in executable_json
+    assert handoff["worker_guide_ref"].endswith(
+        "/runtime-contexts/mfrctx-runtime-text-api/worker-guide"
+    )
+    assert handoff["worker_guide_url"].endswith(
+        "/runtime-contexts/mfrctx-runtime-text-api/worker-guide"
+    )
+    receipt_skeleton = handoff["read_receipt_facade_payload_skeleton"]
+    receipt_payload = receipt_skeleton["payload"]
+    assert receipt_skeleton["method"] == "POST"
+    assert receipt_skeleton["path"].endswith(
+        "/runtime-contexts/mfrctx-runtime-text-api/read-receipts"
+    )
+    receipt_body = receipt_skeleton["body"]
+    assert receipt_skeleton["auth_fields"]["session_token"].startswith(
+        "<read from env:"
+    )
+    assert receipt_body["session_token"].startswith("<read from env:")
+    assert receipt_body["fence_token"].startswith(
+        "<read from env:AMING_WORKER_FENCE_TOKEN"
+    )
+    assert receipt_payload["event_kind"] == "mf_subagent_read_receipt"
+    assert receipt_payload["runtime_context_id"] == "mfrctx-runtime-text-api"
+    assert receipt_payload["task_id"] == "runtime-text-task"
+    assert receipt_payload["parent_task_id"] == "AC-RUNTIME-TEXT"
+    assert receipt_payload["fence_token_env"] == "AMING_WORKER_FENCE_TOKEN"
+    assert receipt_payload["observer_command_id"] == "cmd-runtime-text-api"
+    assert receipt_payload["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
+    assert "session_token" not in receipt_payload
+    assert "fence_token" not in receipt_payload
+    assert receipt_payload["launch_text_hash"] == prepared["launch_text_hash"]
+    startup_skeleton = handoff["startup_facade_payload_skeleton"]
+    startup_payload = startup_skeleton["payload"]
+    assert startup_skeleton["method"] == "POST"
+    assert startup_skeleton["path"].endswith(
+        "/runtime-contexts/mfrctx-runtime-text-api/startup"
+    )
+    assert startup_skeleton["legacy_tool"] == "parallel_branch_startup"
+    startup_body = startup_skeleton["body"]
+    startup_gate_payload = startup_payload["mf_subagent_startup_gate"]
+    assert startup_skeleton["auth_fields"]["session_token"].startswith(
+        "<read from env:"
+    )
+    assert startup_body["session_token"].startswith("<read from env:")
+    assert startup_body["fence_token"].startswith(
+        "<read from env:AMING_WORKER_FENCE_TOKEN"
+    )
+    assert startup_gate_payload["runtime_context_id"] == "mfrctx-runtime-text-api"
+    assert startup_gate_payload["task_id"] == "runtime-text-task"
+    assert startup_gate_payload["parent_task_id"] == "AC-RUNTIME-TEXT"
+    assert startup_gate_payload["observer_command_id"] == "cmd-runtime-text-api"
+    assert startup_gate_payload["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
+    assert startup_gate_payload["fence_token_env"] == "AMING_WORKER_FENCE_TOKEN"
+    assert "session_token" not in startup_gate_payload
+    assert "fence_token" not in startup_gate_payload
+    assert startup_body["actual_cwd"] == str(worktree)
+    assert startup_body["actual_git_root"] == str(worktree)
+    assert startup_body["harness_type"] == "codex"
+    assert startup_body["harness_type"] != "codex_cli"
+    assert startup_body["worker_transcript_path"] == (
+        handoff["transcript_path_suggestion"]
+    )
+    assert handoff["next_step"]["action"] == "launch_worker_now"
+    assert "Launch the worker now" in handoff["next_step"]["description"]
+    assert prepared["next_legal_action"]["handoff_packet"] == handoff
+    assert prepared["next_legal_action"]["next_step"]["action"] == (
+        "launch_worker_now"
+    )
     assert "session_token" not in bridge_payload["worker_launch_pack"]
     assert "session_token" not in bridge_payload["startup_recording"]
     assert "launch_text" not in bridge_payload["worker_launch_pack"]
@@ -2283,6 +2396,12 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert full_payload["launch_text_redacted"] is True
     assert full_payload["raw_launch_text_persisted"] is False
     assert full_payload["launch_text_hash"] == prepared["launch_text_hash"]
+    assert full_payload["executable_handoff_packet"] == handoff
+    full_payload_json = json.dumps(full_payload, sort_keys=True)
+    assert prepared["launch_text"] not in full_payload_json
+    assert raw_fence_token not in full_payload_json
+    assert raw_session_token not in full_payload_json
+    assert full_payload["executable_handoff_packet"]["raw_session_token_persisted"] is False
     assert prepared["persistent_evidence"]["local_runtime_context_bridge"][
         "status"
     ] == "written"
@@ -4748,6 +4867,72 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "session_token": "facade-session",
         "target_project_root": str(worktree),
     }
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-FACADE",
+                "observer_command_id": "cmd-facade",
+                "task_id": context.task_id,
+                "parent_task_id": "runtime-facade-parent",
+                "runtime_context_id": runtime_context_id,
+                "fence_token": "fence-facade",
+                "worktree_path": str(worktree),
+                "base_commit": fixture.main_head,
+                "target_head_commit": fixture.main_head,
+                "merge_queue_id": "mq-facade",
+                "route_context_hash": issued_route["route_context_hash"],
+                "route_id": issued_route["route_id"],
+                "prompt_contract_id": issued_route["route_token"][
+                    "prompt_contract_id"
+                ],
+                "prompt_contract_hash": issued_route["route_token"][
+                    "prompt_contract_hash"
+                ],
+                "route_token_ref": issued_route["route_token_ref"],
+                "visible_injection_manifest_hash": issued_route[
+                    "visible_injection_manifest_hash"
+                ],
+                "main_worktree": str(worktree),
+                "target_project_root": str(worktree),
+                "target_files": [changed_path],
+                "graph_trace_ids": [graph_trace_id],
+            },
+        )
+    )
+    handoff = prepared["executable_handoff_packet"]
+    read_receipt_body = dict(handoff["read_receipt_facade_payload_skeleton"]["body"])
+    read_receipt_body["payload"] = dict(read_receipt_body["payload"])
+    read_receipt_body.update(
+        {
+            "fence_token": "fence-facade",
+            "session_token": "facade-session",
+            "read_receipt_hash": "sha256:read-facade",
+            "target_project_root": str(worktree),
+        }
+    )
+    startup_body_from_skeleton = dict(
+        handoff["startup_facade_payload_skeleton"]["body"]
+    )
+    startup_body_from_skeleton.update(
+        {
+            "fence_token": "fence-facade",
+            "session_token": "facade-session",
+            "target_project_root": str(worktree),
+            "actual_cwd": str(worktree),
+            "actual_git_root": str(worktree),
+            "actual_host_worker_id": "agent-runtime-facade",
+            "agent_id": "agent-runtime-facade",
+            "head_commit": head_commit,
+            "owned_files": [changed_path],
+            "observer_command_id": "cmd-facade",
+            "read_receipt_hash": "sha256:read-facade",
+            "worker_session_id": "worker-session-facade",
+            "harness_type": "codex",
+            "graph_trace_ids": [graph_trace_id],
+        }
+    )
     pre_receipt_transcript = tmp_path / "runtime-facade-pre-receipt.jsonl"
     pre_receipt_transcript.write_text(
         json.dumps(
@@ -4813,23 +4998,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             },
             "mf_sub",
             method="POST",
-            body={
-                **common_body,
-                "read_receipt_hash": "sha256:read-facade",
-                "payload": {
-                    "runtime_context_id": "stale-runtime-context",
-                    "task_id": "stale-task",
-                    "parent_task_id": "stale-parent",
-                    "fence_token": "stale-fence",
-                    "route_id": "stale-route",
-                    "route_context_hash": "sha256:stale-route",
-                    "prompt_contract_id": "stale-prompt",
-                    "prompt_contract_hash": "sha256:stale-prompt",
-                    "route_token_ref": "stale-route-token-ref",
-                    "visible_injection_manifest_hash": "sha256:stale-visible",
-                    "read_receipt_hash": "sha256:stale-read",
-                },
-            },
+            body=read_receipt_body,
         )
     )
     assert read_receipt["ok"] is True
@@ -4846,7 +5015,12 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_read_payload["runtime_context_id"] == runtime_context_id
     assert stored_read_payload["task_id"] == context.task_id
     assert stored_read_payload["parent_task_id"] == "runtime-facade-parent"
-    assert stored_read_payload["fence_token"] == "fence-facade"
+    assert "fence_token" not in stored_read_payload
+    assert stored_read_payload["fence_token_hash"] == _fake_sha("fence-facade")
+    assert stored_read_payload["fence_token_env"] == "AMING_WORKER_FENCE_TOKEN"
+    assert stored_read_payload["fence_token_redacted"] is True
+    assert stored_read_payload["raw_fence_token_persisted"] is False
+    assert stored_read_payload["raw_session_token_persisted"] is False
     assert stored_read_payload["route_id"] == issued_route["route_id"]
     assert stored_read_payload["route_context_hash"] == issued_route[
         "route_context_hash"
@@ -4862,6 +5036,9 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         issued_route["visible_injection_manifest_hash"]
     )
     assert stored_read_payload["read_receipt_hash"] == "sha256:read-facade"
+    stored_read_payload_json = json.dumps(stored_read_payload, sort_keys=True)
+    assert "facade-session" not in stored_read_payload_json
+    assert "fence-facade" not in stored_read_payload_json
 
     transcript_path = tmp_path / "runtime-facade-transcript.jsonl"
     transcript_path.write_text(
@@ -4896,20 +5073,9 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             "mf_sub",
             method="POST",
             body={
-                **common_body,
-                "actual_cwd": str(worktree),
-                "actual_git_root": str(worktree),
-                "actual_host_worker_id": "agent-runtime-facade",
-                "agent_id": "agent-runtime-facade",
-                "head_commit": head_commit,
-                "owned_files": [changed_path],
-                "observer_command_id": "cmd-facade",
-                "read_receipt_hash": "sha256:read-facade",
+                **startup_body_from_skeleton,
                 "read_receipt_event_id": read_receipt["timeline_event"]["id"],
-                "worker_session_id": "worker-session-facade",
                 "worker_transcript_path": str(transcript_path),
-                "harness_type": "codex",
-                "graph_trace_ids": [graph_trace_id],
             },
         )
     )
@@ -4920,6 +5086,12 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert startup["gate"]["close_satisfying"] is True
     assert startup["gate"]["session_token_evidence_type"] == "server_verified"
     assert startup["context"]["status"] == "running"
+    stored_startup = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (startup["timeline_event"]["id"],),
+    ).fetchone()
+    stored_startup_payload = json.loads(stored_startup["payload_json"])
+    assert "facade-session" not in json.dumps(stored_startup_payload, sort_keys=True)
 
     checkpoint = server.handle_graph_governance_runtime_context_checkpoint(
         _ctx_with_role(
@@ -5535,6 +5707,12 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     ).fetchone()
     stored_implementation_payload = json.loads(stored_implementation["payload_json"])
     assert stored_implementation_payload["worker_role"] == "mf_sub"
+    assert stored_implementation_payload["observer_command_id"] == "cmd-facade"
+    assert "fence_token" not in stored_implementation_payload
+    assert stored_implementation_payload["fence_token_hash"] == _fake_sha("fence-facade")
+    assert stored_implementation_payload["fence_token_redacted"] is True
+    assert stored_implementation_payload["raw_fence_token_persisted"] is False
+    assert stored_implementation_payload["raw_session_token_persisted"] is False
     assert "caller_role" not in stored_implementation_payload
     assert "role" not in stored_implementation_payload
     assert stored_implementation_payload["route_token_gate"]["caller_role"] == (
@@ -5544,6 +5722,12 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_implementation_payload["meta_contract_gate"]["action"] == (
         "implementation"
     )
+    stored_implementation_json = json.dumps(
+        stored_implementation_payload,
+        sort_keys=True,
+    )
+    assert "fence-facade" not in stored_implementation_json
+    assert "facade-session" not in stored_implementation_json
 
     current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
@@ -18239,6 +18423,93 @@ def _route_context_gate_baseline_events(
     return events
 
 
+def _issue_parent_child_route_refs(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+) -> tuple[dict, dict, dict, dict]:
+    from agent.governance import observer_route_context
+
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=backlog_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=[f"timeline:{backlog_id}:parent"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_identity = _route_identity_from_issued_route(parent_issue)
+    child_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=[f"timeline:{backlog_id}:child"],
+        parent_route_identity={
+            **parent_identity,
+            "selected_project": PID,
+            "selected_backlog_id": backlog_id,
+        },
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_issue["route_token_ref"],
+        token=child_issue["route_token"],
+    )
+    child_identity = _route_identity_from_issued_route(child_issue)
+    return parent_issue, child_issue, parent_identity, child_identity
+
+
+def _worker_startup_payload(route_identity: dict, *, backlog_id: str, task_id: str) -> dict:
+    worker_session_id = f"worker-session-{task_id}"
+    return {
+        **route_identity,
+        "status": "passed",
+        "bounded": True,
+        "close_satisfying": True,
+        "agent_id_match_mode": "same_as_allocation_owner",
+        "session_token_evidence_type": "hash",
+        "session_token_hash": _fake_sha(f"session-token-{task_id}"),
+        "session_token_present": True,
+        "host_adapter_startup_token_accepted": False,
+        "task_id": task_id,
+        "parent_task_id": backlog_id,
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "worker_slot_id": f"slot-{task_id}",
+        "fence_token": f"fence-{task_id}",
+        "fence_token_matches": True,
+        "observer_command_id": f"cmd-{backlog_id}",
+        "worktree_path": f"/tmp/{task_id}",
+        "actual_cwd": f"/tmp/{task_id}",
+        "actual_git_root": f"/tmp/{task_id}",
+        "branch": f"refs/heads/codex/{task_id}",
+        "head_commit": f"head-{task_id}",
+        "read_receipt_hash": _fake_sha(f"read-receipt-{task_id}"),
+        "read_receipt_event_id": f"rr-{task_id}",
+        "filer_principal": worker_session_id,
+        "worker_session_id": worker_session_id,
+        "worker_transcript_ref": f"transcript:{task_id}",
+        "harness_type": "codex",
+        "worker_self_attestation": {
+            "status": "passed",
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "worker_session_id": worker_session_id,
+            "worker_transcript_ref": f"transcript:{task_id}",
+            "harness_type": "codex",
+        },
+    }
+
+
 def test_timeline_append_ref_only_independent_verification_projects_server_lineage(conn):
     from agent.governance import observer_route_context
 
@@ -18494,6 +18765,397 @@ def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_pro
     assert gate["checks"]["independent_verification_lane_present"] is False
 
 
+def test_timeline_precheck_enriches_ref_only_registry_child_lineage(conn, tmp_path):
+    backlog_id = "AC-PRECHECK-REF-ONLY-REGISTRY-LINEAGE"
+    task_id = "precheck-registry-child-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json=? WHERE bug_id=?",
+        (
+            json.dumps(
+                {
+                    "template_id": "mf_parallel.v1",
+                    "contract_instance_id": backlog_id,
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    _, child_issue, parent_identity, child_identity = _issue_parent_child_route_refs(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    target_root = tmp_path / "precheck-registry-child-worktree"
+    target_root.mkdir()
+    runtime_context_id = f"mfrctx-{task_id}"
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            root_task_id=backlog_id,
+            backlog_id=backlog_id,
+            stage_task_id=task_id,
+            worker_id=f"worker-{task_id}",
+            worker_slot_id=f"slot-{task_id}",
+            branch_ref=f"refs/heads/codex/{task_id}",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token=f"fence-{task_id}",
+            session_token_hash=mf_subagent_session_token_hash(
+                f"session-token-{task_id}"
+            ),
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id=f"crev-{task_id}",
+        contract_version="mf_parallel.v1",
+        payload={
+            "observer_command_id": f"cmd-{backlog_id}",
+            "target_files": ["agent/governance/server.py"],
+            "acceptance_criteria": ["registry-backed child lineage closes"],
+        },
+        route_identity=parent_identity,
+        now_iso="2026-06-15T11:00:00Z",
+    )
+    parent_public = {
+        key: value
+        for key, value in parent_identity.items()
+        if key != "route_token_ref"
+    }
+
+    def record(
+        event_kind: str,
+        *,
+        task: str,
+        payload: dict,
+        phase: str | None = None,
+        actor: str = "observer",
+    ) -> None:
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task,
+            event_type=event_kind,
+            event_kind=event_kind,
+            phase=phase or event_kind,
+            actor=actor,
+            status="passed",
+            payload=payload,
+        )
+
+    record(
+        "route_context",
+        task=backlog_id,
+        payload={
+            "route_context": {
+                **parent_public,
+                "caller_role": "observer",
+                "allowed_actions": ["dispatch_worker"],
+                "required_lanes": ["bounded_implementation_worker"],
+            },
+            "visible_injection_manifest_hash": parent_public[
+                "visible_injection_manifest_hash"
+            ],
+        },
+        phase="dispatch",
+    )
+    record(
+        "route_action_precheck",
+        task=backlog_id,
+        payload={**parent_public, "allowed_action": "dispatch_worker"},
+        phase="pre_mutation",
+    )
+    record(
+        "bounded_implementation_worker_dispatch",
+        task=backlog_id,
+        payload={
+            **parent_public,
+            "task_id": backlog_id,
+            "observer_command_id": f"cmd-{backlog_id}",
+        },
+        phase="dispatch",
+    )
+    startup_payload = _worker_startup_payload(
+        child_identity,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    record(
+        "mf_subagent_startup",
+        task=task_id,
+        actor="mf-sub",
+        payload={
+            **child_identity,
+            "route_token_ref": child_issue["route_token_ref"],
+            "mf_subagent_startup_gate": startup_payload,
+        },
+        phase="startup_gate",
+    )
+    implementation = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": backlog_id,
+                "fence_token": f"fence-{task_id}",
+                "session_token": f"session-token-{task_id}",
+                "target_project_root": str(target_root),
+                "route_token_ref": child_issue["route_token_ref"],
+                "route_token": child_issue["route_token"],
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "summary": "worker appended implementation evidence",
+                    "fence_token": f"fence-{task_id}",
+                    "session_token": f"session-token-{task_id}",
+                    "note": f"proof for fence-{task_id}",
+                },
+            },
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["timeline_event"]["event_kind"] == "implementation"
+    stored_implementation = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (implementation["timeline_event"]["id"],),
+    ).fetchone()
+    stored_implementation_payload = json.loads(stored_implementation["payload_json"])
+    assert stored_implementation_payload["observer_command_id"] == f"cmd-{backlog_id}"
+    assert stored_implementation_payload["fence_token_hash"] == _fake_sha(
+        f"fence-{task_id}"
+    )
+    assert stored_implementation_payload["fence_token_redacted"] is True
+    assert stored_implementation_payload["raw_fence_token_persisted"] is False
+    assert stored_implementation_payload["raw_session_token_persisted"] is False
+    stored_implementation_json = json.dumps(
+        stored_implementation_payload,
+        sort_keys=True,
+    )
+    assert f"fence-{task_id}" not in stored_implementation_json
+    assert f"session-token-{task_id}" not in stored_implementation_json
+    record(
+        "verification",
+        task=backlog_id,
+        payload={**parent_public, "tests": [{"status": "passed"}]},
+        phase="verification",
+    )
+    record(
+        "independent_verification",
+        task=backlog_id,
+        payload={
+            **parent_public,
+            "reviewer_role": "independent_qa",
+            "contract_evidence": [
+                {
+                    "requirement_id": "independent_verification_lane",
+                    "status": "passed",
+                }
+            ],
+        },
+        phase="verification",
+        actor="qa-reviewer",
+    )
+    record(
+        "close_ready",
+        task=backlog_id,
+        payload={**parent_public, "observer_command_id": f"cmd-{backlog_id}"},
+        phase="close",
+    )
+    record(
+        "route_identity_cleanup",
+        task=backlog_id,
+        payload={"route_identity_cleanup": {**parent_public, "applied": True}},
+        phase="identity_recovery",
+    )
+    conn.commit()
+
+    result = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    assert result["can_close"] is True
+    gate = result["timeline_gate"]
+    enrichment = gate["server_route_lineage_enrichment"]
+    assert enrichment["enriched_event_count"] >= 2
+    assert enrichment["failed_event_count"] == 0
+    route_gate = gate["route_context_gate"]
+    assert route_gate["passed"] is True
+    assert route_gate["accepted_startup_lineages"][0]["acceptance_source"] == (
+        "registry_backed_runtime_context_lineage"
+    )
+    implementation_event_id = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="implementation",
+    )[0]["id"]
+    cross_ref = gate["cross_ref_gate"]
+    assert cross_ref["passed"] is True
+    accepted_child_lineages = cross_ref["accepted_route_token_child_lineages"]
+    assert implementation_event_id in [
+        item["event_id"] for item in accepted_child_lineages
+    ]
+    implementation_lineage = next(
+        item
+        for item in accepted_child_lineages
+        if item["event_id"] == implementation_event_id
+    )
+    assert implementation_lineage["fence_proof"]["proof_type"] == (
+        "redacted_fence_token_hash"
+    )
+    assert implementation_lineage["fence_proof"]["fence_token_hash"] == _fake_sha(
+        f"fence-{task_id}"
+    )
+    assert "fence_token" not in implementation_lineage
+    assert f"fence-{task_id}" not in json.dumps(cross_ref, sort_keys=True)
+
+
+def test_server_route_token_ref_enrichment_covers_live_protected_event_kinds(conn):
+    backlog_id = "AC-REF-ONLY-LIVE-EVENT-KIND-ENRICHMENT"
+    task_id = "live-kind-child-task"
+    _, child_issue, parent_identity, child_identity = _issue_parent_child_route_refs(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    common = {
+        **child_identity,
+        "route_token_ref": child_issue["route_token_ref"],
+        "task_id": task_id,
+        "parent_task_id": backlog_id,
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "worker_slot_id": f"slot-{task_id}",
+        "fence_token": f"fence-{task_id}",
+        "observer_command_id": f"cmd-{backlog_id}",
+        "allowed_action": "task_timeline_append",
+    }
+    events = []
+    for index, event_kind in enumerate(
+        [
+            "dispatch_bounded_worker",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "implementation",
+            "mf_subagent_finish_gate",
+            "close_ready",
+            "verification",
+            "independent_verification",
+        ],
+        start=1,
+    ):
+        payload = dict(common)
+        if event_kind == "mf_subagent_startup":
+            payload = {
+                **payload,
+                "mf_subagent_startup_gate": _worker_startup_payload(
+                    child_identity,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            }
+        elif event_kind == "mf_subagent_finish_gate":
+            payload = {
+                **payload,
+                "mf_subagent_finish_gate": {
+                    **payload,
+                    "startup_evidence": _worker_startup_payload(
+                        child_identity,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    ),
+                },
+            }
+        events.append(
+            {
+                "id": index,
+                "event_type": event_kind,
+                "event_kind": event_kind,
+                "phase": event_kind,
+                "status": "passed",
+                "backlog_id": backlog_id,
+                "project_id": PID,
+                "task_id": task_id,
+                "payload": payload,
+            }
+        )
+
+    enriched, report = server._enrich_timeline_events_with_route_token_lineage(
+        conn,
+        project_id=PID,
+        events=events,
+    )
+
+    assert report["attempted_event_count"] == len(events)
+    assert report["enriched_event_count"] == len(events)
+    assert report["failed_event_count"] == 0
+    for event in enriched:
+        lineage = event["payload"]["route_action_scope_lineage"]
+        assert lineage["registry_verified"] is True
+        assert lineage["parent_route_identity"]["route_id"] == parent_identity["route_id"]
+        assert lineage["child_route_identity"]["route_id"] == child_identity["route_id"]
+        assert lineage["route_token_ref"] == child_issue["route_token_ref"]
+
+
+def test_server_route_token_ref_enrichment_rejects_route_id_mismatch(conn):
+    backlog_id = "AC-REF-ONLY-ROUTE-ID-MISMATCH"
+    task_id = "route-id-mismatch-child-task"
+    _, child_issue, _parent_identity, child_identity = _issue_parent_child_route_refs(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    event = {
+        "id": 1,
+        "event_type": "implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "status": "passed",
+        "backlog_id": backlog_id,
+        "project_id": PID,
+        "task_id": task_id,
+        "payload": {
+            **child_identity,
+            "route_id": "route-mismatched-child",
+            "route_token_ref": child_issue["route_token_ref"],
+            "task_id": task_id,
+            "parent_task_id": backlog_id,
+            "runtime_context_id": f"mfrctx-{task_id}",
+            "worker_slot_id": f"slot-{task_id}",
+            "fence_token": f"fence-{task_id}",
+            "observer_command_id": f"cmd-{backlog_id}",
+        },
+    }
+
+    enriched, report = server._enrich_timeline_events_with_route_token_lineage(
+        conn,
+        project_id=PID,
+        events=[event],
+    )
+
+    assert report["enriched_event_count"] == 0
+    assert report["failed_event_count"] == 1
+    assert "route_id" in report["failed_events"][0]["reason"]
+    payload = enriched[0]["payload"]
+    assert "route_action_scope_lineage" not in payload
+    assert payload["route_action_scope_lineage_resolution"]["status"] == "failed"
+
+
 def test_timeline_append_meta_contract_allows_observer_on_behalf_worker_evidence(conn):
     backlog_id = "AC-META-CONTRACT-OBSERVER-ON-BEHALF"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -18625,6 +19287,61 @@ def test_backlog_close_bypass_timeline_gate_is_rejected_for_ai_reachable_callers
     )
     assert len(events) == 1
     assert events[0]["payload"]["bypass_timeline_gate"] is True
+
+
+def test_backlog_close_bypass_timeline_gate_rejects_system_recovery_row(conn):
+    backlog_id = "AC-BYPASS-TIMELINE-SYSTEM-RECOVERY-REJECTED"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+        SET mf_type='system_recovery',
+            bypass_policy_json='{"mf_type":"system_recovery"}'
+        WHERE bug_id=?
+        """,
+        (backlog_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx_with_role(
+                {"project_id": PID, "bug_id": backlog_id},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "bypass_timeline_gate": True,
+                    "timeline_bypass_reason": (
+                        "system_recovery must not bypass the MF timeline gate"
+                    ),
+                    "route_waiver": _route_waiver(
+                        "backlog_close",
+                        backlog_id=backlog_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "mf_timeline_bypass_forbidden"
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+    rejected = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_timeline_gate_bypass_rejected",
+    )
+    accepted = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_timeline_gate_bypass_accepted",
+    )
+    assert len(rejected) == 1
+    assert accepted == []
 
 
 def test_backlog_close_rejects_runtime_gate_projection_as_close_evidence(conn):
