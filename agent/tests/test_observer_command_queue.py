@@ -2433,6 +2433,248 @@ def test_active_owner_old_execute_without_startup_can_be_taken_over_and_failed()
     )
 
 
+def test_consumer_recovery_reports_claimed_execute_missing_startup_without_notified_commands():
+    from agent.governance import server
+
+    conn = _conn()
+    task_timeline.ensure_schema(conn)
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    fallback = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-fallback",
+        now="2026-06-03T00:03:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    observer_session.heartbeat_session(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        now="2026-06-03T00:03:00Z",
+    )
+    task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=_execute_backlog_row_payload()["backlog_id"],
+        task_id="mf-sub-task-1",
+        attempt_num=1,
+        event_type="mf_subagent.read_receipt",
+        phase="startup_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        status="accepted",
+        payload={
+            "observer_command_id": command["command_id"],
+            "task_id": "mf-sub-task-1",
+            "runtime_context_id": "mfrctx-read-receipt-only",
+            "fence_token": "fence-1",
+            "read_receipt_hash": "sha256:read-receipt-only",
+        },
+    )
+
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:00Z",
+    )
+    summary = observer_session.command_summary(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:00Z",
+    )
+    persisted = observer_session.get_command(
+        conn,
+        project_id="demo",
+        command_id=command["command_id"],
+    )
+
+    assert recovery["notified_execute_backlog_row_count"] == 0
+    assert recovery["status"] == "blocked"
+    assert recovery["classification"] == "claimed_execute_missing_startup"
+    assert recovery["computed_status"] == observer_session.CLAIMED_TO_STARTUP_TIMEOUT_STATUS
+    assert recovery["recovery_required"] is True
+    assert recovery["blocked_command_id"] == command["command_id"]
+    assert recovery["diagnosed_claimed_command"]["command_id"] == command["command_id"]
+    assert recovery["diagnosed_claimed_command"]["status"] == (
+        observer_session.COMMAND_STATUS_CLAIMED
+    )
+    assert recovery["claimed_by_session_id"] == owner["session_id"]
+    assert recovery["claimed_at"] == "2026-06-03T00:00:02Z"
+    assert recovery["claimed_age_sec"] == 178.0
+    assert recovery["timeout_sec"] == observer_session.CLAIMED_TO_STARTUP_TIMEOUT_SEC
+    assert recovery["startup_evidence_present"] is False
+    assert recovery["terminal_dispatch_blocker_present"] is False
+    assert recovery["next_expected_evidence"] == (
+        "mf_subagent_startup_or_terminal_dispatch_blocker"
+    )
+    assert recovery["blocker"]["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
+    assert recovery["next_legal_action"]["tool"] == "observer_command_takeover"
+    assert recovery["next_legal_action"]["requires_session_token"] is True
+    assert recovery["next_legal_action"]["eligible_session_ids"] == [fallback["session_id"]]
+    assert recovery["next_legal_action"]["followup_sequence"] == [
+        "observer_runtime_text_prepare",
+        "mf_subagent_read_receipt",
+        "record_mf_subagent_startup",
+    ]
+    assert recovery["next_legal_action"]["alternate_followup"] == (
+        "fail_with_terminal_dispatch_blocker"
+    )
+    assert persisted["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert persisted["result"].get("takeover_status") is None
+    assert summary["counts"][observer_session.COMMAND_STATUS_CLAIMED] == 1
+    assert summary["items"][0]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert summary["observer_consumer_recovery"]["classification"] == (
+        "claimed_execute_missing_startup"
+    )
+    assert summary["observer_consumer_recovery"]["blocked_command_id"] == (
+        command["command_id"]
+    )
+
+    ctx = SimpleNamespace(
+        path_params={"project_id": "demo"},
+        query={},
+        body={},
+        get_project_id=lambda: "demo",
+    )
+    with (
+        patch("agent.governance.server.get_connection", return_value=conn),
+        patch("agent.governance.observer_session._utc_now", return_value="2026-06-03T00:03:00Z"),
+    ):
+        response = server.handle_observer_command_list(ctx)
+
+    assert response["observer_consumer_recovery"]["classification"] == (
+        "claimed_execute_missing_startup"
+    )
+    assert response["summary"]["observer_consumer_recovery"]["blocked_command_id"] == (
+        command["command_id"]
+    )
+    assert response["observer_commands"][0]["status"] == (
+        observer_session.COMMAND_STATUS_CLAIMED
+    )
+
+
+def test_consumer_recovery_does_not_report_missing_startup_when_startup_timeline_exists():
+    conn = _conn()
+    task_timeline.ensure_schema(conn)
+    owner = observer_session.register_session(
+        conn,
+        project_id="demo",
+        session_id="obs-owner",
+        now="2026-06-03T00:00:00Z",
+    )
+    command = observer_session.enqueue_command(
+        conn,
+        project_id="demo",
+        command_type=observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+        payload=_execute_backlog_row_payload(),
+        now="2026-06-03T00:00:01Z",
+    )
+    observer_session.claim_command(
+        conn,
+        project_id="demo",
+        session_id=owner["session_id"],
+        session_token=owner["session_token"],
+        command_id=command["command_id"],
+        now="2026-06-03T00:00:02Z",
+    )
+    payload = _execute_backlog_row_payload()
+    task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=payload["backlog_id"],
+        task_id="mf-sub-task-1",
+        attempt_num=1,
+        event_type="mf_subagent.read_receipt",
+        phase="startup_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        status="accepted",
+        payload={
+            "observer_command_id": command["command_id"],
+            "task_id": "mf-sub-task-1",
+            "runtime_context_id": "mfrctx-startup-present",
+            "fence_token": "fence-1",
+            "read_receipt_hash": "sha256:read-startup-present",
+        },
+    )
+    startup_gate = dict(_actual_startup_result()["startup_gate"])
+    startup_gate.update(
+        {
+            "observer_command_id": command["command_id"],
+            "task_id": "mf-sub-task-1",
+            "parent_task_id": payload["backlog_id"],
+            "runtime_context_id": "mfrctx-startup-present",
+            "fence_token": "fence-1",
+        }
+    )
+    task_timeline.record_event(
+        conn,
+        project_id="demo",
+        backlog_id=payload["backlog_id"],
+        task_id="mf-sub-task-1",
+        attempt_num=1,
+        event_type="mf_subagent.startup",
+        phase="startup_gate",
+        event_kind="mf_subagent_startup",
+        status="passed",
+        payload={
+            "observer_command_id": command["command_id"],
+            "mf_subagent_startup_gate": startup_gate,
+        },
+    )
+
+    recovery = observer_session.observer_command_consumer_recovery(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:00Z",
+    )
+    summary = observer_session.command_summary(
+        conn,
+        project_id="demo",
+        now="2026-06-03T00:03:00Z",
+    )
+    persisted = observer_session.get_command(
+        conn,
+        project_id="demo",
+        command_id=command["command_id"],
+    )
+
+    assert recovery["notified_execute_backlog_row_count"] == 0
+    assert recovery["status"] == "idle"
+    assert recovery["classification"] == "no_notified_execute_backlog_row"
+    assert recovery["recovery_required"] is False
+    assert "blocked_command_id" not in recovery
+    assert "diagnosed_claimed_command" not in recovery
+    assert summary["observer_consumer_recovery"]["classification"] == (
+        "no_notified_execute_backlog_row"
+    )
+    assert summary["counts"][observer_session.COMMAND_STATUS_CLAIMED] == 1
+    assert summary["items"][0]["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert persisted["status"] == observer_session.COMMAND_STATUS_CLAIMED
+    assert "startup_gate" not in persisted["result"]
+    assert "durable_mf_sub_evidence" not in persisted["result"]
+
+
 def test_active_owner_old_execute_with_startup_and_progress_cannot_be_taken_over():
     conn = _conn()
     owner = observer_session.register_session(

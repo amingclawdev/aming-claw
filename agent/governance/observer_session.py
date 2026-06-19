@@ -3431,6 +3431,184 @@ def _latest_notified_execute_commands(
     return [_command_row_to_dict(row) for row in rows]
 
 
+def _latest_owned_execute_commands(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """SELECT * FROM observer_command_queue
+            WHERE project_id = ?
+              AND command_type = ?
+              AND status IN (?, ?)
+            ORDER BY claimed_at ASC, created_at ASC
+            LIMIT ?""",
+        (
+            (project_id or "").strip(),
+            COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            COMMAND_STATUS_CLAIMED,
+            COMMAND_STATUS_RUNNING,
+            max(1, min(int(limit or 50), 1000)),
+        ),
+    ).fetchall()
+    return [_command_row_to_dict(row) for row in rows]
+
+
+def _timeline_startup_event_matches_command(
+    event: Mapping[str, Any],
+    command: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+) -> bool:
+    command_id = str(command.get("command_id") or "").strip()
+    observed_command_id = _first_nested_text(event, "observer_command_id")
+    if observed_command_id:
+        return bool(command_id and observed_command_id == command_id)
+
+    lineage_checks = {
+        key: str(lineage.get(key) or "").strip()
+        for key in ("task_id", "parent_task_id", "runtime_context_id", "fence_token")
+    }
+    if not any(lineage_checks.values()):
+        return False
+    return _lineage_matches(event, lineage_checks)
+
+
+def _timeline_actual_startup_event_for_command(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    command: dict[str, Any],
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    result = _command_result(command)
+    lineage = _startup_lineage_from_result(command, result)
+    backlog_id = str(lineage.get("backlog_id") or payload.get("backlog_id") or "")
+    task_id = str(lineage.get("task_id") or payload.get("task_id") or "")
+    events = _task_timeline_events_for_command(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        has_explicit_refs=False,
+    )
+    candidates: list[dict[str, Any]] = []
+    for event in events:
+        haystack = _timeline_event_haystack(event)
+        if "intent" in haystack:
+            continue
+        if not (_progress_event_tokens(event) & {"mf_subagent_startup", "mf_subagent_startup_gate"}):
+            continue
+        if not _timeline_event_status_passed(event):
+            continue
+        if not _contains_actual_startup_evidence(dict(event)):
+            continue
+        if not _timeline_startup_event_matches_command(event, command, lineage):
+            continue
+        candidates.append(event)
+    return max(candidates, key=_timeline_event_id, default={})
+
+
+def _claimed_execute_missing_startup_recovery(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    now: str,
+    limit: int,
+) -> dict[str, Any]:
+    commands = _latest_owned_execute_commands(conn, project_id=project_id, limit=limit)
+    stale: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for command in commands:
+        if _timeline_actual_startup_event_for_command(
+            conn,
+            project_id=project_id,
+            command=command,
+        ):
+            continue
+        timeout = _claimed_execute_takeover_timeout(conn, command, now=now)
+        if str(timeout.get("status") or "") != CLAIMED_TO_STARTUP_TIMEOUT_STATUS:
+            continue
+        stale.append((command, timeout))
+    if not stale:
+        return {}
+
+    diagnosed, timeout = max(
+        stale,
+        key=lambda item: float(item[1].get("age_sec") or 0.0),
+    )
+    claimed_by = str(diagnosed.get("claimed_by_session_id") or "")
+    sessions = list_sessions(conn, project_id=project_id, limit=100, now=now)
+    active_recovery_session_ids = [
+        session_id
+        for session_id in _active_recovery_session_ids(sessions, diagnosed)
+        if session_id != claimed_by
+    ]
+    blocker = _missing_startup_surface_blocker(diagnosed, now=now)
+    diagnosed_summary = _observer_command_summary_item(diagnosed, now=now)
+    diagnosed_claimed_command = {
+        **diagnosed_summary,
+        "claimed_by_session_id": claimed_by,
+        "claimed_at": str(diagnosed.get("claimed_at") or ""),
+        "claimed_age_sec": timeout.get("age_sec"),
+        "startup_evidence_present": False,
+        "terminal_dispatch_blocker_present": False,
+        "computed_status": CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
+    }
+
+    return {
+        "status": "blocked",
+        "classification": "claimed_execute_missing_startup",
+        "computed_status": CLAIMED_TO_STARTUP_TIMEOUT_STATUS,
+        "recovery_required": True,
+        "blocked_command_id": str(diagnosed.get("command_id") or ""),
+        "diagnosed_claimed_command": diagnosed_claimed_command,
+        "claimed_by_session_id": claimed_by,
+        "claimed_at": str(diagnosed.get("claimed_at") or ""),
+        "claimed_owner_status": _owner_session_takeover_status(
+            conn,
+            project_id=project_id,
+            owner_session_id=claimed_by,
+            now=now,
+            command=diagnosed,
+        ),
+        "claimed_age_sec": timeout.get("age_sec"),
+        "timeout_sec": timeout.get("timeout_sec") or CLAIMED_TO_STARTUP_TIMEOUT_SEC,
+        "timeout_kind": timeout.get("timeout_kind") or "startup_timeout",
+        "startup_evidence_present": False,
+        "terminal_dispatch_blocker_present": False,
+        "next_expected_evidence": "mf_subagent_startup_or_terminal_dispatch_blocker",
+        "owned_execute_backlog_row_count": len(commands),
+        "stale_claimed_execute_backlog_row_count": len(stale),
+        "latest_owned_command": diagnosed_summary,
+        "diagnosed_command": diagnosed_summary,
+        "active_recovery_session_ids": active_recovery_session_ids,
+        "blocker": blocker,
+        "next_legal_action": {
+            "tool": "observer_command_takeover",
+            "action": "takeover_claimed_command",
+            "description": (
+                "Take over the stale claimed execute_backlog_row command with a "
+                "different active observer session, then either restart the legal "
+                "worker startup sequence or fail the command with a terminal "
+                "dispatch blocker."
+            ),
+            "command_id": str(diagnosed.get("command_id") or ""),
+            "claimed_by_session_id": claimed_by,
+            "eligible_session_ids": active_recovery_session_ids,
+            "requires_session_token": True,
+            "prerequisite_tool": (
+                "" if active_recovery_session_ids else "observer_session_register"
+            ),
+            "followup_sequence": [
+                "observer_runtime_text_prepare",
+                "mf_subagent_read_receipt",
+                "record_mf_subagent_startup",
+            ],
+            "alternate_followup": "fail_with_terminal_dispatch_blocker",
+        },
+    }
+
+
 def observer_command_consumer_recovery(
     conn: sqlite3.Connection,
     *,
@@ -3439,7 +3617,7 @@ def observer_command_consumer_recovery(
     threshold_sec: int = NOTIFIED_UNCLAIMED_RECOVERY_THRESHOLD_SEC,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """Diagnose route-bound execute commands that were notified but unclaimed."""
+    """Diagnose route-bound execute commands blocked before claim or startup."""
     ensure_schema(conn)
     pid = (project_id or "").strip()
     timestamp = now or _utc_now()
@@ -3475,6 +3653,15 @@ def observer_command_consumer_recovery(
         "recovery_required": bool(diagnosed and diagnosed in stale_commands),
     }
     if not diagnosed:
+        claimed_recovery = _claimed_execute_missing_startup_recovery(
+            conn,
+            project_id=pid,
+            now=timestamp,
+            limit=limit,
+        )
+        if claimed_recovery:
+            base.update(claimed_recovery)
+            return base
         base.update(
             {
                 "status": "idle",
