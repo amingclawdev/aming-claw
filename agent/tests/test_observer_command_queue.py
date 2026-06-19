@@ -2529,6 +2529,31 @@ def test_consumer_recovery_keeps_takeover_claim_visible_before_worker_startup_ti
     ]
     assert next_action["alternate_followup"] == "fail_with_terminal_dispatch_blocker"
     assert next_action["terminal_after_timeout"] is True
+    assert next_action["prepare_endpoint"]["mcp_tool"] == "observer_runtime_text_prepare"
+    assert next_action["prepare_endpoint"]["path"].endswith(
+        "/observer/runtime-text/prepare"
+    )
+    assert next_action["prepare_payload"]["observer_command_id"] == command["command_id"]
+    assert next_action["prepare_payload"]["backlog_id"] == "AC-ROUTE-HANDOFF"
+    assert next_action["prepare_payload"]["route_token_ref"] == "rtok-route-handoff"
+    assert next_action["prepare_payload"]["worker_next_legal_action"] == (
+        "submit_mf_subagent_read_receipt"
+    )
+    assert next_action["prepare_response_contains"][
+        "executable_worker_launch"
+    ] == "response.executable_worker_launch"
+    assert next_action["prepare_response_contains"][
+        "read_receipt_facade_payload_skeleton"
+    ].endswith("read_receipt_facade_payload_skeleton")
+    assert next_action["prepare_response_contains"][
+        "startup_facade_payload_skeleton"
+    ].endswith("startup_facade_payload_skeleton")
+    assert "current-thread startup" in next_action["startup_evidence_policy"][
+        "forbidden_as_startup_evidence"
+    ]
+    assert "actual_host_worker_id" in next_action["startup_evidence_policy"][
+        "required_startup_fields"
+    ]
     assert summary["observer_consumer_recovery"]["computed_status"] == (
         observer_session.CLAIMED_EXECUTE_WAITING_FOR_STARTUP_STATUS
     )
@@ -2647,6 +2672,12 @@ def test_current_task_exposes_claimed_startup_recovery_without_runtime_or_timeli
     assert recovery["classification"] == "claimed_execute_missing_startup"
     assert recovery["blocked_command_id"] == command["command_id"]
     assert recovery["next_legal_action"]["tool"] == "observer_runtime_text_prepare"
+    assert recovery["next_legal_action"]["prepare_payload"][
+        "observer_command_id"
+    ] == command["command_id"]
+    assert recovery["next_legal_action"]["prepare_response_contains"][
+        "startup_facade_payload_skeleton"
+    ].endswith("startup_facade_payload_skeleton")
     assert response["observer_command_projection"]["command_id"] == (
         command["command_id"]
     )
@@ -2656,6 +2687,13 @@ def test_current_task_exposes_claimed_startup_recovery_without_runtime_or_timeli
     ]["next_legal_action"]["action"] == (
         "prepare_runtime_text_launch_worker_record_startup"
     )
+    projection_action = response["observer_command_projection"]["recovery"][
+        "next_legal_action"
+    ]
+    assert projection_action["prepare_payload"]["observer_command_id"] == (
+        command["command_id"]
+    )
+    assert projection_action["startup_evidence_policy"]["real_worker_required"] is True
 
 
 def test_runtime_text_launch_handoff_names_fence_env_and_launch_text_sources(tmp_path):
@@ -2859,6 +2897,19 @@ def test_consumer_recovery_reports_claimed_execute_missing_startup_without_notif
     assert recovery["next_legal_action"]["tool"] == "observer_command_takeover"
     assert recovery["next_legal_action"]["requires_session_token"] is True
     assert recovery["next_legal_action"]["eligible_session_ids"] == [fallback["session_id"]]
+    assert recovery["next_legal_action"]["stale_recovery_tools"] == [
+        "observer_session_register",
+        "observer_command_takeover",
+    ]
+    assert recovery["next_legal_action"]["prepare_payload_after_takeover"][
+        "observer_command_id"
+    ] == command["command_id"]
+    assert recovery["next_legal_action"]["prepare_endpoint_after_takeover"][
+        "mcp_tool"
+    ] == "observer_runtime_text_prepare"
+    assert "current-thread startup" in recovery["next_legal_action"][
+        "startup_evidence_policy"
+    ]["forbidden_as_startup_evidence"]
     assert recovery["next_legal_action"]["followup_sequence"] == [
         "observer_runtime_text_prepare",
         "mf_subagent_read_receipt",

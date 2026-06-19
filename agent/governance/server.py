@@ -8270,6 +8270,227 @@ def _runtime_context_effective_target_project_root(context) -> str:
     return runtime_context_effective_target_project_root(context)
 
 
+def _runtime_context_worker_recovery_payloads(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    target_project_root: str,
+    route_identity: Mapping[str, Any] | None = None,
+    fence_token_hash: str = "",
+    launch_text_hash: str = "",
+    read_receipt_event_ref: str = "",
+) -> dict[str, Any]:
+    safe_route_identity = {
+        field: str((route_identity or {}).get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str((route_identity or {}).get(field) or "").strip()
+    }
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    session_token_ref = f"env:{session_token_env}"
+    fence_token_ref = f"env:{fence_token_env}"
+    session_token_placeholder = (
+        f"<read from env:{session_token_env} at submission time>"
+    )
+    fence_token_placeholder = f"<read from env:{fence_token_env} at submission time>"
+    read_receipt_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/read-receipts"
+    )
+    startup_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/startup"
+    )
+    read_receipt_payload = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        **safe_route_identity,
+    }
+    read_receipt_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "event_kind": "mf_subagent_read_receipt",
+        "status": "accepted",
+        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
+        "payload": dict(read_receipt_payload),
+    }
+    startup_identity_required_fields = [
+        "worker_session_id",
+        "worker_transcript_ref or worker_transcript_path",
+        "harness_type",
+        "filer_principal",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "host_session_id",
+        "actual_cwd",
+        "actual_git_root",
+        "head_commit",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+    ]
+    startup_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "observer_command_id": "<claimed execute_backlog_row command id>",
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "worker_session_id": "<actual worker-owned session id>",
+        "worker_transcript_ref": "<host transcript ref, e.g. codex:<session-id>>",
+        "worker_transcript_path": "<local transcript path if available>",
+        "harness_type": "codex",
+        "filer_principal": "<actual worker principal filing startup>",
+        "actual_host_worker_id": "<actual host-created worker/session id>",
+        "host_startup_id": "<host startup event/thread id>",
+        "host_session_id": "<host session id>",
+        "actual_cwd": target_project_root,
+        "actual_git_root": target_project_root,
+        "head_commit": "<worker worktree HEAD after launch>",
+        "read_receipt_hash": "<accepted-read-receipt-hash>",
+        "read_receipt_event_id": (
+            read_receipt_event_ref or "<accepted-read-receipt-event-id>"
+        ),
+        **safe_route_identity,
+    }
+    startup_payload = {
+        "mf_subagent_startup_gate": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "target_project_root": target_project_root,
+            "session_token_env": session_token_env,
+            "fence_token_env": fence_token_env,
+            "fence_token_hash": fence_token_hash,
+            "fence_token_redacted": bool(fence_token_hash),
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "required_real_worker_identity_fields": startup_identity_required_fields,
+            **safe_route_identity,
+        }
+    }
+    return {
+        "schema_version": "runtime_context.worker_recovery_payloads.v1",
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "route_identity": safe_route_identity,
+        "route_token_ref": safe_route_identity.get("route_token_ref", ""),
+        "session_token_ref": session_token_ref,
+        "fence_token_ref": fence_token_ref,
+        "fence_token_hash": fence_token_hash,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "endpoints": {
+            "runtime_context_read_receipts": {
+                "method": "POST",
+                "path": read_receipt_path,
+                "tool": "submit_mf_subagent_read_receipt",
+                "facade": "runtime_context.read_receipts",
+            },
+            "runtime_context_startup": {
+                "method": "POST",
+                "path": startup_path,
+                "tool": "record_mf_subagent_startup",
+                "facade": "runtime_context.startup",
+                "legacy_tool": "parallel_branch_startup",
+            },
+        },
+        "read_receipt_facade_payload_skeleton": {
+            "method": "POST",
+            "path": read_receipt_path,
+            "facade": "runtime_context.read_receipts",
+            "required_fields": [
+                "runtime_context_id",
+                "parent_task_id",
+                "session_token",
+                "fence_token",
+                "target_project_root",
+                "read_receipt_hash or launch_text_hash",
+            ],
+            "auth_fields": {
+                "session_token": session_token_placeholder,
+                "session_token_env": session_token_env,
+                "fence_token": fence_token_placeholder,
+                "fence_token_env": fence_token_env,
+            },
+            "body": read_receipt_body,
+            "payload": read_receipt_payload,
+        },
+        "startup_facade_payload_skeleton": {
+            "method": "POST",
+            "path": startup_path,
+            "facade": "runtime_context.startup",
+            "legacy_tool": "parallel_branch_startup",
+            "required_fields": [
+                "runtime_context_id",
+                "parent_task_id",
+                "session_token",
+                "fence_token",
+                "target_project_root",
+                *startup_identity_required_fields,
+            ],
+            "required_real_worker_identity_fields": startup_identity_required_fields,
+            "forbidden_startup_evidence": [
+                "current_thread",
+                "synthetic_startup",
+                "reconstructed_startup",
+                "observer-authored startup evidence",
+            ],
+            "auth_fields": {
+                "session_token": session_token_placeholder,
+                "session_token_env": session_token_env,
+                "fence_token": fence_token_placeholder,
+                "fence_token_env": fence_token_env,
+            },
+            "body": startup_body,
+            "payload": startup_payload,
+        },
+    }
+
+
 def _runtime_context_worker_recovery_details(
     ctx: RequestContext,
     conn,
@@ -8323,6 +8544,7 @@ def _runtime_context_worker_recovery_details(
     recovery_action_id = "retry_with_matching_runtime_context_identity"
     recoverable = bool(context)
     target_root_projection: dict[str, Any] = {}
+    actionable_payloads: dict[str, Any] = {}
     diagnostics: dict[str, Any] = {
         "reason": reason or "fence_invalidated_or_unknown",
         "caller_omitted_target_project_root": caller_omitted_target_root,
@@ -8364,7 +8586,13 @@ def _runtime_context_worker_recovery_details(
             and supplied_session_hash
             and supplied_session_hash == getattr(context, "session_token_hash", "")
         )
+        fence_token_hash = ""
         try:
+            from .parallel_branch_runtime import runtime_context_secret_hash
+
+            fence_token_hash = runtime_context_secret_hash(
+                str(getattr(context, "fence_token", "") or fence_token or "")
+            )
             fence_matches = bool(
                 getattr(context, "fence_token", "")
                 and fence_token
@@ -8513,6 +8741,22 @@ def _runtime_context_worker_recovery_details(
         elif caller_omitted_target_root and expected_target_root:
             next_legal_action = "retry_with_target_project_root"
             recovery_action_id = "copy_projected_target_project_root"
+        actionable_payloads = _runtime_context_worker_recovery_payloads(
+            project_id=project_id,
+            runtime_context_id=expected_runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            parent_task_id=expected_parent_task_id,
+            worker_id=str(getattr(context, "worker_id", "") or ""),
+            worker_slot_id=str(
+                getattr(context, "worker_slot_id", "")
+                or getattr(context, "worker_id", "")
+                or ""
+            ),
+            target_project_root=expected_target_root,
+            route_identity=expected_route_identity or supplied_route_identity,
+            fence_token_hash=fence_token_hash,
+            read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
+        )
     recovery_actions = [
         {
             "id": recovery_action_id,
@@ -8531,12 +8775,22 @@ def _runtime_context_worker_recovery_details(
         "recovery_actions": recovery_actions,
         "diagnostics": diagnostics,
         "target_project_root_projection": target_root_projection,
+        "actionable_payloads": actionable_payloads,
+        "read_receipt_facade_payload_skeleton": actionable_payloads.get(
+            "read_receipt_facade_payload_skeleton",
+            {},
+        ),
+        "startup_facade_payload_skeleton": actionable_payloads.get(
+            "startup_facade_payload_skeleton",
+            {},
+        ),
         "corrected_request_shapes": target_root_projection.get(
             "corrected_request_shapes",
             {},
         ),
         "fail_closed": True,
         "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
         "raw_route_token_exposed": False,
     }
 
@@ -30781,6 +31035,33 @@ def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) ->
             ],
             "alternate_followup": str(next_action.get("alternate_followup") or ""),
             "requires_session_token": bool(next_action.get("requires_session_token")),
+            "prepare_endpoint": dict(
+                next_action.get("prepare_endpoint")
+                if isinstance(next_action.get("prepare_endpoint"), Mapping)
+                else next_action.get("prepare_endpoint_after_takeover")
+                if isinstance(next_action.get("prepare_endpoint_after_takeover"), Mapping)
+                else {}
+            ),
+            "prepare_payload": dict(
+                next_action.get("prepare_payload")
+                if isinstance(next_action.get("prepare_payload"), Mapping)
+                else next_action.get("prepare_payload_after_takeover")
+                if isinstance(next_action.get("prepare_payload_after_takeover"), Mapping)
+                else {}
+            ),
+            "prepare_response_contains": dict(
+                next_action.get("prepare_response_contains")
+                if isinstance(next_action.get("prepare_response_contains"), Mapping)
+                else {}
+            ),
+            "startup_evidence_policy": dict(
+                next_action.get("startup_evidence_policy")
+                if isinstance(next_action.get("startup_evidence_policy"), Mapping)
+                else {}
+            ),
+            "stale_recovery_tools": [
+                str(item) for item in (next_action.get("stale_recovery_tools") or [])
+            ],
         },
     }
 

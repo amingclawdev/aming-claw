@@ -3510,6 +3510,52 @@ def _timeline_actual_startup_event_for_command(
     return max(candidates, key=_timeline_event_id, default={})
 
 
+def _claimed_execute_missing_startup_prepare_payload(command: Mapping[str, Any]) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), Mapping) else {}
+
+    def _text(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    backlog_id = _text(payload.get("backlog_id"), command.get("backlog_id"))
+    command_id = _text(command.get("command_id"))
+    prepare_payload = {
+        "project_id": "<project_id>",
+        "backlog_id": backlog_id,
+        "observer_command_id": command_id,
+        "route_id": _text(payload.get("route_id")),
+        "route_context_hash": _text(payload.get("route_context_hash")),
+        "prompt_contract_id": _text(payload.get("prompt_contract_id")),
+        "prompt_contract_hash": _text(payload.get("prompt_contract_hash")),
+        "route_token_ref": _text(payload.get("route_token_ref")),
+        "visible_injection_manifest_hash": _text(
+            payload.get("visible_injection_manifest_hash")
+        ),
+        "merge_queue_id": _text(payload.get("merge_queue_id")),
+        "runtime_context_id": _text(payload.get("runtime_context_id"))
+        or "<mfrctx-from-branch-runtime-allocation>",
+        "task_id": _text(payload.get("task_id")) or "<worker-task-id>",
+        "parent_task_id": _text(payload.get("parent_task_id")) or backlog_id,
+        "worker_id": _text(payload.get("worker_id"), payload.get("worker_slot_id"))
+        or "<worker-slot-id>",
+        "fence_token": "<read from worker launch envelope or env:AMING_WORKER_FENCE_TOKEN>",
+        "target_project_root": _text(payload.get("target_project_root"))
+        or "<assigned worker worktree root>",
+        "owned_files": payload.get("owned_files")
+        if isinstance(payload.get("owned_files"), list)
+        else payload.get("target_files")
+        if isinstance(payload.get("target_files"), list)
+        else ["<repo-relative-owned-file>"],
+        "backend_mode": _text(payload.get("backend_mode"), payload.get("worker_backend"))
+        or "codex_cli",
+        "worker_next_legal_action": "submit_mf_subagent_read_receipt",
+    }
+    return {key: value for key, value in prepare_payload.items() if value != ""}
+
+
 def _claimed_execute_missing_startup_recovery(
     conn: sqlite3.Connection,
     *,
@@ -3613,6 +3659,44 @@ def _claimed_execute_missing_startup_recovery(
     }
     if blocker:
         response["blocker"] = blocker
+    prepare_payload = _claimed_execute_missing_startup_prepare_payload(diagnosed)
+    prepare_endpoint = {
+        "method": "POST",
+        "path": f"/api/projects/{project_id}/observer/runtime-text/prepare",
+        "mcp_tool": "observer_runtime_text_prepare",
+    }
+    prepare_response_contains = {
+        "executable_worker_launch": "response.executable_worker_launch",
+        "read_receipt_facade_payload_skeleton": (
+            "response.executable_handoff_packet.read_receipt_facade_payload_skeleton"
+        ),
+        "startup_facade_payload_skeleton": (
+            "response.executable_handoff_packet.startup_facade_payload_skeleton"
+        ),
+        "startup_recording": "response.startup_recording",
+        "worker_launch_pack": "response.worker_launch_pack",
+    }
+    startup_evidence_policy = {
+        "real_worker_required": True,
+        "forbidden_as_startup_evidence": [
+            "current-thread startup",
+            "synthetic startup",
+            "observer-authored startup",
+            "reconstructed or backfilled startup",
+        ],
+        "required_startup_fields": [
+            "actual_host_worker_id",
+            "worker_session_id",
+            "worker_transcript_ref or worker_transcript_path",
+            "harness_type",
+            "filer_principal",
+            "actual_cwd",
+            "actual_git_root",
+            "head_commit",
+            "read_receipt_hash",
+            "read_receipt_event_id",
+        ],
+    }
     if stale:
         response["next_legal_action"] = {
             "tool": "observer_command_takeover",
@@ -3627,9 +3711,17 @@ def _claimed_execute_missing_startup_recovery(
             "claimed_by_session_id": claimed_by,
             "eligible_session_ids": active_recovery_session_ids,
             "requires_session_token": True,
+            "stale_recovery_tools": [
+                "observer_session_register",
+                "observer_command_takeover",
+            ],
             "prerequisite_tool": (
                 "" if active_recovery_session_ids else "observer_session_register"
             ),
+            "prepare_endpoint_after_takeover": prepare_endpoint,
+            "prepare_payload_after_takeover": prepare_payload,
+            "prepare_response_contains": prepare_response_contains,
+            "startup_evidence_policy": startup_evidence_policy,
             "followup_sequence": [
                 "observer_runtime_text_prepare",
                 "mf_subagent_read_receipt",
@@ -3650,6 +3742,10 @@ def _claimed_execute_missing_startup_recovery(
             "observer_command_id": str(diagnosed.get("command_id") or ""),
             "claimed_by_session_id": claimed_by,
             "requires_session_token": False,
+            "prepare_endpoint": prepare_endpoint,
+            "prepare_payload": prepare_payload,
+            "prepare_response_contains": prepare_response_contains,
+            "startup_evidence_policy": startup_evidence_policy,
             "followup_sequence": [
                 "observer_runtime_text_prepare",
                 "launch_worker_now",

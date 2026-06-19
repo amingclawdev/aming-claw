@@ -450,6 +450,62 @@ TOOLS: list[dict] = [
                 "prompt": {"type": "string"},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                 "test_commands": {"type": "array", "items": {"type": "string"}},
+                "backend_mode": {
+                    "type": "string",
+                    "description": "Worker launch backend, e.g. codex_cli.",
+                },
+                "worker_backend": {
+                    "type": "string",
+                    "description": "Alias for backend_mode.",
+                },
+                "worker_next_legal_action": {
+                    "type": "string",
+                    "description": (
+                        "Expected next runtime-context worker action, usually "
+                        "submit_mf_subagent_read_receipt or record_mf_subagent_startup."
+                    ),
+                },
+                "read_receipt_hash": {"type": "string"},
+                "read_receipt_event_id": {"type": "string"},
+                "read_receipt": {"type": "object"},
+                "actual_host_worker_id": {
+                    "type": "string",
+                    "description": "Actual host-created worker/session id when known.",
+                },
+                "host_adapter_worker_id": {
+                    "type": "string",
+                    "description": "Alias for actual_host_worker_id.",
+                },
+                "host_worker_id": {
+                    "type": "string",
+                    "description": "Alias for actual_host_worker_id.",
+                },
+                "host_startup_id": {"type": "string"},
+                "host_session_id": {"type": "string"},
+                "worker_session_id": {"type": "string"},
+                "worker_transcript_ref": {"type": "string"},
+                "worker_transcript_path": {"type": "string"},
+                "harness_type": {
+                    "type": "string",
+                    "enum": ["codex", "claude"],
+                },
+                "filer_principal": {"type": "string"},
+                "session_token_surrogate": {"type": "string"},
+                "session_surrogate": {
+                    "type": "string",
+                    "description": "Alias for session_token_surrogate.",
+                },
+                "startup_prerequisites": {"type": "object"},
+                "startup_source": {"type": "string"},
+                "transcript_refs": {"type": "array", "items": {"type": "string"}},
+                "transcript_digests": {"type": "array", "items": {"type": "string"}},
+                "graph_query_schema_trace_id": {"type": "string"},
+                "context_pack_refs": {"type": "array", "items": {"type": "string"}},
+                "context_pack_status": {"type": "string"},
+                "context_pack_resolution": {"type": "object"},
+                "worker_guide_ref": {"type": "string"},
+                "worker_guide_hash": {"type": "string"},
+                "worker_guide_status": {"type": "string"},
             },
             "required": [
                 "project_id",
@@ -1127,6 +1183,7 @@ TOOLS: list[dict] = [
                 "runtime_context_id": {"type": "string"},
                 "observer_command_id": {"type": "string"},
                 "host_startup_id": {"type": "string"},
+                "host_session_id": {"type": "string"},
                 "actual_cwd": {"type": "string"},
                 "actual_git_root": {"type": "string"},
                 "branch": {"type": "string"},

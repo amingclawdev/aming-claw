@@ -1083,6 +1083,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "fence_token",
         "runtime_context_id",
         "observer_command_id",
+        "host_session_id",
         "actual_cwd",
         "actual_git_root",
         "branch",
@@ -1131,6 +1132,25 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     assert "canonical parent route identity" in runtime_text_props[
         "parent_route_identity"
     ]["description"]
+    for key in (
+        "backend_mode",
+        "worker_backend",
+        "worker_next_legal_action",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "host_session_id",
+        "worker_session_id",
+        "worker_transcript_ref",
+        "worker_transcript_path",
+        "harness_type",
+        "filer_principal",
+        "session_token_surrogate",
+        "startup_prerequisites",
+        "startup_source",
+    ):
+        assert key in runtime_text_props
 
 
 def test_mcp_parallel_branch_tools_route_to_governance_api():

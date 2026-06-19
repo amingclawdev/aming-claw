@@ -13320,6 +13320,31 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
     assert missing_read_receipt.value.details["diagnostics"]["expected"][
         "target_project_root"
     ] == str(target_root)
+    read_recovery = missing_read_receipt.value.details
+    assert read_recovery["actionable_payloads"]["runtime_context_id"] == (
+        context.runtime_context_id
+    )
+    assert read_recovery["actionable_payloads"]["worker_slot_id"] == (
+        "worker-runtime-context"
+    )
+    assert read_recovery["actionable_payloads"]["route_token_ref"] == (
+        "rtok-runtime-context"
+    )
+    assert read_recovery["actionable_payloads"]["endpoints"][
+        "runtime_context_read_receipts"
+    ]["tool"] == "submit_mf_subagent_read_receipt"
+    receipt_skeleton = read_recovery["read_receipt_facade_payload_skeleton"]
+    assert receipt_skeleton["path"].endswith(
+        f"/runtime-contexts/{context.runtime_context_id}/read-receipts"
+    )
+    assert receipt_skeleton["body"]["session_token"].startswith("<read from env:")
+    assert receipt_skeleton["body"]["fence_token"].startswith("<read from env:")
+    assert receipt_skeleton["payload"]["target_project_root"] == str(target_root)
+    assert "session-runtime-context" not in json.dumps(
+        read_recovery,
+        sort_keys=True,
+    )
+    assert "fence-runtime-context" not in json.dumps(read_recovery, sort_keys=True)
 
     read_receipt = task_timeline.record_event(
         conn,
@@ -13351,6 +13376,29 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
     assert missing_startup.value.details["next_legal_action"] == (
         "record_mf_subagent_startup"
     )
+    startup_skeleton = missing_startup.value.details[
+        "startup_facade_payload_skeleton"
+    ]
+    assert startup_skeleton["legacy_tool"] == "parallel_branch_startup"
+    assert startup_skeleton["path"].endswith(
+        f"/runtime-contexts/{context.runtime_context_id}/startup"
+    )
+    assert "actual_host_worker_id" in startup_skeleton[
+        "required_real_worker_identity_fields"
+    ]
+    assert "host_startup_id" in startup_skeleton[
+        "required_real_worker_identity_fields"
+    ]
+    assert "host_session_id" in startup_skeleton[
+        "required_real_worker_identity_fields"
+    ]
+    assert startup_skeleton["body"]["worker_session_id"] == (
+        "<actual worker-owned session id>"
+    )
+    assert startup_skeleton["body"]["target_project_root"] == str(target_root)
+    assert missing_startup.value.details["actionable_payloads"]["endpoints"][
+        "runtime_context_startup"
+    ]["tool"] == "record_mf_subagent_startup"
 
     task_timeline.record_event(
         conn,
