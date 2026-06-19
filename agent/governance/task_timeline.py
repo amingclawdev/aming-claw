@@ -107,6 +107,7 @@ MF_CLOSE_PASS_STATUSES = {
 
 MF_CONTRACT_SCHEMA_VERSION = "mf_contract_gate.v1"
 MF_CONTRACT_PROJECTION_SCHEMA_VERSION = "mf_contract_projection.v1"
+CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
 MF_SUBAGENT_FINISH_GATE_CLOSE_PROJECTION_SCHEMA_VERSION = (
     "mf_subagent_finish_gate_close_projection.v1"
 )
@@ -2147,6 +2148,29 @@ _CONTRACT_HASH_FIELD_NAMES = {
     "previous_revision_hash",
 }
 
+_CONTRACT_REVISION_FIELD_NAMES = {
+    "contract_revision_id",
+    "current_revision_id",
+    "revision_id",
+    "runtime_contract_revision_id",
+}
+
+_ROUTE_BINDING_FIELD_NAMES = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "route_token_ref",
+)
+
+_TEST_ROUTE_FIELD_NAMES = (
+    "test_route",
+    "verification_route",
+    "verification_route_policy",
+    "test_scenario_policy",
+)
+
 
 def _collect_contract_hashes(value: Any, hashes: set[str], *, depth: int = 0) -> None:
     if depth > 5:
@@ -2228,6 +2252,179 @@ def mf_contract_projection(
         "contract_hash_source": contract_hash_source,
         "observed_contract_hashes": sorted(observed_hashes),
         "read_receipt_gate": read_receipt_gate,
+    }
+
+
+def _dedupe_nonempty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        token = str(value or "").strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _first_mapping(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
+def _event_payloads(event: dict[str, Any]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for key in ("payload", "verification", "artifact_refs"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            payloads.append(value)
+    return payloads
+
+
+def _latest_contract_revision_id(
+    events: list[dict[str, Any]],
+    root: dict[str, Any],
+) -> str:
+    for key in _CONTRACT_REVISION_FIELD_NAMES:
+        token = str(root.get(key) or "").strip()
+        if token:
+            return token
+    for event in reversed(events):
+        for payload in _event_payloads(event):
+            for key in _CONTRACT_REVISION_FIELD_NAMES:
+                token = str(payload.get(key) or "").strip()
+                if token:
+                    return token
+    return ""
+
+
+def _latest_route_binding(
+    events: list[dict[str, Any]],
+    root: dict[str, Any],
+) -> dict[str, Any]:
+    binding = _first_mapping(
+        root.get("route_binding"),
+        root.get("route_identity"),
+        root.get("route_context"),
+    )
+    for event in events:
+        for payload in _event_payloads(event):
+            candidate = _first_mapping(
+                payload.get("route_binding"),
+                payload.get("route_identity"),
+                payload.get("route_context"),
+                payload.get("route_token_gate"),
+            )
+            for field in _ROUTE_BINDING_FIELD_NAMES:
+                value = payload.get(field)
+                if value:
+                    candidate[field] = value
+            if not candidate:
+                continue
+            binding.update(
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key in _ROUTE_BINDING_FIELD_NAMES
+                    or key in {"source_event_id", "status"}
+                }
+            )
+            event_id = event.get("id")
+            if event_id:
+                binding["source_event_id"] = event_id
+            binding["status"] = str(event.get("status") or binding.get("status") or "")
+    return binding
+
+
+def _latest_test_route(
+    events: list[dict[str, Any]],
+    root: dict[str, Any],
+) -> dict[str, Any]:
+    route = _first_mapping(*(root.get(field) for field in _TEST_ROUTE_FIELD_NAMES))
+    for event in events:
+        for payload in _event_payloads(event):
+            candidate = _first_mapping(
+                *(payload.get(field) for field in _TEST_ROUTE_FIELD_NAMES)
+            )
+            if not candidate:
+                continue
+            route.update(candidate)
+            event_id = event.get("id")
+            if event_id:
+                route["source_event_id"] = event_id
+            route["status"] = str(event.get("status") or route.get("status") or "")
+    return route
+
+
+def _contract_required_evidence(root: dict[str, Any]) -> list[str]:
+    evidence = root.get("evidence_requirements") or root.get("required_evidence") or []
+    if isinstance(evidence, list):
+        values: list[str] = []
+        for item in evidence:
+            if isinstance(item, dict):
+                token = str(item.get("id") or item.get("requirement_id") or "").strip()
+            else:
+                token = str(item or "").strip()
+            if token:
+                values.append(token)
+        if values:
+            return _dedupe_nonempty(values)
+    return _dedupe_nonempty(
+        [
+            "route_context",
+            "route_action_precheck",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "independent_verification_lane",
+            *sorted(MF_CLOSE_REQUIRED_EVENT_KINDS),
+        ]
+    )
+
+
+def contract_state_projection(
+    events: list[dict[str, Any]] | None,
+    contract: dict[str, Any] | None = None,
+    backlog_row: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fold backlog contract JSON and timeline rows into a read-only state view."""
+
+    rows = [event for event in (events or []) if isinstance(event, dict)]
+    root = _contract_root(contract)
+    row = dict(backlog_row or {})
+    backlog_id = str(row.get("bug_id") or row.get("backlog_id") or "").strip()
+    if not backlog_id:
+        for event in rows:
+            backlog_id = str(event.get("backlog_id") or "").strip()
+            if backlog_id:
+                break
+    mf_projection = mf_contract_projection(rows, contract)
+    contract_id = str(
+        root.get("contract_id")
+        or root.get("contract_instance_id")
+        or root.get("template_id")
+        or ""
+    ).strip()
+    state = str(mf_projection.get("status") or "no_contract")
+    return {
+        "schema_version": CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
+        "source_of_truth": "Contract/Revision/Event",
+        "contract_id": contract_id,
+        "backlog_id": backlog_id,
+        "current_revision_id": _latest_contract_revision_id(rows, root),
+        "state": state,
+        "status": state,
+        "legacy_no_contract": not bool(root),
+        "route_binding": _latest_route_binding(rows, root),
+        "test_route": _latest_test_route(rows, root),
+        "required_evidence": _contract_required_evidence(root),
+        "projection_watermark": mf_projection.get("projection_watermark", 0),
+        "contract_projection": mf_projection,
+        "close_ready_policy": {
+            "source": "rule_gate_projection",
+            "timeline_event_is_authoritative": False,
+        },
     }
 
 

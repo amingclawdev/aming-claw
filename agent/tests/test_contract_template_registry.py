@@ -122,12 +122,33 @@ def test_mf_workflow_runtime_loads_while_meta_contract_is_present():
     assert "meta_contract.v1" not in ids
 
 
+def test_review_contract_template_declares_non_close_satisfying_review_events():
+    template = get_contract_template("review_contract.v1")
+
+    assert template["contract_kind"] == "review_contract"
+    assert template["timeline_contract"]["close_satisfying"] is False
+    assert "design_review" in template["timeline_contract"]["allowed_event_kinds"]
+    assert template["gate_policy"]["may_satisfy_close_ready"] is False
+
+
+def test_review_contract_resolves_for_design_review_stage():
+    template = resolve_contract_template(
+        task_type="design_review",
+        stage="design_review",
+    )
+
+    assert template["template_id"] == "review_contract.v1"
+
+
 def test_meta_contract_whitelist_loads_outside_public_template_registry():
     meta_contract = load_meta_contract_template()
 
     assert meta_contract["id"] == "meta_contract.v1"
     assert "observer" in meta_contract["role_action_whitelist"]
     assert "dispatch_bounded_worker" in (
+        meta_contract["role_action_whitelist"]["observer"]["allowed_actions"]
+    )
+    assert "design_review" in (
         meta_contract["role_action_whitelist"]["observer"]["allowed_actions"]
     )
 

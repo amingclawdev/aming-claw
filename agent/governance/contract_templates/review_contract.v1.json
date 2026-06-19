@@ -1,0 +1,79 @@
+{
+  "schema_version": "review_contract.v1",
+  "template_id": "review_contract.v1",
+  "version": "v1",
+  "contract_kind": "review_contract",
+  "description": "First-class contract for non-close-satisfying design, architecture, plan-precheck, and adversarial review timeline evidence.",
+  "task_types": [
+    "design_review",
+    "architecture_review",
+    "plan_precheck",
+    "adversarial_review"
+  ],
+  "stages": [
+    "design_review",
+    "architecture_review",
+    "review_dispatch",
+    "review_ready"
+  ],
+  "source": {
+    "type": "source_controlled",
+    "path": "agent/governance/contract_templates/review_contract.v1.json"
+  },
+  "timeline_contract": {
+    "close_satisfying": false,
+    "source_of_truth": "Contract/Revision/Event",
+    "allowed_event_kinds": [
+      "design_review",
+      "architecture_review",
+      "review_lane",
+      "plan_precheck",
+      "adversarial_review"
+    ],
+    "required_payload_fields": [
+      "review_contract_id",
+      "review_lane_id",
+      "review_decision",
+      "reviewed_contract_summary"
+    ],
+    "forbidden_claims": [
+      "implementation_complete",
+      "verification_passed",
+      "close_ready",
+      "worker_startup_satisfied"
+    ]
+  },
+  "state_model": {
+    "state_layer": "contract_state_projection",
+    "timeline_role": "append_only_review_evidence",
+    "runtime_role": "read_only_projection_consumer",
+    "gate_role": "review_evidence_classifier_not_close_authority"
+  },
+  "event_envelope": {
+    "required_identity_fields": [
+      "project_id",
+      "backlog_id",
+      "contract_id",
+      "contract_revision_id",
+      "actor_role"
+    ],
+    "recommended_identity_fields": [
+      "route_id",
+      "route_context_hash",
+      "prompt_contract_id",
+      "route_token_ref",
+      "source_event_id",
+      "work_mode",
+      "base_commit",
+      "target_head_commit",
+      "fence_token"
+    ]
+  },
+  "gate_policy": {
+    "may_inform_contract_amendment": true,
+    "may_satisfy_architecture_review_lane": true,
+    "may_satisfy_close_ready": false,
+    "may_substitute_worker_or_qa_evidence": false,
+    "unknown_review_action_close_satisfying": false
+  }
+}

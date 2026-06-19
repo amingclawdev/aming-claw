@@ -35,6 +35,11 @@
         "route_context",
         "route_identity_cleanup",
         "route_action_precheck",
+        "design_review",
+        "architecture_review",
+        "review_lane",
+        "plan_precheck",
+        "adversarial_review",
         "observer_work_mode_transition",
         "dispatch_bounded_worker",
         "merge_preview",
@@ -110,6 +115,11 @@
     },
     "judge": {
       "allowed_actions": [
+        "design_review",
+        "architecture_review",
+        "review_lane",
+        "plan_precheck",
+        "adversarial_review",
         "independent_verification",
         "qa_review",
         "record_blocker",

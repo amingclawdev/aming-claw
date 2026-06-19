@@ -18932,6 +18932,81 @@ def test_timeline_append_meta_contract_rejects_observer_forbidden_action(conn):
     assert events == []
 
 
+def test_timeline_append_allows_design_review_contract_event(conn):
+    backlog_id = "AC-REVIEW-CONTRACT-DESIGN-REVIEW"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "event_type": "review.design",
+                "event_kind": "design_review",
+                "phase": "design_review",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "review_contract_id": "review_contract.v1",
+                    "review_lane_id": "architecture_review_lane",
+                    "review_decision": "pass_with_followups",
+                    "reviewed_contract_summary": "Contract State Layer design review.",
+                    "contract_id": "contract-state-layer",
+                    "contract_revision_id": "crev-1",
+                    "close_satisfying": False,
+                },
+            },
+        )
+    )
+
+    assert result["event_kind"] == "design_review"
+    assert result["meta_contract_gate"]["action"] == "design_review"
+    assert result["meta_contract_gate"]["role"] == "observer"
+    assert task_timeline.is_protected_close_evidence(result) is False
+
+
+def test_backlog_contract_state_projection_legacy_no_contract(conn):
+    backlog_id = "AC-CONTRACT-STATE-LEGACY-NO-CONTRACT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        event_type="review.design",
+        event_kind="design_review",
+        phase="design_review",
+        actor="observer",
+        status="passed",
+        payload={
+            "review_contract_id": "review_contract.v1",
+            "review_lane_id": "architecture_review_lane",
+            "review_decision": "pass_with_followups",
+            "reviewed_contract_summary": "Legacy row has review evidence only.",
+            "contract_revision_id": "crev-review-1",
+            "route_context_hash": "sha256:route-context-review",
+            "prompt_contract_id": "prompt-review",
+            "test_route": {"decision": "deferred"},
+        },
+    )
+    conn.commit()
+
+    result = server.handle_backlog_contract_state(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    projection = result["contract_state"]
+    assert projection["schema_version"] == "contract_state_projection.v1"
+    assert projection["source_of_truth"] == "Contract/Revision/Event"
+    assert projection["backlog_id"] == backlog_id
+    assert projection["legacy_no_contract"] is True
+    assert projection["state"] == "no_contract"
+    assert projection["current_revision_id"] == "crev-review-1"
+    assert projection["route_binding"]["route_context_hash"] == "sha256:route-context-review"
+    assert projection["test_route"]["decision"] == "deferred"
+    assert projection["close_ready_policy"]["timeline_event_is_authoritative"] is False
+
+
 def test_task_timeline_record_event_centrally_rejects_meta_contract_bypass(conn):
     backlog_id = "AC-META-CONTRACT-CENTRAL-REJECT"
     _insert_simple_mf_close_backlog(conn, backlog_id)

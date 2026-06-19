@@ -629,6 +629,9 @@ def test_meta_contract_template_encodes_observer_whitelist_and_red_lines() -> No
     assert "dispatch_bounded_worker" in template["role_action_whitelist"]["observer"][
         "allowed_actions"
     ]
+    assert "design_review" in template["role_action_whitelist"]["observer"][
+        "allowed_actions"
+    ]
     assert "observer_work_mode_transition" in template["role_action_whitelist"][
         "observer"
     ]["allowed_actions"]
@@ -642,6 +645,44 @@ def test_meta_contract_template_encodes_observer_whitelist_and_red_lines() -> No
     assert template["hotfix_profile"]["under_action_requires_entry"] is True
     assert template["hotfix_profile"]["under_action_requires_ref"] is True
     assert template["hotfix_profile"]["under_action_requires_reason"] is True
+
+
+def test_meta_contract_allows_design_review_as_non_worker_review_evidence() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "review.design",
+            "event_kind": "design_review",
+            "phase": "design_review",
+            "actor": "observer",
+            "status": "passed",
+            "payload": {
+                "review_contract_id": "review_contract.v1",
+                "review_lane_id": "architecture_review_lane",
+                "review_decision": "pass_with_followups",
+                "reviewed_contract_summary": "Contract State Layer additive design review.",
+                "close_satisfying": False,
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == "observer"
+    assert gate["action"] == "design_review"
+    assert gate["observer_worker_transport"] is False
+
+
+def test_meta_contract_rejects_unknown_review_action() -> None:
+    with pytest.raises(MfSubagentContractError, match="unknown timeline action"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "review.product",
+                "event_kind": "product_review",
+                "phase": "product_review",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {"review_contract_id": "review_contract.v1"},
+            }
+        )
 
 
 def test_meta_contract_rejects_observer_forbidden_action_d2_boundary() -> None:

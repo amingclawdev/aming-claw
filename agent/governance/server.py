@@ -32385,6 +32385,39 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/backlog/{project_id}/{bug_id}/contract-state")
+def handle_backlog_contract_state(ctx: RequestContext):
+    """Return the additive Contract State projection for one backlog row."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    from . import task_timeline
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+        events = task_timeline.list_events(conn, pid, backlog_id=bug_id, limit=1000)
+        contract = backlog_runtime.parse_json_object(
+            _row_get(row, "chain_trigger_json", "{}")
+        )
+        projection = task_timeline.contract_state_projection(
+            events,
+            contract=contract,
+            backlog_row=dict(row),
+        )
+        return {
+            "ok": True,
+            "project_id": pid,
+            "backlog_id": bug_id,
+            "contract_state": projection,
+            "request_id": ctx.request_id,
+        }
+    finally:
+        conn.close()
+
+
 def _changed_files_from_close_body(body: dict) -> list[str]:
     raw = body.get("changed_files")
     if raw is None:
