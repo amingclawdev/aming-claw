@@ -3852,6 +3852,8 @@ def mf_route_context_gate_verification(
             categories = _route_event_categories(event)
             if "route_context" not in categories:
                 continue
+            if categories.intersection(MF_ROUTE_WORKER_REQUIREMENTS):
+                continue
             identity = _route_identity(event)
             if identity and _route_event_passed(event):
                 parent_route_identity_hint = identity

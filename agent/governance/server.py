@@ -27524,6 +27524,38 @@ def _record_bounded_worker_dispatch_event(
         if not dispatch.get(key):
             dispatch[key] = _first_text(body.get(key), prepared.get(key))
 
+    prepared_dispatch_gate = (
+        prepared.get("dispatch_gate")
+        if isinstance(prepared.get("dispatch_gate"), Mapping)
+        else {}
+    )
+    parent_route_lineage = (
+        prepared_dispatch_gate.get("parent_route_lineage")
+        if isinstance(prepared_dispatch_gate.get("parent_route_lineage"), Mapping)
+        else prepared.get("parent_route_lineage")
+        if isinstance(prepared.get("parent_route_lineage"), Mapping)
+        else {}
+    )
+    if parent_route_lineage:
+        dispatch["parent_route_lineage"] = dict(parent_route_lineage)
+        parent_route_token_ref = _first_text(
+            parent_route_lineage.get("route_token_ref"),
+            parent_route_lineage.get("parent_route_token_ref"),
+        )
+        dispatch["child_route_lineage"] = {
+            "schema_version": "bounded_worker_dispatch.child_route_lineage.v1",
+            "route_id": dispatch.get("route_id") or "",
+            "route_context_hash": dispatch.get("route_context_hash") or "",
+            "prompt_contract_id": dispatch.get("prompt_contract_id") or "",
+            "prompt_contract_hash": dispatch.get("prompt_contract_hash") or "",
+            "route_token_ref": dispatch.get("route_token_ref") or "",
+            "visible_injection_manifest_hash": dispatch.get(
+                "visible_injection_manifest_hash"
+            )
+            or "",
+            "parent_route_token_ref": parent_route_token_ref,
+        }
+
     required = (
         "route_context_hash",
         "prompt_contract_id",
@@ -27980,6 +28012,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         precheck_run_id=str(body.get("precheck_run_id") or ""),
         visible_injection_manifest_hash=str(
             body.get("visible_injection_manifest_hash") or ""
+        ),
+        parent_route_identity=(
+            body.get("parent_route_identity")
+            if isinstance(body.get("parent_route_identity"), Mapping)
+            else {}
         ),
         graph_query_schema_trace_id=str(body.get("graph_query_schema_trace_id") or ""),
         context_pack_refs=tuple(

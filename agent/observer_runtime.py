@@ -375,6 +375,7 @@ class ObserverRuntimeTextPrepareRequest:
     route_id: str = ""
     precheck_run_id: str = ""
     visible_injection_manifest_hash: str = ""
+    parent_route_identity: Mapping[str, Any] = field(default_factory=dict)
     graph_query_schema_trace_id: str = ""
     context_pack_refs: tuple[str, ...] = ()
     context_pack_status: str = ""
@@ -1699,14 +1700,40 @@ def _runtime_text_observer_command_requirement(
 def _runtime_text_parent_route_lineage(
     request: ObserverRuntimeTextPrepareRequest,
 ) -> dict[str, Any]:
+    parent_identity = (
+        request.parent_route_identity
+        if isinstance(request.parent_route_identity, Mapping)
+        else {}
+    )
+    route_id = str(parent_identity.get("route_id") or request.route_id or "").strip()
+    route_context_hash = str(
+        parent_identity.get("route_context_hash") or request.route.route_context_hash
+    ).strip()
+    prompt_contract_id = str(
+        parent_identity.get("prompt_contract_id") or request.route.prompt_contract_id
+    ).strip()
+    prompt_contract_hash = str(
+        parent_identity.get("prompt_contract_hash") or request.route.prompt_contract_hash
+    ).strip()
+    route_token_ref = str(
+        parent_identity.get("route_token_ref") or request.route.route_token_ref
+    ).strip()
+    visible_manifest = str(
+        parent_identity.get("visible_injection_manifest_hash")
+        or request.visible_injection_manifest_hash
+    ).strip()
     return {
         "schema_version": "parent_route_lineage.v1",
-        "route_id": request.route_id,
-        "route_context_hash": request.route.route_context_hash,
-        "prompt_contract_id": request.route.prompt_contract_id,
-        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+        "route_token_ref": route_token_ref,
+        "visible_injection_manifest_hash": visible_manifest,
         "selected_project": request.project_id,
         "selected_backlog_id": request.backlog_id,
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
         "allowed_actions": [
             "prepare_runtime_text",
             "dispatch_bounded_worker",

@@ -62,6 +62,10 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
+def _fake_sha(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
 class _NoCloseConn:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -2417,6 +2421,234 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
         "worker_constraints"
     ]["scope"]["owned_files"] == ["agent/observer_runtime.py"]
+
+
+def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_close_gate(
+    conn,
+    tmp_path,
+):
+    bug_id = "AC-RUNTIME-TEXT-LINEAGE"
+    task_id = "runtime-text-lineage-task"
+    runtime_context_id = "mfrctx-runtime-text-lineage"
+    worktree = tmp_path / "lineage-worker"
+    worktree.mkdir()
+    main = tmp_path / "lineage-main"
+    main.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=bug_id,
+            root_task_id=bug_id,
+            stage_task_id=task_id,
+            stage_type="mf_sub",
+            worker_id="worker-lineage",
+            attempt=1,
+            fence_token="fence-runtime-text-lineage",
+            branch_ref="refs/heads/codex/runtime-text-lineage",
+            worktree_id="wt-runtime-text-lineage",
+            worktree_path=str(worktree),
+            base_commit="base-lineage",
+            target_head_commit="target-lineage",
+            merge_queue_id="mq-runtime-text-lineage",
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    server.handle_backlog_upsert(
+        _ctx(
+            {"project_id": PID, "bug_id": bug_id},
+            method="POST",
+            body={
+                "title": "Runtime text lineage",
+                "status": "OPEN",
+                "mf_type": "observer_hotfix",
+                "force_admit": True,
+                "chain_trigger_json": {
+                    "parallel_contract": {
+                        "template_id": "mf_parallel.v1",
+                        "contract_instance_id": bug_id,
+                    }
+                },
+            },
+        )
+    )
+    parent_identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": _fake_sha("runtime-text-parent-route"),
+        "prompt_contract_id": "rprompt-runtime-text-parent",
+        "prompt_contract_hash": _fake_sha("runtime-text-parent-contract"),
+        "visible_injection_manifest_hash": _fake_sha("runtime-text-visible"),
+        "route_token_ref": "rtok-runtime-text-parent",
+    }
+    child_identity = {
+        "route_id": "route-runtime-text-child",
+        "route_context_hash": _fake_sha("runtime-text-child-route"),
+        "prompt_contract_id": "rprompt-runtime-text-child",
+        "prompt_contract_hash": _fake_sha("runtime-text-child-contract"),
+        "visible_injection_manifest_hash": _fake_sha("runtime-text-visible"),
+        "route_token_ref": "rtok-runtime-text-child",
+    }
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": bug_id,
+                "observer_command_id": "cmd-runtime-text-lineage",
+                "task_id": task_id,
+                "parent_task_id": bug_id,
+                "runtime_context_id": runtime_context_id,
+                "fence_token": "fence-runtime-text-lineage",
+                "worktree_path": str(worktree),
+                "base_commit": "base-lineage",
+                "target_head_commit": "target-lineage",
+                "merge_queue_id": "mq-runtime-text-lineage",
+                **child_identity,
+                "parent_route_identity": parent_identity,
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-text-lineage"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["dispatch_timeline_event"]["status"] == "recorded"
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=bug_id,
+        task_id=task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["route_id"] == child_identity["route_id"]
+    assert dispatch_payload["route_context_hash"] == child_identity["route_context_hash"]
+    assert dispatch_payload["prompt_contract_id"] == child_identity["prompt_contract_id"]
+    assert dispatch_payload["route_token_ref"] == child_identity["route_token_ref"]
+    assert dispatch_payload["parent_route_lineage"]["backlog_id"] == bug_id
+    assert dispatch_payload["parent_route_lineage"]["route_id"] == (
+        parent_identity["route_id"]
+    )
+    assert dispatch_payload["parent_route_lineage"]["route_token_ref"] == (
+        parent_identity["route_token_ref"]
+    )
+    assert dispatch_payload["child_route_lineage"]["route_id"] == (
+        child_identity["route_id"]
+    )
+    assert dispatch_payload["child_route_lineage"]["route_token_ref"] == (
+        child_identity["route_token_ref"]
+    )
+    assert dispatch_payload["child_route_lineage"]["parent_route_token_ref"] == (
+        parent_identity["route_token_ref"]
+    )
+
+    route_context = {
+        "route_context": {
+            **parent_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["dispatch_worker"],
+            "required_lanes": ["bounded_implementation_worker"],
+        },
+        **parent_identity,
+    }
+    route_action_precheck = {
+        **parent_identity,
+        "allowed_action": "dispatch_worker",
+        "caller_role": "observer",
+    }
+    startup_payload = {
+        **child_identity,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": bug_id,
+        "worker_role": "mf_sub",
+        "worker_slot_id": "worker-lineage",
+        "worker_id": "worker-lineage",
+        "fence_token": "fence-runtime-text-lineage",
+        "actual_cwd": str(worktree),
+        "actual_git_root": str(worktree),
+        "branch": "refs/heads/codex/runtime-text-lineage",
+        "head_commit": "head-lineage",
+        "close_satisfying": True,
+        "worker_session_id": "worker-lineage-session",
+        "filer_principal": "worker-lineage-session",
+        "worker_transcript_ref": "codex-thread:worker-lineage-session",
+        "harness_type": "codex",
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "worker_self_attestation": {
+            "status": "passed",
+            "worker_self_attesting": True,
+            "worker_session_id": "worker-lineage-session",
+            "worker_transcript_ref": "codex-thread:worker-lineage-session",
+            "harness_type": "codex",
+            "blockers": [],
+        },
+        "identity_join": {
+            "route_identity_matches_latest_contract": True,
+            "read_receipt_lineage_present": True,
+        },
+    }
+    events = [
+        ("route_context", "dispatch", "passed", {"route_context": route_context}, {}),
+        ("route_action_precheck", "pre_mutation", "allowed", {}, route_action_precheck),
+        (
+            "mf_subagent_startup",
+            "startup_gate",
+            "passed",
+            {"mf_subagent_startup_gate": startup_payload},
+            {},
+        ),
+        (
+            "independent_verification",
+            "verification",
+            "passed",
+            {},
+            {
+                **parent_identity,
+                "actor": "qa",
+                "independent": True,
+                "tests_run": ["pytest focused"],
+            },
+        ),
+        ("implementation", "implementation", "accepted", {}, {}),
+        ("verification", "verification", "passed", {}, {"tests_run": ["pytest focused"]}),
+        ("close_ready", "close", "accepted", {}, {}),
+    ]
+    for event_kind, phase, status, payload, verification in events:
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=bug_id,
+            task_id=task_id,
+            event_type=f"mf.{event_kind}",
+            event_kind=event_kind,
+            phase=phase,
+            status=status,
+            payload=payload,
+            verification=verification,
+        )
+    conn.commit()
+
+    ready = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": bug_id})
+    )
+    route_gate = ready["timeline_gate"]["route_context_gate"]
+    assert ready["can_close"] is True
+    assert route_gate["missing_requirement_ids"] == []
+    assert route_gate["route_identity"]["route_context_hash"] == (
+        parent_identity["route_context_hash"]
+    )
+    assert route_gate["accepted_dispatch_lineages"][0]["parent_route_token_ref"] == (
+        parent_identity["route_token_ref"]
+    )
 
 
 def test_observer_runtime_text_prepare_persists_registered_host_identity_for_startup(
