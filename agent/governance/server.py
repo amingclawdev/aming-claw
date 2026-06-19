@@ -27735,6 +27735,11 @@ def _observer_root_route_context_state(
         conn=conn,
         project_id=project_id,
     )
+    contract_state = task_timeline.contract_state_projection(
+        events,
+        contract=contract,
+        backlog_row=dict(row) if row else {"bug_id": backlog_id},
+    )
 
     # Graph query_schema trace id: if the caller supplied a plausible trace id
     # (a fresh session that already ran query_schema passes its own gqt-* id),
@@ -27791,6 +27796,7 @@ def _observer_root_route_context_state(
         backlog_id=backlog_id,
         work_mode=effective_work_mode,
         route_context=route_context_for_bootstrap,
+        contract_state=contract_state,
         loaded_skills=loaded_skills,
         loaded_resources=loaded_resources,
         graph_query_schema_trace_id=graph_trace_id,

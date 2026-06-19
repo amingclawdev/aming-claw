@@ -783,6 +783,7 @@ def build_observer_root_route_context(
     backlog_id: str,
     work_mode: Any = DEFAULT_WORK_MODE,
     route_context: Mapping[str, Any] | None = None,
+    contract_state: Mapping[str, Any] | None = None,
     loaded_skills: Any = None,
     loaded_resources: Any = None,
     graph_query_schema_trace_id: Any = None,
@@ -797,6 +798,20 @@ def build_observer_root_route_context(
 
     route = route_context if isinstance(route_context, Mapping) else {}
     mode = normalize_work_mode(work_mode)
+    contract_state_payload = (
+        dict(contract_state)
+        if isinstance(contract_state, Mapping)
+        else {
+            "schema_version": "contract_state_projection.v1",
+            "source_of_truth": "not_loaded",
+            "contract_id": "",
+            "backlog_id": _root_route_string(backlog_id),
+            "current_revision_id": "",
+            "state": "not_loaded",
+            "status": "not_loaded",
+            "legacy_no_contract": True,
+        }
+    )
 
     route_id = _root_route_string(route.get("route_id"))
     prompt_contract_id = _root_route_string(route.get("prompt_contract_id"))
@@ -897,6 +912,7 @@ def build_observer_root_route_context(
         "loaded_skills": _root_route_string_list(loaded_skills),
         "loaded_resources": _root_route_string_list(loaded_resources),
         "graph_query_schema_trace_id": graph_trace_id,
+        "contract_state": contract_state_payload,
         "allowed_actions": allowed_actions,
         "blocked_actions": blocked_action_list,
         "required_evidence": list(ROOT_ROUTE_CONTEXT_REQUIRED_EVIDENCE),

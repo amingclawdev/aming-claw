@@ -695,6 +695,29 @@ def test_root_route_context_returns_required_fields_with_default_mode():
         assert blocked in ctx["blocked_actions"], blocked
     assert ctx["next_legal_action"]["id"] == "record_work_mode_transition"
     assert "route_context" in ctx["required_evidence"]
+    assert ctx["contract_state"]["schema_version"] == "contract_state_projection.v1"
+    assert ctx["contract_state"]["state"] == "not_loaded"
+
+
+def test_root_route_context_surfaces_supplied_contract_state():
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-CONTRACT-STATE-ROOT-CONTEXT",
+        route_context={"route_id": "route-contract"},
+        contract_state={
+            "schema_version": "contract_state_projection.v1",
+            "source_of_truth": "Contract/Revision/Event",
+            "contract_id": "contract-state-layer",
+            "backlog_id": "AC-CONTRACT-STATE-ROOT-CONTEXT",
+            "current_revision_id": "crev-2",
+            "state": "bound",
+            "status": "bound",
+            "legacy_no_contract": False,
+        },
+    )
+
+    assert ctx["contract_state"]["contract_id"] == "contract-state-layer"
+    assert ctx["contract_state"]["current_revision_id"] == "crev-2"
+    assert ctx["contract_state"]["state"] == "bound"
 
 
 def test_root_route_context_execution_supervisor_unblocks_dispatch():

@@ -19007,6 +19007,98 @@ def test_backlog_contract_state_projection_legacy_no_contract(conn):
     assert projection["close_ready_policy"]["timeline_event_is_authoritative"] is False
 
 
+def test_backlog_contract_state_projection_active_contract_binding(conn):
+    backlog_id = "AC-CONTRACT-STATE-ACTIVE-BINDING"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "contract": {
+                        "contract_id": "contract-state-layer",
+                        "contract_revision_id": "crev-1",
+                        "state": "bound",
+                        "required_evidence": [
+                            "route_context",
+                            "route_action_precheck",
+                        ],
+                    }
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        event_type="contract.revision.created",
+        event_kind="contract_revision_created",
+        phase="contract_binding",
+        actor="observer",
+        status="passed",
+        payload={
+            "contract_binding": {
+                "contract_id": "contract-state-layer",
+                "contract_revision_id": "crev-2",
+                "state": "bound",
+            },
+        },
+    )
+    conn.commit()
+
+    result = server.handle_backlog_contract_state(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    projection = result["contract_state"]
+    assert projection["legacy_no_contract"] is False
+    assert projection["contract_id"] == "contract-state-layer"
+    assert projection["current_revision_id"] == "crev-2"
+    assert projection["state"] == "bound"
+    assert projection["contract_binding"]["source_event_id"]
+    assert projection["required_evidence"] == [
+        "route_context",
+        "route_action_precheck",
+    ]
+
+
+def test_observer_root_route_context_includes_contract_state_projection(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-CONTRACT-STATE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "contract": {
+                        "contract_id": "contract-state-layer",
+                        "contract_revision_id": "crev-root-1",
+                        "state": "bound",
+                    }
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        caller_graph_query_schema_trace_id="gqt-20260619-abcdef1234",
+    )
+
+    assert result["contract_state"]["schema_version"] == "contract_state_projection.v1"
+    assert result["contract_state"]["contract_id"] == "contract-state-layer"
+    assert result["contract_state"]["current_revision_id"] == "crev-root-1"
+    assert result["contract_state"]["state"] == "bound"
+    assert result["contract_state"]["legacy_no_contract"] is False
+
+
 def test_task_timeline_record_event_centrally_rejects_meta_contract_bypass(conn):
     backlog_id = "AC-META-CONTRACT-CENTRAL-REJECT"
     _insert_simple_mf_close_backlog(conn, backlog_id)

@@ -632,6 +632,9 @@ def test_meta_contract_template_encodes_observer_whitelist_and_red_lines() -> No
     assert "design_review" in template["role_action_whitelist"]["observer"][
         "allowed_actions"
     ]
+    assert "contract_revision_created" in template["role_action_whitelist"][
+        "observer"
+    ]["allowed_actions"]
     assert "observer_work_mode_transition" in template["role_action_whitelist"][
         "observer"
     ]["allowed_actions"]
@@ -668,6 +671,31 @@ def test_meta_contract_allows_design_review_as_non_worker_review_evidence() -> N
     assert gate["allowed"] is True
     assert gate["role"] == "observer"
     assert gate["action"] == "design_review"
+    assert gate["observer_worker_transport"] is False
+
+
+def test_meta_contract_allows_contract_revision_created_as_state_evidence() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "contract.revision.created",
+            "event_kind": "contract_revision_created",
+            "phase": "contract_binding",
+            "actor": "observer",
+            "status": "passed",
+            "payload": {
+                "contract_binding": {
+                    "contract_id": "contract-state-layer",
+                    "contract_revision_id": "crev-1",
+                    "state": "bound",
+                },
+                "close_satisfying": False,
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == "observer"
+    assert gate["action"] == "contract_revision_created"
     assert gate["observer_worker_transport"] is False
 
 

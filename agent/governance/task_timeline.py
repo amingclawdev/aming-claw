@@ -2155,6 +2155,40 @@ _CONTRACT_REVISION_FIELD_NAMES = {
     "runtime_contract_revision_id",
 }
 
+_CONTRACT_BINDING_EVENT_KINDS = {
+    "contract_binding",
+    "contract_bound",
+    "contract_binding_changed",
+    "contract_revision_created",
+    "contract_revision_changed",
+    "contract_state_changed",
+}
+
+_CONTRACT_BINDING_CONTAINER_KEYS = (
+    "contract_binding",
+    "active_contract",
+    "contract_revision",
+    "contract_instance",
+    "contract",
+)
+
+_CONTRACT_BINDING_FIELD_NAMES = {
+    "contract_id",
+    "contract_instance_id",
+    "contract_template_id",
+    "template_id",
+    "contract_kind",
+    "contract_type",
+    "contract_status",
+    "contract_state",
+    "current_revision_id",
+    "contract_revision_id",
+    "revision_id",
+    "runtime_contract_revision_id",
+    "state",
+    "status",
+}
+
 _ROUTE_BINDING_FIELD_NAMES = (
     "route_id",
     "route_context_hash",
@@ -2283,10 +2317,65 @@ def _event_payloads(event: dict[str, Any]) -> list[dict[str, Any]]:
     return payloads
 
 
+def _contract_binding_from_mapping(value: dict[str, Any]) -> dict[str, Any]:
+    binding: dict[str, Any] = {}
+    for key in _CONTRACT_BINDING_CONTAINER_KEYS:
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            binding.update(
+                {
+                    field: nested_value
+                    for field, nested_value in nested.items()
+                    if field in _CONTRACT_BINDING_FIELD_NAMES
+                    or field in {"source_event_id"}
+                }
+            )
+    for field in _CONTRACT_BINDING_FIELD_NAMES:
+        field_value = value.get(field)
+        if field_value:
+            binding[field] = field_value
+    return binding
+
+
+def _latest_contract_binding(
+    events: list[dict[str, Any]],
+    root: dict[str, Any],
+) -> dict[str, Any]:
+    binding = _contract_binding_from_mapping(root)
+    for event in events:
+        event_kind = str(event.get("event_kind") or "").strip()
+        for payload in _event_payloads(event):
+            candidate = _contract_binding_from_mapping(payload)
+            if not candidate:
+                continue
+            has_nested_binding = any(
+                isinstance(payload.get(key), dict)
+                for key in _CONTRACT_BINDING_CONTAINER_KEYS
+            )
+            if event_kind not in _CONTRACT_BINDING_EVENT_KINDS and not has_nested_binding:
+                continue
+            binding.update(candidate)
+            event_id = event.get("id")
+            if event_id:
+                binding["source_event_id"] = event_id
+            binding["status"] = str(
+                event.get("status")
+                or binding.get("contract_status")
+                or binding.get("status")
+                or ""
+            )
+    return binding
+
+
 def _latest_contract_revision_id(
     events: list[dict[str, Any]],
     root: dict[str, Any],
 ) -> str:
+    binding = _latest_contract_binding(events, root)
+    for key in _CONTRACT_REVISION_FIELD_NAMES:
+        token = str(binding.get(key) or "").strip()
+        if token:
+            return token
     for key in _CONTRACT_REVISION_FIELD_NAMES:
         token = str(root.get(key) or "").strip()
         if token:
@@ -2400,22 +2489,44 @@ def contract_state_projection(
             if backlog_id:
                 break
     mf_projection = mf_contract_projection(rows, contract)
+    binding = _latest_contract_binding(rows, root)
     contract_id = str(
-        root.get("contract_id")
+        binding.get("contract_id")
+        or binding.get("contract_instance_id")
+        or root.get("contract_id")
         or root.get("contract_instance_id")
+        or binding.get("contract_template_id")
+        or binding.get("template_id")
+        or root.get("contract_template_id")
         or root.get("template_id")
         or ""
     ).strip()
-    state = str(mf_projection.get("status") or "no_contract")
+    current_revision_id = _latest_contract_revision_id(rows, root)
+    legacy_no_contract = not bool(root or binding)
+    binding_state = str(
+        binding.get("contract_state")
+        or binding.get("contract_status")
+        or binding.get("state")
+        or binding.get("status")
+        or root.get("contract_state")
+        or root.get("contract_status")
+        or root.get("state")
+        or root.get("status")
+        or ""
+    ).strip()
+    if not binding_state and (contract_id or current_revision_id) and not legacy_no_contract:
+        binding_state = "bound"
+    state = binding_state or str(mf_projection.get("status") or "no_contract")
     return {
         "schema_version": CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
         "source_of_truth": "Contract/Revision/Event",
         "contract_id": contract_id,
         "backlog_id": backlog_id,
-        "current_revision_id": _latest_contract_revision_id(rows, root),
+        "current_revision_id": current_revision_id,
         "state": state,
         "status": state,
-        "legacy_no_contract": not bool(root),
+        "legacy_no_contract": legacy_no_contract,
+        "contract_binding": binding,
         "route_binding": _latest_route_binding(rows, root),
         "test_route": _latest_test_route(rows, root),
         "required_evidence": _contract_required_evidence(root),
