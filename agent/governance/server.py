@@ -1912,6 +1912,37 @@ def _daily_planner_fixture_script() -> Path:
     return Path(__file__).resolve().parents[2] / "frontend" / "dashboard" / "scripts" / "e2e-vibe-queue-fixture.mjs"
 
 
+def _demo_node_executable() -> str:
+    candidates: list[str] = []
+    for env_key in ("AMING_CLAW_NODE_BIN", "NODE_BIN"):
+        value = str(os.environ.get(env_key) or "").strip()
+        if value:
+            candidates.append(value)
+    found = shutil.which("node")
+    if found:
+        candidates.append(found)
+    candidates.append(
+        str(
+            Path.home()
+            / ".cache"
+            / "codex-runtimes"
+            / "codex-primary-runtime"
+            / "dependencies"
+            / "node"
+            / "bin"
+            / "node"
+        )
+    )
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path)
+    raise RuntimeError(
+        "Node.js executable not found for Daily Planner Lite fixture. "
+        "Set AMING_CLAW_NODE_BIN or NODE_BIN to an executable node binary."
+    )
+
+
 def _run_daily_planner_lite_fixture(
     *,
     environment_id: str,
@@ -1923,7 +1954,7 @@ def _run_daily_planner_lite_fixture(
     if not script.exists():
         raise RuntimeError(f"Daily Planner Lite fixture script is missing: {script}")
     command = [
-        "node",
+        _demo_node_executable(),
         str(script),
         "--run-id",
         environment_id,

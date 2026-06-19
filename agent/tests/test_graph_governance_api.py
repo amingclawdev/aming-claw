@@ -471,6 +471,15 @@ def test_demo_environments_list_empty_returns_template(tmp_path, monkeypatch):
     assert payload["templates"][0]["id"] == "daily-planner-lite"
 
 
+def test_demo_node_executable_uses_explicit_env_binary(tmp_path, monkeypatch):
+    node_bin = tmp_path / "node"
+    node_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    node_bin.chmod(0o755)
+    monkeypatch.setenv("AMING_CLAW_NODE_BIN", str(node_bin))
+
+    assert server._demo_node_executable() == str(node_bin)
+
+
 def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path, monkeypatch):
     demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
     observed = {}
