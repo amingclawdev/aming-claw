@@ -674,6 +674,40 @@ def _runtime_contract_bounded_dispatch_event(
     }
 
 
+def _runtime_text_child_dispatch_event(
+    identity=None,
+    *,
+    runtime_context_id="mfrctx-dogfood",
+    task_id="worker-task-dogfood",
+    parent_task_id="BUG-DOGFOOD",
+    fence_token="fence-dogfood",
+    route_token_ref="rtok-child-dispatch",
+    strict_lineage=True,
+):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    dispatch = _runtime_contract_bounded_dispatch_event(
+        route_identity,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=fence_token,
+    )
+    payload = dispatch["payload"]["bounded_implementation_worker_dispatch"]
+    payload.update(
+        {
+            "route_id": "route-runtime-text-child-dispatch",
+            "route_token_ref": route_token_ref,
+            "worker_id": "mfsub-dogfood",
+            "source": "observer_runtime_text_prepare" if strict_lineage else "",
+            "service_generated": bool(strict_lineage),
+        }
+    )
+    dispatch["event_id"] = "tl-child-dispatch"
+    dispatch["task_id"] = task_id
+    dispatch["correlation_id"] = route_token_ref
+    return dispatch
+
+
 def _daily_planner_finish_gate_event(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     commit = "cae2641a58ef9fa13ba0462a90b146d5d9f4a864"
@@ -6394,6 +6428,131 @@ class TestTaskTimeline(unittest.TestCase):
             ROUTE_IDENTITY["prompt_contract_id"] + ".child.worker-a",
         )
 
+    def test_mf_parallel_close_gate_accepts_service_child_dispatch_lineage(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-CHILD-DISPATCH-LINEAGE",
+        }
+        child_identity = {
+            "route_context_hash": _fake_sha("child-runtime-text-route"),
+            "prompt_contract_id": "rprompt-child-runtime-text",
+            "prompt_contract_hash": _fake_sha("child-runtime-text-contract"),
+        }
+        route_context, route_action, _parent_dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        child_dispatch = _runtime_text_child_dispatch_event(child_identity)
+        child_startup = _runtime_text_actual_startup_event(child_identity)
+        child_startup["backlog_id"] = "BUG-DOGFOOD"
+        child_startup["task_id"] = "worker-task-dogfood"
+        child_startup["payload"]["mf_subagent_startup_gate"].update(
+            {
+                "route_id": "route-runtime-text-child-dispatch",
+                "runtime_context_id": "mfrctx-dogfood",
+                "task_id": "worker-task-dogfood",
+                "parent_task_id": "BUG-DOGFOOD",
+                "worker_slot_id": "mfsub-dogfood",
+                "worker_id": "mfsub-dogfood",
+                "fence_token": "fence-dogfood",
+                "route_token_ref": "rtok-child-dispatch",
+                "read_receipt_event_id": "tl-read-receipt",
+                "read_receipt_hash": "sha256:test-read-receipt",
+                "identity_join": {
+                    "route_identity_matches_latest_contract": True,
+                    "read_receipt_lineage_present": True,
+                },
+            }
+        )
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            route_context,
+            route_action,
+            child_dispatch,
+            child_startup,
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        route_gate = ready["route_context_gate"]
+        self.assertEqual(route_gate["missing_requirement_ids"], [])
+        self.assertNotIn("route_identity_mismatch", route_gate["missing_requirement_ids"])
+        self.assertEqual(route_gate["route_identity"], ROUTE_IDENTITY)
+        self.assertEqual(
+            route_gate["accepted_dispatch_lineages"][0]["acceptance_source"],
+            "service_generated_runtime_text_dispatch",
+        )
+        self.assertEqual(
+            route_gate["accepted_dispatch_lineages"][0]["child_route_context_hash"],
+            child_identity["route_context_hash"],
+        )
+        self.assertEqual(
+            route_gate["accepted_startup_lineages"][0]["acceptance_source"],
+            "identity_join_latest_contract",
+        )
+
+    def test_mf_parallel_close_gate_rejects_child_dispatch_without_strict_lineage(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-CHILD-DISPATCH-FAIL-CLOSED",
+        }
+        child_identity = {
+            "route_context_hash": _fake_sha("arbitrary-child-route"),
+            "prompt_contract_id": "rprompt-arbitrary-child",
+            "prompt_contract_hash": _fake_sha("arbitrary-child-contract"),
+        }
+        route_context, route_action, _parent_dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        child_dispatch = _runtime_text_child_dispatch_event(
+            child_identity,
+            strict_lineage=False,
+        )
+        child_startup = _runtime_text_actual_startup_event(child_identity)
+        child_startup["backlog_id"] = "BUG-DOGFOOD"
+        child_startup["task_id"] = "worker-task-dogfood"
+        child_startup["payload"]["mf_subagent_startup_gate"].update(
+            {
+                "route_id": "route-runtime-text-child-dispatch",
+                "runtime_context_id": "mfrctx-dogfood",
+                "task_id": "worker-task-dogfood",
+                "parent_task_id": "BUG-DOGFOOD",
+                "worker_slot_id": "mfsub-dogfood",
+                "worker_id": "mfsub-dogfood",
+                "fence_token": "fence-dogfood",
+                "identity_join": {
+                    "route_identity_matches_latest_contract": True,
+                    "read_receipt_lineage_present": True,
+                },
+            }
+        )
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+                {"event_kind": "verification", "phase": "verification", "status": "passed"},
+                {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+                route_context,
+                route_action,
+                child_dispatch,
+                child_startup,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        route_gate = blocked["route_context_gate"]
+        self.assertIn("route_identity_mismatch", route_gate["missing_requirement_ids"])
+        self.assertEqual(route_gate["accepted_dispatch_lineages"], [])
+
     def test_mf_parallel_close_gate_rejects_generated_runtime_text_startup_intent(self):
         from agent.governance import task_timeline
 
@@ -8361,6 +8520,107 @@ class TestTaskTimeline(unittest.TestCase):
         )
         self.assertEqual(ready["timeline_gate"]["route_context_gate"]["ignored_route_events"], [])
         self.assertTrue(ready["timeline_gate"]["contract_gate"]["passed"])
+
+    def test_backlog_timeline_gate_precheck_accepts_service_child_dispatch_lineage(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-MF-CHILD-DISPATCH-PRECHECK"
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": bug_id},
+                body={
+                    "title": "MF child dispatch precheck",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        "parallel_contract": {
+                            "template_id": "mf_parallel.v1",
+                            "contract_instance_id": bug_id,
+                        }
+                    },
+                },
+                method="POST",
+            )
+        )
+        child_identity = {
+            "route_context_hash": _fake_sha("precheck-child-runtime-text-route"),
+            "prompt_contract_id": "rprompt-precheck-child-runtime-text",
+            "prompt_contract_hash": _fake_sha("precheck-child-runtime-text-contract"),
+        }
+        route_context, route_action, _parent_dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        child_dispatch = _runtime_text_child_dispatch_event(
+            child_identity,
+            parent_task_id=bug_id,
+            task_id=f"{bug_id}-impl-b",
+            runtime_context_id="mfrctx-precheck-child-dispatch",
+            route_token_ref="rtok-precheck-child-dispatch",
+        )
+        child_startup = _runtime_text_actual_startup_event(child_identity)
+        child_startup["backlog_id"] = bug_id
+        child_startup["task_id"] = f"{bug_id}-impl-b"
+        child_startup["payload"]["mf_subagent_startup_gate"].update(
+            {
+                "route_id": "route-runtime-text-child-dispatch",
+                "runtime_context_id": "mfrctx-precheck-child-dispatch",
+                "task_id": f"{bug_id}-impl-b",
+                "parent_task_id": bug_id,
+                "worker_slot_id": "mfsub-dogfood",
+                "worker_id": "mfsub-dogfood",
+                "route_token_ref": "rtok-precheck-child-dispatch",
+                "read_receipt_event_id": "tl-precheck-read-receipt",
+                "read_receipt_hash": "sha256:test-read-receipt",
+                "identity_join": {
+                    "route_identity_matches_latest_contract": True,
+                    "read_receipt_lineage_present": True,
+                },
+            }
+        )
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            route_context,
+            route_action,
+            child_dispatch,
+            child_startup,
+            _route_context_qa_verification_event(),
+        ]
+        for event in events:
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=event.get("task_id", ""),
+                event_type=f"mf.{event['event_kind']}",
+                phase=event.get("phase", ""),
+                event_kind=event.get("event_kind", ""),
+                status=event.get("status", ""),
+                payload=event.get("payload"),
+                verification=event.get("verification"),
+                artifact_refs=event.get("artifact_refs"),
+            )
+        self.conn.commit()
+
+        ready = server.handle_backlog_timeline_gate(
+            _ctx(path_params={"bug_id": bug_id})
+        )
+        compact = server.handle_backlog_timeline_gate(
+            _ctx({"view": "compact"}, path_params={"bug_id": bug_id})
+        )
+
+        self.assertTrue(ready["can_close"], ready)
+        route_gate = ready["timeline_gate"]["route_context_gate"]
+        self.assertEqual(route_gate["missing_requirement_ids"], [])
+        self.assertEqual(route_gate["route_identity"], ROUTE_IDENTITY)
+        self.assertEqual(
+            route_gate["accepted_dispatch_lineages"][0]["acceptance_source"],
+            "service_generated_runtime_text_dispatch",
+        )
+        self.assertTrue(compact["can_close"], compact)
+        self.assertEqual(compact["gate_summary"]["failed_gates"], [])
 
     def test_backlog_close_handler_loads_instantiated_contract(self):
         from agent.governance import server, task_timeline
