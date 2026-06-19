@@ -8649,6 +8649,59 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(skeleton["event_kind"], "cross_ref_lineage_bridge")
         self.assertEqual(skeleton["payload"]["rejected_event_ids"], [2])
 
+    def test_backlog_timeline_gate_repair_view_quarantines_archive_for_empty_active_row(self):
+        from agent.governance import server
+
+        bug_id = "BUG-MF-EMPTY-REPAIR-VIEW"
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": bug_id},
+                body={
+                    "title": "MF empty repair view",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                },
+                method="POST",
+            )
+        )
+
+        result = server.handle_backlog_timeline_gate(
+            _ctx({"view": "repair"}, path_params={"bug_id": bug_id})
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["can_close"])
+        repair = result["repair_summary"]
+        self.assertNotIn("audit_archive_recovery", repair)
+        self.assertEqual(
+            repair["missing_event_kinds"],
+            ["close_ready", "implementation", "verification"],
+        )
+        normal_actions = repair["normal_repair_actions"]
+        self.assertEqual(
+            [
+                item["event_kind"]
+                for item in normal_actions["missing_event_repairs"]
+            ],
+            ["close_ready", "implementation", "verification"],
+        )
+        archive_state = repair["exceptional_archive_recovery"]
+        self.assertFalse(archive_state["available"])
+        self.assertEqual(archive_state["status"], "quarantined")
+        self.assertEqual(
+            archive_state["reason"],
+            "normal_repair_actions_required_before_archive_recovery",
+        )
+        self.assertIn("accepted_implementation", archive_state["missing_prerequisites"])
+        self.assertIn("accepted_verification", archive_state["missing_prerequisites"])
+        self.assertIn("independent_qa", archive_state["missing_prerequisites"])
+        self.assertIn(
+            "non_reconstructable_evidence_reason",
+            archive_state["missing_prerequisites"],
+        )
+        self.assertNotIn("body_skeleton", archive_state)
+
     def test_observer_hotfix_aliases_upsert_as_mf_applicable_rows(self):
         from agent.governance import server
 
@@ -9952,8 +10005,10 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert route_failure["diagnosis"] == "worker evidence present but rejected by cross_ref_gate"
     assert route_failure["rejected_event_ids"] == [22]
     assert "Do not append route_context" in route_failure["recommended_legal_action"]
-    assert "backlog_audit_archive" in route_failure["recommended_legal_action"]
-    assert "WAIVED recovery" in route_failure["recommended_legal_action"]
+    assert "repair-run evidence cross-ref lineage friction" in route_failure[
+        "recommended_legal_action"
+    ]
+    assert "audit archive" in route_failure["recommended_legal_action"]
     assert route_failure["suggested_event_kind"] == "bounded_worker_rerun"
     assert "append_payload_skeleton" not in route_failure
 
@@ -9968,18 +10023,101 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert route_repair_item["diagnosis"] == "worker evidence present but rejected by cross_ref_gate"
     assert route_repair_item["rejected_event_ids"] == [22]
     assert "append_payload_skeleton" not in route_repair_item
-    audit_recovery = route_repair["audit_archive_recovery"]
+    assert "audit_archive_recovery" not in route_repair
+    archive_state = route_repair["exceptional_archive_recovery"]
+    assert archive_state["status"] == "quarantined"
+    assert archive_state["available"] is False
+    assert "independent_qa" in archive_state["missing_prerequisites"]
+    assert "non_reconstructable_evidence_reason" in archive_state["missing_prerequisites"]
+    assert route_repair["normal_repair_actions"]["failed_gate_repairs"]
+
+    eligible_route_repair = task_timeline.repair_gate_summary(
+        {
+            **route_blocked,
+            "present_event_kinds": ["close_ready", "implementation", "verification"],
+            "checks": {
+                "has_implementation": True,
+                "has_verification": True,
+                "has_independent_qa": True,
+            },
+            "independent_qa_gate": {
+                "passed": True,
+                "evidence_events": [
+                    {
+                        "id": 91,
+                        "event_kind": "qa_verification",
+                        "reviewer_identity": "qa-reviewer",
+                        "status": "passed",
+                    }
+                ],
+            },
+            "repair_reasons": [
+                {
+                    "code": "non_reconstructable_evidence_reason",
+                    "reason": (
+                        "accepted implementation cannot reconstruct the historical "
+                        "route-token registry proof without fabricating facts"
+                    ),
+                }
+            ],
+        },
+        request_id="req-route-repair",
+    )
+    assert "audit_archive_recovery" not in eligible_route_repair
+    eligible_archive_state = eligible_route_repair["exceptional_archive_recovery"]
+    assert eligible_archive_state["available"] is False
+    assert eligible_archive_state["reason"] == (
+        "canonical_runtime_context_lineage_repair_required"
+    )
+    assert "canonical_runtime_context_lineage_repair" in eligible_archive_state[
+        "missing_prerequisites"
+    ]
+
+    eligible_non_lineage_repair = task_timeline.repair_gate_summary(
+        {
+            "passed": False,
+            "can_close": False,
+            "missing_event_kinds": [],
+            "present_event_kinds": ["close_ready", "implementation", "verification"],
+            "checks": {
+                "has_implementation": True,
+                "has_verification": True,
+                "has_independent_qa": True,
+            },
+            "independent_qa_gate": {
+                "passed": True,
+                "evidence_events": [
+                    {
+                        "id": 91,
+                        "event_kind": "qa_verification",
+                        "reviewer_identity": "qa-reviewer",
+                        "status": "passed",
+                    }
+                ],
+            },
+            "repair_reasons": [
+                {
+                    "code": "non_reconstructable_evidence_reason",
+                    "reason": (
+                        "accepted implementation cannot reconstruct the historical "
+                        "worker evidence without fabricating facts"
+                    ),
+                }
+            ],
+        },
+        request_id="req-route-repair",
+    )
+    audit_recovery = eligible_non_lineage_repair["audit_archive_recovery"]
     assert audit_recovery["mcp_tool"] == "backlog_audit_archive"
     assert audit_recovery["row_status"] == "WAIVED"
     assert audit_recovery["normal_close_gate_can_close"] is False
     assert audit_recovery["close_satisfying_by_itself"] is False
+    assert eligible_non_lineage_repair["exceptional_archive_recovery"]["available"] is True
+    assert eligible_non_lineage_repair["exceptional_archive_recovery"]["recovery"] == audit_recovery
     body = audit_recovery["body_skeleton"]
     assert body["timeline_precheck"]["can_close"] is False
     assert body["timeline_precheck"]["request_id"] == "req-route-repair"
-    assert body["timeline_precheck"]["failed_gates"] == [
-        "route_context_gate",
-        "cross_ref_gate",
-    ]
+    assert body["timeline_precheck"]["failed_gates"] == []
     assert body["failure_audit"]["historical_evidence_reconstructed"] is False
     assert body["qa_acceptance"]["reviewer_role"] == "qa"
     assert body["runtime_context"]["route_token_ref"] == (
@@ -9994,7 +10132,33 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
         "passed": False,
         "can_close": False,
         "missing_event_kinds": [],
+        "present_event_kinds": ["close_ready", "implementation", "verification"],
         "event_count": 2,
+        "checks": {
+            "has_implementation": True,
+            "has_verification": True,
+            "has_independent_qa": True,
+        },
+        "independent_qa_gate": {
+            "passed": True,
+            "evidence_events": [
+                {
+                    "id": 92,
+                    "event_kind": "qa_verification",
+                    "reviewer_identity": "qa-reviewer",
+                    "status": "passed",
+                }
+            ],
+        },
+        "repair_reasons": [
+            {
+                "code": "non_reconstructable_evidence_reason",
+                "reason": (
+                    "accepted implementation cannot reconstruct the original "
+                    "startup graph trace without fabricating append-only facts"
+                ),
+            }
+        ],
         "close_timeline_startup_gate": {
             "schema_version": "mf_close_timeline_startup_gate.v1",
             "passed": False,
@@ -10051,8 +10215,9 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
         "recommended_legal_action"
     ]
     assert "Do not record another startup" in close_repair["recommended_legal_action"]
-    assert "backlog_audit_archive" in close_repair["recommended_legal_action"]
-    assert "WAIVED recovery" in close_repair["recommended_legal_action"]
+    assert "separate exceptional recovery decision" in close_repair[
+        "recommended_legal_action"
+    ]
     assert any(
         "Accepted finish-time attestation alone" in reason
         for reason in close_repair["reasons"]

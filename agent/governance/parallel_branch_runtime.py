@@ -1946,12 +1946,42 @@ def _runtime_context_text(value: Any) -> str:
 def runtime_context_effective_target_project_root(
     context: "BranchTaskRuntimeContext",
 ) -> str:
-    """Return the assigned worker root projected to runtime-context callers."""
+    """Return the canonical target root projected to runtime-context callers."""
 
     return _runtime_context_text(
         getattr(context, "target_project_root", "")
         or getattr(context, "worktree_path", "")
     )
+
+
+def runtime_context_target_project_root_matches(
+    context: "BranchTaskRuntimeContext",
+    target_project_root: str,
+    *,
+    allow_worktree_alias: bool = False,
+) -> bool:
+    """Return whether a presented target root matches the runtime context.
+
+    Protected writes and graph queries use the canonical target project root.
+    Worker guide/current-state reads may also accept the assigned worktree path
+    as a read-only alias so the worker can recover the canonical shape.
+    """
+
+    requested_target_root = _startup_path_text(target_project_root)
+    if not requested_target_root:
+        return True
+    context_target_root = _startup_path_text(
+        runtime_context_effective_target_project_root(context)
+    )
+    if not context_target_root:
+        return True
+    if requested_target_root == context_target_root:
+        return True
+    if allow_worktree_alias:
+        context_worktree_path = _startup_path_text(getattr(context, "worktree_path", ""))
+        if context_worktree_path and requested_target_root == context_worktree_path:
+            return True
+    return False
 
 
 def _runtime_context_startup_gate_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -9857,6 +9887,7 @@ def validate_mf_subagent_runtime_context_lookup(
     target_project_root: str = "",
     session_token: str = "",
     allowed_statuses: Sequence[str] | None = None,
+    allow_worktree_target_root_alias: bool = False,
 ) -> BranchTaskRuntimeContext:
     """Validate runtime_context_id + fence identity for worker contract polling."""
 
@@ -9907,11 +9938,11 @@ def validate_mf_subagent_runtime_context_lookup(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if requested_target_project_id != context_target_project_id:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    requested_target_root = _startup_path_text(target_project_root)
-    context_target_root = _startup_path_text(
-        runtime_context_effective_target_project_root(context)
-    )
-    if requested_target_root and context_target_root and requested_target_root != context_target_root:
+    if not runtime_context_target_project_root_matches(
+        context,
+        target_project_root,
+        allow_worktree_alias=allow_worktree_target_root_alias,
+    ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     parent = str(parent_task_id or "").strip()

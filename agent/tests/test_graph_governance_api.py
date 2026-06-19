@@ -13613,6 +13613,192 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
         assert diagnostics["session_token"]["raw_session_token_exposed"] is False
 
 
+def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
+    conn,
+    tmp_path,
+):
+    _activate_basic_graph(conn, "full-runtime-context-worktree-alias")
+    canonical_root = tmp_path / "daily-planner-lite"
+    worktree = tmp_path / "daily-planner-lite-worker"
+    canonical_root.mkdir()
+    worktree.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(canonical_root),
+            task_id="worker-worktree-alias",
+            root_task_id="parent-worktree-alias",
+            backlog_id="AC-WORKTREE-ALIAS",
+            stage_task_id="worker-worktree-alias",
+            worker_id="worker-worktree-alias",
+            worker_slot_id="slot-worktree-alias",
+            branch_ref="refs/heads/codex/worker-worktree-alias",
+            worktree_path=str(worktree),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-worktree-alias",
+            session_token_hash=mf_subagent_session_token_hash(
+                "worktree-alias-session"
+            ),
+            lease_id="lease-worktree-alias",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    route_identity = {
+        "route_id": "route-worktree-alias",
+        "route_context_hash": "sha256:route-worktree-alias",
+        "prompt_contract_id": "rprompt-worktree-alias",
+        "prompt_contract_hash": "sha256:prompt-worktree-alias",
+        "route_token_ref": "rtok-worktree-alias",
+        "visible_injection_manifest_hash": "sha256:visible-worktree-alias",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-worktree-alias",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+    worker_alias_query = {
+        "parent_task_id": "parent-worktree-alias",
+        "fence_token": "fence-worktree-alias",
+        "session_token": "worktree-alias-session",
+        "target_project_root": str(worktree),
+        "view": "all",
+    }
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            query=worker_alias_query,
+        )
+    )
+
+    assert current["ok"] is True
+    assert current["target_project_root"] == str(canonical_root)
+    assert current["project_root"] == str(canonical_root)
+    assert current["repo_root"] == str(canonical_root)
+    assert current["worktree_path"] == str(worktree)
+    projection = current["target_project_root_projection"]
+    assert projection["request_role"] == "assigned_worktree_path_alias"
+    assert projection["worktree_path_alias_accepted_for_read"] is True
+    assert projection["canonical_target_project_root"] == str(canonical_root)
+    assert projection["worktree_path"] == str(worktree)
+    corrected = projection["corrected_request_shapes"]
+    assert corrected["graph_query_body"]["target_project_root"] == str(canonical_root)
+    assert corrected["graph_query_body"]["worktree_path"] == str(worktree)
+    assert corrected["startup_body"]["target_project_root"] == str(canonical_root)
+    worker_view = current["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["task"]["target_project_root"] == str(canonical_root)
+    assert worker_view["branch"]["worktree_path"] == str(worktree)
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            query=worker_alias_query,
+        )
+    )
+
+    worker_guide = guide["worker_guide"]
+    assert guide["target_project_root"] == str(canonical_root)
+    assert guide["worktree_path"] == str(worktree)
+    assert worker_guide["target_project_root"] == str(canonical_root)
+    assert worker_guide["worktree_path"] == str(worktree)
+    assert worker_guide["target_project_root_projection"]["request_role"] == (
+        "assigned_worktree_path_alias"
+    )
+    assert worker_guide["corrected_request_shapes"]["write_facade_body"][
+        "target_project_root"
+    ] == str(canonical_root)
+
+    strict_body = {
+        "parent_task_id": "parent-worktree-alias",
+        "fence_token": "fence-worktree-alias",
+        "session_token": "worktree-alias-session",
+        "target_project_root": str(worktree),
+    }
+    with pytest.raises(GovernanceError) as read_receipt_denied:
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                method="POST",
+                body={
+                    **strict_body,
+                    "launch_text_hash": "sha256:worktree-alias-launch",
+                    "actor": "slot-worktree-alias",
+                },
+            )
+        )
+    assert read_receipt_denied.value.code == "fence_invalidated_or_unknown"
+    assert read_receipt_denied.value.details["target_project_root_projection"][
+        "request_role"
+    ] == "assigned_worktree_path_alias"
+
+    with pytest.raises(GovernanceError) as startup_denied:
+        server.handle_graph_governance_runtime_context_startup(
+            _ctx(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                method="POST",
+                body={
+                    **strict_body,
+                    "actual_cwd": str(worktree),
+                    "actual_git_root": str(worktree),
+                    "worker_session_id": "worker-session-worktree-alias",
+                    "harness_type": "codex",
+                    "filer_principal": "worker-session-worktree-alias",
+                    "worker_transcript_path": str(
+                        tmp_path / "worktree-alias-transcript.jsonl"
+                    ),
+                },
+            )
+        )
+    assert startup_denied.value.code == "fence_invalidated_or_unknown"
+
+    with pytest.raises(GovernanceError) as graph_query_denied:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "runtime_context_id": context.runtime_context_id,
+                    "fence_token": "fence-worktree-alias",
+                    "session_token": "worktree-alias-session",
+                    "target_project_root": str(worktree),
+                    **route_identity,
+                },
+            )
+        )
+    assert graph_query_denied.value.code == "fence_invalidated_or_unknown"
+    assert graph_query_denied.value.details["target_project_root_projection"][
+        "canonical_target_project_root"
+    ] == str(canonical_root)
+    assert graph_query_denied.value.details["corrected_request_shapes"][
+        "graph_query_body"
+    ]["target_project_root"] == str(canonical_root)
+
+    public_json = json.dumps(
+        {
+            "current": current,
+            "guide": guide,
+            "read_receipt_details": read_receipt_denied.value.details,
+            "startup_details": startup_denied.value.details,
+            "graph_query_details": graph_query_denied.value.details,
+        },
+        sort_keys=True,
+    )
+    assert "fence-worktree-alias" not in public_json
+    assert "worktree-alias-session" not in public_json
+    assert "raw-route-token" not in public_json
+
+
 def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):
     _activate_basic_graph(conn, "full-query-mf-sub-unknown")
 

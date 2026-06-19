@@ -7375,6 +7375,15 @@ def _runtime_context_projection_response(
         or {}
     )
     target_project_root = _runtime_context_effective_target_project_root(context)
+    worktree_path = getattr(context, "worktree_path", "") or target_project_root
+    target_root_projection = _runtime_context_target_root_projection(
+        requested_target_project_root=_runtime_context_requested_target_project_root(ctx),
+        canonical_target_project_root=target_project_root,
+        worktree_path=worktree_path,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+        parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
+    )
     audit = record_runtime_context_access_audit(
         conn,
         project_id=context_project_id,
@@ -7401,7 +7410,9 @@ def _runtime_context_projection_response(
         "target_project_root": target_project_root,
         "project_root": target_project_root,
         "repo_root": target_project_root,
-        "worktree_path": getattr(context, "worktree_path", "") or target_project_root,
+        "worktree_path": worktree_path,
+        "target_project_root_projection": target_root_projection,
+        "corrected_request_shapes": target_root_projection["corrected_request_shapes"],
         "runtime_context_id": runtime_context_id,
         "task_id": getattr(context, "task_id", ""),
         "role_scope": role_scope,
@@ -7489,6 +7500,11 @@ def _runtime_context_worker_guide_response(
         or current_state_response.get("repo_root")
         or target_project_root
     )
+    worktree_path = str(
+        branch_view.get("worktree_path")
+        or current_state_response.get("worktree_path")
+        or target_project_root
+    )
     graph_payload_shape = dict(graph_identity.get("payload_shape") or {})
     if target_project_root:
         graph_payload_shape["target_project_root"] = target_project_root
@@ -7496,14 +7512,31 @@ def _runtime_context_worker_guide_response(
         graph_payload_shape["project_root"] = project_root
     if repo_root:
         graph_payload_shape["repo_root"] = repo_root
+    if worktree_path:
+        graph_payload_shape["worktree_path"] = worktree_path
     graph_identity["target_project_root"] = target_project_root
     graph_identity["project_root"] = project_root
     graph_identity["repo_root"] = repo_root
+    graph_identity["worktree_path"] = worktree_path
     graph_identity["payload_shape"] = graph_payload_shape
     runtime_context_id = str(current_state_response.get("runtime_context_id") or "")
     project_id = str(current_state_response.get("project_id") or "")
     task_id = str(current_state_response.get("task_id") or task.get("task_id") or "")
     parent_task_id = str(graph_identity.get("parent_task_id") or task.get("parent_task_id") or "")
+    target_root_projection = dict(
+        current_state_response.get("target_project_root_projection") or {}
+    )
+    if not target_root_projection:
+        target_root_projection = _runtime_context_target_root_projection(
+            canonical_target_project_root=target_project_root,
+            worktree_path=worktree_path,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+    corrected_request_shapes = dict(
+        target_root_projection.get("corrected_request_shapes") or {}
+    )
     next_required_evidence = list(
         control_plane.get("next_required_evidence")
         or action_plan.get("next_required_evidence")
@@ -7964,7 +7997,9 @@ def _runtime_context_worker_guide_response(
         "target_project_root": target_project_root,
         "project_root": project_root,
         "repo_root": repo_root,
-        "worktree_path": branch_view.get("worktree_path") or target_project_root,
+        "worktree_path": worktree_path,
+        "target_project_root_projection": target_root_projection,
+        "corrected_request_shapes": corrected_request_shapes,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "role_scope": current_state_response.get("role_scope"),
@@ -7976,7 +8011,9 @@ def _runtime_context_worker_guide_response(
             "target_project_root": target_project_root,
             "project_root": project_root,
             "repo_root": repo_root,
-            "worktree_path": branch_view.get("worktree_path") or target_project_root,
+            "worktree_path": worktree_path,
+            "target_project_root_projection": target_root_projection,
+            "corrected_request_shapes": corrected_request_shapes,
             "next_legal_action": next_legal_action,
             "next_required_evidence": next_required_evidence,
             "missing_evidence": list(
@@ -8007,6 +8044,7 @@ def _runtime_context_worker_guide_response(
                     or project_id
                 ),
                 "target_project_root": target_project_root,
+                "worktree_path": worktree_path,
                 "fence_token_hash": graph_identity.get("fence_token_hash") or "",
                 "fence_token_redacted": True,
                 "project_root": project_root,
@@ -8115,6 +8153,86 @@ def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
     return str(body.get(key) or query.get(key) or "").strip()
 
 
+def _runtime_context_requested_target_project_root(ctx: RequestContext) -> str:
+    return (
+        _runtime_context_request_value(ctx, "target_project_root")
+        or _runtime_context_request_value(ctx, "target_graph_root")
+        or _runtime_context_request_value(ctx, "project_root")
+        or _runtime_context_request_value(ctx, "workspace_path")
+        or _runtime_context_request_value(ctx, "repo_root")
+    )
+
+
+def _runtime_context_target_root_projection(
+    *,
+    requested_target_project_root: str = "",
+    canonical_target_project_root: str = "",
+    worktree_path: str = "",
+    runtime_context_id: str = "",
+    task_id: str = "",
+    parent_task_id: str = "",
+) -> dict[str, Any]:
+    requested = str(requested_target_project_root or "").strip()
+    canonical = str(canonical_target_project_root or "").strip()
+    worktree = str(worktree_path or "").strip()
+    if requested and canonical and requested == canonical:
+        request_role = "canonical_target_project_root"
+    elif requested and worktree and requested == worktree:
+        request_role = "assigned_worktree_path_alias"
+    elif requested:
+        request_role = "mismatched_or_unknown"
+    else:
+        request_role = "omitted"
+    identity_shape = {
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "parent_task_id": str(parent_task_id or "").strip(),
+        "target_project_root": canonical,
+        "project_root": canonical,
+        "repo_root": canonical,
+        "worktree_path": worktree,
+    }
+    return {
+        "schema_version": "runtime_context.target_project_root_projection.v1",
+        "requested_target_project_root": requested,
+        "request_role": request_role,
+        "accepted_for_read": request_role
+        in {"omitted", "canonical_target_project_root", "assigned_worktree_path_alias"},
+        "worktree_path_alias_accepted_for_read": (
+            request_role == "assigned_worktree_path_alias"
+        ),
+        "canonical_target_project_root": canonical,
+        "target_project_root": canonical,
+        "project_root": canonical,
+        "repo_root": canonical,
+        "worktree_path": worktree,
+        "alias_allowed_for": ["current_state", "worker_guide"],
+        "alias_not_allowed_for": [
+            "graph_query",
+            "runtime_context_write_facades",
+            "startup",
+            "session_token_reissue",
+            "finish_gate",
+        ],
+        "corrected_request_shapes": {
+            "current_state_query": dict(identity_shape),
+            "worker_guide_query": dict(identity_shape),
+            "graph_query_body": {
+                **identity_shape,
+                "worker_role": "mf_sub",
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+            },
+            "write_facade_body": dict(identity_shape),
+            "startup_body": dict(identity_shape),
+        },
+        "strict_gates_validate_canonical_target_project_root": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _runtime_context_effective_target_project_root(context) -> str:
     from .parallel_branch_runtime import runtime_context_effective_target_project_root
 
@@ -8173,6 +8291,7 @@ def _runtime_context_worker_recovery_details(
     next_legal_action = "verify_runtime_context_identity"
     recovery_action_id = "retry_with_matching_runtime_context_identity"
     recoverable = bool(context)
+    target_root_projection: dict[str, Any] = {}
     diagnostics: dict[str, Any] = {
         "reason": reason or "fence_invalidated_or_unknown",
         "caller_omitted_target_project_root": caller_omitted_target_root,
@@ -8245,10 +8364,27 @@ def _runtime_context_worker_recovery_details(
                 else ""
             ),
             "worktree_path": getattr(context, "worktree_path", ""),
+            "accepted_read_target_project_roots": [
+                value
+                for value in (
+                    expected_target_root,
+                    getattr(context, "worktree_path", ""),
+                )
+                if value
+            ],
             "route_identity_present": bool(expected_route_identity),
             "session_token_hash_recorded": bool(getattr(context, "session_token_hash", "")),
             "fence_token_recorded": bool(getattr(context, "fence_token", "")),
         }
+        target_root_projection = _runtime_context_target_root_projection(
+            requested_target_project_root=requested_target_root,
+            canonical_target_project_root=expected_target_root,
+            worktree_path=getattr(context, "worktree_path", ""),
+            runtime_context_id=expected_runtime_context_id,
+            task_id=getattr(context, "task_id", ""),
+            parent_task_id=expected_parent_task_id,
+        )
+        diagnostics["target_project_root_projection"] = target_root_projection
         diagnostics["matches"] = {
             "runtime_context_id": (
                 not requested_runtime_context_id
@@ -8266,6 +8402,10 @@ def _runtime_context_worker_recovery_details(
                 not requested_target_root
                 or not expected_target_root
                 or requested_target_root == expected_target_root
+            ),
+            "target_project_root_read_alias": (
+                target_root_projection.get("request_role")
+                == "assigned_worktree_path_alias"
             ),
             "fence_token": fence_matches,
             "session_token": session_matches,
@@ -8359,6 +8499,11 @@ def _runtime_context_worker_recovery_details(
         "next_legal_action": next_legal_action,
         "recovery_actions": recovery_actions,
         "diagnostics": diagnostics,
+        "target_project_root_projection": target_root_projection,
+        "corrected_request_shapes": target_root_projection.get(
+            "corrected_request_shapes",
+            {},
+        ),
         "fail_closed": True,
         "raw_session_token_exposed": False,
         "raw_route_token_exposed": False,
@@ -8416,6 +8561,7 @@ def _runtime_context_validate_mf_sub_lookup(
     require_session_token: bool = False,
     require_target_project_root: bool = False,
     allow_validated: bool = False,
+    allow_worktree_target_root_alias: bool = False,
 ):
     from .parallel_branch_runtime import (
         ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
@@ -8465,6 +8611,7 @@ def _runtime_context_validate_mf_sub_lookup(
                 if allow_validated
                 else None
             ),
+            allow_worktree_target_root_alias=allow_worktree_target_root_alias,
         )
     except BranchRuntimeFenceError as exc:
         reason = str(exc) or "fence_invalidated_or_unknown"
@@ -8541,6 +8688,7 @@ def _runtime_context_mf_sub_read_context(
             conn,
             project_id=project_id,
             runtime_context_id=runtime_context_id,
+            allow_worktree_target_root_alias=True,
         )
         return context, "mf_sub", session
     if (
@@ -8553,6 +8701,7 @@ def _runtime_context_mf_sub_read_context(
             project_id=project_id,
             runtime_context_id=runtime_context_id,
             require_session_token=True,
+            allow_worktree_target_root_alias=True,
         )
         session = _runtime_context_scoped_mf_sub_session(
             project_id=project_id,

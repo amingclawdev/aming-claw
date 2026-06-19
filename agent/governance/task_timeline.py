@@ -7789,24 +7789,196 @@ def _gate_repair_with_cross_ref_context(
         "substitute. Re-run or re-record the bounded worker through the runtime context "
         "facades so dispatch/startup/implementation carry route_token_ref, parent_task_id, "
         "runtime_context_id, worker_slot_id, observer_command_id, canonical parent route "
-        "scope, and registry-backed active token proof. If the implementation is already "
-        "accepted but historical worker evidence cannot be legally reconstructed, use "
-        "backlog_audit_archive as the audited WAIVED recovery path; do not claim can_close, "
-        "close_ready, or reconstructed worker evidence."
+        "scope, and registry-backed active token proof. If this cannot be legally repaired "
+        "inside the current scope, update acceptance or file a follow-up row for "
+        "repair-run evidence cross-ref lineage friction; do not claim can_close, "
+        "close_ready, audit archive, or reconstructed worker evidence."
     )
     contextual["suggested_event_kind"] = "bounded_worker_rerun"
     contextual.pop("append_payload_skeleton", None)
     return contextual
 
 
+def _archive_recovery_has_non_reconstructable_signal(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key or "").strip().lower().replace("-", "_")
+            if "non_reconstructable" in key_text and item not in ("", None, False):
+                return True
+            if key_text in {
+                "evidence_non_reconstructable",
+                "non_reconstructable",
+                "non_reconstructable_evidence",
+            } and _truthy(item):
+                return True
+            if _archive_recovery_has_non_reconstructable_signal(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_archive_recovery_has_non_reconstructable_signal(item) for item in value)
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        return "non_reconstructable" in normalized
+    return False
+
+
+def _audit_archive_explicit_recovery_mode(full_result: dict[str, Any]) -> bool:
+    for key in (
+        "audit_archive_recovery_mode",
+        "archive_recovery_mode",
+        "recovery_mode",
+    ):
+        mode = str(full_result.get(key) or "").strip().lower()
+        if mode in {"audit_archive", "audit_archive_recovery", "archive", "recovery", "explicit"}:
+            return True
+    for key in (
+        "audit_archive_requested",
+        "audit_archive_recovery_requested",
+        "explicit_audit_archive_recovery",
+    ):
+        if _truthy(full_result.get(key)):
+            return True
+    for reason in _list(full_result.get("repair_reasons")):
+        reason_map = _mapping(reason)
+        combined = " ".join(
+            str(reason_map.get(field) or "")
+            for field in ("code", "kind", "reason", "message", "mode")
+        ).lower()
+        if "audit_archive" in combined and any(
+            token in combined for token in ("explicit", "requested", "recovery_mode")
+        ):
+            return True
+    return False
+
+
+def _audit_archive_has_recoverable_canonical_lineage(full_result: dict[str, Any]) -> bool:
+    cross_ref_gate = _mapping(full_result.get("cross_ref_gate"))
+    if not cross_ref_gate or bool(cross_ref_gate.get("passed")):
+        return False
+    rejected = [
+        _mapping(item)
+        for item in _list(cross_ref_gate.get("rejected_cross_ref_evidence"))
+    ]
+    if not rejected:
+        return False
+    for item in rejected:
+        mismatches = _mapping(item.get("mismatches"))
+        lineage = _mapping(item.get("route_token_child_lineage"))
+        if "task_id" in mismatches or lineage:
+            return True
+        diagnosis = " ".join(
+            str(item.get(field) or "")
+            for field in ("diagnosis", "reason", "message")
+        ).lower()
+        if "task_id" in diagnosis or "route-token" in diagnosis or "route token" in diagnosis:
+            return True
+    return False
+
+
+def _audit_archive_recovery_decision(full_result: dict[str, Any]) -> dict[str, Any]:
+    """Classify whether repair view may expose audit archive recovery."""
+
+    if bool(full_result.get("passed") or full_result.get("can_close")):
+        return {
+            "schema_version": "mf_audit_archive_recovery_decision.v1",
+            "available": False,
+            "status": "not_applicable",
+            "reason": "normal_close_gate_can_close",
+            "normal_repair_first": True,
+        }
+
+    checks = _mapping(full_result.get("checks"))
+    present = {
+        str(item or "").strip()
+        for item in _list(full_result.get("present_event_kinds"))
+        if str(item or "").strip()
+    }
+    independent_qa_gate = _mapping(full_result.get("independent_qa_gate"))
+    has_implementation = _truthy(checks.get("has_implementation")) or "implementation" in present
+    has_verification = _truthy(checks.get("has_verification")) or "verification" in present
+    has_independent_qa = (
+        bool(_list(independent_qa_gate.get("evidence_events")))
+        or _truthy(full_result.get("has_independent_qa_evidence"))
+        or _truthy(full_result.get("accepted_independent_qa"))
+    )
+    explicit_recovery_mode = _audit_archive_explicit_recovery_mode(full_result)
+    non_reconstructable_signal = _archive_recovery_has_non_reconstructable_signal(
+        {
+            "repair_reasons": full_result.get("repair_reasons"),
+            "audit_archive_recovery": full_result.get("audit_archive_recovery"),
+            "audit_archive": full_result.get("audit_archive"),
+            "audit_close_gate": full_result.get("audit_close_gate"),
+            "close_timeline_startup_gate": full_result.get("close_timeline_startup_gate"),
+            "finish_gate_projection": full_result.get("finish_gate_projection"),
+            "cross_ref_gate": full_result.get("cross_ref_gate"),
+        }
+    )
+    recoverable_canonical_lineage = _audit_archive_has_recoverable_canonical_lineage(
+        full_result
+    )
+
+    missing_prerequisites: list[str] = []
+    if not has_implementation:
+        missing_prerequisites.append("accepted_implementation")
+    if not has_verification:
+        missing_prerequisites.append("accepted_verification")
+    if not has_independent_qa:
+        missing_prerequisites.append("independent_qa")
+    if not (explicit_recovery_mode or non_reconstructable_signal):
+        missing_prerequisites.append("non_reconstructable_evidence_reason")
+    if recoverable_canonical_lineage:
+        missing_prerequisites.append("canonical_runtime_context_lineage_repair")
+
+    available = explicit_recovery_mode or not missing_prerequisites
+    decision: dict[str, Any] = {
+        "schema_version": "mf_audit_archive_recovery_decision.v1",
+        "available": available,
+        "status": "available" if available else "quarantined",
+        "normal_repair_first": not available,
+        "explicit_recovery_mode": explicit_recovery_mode,
+        "accepted_implementation": has_implementation,
+        "accepted_verification": has_verification,
+        "independent_qa": has_independent_qa,
+        "non_reconstructable_evidence": non_reconstructable_signal,
+        "recoverable_canonical_lineage_repair": recoverable_canonical_lineage,
+    }
+    if available:
+        decision["reason"] = (
+            "explicit_recovery_archive_mode"
+            if explicit_recovery_mode
+            else "accepted_implementation_independent_qa_non_reconstructable"
+        )
+    else:
+        reason = (
+            "canonical_runtime_context_lineage_repair_required"
+            if recoverable_canonical_lineage
+            else "normal_repair_actions_required_before_archive_recovery"
+        )
+        decision.update({
+            "reason": reason,
+            "missing_prerequisites": missing_prerequisites,
+            "suppressed_recovery": "audit_archive",
+            "message": (
+                "Audit archive recovery is exceptional and stays quarantined while "
+                "canonical runtime-context lineage can be repaired or until accepted "
+                "implementation, accepted verification, independent QA, and a "
+                "non-reconstructable evidence reason are present, or an explicit "
+                "recovery/archive mode is requested."
+            ),
+        })
+    return decision
+
+
 def _audit_archive_recovery_summary(
     full_result: dict[str, Any],
     *,
     request_id: str = "",
+    decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the audited recovery path for rows that cannot normal-close."""
 
-    if bool(full_result.get("passed") or full_result.get("can_close")):
+    decision = decision or _audit_archive_recovery_decision(full_result)
+    if not bool(decision.get("available")):
         return {}
 
     missing_event_kinds = [
@@ -7847,6 +8019,7 @@ def _audit_archive_recovery_summary(
         "close_satisfying_by_itself": False,
         "requires_independent_qa": True,
         "requires_non_reconstructable_evidence_reason": True,
+        "eligibility": decision,
         "body_skeleton": {
             "commit": "<implementation_commit_sha>",
             "reason": (
@@ -8036,11 +8209,11 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                 "runtime_context_id, task_id, worker_session_id, read receipt, "
                 "route identity, and worker-owned graph_trace_ids so close can "
                 "consume the mf_subagent_finish_gate projection. Do not record "
-                "another startup, observer-backfill worker evidence, or use audit "
-                "archive to pretend finish evidence exists. If accepted "
-                "implementation evidence cannot normal-close because historical "
-                "finish evidence is non-reconstructable, use backlog_audit_archive "
-                "as WAIVED recovery with independent QA."
+                "another startup, observer-backfill worker evidence, or an archive "
+                "path to pretend finish evidence exists. If accepted implementation "
+                "evidence cannot normal-close because historical finish evidence is "
+                "non-reconstructable, stop and require a separate exceptional "
+                "recovery decision with independent QA."
             )
             suggested_event_kind = "mf_subagent_finish_gate"
             reasons.append(
@@ -8084,11 +8257,11 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
                 "Record a new worker-authored mf_subagent_startup through the "
                 "runtime/parallel startup facade with worker_session_id, "
                 "worker_transcript_ref or worker_transcript_path, harness_type, "
-                "and filer_principal. Do not observer-backfill or use audit archive "
-                "to pretend startup evidence exists. If accepted implementation "
+                "and filer_principal. Do not observer-backfill or use an archive "
+                "path to pretend startup evidence exists. If accepted implementation "
                 "evidence cannot normal-close because startup evidence is "
-                "non-reconstructable, use backlog_audit_archive as WAIVED recovery "
-                "with independent QA."
+                "non-reconstructable, stop and require a separate exceptional "
+                "recovery decision with independent QA."
             )
             suggested_event_kind = "mf_subagent_startup"
             append_skeleton = _generic_repair_append_skeleton(
@@ -8230,6 +8403,7 @@ def repair_gate_summary(
         }
         for kind in missing_event_kinds
     ]
+    archive_recovery_decision = _audit_archive_recovery_decision(full_result)
 
     summary: dict[str, Any] = {
         "schema_version": MF_TIMELINE_REPAIR_SUMMARY_SCHEMA_VERSION,
@@ -8241,6 +8415,12 @@ def repair_gate_summary(
         "failed_gate_repairs": failed_gate_repairs,
         "failed_gate_count": len(failed_gate_repairs),
         "event_count": int(full_result.get("event_count") or 0),
+        "normal_repair_actions": {
+            "schema_version": "mf_close_timeline_normal_repair_actions.v1",
+            "missing_event_repairs": missing_event_repairs,
+            "failed_gate_repairs": failed_gate_repairs,
+        },
+        "exceptional_archive_recovery": archive_recovery_decision,
     }
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
@@ -8267,9 +8447,14 @@ def repair_gate_summary(
     audit_archive_recovery = _audit_archive_recovery_summary(
         full_result,
         request_id=request_id,
+        decision=archive_recovery_decision,
     )
     if audit_archive_recovery:
         summary["audit_archive_recovery"] = audit_archive_recovery
+        summary["exceptional_archive_recovery"] = {
+            **archive_recovery_decision,
+            "recovery": audit_archive_recovery,
+        }
     for opt_key in ("project_id", "bug_id", "applicable"):
         if full_result.get(opt_key) is not None:
             summary[opt_key] = full_result[opt_key]
