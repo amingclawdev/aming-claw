@@ -848,6 +848,14 @@ def test_mcp_observer_runtime_text_prepare_routes_to_governance_endpoint(tmp_pat
             "prompt_contract_hash": "sha256:prompt",
             "route_id": "route-runtime",
             "visible_injection_manifest_hash": "sha256:visible",
+            "parent_route_identity": {
+                "route_id": "event.route_prompt_context.preview",
+                "route_context_hash": "sha256:parent-route",
+                "prompt_contract_id": "rprompt-parent",
+                "prompt_contract_hash": "sha256:parent-prompt",
+                "route_token_ref": "rtok-parent",
+                "visible_injection_manifest_hash": "sha256:visible",
+            },
             "main_worktree": str(main),
             "workspace_root": str(tmp_path / "workers"),
             "owned_files": ["agent/observer_runtime.py"],
@@ -876,6 +884,14 @@ def test_mcp_observer_runtime_text_prepare_routes_to_governance_endpoint(tmp_pat
                 "prompt_contract_hash": "sha256:prompt",
                 "route_id": "route-runtime",
                 "visible_injection_manifest_hash": "sha256:visible",
+                "parent_route_identity": {
+                    "route_id": "event.route_prompt_context.preview",
+                    "route_context_hash": "sha256:parent-route",
+                    "prompt_contract_id": "rprompt-parent",
+                    "prompt_contract_hash": "sha256:parent-prompt",
+                    "route_token_ref": "rtok-parent",
+                    "visible_injection_manifest_hash": "sha256:visible",
+                },
                 "main_worktree": str(main),
                 "workspace_root": str(tmp_path / "workers"),
                 "owned_files": ["agent/observer_runtime.py"],
@@ -1111,6 +1127,10 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         assert props["route_waiver"]["type"] == "object"
         assert props["route_token_waiver"]["type"] == "object"
     assert runtime_text_props["observer_command_id"]["type"] == "string"
+    assert runtime_text_props["parent_route_identity"]["type"] == "object"
+    assert "canonical parent route identity" in runtime_text_props[
+        "parent_route_identity"
+    ]["description"]
 
 
 def test_mcp_parallel_branch_tools_route_to_governance_api():

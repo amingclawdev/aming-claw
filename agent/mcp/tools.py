@@ -414,6 +414,16 @@ TOOLS: list[dict] = [
                 "route_id": {"type": "string"},
                 "precheck_run_id": {"type": "string"},
                 "visible_injection_manifest_hash": {"type": "string"},
+                "parent_route_identity": {
+                    "type": "object",
+                    "description": (
+                        "Optional public-safe canonical parent route identity "
+                        "for runtime-text dispatch lineage; may include "
+                        "route_id, route_context_hash, prompt_contract_id, "
+                        "prompt_contract_hash, route_token_ref, and "
+                        "visible_injection_manifest_hash."
+                    ),
+                },
                 "main_worktree": {"type": "string"},
                 "workspace_root": {"type": "string"},
                 "owned_files": {"type": "array", "items": {"type": "string"}},
