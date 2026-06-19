@@ -801,6 +801,9 @@ def _persist_worker_launch_bridge(prepared: Mapping[str, Any]) -> dict[str, Any]
         "observer_command_id": str(prepared.get("observer_command_id") or ""),
         "worker_launch_pack": dict(worker_launch_pack),
         "startup_recording": dict(prepared.get("startup_recording") or {}),
+        "executable_worker_launch": dict(
+            prepared.get("executable_worker_launch") or {}
+        ),
         "startup_alternatives": dict(prepared.get("startup_alternatives") or {}),
         "same_owner_session_token_startup": dict(
             prepared.get("same_owner_session_token_startup") or {}
@@ -828,6 +831,7 @@ def _persist_worker_launch_bridge(prepared: Mapping[str, Any]) -> dict[str, Any]
                 "runtime_context_implementation_evidence",
                 "mf_subagent_finish_gate",
             ],
+            "launch_command_source": "executable_worker_launch",
             "failure_blocker": "governance_io_unavailable_before_read_receipt",
         },
         "raw_launch_text_persisted": False,
@@ -27739,21 +27743,20 @@ def _observer_runtime_text_contract_revision_payload(
         if isinstance(worker_launch_pack.get("read_receipt_identity"), Mapping)
         else {}
     )
-    read_receipt_hash = _first_text(
-        body.get("read_receipt_hash"),
-        prepared.get("read_receipt_hash"),
-        startup_recording.get("read_receipt_hash"),
-        worker_launch_pack.get("read_receipt_hash"),
-        read_receipt_identity.get("read_receipt_hash"),
+    identity_recorded = bool(read_receipt_identity.get("recorded"))
+    read_receipt_hash = (
+        _first_text(read_receipt_identity.get("read_receipt_hash"))
+        if identity_recorded
+        else ""
     )
-    read_receipt_event_id = _first_text(
-        body.get("read_receipt_event_id"),
-        prepared.get("read_receipt_event_id"),
-        startup_recording.get("read_receipt_event_id"),
-        worker_launch_pack.get("read_receipt_event_id"),
-        read_receipt_identity.get("read_receipt_event_id"),
+    read_receipt_event_id = (
+        _first_text(read_receipt_identity.get("read_receipt_event_id"))
+        if identity_recorded
+        else ""
     )
-    read_receipt_recorded = bool(read_receipt_hash and read_receipt_event_id)
+    read_receipt_recorded = bool(
+        identity_recorded and read_receipt_hash and read_receipt_event_id
+    )
 
     startup_alternatives = (
         prepared.get("startup_alternatives")
@@ -27899,7 +27902,11 @@ def _observer_runtime_text_contract_revision_payload(
         "read_receipt_identity": {
             **dict(read_receipt_identity),
             "recorded": read_receipt_recorded,
-            "status": "recorded" if read_receipt_recorded else "not_recorded",
+            "status": (
+                "recorded"
+                if read_receipt_recorded
+                else str(read_receipt_identity.get("status") or "not_recorded")
+            ),
             "read_receipt_hash": read_receipt_hash if read_receipt_recorded else "",
             "read_receipt_event_id": (
                 read_receipt_event_id if read_receipt_recorded else ""
@@ -28190,6 +28197,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "status": str(dispatch_gate_validation.get("status") or ""),
         "startup_intent_event_generated": bool(dispatch_gate_validation.get("startup_intent_event_generated")),
     }
+    next_legal_action = (
+        prepared.get("next_legal_action")
+        if isinstance(prepared.get("next_legal_action"), Mapping)
+        else {}
+    )
     compact = {
         "ok": bool(prepared.get("ok")),
         "status": str(prepared.get("status") or ""),
@@ -28206,7 +28218,11 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "branch_runtime_evidence": branch_runtime_evidence,
         "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
+        "next_legal_action": dict(next_legal_action),
         "startup_recording": dict(prepared.get("startup_recording") or {}),
+        "executable_worker_launch": dict(
+            prepared.get("executable_worker_launch") or {}
+        ),
         "startup_alternatives": dict(prepared.get("startup_alternatives") or {}),
         "same_owner_session_token_startup": dict(
             prepared.get("same_owner_session_token_startup") or {}

@@ -1367,6 +1367,7 @@ def test_observer_execute_gate_rejects_mismatched_route_identity(tmp_path):
         "route_context_hash": "sha256:gate-route",
         "prompt_contract_id": "rprompt-gate",
         "prompt_contract_hash": "sha256:gate-prompt",
+        "route_token_ref": "rtok-gate",
         "owned_files": ["agent/observer_runtime.py"],
         "dirty_scope_check": {
             "status": "passed",
@@ -1415,6 +1416,10 @@ def test_observer_dogfood_execute_rejects_missing_materialized_worktree(tmp_path
     assert payload["auth_status"] == "not_invoked"
     assert payload["execute_preflight"]["allowed"] is False
     assert "isolated real git worktree" in payload["execute_preflight"]["error"]
+    assert payload["execute_preflight"]["missing_fields"] == [
+        "worktree_path.real_git_worktree"
+    ]
+    assert payload["execute_preflight"]["executable_worker_launch"]["command_display"]
     assert "observer_run" not in payload
 
 
@@ -1469,7 +1474,7 @@ def test_observer_dogfood_materialize_worktree_creates_real_git_worktree_without
         base_commit=commit,
         target_head_commit=commit,
     )
-    args = _replace_option(args, "--backend-mode", "fixture")
+    args = _replace_option(args, "--backend-mode", "codex_cli")
 
     result = runner.invoke(main, args[:-1] + ["--materialize-worktree", "--json-output"])
 
@@ -1518,7 +1523,7 @@ def test_observer_dogfood_execute_blocks_missing_cli_launch_backend_before_mater
     assert not Path(payload["runtime_context"]["worktree_path"]).exists()
 
 
-def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
+def test_observer_dogfood_execute_launches_without_fabricating_startup(
     tmp_path, monkeypatch
 ):
     from agent.ai_invocation import AIInvocationResult
@@ -1559,52 +1564,31 @@ def test_observer_dogfood_execute_prepares_startup_read_receipt_before_success(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    startup_event = payload["startup_timeline_event"]
-    startup_gate = startup_event["payload"]["mf_subagent_startup_gate"]
-    read_receipt = payload["read_receipt"]
     assert payload["ok"] is True
     assert payload["status"] == "completed"
     assert captured["prompt"].startswith("You are a bounded mf_sub implementation worker")
     assert "mf_subagent_read_receipt" in captured["prompt"]
     assert "precommit-check" in captured["prompt"]
     assert captured["metadata"]["early_progress_timeout_sec"] == 20.0
-    assert startup_event["event_kind"] == "mf_subagent_startup"
-    assert startup_event["status"] == "passed"
-    assert startup_gate["status"] == "passed"
-    assert startup_gate["actual_startup_recorded"] is True
-    assert startup_gate["actual_startup_prepared"] is False
-    assert startup_gate["startup_timing"] == "actual_worker_started"
-    assert startup_gate["timeline_event_recorded"] is True
-    assert startup_gate["session_token_evidence_type"] == "surrogate"
-    assert startup_gate["host_startup_id"].startswith("host_adapter:codex_cli:")
-    assert startup_gate["worker_id"] == "worker-a"
-    assert not startup_gate["agent_id"].startswith("fallback_observer")
-    assert startup_gate["observer_command_id"] == DOGFOOD_BACKLOG_ID
-    assert startup_gate["route_id"]
-    assert startup_gate["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
-    assert startup_gate["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
-    assert read_receipt["read_receipt_hash"].startswith("sha256:")
-    assert read_receipt["observer_command_id"] == DOGFOOD_BACKLOG_ID
-    assert read_receipt["task_id"] == DOGFOOD_BACKLOG_ID
-    assert read_receipt["route_id"] == startup_gate["route_id"]
-    assert read_receipt["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
-    assert read_receipt["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
-    assert read_receipt["visible_injection_manifest_hash"] == DOGFOOD_VISIBLE_MANIFEST_HASH
-    assert read_receipt["branch_ref"] == startup_gate["branch_ref"]
-    assert read_receipt["worktree_path"] == startup_gate["worktree_path"]
-    assert read_receipt["fence_token"] == "fence-dogfood-test"
-    assert read_receipt["owned_files"] == ["agent/observer_runtime.py", "agent/cli.py"]
-    assert read_receipt["prepared_before_implementation_wait"] is True
-    assert read_receipt["recorded_before_implementation_wait"] is True
-    assert read_receipt["timeline_event_recorded"] is True
-    assert read_receipt["timeline_event_id"]
-    assert payload["observer_run"]["startup_recording"]["recorded"] is True
-    assert payload["observer_run"]["startup_recording"]["appendable"] is False
-    assert payload["observer_run"]["startup_recording"]["actual_startup_recorded"] is True
-    assert payload["observer_run"]["read_receipt_recorded"] is True
-    assert payload["observer_run"][
-        "read_receipt_recorded_before_implementation_wait"
-    ] is True
+    executable_launch = payload["executable_worker_launch"]
+    assert executable_launch["status"] == "ready"
+    assert executable_launch["executable"] is True
+    assert executable_launch["payload"]["task_id"] == DOGFOOD_BACKLOG_ID
+    assert executable_launch["payload"]["route_context_hash"] == DOGFOOD_ROUTE_CONTEXT_HASH
+    assert executable_launch["payload"]["prompt_contract_id"] == DOGFOOD_PROMPT_CONTRACT_ID
+    assert executable_launch["payload"]["visible_injection_manifest_hash"] == (
+        DOGFOOD_VISIBLE_MANIFEST_HASH
+    )
+    assert executable_launch["payload"]["owned_files"] == [
+        "agent/observer_runtime.py",
+        "agent/cli.py",
+    ]
+    assert "codex exec" in executable_launch["command_display"]
+    assert "AMING_WORKER_SESSION_TOKEN" in executable_launch["command_display"]
+    assert "startup_timeline_event" not in payload
+    assert "read_receipt" not in payload
+    assert "startup_recording" not in payload["observer_run"]
+    assert payload["observer_run"]["executable_worker_launch"] == executable_launch
 
 
 def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monkeypatch):
@@ -1657,11 +1641,11 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
     assert blocker["terminal_dispatch_blocker"] is True
     assert blocker["failure_evidence_appended"] is True
     assert blocker["command_projection_status"] == "failed"
-    assert blocker["startup_recorded"] is True
-    assert blocker["read_receipt_recorded"] is True
-    assert blocker["read_receipt_recorded_before_implementation_wait"] is True
-    assert blocker["startup_timeline_event_id"]
-    assert blocker["read_receipt_timeline_event_id"]
+    assert blocker["startup_recorded"] is False
+    assert blocker["read_receipt_recorded"] is False
+    assert blocker["read_receipt_recorded_before_implementation_wait"] is False
+    assert blocker["startup_timeline_event_id"] == ""
+    assert blocker["read_receipt_timeline_event_id"] == ""
     assert blocker["observer_command_id"] == DOGFOOD_BACKLOG_ID
     assert blocker["task_id"] == DOGFOOD_BACKLOG_ID
     assert blocker["route_id"]
@@ -1676,10 +1660,17 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
     assert projection["canonical_contract_state"] == "blocked"
     assert projection["command_projection_status"] == "failed"
     assert projection["observer_command_id"] == DOGFOOD_BACKLOG_ID
-    assert payload["startup_timeline_event"]["event_kind"] == "mf_subagent_startup"
-    assert payload["startup_timeline_event"]["status"] == "passed"
-    assert payload["actual_startup_recorded"] is True
-    assert payload["read_receipt_recorded"] is True
+    assert "executable_worker_launch_payload" in projection["terminal_evidence_refs"]
+    assert "mf_subagent_startup_not_recorded" in projection["terminal_evidence_refs"]
+    assert "mf_subagent_read_receipt_not_recorded" in projection["terminal_evidence_refs"]
+    assert blocker["executable_worker_launch"]["payload"]["task_id"] == DOGFOOD_BACKLOG_ID
+    assert blocker["executable_worker_launch"]["payload"]["owned_files"] == [
+        "agent/observer_runtime.py",
+        "agent/cli.py",
+    ]
+    assert "startup_timeline_event" not in payload
+    assert "actual_startup_recorded" not in payload
+    assert "read_receipt_recorded" not in payload
 
 
 def test_observer_dogfood_generated_worker_workspace_differs_from_main(tmp_path):
@@ -2577,6 +2568,7 @@ class TestCliMf:
             "route_context_hash": "sha256:test-route-context",
             "prompt_contract_id": "prompt-contract-test",
             "prompt_contract_hash": "sha256:test-prompt-contract",
+            "route_token_ref": "rtok-test",
             "owned_files": ["agent/cli.py"],
             "dirty_scope_check": {
                 "status": "passed",

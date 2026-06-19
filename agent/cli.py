@@ -1672,6 +1672,12 @@ def observer_dogfood(
         runtime_context = result.get("runtime_context") or {}
         if runtime_context.get("worktree_path"):
             click.echo(f"worktree: {runtime_context.get('worktree_path')}")
+        executable_launch = result.get("executable_worker_launch") or {}
+        if executable_launch.get("command_display"):
+            click.echo(f"worker launch command: {executable_launch.get('command_display')}")
+        missing_launch = executable_launch.get("missing_fields") or []
+        if missing_launch:
+            click.echo(f"missing launch fields: {', '.join(missing_launch)}", err=True)
         if gate_output:
             click.echo(f"gate: {gate_output}")
         if not result.get("ok"):
@@ -1855,6 +1861,12 @@ def observer_runtime_text_prepare(
         )
         click.echo(f"runtime_context_id: {result.get('runtime_context_id')}")
         click.echo(f"launch_text_hash: {result.get('launch_text_hash')}")
+        executable_launch = result.get("executable_worker_launch") or {}
+        if executable_launch.get("command_display"):
+            click.echo(f"worker launch command: {executable_launch.get('command_display')}")
+        missing_launch = executable_launch.get("missing_fields") or []
+        if missing_launch:
+            click.echo(f"missing launch fields: {', '.join(missing_launch)}", err=True)
         if not result.get("ok"):
             validation = result.get("dispatch_gate_validation") or {}
             click.echo(

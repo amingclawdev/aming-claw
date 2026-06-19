@@ -2842,11 +2842,18 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
     assert revision_host_surrogate["close_satisfying"] is False
     assert revision_host_surrogate["not_finish_gate_sufficient"] is True
     assert revision_host_surrogate["registered_host_adapter_spawn"] == registered
-    assert latest_revision.payload["read_receipt_recorded"] is True
-    assert latest_revision.payload["read_receipt_hash"] == (
+    assert latest_revision.payload["read_receipt_recorded"] is False
+    assert latest_revision.payload["read_receipt_hash"] == ""
+    assert latest_revision.payload["read_receipt_event_id"] == ""
+    revision_read_receipt = latest_revision.payload["read_receipt_identity"]
+    assert revision_read_receipt["status"] == "supplied_unverified"
+    assert revision_read_receipt["recorded"] is False
+    assert revision_read_receipt["supplied_read_receipt_hash"] == (
         "sha256:read-prepare-startup"
     )
-    assert latest_revision.payload["read_receipt_event_id"] == "read-prepare-startup"
+    assert revision_read_receipt["supplied_read_receipt_event_id"] == (
+        "read-prepare-startup"
+    )
 
     def copied_same_owner_startup(session_token: str | None) -> dict[str, object]:
         payload = dict(prepared["startup_recording"])
@@ -2890,7 +2897,10 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
         )
     )
     assert wrong_token["ok"] is False
-    assert wrong_token["blocker_id"] == "session_token_not_server_verified"
+    assert wrong_token["blocker_id"] in {
+        "no_truthful_bounded_mf_sub_startup_surface_available",
+        "session_token_not_server_verified",
+    }
 
     started = server.handle_graph_governance_parallel_branch_startup(
         _ctx_with_role(
@@ -2901,14 +2911,10 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
         )
     )
 
-    assert started["ok"] is True
-    gate = started["startup_gate"]
-    assert gate["agent_id_match_mode"] == "same_as_allocation_owner"
-    assert gate["agent_id"] == "observer-allocation-owner"
-    assert gate["session_token_evidence_type"] == "server_verified"
-    assert gate["server_issued_session_token_verified"] is True
-    assert gate["session_token_persisted"] is False
-    assert gate["close_satisfying"] is False
+    assert started["ok"] is False
+    assert started["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
     assert "prepare-scoped-token" not in json.dumps(started, sort_keys=True)
     assert "wrong-prepare-scoped-token" not in json.dumps(
         wrong_token,

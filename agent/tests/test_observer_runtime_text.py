@@ -359,6 +359,49 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert "`--sandbox workspace-write` may prevent localhost governance" in result[
         "launch_text"
     ]
+    executable = result["executable_worker_launch"]
+    assert executable["schema_version"] == "observer_executable_worker_launch.v1"
+    assert executable["status"] == "ready"
+    assert executable["executable"] is True
+    assert executable["backend_mode"] == "codex_cli"
+    assert executable["stdin"]["source"] == "response.launch_text"
+    assert executable["stdin"]["sha256"] == result["launch_text_hash"]
+    assert executable["payload"]["route_context_hash"] == "sha256:route"
+    assert executable["payload"]["prompt_contract_id"] == "rprompt-runtime"
+    assert executable["payload"]["route_token_ref"] == "route-token-ref"
+    assert executable["payload"]["runtime_context_id"] == "mfrctx-runtime-text"
+    assert executable["payload"]["task_id"] == "AC-RUNTIME-TEXT-impl-1"
+    assert executable["payload"]["parent_task_id"] == "AC-RUNTIME-TEXT"
+    assert executable["payload"]["fence_token"] == "fence-runtime-text"
+    assert executable["payload"]["merge_queue_id"] == "mq-runtime-text"
+    assert executable["payload"]["owned_files"] == [
+        "agent/observer_runtime.py",
+        "agent/cli.py",
+    ]
+    assert executable["payload"]["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
+    assert executable["startup_payload_source"] == "startup_recording"
+    assert executable["startup_recording"]["observer_command_id"] == "cmd-runtime-text"
+    assert "codex exec" in executable["command_display"]
+    assert "AMING_WORKER_SESSION_TOKEN" in executable["command_display"]
+    assert executable["missing_fields"] == []
+    next_action = result["next_legal_action"]
+    assert {
+        "action": next_action["action"],
+        "status": next_action["status"],
+        "launch_command_source": next_action["launch_command_source"],
+        "payload_source": next_action["payload_source"],
+        "command_display": next_action["command_display"],
+        "missing_fields": next_action["missing_fields"],
+        "worker_next_legal_action": next_action["worker_next_legal_action"],
+    } == {
+        "action": "launch_bounded_worker",
+        "status": "ready",
+        "launch_command_source": "executable_worker_launch",
+        "payload_source": "response.executable_worker_launch.payload",
+        "command_display": executable["command_display"],
+        "missing_fields": [],
+        "worker_next_legal_action": "submit_mf_subagent_read_receipt",
+    }
 
 
 def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):
@@ -396,6 +439,35 @@ def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):
     persistent = result["persistent_evidence"]["startup_recording"]
     assert persistent["read_receipt_hash"] == "sha256:read-runtime-text"
     assert persistent["read_receipt_event_id"] == "4178"
+
+
+def test_runtime_text_request_supplied_read_receipt_is_unverified(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            read_receipt_hash="sha256:request-supplied",
+            read_receipt_event_id="request-event-1",
+            read_receipt={
+                "event_kind": "mf_subagent_read_receipt",
+                "read_receipt_hash": "sha256:request-supplied",
+                "timeline_event_id": "request-event-1",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "prepared"
+    assert result["read_receipt_recorded"] is False
+    assert result["read_receipt_hash"] == ""
+    assert result["read_receipt_event_id"] == ""
+    identity = result["read_receipt_identity"]
+    assert identity["status"] == "supplied_unverified"
+    assert identity["recorded"] is False
+    assert identity["supplied_unverified"] is True
+    assert identity["supplied_read_receipt_hash"] == "sha256:request-supplied"
+    assert identity["supplied_read_receipt_event_id"] == "request-event-1"
+    assert result["worker_launch_pack"]["read_receipt_recorded"] is False
+    assert result["startup_recording"]["read_receipt_recorded"] is False
 
 
 def test_runtime_text_read_receipt_without_timeline_event_is_not_recorded(tmp_path):
@@ -455,6 +527,30 @@ def test_runtime_text_worker_launch_pack_rejects_missing_route_token_ref(tmp_pat
         "missing_startup_token_join",
         "worker_launch_pack_preflight_failed",
     }
+
+
+def test_runtime_text_unsupported_backend_blocks_executable_launch(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(tmp_path, backend_mode="unsupported_cli")
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    executable = result["executable_worker_launch"]
+    assert executable["status"] == "blocked"
+    assert executable["executable"] is False
+    assert "backend_mode.codex_cli" in executable["missing_fields"]
+    next_action = result["next_legal_action"]
+    assert next_action["status"] == "blocked"
+    assert next_action["allowed"] is False
+    assert "backend_mode.codex_cli" in next_action["missing_fields"]
+    assert "executable_worker_launch_missing_fields" in {
+        item["code"] for item in next_action["blockers"]
+    }
+    validation = result["dispatch_gate_validation"]
+    assert validation["allowed"] is False
+    assert validation["status"] == "executable_worker_launch_blocked"
+    assert validation["next_legal_action"]["status"] == "blocked"
 
 
 def test_runtime_text_worker_launch_pack_rejects_observer_only_next_action(tmp_path):
