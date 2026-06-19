@@ -852,7 +852,9 @@ def _handoff_gate(
         errors.append("missing_tests_evidence")
     if not _has_timeline_kind(subject.get("timeline_evidence"), {"implementation", "verification"}):
         errors.append("missing_timeline_evidence")
-    if _policy_requires(governance_policy, "worker_graph_trace") and not _has_graph_trace_evidence(subject):
+    if _policy_requires(governance_policy, "worker_graph_trace") and not (
+        _has_graph_trace_evidence(subject)
+    ):
         errors.append("missing_worker_graph_trace_evidence")
 
     return {
@@ -1295,11 +1297,21 @@ def _close_gate(
     )
     independent_verification_present = _independent_verification_present(subject)
     route_context_gate = _route_context_consumption_gate(subject)
-    close_missing_event_kinds = [
-        kind
-        for kind in ("implementation", "verification", "close_ready")
-        if not _has_timeline_kind(subject.get("timeline_evidence"), {kind})
-    ]
+    close_timeline_gate = task_timeline.mf_close_gate_verification(
+        _close_timeline_events(subject),
+        contract=_route_context_contract(subject),
+    )
+    close_timeline_accounting = _close_timeline_accounting(
+        subject,
+        close_timeline_gate,
+    )
+    parallel_lane_evidence_ledger = _parallel_lane_evidence_ledger(
+        subject,
+        close_timeline_gate,
+    )
+    close_missing_event_kinds = _string_list(
+        close_timeline_accounting.get("missing_event_kinds")
+    )
     missing_evidence_groups = task_timeline.mf_close_missing_evidence_groups(
         close_missing_event_kinds,
         route_context_gate,
@@ -1311,12 +1323,12 @@ def _close_gate(
 
     if not _text(subject.get("merge_commit")):
         errors.append("missing_merge_commit")
-    if not _has_timeline_kind(subject.get("timeline_evidence"), {"close_ready"}):
+    present_event_kinds = set(
+        _string_list(close_timeline_accounting.get("present_event_kinds"))
+    )
+    if "close_ready" not in present_event_kinds:
         errors.append("missing_close_ready_timeline")
-    if not _has_timeline_kind(
-        subject.get("timeline_evidence"),
-        {"implementation", "verification", "close_ready"},
-    ):
+    if close_missing_event_kinds:
         errors.append("mf_timeline_precheck_incomplete")
     if missing_evidence:
         errors.append("required_evidence_ids_missing")
@@ -1330,6 +1342,14 @@ def _close_gate(
     if projection_requirements["explicit_projection"]:
         for field_name in projection_requirements["missing_fields"]:
             errors.append(f"missing_runtime_context_projection:{field_name}")
+    if not _mapping(close_timeline_gate.get("cross_ref_gate")).get("passed", True):
+        errors.append("mf_timeline_cross_ref_evidence_rejected")
+    finish_gate_projection = _mapping(close_timeline_gate.get("finish_gate_projection"))
+    if (
+        finish_gate_projection.get("required")
+        and not finish_gate_projection.get("passed", True)
+    ):
+        errors.append("mf_finish_gate_projection_incomplete")
 
     return {
         "schema_version": PRECHECK_RESULT_SCHEMA_VERSION,
@@ -1346,15 +1366,14 @@ def _close_gate(
         "route_context_gate": route_context_gate,
         "route_context_reminder": route_context_reminder,
         "route_context_consumption_required": bool(route_context_gate.get("required")),
+        "close_timeline_accounting": close_timeline_accounting,
+        "parallel_lane_evidence_ledger": parallel_lane_evidence_ledger,
         "independent_verification_required": independent_verification_required,
         "independent_verification_evidence_present": independent_verification_present,
         "worker_graph_trace_evidence_present": _has_graph_trace_evidence(subject),
         "runtime_context_projection_requirements": projection_requirements,
-        "close_ready_present": _has_timeline_kind(subject.get("timeline_evidence"), {"close_ready"}),
-        "mf_timeline_precheck_compatible": _has_timeline_kind(
-            subject.get("timeline_evidence"),
-            {"implementation", "verification", "close_ready"},
-        ),
+        "close_ready_present": "close_ready" in present_event_kinds,
+        "mf_timeline_precheck_compatible": not close_missing_event_kinds,
     }
 
 
@@ -1883,6 +1902,242 @@ def _independent_verification_identity(value: Mapping[str, Any]) -> bool:
         or kind in independent_kinds
         or source in independent_lanes
     )
+
+
+def _close_timeline_events(subject: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        dict(item)
+        for item in _iter_mappings(subject.get("timeline_evidence"))
+        if isinstance(item, Mapping)
+    ]
+
+
+def _raw_close_event_kinds(subject: Mapping[str, Any]) -> list[str]:
+    present: set[str] = set()
+    for event in _close_timeline_events(subject):
+        if not _evidence_passed(event):
+            continue
+        kind = _text(event.get("event_kind") or event.get("kind")).lower()
+        phase = _text(event.get("phase")).lower()
+        key = kind or phase
+        if (
+            key not in {"implementation", "verification", "close_ready"}
+            and phase == "verification"
+            and kind in {"qa_verification", "independent_verification"}
+        ):
+            key = "verification"
+        if key in {"implementation", "verification", "close_ready"}:
+            present.add(key)
+    return sorted(present)
+
+
+def _close_timeline_accounting(
+    subject: Mapping[str, Any],
+    close_timeline_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_present = set(_raw_close_event_kinds(subject))
+    gate_present = set(_string_list(close_timeline_gate.get("present_event_kinds")))
+    projected = set(
+        _string_list(
+            _mapping(close_timeline_gate.get("finish_gate_projection")).get(
+                "projected_event_kinds"
+            )
+        )
+    )
+    present = raw_present | gate_present | projected
+    required = {"implementation", "verification", "close_ready"}
+    missing = sorted(required - present)
+    return {
+        "schema_version": "mf_workflow_close_timeline_accounting.v1",
+        "required_event_kinds": sorted(required),
+        "raw_present_event_kinds": sorted(raw_present),
+        "present_event_kinds": sorted(present),
+        "projected_event_kinds": sorted(projected),
+        "missing_event_kinds": missing,
+        "event_count": close_timeline_gate.get(
+            "event_count",
+            len(_close_timeline_events(subject)),
+        ),
+        "projected_event_count": close_timeline_gate.get("projected_event_count", 0),
+        "canonical_gate_status": _text(close_timeline_gate.get("status")),
+        "canonical_gate_passed": bool(close_timeline_gate.get("passed")),
+    }
+
+
+def _parallel_lane_evidence_ledger(
+    subject: Mapping[str, Any],
+    close_timeline_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    finish_gate_projection = _mapping(close_timeline_gate.get("finish_gate_projection"))
+    route_context_gate = _mapping(close_timeline_gate.get("route_context_gate"))
+    cross_ref_gate = _mapping(close_timeline_gate.get("cross_ref_gate"))
+    startup_gate = _mapping(close_timeline_gate.get("close_timeline_startup_gate"))
+    independent_qa_gate = _mapping(close_timeline_gate.get("independent_qa_gate"))
+
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for item in _iter_mappings(finish_gate_projection.get("projected_events")):
+        accepted.append(
+            _parallel_lane_ledger_ref(
+                item,
+                subject=subject,
+                accepted_by="finish_gate_projection",
+            )
+        )
+    for key, accepted_by in (
+        ("accepted_dispatch_lineages", "route_context_dispatch_lineage"),
+        ("accepted_startup_lineages", "route_context_startup_lineage"),
+        ("accepted_action_scope_lineages", "route_context_action_scope_lineage"),
+        ("accepted_startup_events", "startup_close_satisfying"),
+    ):
+        source = startup_gate if key == "accepted_startup_events" else route_context_gate
+        for item in _iter_mappings(source.get(key)):
+            accepted.append(
+                _parallel_lane_ledger_ref(
+                    item,
+                    subject=subject,
+                    accepted_by=accepted_by,
+                )
+            )
+
+    for item in _iter_mappings(finish_gate_projection.get("evidence_events")):
+        missing = _string_list(item.get("missing_fields"))
+        if missing:
+            rejected.append(
+                _parallel_lane_ledger_ref(
+                    item,
+                    subject=subject,
+                    reason="finish_gate_projection_missing_fields",
+                    details={"missing_fields": missing},
+                )
+            )
+    for item in _iter_mappings(cross_ref_gate.get("rejected_cross_ref_evidence")):
+        rejected.append(
+            _parallel_lane_ledger_ref(
+                item,
+                subject=subject,
+                reason=_text(item.get("reason")) or "cross_ref_identity_mismatch",
+                details={
+                    "mismatches": item.get("mismatches", {}),
+                    "diagnosis": item.get("diagnosis", ""),
+                },
+            )
+        )
+    for item in _iter_mappings(independent_qa_gate.get("rejected_evidence_events")):
+        rejected.append(
+            _parallel_lane_ledger_ref(
+                item,
+                subject=subject,
+                reason=_text(item.get("reason")) or "independent_qa_evidence_rejected",
+            )
+        )
+    for item in _iter_mappings(startup_gate.get("demoted_startup_events")):
+        rejected.append(
+            _parallel_lane_ledger_ref(
+                item,
+                subject=subject,
+                reason=_text(item.get("reason")) or "startup_not_close_satisfying",
+            )
+        )
+
+    accepted = [item for item in accepted if item]
+    rejected = [item for item in rejected if item]
+    accepted_evidence = _dedupe_ledger_refs(accepted)
+    return {
+        "schema_version": "mf_workflow_parallel_lane_evidence_ledger.v1",
+        "accepted_evidence": accepted_evidence,
+        "accepted_sibling_lane_evidence": [
+            item for item in accepted_evidence if item.get("sibling_lane")
+        ],
+        "rejected_evidence": _dedupe_ledger_refs(rejected),
+    }
+
+
+def _parallel_lane_ledger_ref(
+    value: Mapping[str, Any],
+    *,
+    subject: Mapping[str, Any],
+    accepted_by: str = "",
+    reason: str = "",
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    parent_backlog_id = _first_text(subject, "backlog_id", "bug_id")
+    parent_task_id = (
+        _first_text(subject, "task_id", "parent_task_id") or parent_backlog_id
+    )
+    task_id = _deep_text(value, "task_id")
+    backlog_id = _deep_text(value, "backlog_id") or parent_backlog_id
+    ref = {
+        "id": _text(value.get("id") or value.get("event_id")),
+        "event_kind": _text(value.get("event_kind") or value.get("kind")),
+        "event_type": _text(value.get("event_type")),
+        "status": _text(value.get("status") or value.get("decision")),
+        "task_id": task_id,
+        "parent_task_id": _deep_text(value, "parent_task_id"),
+        "backlog_id": backlog_id,
+        "route_id": _deep_text(value, "route_id"),
+        "route_context_hash": _deep_text(value, "route_context_hash"),
+        "prompt_contract_id": _deep_text(value, "prompt_contract_id"),
+        "source_event_id": _deep_text(value, "source_event_id"),
+        "projected_from": _deep_text(value, "projected_from"),
+        "sibling_lane": bool(
+            task_id
+            and parent_task_id
+            and task_id != parent_task_id
+            and (
+                _deep_text(value, "parent_task_id") == parent_task_id
+                or backlog_id == parent_backlog_id
+            )
+        ),
+    }
+    if accepted_by:
+        ref["accepted_by"] = accepted_by
+    if reason:
+        ref["reason"] = reason
+    if details:
+        ref["details"] = {
+            key: item
+            for key, item in dict(details).items()
+            if item not in (None, "", [], {})
+        }
+    return {key: item for key, item in ref.items() if item not in (None, "", [], {})}
+
+
+def _dedupe_ledger_refs(values: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        item = dict(value)
+        key = json.dumps(item, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _deep_text(value: Any, *keys: str) -> str:
+    if isinstance(value, Mapping):
+        for key in keys:
+            token = _text(value.get(key))
+            if token:
+                return token
+        for child in value.values():
+            token = _deep_text(child, *keys)
+            if token:
+                return token
+    elif isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        for child in value:
+            token = _deep_text(child, *keys)
+            if token:
+                return token
+    return ""
 
 
 def _required_evidence_ids(subject: Mapping[str, Any]) -> list[str]:

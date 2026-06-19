@@ -364,6 +364,20 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert executable["status"] == "ready"
     assert executable["executable"] is True
     assert executable["backend_mode"] == "codex_cli"
+    env_policy = executable["env_policy"]
+    assert env_policy["mode"] == "additive"
+    assert env_policy["replacement_env_allowed"] is False
+    assert env_policy["must_preserve_host_env"] is True
+    assert set(env_policy["preserve_host_env_keys"]) == {
+        "PATH",
+        "HOME",
+        "SHELL",
+        "TMPDIR",
+    }
+    assert set(env_policy["additive_env_keys"]) == set(executable["env"])
+    assert "sed, cat, git, and Python" in env_policy["operator_instruction"]
+    assert executable["env_additions"] == executable["env"]
+    assert executable["shell_safe"] is True
     assert executable["stdin"]["source"] == "response.launch_text"
     assert executable["stdin"]["sha256"] == result["launch_text_hash"]
     assert executable["payload"]["route_context_hash"] == "sha256:route"
@@ -379,6 +393,29 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         "agent/cli.py",
     ]
     assert executable["payload"]["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
+    registered_spawn = result["registered_host_adapter_spawn"]
+    assert registered_spawn["source"] == "observer_runtime_text_prepare"
+    assert registered_spawn["registration_source"] == "runtime_text_prepare"
+    assert registered_spawn["host_startup_id"]
+    assert registered_spawn["session_token_surrogate"]
+    assert result["startup_recording"]["host_startup_id"] == (
+        registered_spawn["host_startup_id"]
+    )
+    assert result["startup_recording"]["session_token_surrogate"] == (
+        registered_spawn["session_token_surrogate"]
+    )
+    assert executable["payload"]["host_startup_id"] == registered_spawn["host_startup_id"]
+    assert executable["payload"]["session_token_surrogate"] == (
+        registered_spawn["session_token_surrogate"]
+    )
+    assert executable["payload"]["registered_host_adapter_spawn"] == registered_spawn
+    identity_policy = executable["startup_identity_policy"]
+    assert identity_policy["canonical_retry_payload"] == "startup_recording"
+    host_adapter_identity = identity_policy["copyable_host_adapter_identity_fields"]
+    assert host_adapter_identity["host_startup_id"] == registered_spawn["host_startup_id"]
+    assert host_adapter_identity["session_token_surrogate"] == (
+        registered_spawn["session_token_surrogate"]
+    )
     assert executable["startup_payload_source"] == "startup_recording"
     assert executable["startup_recording"]["observer_command_id"] == "cmd-runtime-text"
     assert "codex exec" in executable["command_display"]
@@ -402,6 +439,8 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         "missing_fields": [],
         "worker_next_legal_action": "submit_mf_subagent_read_receipt",
     }
+    assert next_action["env_policy"] == env_policy
+    assert next_action["startup_identity_policy"] == identity_policy
 
 
 def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):

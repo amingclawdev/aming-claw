@@ -24516,14 +24516,19 @@ def _timeline_claimed_route_identity(
     payload = body.get("payload") if isinstance(body, Mapping) else {}
     payload = payload if isinstance(payload, Mapping) else {}
     summary = _timeline_event_summary(body, event)
+    event_identity = _observer_root_route_identity_from_event(
+        _timeline_event_route_consumption_candidate(body, event)
+    )
     candidates: list[Mapping[str, Any]] = []
     for value in (
+        event_identity,
+        summary.get("route_identity"),
+        summary.get("runtime_dispatch_evidence"),
         body.get("route_identity"),
         body.get("claimed_route_identity"),
         body.get("command_route_identity"),
         body.get("observer_command_route_identity"),
         payload.get("route_identity"),
-        summary.get("route_identity"),
         _route_waiver_payload(body),
         (route_context_gate or {}).get("route_identity")
         if isinstance(route_context_gate, Mapping)
@@ -25816,13 +25821,9 @@ def _canonical_visible_injection_manifest_hash(
         for event in events:
             if not isinstance(event, dict) or _event_id(event) != cleanup_event_id:
                 continue
-            summary = task_timeline.route_context_consumption_event_summary(event)
-            manifest_hash = str(
-                (summary.get("runtime_dispatch_evidence") or {}).get(
-                    "visible_injection_manifest_hash"
-                )
-                or ""
-            ).strip()
+            manifest_hash = _observer_root_route_identity_from_event(event).get(
+                "visible_injection_manifest_hash", ""
+            )
             if manifest_hash:
                 return manifest_hash
             break
@@ -25853,12 +25854,9 @@ def _canonical_visible_injection_manifest_hash(
             != canonical_prompt_contract_id
         ):
             continue
-        manifest_hash = str(
-            (summary.get("runtime_dispatch_evidence") or {}).get(
-                "visible_injection_manifest_hash"
-            )
-            or ""
-        ).strip()
+        manifest_hash = _observer_root_route_identity_from_event(event).get(
+            "visible_injection_manifest_hash", ""
+        )
         if manifest_hash:
             return manifest_hash
     return ""
@@ -25904,11 +25902,9 @@ def _canonical_route_id(
         for event in events:
             if not isinstance(event, dict) or _event_id(event) != cleanup_event_id:
                 continue
-            summary = task_timeline.route_context_consumption_event_summary(event)
-            route_id = str(
-                (summary.get("runtime_dispatch_evidence") or {}).get("route_id")
-                or ""
-            ).strip()
+            route_id = _observer_root_route_identity_from_event(event).get(
+                "route_id", ""
+            )
             if route_id:
                 return route_id
             break
@@ -25939,9 +25935,7 @@ def _canonical_route_id(
             != canonical_prompt_contract_id
         ):
             continue
-        route_id = str(
-            (summary.get("runtime_dispatch_evidence") or {}).get("route_id") or ""
-        ).strip()
+        route_id = _observer_root_route_identity_from_event(event).get("route_id", "")
         if route_id:
             return route_id
     return ""
@@ -26004,25 +25998,101 @@ def _observer_root_route_merge_identity(
     return merged
 
 
+def _observer_root_route_direct_identity(value: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        field: str(value.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+        if str(value.get(field) or "").strip()
+    }
+
+
+def _observer_root_route_identity_candidate_mappings(
+    event: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    row = event if isinstance(event, Mapping) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    verification = (
+        row.get("verification") if isinstance(row.get("verification"), Mapping) else {}
+    )
+    artifact_refs = (
+        row.get("artifact_refs") if isinstance(row.get("artifact_refs"), Mapping) else {}
+    )
+    containers: list[Mapping[str, Any]] = []
+
+    def _append(value: Any) -> None:
+        if isinstance(value, Mapping):
+            containers.append(value)
+
+    for source in (payload, verification, row):
+        for key in (
+            "route_context",
+            "route_prompt_contract",
+            "route_identity",
+            "claimed_route_identity",
+            "command_route_identity",
+            "observer_command_route_identity",
+            "route_action_precheck",
+            "route_action_gate",
+            "action_precheck",
+            "route_evidence",
+        ):
+            _append(source.get(key) if isinstance(source, Mapping) else None)
+    for key in (
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_dispatch_gate",
+        "mf_subagent_startup_gate",
+        "mf_subagent_finish_gate",
+        "finish_gate",
+        "finish_gate_result",
+        "dispatch_evidence",
+        "startup_evidence",
+    ):
+        _append(payload.get(key))
+    for source in (verification, artifact_refs, payload, row):
+        _append(source)
+    return containers
+
+
+def _observer_root_route_merge_candidate_identity(
+    base: dict[str, str],
+    candidate: Mapping[str, Any],
+) -> dict[str, str]:
+    merged = dict(base)
+    for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
+        if merged.get(field):
+            continue
+        token = str(candidate.get(field) or "").strip()
+        if token:
+            merged[field] = token
+    return merged
+
+
 def _observer_root_route_identity_from_event(
     event: Mapping[str, Any],
 ) -> dict[str, str]:
     from . import task_timeline
 
     summary = task_timeline.route_context_consumption_event_summary(dict(event))
-    route_identity = (
-        summary.get("route_identity")
-        if isinstance(summary.get("route_identity"), Mapping)
-        else {}
-    )
-    runtime_evidence = (
-        summary.get("runtime_dispatch_evidence")
-        if isinstance(summary.get("runtime_dispatch_evidence"), Mapping)
-        else {}
-    )
     identity: dict[str, str] = {}
+    for candidate in _observer_root_route_identity_candidate_mappings(event):
+        identity = _observer_root_route_merge_candidate_identity(
+            identity,
+            _observer_root_route_direct_identity(candidate),
+        )
+    for summary_key in ("route_identity", "runtime_dispatch_evidence"):
+        summary_identity = (
+            summary.get(summary_key)
+            if isinstance(summary.get(summary_key), Mapping)
+            else {}
+        )
+        identity = _observer_root_route_merge_candidate_identity(
+            identity,
+            _observer_root_route_direct_identity(summary_identity),
+        )
     for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
-        token = str(route_identity.get(field) or runtime_evidence.get(field) or "").strip()
+        if identity.get(field):
+            continue
+        token = _timeline_first_deep_text(dict(event), field)
         if token:
             identity[field] = token
     return identity

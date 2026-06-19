@@ -4467,6 +4467,153 @@ def test_mf_sub_startup_accepts_runtime_text_prepare_placeholder_host_agent(
     assert gate["session_token_evidence_type"] == "surrogate"
 
 
+def test_mf_sub_startup_accepts_nested_runtime_text_registered_host_identity(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-nested-runtime-text-host"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="worker-startup",
+        allocation_owner="worker-startup",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, "mf-sub-startup")
+    registered_identity = {
+        "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+        "source": "observer_runtime_text_prepare",
+        "registration_source": "runtime_text_prepare",
+        "runtime_context_id": runtime_context_id,
+        "observer_command_id": "cmd-startup",
+        "launch_text_hash": "sha256:launch-runtime-text",
+        "task_id": "mf-sub-startup",
+        "worker_slot_id": "worker-startup",
+        "agent_id": "host_adapter_agent:host_adapter:nested",
+        "actual_host_worker_id": "host_adapter_agent:host_adapter:nested",
+        "host_startup_id": "host_adapter:host_adapter:nested",
+        "host_session_id": "host_adapter:host_adapter:nested",
+        "session_token_surrogate": "host-adapter:nested",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={"registered_host_adapter_spawn": registered_identity},
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            worker_slot_id="worker-startup",
+            actual_host_worker_id="",
+            agent_id="019ec4d9-755a-75a1-9216-d4805655a685",
+            session_token="",
+            session_token_surrogate="",
+            startup_source="codex_host_spawn_agent",
+            host_startup_id="",
+            launch_text_hash="sha256:launch-runtime-text",
+            registered_host_adapter_spawn=registered_identity,
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is True
+    gate = result["startup_gate"]
+    assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["host_startup_id"] == "host_adapter:host_adapter:nested"
+    assert gate["session_token_surrogate"] == "host-adapter:nested"
+    assert gate["session_token_evidence_type"] == "surrogate"
+    assert gate["close_satisfying"] is False
+
+
+def test_mf_sub_startup_refusal_lists_identity_fields_and_retry_payload(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-identity-refusal"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            session_token="",
+            session_token_surrogate="",
+            host_startup_id="",
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == (
+        "no_truthful_bounded_mf_sub_startup_surface_available"
+    )
+    assert "session_token_surrogate_or_host_startup_id" in result[
+        "missing_required_fields"
+    ]
+    identity_fields = result["startup_identity_fields"]
+    assert "session_token" in identity_fields["missing_fields"]
+    assert "host_startup_id" in identity_fields["missing_fields"]
+    next_action = result["next_action"]
+    assert next_action["canonical_retry_payload_source"] == (
+        "worker_launch_pack.startup_recording"
+    )
+    assert next_action["startup_payload_source"] == (
+        "worker_launch_pack.startup_recording"
+    )
+    assert "copyable_retry_payload" in next_action
+    assert next_action["copyable_retry_payload"]["append_tool"] == (
+        "parallel_branch_startup"
+    )
+    assert next_action["copyable_retry_payload"]["host_startup_id"] == (
+        "<fill host_startup_id or session_token_surrogate>"
+    )
+    assert next_action["copyable_retry_payload"]["session_token_surrogate"] == (
+        "<fill session_token_surrogate or host_startup_id>"
+    )
+    assert "session_token_surrogate_or_host_startup_id" not in next_action[
+        "copyable_retry_payload"
+    ]
+    refusal = result["timeline_event"]["payload"]["mf_subagent_startup_refusal"]
+    assert refusal["present_startup_identity_fields"] == (
+        next_action["present_startup_identity_fields"]
+    )
+    assert refusal["missing_startup_identity_fields"] == (
+        next_action["missing_startup_identity_fields"]
+    )
+
+
 def test_mf_sub_graph_query_accepts_runtime_text_host_adapter_without_raw_token(
     tmp_path,
 ) -> None:

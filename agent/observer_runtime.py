@@ -78,6 +78,9 @@ OBSERVER_EXECUTABLE_WORKER_LAUNCH_SCHEMA_VERSION = "observer_executable_worker_l
 OBSERVER_RUNTIME_TEXT_NEXT_LEGAL_ACTION_SCHEMA_VERSION = (
     "observer_runtime_text.next_legal_action.v1"
 )
+OBSERVER_EXECUTABLE_LAUNCH_ENV_POLICY_SCHEMA_VERSION = (
+    "observer_executable_worker_launch.env_policy.v1"
+)
 ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION = "observer_one_hop_execution_gate.v1"
 EXECUTE_BACKLOG_ROW_COMMAND_TYPE = "execute_backlog_row"
 EXECUTE_BACKLOG_ROW_REQUIRED_PAYLOAD_FIELDS = (
@@ -181,6 +184,12 @@ EXECUTABLE_WORKER_LAUNCH_REQUIRED_FIELDS = (
     "owned_files",
     "launch_text_hash",
     "session_token_env",
+)
+EXECUTABLE_WORKER_LAUNCH_PRESERVE_HOST_ENV = (
+    "PATH",
+    "HOME",
+    "SHELL",
+    "TMPDIR",
 )
 WORKER_LAUNCH_PACK_ALLOWED_ACTIONS = (
     "submit_mf_subagent_read_receipt",
@@ -3886,6 +3895,21 @@ def _runtime_text_worker_launch_pack(
         "failure_blocker": "governance_io_unavailable_before_read_receipt",
         "raw_session_token_persisted": False,
     }
+    launch_env_additions = {
+        "AMING_GOVERNANCE_URL": "http://localhost:40000",
+        "AMING_WORKER_SESSION_TOKEN": "<server-issued-worker-session-token>",
+        "AMING_RUNTIME_CONTEXT_ID": runtime_context_id,
+        "AMING_OBSERVER_COMMAND_ID": observer_command_id,
+        "AMING_WORKER_TASK_ID": str(
+            getattr(context, "task_id", "") or request.task_id or ""
+        ),
+        "AMING_WORKER_FENCE_TOKEN": str(getattr(context, "fence_token", "") or ""),
+    }
+    launch_env_policy = _runtime_text_executable_launch_env_policy(
+        launch_env_additions
+    )
+    cli_runtime_requirements["env_additions"] = dict(launch_env_additions)
+    cli_runtime_requirements["env_policy"] = dict(launch_env_policy)
     startup_alternatives = {
         "schema_version": "observer_worker_launch_pack.startup_alternatives.v1",
         "default": "same_owner_session_token_startup",
@@ -3896,6 +3920,11 @@ def _runtime_text_worker_launch_pack(
         "raw_session_token_persisted": False,
         "raw_launch_text_persisted": False,
     }
+    startup_identity_policy = _runtime_text_startup_identity_policy(
+        same_owner_session_token_startup=same_owner_session_token_startup,
+        host_adapter_surrogate_startup=host_adapter_surrogate_startup,
+        registered_host_adapter_spawn=registered_host_adapter_spawn,
+    )
     worker_guide_status = str(request.worker_guide_status or "ready").strip()
     next_legal_action = str(
         request.worker_next_legal_action or "submit_mf_subagent_read_receipt"
@@ -3976,6 +4005,7 @@ def _runtime_text_worker_launch_pack(
             "A recorded refusal event id is not startup acceptance; stop and "
             "report the blocker instead of continuing implementation."
         ),
+        "startup_identity_policy": dict(startup_identity_policy),
     }
     required_evidence = [
         {
@@ -4050,6 +4080,7 @@ def _runtime_text_worker_launch_pack(
             "worker_evidence_substitution_allowed": False,
         },
         "startup_alternatives": startup_alternatives,
+        "startup_identity_policy": startup_identity_policy,
         "same_owner_session_token_startup": dict(same_owner_session_token_startup),
         "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
         "startup_refusal_policy": startup_refusal_policy,
@@ -4208,6 +4239,8 @@ def _runtime_text_worker_launch_pack(
         "local_runtime_context_bridge": local_bridge,
         "runtime_context_entrypoints": runtime_context_entrypoints,
         "cli_runtime_requirements": cli_runtime_requirements,
+        "env_additions": dict(launch_env_additions),
+        "env_policy": launch_env_policy,
         "worker_guide_ref": worker_guide_ref,
         "worker_guide_hash": worker_guide_hash,
         "worker_guide_status": worker_guide_status,
@@ -4223,6 +4256,7 @@ def _runtime_text_worker_launch_pack(
         "launch_text_hash": launch_text_hash,
         "read_receipt_identity": dict(read_receipt_identity),
         "startup_alternatives": startup_alternatives,
+        "startup_identity_policy": startup_identity_policy,
         "same_owner_session_token_startup": dict(same_owner_session_token_startup),
         "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
         "startup_identity": dict(same_owner_session_token_startup),
@@ -4265,6 +4299,125 @@ def _runtime_text_worker_output_path(
         / "runtime-context"
         / f"{safe_id[:96]}.last-message.txt"
     )
+
+
+def _runtime_text_executable_launch_env_policy(
+    env_additions: Mapping[str, Any],
+) -> dict[str, Any]:
+    additive_keys = [
+        str(key)
+        for key in env_additions.keys()
+        if str(key or "").strip()
+    ]
+    return {
+        "schema_version": OBSERVER_EXECUTABLE_LAUNCH_ENV_POLICY_SCHEMA_VERSION,
+        "mode": "additive",
+        "env_object_semantics": "additive_env_vars_only",
+        "additive_env_keys": additive_keys,
+        "preserve_host_env_keys": list(EXECUTABLE_WORKER_LAUNCH_PRESERVE_HOST_ENV),
+        "must_preserve_host_env": True,
+        "replacement_env_allowed": False,
+        "shell_safe_prefix": True,
+        "operator_instruction": (
+            "Launch with the host's normal environment intact. Add only the "
+            "listed AMING_* variables; do not replace the environment or use "
+            "env -i. PATH/HOME/SHELL/TMPDIR must remain available so ordinary "
+            "worker tools such as sed, cat, git, and Python can resolve."
+        ),
+        "command_display_semantics": (
+            "The VAR=value prefixes in command_display are shell-safe additive "
+            "assignments for one process; they do not clear the host environment."
+        ),
+    }
+
+
+def _runtime_text_startup_identity_policy(
+    *,
+    same_owner_session_token_startup: Mapping[str, Any],
+    host_adapter_surrogate_startup: Mapping[str, Any],
+    registered_host_adapter_spawn: Mapping[str, Any],
+) -> dict[str, Any]:
+    host_startup_id = str(
+        host_adapter_surrogate_startup.get("host_startup_id")
+        or registered_host_adapter_spawn.get("host_startup_id")
+        or ""
+    ).strip()
+    session_token_surrogate = str(
+        host_adapter_surrogate_startup.get("session_token_surrogate")
+        or registered_host_adapter_spawn.get("session_token_surrogate")
+        or ""
+    ).strip()
+    same_owner_required = [
+        str(item)
+        for item in same_owner_session_token_startup.get(
+            "worker_must_add_before_submit",
+            (),
+        )
+    ]
+    host_adapter_required = [
+        "startup_source",
+        "agent_id",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "session_token_surrogate",
+        "owned_files",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "observer_command_id",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+    ]
+    host_adapter_present = [
+        field
+        for field, value in (
+            ("host_startup_id", host_startup_id),
+            ("session_token_surrogate", session_token_surrogate),
+            ("registered_host_adapter_spawn", registered_host_adapter_spawn),
+        )
+        if value
+    ]
+    return {
+        "schema_version": "observer_runtime_text.startup_identity_policy.v1",
+        "raw_session_token_persisted": False,
+        "default": "same_owner_session_token_startup",
+        "canonical_retry_payload": "startup_recording",
+        "accepted_alternatives": [
+            {
+                "id": "same_owner_session_token_startup",
+                "source": "startup_recording.same_owner_session_token_startup",
+                "requires_raw_session_token": True,
+                "session_token_env": "AMING_WORKER_SESSION_TOKEN",
+                "required_fields": same_owner_required,
+            },
+            {
+                "id": "host_adapter_surrogate_startup",
+                "source": "startup_recording.host_adapter_surrogate_startup",
+                "requires_raw_session_token": False,
+                "required_fields": host_adapter_required,
+                "present_fields": host_adapter_present,
+                "host_startup_id": host_startup_id,
+                "session_token_surrogate": session_token_surrogate,
+                "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
+                "close_satisfying": False,
+            },
+        ],
+        "copyable_host_adapter_identity_fields": {
+            "host_startup_id": host_startup_id,
+            "session_token_surrogate": session_token_surrogate,
+            "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
+        },
+        "present_fields": host_adapter_present,
+        "missing_fields": [
+            field
+            for field, value in (
+                ("host_startup_id", host_startup_id),
+                ("session_token_surrogate", session_token_surrogate),
+            )
+            if not value
+        ],
+    }
 
 
 def _runtime_text_missing_launch_fields(payload: Mapping[str, Any]) -> list[str]:
@@ -4321,6 +4474,22 @@ def _runtime_text_executable_worker_launch(
         "AMING_WORKER_TASK_ID": str(getattr(context, "task_id", "") or request.task_id or ""),
         "AMING_WORKER_FENCE_TOKEN": str(getattr(context, "fence_token", "") or ""),
     }
+    env_policy = _runtime_text_executable_launch_env_policy(env_template)
+    startup_identity_policy = (
+        startup_recording.get("startup_identity_policy")
+        if isinstance(startup_recording.get("startup_identity_policy"), Mapping)
+        else {}
+    )
+    registered_host_adapter_spawn = (
+        startup_recording.get("registered_host_adapter_spawn")
+        if isinstance(startup_recording.get("registered_host_adapter_spawn"), Mapping)
+        else {}
+    )
+    startup_alternatives = (
+        startup_recording.get("startup_alternatives")
+        if isinstance(startup_recording.get("startup_alternatives"), Mapping)
+        else {}
+    )
     payload = {
         "project_id": request.project_id,
         "backlog_id": request.backlog_id,
@@ -4346,6 +4515,20 @@ def _runtime_text_executable_worker_launch(
         "launch_text_hash": launch_text_hash,
         "session_token_env": session_token_env,
         "output_path": output_path,
+        "startup_payload_source": "startup_recording",
+        "startup_identity_policy": dict(startup_identity_policy),
+        "startup_alternatives": dict(startup_alternatives),
+        "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
+        "host_startup_id": str(startup_recording.get("host_startup_id") or ""),
+        "host_session_id": str(startup_recording.get("host_session_id") or ""),
+        "session_token_surrogate": str(
+            startup_recording.get("session_token_surrogate") or ""
+        ),
+        "canonical_startup_identity_fields": dict(
+            startup_recording.get("canonical_startup_identity_fields")
+            if isinstance(startup_recording.get("canonical_startup_identity_fields"), Mapping)
+            else {}
+        ),
     }
     missing_fields = _runtime_text_missing_launch_fields(payload)
     if unsupported_backend:
@@ -4371,22 +4554,29 @@ def _runtime_text_executable_worker_launch(
             "raw_launch_text_persisted": False,
         },
         "env": env_template,
+        "env_additions": dict(env_template),
+        "env_policy": env_policy,
+        "environment_policy": env_policy,
         "operator_must_fill": [f"env.{session_token_env}"],
         "payload": payload,
         "required_fields": list(EXECUTABLE_WORKER_LAUNCH_REQUIRED_FIELDS),
         "missing_fields": missing_fields,
         "startup_payload_source": "startup_recording",
+        "startup_identity_policy": dict(startup_identity_policy),
+        "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "startup_recording": dict(startup_recording),
         "worker_launch_pack_hash": str(
             worker_launch_pack.get("worker_launch_pack_hash") or ""
         ),
         "worker_launch_pack": dict(worker_launch_pack),
+        "shell_safe": True,
         "raw_launch_text_persisted": False,
         "raw_session_token_persisted": False,
         "repair": {
             "copyable_command": command_display,
             "payload_source": "response.executable_worker_launch.payload",
             "stdin_source": "response.launch_text",
+            "env_policy_source": "response.executable_worker_launch.env_policy",
             "missing_fields": missing_fields,
         },
     }
@@ -4411,6 +4601,18 @@ def _runtime_text_observer_next_legal_action(
     payload = (
         executable_worker_launch.get("payload")
         if isinstance(executable_worker_launch.get("payload"), Mapping)
+        else {}
+    )
+    env_policy = (
+        executable_worker_launch.get("env_policy")
+        if isinstance(executable_worker_launch.get("env_policy"), Mapping)
+        else {}
+    )
+    startup_identity_policy = (
+        executable_worker_launch.get("startup_identity_policy")
+        if isinstance(executable_worker_launch.get("startup_identity_policy"), Mapping)
+        else payload.get("startup_identity_policy")
+        if isinstance(payload.get("startup_identity_policy"), Mapping)
         else {}
     )
     stdin = (
@@ -4463,6 +4665,8 @@ def _runtime_text_observer_next_legal_action(
         ),
         "stdin_source": str(stdin.get("source") or "response.launch_text"),
         "command_display": str(executable_worker_launch.get("command_display") or ""),
+        "env_policy": dict(env_policy),
+        "env_policy_source": "response.executable_worker_launch.env_policy",
         "backend_mode": str(executable_worker_launch.get("backend_mode") or ""),
         "runtime_context_id": str(payload.get("runtime_context_id") or ""),
         "observer_command_id": str(payload.get("observer_command_id") or ""),
@@ -4479,6 +4683,7 @@ def _runtime_text_observer_next_legal_action(
         "merge_queue_id": str(payload.get("merge_queue_id") or ""),
         "owned_files": list(payload.get("owned_files") or []),
         "payload": dict(payload),
+        "startup_identity_policy": dict(startup_identity_policy),
         "missing_fields": missing_fields,
         "worker_next_legal_action": str(
             worker_launch_pack.get("next_legal_action") or ""
@@ -4493,6 +4698,7 @@ def _runtime_text_observer_next_legal_action(
             "payload_source": "response.executable_worker_launch.payload",
             "command_source": "response.executable_worker_launch.command_display",
             "stdin_source": str(stdin.get("source") or "response.launch_text"),
+            "env_policy_source": "response.executable_worker_launch.env_policy",
             "missing_fields": missing_fields,
         },
     }
@@ -4941,6 +5147,11 @@ def build_observer_runtime_text_context(
         "raw_session_token_persisted": False,
         "raw_launch_text_persisted": False,
     }
+    startup_identity_policy = _runtime_text_startup_identity_policy(
+        same_owner_session_token_startup=same_owner_session_token_startup,
+        host_adapter_surrogate_startup=host_adapter_surrogate_startup,
+        registered_host_adapter_spawn=registered_host_adapter_spawn,
+    )
     worker_launch_pack = _runtime_text_worker_launch_pack(
         request=request,
         context=context,
@@ -5034,7 +5245,20 @@ def build_observer_runtime_text_context(
         "same_owner_session_token_startup": dict(same_owner_session_token_startup),
         "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
         "startup_identity": dict(same_owner_session_token_startup),
+        "startup_identity_policy": dict(startup_identity_policy),
         "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
+        "host_startup_id": str(
+            registered_host_adapter_spawn.get("host_startup_id") or ""
+        ),
+        "host_session_id": str(
+            registered_host_adapter_spawn.get("host_session_id") or ""
+        ),
+        "session_token_surrogate": str(
+            registered_host_adapter_spawn.get("session_token_surrogate") or ""
+        ),
+        "canonical_startup_identity_fields": dict(
+            startup_identity_policy.get("copyable_host_adapter_identity_fields") or {}
+        ),
         "read_receipt_identity": dict(read_receipt_identity),
         "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
         "read_receipt_hash": str(
@@ -5153,6 +5377,7 @@ def build_observer_runtime_text_context(
             "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
             "read_receipt_identity": dict(read_receipt_identity),
             "startup_alternatives": startup_alternatives,
+            "startup_identity_policy": startup_identity_policy,
             "same_owner_session_token_startup": dict(same_owner_session_token_startup),
             "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
             "startup_identity": dict(same_owner_session_token_startup),
@@ -5170,6 +5395,7 @@ def build_observer_runtime_text_context(
         "startup_intent_event": startup_intent_event,
         "startup_recording": startup_recording,
         "startup_alternatives": startup_alternatives,
+        "startup_identity_policy": startup_identity_policy,
         "same_owner_session_token_startup": same_owner_session_token_startup,
         "host_adapter_surrogate_startup": host_adapter_surrogate_startup,
         "startup_identity": same_owner_session_token_startup,

@@ -7975,6 +7975,56 @@ def _startup_public_registered_host_adapter_identity(
     return identity
 
 
+def _startup_payload_registered_host_adapter_identity(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    sources: list[Any] = [payload.get("registered_host_adapter_spawn")]
+    host_adapter_startup = payload.get("host_adapter_surrogate_startup")
+    if isinstance(host_adapter_startup, Mapping):
+        sources.append(host_adapter_startup.get("registered_host_adapter_spawn"))
+    startup_alternatives = payload.get("startup_alternatives")
+    if isinstance(startup_alternatives, Mapping):
+        nested_host_adapter = startup_alternatives.get("host_adapter_surrogate_startup")
+        if isinstance(nested_host_adapter, Mapping):
+            sources.append(nested_host_adapter.get("registered_host_adapter_spawn"))
+    canonical_fields = payload.get("canonical_startup_identity_fields")
+    if isinstance(canonical_fields, Mapping):
+        sources.append(canonical_fields.get("registered_host_adapter_spawn"))
+    for source in sources:
+        identity = _startup_public_registered_host_adapter_identity(source)
+        if identity:
+            return identity
+    return {}
+
+
+def _startup_registered_payload_identity_matches(
+    *,
+    payload_identity: Mapping[str, Any] | None,
+    registered_identity: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(payload_identity, Mapping) or not payload_identity:
+        return False
+    if not isinstance(registered_identity, Mapping) or not registered_identity:
+        return False
+    payload_texts = set(_startup_registered_identity_texts(payload_identity))
+    registered_texts = set(_startup_registered_identity_texts(registered_identity))
+    if not payload_texts.intersection(registered_texts):
+        return False
+    for field in (
+        "project_id",
+        "runtime_context_id",
+        "observer_command_id",
+        "launch_text_hash",
+        "task_id",
+        "worker_slot_id",
+    ):
+        payload_value = str(payload_identity.get(field) or "").strip()
+        registered_value = str(registered_identity.get(field) or "").strip()
+        if payload_value and registered_value and payload_value != registered_value:
+            return False
+    return True
+
+
 def _startup_registered_host_adapter_identity(
     *,
     context: BranchTaskRuntimeContext,
@@ -8234,6 +8284,189 @@ def _startup_token_evidence(
         "session_token_surrogate": "",
         "session_token_evidence_type": "",
     }
+
+
+def _startup_identity_field_report(
+    *,
+    payload: Mapping[str, Any],
+    token_evidence: Mapping[str, Any] | None,
+    registered_identity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    token_evidence = token_evidence if isinstance(token_evidence, Mapping) else {}
+    registered_public = _startup_public_registered_host_adapter_identity(
+        registered_identity or {}
+    )
+    payload_registered = _startup_payload_registered_host_adapter_identity(payload)
+    session_token_present = bool(str(payload.get("session_token") or "").strip())
+    session_token_surrogate = str(
+        token_evidence.get("session_token_surrogate")
+        or payload.get("session_token_surrogate")
+        or payload.get("session_surrogate")
+        or payload_registered.get("session_token_surrogate")
+        or registered_public.get("session_token_surrogate")
+        or ""
+    ).strip()
+    host_startup_id = str(
+        payload.get("host_startup_id")
+        or payload_registered.get("host_startup_id")
+        or registered_public.get("host_startup_id")
+        or ""
+    ).strip()
+    fields = {
+        "session_token": {
+            "present": session_token_present,
+            "source": "payload.session_token",
+            "value": "<redacted>" if session_token_present else "",
+        },
+        "session_token_hash": {
+            "present": bool(str(token_evidence.get("session_token_hash") or "").strip()),
+            "source": "server_computed_session_token_hash",
+            "value": str(token_evidence.get("session_token_hash") or ""),
+        },
+        "session_token_surrogate": {
+            "present": bool(session_token_surrogate),
+            "source": (
+                "payload_or_registered_host_adapter_spawn.session_token_surrogate"
+            ),
+            "value": session_token_surrogate,
+        },
+        "host_startup_id": {
+            "present": bool(host_startup_id),
+            "source": "payload_or_registered_host_adapter_spawn.host_startup_id",
+            "value": host_startup_id,
+        },
+        "registered_host_adapter_spawn": {
+            "present": bool(registered_public),
+            "source": "latest_runtime_contract_revision",
+            "value": registered_public,
+        },
+        "registered_host_adapter_spawn.host_startup_id": {
+            "present": bool(str(registered_public.get("host_startup_id") or "").strip()),
+            "source": "latest_runtime_contract_revision.registered_host_adapter_spawn",
+            "value": str(registered_public.get("host_startup_id") or ""),
+        },
+        "registered_host_adapter_spawn.session_token_surrogate": {
+            "present": bool(
+                str(registered_public.get("session_token_surrogate") or "").strip()
+            ),
+            "source": "latest_runtime_contract_revision.registered_host_adapter_spawn",
+            "value": str(registered_public.get("session_token_surrogate") or ""),
+        },
+        "payload.registered_host_adapter_spawn": {
+            "present": bool(payload_registered),
+            "source": "payload.registered_host_adapter_spawn",
+            "value": payload_registered,
+        },
+    }
+    present_fields = [
+        field for field, report in fields.items() if bool(report.get("present"))
+    ]
+    missing_fields = [
+        field for field, report in fields.items() if not bool(report.get("present"))
+    ]
+    return {
+        "schema_version": "mf_subagent_startup_identity_fields.v1",
+        "present_fields": present_fields,
+        "missing_fields": missing_fields,
+        "fields": fields,
+        "accepted_alternatives": [
+            {
+                "id": "same_owner_session_token",
+                "present": bool(token_evidence.get("session_token_hash")),
+                "required_any": ["session_token"],
+            },
+            {
+                "id": "registered_host_adapter_spawn",
+                "present": bool(host_startup_id or session_token_surrogate),
+                "required_any": ["host_startup_id", "session_token_surrogate"],
+                "registered_host_adapter_spawn_present": bool(registered_public),
+            },
+        ],
+        "copyable_identity_fields": {
+            "host_startup_id": host_startup_id,
+            "session_token_surrogate": session_token_surrogate,
+            "registered_host_adapter_spawn": registered_public,
+        },
+    }
+
+
+def _startup_retry_payload_template(
+    *,
+    payload: Mapping[str, Any],
+    missing: Sequence[str],
+    identity_fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    retry_fields = (
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "parent_task_id",
+        "runtime_context_id",
+        "worker_role",
+        "worker_id",
+        "worker_slot_id",
+        "agent_id",
+        "actual_host_worker_id",
+        "fence_token",
+        "actual_cwd",
+        "actual_git_root",
+        "branch",
+        "head_commit",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "owned_files",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+        "observer_command_id",
+        "read_receipt_hash",
+        "read_receipt_event_id",
+        "startup_source",
+        "host_startup_id",
+        "session_token_surrogate",
+        "worker_session_id",
+        "worker_transcript_ref",
+        "worker_transcript_path",
+        "harness_type",
+        "filer_principal",
+    )
+    retry: dict[str, Any] = {}
+    copyable_identity = (
+        identity_fields.get("copyable_identity_fields")
+        if isinstance(identity_fields.get("copyable_identity_fields"), Mapping)
+        else {}
+    )
+    for field in retry_fields:
+        value = payload.get(field)
+        if field == "host_startup_id" and not value:
+            value = copyable_identity.get("host_startup_id")
+        if field == "session_token_surrogate" and not value:
+            value = copyable_identity.get("session_token_surrogate")
+        if field == "worker_role" and not value:
+            value = "mf_sub"
+        if field in {"session_token"}:
+            value = "<redacted-if-present>"
+        if value:
+            retry[field] = value
+    for field in missing:
+        if field == "session_token_surrogate_or_host_startup_id":
+            retry.setdefault(
+                "host_startup_id",
+                "<fill host_startup_id or session_token_surrogate>",
+            )
+            retry.setdefault(
+                "session_token_surrogate",
+                "<fill session_token_surrogate or host_startup_id>",
+            )
+            continue
+        retry.setdefault(field, f"<fill {field}>")
+    retry["append_tool"] = "parallel_branch_startup"
+    retry["event_kind"] = "mf_subagent_startup"
+    return retry
 
 
 def _startup_graph_trace_ids(payload: Mapping[str, Any]) -> list[str]:
@@ -8536,6 +8769,38 @@ def _startup_refusal_timeline_event(
         or payload.get("on_behalf_of")
         or ""
     ).strip()
+    startup_identity_fields = _startup_identity_field_report(
+        payload=payload,
+        token_evidence=token_evidence,
+        registered_identity=registered_host_adapter_identity,
+    )
+    next_action = (
+        dict(result.get("next_action"))
+        if isinstance(result.get("next_action"), Mapping)
+        else {}
+    )
+    if next_action:
+        retry_template = _startup_retry_payload_template(
+            payload=payload,
+            missing=missing,
+            identity_fields=startup_identity_fields,
+        )
+        next_action.update(
+            {
+                "canonical_retry_payload_source": (
+                    "worker_launch_pack.startup_recording"
+                ),
+                "startup_payload_source": "worker_launch_pack.startup_recording",
+                "copyable_retry_payload": retry_template,
+                "startup_identity_fields": startup_identity_fields,
+                "present_startup_identity_fields": list(
+                    startup_identity_fields.get("present_fields") or []
+                ),
+                "missing_startup_identity_fields": list(
+                    startup_identity_fields.get("missing_fields") or []
+                ),
+            }
+        )
     refusal = {
         "schema_version": MF_SUBAGENT_STARTUP_REFUSAL_SCHEMA_VERSION,
         "gate_kind": "mf_subagent.startup",
@@ -8548,9 +8813,14 @@ def _startup_refusal_timeline_event(
         "message": str(result.get("message") or ""),
         "missing": missing,
         "missing_required_fields": missing,
-        "next_action": result.get("next_action")
-        if isinstance(result.get("next_action"), Mapping)
-        else {},
+        "next_action": next_action,
+        "startup_identity_fields": startup_identity_fields,
+        "present_startup_identity_fields": list(
+            startup_identity_fields.get("present_fields") or []
+        ),
+        "missing_startup_identity_fields": list(
+            startup_identity_fields.get("missing_fields") or []
+        ),
         "project_id": project_id,
         "backlog_id": (
             context.backlog_id if context is not None else str(payload.get("backlog_id") or "")
@@ -8704,6 +8974,20 @@ def _startup_blocker_with_timeline(
             "missing_required_fields": list(
                 result.get("missing_required_fields") or result.get("missing") or []
             ),
+            "startup_identity_fields": dict(
+                refusal.get("startup_identity_fields")
+                if isinstance(refusal.get("startup_identity_fields"), Mapping)
+                else {}
+            ),
+            "present_startup_identity_fields": list(
+                refusal.get("present_startup_identity_fields") or []
+            ),
+            "missing_startup_identity_fields": list(
+                refusal.get("missing_startup_identity_fields") or []
+            ),
+            "next_action": refusal.get("next_action")
+            if isinstance(refusal.get("next_action"), Mapping)
+            else result.get("next_action"),
             "refusal": {
                 "event_kind": "mf_subagent_startup_refusal",
                 "status": "blocked",
@@ -8719,6 +9003,17 @@ def _startup_blocker_with_timeline(
                 ),
                 "next_action": refusal.get("next_action") or result.get("next_action") or {},
                 "message": str(refusal.get("message") or result.get("message") or ""),
+                "startup_identity_fields": dict(
+                    refusal.get("startup_identity_fields")
+                    if isinstance(refusal.get("startup_identity_fields"), Mapping)
+                    else {}
+                ),
+                "present_startup_identity_fields": list(
+                    refusal.get("present_startup_identity_fields") or []
+                ),
+                "missing_startup_identity_fields": list(
+                    refusal.get("missing_startup_identity_fields") or []
+                ),
             },
         }
     )
@@ -8865,10 +9160,6 @@ def record_mf_subagent_startup(
         or context.agent_id
         or ""
     ).strip()
-    token_evidence = _startup_token_evidence(
-        payload,
-        stored_token_hash=context.session_token_hash if context is not None else "",
-    )
     actual_cwd = str(payload.get("actual_cwd") or payload.get("cwd") or "").strip()
     actual_git_root = str(payload.get("actual_git_root") or payload.get("git_root") or "").strip()
     branch = str(payload.get("branch") or payload.get("branch_ref") or "").strip()
@@ -8895,6 +9186,19 @@ def record_mf_subagent_startup(
         context=context,
         latest_revision=latest_revision,
     )
+    payload_registered_host_adapter_identity = (
+        _startup_payload_registered_host_adapter_identity(payload)
+    )
+    payload_registered_identity_allowed = bool(
+        _startup_registered_host_adapter_identity_matches_context(
+            registered_host_adapter_identity,
+            context,
+        )
+        and _startup_registered_payload_identity_matches(
+            payload_identity=payload_registered_host_adapter_identity,
+            registered_identity=registered_host_adapter_identity,
+        )
+    )
     launch_text_hash = str(payload.get("launch_text_hash") or "").strip()
     observer_command_id = str(payload.get("observer_command_id") or "").strip()
     read_receipt_hash, read_receipt_hash_source = _startup_read_receipt_hash(payload)
@@ -8909,9 +9213,47 @@ def record_mf_subagent_startup(
         or ""
     ).strip()
     host_startup_id = str(payload.get("host_startup_id") or "").strip()
+    if not host_startup_id and payload_registered_identity_allowed:
+        host_startup_id = str(
+            payload_registered_host_adapter_identity.get("host_startup_id")
+            or payload_registered_host_adapter_identity.get("host_session_id")
+            or ""
+        ).strip()
+    payload_for_token_evidence: Mapping[str, Any] = payload
+    if (
+        payload_registered_identity_allowed
+        and not str(payload.get("session_token") or "").strip()
+        and not str(
+            payload.get("session_token_surrogate")
+            or payload.get("session_surrogate")
+            or ""
+        ).strip()
+        and str(
+            payload_registered_host_adapter_identity.get("session_token_surrogate")
+            or ""
+        ).strip()
+    ):
+        payload_for_token_evidence = {
+            **dict(payload),
+            "session_token_surrogate": str(
+                payload_registered_host_adapter_identity.get(
+                    "session_token_surrogate"
+                )
+                or ""
+            ).strip(),
+        }
+    token_evidence = _startup_token_evidence(
+        payload_for_token_evidence,
+        stored_token_hash=context.session_token_hash if context is not None else "",
+    )
     host_session_id = str(
         payload.get("host_session_id")
         or payload.get("session_id")
+        or (
+            payload_registered_host_adapter_identity.get("host_session_id")
+            if payload_registered_identity_allowed
+            else ""
+        )
         or token_evidence["session_token_surrogate"]
         or ""
     ).strip()

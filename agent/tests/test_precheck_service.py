@@ -98,6 +98,138 @@ def route_context_consumption_events() -> list[dict[str, object]]:
     ]
 
 
+def _child_lane_dispatch_event(parent_task_id: str, task_id: str) -> dict[str, object]:
+    return {
+        "id": "tl-child-dispatch",
+        "event_kind": "mf_subagent_dispatch",
+        "status": "passed",
+        "backlog_id": parent_task_id,
+        "task_id": task_id,
+        "payload": {
+            "mf_subagent_dispatch_gate": {
+                **ROUTE_IDENTITY,
+                "bounded": True,
+                "worker_role": "mf_sub",
+                "worker_id": "worker-b",
+                "worker_slot_id": "worker-b",
+                "runtime_context_id": "mfrctx-worker-b",
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "fence_token": FENCE_TOKEN,
+                "worktree_path": "/repo/.worktrees/worker-b",
+                "observer_command_id": "cmd-worker-b",
+            }
+        },
+    }
+
+
+def _child_lane_startup_gate(parent_task_id: str, task_id: str) -> dict[str, object]:
+    return {
+        **ROUTE_IDENTITY,
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "bounded": True,
+        "close_satisfying": True,
+        "worker_role": "mf_sub",
+        "worker_id": "worker-b",
+        "worker_slot_id": "worker-b",
+        "worker_session_id": "worker-session-b",
+        "runtime_context_id": "mfrctx-worker-b",
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": FENCE_TOKEN,
+        "actual_cwd": "/repo/.worktrees/worker-b",
+        "actual_git_root": "/repo/.worktrees/worker-b",
+        "worktree_path": "/repo/.worktrees/worker-b",
+        "branch": "refs/heads/codex/worker-b",
+        "head_commit": "head-worker-b",
+        "observer_command_id": "cmd-worker-b",
+        "read_receipt_hash": "sha256:read-worker-b",
+        "read_receipt_event_id": "tl-read-worker-b",
+        "worker_transcript_ref": "codex-thread:worker-session-b",
+        "harness_type": "codex",
+    }
+
+
+def _child_lane_startup_event(parent_task_id: str, task_id: str) -> dict[str, object]:
+    return {
+        "id": "tl-child-startup",
+        "event_kind": "mf_subagent_startup",
+        "status": "passed",
+        "backlog_id": parent_task_id,
+        "task_id": task_id,
+        "payload": {
+            "mf_subagent_startup_gate": _child_lane_startup_gate(
+                parent_task_id,
+                task_id,
+            )
+        },
+    }
+
+
+def _child_lane_finish_gate_event(parent_task_id: str, task_id: str) -> dict[str, object]:
+    startup_gate = _child_lane_startup_gate(parent_task_id, task_id)
+    return {
+        "id": "tl-child-finish",
+        "event_kind": "mf_subagent_finish_gate",
+        "event_type": "mf_subagent.finish_gate",
+        "phase": "finish_gate",
+        "status": "passed",
+        "actor": "worker-session-b",
+        "backlog_id": parent_task_id,
+        "task_id": task_id,
+        "payload": {
+            "mf_subagent_finish_gate": {
+                "schema_version": "mf_subagent_finish_gate.v1",
+                "status": "passed",
+                "review_ready": True,
+                "close_ready": True,
+                "observer_command_id": "cmd-worker-b",
+                "startup_evidence": startup_gate,
+                "startup_worker_identity_gate": {
+                    "status": "passed",
+                    "passed": True,
+                    "worker_session_id": "worker-session-b",
+                    "worker_transcript_ref": "codex-thread:worker-session-b",
+                    "harness_type": "codex",
+                },
+                "worker_self_attestation_gate": {
+                    "status": "passed",
+                    "passed": True,
+                    "worker_session_id": "worker-session-b",
+                    "worker_transcript_ref": "codex-thread:worker-session-b",
+                    "harness_type": "codex",
+                    "attestation": {
+                        "status": "passed",
+                        "ok": True,
+                        "finish_time_self_attesting": True,
+                    },
+                },
+                "receipt_gate": {
+                    "status": "passed",
+                    "read_receipt_present": True,
+                    "read_receipt_event_id_present": True,
+                    "startup_present": True,
+                    "observer_command_id_present": True,
+                },
+                "route_prompt_contract": {**ROUTE_IDENTITY},
+                "runtime_context_id": "mfrctx-worker-b",
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_slot_id": "worker-b",
+                "fence_token": FENCE_TOKEN,
+                "changed_files": ["agent/governance/precheck_service.py"],
+                "head_commit": "head-worker-b",
+                "commit_sha": "head-worker-b",
+                "test_results": {"status": "passed", "passed": True},
+                "graph_trace_ids": ["gqt-worker-b"],
+                "query_source": "mf_subagent",
+            }
+        },
+    }
+
+
 def _bounded_dispatch_evidence() -> dict[str, object]:
     return {
         **ROUTE_IDENTITY,
@@ -1003,6 +1135,200 @@ def test_scn_mf_wf_006_close_gate_requires_close_ready_merge_commit_and_evidence
     )
     assert missing_result["decision"] == "block"
     assert "missing_close_ready_timeline" in missing_result["evidence"]["errors"]
+
+
+def test_close_gate_counts_child_lane_finish_projection_but_keeps_qa_separate(
+    tmp_path: Path,
+) -> None:
+    parent_task_id = "AC-PARENT-ROW"
+    child_task_id = f"{parent_task_id}-impl-b"
+    contract = {
+        **load_workflow_contract(),
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": parent_task_id,
+        "governance_policy": {
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": True,
+            }
+        },
+    }
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject.update(
+        {
+            "backlog_id": parent_task_id,
+            "task_id": parent_task_id,
+            "priority": "P0",
+            "changed_files": ["agent/governance/precheck_service.py"],
+            "task_summary": "Close parent row from accepted child implementation lane.",
+        }
+    )
+    route_context, route_action, _dispatch, _startup = route_context_consumption_events()
+    subject["timeline_evidence"] = [
+        route_context,
+        route_action,
+        _child_lane_dispatch_event(parent_task_id, child_task_id),
+        _child_lane_startup_event(parent_task_id, child_task_id),
+        _child_lane_finish_gate_event(parent_task_id, child_task_id),
+        {
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "backlog_id": parent_task_id,
+            "task_id": child_task_id,
+            "verification": {
+                **ROUTE_IDENTITY,
+                "parent_task_id": parent_task_id,
+                "test_results": {"status": "passed"},
+            },
+        },
+    ]
+
+    blocked = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    assert blocked["decision"] == "block"
+    errors = blocked["evidence"]["errors"]
+    assert "missing_close_ready_timeline" not in errors
+    assert "mf_timeline_precheck_incomplete" not in errors
+    assert "missing_independent_verification_lane_evidence" in errors
+    accounting = blocked["evidence"]["close_timeline_accounting"]
+    assert accounting["present_event_kinds"] == [
+        "close_ready",
+        "implementation",
+        "verification",
+    ]
+    assert accounting["projected_event_kinds"] == ["close_ready", "implementation"]
+    ledger = blocked["evidence"]["parallel_lane_evidence_ledger"]
+    assert any(
+        item.get("accepted_by") == "finish_gate_projection"
+        and item.get("task_id") == child_task_id
+        and item.get("parent_task_id") == parent_task_id
+        and item.get("sibling_lane") is True
+        for item in ledger["accepted_sibling_lane_evidence"]
+    )
+
+    subject["timeline_evidence"].append(
+        {
+            "event_kind": "qa_verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "qa",
+            "backlog_id": parent_task_id,
+            "task_id": child_task_id,
+            "verification": {
+                **ROUTE_IDENTITY,
+                "role": "qa",
+                "lane_id": "independent_verification_lane",
+                "parent_task_id": parent_task_id,
+            },
+        }
+    )
+    allowed = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    assert allowed["decision"] == "allow"
+    assert allowed["evidence"]["independent_verification_evidence_present"] is True
+
+
+def test_close_gate_parallel_lane_ledger_reports_rejected_evidence_reason(
+    tmp_path: Path,
+) -> None:
+    parent_task_id = "AC-PARENT-ROW"
+    child_task_id = f"{parent_task_id}-impl-b"
+    contract = {
+        **load_workflow_contract(),
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": parent_task_id,
+        "governance_policy": {
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": False,
+            }
+        },
+    }
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    route_context, route_action, _dispatch, _startup = route_context_consumption_events()
+    subject.update(
+        {
+            "backlog_id": parent_task_id,
+            "task_id": parent_task_id,
+            "timeline_evidence": [
+                route_context,
+                route_action,
+                _child_lane_dispatch_event(parent_task_id, child_task_id),
+                _child_lane_startup_event(parent_task_id, child_task_id),
+                _child_lane_finish_gate_event(parent_task_id, child_task_id),
+                {
+                    "event_kind": "verification",
+                    "phase": "verification",
+                    "status": "passed",
+                    "backlog_id": parent_task_id,
+                    "task_id": child_task_id,
+                    "verification": {
+                        **ROUTE_IDENTITY,
+                        "parent_task_id": parent_task_id,
+                        "test_results": {"status": "passed"},
+                    },
+                },
+                {
+                    "id": "tl-foreign-impl",
+                    "event_kind": "implementation",
+                    "status": "accepted",
+                    "backlog_id": "OTHER-ROW",
+                    "project_id": "proj",
+                    "task_id": "other-worker",
+                    "payload": {
+                        "route_context_hash": "sha256:other-route",
+                        "prompt_contract_id": "rprompt-other",
+                    },
+                },
+            ],
+        }
+    )
+
+    blocked = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    assert blocked["decision"] == "block"
+    assert "mf_timeline_cross_ref_evidence_rejected" in blocked["evidence"]["errors"]
+    rejected = blocked["evidence"]["parallel_lane_evidence_ledger"]["rejected_evidence"]
+    assert any(
+        item.get("id") == "tl-foreign-impl"
+        and item.get("reason") == "cross_ref_identity_mismatch"
+        for item in rejected
+    )
 
 
 def test_close_gate_recognizes_service_route_contract_evidence_from_timeline(
