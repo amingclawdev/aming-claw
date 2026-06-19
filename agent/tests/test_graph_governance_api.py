@@ -2209,6 +2209,64 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     )
     assert planned_bridge_path.resolve() == bridge_path
     assert bridge_payload["startup_recording"]["event_kind"] == "mf_subagent_startup"
+    assert bridge_payload["startup_recording"]["append_tool"] == (
+        "parallel_branch_startup"
+    )
+    same_owner = prepared["same_owner_session_token_startup"]
+    host_surrogate = prepared["host_adapter_surrogate_startup"]
+    registered = prepared["registered_host_adapter_spawn"]
+    refusal_policy = prepared["worker_launch_pack"]["startup_refusal_policy"]
+    assert "host_startup_id" not in refusal_policy["required_retry_fields"]
+    assert "session_token_surrogate" not in refusal_policy["required_retry_fields"]
+    assert "session_token" in refusal_policy["required_retry_fields"]
+    assert "host_startup_id" not in same_owner
+    assert "session_token_surrogate" not in same_owner
+    assert "host_startup_id" in host_surrogate
+    assert "session_token_surrogate" in host_surrogate
+    assert "host_startup_id" in refusal_policy[
+        "host_adapter_surrogate_required_fields"
+    ]
+    assert "session_token_surrogate" in refusal_policy[
+        "host_adapter_surrogate_required_fields"
+    ]
+    assert prepared["startup_alternatives"]["default"] == (
+        "same_owner_session_token_startup"
+    )
+    assert same_owner == prepared["startup_identity"]
+    assert same_owner == prepared["startup_recording"]["startup_identity"]
+    assert prepared["startup_recording"]["append_tool"] == "parallel_branch_startup"
+    assert same_owner == prepared["worker_launch_pack"]["startup_identity"]
+    assert same_owner == bridge_payload["same_owner_session_token_startup"]
+    assert same_owner == bridge_payload["startup_recording"]["startup_identity"]
+    assert same_owner == prepared["persistent_evidence"][
+        "same_owner_session_token_startup"
+    ]
+    assert same_owner == prepared["worker_launch_pack"]["worker_guide"][
+        "same_owner_session_token_startup"
+    ]
+    assert same_owner["session_token_source"] == "env:AMING_WORKER_SESSION_TOKEN"
+    assert same_owner["session_token_persisted"] is False
+    assert same_owner["raw_session_token_persisted"] is False
+    assert host_surrogate == bridge_payload["host_adapter_surrogate_startup"]
+    assert host_surrogate == prepared["persistent_evidence"][
+        "host_adapter_surrogate_startup"
+    ]
+    assert host_surrogate == prepared["worker_launch_pack"]["worker_guide"][
+        "host_adapter_surrogate_startup"
+    ]
+    assert host_surrogate["session_token_evidence_type"] == "surrogate"
+    assert host_surrogate["close_satisfying"] is False
+    assert host_surrogate["not_finish_gate_sufficient"] is True
+    assert registered == host_surrogate["registered_host_adapter_spawn"]
+    assert registered == prepared["worker_launch_pack"][
+        "registered_host_adapter_spawn"
+    ]
+    assert registered == bridge_payload["registered_host_adapter_spawn"]
+    assert registered["session_token_surrogate"].startswith("host-adapter:")
+    assert "session_token" not in bridge_payload["worker_launch_pack"]
+    assert "session_token" not in bridge_payload["startup_recording"]
+    assert "launch_text" not in bridge_payload["worker_launch_pack"]
+    assert "launch_text" not in bridge_payload["startup_recording"]
     assert "launch_text" not in bridge_payload
     assert bridge_payload["raw_launch_text_persisted"] is False
     assert bridge_write["worktree_status_visible"] is False
@@ -2677,6 +2735,7 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
         base_commit="base-prepare-startup",
         target_head_commit="target-prepare-startup",
         merge_queue_id="mq-prepare-startup",
+        session_token_hash=mf_subagent_session_token_hash("prepare-scoped-token"),
     )
     upsert_branch_context(conn, runtime_context, now_iso="2026-06-12T10:00:00Z")
 
@@ -2736,60 +2795,125 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
     assert registered["host_startup_id"] == "host-startup-prepare"
     assert registered["host_session_id"] == "host-session-prepare"
     assert registered["session_token_surrogate"] == "host-adapter:prepare"
+    assert registered == prepared["registered_host_adapter_spawn"]
+    same_owner = prepared["same_owner_session_token_startup"]
+    host_surrogate = prepared["host_adapter_surrogate_startup"]
+    assert prepared["startup_alternatives"]["default"] == (
+        "same_owner_session_token_startup"
+    )
+    assert same_owner == prepared["startup_identity"]
+    assert same_owner == prepared["startup_recording"]["startup_identity"]
+    assert same_owner == prepared["worker_launch_pack"]["startup_identity"]
+    assert same_owner == prepared["persistent_evidence"][
+        "same_owner_session_token_startup"
+    ]
+    assert same_owner == prepared["worker_launch_pack"]["worker_guide"][
+        "same_owner_session_token_startup"
+    ]
+    assert same_owner["agent_id"] == "observer-allocation-owner"
+    assert same_owner["session_token_source"] == "env:AMING_WORKER_SESSION_TOKEN"
+    assert same_owner["session_token_persisted"] is False
+    assert same_owner["raw_session_token_persisted"] is False
+    assert host_surrogate["registered_host_adapter_spawn"] == registered
+    assert host_surrogate == prepared["persistent_evidence"][
+        "host_adapter_surrogate_startup"
+    ]
+    assert host_surrogate == prepared["worker_launch_pack"]["worker_guide"][
+        "host_adapter_surrogate_startup"
+    ]
+    assert host_surrogate["session_token_evidence_type"] == "surrogate"
+    assert host_surrogate["close_satisfying"] is False
+    assert host_surrogate["not_finish_gate_sufficient"] is True
+    assert registered == prepared["worker_launch_pack"][
+        "registered_host_adapter_spawn"
+    ]
+    assert registered == prepared["startup_recording"]["registered_host_adapter_spawn"]
+    revision_same_owner = latest_revision.payload["same_owner_session_token_startup"]
+    assert revision_same_owner["startup_mode"] == "same_owner_session_token"
+    assert revision_same_owner["agent_id"] == "observer-allocation-owner"
+    assert revision_same_owner["session_token_source"] == (
+        "env:AMING_WORKER_SESSION_TOKEN"
+    )
+    assert revision_same_owner["raw_session_token_persisted"] is False
+    assert "session_token" not in revision_same_owner
+    revision_host_surrogate = latest_revision.payload["host_adapter_surrogate_startup"]
+    assert revision_host_surrogate["startup_mode"] == "host_adapter_surrogate"
+    assert revision_host_surrogate["session_token_evidence_type"] == "surrogate"
+    assert revision_host_surrogate["close_satisfying"] is False
+    assert revision_host_surrogate["not_finish_gate_sufficient"] is True
+    assert revision_host_surrogate["registered_host_adapter_spawn"] == registered
     assert latest_revision.payload["read_receipt_recorded"] is True
     assert latest_revision.payload["read_receipt_hash"] == (
         "sha256:read-prepare-startup"
     )
     assert latest_revision.payload["read_receipt_event_id"] == "read-prepare-startup"
 
+    def copied_same_owner_startup(session_token: str | None) -> dict[str, object]:
+        payload = dict(prepared["startup_recording"])
+        payload.update(
+            {
+                "worker_id": "prepare-worker-slot",
+                "actual_host_worker_id": "multi_agent:prepare-worker",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "head_commit": "head-prepare-startup",
+                "worker_session_id": "multi_agent:prepare-worker",
+                "worker_transcript_ref": "multi_agent:prepare-worker",
+                "filer_principal": "multi_agent:prepare-worker",
+                "harness_type": "codex",
+            }
+        )
+        if session_token is not None:
+            payload["session_token"] = session_token
+        return payload
+
+    missing_token = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=copied_same_owner_startup(None),
+        )
+    )
+    assert missing_token["ok"] is False
+    assert missing_token["blocker_id"] in {
+        "no_truthful_bounded_mf_sub_startup_surface_available",
+        "session_token_not_server_verified",
+    }
+
+    wrong_token = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=copied_same_owner_startup("wrong-prepare-scoped-token"),
+        )
+    )
+    assert wrong_token["ok"] is False
+    assert wrong_token["blocker_id"] == "session_token_not_server_verified"
+
     started = server.handle_graph_governance_parallel_branch_startup(
         _ctx_with_role(
             {"project_id": PID},
             "mf_sub",
             method="POST",
-            body={
-                "task_id": "prepare-startup-task",
-                "parent_task_id": "AC-RUNTIME-PREPARE-STARTUP",
-                "worker_role": "mf_sub",
-                "worker_id": "prepare-worker-slot",
-                "agent_id": registered["agent_id"],
-                "actual_host_worker_id": registered["actual_host_worker_id"],
-                "runtime_context_id": registered["runtime_context_id"],
-                "launch_text_hash": registered["launch_text_hash"],
-                "host_startup_id": registered["host_startup_id"],
-                "host_session_id": registered["host_session_id"],
-                "session_token_surrogate": registered["session_token_surrogate"],
-                "startup_source": registered["startup_source"],
-                "fence_token": "fence-prepare-startup",
-                "actual_cwd": str(worktree),
-                "actual_git_root": str(worktree),
-                "branch": "refs/heads/codex/prepare-startup-task",
-                "head_commit": "head-prepare-startup",
-                "base_commit": "base-prepare-startup",
-                "target_head_commit": "target-prepare-startup",
-                "merge_queue_id": "mq-prepare-startup",
-                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
-                "route_id": "route-prepare-startup",
-                "route_context_hash": "sha256:route-prepare-startup",
-                "prompt_contract_id": "rprompt-prepare-startup",
-                "prompt_contract_hash": "sha256:prompt-prepare-startup",
-                "route_token_ref": "rtok-prepare-startup",
-                "visible_injection_manifest_hash": "sha256:visible-prepare-startup",
-                "observer_command_id": "cmd-prepare-startup",
-                "read_receipt_hash": "sha256:read-prepare-startup",
-                "read_receipt_event_id": "read-prepare-startup",
-            },
+            body=copied_same_owner_startup("prepare-scoped-token"),
         )
     )
 
     assert started["ok"] is True
     gate = started["startup_gate"]
-    assert gate["host_adapter_startup_token_accepted"] is True
-    assert gate["agent_id_match_mode"] == "host_adapter_startup_token_surrogate"
-    assert gate["agent_id"] == "prepare-host-agent"
-    assert gate["actual_host_worker_id"] == "prepare-host-worker"
-    assert gate["host_startup_id"] == "host-startup-prepare"
-    assert gate["session_token_surrogate"] == "host-adapter:prepare"
+    assert gate["agent_id_match_mode"] == "same_as_allocation_owner"
+    assert gate["agent_id"] == "observer-allocation-owner"
+    assert gate["session_token_evidence_type"] == "server_verified"
+    assert gate["server_issued_session_token_verified"] is True
+    assert gate["session_token_persisted"] is False
+    assert gate["close_satisfying"] is False
+    assert "prepare-scoped-token" not in json.dumps(started, sort_keys=True)
+    assert "wrong-prepare-scoped-token" not in json.dumps(
+        wrong_token,
+        sort_keys=True,
+    )
 
 
 def test_observer_runtime_text_prepare_rejects_unpersisted_runtime_context_id(conn, tmp_path):
@@ -7666,6 +7790,8 @@ def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allo
         "host_adapter_startup_token_surrogate"
     )
     assert started["startup_gate"]["host_adapter_startup_token_accepted"] is True
+    assert started["startup_gate"]["session_token_evidence_type"] == "surrogate"
+    assert started["startup_gate"]["close_satisfying"] is False
 
 
 def test_parallel_branch_startup_accepts_codex_cli_host_startup_id_for_observer_allocation(

@@ -801,6 +801,16 @@ def _persist_worker_launch_bridge(prepared: Mapping[str, Any]) -> dict[str, Any]
         "observer_command_id": str(prepared.get("observer_command_id") or ""),
         "worker_launch_pack": dict(worker_launch_pack),
         "startup_recording": dict(prepared.get("startup_recording") or {}),
+        "startup_alternatives": dict(prepared.get("startup_alternatives") or {}),
+        "same_owner_session_token_startup": dict(
+            prepared.get("same_owner_session_token_startup") or {}
+        ),
+        "host_adapter_surrogate_startup": dict(
+            prepared.get("host_adapter_surrogate_startup") or {}
+        ),
+        "registered_host_adapter_spawn": dict(
+            prepared.get("registered_host_adapter_spawn") or {}
+        ),
         "self_contract_lookup": dict(prepared.get("self_contract_lookup") or {}),
         "graph_first_obligations": dict(prepared.get("graph_first_obligations") or {}),
         "finish_gate_contract": dict(prepared.get("finish_gate_contract") or {}),
@@ -27745,77 +27755,122 @@ def _observer_runtime_text_contract_revision_payload(
     )
     read_receipt_recorded = bool(read_receipt_hash and read_receipt_event_id)
 
-    registered_host_adapter_spawn = build_registered_host_adapter_spawn_identity(
-        project_id=_first_text(prepared.get("project_id"), body.get("project_id")),
-        runtime_context_id=_first_text(
-            prepared.get("runtime_context_id"),
-            runtime_context.get("runtime_context_id"),
-            body.get("runtime_context_id"),
-            branch_context.get("runtime_context_id"),
-        ),
-        observer_command_id=_first_text(
-            prepared.get("observer_command_id"),
-            body.get("observer_command_id"),
-            runtime_context.get("observer_command_id"),
-            branch_context.get("observer_command_id"),
-        ),
-        launch_text_hash=_first_text(prepared.get("launch_text_hash")),
-        backend_mode=_first_text(
-            body.get("backend_mode"),
-            prepared.get("backend_mode"),
-            body.get("worker_backend"),
-        ),
-        startup_source=_first_text(
-            startup_recording.get("startup_source"),
-            body.get("startup_source"),
-            prepared.get("startup_source"),
-        ),
-        task_id=_first_text(
-            startup_recording.get("task_id"),
-            body.get("task_id"),
-            runtime_context.get("task_id"),
-            branch_context.get("task_id"),
-        ),
-        worker_slot_id=_first_text(
-            startup_recording.get("worker_slot_id"),
-            startup_recording.get("worker_id"),
-            body.get("worker_slot_id"),
-            body.get("worker_id"),
-            runtime_context.get("worker_slot_id"),
-            runtime_context.get("worker_id"),
-            branch_context.get("worker_slot_id"),
-            branch_context.get("worker_id"),
-        ),
-        agent_id=_first_text(
-            startup_recording.get("agent_id"),
-            startup_recording.get("host_agent_id"),
-            prepared.get("host_adapter_agent_id"),
-            body.get("host_adapter_agent_id"),
-            body.get("agent_id"),
-        ),
-        actual_host_worker_id=_first_text(
-            startup_recording.get("actual_host_worker_id"),
-            startup_recording.get("host_worker_id"),
-            prepared.get("actual_host_worker_id"),
-            prepared.get("host_adapter_worker_id"),
-            body.get("actual_host_worker_id"),
-            body.get("host_worker_id"),
-        ),
-        host_startup_id=_first_text(
-            startup_recording.get("host_startup_id"),
-            body.get("host_startup_id"),
-        ),
-        host_session_id=_first_text(
-            startup_recording.get("host_session_id"),
-            body.get("host_session_id"),
-        ),
-        session_token_surrogate=_first_text(
-            startup_recording.get("session_token_surrogate"),
-            startup_recording.get("session_surrogate"),
-            body.get("session_token_surrogate"),
-            body.get("session_surrogate"),
-        ),
+    startup_alternatives = (
+        prepared.get("startup_alternatives")
+        if isinstance(prepared.get("startup_alternatives"), Mapping)
+        else startup_recording.get("startup_alternatives")
+        if isinstance(startup_recording.get("startup_alternatives"), Mapping)
+        else worker_launch_pack.get("startup_alternatives")
+        if isinstance(worker_launch_pack.get("startup_alternatives"), Mapping)
+        else {}
     )
+    host_adapter_surrogate_startup = (
+        prepared.get("host_adapter_surrogate_startup")
+        if isinstance(prepared.get("host_adapter_surrogate_startup"), Mapping)
+        else startup_recording.get("host_adapter_surrogate_startup")
+        if isinstance(startup_recording.get("host_adapter_surrogate_startup"), Mapping)
+        else worker_launch_pack.get("host_adapter_surrogate_startup")
+        if isinstance(worker_launch_pack.get("host_adapter_surrogate_startup"), Mapping)
+        else startup_alternatives.get("host_adapter_surrogate_startup")
+        if isinstance(startup_alternatives.get("host_adapter_surrogate_startup"), Mapping)
+        else {}
+    )
+    same_owner_session_token_startup = (
+        prepared.get("same_owner_session_token_startup")
+        if isinstance(prepared.get("same_owner_session_token_startup"), Mapping)
+        else startup_recording.get("same_owner_session_token_startup")
+        if isinstance(startup_recording.get("same_owner_session_token_startup"), Mapping)
+        else worker_launch_pack.get("same_owner_session_token_startup")
+        if isinstance(worker_launch_pack.get("same_owner_session_token_startup"), Mapping)
+        else startup_alternatives.get("same_owner_session_token_startup")
+        if isinstance(startup_alternatives.get("same_owner_session_token_startup"), Mapping)
+        else {}
+    )
+    prepared_startup_identity = {}
+    for source in (
+        prepared.get("registered_host_adapter_spawn"),
+        host_adapter_surrogate_startup.get("registered_host_adapter_spawn")
+        if isinstance(host_adapter_surrogate_startup, Mapping)
+        else {},
+        startup_recording.get("registered_host_adapter_spawn"),
+        worker_launch_pack.get("registered_host_adapter_spawn"),
+    ):
+        if isinstance(source, Mapping) and source:
+            prepared_startup_identity = dict(source)
+            break
+    registered_host_adapter_spawn = prepared_startup_identity
+    if not registered_host_adapter_spawn:
+        registered_host_adapter_spawn = build_registered_host_adapter_spawn_identity(
+            project_id=_first_text(prepared.get("project_id"), body.get("project_id")),
+            runtime_context_id=_first_text(
+                prepared.get("runtime_context_id"),
+                runtime_context.get("runtime_context_id"),
+                body.get("runtime_context_id"),
+                branch_context.get("runtime_context_id"),
+            ),
+            observer_command_id=_first_text(
+                prepared.get("observer_command_id"),
+                body.get("observer_command_id"),
+                runtime_context.get("observer_command_id"),
+                branch_context.get("observer_command_id"),
+            ),
+            launch_text_hash=_first_text(prepared.get("launch_text_hash")),
+            backend_mode=_first_text(
+                body.get("backend_mode"),
+                prepared.get("backend_mode"),
+                body.get("worker_backend"),
+            ),
+            startup_source=_first_text(
+                startup_recording.get("startup_source"),
+                body.get("startup_source"),
+                prepared.get("startup_source"),
+            ),
+            task_id=_first_text(
+                startup_recording.get("task_id"),
+                body.get("task_id"),
+                runtime_context.get("task_id"),
+                branch_context.get("task_id"),
+            ),
+            worker_slot_id=_first_text(
+                startup_recording.get("worker_slot_id"),
+                startup_recording.get("worker_id"),
+                body.get("worker_slot_id"),
+                body.get("worker_id"),
+                runtime_context.get("worker_slot_id"),
+                runtime_context.get("worker_id"),
+                branch_context.get("worker_slot_id"),
+                branch_context.get("worker_id"),
+            ),
+            agent_id=_first_text(
+                startup_recording.get("agent_id"),
+                startup_recording.get("host_agent_id"),
+                prepared.get("host_adapter_agent_id"),
+                body.get("host_adapter_agent_id"),
+                body.get("agent_id"),
+            ),
+            actual_host_worker_id=_first_text(
+                startup_recording.get("actual_host_worker_id"),
+                startup_recording.get("host_worker_id"),
+                prepared.get("actual_host_worker_id"),
+                prepared.get("host_adapter_worker_id"),
+                body.get("actual_host_worker_id"),
+                body.get("host_worker_id"),
+            ),
+            host_startup_id=_first_text(
+                startup_recording.get("host_startup_id"),
+                body.get("host_startup_id"),
+            ),
+            host_session_id=_first_text(
+                startup_recording.get("host_session_id"),
+                body.get("host_session_id"),
+            ),
+            session_token_surrogate=_first_text(
+                startup_recording.get("session_token_surrogate"),
+                startup_recording.get("session_surrogate"),
+                body.get("session_token_surrogate"),
+                body.get("session_surrogate"),
+            ),
+        )
     return {
         "schema_version": "observer_runtime_text_contract_revision.v1",
         "source": "observer_runtime_text_prepare",
@@ -27853,8 +27908,12 @@ def _observer_runtime_text_contract_revision_payload(
         "read_receipt_recorded": read_receipt_recorded,
         "read_receipt_hash": read_receipt_hash if read_receipt_recorded else "",
         "read_receipt_event_id": read_receipt_event_id if read_receipt_recorded else "",
+        "startup_alternatives": dict(startup_alternatives),
+        "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+        "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
         "registered_host_adapter_spawn": registered_host_adapter_spawn,
         "raw_launch_text_persisted": False,
+        "raw_session_token_persisted": False,
         "startup_intent_event_generated": bool(
             (prepared.get("persistent_evidence") or {}).get(
                 "startup_intent_event_generated"
@@ -28013,6 +28072,22 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         visible_injection_manifest_hash=str(
             body.get("visible_injection_manifest_hash") or ""
         ),
+        backend_mode=str(body.get("backend_mode") or body.get("worker_backend") or ""),
+        startup_source=str(body.get("startup_source") or ""),
+        host_adapter_agent_id=str(
+            body.get("host_adapter_agent_id") or body.get("host_agent_id") or ""
+        ),
+        actual_host_worker_id=str(
+            body.get("actual_host_worker_id")
+            or body.get("host_adapter_worker_id")
+            or body.get("host_worker_id")
+            or ""
+        ),
+        host_startup_id=str(body.get("host_startup_id") or ""),
+        host_session_id=str(body.get("host_session_id") or ""),
+        session_token_surrogate=str(
+            body.get("session_token_surrogate") or body.get("session_surrogate") or ""
+        ),
         parent_route_identity=(
             body.get("parent_route_identity")
             if isinstance(body.get("parent_route_identity"), Mapping)
@@ -28131,6 +28206,18 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "branch_runtime_evidence": branch_runtime_evidence,
         "persistent_evidence": dict(prepared.get("persistent_evidence") or {}),
         "dispatch_gate_validation": dispatch_verdict,
+        "startup_recording": dict(prepared.get("startup_recording") or {}),
+        "startup_alternatives": dict(prepared.get("startup_alternatives") or {}),
+        "same_owner_session_token_startup": dict(
+            prepared.get("same_owner_session_token_startup") or {}
+        ),
+        "host_adapter_surrogate_startup": dict(
+            prepared.get("host_adapter_surrogate_startup") or {}
+        ),
+        "startup_identity": dict(prepared.get("startup_identity") or {}),
+        "registered_host_adapter_spawn": dict(
+            prepared.get("registered_host_adapter_spawn") or {}
+        ),
         "worker_launch_pack": dict(prepared.get("worker_launch_pack") or {}),
         "local_runtime_context_bridge": local_runtime_context_bridge,
         "dispatch_timeline_event": dispatch_timeline_event,

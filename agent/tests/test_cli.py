@@ -1757,6 +1757,8 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
             "sha256:prompt-contract",
             "--route-id",
             "route-20260603-runtime-text",
+            "--route-token-ref",
+            "rtok-runtime-text-test",
             "--visible-injection-manifest-hash",
             DOGFOOD_VISIBLE_MANIFEST_HASH,
             "--main-worktree",
@@ -1803,12 +1805,51 @@ def test_observer_runtime_text_prepare_json_includes_launch_text_and_hash(tmp_pa
     assert payload["persistent_evidence"]["actual_startup_required"] is True
     assert payload["persistent_evidence"]["actual_startup_recorded"] is False
     assert payload["persistent_evidence"]["close_ready"] is False
+    assert payload["startup_recording"]["append_tool"] == "parallel_branch_startup"
+    same_owner = payload["same_owner_session_token_startup"]
+    host_surrogate = payload["host_adapter_surrogate_startup"]
+    registered = payload["registered_host_adapter_spawn"]
+    refusal_policy = payload["worker_launch_pack"]["startup_refusal_policy"]
+    assert "host_startup_id" not in refusal_policy["required_retry_fields"]
+    assert "session_token_surrogate" not in refusal_policy["required_retry_fields"]
+    assert "session_token" in refusal_policy["required_retry_fields"]
+    assert "host_startup_id" not in same_owner
+    assert "session_token_surrogate" not in same_owner
+    assert "host_startup_id" in host_surrogate
+    assert "session_token_surrogate" in host_surrogate
+    assert payload["startup_alternatives"]["default"] == (
+        "same_owner_session_token_startup"
+    )
+    assert same_owner == payload["startup_identity"]
+    assert same_owner == payload["startup_recording"]["startup_identity"]
+    assert same_owner == payload["worker_launch_pack"]["startup_identity"]
+    assert same_owner["session_token_source"] == "env:AMING_WORKER_SESSION_TOKEN"
+    assert same_owner["session_token_persisted"] is False
+    assert same_owner["raw_session_token_persisted"] is False
+    assert host_surrogate == payload["startup_recording"][
+        "host_adapter_surrogate_startup"
+    ]
+    assert host_surrogate["session_token_evidence_type"] == "surrogate"
+    assert host_surrogate["close_satisfying"] is False
+    assert host_surrogate["not_finish_gate_sufficient"] is True
+    assert registered == host_surrogate["registered_host_adapter_spawn"]
+    assert registered == payload["worker_launch_pack"][
+        "registered_host_adapter_spawn"
+    ]
+    assert registered["session_token_surrogate"].startswith("host-adapter:")
     assert payload["startup_intent_event"]["event_kind"] == "mf_subagent_startup_intent"
     assert payload["startup_intent_event"]["close_satisfying"] is False
     assert payload["startup_intent_event"]["payload"]["mf_subagent_startup_intent"][
         "launch_text_hash"
     ] == payload["launch_text_hash"]
     assert "launch_text" not in payload["persistent_evidence"]
+    for surface in (
+        payload["startup_recording"],
+        payload["worker_launch_pack"],
+        payload["persistent_evidence"],
+    ):
+        assert "session_token" not in surface
+        assert "launch_text" not in surface
 
 
 def test_observer_runtime_text_prepare_json_requires_branch_allocation_ref(tmp_path):

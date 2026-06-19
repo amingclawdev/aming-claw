@@ -33,6 +33,7 @@ try:
     )
     from governance import batch_jobs
     from governance.parallel_branch_runtime import (
+        build_registered_host_adapter_spawn_identity,
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
         runtime_context_id_for_branch_context,
@@ -55,6 +56,7 @@ except ImportError:  # pragma: no cover - package import path
     )
     from agent.governance import batch_jobs
     from agent.governance.parallel_branch_runtime import (
+        build_registered_host_adapter_spawn_identity,
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
         runtime_context_id_for_branch_context,
@@ -375,6 +377,13 @@ class ObserverRuntimeTextPrepareRequest:
     route_id: str = ""
     precheck_run_id: str = ""
     visible_injection_manifest_hash: str = ""
+    backend_mode: str = ""
+    startup_source: str = ""
+    host_adapter_agent_id: str = ""
+    actual_host_worker_id: str = ""
+    host_startup_id: str = ""
+    host_session_id: str = ""
+    session_token_surrogate: str = ""
     parent_route_identity: Mapping[str, Any] = field(default_factory=dict)
     graph_query_schema_trace_id: str = ""
     context_pack_refs: tuple[str, ...] = ()
@@ -3913,6 +3922,205 @@ def _runtime_text_local_bridge_path(
     }
 
 
+def _runtime_text_registered_startup_identity(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    context: Any,
+    runtime_context_id: str,
+    observer_command_id: str,
+    launch_text_hash: str,
+) -> dict[str, Any]:
+    return build_registered_host_adapter_spawn_identity(
+        project_id=request.project_id,
+        runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
+        launch_text_hash=launch_text_hash,
+        backend_mode=request.backend_mode,
+        startup_source=request.startup_source,
+        task_id=str(getattr(context, "task_id", "") or request.task_id or ""),
+        worker_slot_id=str(
+            getattr(context, "worker_slot_id", "")
+            or request.worker_id
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        agent_id=request.host_adapter_agent_id,
+        actual_host_worker_id=request.actual_host_worker_id,
+        host_startup_id=request.host_startup_id,
+        host_session_id=request.host_session_id,
+        session_token_surrogate=request.session_token_surrogate,
+    )
+
+
+def _runtime_text_same_owner_session_token_startup(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    context: Any,
+    runtime_context_id: str,
+    observer_command_id: str,
+    parent_task_id: str,
+    owned_files: Sequence[str],
+    read_receipt_identity: Mapping[str, Any],
+    launch_text_hash: str,
+) -> dict[str, Any]:
+    allocation_owner = str(
+        getattr(context, "allocation_owner", "")
+        or getattr(context, "agent_id", "")
+        or request.allocation_owner
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or request.worker_id
+        or ""
+    ).strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    return {
+        "schema_version": "mf_subagent_same_owner_session_token_startup.v1",
+        "startup_mode": "same_owner_session_token",
+        "startup_source": "multi_agent_worker",
+        "primary": True,
+        "copyable_default": True,
+        "append_tool": "parallel_branch_startup",
+        "event_kind": "mf_subagent_startup",
+        "session_token_source": "env:AMING_WORKER_SESSION_TOKEN",
+        "session_token_required": True,
+        "session_token_evidence_type": "server_verified_required",
+        "session_token_persisted": False,
+        "raw_session_token_persisted": False,
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "task_id": str(getattr(context, "task_id", "") or request.task_id or ""),
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_slot_id,
+        "worker_slot_id": worker_slot_id,
+        "allocation_owner": allocation_owner,
+        "agent_id": allocation_owner,
+        "actual_host_worker_id": "<fill actual_host_worker_id>",
+        "worker_session_id": "<fill worker_session_id>",
+        "worker_transcript_ref": "<fill worker_transcript_ref>",
+        "filer_principal": "<fill filer_principal>",
+        "harness_type": "<fill harness_type>",
+        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "branch": str(getattr(context, "branch_ref", "") or ""),
+        "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+        "worktree_path": worktree_path,
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(getattr(context, "target_head_commit", "") or ""),
+        "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+        "owned_files": list(owned_files),
+        "target_files": list(owned_files),
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "launch_text_hash": launch_text_hash,
+        "read_receipt_identity": dict(read_receipt_identity),
+        "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+        "read_receipt_hash": str(
+            read_receipt_identity.get("read_receipt_hash") or ""
+        ),
+        "read_receipt_event_id": str(
+            read_receipt_identity.get("read_receipt_event_id") or ""
+        ),
+        "close_satisfying": False,
+        "not_finish_gate_sufficient": True,
+        "worker_must_add_before_submit": [
+            "session_token",
+            "actual_host_worker_id",
+            "worker_session_id",
+            "worker_transcript_ref",
+            "filer_principal",
+            "harness_type",
+        ],
+    }
+
+
+def _runtime_text_host_adapter_surrogate_startup(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    context: Any,
+    runtime_context_id: str,
+    observer_command_id: str,
+    parent_task_id: str,
+    owned_files: Sequence[str],
+    read_receipt_identity: Mapping[str, Any],
+    launch_text_hash: str,
+    registered_host_adapter_spawn: Mapping[str, Any],
+) -> dict[str, Any]:
+    identity = dict(registered_host_adapter_spawn)
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or request.worker_id
+        or ""
+    ).strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    return {
+        "schema_version": "mf_subagent_host_adapter_surrogate_startup.v1",
+        "startup_mode": "host_adapter_surrogate",
+        "startup_source": str(identity.get("startup_source") or ""),
+        "primary": False,
+        "secondary": True,
+        "append_tool": "parallel_branch_startup",
+        "event_kind": "mf_subagent_startup",
+        "session_token_evidence_type": "surrogate",
+        "session_token_persisted": False,
+        "raw_session_token_persisted": False,
+        "close_satisfying": False,
+        "not_finish_gate_sufficient": True,
+        "registered_host_adapter_spawn": identity,
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "task_id": str(getattr(context, "task_id", "") or request.task_id or ""),
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_slot_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": str(identity.get("agent_id") or ""),
+        "actual_host_worker_id": str(identity.get("actual_host_worker_id") or ""),
+        "host_startup_id": str(identity.get("host_startup_id") or ""),
+        "host_session_id": str(identity.get("host_session_id") or ""),
+        "session_token_surrogate": str(identity.get("session_token_surrogate") or ""),
+        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "branch": str(getattr(context, "branch_ref", "") or ""),
+        "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+        "worktree_path": worktree_path,
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(getattr(context, "target_head_commit", "") or ""),
+        "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+        "owned_files": list(owned_files),
+        "target_files": list(owned_files),
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "launch_text_hash": launch_text_hash,
+        "read_receipt_identity": dict(read_receipt_identity),
+        "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
+        "read_receipt_hash": str(
+            read_receipt_identity.get("read_receipt_hash") or ""
+        ),
+        "read_receipt_event_id": str(
+            read_receipt_identity.get("read_receipt_event_id") or ""
+        ),
+    }
+
+
 def _runtime_text_worker_launch_pack(
     *,
     request: ObserverRuntimeTextPrepareRequest,
@@ -3927,6 +4135,9 @@ def _runtime_text_worker_launch_pack(
     dispatch_gate_validation: Mapping[str, Any],
     graph_first_obligations: Mapping[str, Any],
     read_receipt_identity: Mapping[str, Any],
+    same_owner_session_token_startup: Mapping[str, Any],
+    host_adapter_surrogate_startup: Mapping[str, Any],
+    registered_host_adapter_spawn: Mapping[str, Any],
     launch_text_hash: str,
 ) -> dict[str, Any]:
     context_pack_refs, context_pack_status, context_pack_resolution = (
@@ -4003,6 +4214,16 @@ def _runtime_text_worker_launch_pack(
         "failure_blocker": "governance_io_unavailable_before_read_receipt",
         "raw_session_token_persisted": False,
     }
+    startup_alternatives = {
+        "schema_version": "observer_worker_launch_pack.startup_alternatives.v1",
+        "default": "same_owner_session_token_startup",
+        "primary": "same_owner_session_token_startup",
+        "secondary": "host_adapter_surrogate_startup",
+        "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+        "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
+        "raw_session_token_persisted": False,
+        "raw_launch_text_persisted": False,
+    }
     worker_guide_status = str(request.worker_guide_status or "ready").strip()
     next_legal_action = str(
         request.worker_next_legal_action or "submit_mf_subagent_read_receipt"
@@ -4029,6 +4250,47 @@ def _runtime_text_worker_launch_pack(
         "refusal_event_kind": "mf_subagent_startup_refusal",
         "canonical_retry_payload": "startup_recording",
         "required_retry_fields": [
+            "startup_source",
+            "agent_id",
+            "actual_host_worker_id",
+            "worker_session_id",
+            "worker_transcript_ref",
+            "filer_principal",
+            "harness_type",
+            "session_token",
+            "owned_files",
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "observer_command_id",
+            "read_receipt_hash",
+            "read_receipt_event_id",
+        ],
+        "same_owner_session_token_required_fields": [
+            "startup_source",
+            "agent_id",
+            "actual_host_worker_id",
+            "worker_session_id",
+            "worker_transcript_ref",
+            "filer_principal",
+            "harness_type",
+            "session_token",
+            "owned_files",
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "observer_command_id",
+            "read_receipt_hash",
+            "read_receipt_event_id",
+        ],
+        "host_adapter_surrogate_required_fields": [
+            "startup_source",
+            "agent_id",
+            "actual_host_worker_id",
+            "host_startup_id",
+            "session_token_surrogate",
             "owned_files",
             "route_id",
             "route_context_hash",
@@ -4115,6 +4377,9 @@ def _runtime_text_worker_launch_pack(
             "raw_tokens_persisted": False,
             "worker_evidence_substitution_allowed": False,
         },
+        "startup_alternatives": startup_alternatives,
+        "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+        "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
         "startup_refusal_policy": startup_refusal_policy,
         "tests_to_run": list(request.test_commands),
         "evidence_to_file": required_evidence,
@@ -4285,6 +4550,11 @@ def _runtime_text_worker_launch_pack(
         "transcript_digests": _runtime_text_items(request.transcript_digests),
         "launch_text_hash": launch_text_hash,
         "read_receipt_identity": dict(read_receipt_identity),
+        "startup_alternatives": startup_alternatives,
+        "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+        "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
+        "startup_identity": dict(same_owner_session_token_startup),
+        "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
         "read_receipt_hash": str(read_receipt_identity.get("read_receipt_hash") or ""),
         "read_receipt_event_id": str(
@@ -4700,6 +4970,44 @@ def build_observer_runtime_text_context(
         and not projection_missing
         and not observer_command_missing
     )
+    registered_host_adapter_spawn = _runtime_text_registered_startup_identity(
+        request=request,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
+        launch_text_hash=launch_text_hash,
+    )
+    same_owner_session_token_startup = _runtime_text_same_owner_session_token_startup(
+        request=request,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
+        parent_task_id=parent_task_id,
+        owned_files=owned_files,
+        read_receipt_identity=read_receipt_identity,
+        launch_text_hash=launch_text_hash,
+    )
+    host_adapter_surrogate_startup = _runtime_text_host_adapter_surrogate_startup(
+        request=request,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
+        parent_task_id=parent_task_id,
+        owned_files=owned_files,
+        read_receipt_identity=read_receipt_identity,
+        launch_text_hash=launch_text_hash,
+        registered_host_adapter_spawn=registered_host_adapter_spawn,
+    )
+    startup_alternatives = {
+        "schema_version": "observer_runtime_text.startup_alternatives.v1",
+        "default": "same_owner_session_token_startup",
+        "primary": "same_owner_session_token_startup",
+        "secondary": "host_adapter_surrogate_startup",
+        "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+        "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
+        "raw_session_token_persisted": False,
+        "raw_launch_text_persisted": False,
+    }
     worker_launch_pack = _runtime_text_worker_launch_pack(
         request=request,
         context=context,
@@ -4713,6 +5021,9 @@ def build_observer_runtime_text_context(
         dispatch_gate_validation=dispatch_gate_validation,
         graph_first_obligations=graph_first_obligations,
         read_receipt_identity=read_receipt_identity,
+        same_owner_session_token_startup=same_owner_session_token_startup,
+        host_adapter_surrogate_startup=host_adapter_surrogate_startup,
+        registered_host_adapter_spawn=registered_host_adapter_spawn,
         launch_text_hash=launch_text_hash,
     )
     worker_launch_pack_preflight = dict(
@@ -4747,11 +5058,12 @@ def build_observer_runtime_text_context(
         else {}
     )
     startup_recording = {
+        **dict(same_owner_session_token_startup),
         "schema_version": "mf_subagent_startup_recording.v1",
         "required": bool(ok),
         "recorded": False,
         "close_ready": False,
-        "append_tool": "task_timeline_append",
+        "append_tool": "parallel_branch_startup",
         "event_kind": "mf_subagent_startup",
         "observer_command_id": observer_command_id,
         "observer_command_requirement": observer_command_requirement,
@@ -4778,6 +5090,18 @@ def build_observer_runtime_text_context(
         "owned_files": list(owned_files),
         "target_files": list(owned_files),
         "launch_text_hash": launch_text_hash,
+        "startup_source": str(
+            same_owner_session_token_startup.get("startup_source") or ""
+        ),
+        "agent_id": str(same_owner_session_token_startup.get("agent_id") or ""),
+        "actual_host_worker_id": str(
+            same_owner_session_token_startup.get("actual_host_worker_id") or ""
+        ),
+        "startup_alternatives": startup_alternatives,
+        "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+        "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
+        "startup_identity": dict(same_owner_session_token_startup),
+        "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "read_receipt_identity": dict(read_receipt_identity),
         "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
         "read_receipt_hash": str(
@@ -4841,6 +5165,11 @@ def build_observer_runtime_text_context(
             "actual_startup_recorded": False,
             "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
             "read_receipt_identity": dict(read_receipt_identity),
+            "startup_alternatives": startup_alternatives,
+            "same_owner_session_token_startup": dict(same_owner_session_token_startup),
+            "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
+            "startup_identity": dict(same_owner_session_token_startup),
+            "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
             "close_ready": False,
             "startup_recording": startup_recording,
             "startup_intent_event": startup_intent_event,
@@ -4851,6 +5180,11 @@ def build_observer_runtime_text_context(
         },
         "startup_intent_event": startup_intent_event,
         "startup_recording": startup_recording,
+        "startup_alternatives": startup_alternatives,
+        "same_owner_session_token_startup": same_owner_session_token_startup,
+        "host_adapter_surrogate_startup": host_adapter_surrogate_startup,
+        "startup_identity": same_owner_session_token_startup,
+        "registered_host_adapter_spawn": registered_host_adapter_spawn,
         "read_receipt_identity": read_receipt_identity,
         "read_receipt_recorded": bool(read_receipt_identity.get("recorded")),
         "read_receipt_hash": str(read_receipt_identity.get("read_receipt_hash") or ""),
