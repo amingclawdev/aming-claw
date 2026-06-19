@@ -4255,12 +4255,14 @@ def _runtime_text_worker_launch_pack(
         "prompt_contract_id": request.route.prompt_contract_id,
         "prompt_contract_hash": request.route.prompt_contract_hash,
         "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
         "worker_role": "mf_sub",
         "branch": context.branch_ref,
         "branch_ref": context.branch_ref,
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
+        "fence_token": context.fence_token,
         "fence_token_hash": fence_token_hash,
         "fence_token_env": fence_token_env,
         "fence_token_redacted": bool(fence_token_hash),
@@ -4548,6 +4550,7 @@ def _runtime_text_executable_worker_launch(
         "branch_ref": str(getattr(context, "branch_ref", "") or ""),
         "base_commit": str(getattr(context, "base_commit", "") or ""),
         "target_head_commit": str(getattr(context, "target_head_commit", "") or ""),
+        "fence_token": str(getattr(context, "fence_token", "") or ""),
         "fence_token_hash": fence_token_hash,
         "fence_token_env": fence_token_env,
         "fence_token_redacted": bool(fence_token_hash),
@@ -4617,6 +4620,17 @@ def _runtime_text_executable_worker_launch(
         f"/api/graph-governance/{request.project_id}/runtime-contexts/"
         f"{runtime_context_id}/startup"
     )
+    route_identity = {
+        "route_id": str(request.route_id or ""),
+        "route_context_hash": str(request.route.route_context_hash or ""),
+        "prompt_contract_id": str(request.route.prompt_contract_id or ""),
+        "prompt_contract_hash": str(request.route.prompt_contract_hash or ""),
+        "route_token_ref": str(request.route.route_token_ref or ""),
+        "visible_injection_manifest_hash": str(
+            request.visible_injection_manifest_hash or ""
+        ),
+    }
+    required_route_identity_fields = list(route_identity)
     session_token_placeholder = (
         f"<read from env:{session_token_env} at submission time>"
     )
@@ -4651,10 +4665,24 @@ def _runtime_text_executable_worker_launch(
         "fence_token_hash": fence_token_hash,
         "fence_token_redacted": bool(fence_token_hash),
         "raw_fence_token_persisted": False,
+        **route_identity,
     }
     read_receipt_body_skeleton = {
         "runtime_context_id": runtime_context_id,
+        "task_id": payload["task_id"],
         "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": str(
+            worker_launch_pack.get("worker_id")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "worker_slot_id": str(
+            worker_launch_pack.get("worker_id")
+            or getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
         "fence_token": fence_token_placeholder,
         "session_token": session_token_placeholder,
         "fence_token_env": fence_token_env,
@@ -4664,12 +4692,60 @@ def _runtime_text_executable_worker_launch(
         "status": "accepted",
         "launch_text_hash": launch_text_hash,
         "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        **route_identity,
         "payload": dict(read_receipt_persisted_payload_skeleton),
+    }
+    read_receipt_field_pointers = {
+        "top_level_post_json": (
+            "read_receipt_facade_payload_skeleton.copy_safe_body"
+        ),
+        "do_not_post_alone": [
+            "read_receipt_facade_payload_skeleton.payload",
+            "read_receipt_facade_payload_skeleton.copy_safe_body.payload",
+        ],
+        "runtime_context_id": "copy_safe_body.runtime_context_id",
+        "task_id": "copy_safe_body.task_id",
+        "parent_task_id": "copy_safe_body.parent_task_id",
+        "worker_id": "copy_safe_body.worker_id",
+        "worker_slot_id": "copy_safe_body.worker_slot_id",
+        "target_project_root": "copy_safe_body.target_project_root",
+        "session_token": "copy_safe_body.session_token",
+        "fence_token": "copy_safe_body.fence_token",
+        "route_identity": {
+            field: f"copy_safe_body.{field}"
+            for field in required_route_identity_fields
+        },
+        "receipt_hash": (
+            "copy_safe_body.read_receipt_hash or copy_safe_body.launch_text_hash"
+        ),
     }
     read_receipt_payload_skeleton = {
         "method": "POST",
         "path": read_receipt_path,
         "facade": "runtime_context.read_receipts",
+        "top_level_body_required": True,
+        "body_is_top_level_post_json": True,
+        "body_source": "copy_safe_body",
+        "required_fields": [
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_role",
+            "worker_id",
+            "worker_slot_id",
+            "session_token",
+            "fence_token",
+            "target_project_root",
+            "read_receipt_hash or launch_text_hash",
+            *required_route_identity_fields,
+        ],
+        "required_route_identity_fields": required_route_identity_fields,
+        "forbidden_shapes": [
+            "nested_payload_only_identity",
+            "payload_posted_without_top_level_identity",
+            "worktree_path_as_target_project_root_for_write_facades",
+        ],
+        "field_pointers": read_receipt_field_pointers,
         "auth_fields": {
             "session_token": session_token_placeholder,
             "session_token_env": session_token_env,
@@ -4677,6 +4753,8 @@ def _runtime_text_executable_worker_launch(
             "fence_token_env": fence_token_env,
         },
         "body": read_receipt_body_skeleton,
+        "copy_safe_body": dict(read_receipt_body_skeleton),
+        "retry_payload": dict(read_receipt_body_skeleton),
         "payload": read_receipt_persisted_payload_skeleton,
     }
     startup_persisted_payload_skeleton = {

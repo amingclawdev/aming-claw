@@ -2278,6 +2278,16 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert registered["session_token_surrogate"].startswith("host-adapter:")
     executable = prepared["executable_worker_launch"]
     handoff = prepared["executable_handoff_packet"]
+    worker_launch_pack_json = json.dumps(
+        prepared["worker_launch_pack"],
+        sort_keys=True,
+    )
+    assert raw_fence_token not in worker_launch_pack_json
+    assert raw_session_token not in worker_launch_pack_json
+    assert prepared["launch_text"] not in worker_launch_pack_json
+    bridge_payload_json = json.dumps(bridge_payload, sort_keys=True)
+    assert raw_fence_token not in bridge_payload_json
+    assert raw_session_token not in bridge_payload_json
     assert executable["handoff_packet"] == handoff
     assert handoff["schema_version"] == (
         "observer_runtime_text.executable_handoff_packet.v1"
@@ -2327,11 +2337,30 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     )
     receipt_skeleton = handoff["read_receipt_facade_payload_skeleton"]
     receipt_payload = receipt_skeleton["payload"]
+    route_identity_fields = {
+        "route_id": "route-api",
+        "route_context_hash": "sha256:route-api",
+        "prompt_contract_id": "rprompt-api",
+        "prompt_contract_hash": "sha256:prompt-api",
+        "route_token_ref": "rtok-api",
+        "visible_injection_manifest_hash": "sha256:visible-api",
+    }
     assert receipt_skeleton["method"] == "POST"
     assert receipt_skeleton["path"].endswith(
         "/runtime-contexts/mfrctx-runtime-text-api/read-receipts"
     )
     receipt_body = receipt_skeleton["body"]
+    assert receipt_skeleton["top_level_body_required"] is True
+    assert receipt_skeleton["body_source"] == "copy_safe_body"
+    assert receipt_skeleton["copy_safe_body"] == receipt_body
+    assert "nested_payload_only_identity" in receipt_skeleton["forbidden_shapes"]
+    assert (
+        "worktree_path_as_target_project_root_for_write_facades"
+        in receipt_skeleton["forbidden_shapes"]
+    )
+    assert receipt_skeleton["field_pointers"]["top_level_post_json"].endswith(
+        "copy_safe_body"
+    )
     assert receipt_skeleton["auth_fields"]["session_token"].startswith(
         "<read from env:"
     )
@@ -2339,6 +2368,9 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert receipt_body["fence_token"].startswith(
         "<read from env:AMING_WORKER_FENCE_TOKEN"
     )
+    assert receipt_body["task_id"] == "runtime-text-task"
+    assert receipt_body["worker_id"] == "worker-api"
+    assert receipt_body["worker_slot_id"] == "worker-api"
     assert receipt_payload["event_kind"] == "mf_subagent_read_receipt"
     assert receipt_payload["runtime_context_id"] == "mfrctx-runtime-text-api"
     assert receipt_payload["task_id"] == "runtime-text-task"
@@ -2349,6 +2381,11 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     assert "session_token" not in receipt_payload
     assert "fence_token" not in receipt_payload
     assert receipt_payload["launch_text_hash"] == prepared["launch_text_hash"]
+    for field, value in route_identity_fields.items():
+        assert receipt_body[field] == value
+        assert receipt_payload[field] == value
+        assert field in receipt_skeleton["required_fields"]
+        assert field in receipt_skeleton["required_route_identity_fields"]
     startup_skeleton = handoff["startup_facade_payload_skeleton"]
     startup_payload = startup_skeleton["payload"]
     assert startup_skeleton["method"] == "POST"
@@ -13339,6 +13376,24 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
     )
     assert receipt_skeleton["body"]["session_token"].startswith("<read from env:")
     assert receipt_skeleton["body"]["fence_token"].startswith("<read from env:")
+    assert receipt_skeleton["top_level_body_required"] is True
+    assert receipt_skeleton["copy_safe_body"] == receipt_skeleton["body"]
+    assert "nested_payload_only_identity" in receipt_skeleton["forbidden_shapes"]
+    assert (
+        "worktree_path_as_target_project_root_for_write_facades"
+        in receipt_skeleton["forbidden_shapes"]
+    )
+    assert receipt_skeleton["field_pointers"]["top_level_post_json"].endswith(
+        "copy_safe_body"
+    )
+    assert receipt_skeleton["copy_safe_body"]["task_id"] == "worker-runtime-context"
+    assert receipt_skeleton["copy_safe_body"]["worker_id"] == "worker-runtime-context"
+    assert receipt_skeleton["copy_safe_body"]["worker_slot_id"] == (
+        "worker-runtime-context"
+    )
+    for field, value in route_identity.items():
+        assert receipt_skeleton["copy_safe_body"][field] == value
+        assert field in receipt_skeleton["required_fields"]
     assert receipt_skeleton["payload"]["target_project_root"] == str(target_root)
     assert "session-runtime-context" not in json.dumps(
         read_recovery,
@@ -13752,6 +13807,28 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     assert worker_guide["graph_query_identity"]["payload_shape"][
         "target_project_root"
     ] == str(target_root)
+    write_guide = worker_guide["write_guides"]["read_receipt"]
+    assert write_guide["top_level_body_required"] is True
+    assert "route_context_hash" in write_guide["required_fields"]
+    receipt_skeleton = worker_guide["read_receipt_facade_payload_skeleton"]
+    assert receipt_skeleton["top_level_body_required"] is True
+    assert receipt_skeleton["body_source"] == "copy_safe_body"
+    assert "nested_payload_only_identity" in receipt_skeleton["forbidden_shapes"]
+    copy_safe_body = receipt_skeleton["copy_safe_body"]
+    assert copy_safe_body["runtime_context_id"] == context.runtime_context_id
+    assert copy_safe_body["task_id"] == "worker-empty-target-root"
+    assert copy_safe_body["parent_task_id"] == "parent-empty-target-root"
+    assert copy_safe_body["worker_id"] == "worker-empty-target-root"
+    assert copy_safe_body["worker_slot_id"] == "slot-empty-target-root"
+    assert copy_safe_body["target_project_root"] == str(target_root)
+    assert copy_safe_body["route_id"] == "route-empty-target-root"
+    assert copy_safe_body["route_context_hash"] == "sha256:route-empty-target-root"
+    assert copy_safe_body["prompt_contract_id"] == "rprompt-empty-target-root"
+    assert copy_safe_body["prompt_contract_hash"] == "sha256:prompt-empty-target-root"
+    assert copy_safe_body["route_token_ref"] == "rtok-empty-target-root"
+    assert copy_safe_body["visible_injection_manifest_hash"] == (
+        "sha256:visible-empty-target-root"
+    )
 
     read_receipt = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx(
@@ -13800,6 +13877,124 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
         assert diagnostics["expected"]["target_project_root"] == str(target_root)
         assert diagnostics["expected"]["worktree_path"] == str(target_root)
         assert diagnostics["session_token"]["raw_session_token_exposed"] is False
+
+
+def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "copy-safe-worker-root"
+    target_root.mkdir()
+    route_identity = {
+        "route_id": "route-copy-safe-receipt",
+        "route_context_hash": "sha256:route-copy-safe-receipt",
+        "prompt_contract_id": "rprompt-copy-safe-receipt",
+        "prompt_contract_hash": "sha256:prompt-copy-safe-receipt",
+        "route_token_ref": "rtok-copy-safe-receipt",
+        "visible_injection_manifest_hash": "sha256:visible-copy-safe-receipt",
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-copy-safe-receipt",
+            root_task_id="parent-copy-safe-receipt",
+            backlog_id="AC-COPY-SAFE-RECEIPT",
+            stage_task_id="worker-copy-safe-receipt",
+            worker_id="worker-copy-safe-receipt",
+            worker_slot_id="slot-copy-safe-receipt",
+            branch_ref="refs/heads/codex/worker-copy-safe-receipt",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-copy-safe-receipt",
+            session_token_hash=mf_subagent_session_token_hash(
+                "copy-safe-session"
+            ),
+            lease_id="lease-copy-safe-receipt",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-copy-safe-receipt",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            query={
+                "parent_task_id": "parent-copy-safe-receipt",
+                "fence_token": "fence-copy-safe-receipt",
+                "session_token": "copy-safe-session",
+                "target_project_root": str(target_root),
+                "view": "all",
+            },
+        )
+    )
+    receipt_skeleton = guide["worker_guide"][
+        "read_receipt_facade_payload_skeleton"
+    ]
+    copied_body = dict(receipt_skeleton["copy_safe_body"])
+
+    assert copied_body["target_project_root"] == str(target_root)
+    for field, value in route_identity.items():
+        assert copied_body[field] == value
+
+    submitted_body = dict(copied_body)
+    submitted_body["session_token"] = "copy-safe-session"
+    submitted_body["fence_token"] = "fence-copy-safe-receipt"
+    if str(submitted_body.get("read_receipt_hash") or "").startswith("<"):
+        submitted_body["read_receipt_hash"] = "sha256:copy-safe-receipt"
+    if str(submitted_body.get("launch_text_hash") or "").startswith("<"):
+        submitted_body["launch_text_hash"] = "sha256:copy-safe-launch"
+    for field, value in copied_body.items():
+        if field not in {
+            "session_token",
+            "fence_token",
+            "read_receipt_hash",
+            "launch_text_hash",
+        }:
+            assert submitted_body[field] == value
+
+    response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            method="POST",
+            body=submitted_body,
+        )
+    )
+
+    assert response["ok"] is True
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-copy-safe-receipt",
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert len(events) == 1
+    persisted_payload = events[0]["payload"]
+    assert persisted_payload["target_project_root"] == str(target_root)
+    assert persisted_payload["runtime_context_id"] == context.runtime_context_id
+    assert persisted_payload["read_receipt_hash"] == "sha256:copy-safe-receipt"
+    assert persisted_payload["worker_id"] == "worker-copy-safe-receipt"
+    assert persisted_payload["worker_slot_id"] == "slot-copy-safe-receipt"
+    for field, value in route_identity.items():
+        assert persisted_payload[field] == value
+    persisted_json = json.dumps(persisted_payload, sort_keys=True)
+    assert "copy-safe-session" not in persisted_json
+    assert "fence-copy-safe-receipt" not in persisted_json
+    assert persisted_payload["raw_session_token_persisted"] is False
+    assert persisted_payload["raw_fence_token_persisted"] is False
+    assert persisted_payload["fence_token_redacted"] is True
+    assert persisted_payload["fence_token_hash"] == _fake_sha(
+        "fence-copy-safe-receipt"
+    )
 
 
 def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
@@ -13918,6 +14113,11 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
                     **strict_body,
                     "launch_text_hash": "sha256:worktree-alias-launch",
                     "actor": "slot-worktree-alias",
+                    "payload": {
+                        "event_kind": "mf_subagent_read_receipt",
+                        "launch_text_hash": "sha256:worktree-alias-launch",
+                        **route_identity,
+                    },
                 },
             )
         )
@@ -13925,6 +14125,29 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     assert read_receipt_denied.value.details["target_project_root_projection"][
         "request_role"
     ] == "assigned_worktree_path_alias"
+    read_receipt_details = read_receipt_denied.value.details
+    presence = read_receipt_details["diagnostics"]["route_identity_presence"]
+    assert presence["nested_payload_only_identity"] is True
+    for field in route_identity:
+        assert field in presence["missing_top_level_required"]
+    receipt_skeleton = read_receipt_details["read_receipt_facade_payload_skeleton"]
+    assert receipt_skeleton["top_level_body_required"] is True
+    assert "nested_payload_only_identity" in receipt_skeleton["forbidden_shapes"]
+    assert (
+        "worktree_path_as_target_project_root_for_write_facades"
+        in receipt_skeleton["forbidden_shapes"]
+    )
+    retry_body = read_receipt_details["retry_read_receipt_top_level_body"]
+    assert retry_body == receipt_skeleton["copy_safe_body"]
+    assert read_receipt_details["retry_payload"] == retry_body
+    assert read_receipt_details["field_pointers"]["top_level_post_json"].endswith(
+        "copy_safe_body"
+    )
+    assert retry_body["target_project_root"] == str(canonical_root)
+    assert retry_body["worker_id"] == "worker-worktree-alias"
+    assert retry_body["worker_slot_id"] == "slot-worktree-alias"
+    for field, value in route_identity.items():
+        assert retry_body[field] == value
 
     with pytest.raises(GovernanceError) as startup_denied:
         server.handle_graph_governance_runtime_context_startup(

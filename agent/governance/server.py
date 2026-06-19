@@ -7554,6 +7554,19 @@ def _runtime_context_worker_guide_response(
     project_id = str(current_state_response.get("project_id") or "")
     task_id = str(current_state_response.get("task_id") or task.get("task_id") or "")
     parent_task_id = str(graph_identity.get("parent_task_id") or task.get("parent_task_id") or "")
+    worker_id = str(
+        graph_identity.get("worker_id")
+        or task.get("worker_id")
+        or worker_view.get("worker_id")
+        or worker_view.get("agent_id")
+        or ""
+    )
+    worker_slot_id = str(
+        graph_identity.get("worker_slot_id")
+        or task.get("worker_slot_id")
+        or worker_view.get("worker_slot_id")
+        or worker_id
+    )
     target_root_projection = dict(
         current_state_response.get("target_project_root_projection") or {}
     )
@@ -7806,10 +7819,26 @@ def _runtime_context_worker_guide_response(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                "worker_role",
+                "worker_id",
+                "worker_slot_id",
                 "fence_token",
                 "session_token",
                 "target_project_root",
                 "read_receipt_hash",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+            ],
+            "required_route_identity_fields": list(
+                _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            ),
+            "top_level_body_required": True,
+            "body_source": (
+                "read_receipt_facade_payload_skeleton.copy_safe_body"
+            ),
+            "forbidden_shapes": [
+                "nested_payload_only_identity",
+                "payload_posted_without_top_level_identity",
+                "worktree_path_as_target_project_root_for_write_facades",
             ],
             "auth": _auth_guide("body.session_token"),
         },
@@ -8019,6 +8048,23 @@ def _runtime_context_worker_guide_response(
             "auth": _auth_guide("body.session_token"),
         },
     }
+    actionable_payloads = _runtime_context_worker_recovery_payloads(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        target_project_root=target_project_root,
+        route_identity=route_identity,
+        fence_token_hash=str(
+            graph_identity.get("fence_token_hash")
+            or worker_view.get("fence_token_hash")
+            or ""
+        ),
+        launch_text_hash=str(worker_view.get("launch_text_hash") or ""),
+        read_receipt_event_ref=str(worker_view.get("read_receipt_event_ref") or ""),
+    )
     return {
         "ok": True,
         "schema_version": "runtime_context.worker_guide_response.v1",
@@ -8033,6 +8079,11 @@ def _runtime_context_worker_guide_response(
         "corrected_request_shapes": corrected_request_shapes,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
+        "actionable_payloads": actionable_payloads,
+        "read_receipt_facade_payload_skeleton": actionable_payloads.get(
+            "read_receipt_facade_payload_skeleton",
+            {},
+        ),
         "role_scope": current_state_response.get("role_scope"),
         "worker_guide": {
             "schema_version": "runtime_context.worker_guide.v1",
@@ -8059,6 +8110,11 @@ def _runtime_context_worker_guide_response(
             ),
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
+            "actionable_payloads": actionable_payloads,
+            "read_receipt_facade_payload_skeleton": actionable_payloads.get(
+                "read_receipt_facade_payload_skeleton",
+                {},
+            ),
             "graph_query_identity": {
                 "runtime_context_id": runtime_context_id,
                 "task_id": graph_identity.get("task_id") or task_id,
@@ -8184,6 +8240,70 @@ def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
     return str(body.get(key) or query.get(key) or "").strip()
 
 
+def _runtime_context_request_route_identity_shapes(
+    ctx: RequestContext,
+) -> dict[str, Any]:
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    query = ctx.query if isinstance(ctx.query, Mapping) else {}
+    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    nested_route_identity = (
+        body.get("route_identity")
+        if isinstance(body.get("route_identity"), Mapping)
+        else {}
+    )
+    payload_route_identity = (
+        payload.get("route_identity")
+        if isinstance(payload.get("route_identity"), Mapping)
+        else {}
+    )
+
+    def _shape(source: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            field: str(source.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+
+    top_level = {
+        field: str(body.get(field) or query.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    nested_payload = _shape(payload)
+    nested_identity = _shape(nested_route_identity)
+    payload_identity = _shape(payload_route_identity)
+    supplied: dict[str, str] = {}
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        for source in (
+            top_level,
+            nested_identity,
+            nested_payload,
+            payload_identity,
+        ):
+            value = str(source.get(field) or "").strip()
+            if value:
+                supplied[field] = value
+                break
+
+    return {
+        "top_level": top_level,
+        "nested_payload": nested_payload,
+        "nested_route_identity": nested_identity,
+        "payload_route_identity": payload_identity,
+        "supplied": supplied,
+        "top_level_present": {
+            field: bool(top_level.get(field))
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+        "nested_payload_present": {
+            field: bool(nested_payload.get(field))
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+        "nested_route_identity_present": {
+            field: bool(nested_identity.get(field) or payload_identity.get(field))
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+    }
+
+
 def _runtime_context_requested_target_project_root(ctx: RequestContext) -> str:
     return (
         _runtime_context_request_value(ctx, "target_project_root")
@@ -8287,8 +8407,11 @@ def _runtime_context_worker_recovery_payloads(
     safe_route_identity = {
         field: str((route_identity or {}).get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-        if str((route_identity or {}).get(field) or "").strip()
     }
+    present_route_identity = {
+        field: value for field, value in safe_route_identity.items() if value
+    }
+    required_route_identity_fields = list(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
     session_token_env = "AMING_WORKER_SESSION_TOKEN"
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
     session_token_ref = f"env:{session_token_env}"
@@ -8329,6 +8452,7 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
@@ -8340,8 +8464,36 @@ def _runtime_context_worker_recovery_payloads(
         "status": "accepted",
         "read_receipt_hash": "<worker-computed-read-receipt-hash>",
         "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
+        **safe_route_identity,
         "payload": dict(read_receipt_payload),
     }
+    read_receipt_field_pointers = {
+        "top_level_post_json": "read_receipt_facade_payload_skeleton.copy_safe_body",
+        "do_not_post_alone": [
+            "read_receipt_facade_payload_skeleton.payload",
+            "read_receipt_facade_payload_skeleton.copy_safe_body.payload",
+        ],
+        "runtime_context_id": "copy_safe_body.runtime_context_id",
+        "task_id": "copy_safe_body.task_id",
+        "parent_task_id": "copy_safe_body.parent_task_id",
+        "worker_id": "copy_safe_body.worker_id",
+        "worker_slot_id": "copy_safe_body.worker_slot_id",
+        "target_project_root": "copy_safe_body.target_project_root",
+        "session_token": "copy_safe_body.session_token",
+        "fence_token": "copy_safe_body.fence_token",
+        "route_identity": {
+            field: f"copy_safe_body.{field}"
+            for field in required_route_identity_fields
+        },
+        "receipt_hash": (
+            "copy_safe_body.read_receipt_hash or copy_safe_body.launch_text_hash"
+        ),
+    }
+    read_receipt_forbidden_shapes = [
+        "nested_payload_only_identity",
+        "payload_posted_without_top_level_identity",
+        "worktree_path_as_target_project_root_for_write_facades",
+    ]
     startup_identity_required_fields = [
         "worker_session_id",
         "worker_transcript_ref or worker_transcript_path",
@@ -8415,7 +8567,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
-        "route_identity": safe_route_identity,
+        "route_identity": present_route_identity,
         "route_token_ref": safe_route_identity.get("route_token_ref", ""),
         "session_token_ref": session_token_ref,
         "fence_token_ref": fence_token_ref,
@@ -8429,6 +8581,7 @@ def _runtime_context_worker_recovery_payloads(
                 "path": read_receipt_path,
                 "tool": "submit_mf_subagent_read_receipt",
                 "facade": "runtime_context.read_receipts",
+                "body_source": "read_receipt_facade_payload_skeleton.copy_safe_body",
             },
             "runtime_context_startup": {
                 "method": "POST",
@@ -8442,14 +8595,25 @@ def _runtime_context_worker_recovery_payloads(
             "method": "POST",
             "path": read_receipt_path,
             "facade": "runtime_context.read_receipts",
+            "top_level_body_required": True,
+            "body_is_top_level_post_json": True,
+            "body_source": "copy_safe_body",
             "required_fields": [
                 "runtime_context_id",
+                "task_id",
                 "parent_task_id",
+                "worker_role",
+                "worker_id",
+                "worker_slot_id",
                 "session_token",
                 "fence_token",
                 "target_project_root",
                 "read_receipt_hash or launch_text_hash",
+                *required_route_identity_fields,
             ],
+            "required_route_identity_fields": required_route_identity_fields,
+            "forbidden_shapes": read_receipt_forbidden_shapes,
+            "field_pointers": read_receipt_field_pointers,
             "auth_fields": {
                 "session_token": session_token_placeholder,
                 "session_token_env": session_token_env,
@@ -8457,6 +8621,8 @@ def _runtime_context_worker_recovery_payloads(
                 "fence_token_env": fence_token_env,
             },
             "body": read_receipt_body,
+            "copy_safe_body": dict(read_receipt_body),
+            "retry_payload": dict(read_receipt_body),
             "payload": read_receipt_payload,
         },
         "startup_facade_payload_skeleton": {
@@ -8518,6 +8684,7 @@ def _runtime_context_worker_recovery_details(
     requested_task_id = str(task_id or "").strip()
     query = ctx.query if isinstance(ctx.query, Mapping) else {}
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    request_route_identity_shapes = _runtime_context_request_route_identity_shapes(ctx)
     caller_omitted_target_root = not any(
         str(source.get(key) or "").strip()
         for source in (body, query)
@@ -8538,7 +8705,9 @@ def _runtime_context_worker_recovery_details(
     if context is None and requested_task_id:
         context = get_branch_context(conn, project_id, requested_task_id)
 
-    supplied_route_identity = dict(route_identity or {})
+    supplied_route_identity = dict(
+        route_identity or request_route_identity_shapes.get("supplied") or {}
+    )
     requested_target_root = str(target_project_root or "").strip()
     next_legal_action = "verify_runtime_context_identity"
     recovery_action_id = "retry_with_matching_runtime_context_identity"
@@ -8564,6 +8733,17 @@ def _runtime_context_worker_recovery_details(
                 field: bool(str(supplied_route_identity.get(field) or "").strip())
                 for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
             },
+            "top_level_request": dict(
+                request_route_identity_shapes.get("top_level_present") or {}
+            ),
+            "nested_payload": dict(
+                request_route_identity_shapes.get("nested_payload_present") or {}
+            ),
+            "nested_route_identity": dict(
+                request_route_identity_shapes.get("nested_route_identity_present") or {}
+            ),
+            "missing_top_level_required": [],
+            "nested_payload_only_identity": False,
             "expected": {},
         },
         "session_token": {
@@ -8692,6 +8872,17 @@ def _runtime_context_worker_recovery_details(
             field: bool(str(expected_route_identity.get(field) or "").strip())
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         }
+        diagnostics["route_identity_presence"]["missing_top_level_required"] = [
+            field
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(expected_route_identity.get(field) or "").strip()
+            and not request_route_identity_shapes["top_level_present"].get(field)
+        ]
+        diagnostics["route_identity_presence"]["nested_payload_only_identity"] = any(
+            request_route_identity_shapes["nested_payload_present"].get(field)
+            and not request_route_identity_shapes["top_level_present"].get(field)
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
         diagnostics["session_token"].update(
             {
                 "matches_recorded_hash": session_matches,
@@ -8769,6 +8960,25 @@ def _runtime_context_worker_recovery_details(
             "description": "Refresh current-state/worker-guide and copy the projected identity fields.",
         },
     ]
+    read_receipt_skeleton = actionable_payloads.get(
+        "read_receipt_facade_payload_skeleton",
+        {},
+    )
+    read_receipt_copy_safe_body = (
+        read_receipt_skeleton.get("copy_safe_body")
+        if isinstance(read_receipt_skeleton, Mapping)
+        else {}
+    )
+    if not isinstance(read_receipt_copy_safe_body, Mapping):
+        read_receipt_copy_safe_body = {}
+    read_receipt_field_pointers = (
+        read_receipt_skeleton.get("field_pointers")
+        if isinstance(read_receipt_skeleton, Mapping)
+        else {}
+    )
+    if not isinstance(read_receipt_field_pointers, Mapping):
+        read_receipt_field_pointers = {}
+
     return {
         "recoverable": recoverable,
         "next_legal_action": next_legal_action,
@@ -8776,10 +8986,10 @@ def _runtime_context_worker_recovery_details(
         "diagnostics": diagnostics,
         "target_project_root_projection": target_root_projection,
         "actionable_payloads": actionable_payloads,
-        "read_receipt_facade_payload_skeleton": actionable_payloads.get(
-            "read_receipt_facade_payload_skeleton",
-            {},
-        ),
+        "read_receipt_facade_payload_skeleton": read_receipt_skeleton,
+        "retry_read_receipt_top_level_body": dict(read_receipt_copy_safe_body),
+        "retry_payload": dict(read_receipt_copy_safe_body),
+        "field_pointers": dict(read_receipt_field_pointers),
         "startup_facade_payload_skeleton": actionable_payloads.get(
             "startup_facade_payload_skeleton",
             {},

@@ -393,6 +393,35 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         "agent/cli.py",
     ]
     assert executable["payload"]["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
+    handoff = executable["handoff_packet"]
+    receipt_skeleton = handoff["read_receipt_facade_payload_skeleton"]
+    receipt_body = receipt_skeleton["copy_safe_body"]
+    assert receipt_skeleton["top_level_body_required"] is True
+    assert receipt_skeleton["body_source"] == "copy_safe_body"
+    assert receipt_skeleton["body"] == receipt_body
+    assert "nested_payload_only_identity" in receipt_skeleton["forbidden_shapes"]
+    assert (
+        "worktree_path_as_target_project_root_for_write_facades"
+        in receipt_skeleton["forbidden_shapes"]
+    )
+    assert receipt_skeleton["field_pointers"]["top_level_post_json"].endswith(
+        "copy_safe_body"
+    )
+    assert "payload" in receipt_body
+    assert receipt_body["runtime_context_id"] == "mfrctx-runtime-text"
+    assert receipt_body["task_id"] == "AC-RUNTIME-TEXT-impl-1"
+    assert receipt_body["parent_task_id"] == "AC-RUNTIME-TEXT"
+    assert receipt_body["worker_id"] == "worker-1"
+    assert receipt_body["worker_slot_id"] == "worker-1"
+    assert receipt_body["route_id"] == "route-20260603-runtime"
+    assert receipt_body["route_context_hash"] == "sha256:route"
+    assert receipt_body["prompt_contract_id"] == "rprompt-runtime"
+    assert receipt_body["prompt_contract_hash"] == "sha256:prompt"
+    assert receipt_body["route_token_ref"] == "route-token-ref"
+    assert receipt_body["visible_injection_manifest_hash"] == "sha256:visible"
+    for field in receipt_skeleton["required_route_identity_fields"]:
+        assert field in receipt_body
+        assert field in receipt_skeleton["required_fields"]
     registered_spawn = result["registered_host_adapter_spawn"]
     assert registered_spawn["source"] == "observer_runtime_text_prepare"
     assert registered_spawn["registration_source"] == "runtime_text_prepare"
