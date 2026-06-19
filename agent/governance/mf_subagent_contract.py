@@ -478,6 +478,8 @@ _META_ACTION_ALIASES = {
     "implement": "implementation",
     "worker_progress": "worker_progress",
     "progress": "worker_progress",
+    "finish_time_worker_attestation": "record_finish_time_worker_attestation",
+    "record_finish_time_worker_attestation": "record_finish_time_worker_attestation",
     "mf_subagent_session_token_reissue": "worker_progress",
     "mf_subagent_session_token_renew": "worker_progress",
     "session_token_reissue": "worker_progress",
@@ -524,6 +526,8 @@ _META_ACTION_ALIASES = {
     "observer_command": "observer_command",
     "observer_command_complete": "observer_command",
     "observer_command_disposition": "observer_command",
+    "observer_visual_smoke": "observer_visual_smoke",
+    "visual_smoke": "observer_visual_smoke",
     "independent_verification": "independent_verification",
     "verification": "qa_verification",
     "qa_verification": "qa_verification",
@@ -5542,11 +5546,14 @@ def _meta_allowed_actions(meta_contract: Mapping[str, Any], role: str) -> list[s
         field_name="role_action_whitelist",
     )
     role_policy = _mapping(whitelist.get(role), field_name=f"role_action_whitelist.{role}")
-    return [
+    allowed = [
         _normalized_action(item)
         for item in _string_list_forgiving(role_policy.get("allowed_actions"))
         if _normalized_action(item)
     ]
+    if role == OBSERVER_COORDINATOR_ROLE and "observer_visual_smoke" not in allowed:
+        allowed.append("observer_visual_smoke")
+    return allowed
 
 
 def _meta_work_mode_transition_evidence_containers(

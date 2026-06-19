@@ -1131,10 +1131,9 @@ def _independent_qa_reviewer_identity(event: dict[str, Any]) -> str:
     """Derive the effective reviewer identity for independence checking.
 
     For direct evidence (qa_reviewer, qa_verification, independent_verification),
-    the reviewer is the actor.  For observer-on-behalf transport events the
-    transport actor is "observer-on-behalf-of:<reviewer>" or the payload carries
-    a "reviewer" field; in both cases the *reviewer* identity is what matters for
-    the independence test, not the transport actor.
+    the reviewer is the actor.  For observer-on-behalf transport events this
+    still returns the named reviewer for diagnostics, but those events are not
+    independent QA evidence.
 
     Returns the reviewer identity string (non-empty) or "" if none can be derived.
     """
@@ -1156,6 +1155,19 @@ def _independent_qa_reviewer_identity(event: dict[str, Any]) -> str:
 
 
 _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS = {"observer", "mf_observer", "route_observer"}
+
+
+def _is_independent_qa_observer_transport(event: dict[str, Any]) -> bool:
+    actor = _text(event.get("actor")).strip().lower()
+    actor_token = _normalize_token(actor)
+    return bool(
+        actor in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+        or actor in MF_OBSERVER_ACTOR_TOKENS
+        or actor_token in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+        or actor_token in MF_OBSERVER_ACTOR_TOKENS
+        or actor.startswith("observer-on-behalf-of:")
+        or actor_token.startswith("observer_on_behalf_of")
+    )
 
 
 def _independent_qa_ref_aliases(value: Any) -> set[str]:
@@ -1238,7 +1250,8 @@ def _independent_qa_resolved_verdict_refs(
         target_reviewer_identity = _independent_qa_reviewer_identity(target)
         target_reviewer = target_reviewer_identity.lower()
         if (
-            not target_reviewer_identity
+            _is_independent_qa_observer_transport(target)
+            or not target_reviewer_identity
             or target_reviewer in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
             or target_reviewer_identity in worker_slot_ids
         ):
@@ -1264,13 +1277,8 @@ def _independent_qa_gate(
     - Evidence whose *reviewer identity* is the same as any known worker_slot_id
       in the timeline does NOT count (live incidents #3750/#3811: workers
       self-appended IV lane events).
-    - Plain observer verification events (actor="observer" or similar) without an
-      independent reviewer identity (no on-behalf suffix, no payload.reviewer, no
-      qa_verdict_refs pointing at real qa_review events) do NOT count.
-    - Observer-on-behalf transport DOES count when the reviewer identity
-      (derived from the actor suffix or payload.reviewer) is independent of the
-      known workers.  This is the established daily pattern for observer-recorded
-      verdicts and must not be broken.
+    - Observer-authored/on-behalf verification events do NOT count, even when
+      they carry payload.reviewer or an observer-on-behalf reviewer suffix.
     - Direct qa_review / qa_verification / independent_verification events with a
       non-worker, non-plain-observer actor count normally.
     """
@@ -1345,6 +1353,19 @@ def _independent_qa_gate(
         reviewer_identity = _independent_qa_reviewer_identity(event)
         reviewer_lower = reviewer_identity.lower()
 
+        # REJECT: observer-authored transport may relay facts but cannot itself
+        # satisfy the independent QA gate.
+        if _is_independent_qa_observer_transport(event):
+            rejected_events.append({
+                "id": event.get("id"),
+                "event_kind": event.get("event_kind"),
+                "actor": event.get("actor"),
+                "status": event.get("status"),
+                "reason": "observer_transport_not_independent_qa",
+                "reviewer_identity": reviewer_identity,
+            })
+            continue
+
         # REJECT: reviewer is a known worker (self-appended IV — incidents #3750/#3811).
         if reviewer_identity and reviewer_identity in worker_slot_ids:
             rejected_events.append({
@@ -1358,12 +1379,8 @@ def _independent_qa_gate(
             continue
 
         # REJECT: plain observer token without an independent reviewer identity.
-        # This catches raw "observer" verification events that are NOT on-behalf
-        # transports (no on-behalf suffix, no payload.reviewer, no verdict refs).
         resolved_verdict_refs: list[str] = []
         if reviewer_lower in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS:
-            # Only same-timeline refs to real passing QA/IV events elevate a
-            # plain-observer transport to a legitimate verdict relay.
             unresolved_verdict_refs = _independent_qa_verdict_refs(event)
             resolved_verdict_refs = _independent_qa_resolved_verdict_refs(
                 event,
@@ -1422,10 +1439,8 @@ def _independent_qa_gate(
             if passed
             else (
                 "Record a passing qa_review/qa_verification/independent_verification event "
-                "from an independent reviewer (not the implementation worker). "
-                "Observer-on-behalf transport is accepted when actor contains "
-                "'observer-on-behalf-of:<reviewer-id>' or payload.reviewer is set "
-                "to an independent reviewer identity."
+                "directly authored by an independent reviewer (not the implementation "
+                "worker or observer-on-behalf transport)."
             )
         ),
         "evidence_events": evidence_events,
@@ -2876,6 +2891,181 @@ def _route_parent_child_dispatch_identity(
     }
 
 
+def _route_action_scope_route_token_gate(
+    gate: Mapping[str, Any],
+    identity: Mapping[str, str],
+    route_token_ref: str,
+) -> tuple[bool, dict[str, Any]]:
+    gate = _mapping(gate)
+    if not gate:
+        return False, {}
+    status = str(gate.get("status") or gate.get("decision") or "").strip().lower()
+    action = str(gate.get("action") or "").strip()
+    decision = _route_marker(gate.get("decision"))
+    gate_ref = str(gate.get("route_token_ref") or "").strip()
+    server_backed = bool(
+        _truthy(gate.get("resolved_from_ref"))
+        or _truthy(gate.get("server_issued_binding"))
+        or str(gate.get("binding_source") or "").strip()
+        == "observer_route_token_refs"
+    )
+    gate_passed = bool(
+        _truthy(gate.get("allowed"))
+        or _truthy(gate.get("accepted"))
+        or status in MF_ROUTE_CONTEXT_PASS_STATUSES
+    )
+    if not (
+        gate_passed
+        and server_backed
+        and action == "task_timeline_append"
+        and decision in {"route_token", "route_token_ref_resolved"}
+        and route_token_ref
+        and gate_ref == route_token_ref
+    ):
+        return False, {}
+    mismatches: list[dict[str, str]] = []
+    for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS):
+        expected = str(identity.get(field) or "").strip()
+        actual = str(gate.get(field) or "").strip()
+        if expected and actual and actual != expected:
+            mismatches.append({"field": field, "expected": expected, "actual": actual})
+    if mismatches:
+        return False, {}
+    return True, {
+        "schema_version": "route_action_scope_route_token_gate.v1",
+        "accepted": True,
+        "allowed_action": action,
+        "decision": decision,
+        "route_token_ref": gate_ref,
+        "resolved_from_ref": bool(_truthy(gate.get("resolved_from_ref"))),
+        "server_issued_binding": bool(_truthy(gate.get("server_issued_binding"))),
+        "binding_source": str(gate.get("binding_source") or "").strip(),
+    }
+
+
+def _lineage_route_identity(
+    lineage: Mapping[str, Any],
+    prefix: str,
+    nested_keys: tuple[str, ...],
+) -> dict[str, str]:
+    nested: Mapping[str, Any] = {}
+    for key in nested_keys:
+        candidate = _mapping(lineage.get(key))
+        if candidate:
+            nested = candidate
+            break
+    identity: dict[str, str] = {}
+    for field in (*MF_ROUTE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS):
+        token = str(
+            nested.get(field)
+            or lineage.get(f"{prefix}_{field}")
+            or ""
+        ).strip()
+        if token:
+            identity[field] = token
+    return identity
+
+
+def _lineage_identity_matches(
+    actual: Mapping[str, str],
+    expected: Mapping[str, str],
+) -> bool:
+    for field in MF_ROUTE_IDENTITY_FIELDS:
+        if str(actual.get(field) or "").strip() != str(expected.get(field) or "").strip():
+            return False
+    expected_prompt_hash = str(expected.get("prompt_contract_hash") or "").strip()
+    return not expected_prompt_hash or (
+        str(actual.get("prompt_contract_hash") or "").strip() == expected_prompt_hash
+    )
+
+
+def _route_action_scope_server_lineage(
+    value: Any,
+    identity: Mapping[str, str],
+    parent_hint: Mapping[str, str],
+    route_token_ref: str,
+) -> dict[str, Any]:
+    for lineage_key in (
+        "route_action_scope_lineage",
+        "action_scope_route_lineage",
+        "route_token_action_scope_lineage",
+        "server_route_lineage",
+    ):
+        lineage = _first_deep_mapping(value, lineage_key)
+        if not lineage:
+            continue
+        status = str(
+            lineage.get("status") or lineage.get("decision") or ""
+        ).strip().lower()
+        passed = bool(
+            _truthy(lineage.get("accepted"))
+            or _truthy(lineage.get("allowed"))
+            or status in MF_ROUTE_CONTEXT_PASS_STATUSES
+        )
+        provenance = _mapping(lineage.get("provenance"))
+        source = _route_marker(
+            lineage.get("acceptance_source")
+            or lineage.get("source")
+            or lineage.get("projected_by")
+            or provenance.get("source")
+        )
+        server_backed = bool(
+            _truthy(lineage.get("resolved_from_ref"))
+            or _truthy(lineage.get("server_issued_binding"))
+            or _truthy(lineage.get("registry_verified"))
+            or _truthy(lineage.get("server_projected"))
+            or _truthy(provenance.get("server_projected"))
+        )
+        source_ok = bool(
+            source
+            and (
+                source in {
+                    "route_token_ref_resolved",
+                    "observer_route_token_refs",
+                    "server_route_token_action_scope",
+                    "server_backed_route_token_action_scope",
+                    "protected_route_token_ref_action_scope",
+                    "route_token_gate",
+                }
+                or "server" in source
+                or "registry" in source
+            )
+        )
+        lineage_ref = str(lineage.get("route_token_ref") or "").strip()
+        parent_identity = _lineage_route_identity(
+            lineage,
+            "parent",
+            ("parent_route_identity", "parent_route_lineage", "parent_identity", "parent"),
+        )
+        child_identity = _lineage_route_identity(
+            lineage,
+            "child",
+            ("child_route_identity", "child_route_lineage", "child_identity", "child"),
+        )
+        if not (
+            passed
+            and server_backed
+            and source_ok
+            and route_token_ref
+            and lineage_ref == route_token_ref
+            and _lineage_identity_matches(parent_identity, parent_hint)
+            and _lineage_identity_matches(child_identity, identity)
+        ):
+            continue
+        return {
+            "schema_version": "route_action_scope_server_lineage.v1",
+            "accepted": True,
+            "acceptance_source": source,
+            "route_token_ref": lineage_ref,
+            "server_backed": True,
+            "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
+            "child_route_context_hash": identity.get("route_context_hash", ""),
+            "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
+            "child_prompt_contract_id": identity.get("prompt_contract_id", ""),
+        }
+    return {}
+
+
 def _route_action_scoped_verification_identity(
     value: Any,
     identity: dict[str, str],
@@ -2895,22 +3085,44 @@ def _route_action_scoped_verification_identity(
         return identity, {}
 
     route_token_ref = _first_deep_text(value, "route_token_ref")
-    route_identity = _first_deep_mapping(value, "route_identity")
-    allowed_action = str(
-        route_identity.get("allowed_action")
-        or route_identity.get("action")
-        or ""
-    ).strip()
+    route_token_gate = _first_deep_mapping(value, "route_token_gate")
+    gate_ok, gate_summary = _route_action_scope_route_token_gate(
+        route_token_gate,
+        identity,
+        route_token_ref,
+    )
+    route_lineage = _route_action_scope_server_lineage(
+        value,
+        identity,
+        parent_hint,
+        route_token_ref,
+    )
+    allowed_action = str(gate_summary.get("allowed_action") or "").strip()
     meta_gate = _first_deep_mapping(value, "meta_contract_gate")
     meta_role = str(meta_gate.get("role") or "").strip().lower()
     meta_action = str(meta_gate.get("action") or "").strip().lower()
+    meta_status = str(meta_gate.get("status") or meta_gate.get("decision") or "").strip().lower()
+    meta_valid = (
+        meta_role in {"qa", "observer"}
+        and meta_action in {"qa_verification", "independent_verification", "qa_review"}
+        and (bool(meta_gate.get("allowed")) or meta_status in MF_ROUTE_CONTEXT_PASS_STATUSES)
+    )
     reviewer_role = _first_deep_text(value, "reviewer_role").lower()
+    reviewer_identity = _independent_qa_reviewer_identity(_mapping(value))
+    reviewer_normalized = reviewer_identity.strip().lower()
     protected_qa_append = bool(
         route_token_ref
+        and gate_ok
+        and route_lineage
         and allowed_action == "task_timeline_append"
-        and meta_role == "qa"
-        and meta_action in {"qa_verification", "independent_verification", "qa_review"}
-        and reviewer_role in {"qa", "independent_qa", "independent_verification"}
+        and (
+            meta_valid
+            or reviewer_role in {"qa", "independent_qa", "independent_verification"}
+            or (
+                reviewer_normalized
+                and reviewer_normalized not in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+            )
+        )
     )
     if not protected_qa_append:
         return identity, {}
@@ -2918,9 +3130,14 @@ def _route_action_scoped_verification_identity(
     return dict(parent_hint), {
         "schema_version": "independent_verification_action_scope_lineage.v1",
         "accepted": True,
-        "acceptance_source": "protected_route_token_ref_action_scope",
+        "acceptance_source": route_lineage.get(
+            "acceptance_source",
+            "server_backed_route_token_action_scope",
+        ),
         "route_token_ref": route_token_ref,
         "allowed_action": allowed_action,
+        "route_token_gate": gate_summary,
+        "server_lineage": route_lineage,
         "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
         "child_route_context_hash": identity.get("route_context_hash", ""),
         "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
@@ -4000,6 +4217,23 @@ def mf_route_context_gate_verification(
             "phase": event.get("phase"),
             "status": event.get("status") or event.get("decision"),
         }
+        if (
+            MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in categories
+            and parent_route_identity_hint
+            and not _route_identity_matches_filter(
+                normalized_identity,
+                parent_route_identity_hint,
+            )
+        ):
+            ignored.append({
+                **event_ref,
+                "reason": "independent_verification_route_lineage_untrusted",
+                "categories": [MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID],
+            })
+            categories = set(categories)
+            categories.discard(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+            if not categories:
+                continue
         attempt_lineage = _route_attempt_lineage(event)
         if attempt_lineage and categories.intersection(MF_ROUTE_WORKER_REQUIREMENTS):
             attempt_lineage_candidates.append({
@@ -4066,6 +4300,11 @@ def mf_route_context_gate_verification(
         "topology_policy": topology_policy,
         "route_identity": route_identity,
         "same_route_identity": same_route_identity,
+        "next_legal_action": (
+            "retry_close_with_accepted_route_context_evidence"
+            if passed
+            else "record_missing_route_context_evidence_for_canonical_route_identity"
+        ),
         "route_identity_cleanup": {
             "applied": bool(cleanup_identity),
             "event": cleanup_event,
@@ -4365,6 +4604,142 @@ def _requirement_ids_from_container(container: dict[str, Any]) -> set[str]:
     return ids
 
 
+def _effective_contract_status(value: Mapping[str, Any], inherited_status: str) -> str:
+    status = str(value.get("status") or value.get("decision") or "").strip().lower()
+    if status:
+        return status
+    if _truthy(value.get("passed")):
+        return "passed"
+    return inherited_status
+
+
+def _collect_contract_evidence_ids(
+    value: Any,
+    ids: set[str],
+    *,
+    status: str,
+    event_passed: bool,
+    depth: int = 0,
+) -> None:
+    if depth > 6:
+        return
+    if isinstance(value, dict):
+        effective_status = _effective_contract_status(value, status)
+        for item in _list(value.get("contract_evidence")):
+            if isinstance(item, str):
+                evidence_id = item.strip()
+                if evidence_id and event_passed:
+                    ids.add(evidence_id)
+                continue
+            evidence = _mapping(item)
+            evidence_status = _effective_contract_status(evidence, "")
+            if evidence_status not in MF_CLOSE_PASS_STATUSES:
+                continue
+            evidence_id = str(
+                evidence.get("requirement_id")
+                or evidence.get("id")
+                or evidence.get("evidence_id")
+                or ""
+            ).strip()
+            if evidence_id:
+                ids.add(evidence_id)
+        for child in value.values():
+            _collect_contract_evidence_ids(
+                child,
+                ids,
+                status=effective_status,
+                event_passed=event_passed,
+                depth=depth + 1,
+            )
+    elif isinstance(value, list):
+        for child in value:
+            _collect_contract_evidence_ids(
+                child,
+                ids,
+                status=status,
+                event_passed=event_passed,
+                depth=depth + 1,
+            )
+
+
+def _explicit_observer_visual_smoke_event(
+    event: dict[str, Any],
+    markers: set[str],
+) -> bool:
+    if not markers.intersection({"visual_smoke", "observer_visual_smoke"}):
+        return False
+    actor = str(event.get("actor") or "").strip().lower()
+    meta_gate = _first_deep_mapping(event, "meta_contract_gate")
+    meta_role = str(meta_gate.get("role") or "").strip().lower()
+    meta_action = str(meta_gate.get("action") or "").strip().lower()
+    meta_status = str(
+        meta_gate.get("status") or meta_gate.get("decision") or ""
+    ).strip().lower()
+    meta_valid = bool(
+        meta_role == "observer"
+        and meta_action == "observer_visual_smoke"
+        and (
+            _truthy(meta_gate.get("allowed"))
+            or meta_status in MF_ROUTE_CONTEXT_PASS_STATUSES
+        )
+    )
+    return bool(meta_valid and actor in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS)
+
+
+def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str]:
+    """Return stable evidence ids implied by accepted canonical timeline events."""
+
+    event = _mapping(event)
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    if not (bool(event.get("passed")) or status in MF_CLOSE_PASS_STATUSES):
+        return set()
+
+    ids: set[str] = set()
+    kind = _route_marker(event.get("event_kind") or event.get("kind"))
+    phase = _route_marker(event.get("phase"))
+    event_type = _route_marker(event.get("event_type"))
+    markers = {marker for marker in (kind, phase, event_type) if marker}
+    categories = _route_event_categories(event)
+
+    if "route_context" in categories:
+        ids.update({"route_context", "route_prompt_bundle"})
+    if "route_action_precheck" in categories:
+        ids.update({"route_action_precheck", "route_action_gate"})
+    if "bounded_implementation_worker_dispatch" in categories:
+        ids.update({
+            "bounded_implementation_worker_dispatch",
+            MF_BOUNDED_SUBAGENT_DISPATCH_ID,
+        })
+    if "mf_subagent_startup" in categories:
+        ids.add("mf_subagent_startup")
+    if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in categories:
+        ids.add(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+    if MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID in categories:
+        ids.add(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
+    if "service_route" in markers:
+        ids.add("service_route")
+    if "implementation" in markers:
+        ids.add("implementation")
+    if "verification" in markers or markers.intersection(
+        {"qa_verification", "independent_verification", "qa_review"}
+    ):
+        ids.add("verification")
+    if "close_ready" in markers:
+        ids.add("close_ready")
+    if "merge" in markers:
+        ids.add("merge")
+    if _explicit_observer_visual_smoke_event(event, markers):
+        ids.add("observer_visual_smoke")
+
+    gate = _mf_subagent_finish_gate_projection(event)
+    if gate:
+        ids.update(_string_list(_mapping(gate.get("lane_ownership_projection")).get("evidence_ids")))
+        ids.add(MF_BOUNDED_SUBAGENT_REVIEW_READY_ID)
+        ids.update(_mf_subagent_finish_gate_projected_event_kinds(event))
+
+    return ids
+
+
 def _contract_evidence_ids(event: dict[str, Any]) -> set[str]:
     status = str(event.get("status") or "").strip().lower()
     event_passed = status in MF_CLOSE_PASS_STATUSES
@@ -4377,16 +4752,15 @@ def _contract_evidence_ids(event: dict[str, Any]) -> set[str]:
         ids.update(_requirement_ids_from_container(payload))
         ids.update(_requirement_ids_from_container(verification))
         ids.update(_requirement_ids_from_container(artifact_refs))
+        ids.update(canonical_contract_evidence_ids_from_event(event))
 
     for container in (payload, verification, artifact_refs):
-        for item in _list(container.get("contract_evidence")):
-            evidence = _mapping(item)
-            evidence_status = str(evidence.get("status") or status).strip().lower()
-            if evidence_status not in MF_CLOSE_PASS_STATUSES:
-                continue
-            evidence_id = str(evidence.get("requirement_id") or evidence.get("id") or "").strip()
-            if evidence_id:
-                ids.add(evidence_id)
+        _collect_contract_evidence_ids(
+            container,
+            ids,
+            status=status,
+            event_passed=event_passed,
+        )
     return ids
 
 
@@ -4442,6 +4816,11 @@ def mf_contract_gate_verification(
         ],
         "present_requirement_ids": sorted(req_id for req_id in present if req_id in all_requirement_ids),
         "missing_requirement_ids": missing,
+        "next_legal_action": (
+            "retry_close_with_current_contract_evidence"
+            if not missing
+            else "record_passing_timeline_evidence_for_missing_contract_requirement_ids"
+        ),
         "evidence_events": evidence_events,
         "checks": {
             "has_contract": bool(root),
@@ -5043,6 +5422,12 @@ def mf_lane_ownership_gate_verification(
         "required_lane_ownership_ids": requirements["required_lane_ownership_ids"],
         "present_lane_ownership_ids": present,
         "missing_lane_ownership_ids": missing,
+        "missing_requirement_ids": missing,
+        "next_legal_action": (
+            "retry_close_with_current_lane_ownership_evidence"
+            if passed
+            else "record_bounded_subagent_dispatch_and_review_ready_evidence"
+        ),
         "requirement_signals": requirements["requirement_signals"],
         "route_identity": route_identity,
         "evidence_events": [*dispatch_events, *review_ready_events],

@@ -23767,6 +23767,8 @@ def _route_gate_public_summary(gate: Mapping[str, Any] | None) -> dict[str, Any]
         "timeline_evidence",
         "source_event_refs",
         "server_issued_binding",
+        "resolved_from_ref",
+        "registry_verified",
         "route_token_ref",
         "binding_source",
         "scope",
@@ -23845,7 +23847,150 @@ def _timeline_payload_with_route_gate(
             continue
         if not payload.get(key) and body.get(key):
             payload[key] = body.get(key)
+    if route_gate:
+        payload["route_token_gate"] = _route_gate_public_summary(route_gate)
     return payload
+
+
+_ROUTE_ACTION_SCOPE_LINEAGE_KEYS = (
+    "route_action_scope_lineage",
+    "action_scope_route_lineage",
+    "route_token_action_scope_lineage",
+    "server_route_lineage",
+)
+
+
+def _strip_route_action_scope_lineage_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_route_action_scope_lineage_value(child)
+            for key, child in value.items()
+            if key not in _ROUTE_ACTION_SCOPE_LINEAGE_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_route_action_scope_lineage_value(item) for item in value]
+    return value
+
+
+def _strip_caller_route_action_scope_lineage(payload: Mapping[str, Any]) -> dict[str, Any]:
+    stripped = _strip_route_action_scope_lineage_value(dict(payload))
+    return dict(stripped) if isinstance(stripped, Mapping) else {}
+
+
+def _timeline_event_has_action_scope_verification_marker(
+    body: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> bool:
+    tokens: set[str] = set()
+    for value in (
+        event.get("event_type"),
+        event.get("event_kind"),
+        event.get("phase"),
+        body.get("event_type"),
+        body.get("event_kind"),
+        body.get("phase"),
+    ):
+        text = str(value or "").strip().lower().replace("-", "_")
+        if not text:
+            continue
+        tokens.add(text)
+        tokens.update(
+            part
+            for part in re.split(r"[._:/\s]+", text)
+            if part
+        )
+    payload = body.get("payload")
+    if isinstance(payload, Mapping):
+        for key in payload.keys():
+            tokens.add(str(key).strip().lower().replace("-", "_"))
+    return bool(
+        tokens.intersection(
+            {
+                "independent_verification",
+                "independent_verification_lane",
+                "independent_qa",
+                "qa",
+                "qa_lane",
+                "qa_review",
+                "qa_verification",
+            }
+        )
+    )
+
+
+def _route_gate_lineage_mapping(
+    route_gate: Mapping[str, Any],
+    public_key: str,
+) -> dict[str, Any]:
+    value = route_gate.get(public_key)
+    if isinstance(value, Mapping):
+        return dict(value)
+    route_lineage = route_gate.get("route_lineage")
+    if isinstance(route_lineage, Mapping):
+        nested = route_lineage.get(public_key)
+        if isinstance(nested, Mapping):
+            return dict(nested)
+    return {}
+
+
+def _server_route_action_scope_lineage(
+    body: Mapping[str, Any],
+    event: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(route_gate, Mapping) or not route_gate:
+        return {}
+    if not _timeline_event_has_action_scope_verification_marker(body, event):
+        return {}
+    status = str(
+        route_gate.get("status") or route_gate.get("decision") or ""
+    ).strip().lower()
+    gate_passed = bool(
+        route_gate.get("allowed")
+        or route_gate.get("accepted")
+        or status in {"accepted", "ok", "passed", "succeeded", "success", "allowed"}
+    )
+    server_backed = bool(
+        route_gate.get("resolved_from_ref")
+        or route_gate.get("server_issued_binding")
+        or route_gate.get("registry_verified")
+        or str(route_gate.get("binding_source") or "").strip()
+        == "observer_route_token_refs"
+    )
+    route_token_ref = str(
+        route_gate.get("route_token_ref") or body.get("route_token_ref") or ""
+    ).strip()
+    parent_lineage = _route_gate_lineage_mapping(route_gate, "parent_route_lineage")
+    child_lineage = _route_gate_lineage_mapping(route_gate, "child_route_lineage")
+    if not (
+        gate_passed
+        and server_backed
+        and route_token_ref
+        and parent_lineage
+        and child_lineage
+    ):
+        return {}
+
+    return {
+        "schema_version": "route_action_scope_lineage.v1",
+        "accepted": True,
+        "status": "accepted",
+        "source": "server_route_token_action_scope",
+        "acceptance_source": "server_route_token_action_scope",
+        "projected_by": "handle_task_timeline_append",
+        "server_projected": True,
+        "server_issued_binding": bool(route_gate.get("server_issued_binding")),
+        "registry_verified": True,
+        "resolved_from_ref": bool(route_gate.get("resolved_from_ref")),
+        "binding_source": str(route_gate.get("binding_source") or "")
+        or "observer_route_token_refs",
+        "route_token_ref": route_token_ref,
+        "parent_route_identity": _route_identity_public_summary(parent_lineage),
+        "child_route_identity": _route_identity_public_summary(child_lineage),
+        "parent_route_lineage": parent_lineage,
+        "child_route_lineage": child_lineage,
+        "route_token_gate": _route_gate_public_summary(route_gate),
+    }
 
 
 def _resolve_route_token_ref_server_side(
@@ -24080,10 +24225,15 @@ def _require_route_token_mutation_gate(
         result = dict(result)
         result["route_token_ref"] = str(server_binding.get("route_token_ref") or "")
         result["server_issued_binding"] = True
+        result["registry_verified"] = True
         result["binding_source"] = (
             str(server_binding.get("binding_source") or "")
             or "observer_route_token_refs"
         )
+        for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
+            value = server_binding.get(key)
+            if isinstance(value, Mapping):
+                result[key] = dict(value)
 
     return result
 
@@ -26989,6 +27139,14 @@ def handle_task_timeline_append(ctx: RequestContext):
         raw_event_kind = ctx.body.get("event_kind", "")
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
+        raw_payload = _strip_caller_route_action_scope_lineage(raw_payload)
+        route_action_scope_lineage = _server_route_action_scope_lineage(
+            ctx.body or {},
+            event,
+            route_gate,
+        )
+        if route_action_scope_lineage:
+            raw_payload["route_action_scope_lineage"] = route_action_scope_lineage
         try:
             norm_event_kind, norm_status, norm_payload = (
                 task_timeline.validate_and_normalize_mf_read_receipt_append(

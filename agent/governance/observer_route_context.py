@@ -981,6 +981,74 @@ _REF_REGISTRY_LOCK = threading.RLock()
 REF_STATUS_ACTIVE = "active"
 REF_STATUS_SUPERSEDED = "superseded"
 REF_STATUS_EXPIRED = "expired"
+_REF_LINEAGE_COLUMNS = {
+    "parent_route_lineage": "parent_route_lineage_json",
+    "child_route_lineage": "child_route_lineage_json",
+    "route_lineage": "route_lineage_json",
+}
+
+
+def _public_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _json_dumps_public_mapping(value: Any) -> str:
+    payload = _public_mapping(value)
+    if not payload:
+        return "{}"
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _json_loads_public_mapping(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _ref_lineage_payloads(
+    token: Mapping[str, Any],
+    *,
+    route_token_ref: str,
+) -> dict[str, dict[str, Any]]:
+    parent = _public_mapping(token.get("parent_route_lineage"))
+    child = _public_mapping(token.get("child_route_lineage"))
+    if parent and not child:
+        child = _child_route_lineage(token, route_token_ref=route_token_ref)
+    route_lineage = _public_mapping(token.get("route_lineage"))
+    if parent and child and not route_lineage:
+        route_lineage = {
+            "schema_version": ROUTE_LINEAGE_SCHEMA_VERSION,
+            "status": "parent_bound",
+            "parent_route_id": _string(parent.get("route_id")),
+            "parent_route_context_hash": _string(parent.get("route_context_hash")),
+            "parent_prompt_contract_id": _string(parent.get("prompt_contract_id")),
+            "child_route_id": _string(child.get("route_id")),
+            "child_route_context_hash": _string(child.get("route_context_hash")),
+            "child_prompt_contract_id": _string(child.get("prompt_contract_id")),
+            "parent_route_lineage": dict(parent),
+            "child_route_lineage": dict(child),
+            "raw_route_token_persisted": False,
+            "raw_session_token_persisted": False,
+        }
+    return {
+        "parent_route_lineage": parent,
+        "child_route_lineage": child,
+        "route_lineage": route_lineage,
+    }
+
+
+def _with_registry_lineages(
+    payload: dict[str, Any],
+    row_dict: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = dict(payload)
+    for public_key, column in _REF_LINEAGE_COLUMNS.items():
+        lineage = _json_loads_public_mapping(row_dict.get(column))
+        if lineage:
+            result[public_key] = lineage
+    return result
 
 
 def _token_digest(token: Mapping[str, Any], salt: str) -> str:
@@ -1018,6 +1086,9 @@ def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
             expires_at          TEXT NOT NULL DEFAULT '',
             evidence_refs_json  TEXT NOT NULL DEFAULT '[]',
             scope_json          TEXT NOT NULL DEFAULT '{}',
+            parent_route_lineage_json TEXT NOT NULL DEFAULT '{}',
+            child_route_lineage_json TEXT NOT NULL DEFAULT '{}',
+            route_lineage_json TEXT NOT NULL DEFAULT '{}',
             status              TEXT NOT NULL DEFAULT 'active',
             issued_at           TEXT NOT NULL DEFAULT '',
             created_at          TEXT NOT NULL,
@@ -1031,6 +1102,16 @@ def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
             ON observer_route_token_refs (project_id, status, route_token_ref)
         """
     )
+    existing_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(observer_route_token_refs)").fetchall()
+    }
+    for column in _REF_LINEAGE_COLUMNS.values():
+        if column not in existing_columns:
+            conn.execute(
+                f"ALTER TABLE observer_route_token_refs "
+                f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'"
+            )
 
 
 def persist_route_token_ref(
@@ -1062,13 +1143,14 @@ def persist_route_token_ref(
     scope = dict(token.get("scope") or {})
     allowed_actions = list(token.get("allowed_actions") or [])
     evidence_refs = list(token.get("evidence_refs") or [])
+    lineage_payloads = _ref_lineage_payloads(token, route_token_ref=route_token_ref)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     _ensure_ref_registry_schema(conn)
     with _REF_REGISTRY_LOCK:
         # Check for existing entry
         row = conn.execute(
-            "SELECT token_digest, salt, status FROM observer_route_token_refs "
+            "SELECT * FROM observer_route_token_refs "
             "WHERE project_id=? AND route_token_ref=?",
             (project_id, route_token_ref),
         ).fetchone()
@@ -1079,7 +1161,35 @@ def persist_route_token_ref(
                     "route_token_ref collision: a different token body is already "
                     f"registered under ref {route_token_ref!r}"
                 )
-            # Idempotent re-issue: same token, already registered — nothing to do.
+            missing_lineage_columns = [
+                column
+                for public_key, column in _REF_LINEAGE_COLUMNS.items()
+                if lineage_payloads[public_key]
+                and not _json_loads_public_mapping(dict(row).get(column))
+            ]
+            if missing_lineage_columns:
+                conn.execute(
+                    """
+                    UPDATE observer_route_token_refs
+                    SET parent_route_lineage_json=?,
+                        child_route_lineage_json=?,
+                        route_lineage_json=?
+                    WHERE project_id=? AND route_token_ref=?
+                    """,
+                    (
+                        _json_dumps_public_mapping(
+                            lineage_payloads["parent_route_lineage"]
+                        ),
+                        _json_dumps_public_mapping(
+                            lineage_payloads["child_route_lineage"]
+                        ),
+                        _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
+                        project_id,
+                        route_token_ref,
+                    ),
+                )
+                conn.commit()
+            # Idempotent re-issue: same token, already registered.
             return
 
         conn.execute(
@@ -1090,8 +1200,9 @@ def persist_route_token_ref(
                  prompt_contract_hash, visible_injection_manifest_hash,
                  backlog_id, task_id, caller_role,
                  allowed_actions_json, expires_at, evidence_refs_json,
-                 scope_json, status, issued_at, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 scope_json, parent_route_lineage_json, child_route_lineage_json,
+                 route_lineage_json, status, issued_at, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 project_id,
@@ -1110,6 +1221,9 @@ def persist_route_token_ref(
                 _string(token.get("expires_at")),
                 json.dumps(evidence_refs),
                 json.dumps(scope),
+                _json_dumps_public_mapping(lineage_payloads["parent_route_lineage"]),
+                _json_dumps_public_mapping(lineage_payloads["child_route_lineage"]),
+                _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
                 REF_STATUS_ACTIVE,
                 _string(token.get("issued_at")) or now_str,
                 now_str,
@@ -1241,7 +1355,7 @@ def resolve_route_token_ref(
     except (json.JSONDecodeError, TypeError):
         scope = {}
 
-    return {
+    return _with_registry_lineages({
         "schema_version": REF_REGISTRY_SCHEMA_VERSION,
         "route_token_ref": route_token_ref,
         "route_id": _string(row_dict.get("route_id")),
@@ -1258,7 +1372,7 @@ def resolve_route_token_ref(
         "scope": scope,
         "status": status,
         "resolved_from_ref": True,
-    }
+    }, row_dict)
 
 
 def verify_route_token_binding(
@@ -1453,7 +1567,7 @@ def verify_route_token_binding(
             evidence_refs = json.loads(row_dict.get("evidence_refs_json") or "[]")
         except (json.JSONDecodeError, TypeError):
             evidence_refs = []
-        return {
+        result = {
             "schema_version": REF_REGISTRY_SCHEMA_VERSION,
             "server_issued_binding": True,
             "binding_source": "observer_route_token_refs",
@@ -1472,6 +1586,13 @@ def verify_route_token_binding(
             "scope": stored_scope,
             "status": REF_STATUS_ACTIVE,
         }
+        for public_key, column in _REF_LINEAGE_COLUMNS.items():
+            lineage = _json_loads_public_mapping(row_dict.get(column))
+            if not lineage and isinstance(token.get(public_key), Mapping):
+                lineage = dict(token.get(public_key) or {})
+            if lineage:
+                result[public_key] = lineage
+        return result
 
     if saw_allowed_superset:
         raise RouteTokenRefError(

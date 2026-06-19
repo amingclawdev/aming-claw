@@ -1397,6 +1397,339 @@ def test_close_gate_recognizes_service_route_contract_evidence_from_timeline(
     assert allowed["evidence"]["missing_required_evidence"] == []
 
 
+def test_close_gate_precheck_accepts_dogfood_canonical_timeline_shape(
+    tmp_path: Path,
+) -> None:
+    parent_task_id = "DPL-FOCUS-REMINDERS-20260619"
+    child_task_id = f"{parent_task_id}-worker-a"
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": parent_task_id,
+        "stage_graph": [
+            {"stage": "close_gate", "gate_kind": "backlog.close"},
+        ],
+        "evidence_requirements": [
+            {"id": "route_context", "required": True},
+            {"id": "route_action_precheck", "required": True},
+            {"id": "bounded_implementation_worker_dispatch", "required": True},
+            {"id": "mf_subagent_startup", "required": True},
+            {"id": "independent_verification_lane", "required": True},
+            {"id": "observer_visual_smoke", "required": True},
+        ],
+        "route_topology_policy": {
+            "selected_topology": "observer_led_parallel_lanes",
+            "recommended_topology": "mf_parallel.v1",
+            "required_lanes": [
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+            ],
+            "independent_verification_required": True,
+        },
+        "governance_policy": {
+            "profile": "third-party-public",
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": False,
+            },
+        },
+    }
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(contract, merge_commit=source_commit, precheck_token=token)
+    subject.update(
+        {
+            "backlog_id": parent_task_id,
+            "task_id": parent_task_id,
+            "contract_evidence": [],
+            "timeline_evidence": [
+                {
+                    "id": 2,
+                    "event_kind": "route_action_precheck",
+                    "status": "passed",
+                    "payload": {
+                        **ROUTE_IDENTITY,
+                        "allowed_action": "dispatch_bounded_worker",
+                    },
+                },
+                {
+                    "id": 3,
+                    "event_kind": "service_route",
+                    "phase": "dispatch",
+                    "status": "passed",
+                    "payload": {
+                        "route_context": {
+                            **ROUTE_IDENTITY,
+                            "visible_injection_manifest_hash": "sha256:visible",
+                        },
+                        "dispatch_evidence": {
+                            **ROUTE_IDENTITY,
+                            "worker_role": "mf_sub",
+                            "task_id": child_task_id,
+                            "parent_task_id": parent_task_id,
+                        },
+                    },
+                },
+                {
+                    "id": 4,
+                    "event_kind": "observer_work_mode_transition",
+                    "status": "accepted",
+                    "payload": {
+                        "route_identity": ROUTE_IDENTITY,
+                        "route_action_precheck_event_id": "2",
+                    },
+                },
+                {
+                    "id": 5,
+                    "event_kind": "mf_subagent_read_receipt",
+                    "status": "passed",
+                    "payload": {
+                        **ROUTE_IDENTITY,
+                        "runtime_context_id": "mfrctx-dogfood",
+                        "task_id": child_task_id,
+                        "parent_task_id": parent_task_id,
+                        "worker_slot_id": "worker-a",
+                        "fence_token": FENCE_TOKEN,
+                        "read_receipt_hash": "sha256:dogfood-read",
+                    },
+                },
+                {
+                    "id": 6,
+                    "event_kind": "mf_subagent_startup",
+                    "status": "blocked",
+                    "payload": {"reason": "first startup refused before retry"},
+                },
+                {
+                    "id": 7,
+                    "event_kind": "mf_subagent_startup",
+                    "status": "passed",
+                    "payload": {
+                        "mf_subagent_startup_gate": {
+                            **ROUTE_IDENTITY,
+                            "schema_version": "mf_subagent_startup_gate.v1",
+                            "status": "passed",
+                            "ok": True,
+                            "allowed": True,
+                            "close_satisfying": True,
+                            "worker_role": "mf_sub",
+                            "task_id": child_task_id,
+                            "parent_task_id": parent_task_id,
+                            "runtime_context_id": "mfrctx-dogfood",
+                            "worker_slot_id": "worker-a",
+                            "fence_token": FENCE_TOKEN,
+                            "actual_cwd": "/tmp/dogfood-worker",
+                            "actual_git_root": "/tmp/dogfood-worker",
+                            "branch": "refs/heads/codex/dogfood",
+                            "head_commit": source_commit,
+                            "worker_self_attestation": {
+                                "status": "passed",
+                                "worker_self_attesting": True,
+                                "worker_session_id": "worker-session-a",
+                                "worker_transcript_path": "/tmp/worker-session-a.jsonl",
+                                "harness_type": "codex",
+                            },
+                            "worker_session_id": "worker-session-a",
+                            "filer_principal": "worker-session-a",
+                            "worker_transcript_path": "/tmp/worker-session-a.jsonl",
+                            "harness_type": "codex",
+                            "read_receipt_event_id": "5",
+                            "observer_command_id": "cmd-dogfood",
+                        }
+                    },
+                },
+                {
+                    "id": 9,
+                    "event_kind": "implementation",
+                    "status": "passed",
+                    "actor": "mf_sub",
+                    "payload": {
+                        **ROUTE_IDENTITY,
+                        "worker_role": "mf_sub",
+                        "changed_files": ["src/app.js"],
+                        "graph_trace_ids": ["gqt-dogfood-worker"],
+                    },
+                },
+                {
+                    "id": 10,
+                    "event_kind": "mf_subagent_finish_gate",
+                    "status": "passed",
+                    "actor": "worker-session-a",
+                    "payload": {
+                        "mf_subagent_finish_gate": {
+                            **ROUTE_IDENTITY,
+                            "close_ready": True,
+                            "review_ready": True,
+                            "worker_role": "mf_sub",
+                            "task_id": child_task_id,
+                            "parent_task_id": parent_task_id,
+                            "runtime_context_id": "mfrctx-dogfood",
+                            "worker_slot_id": "worker-a",
+                            "fence_token": FENCE_TOKEN,
+                            "observer_command_id": "cmd-dogfood",
+                            "changed_files": ["src/app.js"],
+                            "implementation_commit": source_commit,
+                            "commit": source_commit,
+                            "head_commit": source_commit,
+                            "test_results": {"status": "passed"},
+                            "receipt_gate": {
+                                "status": "passed",
+                                "read_receipt_present": True,
+                                "read_receipt_event_id_present": True,
+                                "startup_present": True,
+                                "observer_command_id_present": True,
+                            },
+                            "startup_worker_identity_gate": {"passed": True},
+                            "worker_self_attestation_gate": {"passed": True},
+                            "startup_evidence": {
+                                "runtime_context_id": "mfrctx-dogfood",
+                                "task_id": child_task_id,
+                                "parent_task_id": parent_task_id,
+                                "worker_slot_id": "worker-a",
+                                "fence_token": FENCE_TOKEN,
+                                "actual_cwd": "/tmp/dogfood-worker",
+                                "actual_git_root": "/tmp/dogfood-worker",
+                                "branch": "refs/heads/codex/dogfood",
+                                "head_commit": source_commit,
+                                "worker_session_id": "worker-session-a",
+                                "filer_principal": "worker-session-a",
+                                "worker_transcript_path": "/tmp/worker-session-a.jsonl",
+                                "harness_type": "codex",
+                                "worker_self_attestation": {
+                                    "status": "passed",
+                                    "worker_self_attesting": True,
+                                },
+                            },
+                            "finish_time_worker_self_attestation": {
+                                "schema_version": "worker_transcript_self_attestation.v1",
+                                "attestation_phase": "finish",
+                                "status": "passed",
+                                "ok": True,
+                                "worker_self_attesting": True,
+                                "self_attesting": True,
+                                "finish_time_self_attesting": True,
+                                "finish_time_blockers": [],
+                                "worker_session_id": "worker-session-a",
+                                "filer_principal": "worker-session-a",
+                                "worker_transcript_path": "/tmp/worker-session-a.jsonl",
+                                "harness_type": "codex",
+                                "blockers": [],
+                            },
+                            "lane_ownership_projection": {
+                                "evidence_ids": [
+                                    "bounded_implementation_subagent.review_ready"
+                                ]
+                            },
+                        }
+                    },
+                },
+                {
+                    "id": 12,
+                    "event_kind": "independent_verification",
+                    "phase": "verification",
+                    "status": "passed",
+                    "actor": "qa-reviewer",
+                    "payload": {**ROUTE_IDENTITY, "reviewer": "qa-reviewer"},
+                },
+                {
+                    "id": 13,
+                    "event_type": "observer.visual_smoke",
+                    "event_kind": "observer_visual_smoke",
+                    "phase": "visual_smoke",
+                    "status": "passed",
+                    "actor": "observer",
+                    "payload": {
+                        **ROUTE_IDENTITY,
+                        "observer_visual_smoke": {"status": "passed"},
+                        "meta_contract_gate": {
+                            "role": "observer",
+                            "action": "observer_visual_smoke",
+                            "status": "passed",
+                            "allowed": True,
+                        },
+                    },
+                },
+                {
+                    "id": 14,
+                    "event_kind": "merge",
+                    "phase": "merge",
+                    "status": "passed",
+                    "actor": "observer",
+                    "payload": {
+                        **ROUTE_IDENTITY,
+                        "merge_commit": source_commit,
+                    },
+                },
+            ],
+        }
+    )
+
+    allowed = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    assert allowed["decision"] == "allow"
+    evidence = allowed["evidence"]
+    assert evidence["missing_required_evidence"] == []
+    assert evidence["close_timeline_accounting"]["missing_event_kinds"] == []
+    assert evidence["route_context_gate"]["missing_requirement_ids"] == []
+    assert evidence["route_context_gate"]["checks"][
+        "independent_verification_lane_present"
+    ] is True
+
+
+def test_close_gate_precheck_rejects_failed_timeline_nested_bare_string_contract_evidence(
+    tmp_path: Path,
+) -> None:
+    contract = {
+        "template_id": "mf_workflow_runtime.v1",
+        "contract_instance_id": "failed-string-contract-evidence",
+        "stage_graph": [
+            {"stage": "close_gate", "gate_kind": "backlog.close"},
+        ],
+        "evidence_requirements": [
+            {"id": "route_context", "required": True},
+        ],
+        "governance_policy": {"requirements": {"close_timeline": True}},
+    }
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject["contract_evidence"] = []
+    subject["timeline_evidence"].append(
+        {
+            "event_kind": "worker_note",
+            "status": "failed",
+            "payload": {
+                "child_gate": {
+                    "status": "passed",
+                    "contract_evidence": ["route_context"],
+                }
+            },
+        }
+    )
+
+    blocked = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    assert blocked["decision"] == "block"
+    assert "route_context" in blocked["evidence"]["missing_required_evidence"]
+
+
 def test_p1_governance_route_work_requires_independent_verification_before_merge_and_close(
     tmp_path: Path,
 ) -> None:

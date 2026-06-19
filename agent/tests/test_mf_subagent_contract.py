@@ -860,6 +860,29 @@ def test_meta_contract_allows_legal_observer_actions(event_kind: str) -> None:
     assert gate["observer_event_validated"] is True
 
 
+def test_meta_contract_allows_observer_visual_smoke_without_qa_impersonation() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "observer.visual_smoke",
+            "event_kind": "visual_smoke",
+            "actor": "observer",
+            "status": "passed",
+            "payload": {
+                "observer_visual_smoke": {
+                    "status": "passed",
+                    "url": "http://127.0.0.1:4173",
+                }
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == OBSERVER_COORDINATOR_ROLE
+    assert gate["action"] == "observer_visual_smoke"
+    assert gate["observer_event_validated"] is True
+    assert gate["observer_worker_transport"] is False
+
+
 def test_meta_contract_validates_worker_and_qa_roles() -> None:
     worker_gate = validate_meta_contract_timeline_event(
         {
@@ -948,6 +971,31 @@ def test_meta_contract_allows_worker_progress_and_patch_for_worker_only(
         }
     )
     assert transport_gate["observer_worker_transport"] is True
+
+
+def test_meta_contract_allows_canonical_finish_time_attestation_event_kind() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_subagent.finish_time_worker_attestation",
+            "event_kind": "finish_time_worker_attestation",
+            "phase": "finish_time_worker_attestation",
+            "actor": "mf_sub",
+            "status": "passed",
+            "payload": {
+                "action": "record_finish_time_worker_attestation",
+                "worker_role": "mf_sub",
+                "finish_time_worker_self_attestation": {
+                    "schema_version": "worker_transcript_self_attestation.v1",
+                    "attestation_phase": "finish",
+                    "status": "passed",
+                },
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == MF_SUB_ROLE
+    assert gate["action"] == "record_finish_time_worker_attestation"
 
 
 def test_meta_contract_validates_explicit_judge_and_system_roles() -> None:
@@ -3223,6 +3271,674 @@ def test_finish_gate_review_ready_projection_satisfies_lane_ownership_shape() ->
         "sha256:visible-finish-lane-ready"
     )
     assert projection["worker_role"] == "mf_sub"
+
+
+def test_dogfood_close_gate_accepts_canonical_worker_happy_path_evidence() -> None:
+    from agent.governance import task_timeline
+
+    backlog_id = "DPL-FOCUS-REMINDERS-20260619"
+    task_id = "DPL-FOCUS-REMINDERS-20260619-worker-a"
+    route_identity = {
+        "route_id": "route-dogfood-daily-planner",
+        "route_context_hash": "sha256:dogfood-route-context",
+        "prompt_contract_id": "rprompt-dogfood",
+        "prompt_contract_hash": "sha256:dogfood-prompt",
+        "visible_injection_manifest_hash": "sha256:dogfood-visible",
+        "route_token_ref": "rtok-dogfood",
+    }
+    startup = _finish_startup_evidence(
+        **route_identity,
+        task_id=task_id,
+        parent_task_id=backlog_id,
+        worker_id="focus-worker",
+        worker_slot_id="focus-worker",
+        runtime_context_id="mfrctx-daily-planner",
+        branch="refs/heads/codex/daily-planner-focus",
+        actual_cwd="/tmp/daily-planner-focus",
+        actual_git_root="/tmp/daily-planner-focus",
+        worktree="/tmp/daily-planner-focus",
+        head_commit="2543eeeeb5675414dc008034276dbd8f4cfa2218",
+        observer_command_id="cmd-dogfood",
+        read_receipt_hash="sha256:dogfood-read-receipt",
+        read_receipt_event_id="5",
+        **_self_attested_startup_fields(
+            worker_session_id="worker-session-focus",
+            transcript_path="/tmp/worker-session-focus.jsonl",
+            transcript_ref="codex-thread:worker-session-focus",
+        ),
+    )
+    finish_gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "daily-planner-lite-20260619064012-8fd77a5f",
+            "task_id": task_id,
+            "parent_task_id": backlog_id,
+            "backlog_id": backlog_id,
+            "branch_ref": "refs/heads/codex/daily-planner-focus",
+            "worktree_path": "/tmp/daily-planner-focus",
+            "base_commit": "base-dogfood",
+            "target_head_commit": "target-dogfood",
+            "merge_queue_id": "mq-dogfood",
+            "head_commit": "2543eeeeb5675414dc008034276dbd8f4cfa2218",
+            "status": "review_ready",
+            "changed_files": ["src/App.jsx"],
+            "test_results": {"status": "passed", "command": "npm test"},
+            "checkpoint_id": "ckpt-dogfood",
+            "fence_token": "fence-2",
+            "summary": "Daily planner focus reminders ready.",
+            "real_startup_events": [_startup_event(startup, event_id="7")],
+            "finish_time_worker_self_attestation": _finish_time_worker_attestation(
+                worker_session_id="worker-session-focus",
+                transcript_path="/tmp/worker-session-focus.jsonl",
+                transcript_ref="codex-thread:worker-session-focus",
+            ),
+        },
+        context=_context(
+            project_id="daily-planner-lite-20260619064012-8fd77a5f",
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref="refs/heads/codex/daily-planner-focus",
+            worktree_path="/tmp/daily-planner-focus",
+            base_commit="base-dogfood",
+            head_commit="2543eeeeb5675414dc008034276dbd8f4cfa2218",
+            target_head_commit="target-dogfood",
+            merge_queue_id="mq-dogfood",
+        ),
+    )
+    common = {"backlog_id": backlog_id, "task_id": task_id}
+    events = [
+        {
+            "id": 2,
+            **common,
+            "event_kind": "route_action_precheck",
+            "phase": "route_action_precheck",
+            "status": "passed",
+            "payload": {**route_identity, "allowed_action": "dispatch_bounded_worker"},
+        },
+        {
+            "id": 3,
+            **common,
+            "event_kind": "service_route",
+            "phase": "dispatch",
+            "status": "passed",
+            "actor": "service-router",
+            "payload": {
+                "route_context": route_identity,
+                "dispatch_evidence": {
+                    **route_identity,
+                    "source": "observer_runtime_text_prepare",
+                    "service_generated": True,
+                    "worker_role": "mf_sub",
+                    "task_id": task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_slot_id": "focus-worker",
+                    "route_token_ref": route_identity["route_token_ref"],
+                    "parent_route_lineage": {
+                        **route_identity,
+                        "backlog_id": backlog_id,
+                    },
+                    "child_route_lineage": {
+                        **route_identity,
+                        "parent_route_token_ref": route_identity["route_token_ref"],
+                    },
+                },
+            },
+        },
+        {
+            "id": 4,
+            **common,
+            "event_kind": "observer_work_mode_transition",
+            "phase": "routing",
+            "status": "accepted",
+            "payload": {
+                "route_identity": route_identity,
+                "route_action_precheck_event_id": "2",
+            },
+        },
+        {
+            "id": 5,
+            **common,
+            "event_kind": "mf_subagent_read_receipt",
+            "phase": "startup_read_receipt",
+            "status": "passed",
+            "payload": {
+                **route_identity,
+                "runtime_context_id": "mfrctx-daily-planner",
+                "parent_task_id": backlog_id,
+                "worker_slot_id": "focus-worker",
+                "fence_token": "fence-2",
+                "read_receipt_hash": "sha256:dogfood-read-receipt",
+            },
+        },
+        {
+            "id": 6,
+            **common,
+            "event_kind": "mf_subagent_startup",
+            "phase": "startup_gate",
+            "status": "blocked",
+            "payload": {"reason": "first startup refused before retry"},
+        },
+        {
+            "id": 7,
+            **common,
+            "event_kind": "mf_subagent_startup",
+            "phase": "startup_gate",
+            "status": "passed",
+            "payload": {"mf_subagent_startup_gate": startup},
+        },
+        {
+            "id": 9,
+            **common,
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "passed",
+            "actor": "mf_sub",
+            "payload": {
+                **route_identity,
+                "worker_role": "mf_sub",
+                "changed_files": ["src/App.jsx"],
+                "graph_trace_ids": ["gqt-dogfood-worker"],
+            },
+        },
+        {
+            "id": 10,
+            **common,
+            "event_type": "mf_subagent.finish_gate",
+            "event_kind": "mf_subagent_finish_gate",
+            "phase": "finish_gate",
+            "status": "passed",
+            "actor": "worker-session-focus",
+            "payload": {"mf_subagent_finish_gate": finish_gate},
+        },
+        {
+            "id": 12,
+            **common,
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "qa-reviewer",
+            "payload": {**route_identity, "reviewer": "qa-reviewer"},
+        },
+        {
+            "id": 13,
+            **common,
+            "event_type": "observer.visual_smoke",
+            "event_kind": "observer_visual_smoke",
+            "phase": "visual_smoke",
+            "status": "passed",
+            "actor": "observer",
+            "payload": {
+                **route_identity,
+                "observer_visual_smoke": {
+                    "status": "passed",
+                    "url": "http://127.0.0.1:4173",
+                },
+                "meta_contract_gate": {
+                    "role": "observer",
+                    "action": "observer_visual_smoke",
+                    "status": "passed",
+                    "allowed": True,
+                },
+            },
+        },
+        {
+            "id": 14,
+            **common,
+            "event_kind": "merge",
+            "phase": "merge",
+            "status": "passed",
+            "actor": "observer",
+            "payload": {
+                **route_identity,
+                "merge_commit": "merge-dogfood",
+            },
+        },
+    ]
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": backlog_id,
+        "route_topology_policy": {
+            "selected_topology": "observer_led_parallel_lanes",
+            "recommended_topology": "mf_parallel.v1",
+            "required_lanes": [
+                "observer_coordinator",
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+            ],
+            "independent_verification_required": True,
+        },
+        "governance_policy": {
+            "profile": "third-party-public",
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": False,
+            },
+        },
+        "evidence_requirements": [
+            {"id": "route_context", "required": True},
+            {"id": "route_action_precheck", "required": True},
+            {"id": "bounded_implementation_worker_dispatch", "required": True},
+            {"id": "mf_subagent_startup", "required": True},
+            {"id": "bounded_implementation_subagent.review_ready", "required": True},
+            {"id": "independent_verification_lane", "required": True},
+            {"id": "observer_visual_smoke", "required": True},
+        ],
+    }
+
+    gate = task_timeline.mf_close_gate_verification(events, contract)
+
+    assert gate["passed"] is True
+    assert gate["contract_gate"]["missing_requirement_ids"] == []
+    assert gate["route_context_gate"]["missing_requirement_ids"] == []
+    assert gate["route_context_gate"]["checks"]["independent_verification_lane_present"] is True
+    assert gate["lane_ownership_gate"]["missing_requirement_ids"] == []
+    assert gate["independent_qa_gate"]["evidence_events"][0]["id"] == 12
+    assert gate["contract_gate"]["present_requirement_ids"] == [
+        "bounded_implementation_subagent.review_ready",
+        "bounded_implementation_worker_dispatch",
+        "independent_verification_lane",
+        "mf_subagent_startup",
+        "observer_visual_smoke",
+        "route_action_precheck",
+        "route_context",
+    ]
+
+
+def test_contract_gate_rejects_failed_event_nested_bare_string_evidence() -> None:
+    from agent.governance import task_timeline
+
+    gate = task_timeline.mf_contract_gate_verification(
+        [
+            {
+                "id": 1,
+                "event_kind": "worker_note",
+                "status": "failed",
+                "payload": {
+                    "child_gate": {
+                        "status": "passed",
+                        "contract_evidence": ["close_ready"],
+                    }
+                },
+            }
+        ],
+        {"evidence_requirements": [{"id": "close_ready", "required": True}]},
+    )
+
+    assert gate["passed"] is False
+    assert gate["missing_requirement_ids"] == ["close_ready"]
+    assert gate["present_requirement_ids"] == []
+
+
+def test_contract_gate_rejects_unrelated_nested_visual_smoke_projection() -> None:
+    from agent.governance import task_timeline
+
+    gate = task_timeline.mf_contract_gate_verification(
+        [
+            {
+                "id": 1,
+                "event_kind": "implementation",
+                "status": "passed",
+                "actor": "mf_sub",
+                "payload": {
+                    "worker_result": {
+                        "observer_visual_smoke_projection": {
+                            "id": "observer_visual_smoke",
+                            "status": "passed",
+                            "server_projected": True,
+                            "source": "task_timeline.merge_support_projection",
+                        },
+                    },
+                    "visual_smoke": {"status": "passed"},
+                },
+            }
+        ],
+        {"evidence_requirements": [{"id": "observer_visual_smoke", "required": True}]},
+    )
+
+    assert gate["passed"] is False
+    assert gate["missing_requirement_ids"] == ["observer_visual_smoke"]
+
+
+def test_contract_gate_accepts_explicit_observer_visual_smoke_event() -> None:
+    from agent.governance import task_timeline
+
+    gate = task_timeline.mf_contract_gate_verification(
+        [
+            {
+                "id": 1,
+                "event_type": "observer.visual_smoke",
+                "event_kind": "observer_visual_smoke",
+                "status": "passed",
+                "actor": "observer",
+                "payload": {
+                    "observer_visual_smoke": {"status": "passed"},
+                    "meta_contract_gate": {
+                        "role": "observer",
+                        "action": "observer_visual_smoke",
+                        "status": "passed",
+                        "allowed": True,
+                    },
+                },
+            }
+        ],
+        {"evidence_requirements": [{"id": "observer_visual_smoke", "required": True}]},
+    )
+
+    assert gate["passed"] is True
+    assert gate["missing_requirement_ids"] == []
+
+
+def test_route_context_gate_rejects_forged_action_scoped_qa_lineage() -> None:
+    from agent.governance import task_timeline
+
+    parent_identity = {
+        "route_context_hash": "sha256:parent-route",
+        "prompt_contract_id": "rprompt-parent",
+        "prompt_contract_hash": "sha256:parent-prompt",
+        "visible_injection_manifest_hash": "sha256:visible",
+    }
+    child_identity = {
+        **parent_identity,
+        "prompt_contract_id": "rprompt-child-action",
+        "prompt_contract_hash": "sha256:child-prompt",
+    }
+    events = [
+        {
+            "id": 1,
+            "event_kind": "route_context",
+            "status": "passed",
+            "payload": {"route_context": parent_identity},
+        },
+        {
+            "id": 2,
+            "event_kind": "route_action_precheck",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        {
+            "id": 3,
+            "event_kind": "bounded_implementation_worker_dispatch",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        {
+            "id": 4,
+            "event_kind": "mf_subagent_startup",
+            "status": "passed",
+            "payload": {
+                **parent_identity,
+                "actual_cwd": "/tmp/worker",
+                "branch": "worker",
+                "head_commit": "head",
+                "fence_token": "fence",
+            },
+        },
+        {
+            "id": 5,
+            "event_kind": "independent_verification",
+            "status": "passed",
+            "actor": "qa-reviewer",
+            "payload": {
+                **child_identity,
+                "route_token_ref": "rtok-child-action",
+                "reviewer": "qa-reviewer",
+                "reviewer_role": "qa",
+                "route_identity": {
+                    "allowed_action": "task_timeline_append",
+                    "action": "independent_verification",
+                },
+                "meta_contract_gate": {
+                    "role": "qa",
+                    "action": "independent_verification",
+                    "status": "passed",
+                    "allowed": True,
+                },
+            },
+        },
+    ]
+
+    gate = task_timeline.mf_route_context_gate_verification(
+        events,
+        contract={
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": ["independent_verification_lane"],
+                "independent_verification_required": True,
+            }
+        },
+    )
+
+    assert gate["passed"] is False
+    assert "independent_verification_lane" in gate["missing_requirement_ids"]
+    assert gate["checks"]["independent_verification_lane_present"] is False
+    assert gate["accepted_action_scope_lineages"] == []
+
+
+def test_route_context_gate_accepts_server_backed_action_scoped_qa_lineage() -> None:
+    from agent.governance import task_timeline
+
+    parent_identity = {
+        "route_context_hash": "sha256:parent-route",
+        "prompt_contract_id": "rprompt-parent",
+        "prompt_contract_hash": "sha256:parent-prompt",
+        "visible_injection_manifest_hash": "sha256:visible",
+    }
+    child_identity = {
+        **parent_identity,
+        "route_context_hash": "sha256:child-route",
+        "prompt_contract_id": "rprompt-child-action",
+        "prompt_contract_hash": "sha256:child-prompt",
+    }
+    events = [
+        {
+            "id": 1,
+            "event_kind": "route_context",
+            "status": "passed",
+            "payload": {"route_context": parent_identity},
+        },
+        {
+            "id": 2,
+            "event_kind": "route_action_precheck",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        {
+            "id": 3,
+            "event_kind": "bounded_implementation_worker_dispatch",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        {
+            "id": 4,
+            "event_kind": "mf_subagent_startup",
+            "status": "passed",
+            "payload": {
+                **parent_identity,
+                "actual_cwd": "/tmp/worker",
+                "branch": "worker",
+                "head_commit": "head",
+                "fence_token": "fence",
+            },
+        },
+        {
+            "id": 5,
+            "event_kind": "independent_verification",
+            "status": "passed",
+            "actor": "qa-reviewer",
+            "payload": {
+                **child_identity,
+                "route_token_ref": "rtok-child-action",
+                "reviewer": "qa-reviewer",
+                "reviewer_role": "qa",
+                "route_token_gate": {
+                    **child_identity,
+                    "action": "task_timeline_append",
+                    "allowed": True,
+                    "status": "accepted",
+                    "decision": "route_token_ref_resolved",
+                    "route_token_ref": "rtok-child-action",
+                    "resolved_from_ref": True,
+                    "server_issued_binding": True,
+                    "binding_source": "observer_route_token_refs",
+                },
+                "route_action_scope_lineage": {
+                    "accepted": True,
+                    "status": "accepted",
+                    "acceptance_source": "route_token_ref_resolved",
+                    "server_issued_binding": True,
+                    "resolved_from_ref": True,
+                    "route_token_ref": "rtok-child-action",
+                    "parent_route_identity": parent_identity,
+                    "child_route_identity": child_identity,
+                },
+                "meta_contract_gate": {
+                    "role": "qa",
+                    "action": "independent_verification",
+                    "status": "passed",
+                    "allowed": True,
+                },
+            },
+        },
+    ]
+
+    gate = task_timeline.mf_route_context_gate_verification(
+        events,
+        contract={
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": ["independent_verification_lane"],
+                "independent_verification_required": True,
+            }
+        },
+    )
+
+    assert gate["passed"] is True
+    assert gate["missing_requirement_ids"] == []
+    assert gate["checks"]["independent_verification_lane_present"] is True
+    assert gate["accepted_action_scope_lineages"][0]["server_lineage"][
+        "server_backed"
+    ] is True
+
+
+def test_observer_on_behalf_transport_does_not_satisfy_route_lane_without_lineage() -> None:
+    from agent.governance import task_timeline
+
+    parent_identity = {
+        "route_context_hash": "sha256:parent-route",
+        "prompt_contract_id": "rprompt-parent",
+        "prompt_contract_hash": "sha256:parent-prompt",
+        "visible_injection_manifest_hash": "sha256:visible",
+    }
+    child_identity = {
+        **parent_identity,
+        "route_context_hash": "sha256:child-route",
+        "prompt_contract_id": "rprompt-child-action",
+        "prompt_contract_hash": "sha256:child-prompt",
+    }
+    base_events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+        {"event_kind": "verification", "phase": "verification", "status": "passed"},
+        {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        {
+            "event_kind": "route_context",
+            "status": "passed",
+            "payload": {"route_context": parent_identity},
+        },
+        {
+            "event_kind": "route_action_precheck",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        {
+            "event_kind": "bounded_implementation_worker_dispatch",
+            "status": "passed",
+            "payload": parent_identity,
+        },
+        {
+            "event_kind": "mf_subagent_startup",
+            "status": "passed",
+            "payload": {
+                **parent_identity,
+                "actual_cwd": "/tmp/worker",
+                "branch": "worker",
+                "head_commit": "head",
+                "fence_token": "fence",
+            },
+        },
+    ]
+    observer_on_behalf = {
+        "id": 8,
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "status": "passed",
+        "actor": "observer-on-behalf-of:qa-reviewer",
+        "payload": {
+            **child_identity,
+            "route_token_ref": "rtok-child-action",
+            "reviewer": "qa-reviewer",
+            "reviewer_role": "qa",
+            "route_identity": {
+                "allowed_action": "task_timeline_append",
+                "action": "independent_verification",
+            },
+            "meta_contract_gate": {
+                "role": "observer",
+                "action": "independent_verification",
+                "status": "passed",
+                "allowed": True,
+            },
+        },
+    }
+
+    contract = {
+        "route_topology_policy": {
+            "selected_topology": "observer_led_parallel_lanes",
+            "recommended_topology": "mf_parallel.v1",
+            "required_lanes": ["independent_verification_lane"],
+            "independent_verification_required": True,
+        },
+        "governance_policy": {"requirements": {"independent_qa": True}},
+    }
+
+    gate = task_timeline.mf_close_gate_verification(
+        [*base_events, observer_on_behalf],
+        contract=contract,
+    )
+
+    assert gate["independent_qa_gate"]["passed"] is False
+    assert gate["independent_qa_gate"]["rejected_evidence_events"][0]["reason"] == (
+        "observer_transport_not_independent_qa"
+    )
+    assert gate["route_context_gate"]["checks"][
+        "independent_verification_lane_present"
+    ] is False
+    assert "independent_verification_lane" in gate["route_context_gate"][
+        "missing_requirement_ids"
+    ]
+
+    direct_qa = {
+        **observer_on_behalf,
+        "actor": "qa-reviewer",
+        "payload": {
+            **observer_on_behalf["payload"],
+            "meta_contract_gate": {
+                "role": "qa",
+                "action": "independent_verification",
+                "status": "passed",
+                "allowed": True,
+            },
+        },
+    }
+    direct_gate = task_timeline.mf_close_gate_verification(
+        [*base_events, direct_qa],
+        contract=contract,
+    )
+    assert direct_gate["independent_qa_gate"]["passed"] is True
+    assert direct_gate["independent_qa_gate"]["evidence_events"][0]["actor"] == (
+        "qa-reviewer"
+    )
 
 
 def test_finish_gate_rejects_caller_supplied_review_ready_bridge() -> None:

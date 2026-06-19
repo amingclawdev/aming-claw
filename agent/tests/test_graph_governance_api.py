@@ -18183,6 +18183,317 @@ def test_timeline_append_meta_contract_prefers_worker_role_over_route_gate_obser
     assert payload["route_token_gate"]["caller_role"] == "observer"
 
 
+def _route_identity_from_issued_route(issued: dict) -> dict:
+    return {
+        "route_id": issued["route_id"],
+        "route_context_hash": issued["route_context_hash"],
+        "prompt_contract_id": issued["prompt_contract_id"],
+        "prompt_contract_hash": issued["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": issued[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": issued["route_token_ref"],
+    }
+
+
+def _route_context_gate_baseline_events(
+    route_identity: dict,
+    *,
+    backlog_id: str,
+    task_id: str,
+) -> list[dict]:
+    events: list[dict] = []
+    for event_kind, actor in (
+        ("route_context", "observer"),
+        ("route_action_precheck", "observer"),
+        ("bounded_implementation_worker_dispatch", "observer"),
+        ("mf_subagent_startup", "mf_sub"),
+    ):
+        payload = dict(route_identity)
+        if event_kind == "mf_subagent_startup":
+            payload.update(
+                {
+                    "runtime_context_id": f"mfrctx-{task_id}",
+                    "task_id": task_id,
+                    "parent_task_id": f"{backlog_id}-parent-task",
+                    "worker_slot_id": f"slot-{task_id}",
+                    "fence_token": f"fence-{task_id}",
+                    "actual_cwd": f"/tmp/{task_id}",
+                    "actual_git_root": f"/tmp/{task_id}",
+                    "branch": f"refs/heads/codex/{task_id}",
+                    "head_commit": f"head-{task_id}",
+                }
+            )
+        events.append(
+            {
+                "event_type": event_kind,
+                "event_kind": event_kind,
+                "phase": event_kind,
+                "status": "passed",
+                "actor": actor,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "payload": payload,
+            }
+        )
+    return events
+
+
+def test_timeline_append_ref_only_independent_verification_projects_server_lineage(conn):
+    from agent.governance import observer_route_context
+
+    backlog_id = "AC-REF-ONLY-INDEPENDENT-VERIFY-LINEAGE"
+    task_id = "ref-only-independent-verify-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=f"{task_id}-parent",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-parent-action-scope"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_identity = _route_identity_from_issued_route(parent_issue)
+    child_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-child-action-scope"],
+        parent_route_identity={
+            **parent_identity,
+            "selected_project": PID,
+            "selected_backlog_id": backlog_id,
+        },
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_issue["route_token_ref"],
+        token=child_issue["route_token"],
+    )
+
+    result = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "actor": "qa-reviewer",
+                "status": "passed",
+                "route_token_ref": child_issue["route_token_ref"],
+                "payload": {
+                    "reviewer_role": "independent_qa",
+                    "summary": "QA accepted the child action scope.",
+                    "route_action_scope_lineage": {
+                        "accepted": True,
+                        "source": "caller_forged_server_lineage",
+                    },
+                    "nested_forgery": {
+                        "kept": True,
+                        "route_action_scope_lineage": {
+                            "accepted": True,
+                            "source": "caller_nested_object_forgery",
+                        },
+                        "items": [
+                            {
+                                "action_scope_route_lineage": {
+                                    "accepted": True,
+                                    "source": "caller_nested_list_forgery",
+                                }
+                            },
+                            {
+                                "kept": "list item",
+                                "route_token_action_scope_lineage": {
+                                    "accepted": True,
+                                    "source": "caller_route_token_forgery",
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        )
+    )
+
+    assert result["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    listed = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+    )
+    assert len(listed) == 1
+    payload = listed[0]["payload"]
+    lineage = payload["route_action_scope_lineage"]
+    assert lineage["source"] == "server_route_token_action_scope"
+    assert lineage["route_token_ref"] == child_issue["route_token_ref"]
+    assert lineage["resolved_from_ref"] is True
+    assert lineage["server_issued_binding"] is True
+    assert lineage["registry_verified"] is True
+    assert lineage["parent_route_identity"]["route_context_hash"] == (
+        parent_identity["route_context_hash"]
+    )
+    assert lineage["child_route_identity"]["route_context_hash"] == (
+        child_issue["route_context_hash"]
+    )
+    assert lineage["parent_route_lineage"]["route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+    assert lineage["child_route_lineage"]["route_token_ref"] == (
+        child_issue["route_token_ref"]
+    )
+    serialized_payload = json.dumps(payload, sort_keys=True)
+    assert lineage["source"] != "caller_forged_server_lineage"
+    assert "caller_forged_server_lineage" not in serialized_payload
+    assert "caller_nested_object_forgery" not in serialized_payload
+    assert "caller_nested_list_forgery" not in serialized_payload
+    assert "caller_route_token_forgery" not in serialized_payload
+    assert payload["nested_forgery"] == {
+        "kept": True,
+        "items": [{}, {"kept": "list item"}],
+    }
+
+    gate = task_timeline.mf_route_context_gate_verification(
+        [
+            *_route_context_gate_baseline_events(
+                parent_identity,
+                backlog_id=backlog_id,
+                task_id=task_id,
+            ),
+            listed[0],
+        ],
+        {"template_id": "mf_parallel.v1"},
+    )
+    assert gate["passed"] is True
+    assert gate["checks"]["independent_verification_lane_present"] is True
+    assert gate["accepted_action_scope_lineages"][0]["route_token_ref"] == (
+        child_issue["route_token_ref"]
+    )
+
+
+def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_projection(conn):
+    from agent.governance import observer_route_context
+
+    backlog_id = "AC-REF-ONLY-INDEPENDENT-VERIFY-NO-LINEAGE"
+    task_id = "ref-only-no-lineage-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=f"{task_id}-parent",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-parent-no-lineage"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_identity = _route_identity_from_issued_route(parent_issue)
+    unbound_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-unbound-action-scope"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=unbound_issue["route_token_ref"],
+        token=unbound_issue["route_token"],
+    )
+
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "actor": "qa-reviewer",
+                "status": "passed",
+                "route_token_ref": unbound_issue["route_token_ref"],
+                "payload": {
+                    "reviewer_role": "independent_qa",
+                    "summary": "QA cannot bridge an unbound action token.",
+                    "route_action_scope_lineage": {
+                        "accepted": True,
+                        "source": "caller_forged_server_lineage",
+                        "server_projected": True,
+                    },
+                    "nested_forgery": {
+                        "action_scope_route_lineage": {
+                            "accepted": True,
+                            "source": "caller_nested_action_scope",
+                        },
+                        "items": [
+                            {
+                                "server_route_lineage": {
+                                    "accepted": True,
+                                    "source": "caller_nested_server_lineage",
+                                }
+                            }
+                        ],
+                    },
+                },
+            },
+        )
+    )
+
+    listed = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+    )
+    assert len(listed) == 1
+    payload = listed[0]["payload"]
+    assert "route_action_scope_lineage" not in payload
+    assert payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    serialized_payload = json.dumps(payload, sort_keys=True)
+    assert "caller_forged_server_lineage" not in serialized_payload
+    assert "caller_nested_action_scope" not in serialized_payload
+    assert "caller_nested_server_lineage" not in serialized_payload
+
+    gate = task_timeline.mf_route_context_gate_verification(
+        [
+            *_route_context_gate_baseline_events(
+                parent_identity,
+                backlog_id=backlog_id,
+                task_id=task_id,
+            ),
+            listed[0],
+        ],
+        {"template_id": "mf_parallel.v1"},
+    )
+    assert gate["passed"] is False
+    assert "independent_verification_lane" in gate["missing_requirement_ids"]
+    assert gate["checks"]["independent_verification_lane_present"] is False
+
+
 def test_timeline_append_meta_contract_allows_observer_on_behalf_worker_evidence(conn):
     backlog_id = "AC-META-CONTRACT-OBSERVER-ON-BEHALF"
     _insert_simple_mf_close_backlog(conn, backlog_id)

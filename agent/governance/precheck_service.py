@@ -2172,23 +2172,51 @@ def _present_route_evidence_ids(value: Any) -> set[str]:
 
 
 def _timeline_contract_evidence_ids(value: Any) -> set[str]:
+    from . import task_timeline
+
     present: set[str] = set()
     for event in _iter_mappings(value):
         event_status = _text(event.get("status") or event.get("decision")).lower()
         event_passed = event_status in PASS_STATUSES
         if event_passed:
             present.update(_requirement_ids_from_container(event))
+            present.update(
+                task_timeline.canonical_contract_evidence_ids_from_event(dict(event))
+            )
         for key in ("payload", "verification", "artifact_refs"):
             container = _mapping(event.get(key))
             if event_passed:
                 present.update(_requirement_ids_from_container(container))
-            present.update(_present_evidence_ids(container.get("contract_evidence")))
+            container_passed = _evidence_passed(container) if container else event_passed
+            present.update(
+                _present_evidence_ids(
+                    container.get("contract_evidence"),
+                    allow_string_evidence=container_passed,
+                    require_typed_status=True,
+                )
+            )
             route_evidence = _mapping(container.get("route_evidence"))
-            present.update(_present_evidence_ids(route_evidence.get("contract_evidence")))
+            route_evidence_passed = (
+                _evidence_passed(route_evidence)
+                if route_evidence
+                else container_passed
+            )
+            present.update(
+                _present_evidence_ids(
+                    route_evidence.get("contract_evidence"),
+                    allow_string_evidence=route_evidence_passed,
+                    require_typed_status=True,
+                )
+            )
     return present
 
 
-def _present_evidence_ids(value: Any) -> set[str]:
+def _present_evidence_ids(
+    value: Any,
+    *,
+    allow_string_evidence: bool = True,
+    require_typed_status: bool = False,
+) -> set[str]:
     present: set[str] = set()
     if isinstance(value, Mapping):
         iterable = value.values()
@@ -2198,11 +2226,14 @@ def _present_evidence_ids(value: Any) -> set[str]:
         iterable = []
     for item in iterable:
         if isinstance(item, str):
-            present.add(item)
+            if allow_string_evidence:
+                present.add(item)
             continue
         if not isinstance(item, Mapping):
             continue
         status = _text(item.get("status") or item.get("decision")).lower()
+        if require_typed_status and not (status or item.get("passed")):
+            continue
         if status and status not in PASS_STATUSES:
             continue
         evidence_id = _text(
