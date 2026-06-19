@@ -1007,6 +1007,56 @@ def _json_loads_public_mapping(value: Any) -> dict[str, Any]:
     return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
+def _lineage_conflicting_fields(
+    existing: Mapping[str, Any],
+    supplied: Mapping[str, Any],
+    *,
+    public_key: str,
+) -> list[str]:
+    if public_key == "route_lineage":
+        fields = (
+            "parent_route_id",
+            "parent_route_context_hash",
+            "parent_prompt_contract_id",
+            "child_route_id",
+            "child_route_context_hash",
+            "child_prompt_contract_id",
+        )
+    else:
+        fields = (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "selected_project",
+            "selected_backlog_id",
+        )
+    conflicts: list[str] = []
+    for field in fields:
+        left = _string(existing.get(field))
+        right = _string(supplied.get(field))
+        if left and right and left != right:
+            conflicts.append(field)
+    return conflicts
+
+
+def _merge_registry_lineage(
+    existing: Mapping[str, Any],
+    supplied: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in supplied.items():
+        if value in ("", None, [], {}):
+            merged.setdefault(str(key), value)
+        else:
+            merged[str(key)] = value
+    return merged
+
+
 def _ref_lineage_payloads(
     token: Mapping[str, Any],
     *,
@@ -1230,6 +1280,153 @@ def persist_route_token_ref(
             ),
         )
         conn.commit()
+
+
+def persist_route_token_ref_lineage(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    parent_route_lineage: Mapping[str, Any],
+    child_route_lineage: Mapping[str, Any],
+    route_lineage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach server-validated parent/child route lineage to an active ref.
+
+    This stores only public route-lineage fields and refuses to overwrite an
+    existing non-matching registry lineage. Close precheck may consume registry
+    lineage, but it must never trust event-local lineage directly.
+    """
+
+    project_id = _string(project_id)
+    route_token_ref = _string(route_token_ref)
+    parent = _public_mapping(parent_route_lineage)
+    child = _public_mapping(child_route_lineage)
+    if not project_id or not route_token_ref:
+        raise ValueError("project_id and route_token_ref are required")
+    if not parent or not child:
+        raise ValueError("parent_route_lineage and child_route_lineage are required")
+
+    lineage_payloads = _ref_lineage_payloads(
+        {
+            "parent_route_lineage": parent,
+            "child_route_lineage": child,
+            "route_lineage": _public_mapping(route_lineage),
+        },
+        route_token_ref=route_token_ref,
+    )
+
+    _ensure_ref_registry_schema(conn)
+    with _REF_REGISTRY_LOCK:
+        row = conn.execute(
+            "SELECT * FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (project_id, route_token_ref),
+        ).fetchone()
+        if row is None:
+            return {}
+        row_dict = dict(row)
+        status = _string(row_dict.get("status"))
+        if status != REF_STATUS_ACTIVE:
+            raise RouteTokenRefError(
+                f"route_token_ref {route_token_ref!r} is not active (status={status!r}); "
+                "lineage attach refused"
+            )
+        for field in ("route_id", "route_context_hash", "prompt_contract_id"):
+            stored = _string(row_dict.get(field))
+            supplied = _string(child.get(field))
+            if stored and supplied and stored != supplied:
+                raise RouteTokenRefError(
+                    f"route_token_ref lineage mismatch: child {field} {supplied!r} "
+                    f"does not match registered {stored!r}"
+                )
+
+        final_payloads: dict[str, dict[str, Any]] = {}
+        changed = False
+        for public_key, column in _REF_LINEAGE_COLUMNS.items():
+            existing = _json_loads_public_mapping(row_dict.get(column))
+            supplied = lineage_payloads[public_key]
+            conflicts = (
+                _lineage_conflicting_fields(
+                    existing,
+                    supplied,
+                    public_key=public_key,
+                )
+                if existing and supplied
+                else []
+            )
+            if conflicts:
+                raise RouteTokenRefError(
+                    f"route_token_ref lineage mismatch: registered {public_key} "
+                    f"conflicts on {', '.join(conflicts)}"
+                )
+            final_payloads[public_key] = (
+                _merge_registry_lineage(existing, supplied)
+                if existing and supplied
+                else existing or supplied
+            )
+            if final_payloads[public_key] != existing:
+                changed = True
+
+        if changed:
+            conn.execute(
+                """
+                UPDATE observer_route_token_refs
+                SET parent_route_lineage_json=?,
+                    child_route_lineage_json=?,
+                    route_lineage_json=?
+                WHERE project_id=? AND route_token_ref=?
+                """,
+                (
+                    _json_dumps_public_mapping(final_payloads["parent_route_lineage"]),
+                    _json_dumps_public_mapping(final_payloads["child_route_lineage"]),
+                    _json_dumps_public_mapping(final_payloads["route_lineage"]),
+                    project_id,
+                    route_token_ref,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM observer_route_token_refs "
+                "WHERE project_id=? AND route_token_ref=?",
+                (project_id, route_token_ref),
+            ).fetchone()
+            row_dict = dict(row) if row is not None else row_dict
+
+    try:
+        allowed_actions = json.loads(row_dict.get("allowed_actions_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        allowed_actions = []
+    try:
+        evidence_refs = json.loads(row_dict.get("evidence_refs_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        evidence_refs = []
+    try:
+        scope = json.loads(row_dict.get("scope_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        scope = {}
+
+    return _with_registry_lineages(
+        {
+            "schema_version": REF_REGISTRY_SCHEMA_VERSION,
+            "route_token_ref": route_token_ref,
+            "route_id": _string(row_dict.get("route_id")),
+            "route_context_hash": _string(row_dict.get("route_context_hash")),
+            "prompt_contract_id": _string(row_dict.get("prompt_contract_id")),
+            "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
+            "visible_injection_manifest_hash": _string(
+                row_dict.get("visible_injection_manifest_hash")
+            ),
+            "caller_role": _string(row_dict.get("caller_role")),
+            "allowed_actions": allowed_actions,
+            "evidence_refs": evidence_refs,
+            "expires_at": _string(row_dict.get("expires_at")),
+            "scope": scope,
+            "status": _string(row_dict.get("status")),
+            "resolved_from_ref": True,
+        },
+        row_dict,
+    )
 
 
 def resolve_route_token_ref(

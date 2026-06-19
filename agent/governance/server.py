@@ -24509,6 +24509,7 @@ def _server_route_action_scope_lineage(
         "acceptance_source": "server_route_token_action_scope",
         "projected_by": "handle_task_timeline_append",
         "server_projected": True,
+        "allowed_action": "task_timeline_append",
         "server_issued_binding": bool(route_gate.get("server_issued_binding")),
         "registry_verified": True,
         "resolved_from_ref": bool(route_gate.get("resolved_from_ref")),
@@ -28228,6 +28229,11 @@ def _record_bounded_worker_dispatch_event(
         context.get("worker_slot_id"),
         context.get("worker_id"),
     )
+    observer_command_id = _first_text(
+        body.get("observer_command_id"),
+        prepared.get("observer_command_id"),
+        context.get("observer_command_id"),
+    )
     branch_ref = _first_text(
         body.get("branch"),
         body.get("branch_ref"),
@@ -28262,6 +28268,7 @@ def _record_bounded_worker_dispatch_event(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "backlog_id": backlog_id,
+        "observer_command_id": observer_command_id,
         "worker_role": "mf_sub",
         "worker_slot_id": worker_slot_id,
         "worker_id": worker_slot_id,
@@ -28322,6 +28329,26 @@ def _record_bounded_worker_dispatch_event(
         else {}
     )
     if parent_route_lineage:
+        parent_route_lineage = dict(parent_route_lineage)
+        for parent_source in (
+            body.get("parent_route_identity"),
+            prepared.get("parent_route_identity"),
+            prepared.get("parent_route_lineage"),
+        ):
+            if not isinstance(parent_source, Mapping):
+                continue
+            for key in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+                "route_token_ref",
+            ):
+                if not parent_route_lineage.get(key):
+                    text = _first_text(parent_source.get(key))
+                    if text:
+                        parent_route_lineage[key] = text
         dispatch["parent_route_lineage"] = dict(parent_route_lineage)
         parent_route_token_ref = _first_text(
             parent_route_lineage.get("route_token_ref"),
@@ -28341,12 +28368,122 @@ def _record_bounded_worker_dispatch_event(
             "parent_route_token_ref": parent_route_token_ref,
         }
 
+    route_token_ref = str(dispatch.get("route_token_ref") or "").strip()
+    child_route_lineage = (
+        dispatch.get("child_route_lineage")
+        if isinstance(dispatch.get("child_route_lineage"), Mapping)
+        else {}
+    )
+    if route_token_ref and parent_route_lineage and child_route_lineage:
+        try:
+            from . import observer_route_context as _orc
+            from .mf_subagent_contract import (
+                MfSubagentContractError,
+                validate_route_token_mutation_gate,
+            )
+
+            resolved = _orc.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+                backlog_id=backlog_id,
+                route_id=str(dispatch.get("route_id") or ""),
+                route_context_hash=str(dispatch.get("route_context_hash") or ""),
+                prompt_contract_id=str(dispatch.get("prompt_contract_id") or ""),
+            )
+            if resolved:
+                registered_lineage = _orc.persist_route_token_ref_lineage(
+                    conn,
+                    project_id=project_id,
+                    route_token_ref=route_token_ref,
+                    parent_route_lineage=parent_route_lineage,
+                    child_route_lineage=child_route_lineage,
+                )
+                server_binding = {
+                    **dict(registered_lineage or resolved),
+                    "server_issued_binding": True,
+                    "binding_source": (
+                        str(resolved.get("binding_source") or "")
+                        or "observer_route_token_refs"
+                    ),
+                }
+                route_gate = validate_route_token_mutation_gate(
+                    {
+                        "route_token": dict(registered_lineage or resolved),
+                        "route_token_ref": route_token_ref,
+                    },
+                    action="task_timeline_append",
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id="",
+                    require_server_binding=True,
+                    server_binding=server_binding,
+                )
+                route_gate = {
+                    **dict(route_gate),
+                    "decision": "route_token_ref_resolved",
+                    "resolved_from_ref": True,
+                    "server_issued_binding": True,
+                    "registry_verified": True,
+                    "binding_source": "observer_route_token_refs",
+                    "route_token_ref": route_token_ref,
+                    "parent_route_lineage": dict(parent_route_lineage),
+                    "child_route_lineage": dict(child_route_lineage),
+                }
+                lineage = _server_route_action_scope_lineage(
+                    {
+                        "event_kind": "bounded_implementation_worker_dispatch",
+                        "route_token_ref": route_token_ref,
+                        "payload": {
+                            "bounded_implementation_worker_dispatch": dispatch,
+                        },
+                    },
+                    {
+                        "event_kind": "bounded_implementation_worker_dispatch",
+                        "payload": {
+                            "bounded_implementation_worker_dispatch": dispatch,
+                        },
+                    },
+                    route_gate,
+                )
+                dispatch["route_token_gate"] = _route_gate_public_summary(route_gate)
+                if lineage:
+                    dispatch["route_action_scope_lineage"] = lineage
+                dispatch["route_token_registry_proof"] = {
+                    "schema_version": "bounded_worker_dispatch.route_token_registry_proof.v1",
+                    "accepted": bool(lineage),
+                    "status": "accepted" if lineage else "blocked",
+                    "route_token_ref": route_token_ref,
+                    "binding_source": "observer_route_token_refs",
+                    "server_issued_binding": True,
+                    "registry_verified": bool(lineage),
+                    "allowed_action": "task_timeline_append",
+                }
+            else:
+                dispatch["route_token_registry_proof"] = {
+                    "schema_version": "bounded_worker_dispatch.route_token_registry_proof.v1",
+                    "accepted": False,
+                    "status": "blocked",
+                    "route_token_ref": route_token_ref,
+                    "reason": "route_token_ref_not_registered",
+                }
+        except (_orc.RouteTokenRefError, MfSubagentContractError) as exc:
+            dispatch["route_token_registry_proof"] = {
+                "schema_version": "bounded_worker_dispatch.route_token_registry_proof.v1",
+                "accepted": False,
+                "status": "blocked",
+                "route_token_ref": route_token_ref,
+                "reason": str(exc),
+            }
+
     required = (
         "route_context_hash",
         "prompt_contract_id",
+        "route_token_ref",
         "runtime_context_id",
         "task_id",
         "parent_task_id",
+        "observer_command_id",
         "worker_slot_id",
         "fence_token",
         "worktree_path",
@@ -33449,7 +33586,6 @@ def _enrich_timeline_events_with_route_token_lineage(
                 project_id=project_id,
                 route_token_ref=route_token_ref,
                 backlog_id=str(event.get("backlog_id") or ""),
-                task_id=str(event.get("task_id") or ""),
                 route_id=route_id,
                 route_context_hash=route_context_hash,
                 prompt_contract_id=prompt_contract_id,

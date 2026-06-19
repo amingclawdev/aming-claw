@@ -20,6 +20,7 @@ from agent.governance import batch_jobs
 from agent.governance import graph_correction_patches
 from agent.governance import graph_events
 from agent.governance import graph_query_trace
+from agent.governance import observer_route_context
 from agent.governance import observer_session
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
@@ -2667,6 +2668,19 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
         "visible_injection_manifest_hash": _fake_sha("runtime-text-visible"),
         "route_token_ref": "rtok-runtime-text-child",
     }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_identity["route_token_ref"],
+        token={
+            **child_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {"project_id": PID, "backlog_id": bug_id},
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:runtime-text-lineage"],
+        },
+    )
 
     prepared = server.handle_observer_runtime_text_prepare(
         _ctx(
@@ -2709,6 +2723,7 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
     assert dispatch_payload["route_context_hash"] == child_identity["route_context_hash"]
     assert dispatch_payload["prompt_contract_id"] == child_identity["prompt_contract_id"]
     assert dispatch_payload["route_token_ref"] == child_identity["route_token_ref"]
+    assert dispatch_payload["observer_command_id"] == "cmd-runtime-text-lineage"
     assert dispatch_payload["parent_route_lineage"]["backlog_id"] == bug_id
     assert dispatch_payload["parent_route_lineage"]["route_id"] == (
         parent_identity["route_id"]
@@ -2725,6 +2740,14 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
     assert dispatch_payload["child_route_lineage"]["parent_route_token_ref"] == (
         parent_identity["route_token_ref"]
     )
+    assert dispatch_payload["route_token_registry_proof"]["accepted"] is True
+    assert dispatch_payload["route_action_scope_lineage"]["registry_verified"] is True
+    assert dispatch_payload["route_action_scope_lineage"]["parent_route_identity"][
+        "route_context_hash"
+    ] == parent_identity["route_context_hash"]
+    assert dispatch_payload["route_action_scope_lineage"]["child_route_identity"][
+        "route_context_hash"
+    ] == child_identity["route_context_hash"]
 
     route_context = {
         "route_context": {
@@ -2745,6 +2768,7 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": bug_id,
+        "observer_command_id": "cmd-runtime-text-lineage",
         "worker_role": "mf_sub",
         "worker_slot_id": "worker-lineage",
         "worker_id": "worker-lineage",
@@ -2818,7 +2842,17 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
         _ctx({"project_id": PID, "bug_id": bug_id})
     )
     route_gate = ready["timeline_gate"]["route_context_gate"]
-    assert ready["can_close"] is True
+    gate_summary = {
+        key: {
+            "passed": value.get("passed"),
+            "status": value.get("status"),
+            "missing_requirement_ids": value.get("missing_requirement_ids"),
+            "rejected_cross_ref_evidence": value.get("rejected_cross_ref_evidence"),
+        }
+        for key, value in ready["timeline_gate"].items()
+        if key.endswith("_gate") and isinstance(value, dict)
+    }
+    assert ready["can_close"] is True, gate_summary
     assert route_gate["missing_requirement_ids"] == []
     assert route_gate["route_identity"]["route_context_hash"] == (
         parent_identity["route_context_hash"]
@@ -2826,6 +2860,104 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
     assert route_gate["accepted_dispatch_lineages"][0]["parent_route_token_ref"] == (
         parent_identity["route_token_ref"]
     )
+    cross_ref_gate = ready["timeline_gate"]["cross_ref_gate"]
+    assert cross_ref_gate["passed"] is True
+    assert cross_ref_gate["accepted_route_token_child_lineages"], cross_ref_gate
+    assert cross_ref_gate["accepted_route_token_child_lineages"][0][
+        "registry_verified"
+    ] is True
+    assert not cross_ref_gate["rejected_cross_ref_evidence"]
+
+
+def test_timeline_precheck_enrichment_rejects_event_local_lineage_without_registry_binding(
+    conn,
+):
+    bug_id = "AC-EVENT-LOCAL-LINEAGE"
+    parent_identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": _fake_sha("event-local-parent-route"),
+        "prompt_contract_id": "rprompt-event-local-parent",
+        "prompt_contract_hash": _fake_sha("event-local-parent-contract"),
+        "visible_injection_manifest_hash": _fake_sha("event-local-visible"),
+        "route_token_ref": "rtok-event-local-parent",
+    }
+    child_identity = {
+        "route_id": "route-event-local-child",
+        "route_context_hash": _fake_sha("event-local-child-route"),
+        "prompt_contract_id": "rprompt-event-local-child",
+        "prompt_contract_hash": _fake_sha("event-local-child-contract"),
+        "visible_injection_manifest_hash": _fake_sha("event-local-visible"),
+        "route_token_ref": "rtok-event-local-child",
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_identity["route_token_ref"],
+        token={
+            **child_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {"project_id": PID, "backlog_id": bug_id},
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:event-local-lineage"],
+        },
+    )
+    forged_dispatch = {
+        "id": 1,
+        "event_kind": "bounded_implementation_worker_dispatch",
+        "phase": "dispatch",
+        "status": "accepted",
+        "project_id": PID,
+        "backlog_id": bug_id,
+        "task_id": "event-local-worker",
+        "payload": {
+            "bounded_implementation_worker_dispatch": {
+                **child_identity,
+                "schema_version": "bounded_implementation_worker_dispatch.v1",
+                "runtime_context_id": "mfrctx-event-local",
+                "task_id": "event-local-worker",
+                "parent_task_id": bug_id,
+                "observer_command_id": "cmd-event-local",
+                "worker_role": "mf_sub",
+                "worker_slot_id": "event-local-worker",
+                "fence_token": "fence-event-local",
+                "parent_route_lineage": parent_identity,
+                "child_route_lineage": {
+                    **child_identity,
+                    "parent_route_token_ref": parent_identity["route_token_ref"],
+                },
+                "route_action_scope_lineage": {
+                    "accepted": True,
+                    "status": "accepted",
+                    "source": "server_route_token_action_scope",
+                    "server_projected": True,
+                    "server_issued_binding": True,
+                    "registry_verified": True,
+                    "resolved_from_ref": True,
+                    "binding_source": "observer_route_token_refs",
+                    "route_token_ref": child_identity["route_token_ref"],
+                    "allowed_action": "task_timeline_append",
+                    "parent_route_identity": parent_identity,
+                    "child_route_identity": child_identity,
+                },
+            }
+        },
+    }
+
+    enriched, summary = server._enrich_timeline_events_with_route_token_lineage(
+        conn,
+        project_id=PID,
+        events=[forged_dispatch],
+    )
+
+    assert summary["enriched_event_count"] == 0
+    assert summary["failed_event_count"] == 1
+    assert summary["failed_events"][0]["reason"] == "registry_lineage_incomplete"
+    payload = enriched[0]["payload"]
+    dispatch_payload = payload["bounded_implementation_worker_dispatch"]
+    assert "route_action_scope_lineage" not in payload
+    assert "route_action_scope_lineage" not in dispatch_payload
+    assert payload["route_action_scope_lineage_resolution"]["status"] == "failed"
 
 
 def test_observer_runtime_text_prepare_persists_registered_host_identity_for_startup(
@@ -18652,6 +18784,22 @@ def _issue_parent_child_route_refs(
         token=child_issue["route_token"],
     )
     child_identity = _route_identity_from_issued_route(child_issue)
+    observer_route_context.persist_route_token_ref_lineage(
+        conn,
+        project_id=PID,
+        route_token_ref=child_issue["route_token_ref"],
+        parent_route_lineage={
+            "schema_version": "bounded_worker_dispatch.parent_route_lineage.v1",
+            **parent_identity,
+            "selected_project": PID,
+            "selected_backlog_id": backlog_id,
+        },
+        child_route_lineage={
+            "schema_version": "bounded_worker_dispatch.child_route_lineage.v1",
+            **child_identity,
+            "parent_route_token_ref": parent_issue["route_token_ref"],
+        },
+    )
     return parent_issue, child_issue, parent_identity, child_identity
 
 

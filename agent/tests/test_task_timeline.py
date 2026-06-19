@@ -9541,6 +9541,63 @@ def test_close_gate_accepts_same_backlog_scope_evidence():
     assert gate["rejected_cross_ref_evidence"] == []
 
 
+def test_close_gate_normalizes_structured_scope_for_same_row():
+    from agent.governance import task_timeline
+
+    row_identity = {
+        "backlog_id": "AC-A",
+        "scope": {"backlog_id": "AC-A", "project_id": "aming-claw", "task_id": ""},
+    }
+    same_row = {
+        "id": 1,
+        "event_kind": "close_ready",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "payload": {"scope": {"project_id": "aming-claw", "backlog_id": "AC-A"}},
+    }
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [same_row], row_identity
+    )
+
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+
+
+def test_close_gate_rejects_structured_scope_task_mismatch():
+    from agent.governance import task_timeline
+
+    row_identity = {
+        "backlog_id": "AC-A",
+        "scope": {"backlog_id": "AC-A", "project_id": "aming-claw", "task_id": ""},
+    }
+    worker_scoped = {
+        "id": 1,
+        "event_kind": "implementation",
+        "status": "accepted",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "payload": {
+            "scope": {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-A",
+                "task_id": "worker-task",
+            },
+        },
+    }
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [worker_scoped], row_identity
+    )
+
+    assert gate["passed"] is False
+    rejected = gate["rejected_cross_ref_evidence"][0]
+    assert rejected["mismatches"]["scope"]["expected"] != rejected["mismatches"][
+        "scope"
+    ]["actual"]
+
+
 # ---------------------------------------------------------------------------
 # Multi-lane bridge: one row implemented by >=2 bounded mf_sub lanes under one
 # observer command + route. [AC-CLOSE-CROSS-REF-MULTI-LANE-BRIDGE-20260609]

@@ -5793,10 +5793,64 @@ def mf_blocker_resolution_gate_verification(
     }
 
 
+def _canonical_cross_ref_scope_token(value: Any) -> str:
+    if isinstance(value, Mapping):
+        normalized: dict[str, str] = {}
+        for key, raw in value.items():
+            text = str(raw or "").strip()
+            if text or str(key) == "task_id":
+                normalized[str(key)] = text
+        if any(key in normalized for key in ("project_id", "backlog_id", "task_id")):
+            for key in ("project_id", "backlog_id", "task_id"):
+                normalized.setdefault(key, "")
+        if not normalized:
+            return ""
+        return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    text = str(value or "").strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        if isinstance(decoded, Mapping):
+            return _canonical_cross_ref_scope_token(decoded)
+    return text
+
+
+def _cross_ref_scope_identity(value: Any) -> str:
+    if isinstance(value, Mapping):
+        candidates: list[Any] = []
+        if "scope" in value:
+            candidates.append(value.get("scope"))
+        for container_key in ("payload", "verification", "artifact_refs"):
+            container = _mapping(value.get(container_key))
+            if not container:
+                continue
+            if "scope" in container:
+                candidates.append(container.get("scope"))
+            for child in container.values():
+                child_map = _mapping(child)
+                if "scope" in child_map:
+                    candidates.append(child_map.get("scope"))
+        candidates.append(_first_deep_value(value, "scope"))
+        for candidate in candidates:
+            token = _canonical_cross_ref_scope_token(candidate)
+            if token:
+                return token
+        return ""
+    return _canonical_cross_ref_scope_token(value)
+
+
+def _cross_ref_identity_field(value: Any, field: str) -> str:
+    if field == "scope":
+        return _cross_ref_scope_identity(value)
+    return _first_deep_text(value, field)
+
+
 def _close_evidence_ref_identity(event: dict[str, Any]) -> dict[str, str]:
     identity: dict[str, str] = {}
     for field in MF_CROSS_REF_IDENTITY_FIELDS:
-        value = _first_deep_text(event, field)
+        value = _cross_ref_identity_field(event, field)
         if value:
             identity[field] = value
     return identity
@@ -6289,9 +6343,9 @@ def mf_close_cross_ref_gate_verification(
 
     rows = events if isinstance(events, list) else []
     expected = {
-        field: str((row_identity or {}).get(field) or "").strip()
+        field: token
         for field in MF_CROSS_REF_IDENTITY_FIELDS
-        if str((row_identity or {}).get(field) or "").strip()
+        if (token := _cross_ref_identity_field(row_identity or {}, field))
     }
     # Trusted backlog/project floor (#3090): the caller-supplied row_identity is
     # the ONLY trusted source for the backlog_id/project_id anchor. It is computed
@@ -6317,7 +6371,11 @@ def mf_close_cross_ref_gate_verification(
                 # is the deliberate legacy bridge declaration and may authorize a
                 # foreign value for that single field (e.g. bridged_backlog_id).
                 for value in _field_values(event, {f"bridged_{field}"}):
-                    text = str(value or "").strip()
+                    text = (
+                        _canonical_cross_ref_scope_token(value)
+                        if field == "scope"
+                        else str(value or "").strip()
+                    )
                     if text:
                         bridged.add(f"{field}={text}")
                 # IMPLICIT scrape of the plain `<field>` recurses into nested
@@ -6329,7 +6387,11 @@ def mf_close_cross_ref_gate_verification(
                 # dimensions (route_id, prompt_contract_id, scope) legitimately
                 # vary under one row and are unaffected.
                 for value in _field_values(event, {field}):
-                    text = str(value or "").strip()
+                    text = (
+                        _canonical_cross_ref_scope_token(value)
+                        if field == "scope"
+                        else str(value or "").strip()
+                    )
                     if not text:
                         continue
                     if (
