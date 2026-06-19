@@ -3640,17 +3640,6 @@ def mf_route_context_gate_verification(
 
     for raw_event in rows:
         event = _mapping(raw_event)
-        if not event or parent_route_identity_hint:
-            continue
-        categories = _route_event_categories(event)
-        if "route_context" not in categories:
-            continue
-        identity = _route_identity(event)
-        if identity and _route_event_passed(event):
-            parent_route_identity_hint = identity
-
-    for raw_event in rows:
-        event = _mapping(raw_event)
         if not event or not _route_event_is_identity_cleanup(event):
             continue
         identity = _route_identity(event)
@@ -3670,6 +3659,18 @@ def mf_route_context_gate_verification(
                 "reason": "invalid_route_identity_cleanup",
                 "categories": ["route_identity_cleanup"],
             })
+    parent_route_identity_hint = dict(cleanup_identity)
+    if not parent_route_identity_hint:
+        for raw_event in rows:
+            event = _mapping(raw_event)
+            if not event or parent_route_identity_hint:
+                continue
+            categories = _route_event_categories(event)
+            if "route_context" not in categories:
+                continue
+            identity = _route_identity(event)
+            if identity and _route_event_passed(event):
+                parent_route_identity_hint = identity
     superseded_event_count = 0
 
     for index, raw_event in enumerate(rows):

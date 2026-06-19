@@ -7284,6 +7284,82 @@ class TestTaskTimeline(unittest.TestCase):
             0,
         )
 
+    def test_route_identity_cleanup_seeds_parent_hint_for_startup_route_gate(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-ROUTE-CLEANUP-PARENT-HINT",
+        }
+        canonical = dict(ROUTE_IDENTITY)
+        stale_identity = {
+            "route_context_hash": _fake_sha("stale-route-context"),
+            "prompt_contract_id": "rprompt-stale-route",
+            "prompt_contract_hash": _fake_sha("stale-prompt-contract"),
+        }
+        child_identity = {
+            "route_context_hash": _fake_sha("child-startup-route-context"),
+            "prompt_contract_id": "rprompt-child-startup",
+            "prompt_contract_hash": _fake_sha("child-startup-contract"),
+        }
+        stale_route_context = _route_context_consumption_events(stale_identity)[0]
+        canonical_route_context, canonical_precheck, canonical_dispatch, _ = (
+            _route_context_consumption_events(canonical)
+        )
+        canonical_qa = _route_context_qa_verification_event(canonical)
+        canonical_read_receipt = _mf_subagent_read_receipt_event(
+            event_id=6,
+            identity=canonical,
+        )
+        child_startup = _route_context_worker_startup_event(child_identity)
+        child_startup["event_id"] = "tl-child-startup"
+        child_startup["payload"]["mf_subagent_startup_gate"].update(
+            {
+                "route_token_ref": "rtok-canonical",
+                "read_receipt_event_id": "6",
+                "read_receipt_hash": "sha256:test-read-receipt",
+                "identity_join": {
+                    "route_identity_matches_latest_contract": True,
+                    "read_receipt_lineage_present": True,
+                },
+            }
+        )
+        cleanup = {
+            "event_kind": "route_identity_cleanup",
+            "phase": "identity_recovery",
+            "status": "accepted",
+            "payload": {
+                "route_identity_cleanup": {
+                    **canonical,
+                    "reason": "Supersede stale route context before worker evidence.",
+                }
+            },
+        }
+
+        gate = task_timeline.mf_route_context_gate_verification(
+            [
+                stale_route_context,
+                cleanup,
+                canonical_route_context,
+                canonical_precheck,
+                canonical_dispatch,
+                canonical_qa,
+                canonical_read_receipt,
+                child_startup,
+            ],
+            contract=contract,
+        )
+
+        self.assertEqual(gate["missing_requirement_ids"], [], gate)
+        self.assertNotIn("mf_subagent_startup", gate["missing_requirement_ids"])
+        self.assertNotIn("route_action_precheck", gate["missing_requirement_ids"])
+        self.assertEqual(gate["route_identity"], canonical)
+        self.assertEqual(
+            gate["accepted_startup_lineages"][0]["acceptance_source"],
+            "identity_join_latest_contract",
+        )
+        self.assertTrue(gate["route_identity_cleanup"]["applied"])
+
     def test_observer_command_terminal_projection_uses_canonical_close_evidence(self):
         from agent.governance import task_timeline
 
