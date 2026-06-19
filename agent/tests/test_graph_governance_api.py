@@ -2915,6 +2915,168 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
     assert not cross_ref_gate["rejected_cross_ref_evidence"]
 
 
+def test_observer_runtime_text_prepare_prefers_registered_parent_lineage_without_explicit_parent(
+    conn,
+    tmp_path,
+):
+    bug_id = "AC-RUNTIME-TEXT-REGISTERED-PARENT"
+    task_id = "runtime-text-registered-parent-task"
+    runtime_context_id = "mfrctx-runtime-text-registered-parent"
+    worktree = tmp_path / "registered-parent-worker"
+    worktree.mkdir()
+    main = tmp_path / "registered-parent-main"
+    main.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=bug_id,
+            root_task_id=bug_id,
+            stage_task_id=task_id,
+            stage_type="mf_sub",
+            worker_id="worker-registered-parent",
+            attempt=1,
+            fence_token="fence-runtime-text-registered-parent",
+            branch_ref="refs/heads/codex/runtime-text-registered-parent",
+            worktree_id="wt-runtime-text-registered-parent",
+            worktree_path=str(worktree),
+            base_commit="base-registered-parent",
+            target_head_commit="target-registered-parent",
+            merge_queue_id="mq-runtime-text-registered-parent",
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    server.handle_backlog_upsert(
+        _ctx(
+            {"project_id": PID, "bug_id": bug_id},
+            method="POST",
+            body={
+                "title": "Runtime text registered parent lineage",
+                "status": "OPEN",
+                "mf_type": "observer_hotfix",
+                "force_admit": True,
+                "chain_trigger_json": {
+                    "parallel_contract": {
+                        "template_id": "mf_parallel.v1",
+                        "contract_instance_id": bug_id,
+                    }
+                },
+            },
+        )
+    )
+    parent_identity = {
+        "route_id": "event.route_prompt_context.preview",
+        "route_context_hash": _fake_sha("registered-parent-route"),
+        "prompt_contract_id": "rprompt-registered-parent",
+        "prompt_contract_hash": _fake_sha("registered-parent-contract"),
+        "visible_injection_manifest_hash": _fake_sha("registered-visible"),
+        "route_token_ref": "rtok-registered-parent",
+    }
+    child_identity = {
+        "route_id": "route-registered-child",
+        "route_context_hash": _fake_sha("registered-child-route"),
+        "prompt_contract_id": "rprompt-registered-child",
+        "prompt_contract_hash": _fake_sha("registered-child-contract"),
+        "visible_injection_manifest_hash": _fake_sha("registered-visible"),
+        "route_token_ref": "rtok-registered-child",
+    }
+    parent_lineage = {
+        **parent_identity,
+        "schema_version": "parent_route_lineage.v1",
+        "selected_project": PID,
+        "selected_backlog_id": bug_id,
+        "binding_status": "parent_bound",
+        "binding_source": "route_context_registry",
+    }
+    child_lineage = {
+        **child_identity,
+        "schema_version": "child_route_lineage.v1",
+        "project_id": PID,
+        "backlog_id": bug_id,
+        "task_id": task_id,
+        "caller_role": "observer",
+        "allowed_actions": ["task_timeline_append"],
+        "blocked_actions": [],
+        "parent_route_token_ref": parent_identity["route_token_ref"],
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_identity["route_token_ref"],
+        token={
+            **child_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {"project_id": PID, "backlog_id": bug_id},
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:runtime-text-registered-parent"],
+            "parent_route_lineage": parent_lineage,
+            "child_route_lineage": child_lineage,
+        },
+    )
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": bug_id,
+                "observer_command_id": "cmd-runtime-text-registered-parent",
+                "task_id": task_id,
+                "parent_task_id": bug_id,
+                "runtime_context_id": runtime_context_id,
+                "fence_token": "fence-runtime-text-registered-parent",
+                "worktree_path": str(worktree),
+                "base_commit": "base-registered-parent",
+                "target_head_commit": "target-registered-parent",
+                "merge_queue_id": "mq-runtime-text-registered-parent",
+                **child_identity,
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-text-registered-parent"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["dispatch_timeline_event"]["status"] == "recorded"
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=bug_id,
+        task_id=task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["route_id"] == child_identity["route_id"]
+    assert dispatch_payload["parent_route_lineage"]["route_id"] == (
+        parent_identity["route_id"]
+    )
+    assert dispatch_payload["parent_route_lineage"]["route_context_hash"] == (
+        parent_identity["route_context_hash"]
+    )
+    assert dispatch_payload["child_route_lineage"]["route_id"] == (
+        child_identity["route_id"]
+    )
+    assert dispatch_payload["child_route_lineage"]["parent_route_token_ref"] == (
+        parent_identity["route_token_ref"]
+    )
+    assert dispatch_payload["route_token_registry_proof"]["accepted"] is True
+    assert "reason" not in dispatch_payload["route_token_registry_proof"]
+    assert dispatch_payload["route_action_scope_lineage"]["registry_verified"] is True
+    assert dispatch_payload["route_action_scope_lineage"]["parent_route_identity"][
+        "route_context_hash"
+    ] == parent_identity["route_context_hash"]
+    assert dispatch_payload["route_action_scope_lineage"]["child_route_identity"][
+        "route_context_hash"
+    ] == child_identity["route_context_hash"]
+
+
 def test_timeline_precheck_enrichment_rejects_event_local_lineage_without_registry_binding(
     conn,
 ):

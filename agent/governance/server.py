@@ -28887,6 +28887,62 @@ def _record_bounded_worker_dispatch_event(
                 prompt_contract_id=str(dispatch.get("prompt_contract_id") or ""),
             )
             if resolved:
+                registered_parent_lineage = (
+                    resolved.get("parent_route_lineage")
+                    if isinstance(resolved.get("parent_route_lineage"), Mapping)
+                    else {}
+                )
+                registered_child_lineage = (
+                    resolved.get("child_route_lineage")
+                    if isinstance(resolved.get("child_route_lineage"), Mapping)
+                    else {}
+                )
+                if (
+                    registered_parent_lineage
+                    and not isinstance(body.get("parent_route_identity"), Mapping)
+                ):
+                    parent_route_lineage = dict(registered_parent_lineage)
+                    dispatch["parent_route_lineage"] = dict(parent_route_lineage)
+                    parent_route_token_ref = _first_text(
+                        parent_route_lineage.get("route_token_ref"),
+                        parent_route_lineage.get("parent_route_token_ref"),
+                    )
+                    if registered_child_lineage:
+                        child_route_lineage = dict(registered_child_lineage)
+                        for key in (
+                            "route_id",
+                            "route_context_hash",
+                            "prompt_contract_id",
+                            "prompt_contract_hash",
+                            "visible_injection_manifest_hash",
+                            "route_token_ref",
+                        ):
+                            if not child_route_lineage.get(key):
+                                child_route_lineage[key] = dispatch.get(key) or ""
+                        if not child_route_lineage.get("parent_route_token_ref"):
+                            child_route_lineage["parent_route_token_ref"] = (
+                                parent_route_token_ref
+                            )
+                    else:
+                        child_route_lineage = {
+                            "schema_version": "bounded_worker_dispatch.child_route_lineage.v1",
+                            "route_id": dispatch.get("route_id") or "",
+                            "route_context_hash": dispatch.get("route_context_hash")
+                            or "",
+                            "prompt_contract_id": dispatch.get("prompt_contract_id")
+                            or "",
+                            "prompt_contract_hash": dispatch.get(
+                                "prompt_contract_hash"
+                            )
+                            or "",
+                            "route_token_ref": dispatch.get("route_token_ref") or "",
+                            "visible_injection_manifest_hash": dispatch.get(
+                                "visible_injection_manifest_hash"
+                            )
+                            or "",
+                            "parent_route_token_ref": parent_route_token_ref,
+                        }
+                    dispatch["child_route_lineage"] = dict(child_route_lineage)
                 registered_lineage = _orc.persist_route_token_ref_lineage(
                     conn,
                     project_id=project_id,
