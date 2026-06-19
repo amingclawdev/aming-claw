@@ -682,9 +682,17 @@ def _runtime_text_child_dispatch_event(
     parent_task_id="BUG-DOGFOOD",
     fence_token="fence-dogfood",
     route_token_ref="rtok-child-dispatch",
+    parent_route_token_ref="rtok-parent-dispatch",
+    parent_identity=None,
+    parent_route_lineage=None,
+    child_route_lineage=None,
+    include_parent_route_lineage=True,
+    include_child_route_lineage=True,
+    worker_role="mf_sub",
     strict_lineage=True,
 ):
     route_identity = dict(identity or ROUTE_IDENTITY)
+    parent_route_identity = dict(parent_identity or ROUTE_IDENTITY)
     dispatch = _runtime_contract_bounded_dispatch_event(
         route_identity,
         runtime_context_id=runtime_context_id,
@@ -698,10 +706,33 @@ def _runtime_text_child_dispatch_event(
             "route_id": "route-runtime-text-child-dispatch",
             "route_token_ref": route_token_ref,
             "worker_id": "mfsub-dogfood",
+            "worker_role": worker_role,
             "source": "observer_runtime_text_prepare" if strict_lineage else "",
             "service_generated": bool(strict_lineage),
         }
     )
+    if include_parent_route_lineage:
+        payload["parent_route_lineage"] = {
+            "schema_version": "bounded_worker_dispatch.parent_route_lineage.v1",
+            "backlog_id": parent_task_id,
+            "route_id": "event.route_prompt_context.preview",
+            "route_token_ref": parent_route_token_ref,
+            "visible_injection_manifest_hash": "sha256:test-visible-manifest",
+            **parent_route_identity,
+            **dict(parent_route_lineage or {}),
+        }
+    if include_child_route_lineage:
+        payload["child_route_lineage"] = {
+            "schema_version": "bounded_worker_dispatch.child_route_lineage.v1",
+            "route_id": payload["route_id"],
+            "route_token_ref": route_token_ref,
+            "parent_route_token_ref": parent_route_token_ref,
+            "visible_injection_manifest_hash": payload[
+                "visible_injection_manifest_hash"
+            ],
+            **route_identity,
+            **dict(child_route_lineage or {}),
+        }
     dispatch["event_id"] = "tl-child-dispatch"
     dispatch["task_id"] = task_id
     dispatch["correlation_id"] = route_token_ref
@@ -6433,7 +6464,7 @@ class TestTaskTimeline(unittest.TestCase):
 
         contract = {
             "template_id": "mf_parallel.v1",
-            "contract_instance_id": "BUG-CHILD-DISPATCH-LINEAGE",
+            "contract_instance_id": "BUG-DOGFOOD",
         }
         child_identity = {
             "route_context_hash": _fake_sha("child-runtime-text-route"),
@@ -6552,6 +6583,96 @@ class TestTaskTimeline(unittest.TestCase):
         route_gate = blocked["route_context_gate"]
         self.assertIn("route_identity_mismatch", route_gate["missing_requirement_ids"])
         self.assertEqual(route_gate["accepted_dispatch_lineages"], [])
+
+    def test_mf_parallel_close_gate_rejects_strict_looking_wrong_child_dispatch_lineage(self):
+        from agent.governance import task_timeline
+
+        child_identity = {
+            "route_context_hash": _fake_sha("strict-looking-child-route"),
+            "prompt_contract_id": "rprompt-strict-looking-child",
+            "prompt_contract_hash": _fake_sha("strict-looking-child-contract"),
+        }
+        cases = [
+            (
+                "wrong_parent_task",
+                {
+                    "parent_task_id": "OTHER-BUG",
+                },
+                "parent_task_id_mismatch",
+            ),
+            (
+                "wrong_parent_route_identity",
+                {
+                    "parent_route_lineage": {
+                        "route_context_hash": _fake_sha("wrong-parent-route")
+                    },
+                },
+                "parent_route_lineage_mismatch",
+            ),
+            (
+                "wrong_token_binding",
+                {
+                    "child_route_lineage": {
+                        "parent_route_token_ref": "rtok-unrelated-parent"
+                    },
+                },
+                "route_token_ref_binding_mismatch",
+            ),
+            (
+                "missing_parent_route_lineage",
+                {
+                    "include_parent_route_lineage": False,
+                },
+                "missing_parent_route_lineage",
+            ),
+            (
+                "missing_child_route_lineage",
+                {
+                    "include_child_route_lineage": False,
+                },
+                "missing_child_route_lineage",
+            ),
+            (
+                "missing_worker_role",
+                {
+                    "worker_role": "",
+                },
+                "missing_or_invalid_worker_role",
+            ),
+        ]
+        for name, kwargs, reason in cases:
+            with self.subTest(name=name):
+                route_context, route_action, _parent_dispatch, _startup = (
+                    _route_context_consumption_events()
+                )
+                dispatch_kwargs = {
+                    "parent_task_id": "BUG-DOGFOOD",
+                    "task_id": "worker-task-dogfood",
+                    "runtime_context_id": "mfrctx-dogfood",
+                    "route_token_ref": "rtok-child-dispatch",
+                    **kwargs,
+                }
+                child_dispatch = _runtime_text_child_dispatch_event(
+                    child_identity,
+                    **dispatch_kwargs,
+                )
+                contract = {
+                    "template_id": "mf_parallel.v1",
+                    "contract_instance_id": "BUG-DOGFOOD",
+                }
+
+                gate = task_timeline.mf_route_context_gate_verification(
+                    [route_context, route_action, child_dispatch],
+                    contract=contract,
+                )
+
+                self.assertFalse(gate["passed"], gate)
+                self.assertIn("route_identity_mismatch", gate["missing_requirement_ids"])
+                self.assertEqual(gate["accepted_dispatch_lineages"], [])
+                self.assertEqual(
+                    gate["rejected_dispatch_lineages"][0]["reason"],
+                    reason,
+                )
 
     def test_mf_parallel_close_gate_rejects_generated_runtime_text_startup_intent(self):
         from agent.governance import task_timeline
@@ -8621,6 +8742,107 @@ class TestTaskTimeline(unittest.TestCase):
         )
         self.assertTrue(compact["can_close"], compact)
         self.assertEqual(compact["gate_summary"]["failed_gates"], [])
+
+    def test_backlog_close_refuses_wrong_parent_child_dispatch_bypass(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-MF-CHILD-DISPATCH-CLOSE-BYPASS"
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": bug_id},
+                body={
+                    "title": "MF forged child dispatch close bypass",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        "parallel_contract": {
+                            "template_id": "mf_parallel.v1",
+                            "contract_instance_id": bug_id,
+                        }
+                    },
+                },
+                method="POST",
+            )
+        )
+        child_identity = {
+            "route_context_hash": _fake_sha("forged-close-child-route"),
+            "prompt_contract_id": "rprompt-forged-close-child",
+            "prompt_contract_hash": _fake_sha("forged-close-child-contract"),
+        }
+        route_context, route_action, _parent_dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        forged_child_dispatch = _runtime_text_child_dispatch_event(
+            child_identity,
+            parent_task_id="OTHER-BUG",
+            task_id=f"{bug_id}-impl-b",
+            runtime_context_id="mfrctx-forged-close-child",
+            route_token_ref="rtok-forged-close-child",
+        )
+        child_startup = _runtime_text_actual_startup_event(child_identity)
+        child_startup["backlog_id"] = bug_id
+        child_startup["task_id"] = f"{bug_id}-impl-b"
+        child_startup["payload"]["mf_subagent_startup_gate"].update(
+            {
+                "route_id": "route-runtime-text-child-dispatch",
+                "runtime_context_id": "mfrctx-forged-close-child",
+                "task_id": f"{bug_id}-impl-b",
+                "parent_task_id": bug_id,
+                "worker_slot_id": "mfsub-dogfood",
+                "worker_id": "mfsub-dogfood",
+                "route_token_ref": "rtok-forged-close-child",
+                "read_receipt_event_id": "tl-forged-read-receipt",
+                "read_receipt_hash": "sha256:test-read-receipt",
+                "identity_join": {
+                    "route_identity_matches_latest_contract": True,
+                    "read_receipt_lineage_present": True,
+                },
+            }
+        )
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            route_context,
+            route_action,
+            forged_child_dispatch,
+            child_startup,
+            _route_context_qa_verification_event(),
+        ]
+        for event in events:
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=event.get("task_id", ""),
+                event_type=f"mf.{event['event_kind']}",
+                phase=event.get("phase", ""),
+                event_kind=event.get("event_kind", ""),
+                status=event.get("status", ""),
+                payload=event.get("payload"),
+                verification=event.get("verification"),
+                artifact_refs=event.get("artifact_refs"),
+            )
+        self.conn.commit()
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_backlog_close(
+                _ctx(
+                    path_params={"bug_id": bug_id},
+                    body={
+                        "actor": "observer",
+                        "route_waiver": _route_waiver("backlog_close", bug_id),
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "mf_timeline_gate_failed")
+        self.assertIn("route_identity_mismatch", str(raised.exception))
+        row = server.handle_backlog_get(_ctx(path_params={"bug_id": bug_id}))
+        self.assertNotEqual(row["status"], "FIXED")
 
     def test_backlog_close_handler_loads_instantiated_contract(self):
         from agent.governance import server, task_timeline
