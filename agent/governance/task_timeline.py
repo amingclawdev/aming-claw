@@ -3345,6 +3345,123 @@ def _route_action_scoped_verification_identity(
     }
 
 
+def _route_action_scoped_child_identity(
+    value: Any,
+    identity: dict[str, str],
+    *,
+    parent_identity_hint: Mapping[str, Any] | None = None,
+    expected_parent_task_id: str = "",
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Normalize registry-backed child route evidence back to the parent route."""
+
+    if not identity:
+        return identity, {}
+    parent_hint = {
+        field: token
+        for field, token in _route_lineage_identity_hint(parent_identity_hint).items()
+    }
+    if not parent_hint or _route_identity_key(identity) == _route_identity_key(parent_hint):
+        return identity, {}
+
+    route_token_ref = _first_deep_text(value, "route_token_ref")
+    route_lineage = _route_action_scope_server_lineage(
+        value,
+        identity,
+        parent_hint,
+        route_token_ref,
+    )
+    if not route_lineage:
+        return identity, {}
+
+    parent_task_id = _first_deep_text(value, "parent_task_id")
+    expected_parent = str(expected_parent_task_id or "").strip()
+    runtime_context_id = _first_deep_text(value, "runtime_context_id")
+    task_id = _first_deep_text(value, "task_id")
+    worker_slot_id = (
+        _first_deep_text(value, "worker_slot_id")
+        or _first_deep_text(value, "worker_id")
+    )
+    missing = [
+        field
+        for field, token in {
+            "route_token_ref": route_token_ref,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_slot_id": worker_slot_id,
+        }.items()
+        if not token
+    ]
+    if expected_parent and parent_task_id and parent_task_id != expected_parent:
+        missing.append("parent_task_id_matches_root_backlog")
+    if missing:
+        return identity, {
+            "schema_version": "registry_backed_child_route_identity.v1",
+            "accepted": False,
+            "reason": "missing_runtime_context_lineage",
+            "missing_fields": missing,
+            "server_lineage": route_lineage,
+        }
+
+    return dict(parent_hint), {
+        "schema_version": "registry_backed_child_route_identity.v1",
+        "accepted": True,
+        "acceptance_source": route_lineage.get(
+            "acceptance_source",
+            "server_backed_route_token_action_scope",
+        ),
+        "route_token_ref": route_token_ref,
+        "server_lineage": route_lineage,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_slot_id": worker_slot_id,
+        "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
+        "child_route_context_hash": identity.get("route_context_hash", ""),
+        "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
+        "child_prompt_contract_id": identity.get("prompt_contract_id", ""),
+    }
+
+
+def _route_independent_verification_row_scoped(event: dict[str, Any]) -> bool:
+    """Return true for independent QA that proves row scope without route adoption."""
+
+    if not _route_event_passed(event) or not _independent_qa_event_kind_matches(event):
+        return False
+    reviewer_identity = _independent_qa_reviewer_identity(event)
+    reviewer = reviewer_identity.strip().lower()
+    if (
+        not reviewer_identity
+        or reviewer in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS
+        or _is_independent_qa_observer_transport(event)
+    ):
+        return False
+    route_gate = _first_deep_mapping(event, "route_token_gate")
+    if not route_gate:
+        return False
+    status = str(
+        route_gate.get("status") or route_gate.get("decision") or ""
+    ).strip().lower()
+    gate_passed = bool(
+        _truthy(route_gate.get("allowed"))
+        or _truthy(route_gate.get("accepted"))
+        or status in MF_ROUTE_CONTEXT_PASS_STATUSES
+    )
+    server_backed = bool(
+        _truthy(route_gate.get("resolved_from_ref"))
+        or _truthy(route_gate.get("server_issued_binding"))
+        or _truthy(route_gate.get("registry_verified"))
+        or str(route_gate.get("binding_source") or "").strip()
+        == "observer_route_token_refs"
+    )
+    lineage_present = bool(
+        _first_deep_mapping(event, "route_action_scope_lineage")
+        or _first_deep_mapping(event, "parent_route_lineage")
+        or _first_deep_mapping(route_gate, "parent_route_lineage")
+    )
+    return bool(gate_passed and server_backed and lineage_present)
+
+
 def _route_visible_manifest_present(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -4336,6 +4453,23 @@ def mf_route_context_gate_verification(
                         "status": event.get("status") or event.get("decision"),
                     },
                 })
+        if "route_context" in categories:
+            normalized_identity, lineage = _route_action_scoped_child_identity(
+                event,
+                normalized_identity,
+                parent_identity_hint=parent_route_identity_hint,
+                expected_parent_task_id=expected_parent_task_id,
+            )
+            if lineage:
+                accepted_action_scope_lineages.append({
+                    **lineage,
+                    "event": {
+                        "id": event.get("id") or event.get("event_id"),
+                        "event_kind": event.get("event_kind"),
+                        "phase": event.get("phase"),
+                        "status": event.get("status") or event.get("decision"),
+                    },
+                })
         if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in categories:
             normalized_identity, lineage = _route_action_scoped_verification_identity(
                 event,
@@ -4428,12 +4562,20 @@ def mf_route_context_gate_verification(
                 parent_route_identity_hint,
             )
         ):
-            ignored.append({
-                **event_ref,
-                "reason": "independent_verification_route_lineage_untrusted",
-                "categories": [MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID],
-            })
-            route_identity_mismatch_seen = True
+            if _route_independent_verification_row_scoped(event):
+                present[MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID].append(event_ref)
+                ignored.append({
+                    **event_ref,
+                    "reason": "independent_verification_row_scoped_route_identity_not_adopted",
+                    "categories": [MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID],
+                })
+            else:
+                ignored.append({
+                    **event_ref,
+                    "reason": "independent_verification_route_lineage_untrusted",
+                    "categories": [MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID],
+                })
+                route_identity_mismatch_seen = True
             categories = set(categories)
             categories.discard(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
             if not categories:
@@ -4450,6 +4592,35 @@ def mf_route_context_gate_verification(
             if category in present:
                 present[category].append(event_ref)
                 identities[category].append(normalized_identity)
+
+    runtime_lineage_identity_filter: dict[str, Any] = {}
+    if parent_route_identity_hint and (
+        accepted_dispatch_lineages
+        or accepted_startup_lineages
+        or accepted_action_scope_lineages
+    ):
+        filtered_categories: list[str] = []
+        parent_filter = _route_lineage_identity_hint(parent_route_identity_hint)
+        for category_id in required_requirement_ids:
+            if category_id == MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID:
+                continue
+            category_identities = identities.get(category_id) or []
+            matching = [
+                identity
+                for identity in category_identities
+                if _route_identity_matches_filter(identity, parent_filter)
+            ]
+            if matching and len(matching) != len(category_identities):
+                identities[category_id] = matching
+                filtered_categories.append(category_id)
+        if filtered_categories:
+            runtime_lineage_identity_filter = {
+                "schema_version": "route_context_runtime_lineage_identity_filter.v1",
+                "applied": True,
+                "filtered_requirement_ids": filtered_categories,
+                "parent_route_identity": parent_filter,
+                "reason": "registry_backed_runtime_lineage_supersedes_stale_sibling_route_identity",
+            }
 
     missing = [req_id for req_id in required_requirement_ids if required and not present[req_id]]
     identity_keys = {
@@ -4552,6 +4723,7 @@ def mf_route_context_gate_verification(
         "rejected_dispatch_lineages": rejected_dispatch_lineages,
         "accepted_startup_lineages": accepted_startup_lineages,
         "accepted_action_scope_lineages": accepted_action_scope_lineages,
+        "runtime_lineage_identity_filter": runtime_lineage_identity_filter,
         "runtime_context_projection_evidence_fields": {
             "schema_version": "runtime_context.timeline_evidence_fields.v1",
             "startup": list(RUNTIME_CONTEXT_TIMELINE_STARTUP_FIELDS),
@@ -6147,8 +6319,7 @@ def _cross_ref_route_token_child_lineage_diagnosis(
             missing.append("fence_token_redacted")
     if not command:
         missing.append("observer_command_id")
-    elif row_command and command != row_command:
-        missing.append("observer_command_id_matches_row")
+    command_superseded_by_registry_lineage = False
     if not canonical_route_scope.get("route_context_hash"):
         missing.append("canonical_parent_route_context_hash")
     if not canonical_route_scope.get("prompt_contract_id"):
@@ -6166,6 +6337,8 @@ def _cross_ref_route_token_child_lineage_diagnosis(
             missing.append("route_token_registry_proof")
         elif route_lineage.get("allowed_action") not in {"", "task_timeline_append"}:
             missing.append("allowed_action")
+        elif row_command and command and command != row_command:
+            command_superseded_by_registry_lineage = True
     accepted = bool(route_lineage and not missing)
     event_scope_complete = bool(accepted or missing == ["route_token_registry_proof"])
     registry_verified = bool(accepted and route_lineage.get("server_backed"))
@@ -6206,6 +6379,9 @@ def _cross_ref_route_token_child_lineage_diagnosis(
             for key, value in {
                 "observer_command_id": command,
                 "row_command": row_command,
+                "row_command_superseded_by_registry_lineage": (
+                    "true" if command_superseded_by_registry_lineage else ""
+                ),
             }.items()
             if value
         },
@@ -6927,6 +7103,98 @@ def mf_fixed_close_waiver_alert(
     }
 
 
+def _route_context_gate_with_independent_qa(
+    route_context_gate: Mapping[str, Any],
+    independent_qa_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    gate = dict(route_context_gate or {})
+    if not gate or not independent_qa_gate.get("passed"):
+        return gate
+    missing = [
+        str(item)
+        for item in _list(gate.get("missing_requirement_ids"))
+        if str(item)
+    ]
+    if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID not in missing:
+        return gate
+    accepted_runtime_child_lineage = False
+    for lineage in _list(gate.get("accepted_action_scope_lineages")):
+        if not isinstance(lineage, Mapping):
+            continue
+        server_lineage = _mapping(lineage.get("server_lineage"))
+        server_backed = bool(
+            _truthy(server_lineage.get("server_backed"))
+            or _truthy(server_lineage.get("registry_verified"))
+            or _truthy(server_lineage.get("resolved_from_ref"))
+        )
+        has_runtime_child_fields = all(
+            str(lineage.get(field) or "").strip()
+            for field in (
+                "route_token_ref",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_slot_id",
+            )
+        )
+        if bool(lineage.get("accepted")) and server_backed and has_runtime_child_fields:
+            accepted_runtime_child_lineage = True
+            break
+    if not accepted_runtime_child_lineage:
+        return gate
+
+    missing = [
+        item
+        for item in missing
+        if item != MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID
+    ]
+    checks = dict(_mapping(gate.get("checks")))
+    if (
+        "route_identity_mismatch" in missing
+        and checks.get("same_route_identity")
+        and checks.get("same_optional_route_id")
+        and checks.get("same_optional_prompt_contract_hash")
+    ):
+        missing = [item for item in missing if item != "route_identity_mismatch"]
+        gate["route_identity_mismatch_satisfied_by"] = (
+            "independent_qa_gate_row_scoped_verification"
+        )
+    present = [
+        str(item)
+        for item in _list(gate.get("present_requirement_ids"))
+        if str(item)
+    ]
+    if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID not in present:
+        present.append(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+    evidence_events = dict(_mapping(gate.get("evidence_events")))
+    if not evidence_events.get(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID):
+        evidence_events[MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID] = [
+            {
+                "id": item.get("id"),
+                "event_kind": item.get("event_kind"),
+                "phase": item.get("phase"),
+                "status": item.get("status"),
+                "actor": item.get("actor"),
+                "reviewer_identity": item.get("reviewer_identity"),
+                "source_gate": "independent_qa_gate",
+            }
+            for item in _list(independent_qa_gate.get("evidence_events"))
+            if isinstance(item, Mapping)
+        ]
+    checks["independent_verification_lane_present"] = True
+    checks["independent_verification_satisfied_by_independent_qa_gate"] = True
+    gate["missing_requirement_ids"] = missing
+    gate["present_requirement_ids"] = present
+    gate["evidence_events"] = evidence_events
+    gate["checks"] = checks
+    gate["independent_verification_satisfied_by"] = "independent_qa_gate"
+    if not missing:
+        gate["passed"] = True
+        gate["status"] = "passed"
+        gate["next_legal_action"] = "retry_close_with_accepted_route_context_evidence"
+    return gate
+
+
 def mf_close_gate_verification(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
@@ -7002,6 +7270,10 @@ def mf_close_gate_verification(
     lane_ownership_gate = mf_lane_ownership_gate_verification(rows, contract)
     worker_graph_trace_gate = _worker_graph_trace_gate(rows, governance_policy)
     independent_qa_gate = _independent_qa_gate(rows, governance_policy, contract=contract)
+    route_context_gate = _route_context_gate_with_independent_qa(
+        route_context_gate,
+        independent_qa_gate,
+    )
     contract_projection = mf_contract_projection(
         rows,
         contract,

@@ -507,6 +507,168 @@ def test_route_context_gate_accepts_registry_backed_child_startup_lineage():
     assert startup_lineage["server_lineage"]["registry_verified"] is True
 
 
+def test_route_context_gate_adopts_registry_child_lineage_over_stale_route_noise():
+    from agent.governance import task_timeline
+
+    parent_identity = {
+        **ROUTE_IDENTITY,
+        "route_id": "route-runtime-parent",
+        "route_token_ref": "rtok-parent",
+        "visible_injection_manifest_hash": _fake_sha("runtime-parent-visible"),
+    }
+    stale_identity = {
+        **ROUTE_IDENTITY,
+        "route_id": "route-stale-precheck",
+        "route_context_hash": _fake_sha("stale-route-context"),
+        "prompt_contract_id": "rprompt-stale-precheck",
+        "prompt_contract_hash": _fake_sha("stale-prompt-contract"),
+        "visible_injection_manifest_hash": _fake_sha("stale-visible"),
+    }
+    child_identity = {
+        **parent_identity,
+        "route_id": "route-runtime-child",
+        "route_context_hash": _fake_sha("runtime-child-route"),
+        "prompt_contract_id": "rprompt-runtime-child",
+        "prompt_contract_hash": _fake_sha("runtime-child-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("runtime-child-visible"),
+        "route_token_ref": "rtok-runtime-child",
+    }
+    dispatch = {
+        "id": 4,
+        "event_kind": "bounded_implementation_worker_dispatch",
+        "phase": "dispatch",
+        "status": "accepted",
+        "payload": {
+            **parent_identity,
+            "runtime_context_id": "mfrctx-runtime-child",
+            "task_id": "worker-runtime-child",
+            "parent_task_id": "AC-RUNTIME-PARENT",
+            "worker_role": "mf_sub",
+            "worker_slot_id": "worker-runtime-slot",
+            "fence_token": "fence-runtime-child",
+        },
+    }
+    startup = {
+        "id": 5,
+        "event_kind": "mf_subagent_startup",
+        "phase": "startup_gate",
+        "status": "passed",
+        "payload": {
+            **child_identity,
+            "runtime_context_id": "mfrctx-runtime-child",
+            "task_id": "worker-runtime-child",
+            "parent_task_id": "AC-RUNTIME-PARENT",
+            "worker_slot_id": "worker-runtime-slot",
+            "observer_command_id": "cmd-runtime-rerun",
+            "actual_cwd": "/repo/.worktrees/worker-runtime-child",
+            "actual_git_root": "/repo/.worktrees/worker-runtime-child",
+            "branch": "refs/heads/codex/runtime-child",
+            "head_commit": "head-runtime-child",
+            "fence_token": "fence-runtime-child",
+        },
+    }
+    startup = _attach_server_action_scope_route_token_lineage(
+        startup,
+        child_identity,
+        parent_identity=parent_identity,
+        route_token_ref="rtok-runtime-child",
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+    implementation = {
+        "id": 6,
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "status": "passed",
+        "payload": {
+            **child_identity,
+            "runtime_context_id": "mfrctx-runtime-child",
+            "task_id": "worker-runtime-child",
+            "parent_task_id": "AC-RUNTIME-PARENT",
+            "worker_slot_id": "worker-runtime-slot",
+        },
+    }
+    implementation = _attach_server_action_scope_route_token_lineage(
+        implementation,
+        child_identity,
+        parent_identity=parent_identity,
+        route_token_ref="rtok-runtime-child",
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+    independent_qa = {
+        "id": 7,
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa-reviewer",
+        "status": "passed",
+        "payload": {
+            **stale_identity,
+            "reviewer_role": "qa",
+            "route_token_ref": "rtok-stale-parent",
+            "route_token_gate": {
+                **stale_identity,
+                "action": "task_timeline_append",
+                "allowed": True,
+                "decision": "route_token_ref_resolved",
+                "resolved_from_ref": True,
+                "server_issued_binding": True,
+                "registry_verified": True,
+                "binding_source": "observer_route_token_refs",
+                "route_token_ref": "rtok-stale-parent",
+                "parent_route_lineage": stale_identity,
+            },
+        },
+    }
+    events = [
+        {
+            "id": 1,
+            "event_kind": "route_context",
+            "phase": "dispatch",
+            "status": "passed",
+            "payload": {"route_context": parent_identity},
+        },
+        {
+            "id": 2,
+            "event_kind": "route_action_precheck",
+            "phase": "pre_mutation",
+            "status": "allowed",
+            "payload": parent_identity,
+        },
+        {
+            "id": 3,
+            "event_kind": "route_action_precheck",
+            "phase": "pre_mutation",
+            "status": "allowed",
+            "payload": stale_identity,
+        },
+        dispatch,
+        startup,
+        implementation,
+        independent_qa,
+    ]
+
+    gate = task_timeline.mf_route_context_gate_verification(
+        events,
+        contract={
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "AC-RUNTIME-PARENT",
+        },
+    )
+
+    assert gate["passed"] is True
+    assert gate["missing_requirement_ids"] == []
+    assert gate["route_identity"]["route_id"] == parent_identity["route_id"]
+    assert gate["runtime_lineage_identity_filter"]["applied"] is True
+    assert "independent_verification_lane" in gate["present_requirement_ids"]
+    qa_ignored = [
+        item for item in gate["ignored_route_events"] if item.get("id") == 7
+    ]
+    assert qa_ignored[0]["reason"] == "independent_verification_row_scoped_route_identity_not_adopted"
+    accepted_action_events = {
+        item["event"]["id"] for item in gate["accepted_action_scope_lineages"]
+    }
+    assert 6 in accepted_action_events
+
+
 def test_precheck_startup_projection_requirements_name_missing_field():
     from agent.governance import precheck_service
 
@@ -9876,6 +10038,46 @@ def test_cross_ref_accepts_registry_backed_route_token_child_lineage_without_bri
     assert "AC-ROUTE-TOKEN-CHILD|aming-claw|worker-a-task" in gate[
         "bridged_lane_membership"
     ]
+
+
+def test_cross_ref_accepts_registry_child_lane_with_new_observer_command():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    worker_implementation = copy.deepcopy(worker_implementation)
+    worker_implementation["payload"]["observer_command_id"] = "cmd-rerun-route"
+    canonical = route_context_gate["route_identity"]
+    child = {
+        field: worker_implementation["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    worker_implementation = _attach_server_action_scope_route_token_lineage(
+        worker_implementation,
+        child,
+        parent_identity=canonical,
+        route_token_ref=worker_implementation["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is True
+    accepted = gate["accepted_route_token_child_lineages"][0]
+    assert accepted["command_scope"]["observer_command_id"] == "cmd-rerun-route"
+    assert accepted["command_scope"]["row_command"] == "cmd-root-route"
+    assert accepted["command_scope"]["row_command_superseded_by_registry_lineage"] == "true"
 
 
 def test_cross_ref_rejects_registry_backed_child_lineage_route_id_mismatch():
