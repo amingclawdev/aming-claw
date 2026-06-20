@@ -706,25 +706,34 @@ def _event_satisfies_requirement(
         or ""
     ).strip()
     if required_execution_id:
-        event_execution_id = str(
-            event.get("contract_execution_id")
-            or event.get("successor_contract_execution_id")
-            or ""
-        ).strip()
-        if not event_execution_id:
-            for payload in _event_payloads(event):
-                event_execution_id = _payload_field_value(
-                    payload,
-                    {
-                        "active_contract_execution_id",
-                        "contract_execution_id",
-                        "reviewed_contract_execution_id",
-                        "successor_contract_execution_id",
-                    },
-                )
-                if event_execution_id:
-                    break
-        if event_execution_id != required_execution_id:
+        event_id = str(event.get("id") or event.get("event_id") or "").strip()
+        accepted_event_ids = set(_string_list(requirement.get("accepted_event_ids")))
+        execution_ids = {
+            str(event.get(field) or "").strip()
+            for field in (
+                "active_contract_execution_id",
+                "contract_execution_id",
+                "parent_contract_execution_id",
+                "reviewed_contract_execution_id",
+                "successor_contract_execution_id",
+            )
+            if str(event.get(field) or "").strip()
+        }
+        for payload in _event_payloads(event):
+            for field in (
+                "active_contract_execution_id",
+                "contract_execution_id",
+                "parent_contract_execution_id",
+                "reviewed_contract_execution_id",
+                "successor_contract_execution_id",
+            ):
+                execution_id = _payload_field_value(payload, {field})
+                if execution_id:
+                    execution_ids.add(execution_id)
+        if (
+            required_execution_id not in execution_ids
+            and event_id not in accepted_event_ids
+        ):
             return False, None
     source = {
         "event_id": event.get("id") or event.get("event_id") or "",
@@ -1018,6 +1027,10 @@ def _successor_contract_root(
     ).strip()
     root["contract_chain_id"] = str(successor.get("contract_chain_id") or "").strip()
     root["contract_revision_id"] = str(successor.get("contract_revision_id") or "").strip()
+    root["handoff_event_id"] = str(successor.get("handoff_event_id") or "").strip()
+    root["parent_contract_execution_id"] = str(
+        successor.get("parent_contract_execution_id") or ""
+    ).strip()
     root["state"] = str(successor.get("state") or successor.get("status") or "selected")
     return root
 
@@ -1041,6 +1054,12 @@ def _contract_requirements_state(
         step = dict(requirement)
         if contract_execution_id:
             step.setdefault("contract_execution_id", contract_execution_id)
+        handoff_event_id = str(root.get("handoff_event_id") or "").strip()
+        if handoff_event_id:
+            accepted_event_ids = _string_list(step.get("accepted_event_ids"))
+            if handoff_event_id not in accepted_event_ids:
+                accepted_event_ids.append(handoff_event_id)
+            step["accepted_event_ids"] = accepted_event_ids
         if missing_precedence:
             step["precedence"] = missing_precedence
         scoped_steps.append(step)

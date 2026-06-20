@@ -684,6 +684,86 @@ def test_nested_successor_binding_after_hotfix_is_parent_scoped():
     assert projection["next_legal_action"]["contract_execution_id"] == "cex-qa"
 
 
+def test_successor_requirements_accept_handoff_and_parent_execution_evidence():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_chain_id": "cchain-hotfix-lineage",
+            "contract_execution_id": "cex-onboard-root",
+            "contract_revision_id": "rev-onboard-hotfix",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+            "successor_contract_policy": {
+                "candidates": [
+                    {"contract_template_id": "observer_hotfix_direct_mutation.v1"}
+                ]
+            },
+        }
+    }
+    hotfix_template = {
+        "template_id": "observer_hotfix_direct_mutation.v1",
+        "evidence_requirements": [
+            {"id": "hotfix_pre_reason", "event_kind": "hotfix_entered"},
+            {"id": "hotfix_post_action_summary", "event_kind": "hotfix_under_action"},
+            {
+                "id": "focused_verification",
+                "event_kind": "verification",
+                "match_policy": "canonical_event_kind",
+            },
+            {"id": "close_ready", "event_kind": "close_ready"},
+        ],
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(150, "route_context"),
+            _event(151, "hotfix_entered"),
+            _event(
+                152,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-hotfix-lineage",
+                        "parent_contract_execution_id": "cex-onboard-root",
+                        "successor_contract_execution_id": "cex-hotfix",
+                        "contract_template_id": "observer_hotfix_direct_mutation.v1",
+                        "handoff_event_id": "151",
+                    }
+                },
+            ),
+            _event(
+                153,
+                "hotfix_under_action",
+                payload={"contract_execution_id": "cex-hotfix"},
+            ),
+            _event(
+                154,
+                "verification",
+                payload={
+                    "contract_execution_id": "cex-qa",
+                    "parent_contract_execution_id": "cex-hotfix",
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        contract_templates={
+            "observer_hotfix_direct_mutation.v1": hotfix_template,
+        },
+    )
+
+    state = projection["selected_successor_contract_state"]
+    assert [item["id"] for item in state["completed_evidence"]] == [
+        "hotfix_pre_reason",
+        "hotfix_post_action_summary",
+        "focused_verification",
+    ]
+    assert state["missing_evidence"] == ["close_ready"]
+    assert projection["next_legal_action"]["id"] == "close_ready"
+    assert projection["next_legal_action"]["contract_execution_id"] == "cex-hotfix"
+
+
 def test_custom_requirement_next_action_recommends_contract_state_changed_wrapper():
     contract = {
         "contract": {
