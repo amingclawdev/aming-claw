@@ -157,6 +157,7 @@ class AIInvocationRequest:
     output_policy: str = "hash_and_summary_only"
     route: RoutePromptContract = field(default_factory=RoutePromptContract)
     metadata: dict[str, Any] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
 
     def resolved_backend(self) -> str:
         if self.backend_mode:
@@ -198,6 +199,9 @@ class AIInvocationRequest:
         monitor_policy = _runtime_monitor_policy(self.metadata)
         if monitor_policy:
             evidence["runtime_monitor_policy"] = monitor_policy
+        if self.env:
+            evidence["env_keys"] = sorted(str(key) for key in self.env)
+            evidence["raw_env_exposed"] = False
         return evidence
 
 
@@ -477,6 +481,14 @@ def _stop_process(process: subprocess.Popen[str], *, terminate_first: bool = Tru
         return
 
 
+def _merged_env(additions: Mapping[str, str] | None = None) -> dict[str, str] | None:
+    if not additions:
+        return None
+    env = dict(os.environ)
+    env.update({str(key): str(value) for key, value in additions.items()})
+    return env
+
+
 def _call_heartbeat(callback: Any) -> dict[str, Any]:
     try:
         payload = callback()
@@ -535,6 +547,7 @@ def _invoke_codex_cli_monitored(
             stderr=stderr_handle,
             text=True,
             cwd=cwd,
+            env=_merged_env(request.env),
         )
         if process.stdin is not None:
             try:
@@ -820,6 +833,7 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
                 input=prompt,
                 text=True,
                 cwd=cwd,
+                env=_merged_env(request.env),
                 capture_output=True,
                 timeout=request.timeout_sec,
                 check=False,
@@ -849,6 +863,7 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
             input=prompt,
             text=True,
             cwd=cwd,
+            env=_merged_env(request.env),
             capture_output=True,
             timeout=request.timeout_sec,
             check=False,

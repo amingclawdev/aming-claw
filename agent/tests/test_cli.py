@@ -1540,10 +1540,12 @@ def test_observer_dogfood_execute_launches_without_fabricating_startup(
         target_head_commit=commit,
     )
     captured = {}
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
 
     def fake_invoke_ai(request):
         captured["prompt"] = request.prompt
         captured["metadata"] = dict(request.metadata)
+        captured["env"] = dict(request.env)
         return AIInvocationResult(
             request=request,
             status="completed",
@@ -1570,6 +1572,8 @@ def test_observer_dogfood_execute_launches_without_fabricating_startup(
     assert "mf_subagent_read_receipt" in captured["prompt"]
     assert "precommit-check" in captured["prompt"]
     assert captured["metadata"]["early_progress_timeout_sec"] == 20.0
+    assert captured["env"]["AMING_WORKER_SESSION_TOKEN"] == "worker-session-token-test"
+    assert captured["env"]["AMING_WORKER_FENCE_TOKEN"] == "fence-dogfood-test"
     executable_launch = payload["executable_worker_launch"]
     assert executable_launch["status"] == "ready"
     assert executable_launch["executable"] is True
@@ -1605,6 +1609,7 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
         base_commit=commit,
         target_head_commit=commit,
     )
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
 
     def fake_invoke_ai(request):
         return AIInvocationResult(

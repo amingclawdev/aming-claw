@@ -71,6 +71,24 @@ class TestAIInvocationContract(unittest.TestCase):
         self.assertTrue(snapshot["progress_observed"])
         self.assertEqual(snapshot["stdout_bytes"], 42)
 
+    def test_invocation_evidence_lists_env_keys_without_values(self):
+        from ai_invocation import AIInvocationRequest
+
+        request = AIInvocationRequest(
+            role="observer",
+            provider="openai",
+            backend_mode="codex_cli",
+            cwd="/repo",
+            prompt="private prompt text",
+            env={"AMING_WORKER_SESSION_TOKEN": "raw-secret-token"},
+        )
+
+        evidence = request.to_evidence()
+
+        self.assertEqual(evidence["env_keys"], ["AMING_WORKER_SESSION_TOKEN"])
+        self.assertFalse(evidence["raw_env_exposed"])
+        self.assertNotIn("raw-secret-token", str(evidence))
+
     def test_fixture_invocation_uses_result_schema_without_model_call(self):
         from ai_invocation import AIInvocationRequest, RoutePromptContract, invoke_ai
 

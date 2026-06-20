@@ -333,6 +333,7 @@ class ObserverRunRequest:
     main_worktree: str = ""
     heartbeat_callback: Callable[[], Mapping[str, Any]] | None = None
     heartbeat_interval_sec: float = 0.0
+    env: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_route_token(
@@ -1071,6 +1072,81 @@ def _runtime_monitor_summary(monitor: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _dogfood_execute_launch_env(
+    *,
+    request: "DogfoodObserverPlanRequest",
+    context: Any,
+    runtime_context_id: str,
+    observer_command_id: str,
+) -> dict[str, Any]:
+    """Build child-process env additions without persisting raw secret values."""
+
+    session_token = str(os.environ.get("AMING_WORKER_SESSION_TOKEN") or "").strip()
+    env = {
+        "AMING_GOVERNANCE_URL": str(os.environ.get("AMING_GOVERNANCE_URL") or "http://localhost:40000"),
+        "AMING_RUNTIME_CONTEXT_ID": runtime_context_id,
+        "AMING_OBSERVER_COMMAND_ID": observer_command_id,
+        "AMING_WORKER_TASK_ID": str(getattr(context, "task_id", "") or request.task_id or ""),
+        "AMING_WORKER_FENCE_TOKEN": str(getattr(context, "fence_token", "") or request.fence_token or ""),
+    }
+    if session_token:
+        env["AMING_WORKER_SESSION_TOKEN"] = session_token
+    missing = [
+        key
+        for key in (
+            "AMING_WORKER_SESSION_TOKEN",
+            "AMING_WORKER_FENCE_TOKEN",
+            "AMING_RUNTIME_CONTEXT_ID",
+        )
+        if not str(env.get(key) or "").strip()
+    ]
+    return {
+        "schema_version": "observer_dogfood_execute_launch_env.v1",
+        "allowed": not missing,
+        "env": env,
+        "env_keys": sorted(env),
+        "missing_env": missing,
+        "session_token_present": bool(session_token),
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+    }
+
+
+def _dogfood_execute_env_blocker(
+    *,
+    request: "DogfoodObserverPlanRequest",
+    context: Any,
+    launch_env: Mapping[str, Any],
+    executable_worker_launch: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "observer_dogfood_execute_env_blocker.v1",
+        "ok": False,
+        "status": "blocked",
+        "terminal_dispatch_blocker": True,
+        "blocker_id": "worker_session_token_env_missing_before_cli_launch",
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": str(getattr(context, "task_id", "") or request.task_id or ""),
+        "runtime_context_id": request.runtime_context_id
+        or runtime_context_id_for_branch_context(context),
+        "missing_env": list(launch_env.get("missing_env") or []),
+        "env_keys": list(launch_env.get("env_keys") or []),
+        "executable_worker_launch": dict(executable_worker_launch),
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "reason": (
+            "execute requested for a bounded CLI worker, but the parent observer "
+            "process did not provide the server-issued AMING_WORKER_SESSION_TOKEN "
+            "needed for worker read-receipt/startup facades."
+        ),
+        "next_action": (
+            "mint/allocate the worker session token, then launch observer dogfood "
+            "with AMING_WORKER_SESSION_TOKEN set only in process env."
+        ),
+    }
+
+
 def _startup_read_receipt_recording_status(
     observer_result: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1525,6 +1601,7 @@ def build_observer_invocation_request(request: ObserverRunRequest) -> AIInvocati
         auth_mode="cli_auth" if request.backend_mode.endswith("_cli") else "api_key_env",
         route=request.route,
         metadata=metadata,
+        env={str(key): str(value) for key, value in request.env.items()},
     )
 
 
@@ -6323,6 +6400,48 @@ def build_dogfood_observer_run_plan(
             "worktree": str(worker_worktree),
         }
         return result
+    if execute and not materialization.get("materialized"):
+        result["execute_preflight"] = {
+            "allowed": False,
+            "error": "execute requires the gated worker worktree to be an isolated real git worktree",
+            "worktree": str(worker_worktree),
+            "worktree_status": materialization.get("worktree_status") or {},
+            "executable_worker_launch": dict(executable_worker_launch),
+            "missing_fields": ["worktree_path.real_git_worktree"],
+        }
+        return result
+    observer_command_id = request.task_id or context.task_id
+    launch_env = _dogfood_execute_launch_env(
+        request=request,
+        context=context,
+        runtime_context_id=request.runtime_context_id
+        or runtime_context_id_for_branch_context(context),
+        observer_command_id=observer_command_id,
+    )
+    result["execute_launch_env"] = {
+        key: value for key, value in launch_env.items() if key != "env"
+    }
+    if execute and not launch_env.get("allowed"):
+        blocker = _dogfood_execute_env_blocker(
+            request=request,
+            context=context,
+            launch_env=launch_env,
+            executable_worker_launch=executable_worker_launch,
+        )
+        result.update(
+            {
+                "ok": False,
+                "status": "blocked",
+                "calls_models": False,
+                "auth_status": "not_invoked",
+                "execute_env_blocker": blocker,
+                "terminal_dispatch_blocker": True,
+                "command_projection_status": "failed",
+                "canonical_contract_state": "blocked",
+                "error": blocker["reason"],
+            }
+        )
+        return result
 
     observer_request = ObserverRunRequest(
         project_id=request.project_id,
@@ -6337,17 +6456,8 @@ def build_dogfood_observer_run_plan(
         early_progress_timeout_sec=request.early_progress_timeout_sec,
         dispatch_gate=dispatch_gate,
         main_worktree=str(main_worktree),
+        env=launch_env.get("env") if isinstance(launch_env.get("env"), Mapping) else {},
     )
-    if execute and not materialization.get("materialized"):
-        result["execute_preflight"] = {
-            "allowed": False,
-            "error": "execute requires the gated worker worktree to be an isolated real git worktree",
-            "worktree": str(worker_worktree),
-            "worktree_status": materialization.get("worktree_status") or {},
-            "executable_worker_launch": dict(executable_worker_launch),
-            "missing_fields": ["worktree_path.real_git_worktree"],
-        }
-        return result
 
     observer_result = run_observer(observer_request, execute=execute)
     if execute:

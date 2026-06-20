@@ -520,6 +520,7 @@ def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tm
 
 def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_path):
     request, allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
     _patch_dogfood_no_progress(monkeypatch)
     recorded_events = []
 
@@ -631,6 +632,7 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
 
 def test_dogfood_no_progress_terminal_blocker_reports_append_error(monkeypatch, tmp_path):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
     _patch_dogfood_no_progress(monkeypatch)
 
     def fail_record_task_timeline_event(*, project_id, event):
@@ -669,6 +671,21 @@ def test_dogfood_no_progress_terminal_blocker_reports_append_error(monkeypatch, 
     assert startup_status["startup_timeline_event_id"] == ""
     assert startup_status["implementation_evidence_recorded"] is False
     assert blocker["implementation_evidence_recorded"] is False
+
+
+def test_dogfood_execute_blocks_missing_worker_session_token_env(tmp_path):
+    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+
+    result = build_dogfood_observer_run_plan(request, execute=True)
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    blocker = result["execute_env_blocker"]
+    assert blocker["blocker_id"] == "worker_session_token_env_missing_before_cli_launch"
+    assert blocker["missing_env"] == ["AMING_WORKER_SESSION_TOKEN"]
+    assert blocker["raw_session_token_persisted"] is False
+    assert result["calls_models"] is False
+    assert result["auth_status"] == "not_invoked"
 
 
 def test_observer_prompt_says_startup_is_not_progress(tmp_path):
