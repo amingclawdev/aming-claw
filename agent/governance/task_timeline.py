@@ -7453,7 +7453,9 @@ def _cross_ref_route_token_child_diagnostics(
             continue
         if row_project and lane.get("project_id") and lane["project_id"] != row_project:
             continue
-        if _route_independent_verification_row_scoped(event):
+        if _cross_ref_row_scoped_independent_qa(event, anchor):
+            continue
+        if _cross_ref_observer_hotfix_direct_evidence(event, anchor):
             continue
         route_scope = _cross_ref_public_route_scope(event)
         parent_task_id = _first_deep_text(event, "parent_task_id")
@@ -7468,12 +7470,10 @@ def _cross_ref_route_token_child_diagnostics(
     return diagnostics
 
 
-def _cross_ref_row_scoped_independent_qa(
+def _cross_ref_same_row_floor(
     event: dict[str, Any],
     anchor: Mapping[str, Any],
 ) -> bool:
-    if not _route_independent_verification_row_scoped(event):
-        return False
     lane = _cross_ref_lane_identity(event)
     row_backlog = str(anchor.get("backlog_id") or "").strip()
     row_project = str(anchor.get("project_id") or "").strip()
@@ -7482,6 +7482,45 @@ def _cross_ref_row_scoped_independent_qa(
     if row_project and lane.get("project_id") and lane["project_id"] != row_project:
         return False
     return True
+
+
+def _cross_ref_row_scoped_independent_qa(
+    event: dict[str, Any],
+    anchor: Mapping[str, Any],
+) -> bool:
+    if not _independent_qa_event_kind_matches(event):
+        return False
+    if not _route_event_passed(event):
+        return False
+    return _cross_ref_same_row_floor(event, anchor)
+
+
+def _cross_ref_observer_hotfix_direct_evidence(
+    event: dict[str, Any],
+    anchor: Mapping[str, Any],
+) -> bool:
+    marker = _route_marker(
+        event.get("event_kind") or event.get("event_type") or event.get("phase")
+    )
+    if marker != "hotfix_under_action":
+        return False
+    meta_gate = _first_deep_mapping(event, "meta_contract_gate")
+    meta_action = _route_marker(meta_gate.get("action"))
+    meta_role = str(meta_gate.get("role") or "").strip().lower()
+    meta_status = str(
+        meta_gate.get("status") or meta_gate.get("decision") or ""
+    ).strip().lower()
+    meta_allowed = bool(
+        meta_action == "hotfix_under_action"
+        and meta_role == "observer"
+        and (
+            _truthy(meta_gate.get("allowed"))
+            or meta_status in MF_ROUTE_CONTEXT_PASS_STATUSES
+        )
+    )
+    if not meta_allowed:
+        return False
+    return _cross_ref_same_row_floor(event, anchor)
 
 
 def _cross_ref_bridge_scope_membership(
@@ -7708,6 +7747,8 @@ def mf_close_cross_ref_gate_verification(
         if not is_protected_close_evidence(event):
             continue
         if _cross_ref_row_scoped_independent_qa(event, anchor):
+            continue
+        if _cross_ref_observer_hotfix_direct_evidence(event, anchor):
             continue
         identity = _close_evidence_ref_identity(event)
         # If this evidence's lane {backlog_id, project_id, task_id} is covered by
