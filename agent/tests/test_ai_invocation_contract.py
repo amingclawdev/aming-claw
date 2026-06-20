@@ -39,6 +39,38 @@ class TestAIInvocationContract(unittest.TestCase):
         self.assertNotIn("private system text", str(evidence))
         self.assertFalse(evidence["raw_prompt_exposed"])
 
+    def test_codex_exec_command_streams_json_without_dangling_output_flag(self):
+        from ai_invocation import build_codex_exec_command
+
+        command = build_codex_exec_command(cwd="/repo", output_path="")
+
+        self.assertIn("--json", command)
+        self.assertIn("-C", command)
+        self.assertNotIn("-o", command)
+
+    def test_codex_exec_command_writes_last_message_when_output_path_supplied(self):
+        from ai_invocation import build_codex_exec_command
+
+        command = build_codex_exec_command(cwd="/repo", output_path="/tmp/last.txt")
+
+        self.assertIn("--json", command)
+        self.assertEqual(command[command.index("-o") + 1], "/tmp/last.txt")
+
+    def test_codex_cli_progress_snapshot_counts_stream_output(self):
+        from ai_invocation import _codex_cli_progress_snapshot
+
+        snapshot = _codex_cli_progress_snapshot(
+            cwd=os.getcwd(),
+            output_path="",
+            baseline_git_status="",
+            stdout_bytes=42,
+            stderr_bytes=0,
+        )
+
+        self.assertTrue(snapshot["stream_output_observed"])
+        self.assertTrue(snapshot["progress_observed"])
+        self.assertEqual(snapshot["stdout_bytes"], 42)
+
     def test_fixture_invocation_uses_result_schema_without_model_call(self):
         from ai_invocation import AIInvocationRequest, RoutePromptContract, invoke_ai
 

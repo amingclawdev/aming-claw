@@ -4004,6 +4004,14 @@ def _runtime_text_worker_launch_pack(
         "recommended_codex_exec_flags": [
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
+            "--json",
+        ],
+        "streaming_json_required_for_startup_monitor": True,
+        "early_progress_signals": [
+            "stdout_jsonl",
+            "stderr",
+            "output_last_message_file",
+            "worktree_diff",
         ],
         "workspace_write_warning": (
             "Codex CLI launched with --sandbox workspace-write may be unable to "

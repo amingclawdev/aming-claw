@@ -333,6 +333,9 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert "--dangerously-bypass-approvals-and-sandbox" in cli_requirements[
         "recommended_codex_exec_flags"
     ]
+    assert "--json" in cli_requirements["recommended_codex_exec_flags"]
+    assert cli_requirements["streaming_json_required_for_startup_monitor"] is True
+    assert "stdout_jsonl" in cli_requirements["early_progress_signals"]
     assert cli_requirements["governance_network_required_for_timeline_writes"] is True
     assert launch_pack["worker_guide_status"] == "ready"
     assert launch_pack["worker_guide_ref"].endswith("/worker-guide")

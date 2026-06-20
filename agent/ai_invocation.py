@@ -275,6 +275,7 @@ def build_codex_exec_command(
     dangerous: bool | None = None,
     sandbox: str = "workspace-write",
     ephemeral: bool = False,
+    stream_json: bool = True,
 ) -> list[str]:
     codex_bin = os.getenv("CODEX_BIN", "").strip()
     if not codex_bin:
@@ -294,9 +295,11 @@ def build_codex_exec_command(
     cmd.append("--skip-git-repo-check")
     if ephemeral:
         cmd.append("--ephemeral")
-    cmd.extend(["-C", cwd, "-o"])
+    if stream_json:
+        cmd.append("--json")
+    cmd.extend(["-C", cwd])
     if output_path:
-        cmd.append(output_path)
+        cmd.extend(["-o", output_path])
     return cmd
 
 
@@ -403,6 +406,8 @@ def _codex_cli_progress_snapshot(
     cwd: str,
     output_path: str,
     baseline_git_status: str,
+    stdout_bytes: int = 0,
+    stderr_bytes: int = 0,
 ) -> dict[str, Any]:
     current_git_status = _git_status_short(cwd)
     git_status_available = bool(baseline_git_status or current_git_status)
@@ -411,12 +416,18 @@ def _codex_cli_progress_snapshot(
         and current_git_status != baseline_git_status
     )
     output_file_nonempty = _output_file_nonempty(output_path)
+    stream_output_observed = stdout_bytes > 0 or stderr_bytes > 0
     return {
         "schema_version": "codex_cli_progress_snapshot.v1",
         "output_file_nonempty": output_file_nonempty,
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "stream_output_observed": stream_output_observed,
         "worktree_status_available": git_status_available,
         "worktree_changed": worktree_changed,
-        "progress_observed": output_file_nonempty or worktree_changed,
+        "progress_observed": output_file_nonempty
+        or stream_output_observed
+        or worktree_changed,
     }
 
 
@@ -435,6 +446,18 @@ def _read_output_text(output_path: str, fallback: str) -> str:
         except OSError:
             return fallback
     return fallback
+
+
+def _temp_file_size(handle: Any) -> int:
+    try:
+        handle.flush()
+        current = handle.tell()
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(current)
+        return max(0, int(size))
+    except Exception:
+        return 0
 
 
 def _stop_process(process: subprocess.Popen[str], *, terminate_first: bool = True) -> None:
@@ -559,6 +582,8 @@ def _invoke_codex_cli_monitored(
                     cwd=cwd,
                     output_path=output_path,
                     baseline_git_status=baseline_git_status,
+                    stdout_bytes=_temp_file_size(stdout_handle),
+                    stderr_bytes=_temp_file_size(stderr_handle),
                 )
                 monitor["early_progress"] = progress
                 monitor["progress_observed"] = bool(progress.get("progress_observed"))
