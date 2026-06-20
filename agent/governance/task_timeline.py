@@ -7453,6 +7453,8 @@ def _cross_ref_route_token_child_diagnostics(
             continue
         if row_project and lane.get("project_id") and lane["project_id"] != row_project:
             continue
+        if _route_independent_verification_row_scoped(event):
+            continue
         route_scope = _cross_ref_public_route_scope(event)
         parent_task_id = _first_deep_text(event, "parent_task_id")
         if not route_scope.get("route_token_ref") and not parent_task_id:
@@ -7464,6 +7466,22 @@ def _cross_ref_route_token_child_diagnostics(
         )
         diagnostics.append(diagnosis)
     return diagnostics
+
+
+def _cross_ref_row_scoped_independent_qa(
+    event: dict[str, Any],
+    anchor: Mapping[str, Any],
+) -> bool:
+    if not _route_independent_verification_row_scoped(event):
+        return False
+    lane = _cross_ref_lane_identity(event)
+    row_backlog = str(anchor.get("backlog_id") or "").strip()
+    row_project = str(anchor.get("project_id") or "").strip()
+    if row_backlog and lane.get("backlog_id") and lane["backlog_id"] != row_backlog:
+        return False
+    if row_project and lane.get("project_id") and lane["project_id"] != row_project:
+        return False
+    return True
 
 
 def _cross_ref_bridge_scope_membership(
@@ -7688,6 +7706,8 @@ def mf_close_cross_ref_gate_verification(
     for event in rows:
         event = _mapping(event)
         if not is_protected_close_evidence(event):
+            continue
+        if _cross_ref_row_scoped_independent_qa(event, anchor):
             continue
         identity = _close_evidence_ref_identity(event)
         # If this evidence's lane {backlog_id, project_id, task_id} is covered by
@@ -8144,8 +8164,6 @@ def _route_context_gate_with_independent_qa(
         for item in _list(gate.get("missing_requirement_ids"))
         if str(item)
     ]
-    if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID not in missing:
-        return gate
     accepted_runtime_child_lineage = False
     for lineage in _list(gate.get("accepted_action_scope_lineages")):
         if not isinstance(lineage, Mapping):
@@ -8169,7 +8187,17 @@ def _route_context_gate_with_independent_qa(
         if bool(lineage.get("accepted")) and server_backed and has_runtime_child_fields:
             accepted_runtime_child_lineage = True
             break
-    if not accepted_runtime_child_lineage:
+    row_scoped_independent_qa = any(
+        str(item.get("reason") or "").strip()
+        == "independent_verification_row_scoped_route_identity_not_adopted"
+        for item in _list(gate.get("ignored_route_events"))
+        if isinstance(item, Mapping)
+    )
+    if (
+        MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in missing
+        and not accepted_runtime_child_lineage
+        and not row_scoped_independent_qa
+    ):
         return gate
 
     missing = [
@@ -8180,13 +8208,27 @@ def _route_context_gate_with_independent_qa(
     checks = dict(_mapping(gate.get("checks")))
     if (
         "route_identity_mismatch" in missing
-        and checks.get("same_route_identity")
-        and checks.get("same_optional_route_id")
-        and checks.get("same_optional_prompt_contract_hash")
+        and (
+            (
+                checks.get("same_route_identity")
+                and checks.get("same_optional_route_id")
+                and checks.get("same_optional_prompt_contract_hash")
+            )
+            or (
+                row_scoped_independent_qa
+                and not {
+                    item
+                    for item in missing
+                    if item != "route_identity_mismatch"
+                }
+            )
+        )
     ):
         missing = [item for item in missing if item != "route_identity_mismatch"]
         gate["route_identity_mismatch_satisfied_by"] = (
             "independent_qa_gate_row_scoped_verification"
+            if row_scoped_independent_qa
+            else "independent_qa_gate_runtime_child_lineage"
         )
     present = [
         str(item)
@@ -8212,6 +8254,8 @@ def _route_context_gate_with_independent_qa(
         ]
     checks["independent_verification_lane_present"] = True
     checks["independent_verification_satisfied_by_independent_qa_gate"] = True
+    if row_scoped_independent_qa:
+        checks["independent_verification_row_scoped_route_identity_not_adopted"] = True
     gate["missing_requirement_ids"] = missing
     gate["present_requirement_ids"] = present
     gate["evidence_events"] = evidence_events

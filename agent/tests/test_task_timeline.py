@@ -8263,6 +8263,88 @@ class TestTaskTimeline(unittest.TestCase):
             ROUTE_IDENTITY,
         )
 
+    def test_mf_parallel_close_gate_accepts_row_scoped_qa_without_worker_lineage(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-ROUTE-QA-ROW-SCOPED"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": bug_id,
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "independent_verification_required": True,
+            },
+        }
+        child_identity = {
+            "route_id": "route-qa-row-scoped-child",
+            "route_context_hash": "sha256:qa-row-scoped-child-route",
+            "prompt_contract_id": "rprompt-qa-row-scoped-child",
+            "prompt_contract_hash": "sha256:qa-row-scoped-child-contract",
+        }
+        parent_identity = {
+            "route_id": "route-qa-row-scoped-parent",
+            "route_context_hash": "sha256:qa-row-scoped-parent-route",
+            "prompt_contract_id": "rprompt-qa-row-scoped-parent",
+            "prompt_contract_hash": "sha256:qa-row-scoped-parent-contract",
+        }
+        qa_event = _route_context_qa_verification_event(child_identity)
+        qa_event.update({
+            "id": 5716,
+            "actor": "qa-subagent-Kuhn",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-qa-row-scoped-r2",
+        })
+        qa_event["payload"] = {
+            "meta_contract_gate": {
+                "action": "qa_verification",
+                "role": "qa",
+                "status": "passed",
+                "allowed": True,
+            },
+        }
+        qa_event["verification"]["reviewer"] = "qa-subagent-Kuhn"
+        _attach_server_action_scope_route_token_lineage(
+            qa_event,
+            child_identity,
+            parent_identity=parent_identity,
+            route_token_ref="rtok-qa-row-scoped",
+            acceptance_source="server_route_token_action_scope",
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                {
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-hotfix-row-scoped-r2",
+                },
+                {
+                    "event_kind": "close_ready",
+                    "phase": "close",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-hotfix-row-scoped-r2",
+                },
+                *_route_context_consumption_events(),
+                qa_event,
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(ready["cross_ref_gate"]["rejected_cross_ref_evidence"], [])
+        self.assertTrue(
+            ready["route_context_gate"]["checks"][
+                "independent_verification_row_scoped_route_identity_not_adopted"
+            ]
+        )
+
     def test_mf_parallel_close_gate_rejects_unprotected_action_scoped_qa_route(self):
         from agent.governance import task_timeline
 
