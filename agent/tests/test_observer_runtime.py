@@ -630,6 +630,79 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert event["verification"]["implementation_evidence_recorded"] is False
 
 
+def test_dogfood_timeout_blocker_uses_timeline_read_receipt_status(
+    monkeypatch, tmp_path
+):
+    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
+    _patch_dogfood_no_progress(monkeypatch)
+    recorded_events = []
+
+    def fake_timeline_status(**kwargs):
+        assert kwargs["project_id"] == "aming-claw"
+        assert kwargs["task_id"] == "task-a3"
+        assert kwargs["runtime_context_id"]
+        assert kwargs["route_identity"]["route_context_hash"] == "sha256:route-a3"
+        return {
+            "schema_version": "observer_startup_read_receipt_timeline_status.v1",
+            "read_receipt_recorded": True,
+            "read_receipt_recorded_before_implementation_wait": True,
+            "read_receipt_timeline_event_id": "41",
+            "read_receipt_hash": "sha256:receipt-a3",
+            "read_receipt_prepared": True,
+            "startup_recorded": False,
+            "startup_timeline_event_id": "",
+            "timeline_read_receipt_event_ids": [41],
+            "timeline_startup_event_ids": [],
+        }
+
+    def fake_record_task_timeline_event(*, project_id, event):
+        recorded_events.append((project_id, event))
+        return {
+            "id": 42,
+            "project_id": project_id,
+            **event,
+            "created_at": "2026-06-20T00:00:00Z",
+        }
+
+    monkeypatch.setattr(
+        "agent.observer_runtime._timeline_startup_read_receipt_recording_status",
+        fake_timeline_status,
+    )
+    monkeypatch.setattr(
+        "agent.observer_runtime._record_task_timeline_event",
+        fake_record_task_timeline_event,
+    )
+
+    result = build_dogfood_observer_run_plan(request, execute=True)
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    blocker = result["cli_timeout_blocker"]
+    assert blocker["schema_version"] == "observer_cli_timeout_blocker.v1"
+    assert blocker["blocker_id"] == "codex_cli_timeout_no_output_no_finish"
+    assert blocker["invocation_blocker_id"] == "codex_cli_worker_no_progress_no_read_receipt"
+    assert blocker["read_receipt_recorded"] is True
+    assert blocker["read_receipt_recorded_before_implementation_wait"] is True
+    assert blocker["read_receipt_timeline_event_id"] == "41"
+    assert blocker["startup_recorded"] is False
+    projection = blocker["terminal_contract_projection"]
+    assert "mf_subagent_read_receipt_recorded" in projection["terminal_evidence_refs"]
+    assert (
+        "mf_subagent_read_receipt_not_recorded"
+        not in projection["terminal_evidence_refs"]
+    )
+    assert "mf_subagent_startup_not_recorded" in projection["terminal_evidence_refs"]
+    assert recorded_events
+    event_payload = recorded_events[0][1]["payload"]
+    assert event_payload["startup_read_receipt_recording_status"][
+        "read_receipt_recorded"
+    ] is True
+    assert event_payload["command_projection"]["divergence_reason"] == (
+        "codex_cli_timeout_no_output_no_finish"
+    )
+
+
 def test_dogfood_no_progress_terminal_blocker_reports_append_error(monkeypatch, tmp_path):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")

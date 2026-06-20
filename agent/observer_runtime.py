@@ -1227,6 +1227,134 @@ def _startup_read_receipt_recording_status(
     }
 
 
+def _merge_startup_read_receipt_recording_status(
+    base: Mapping[str, Any],
+    overlay: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = dict(base or {})
+    overlay = overlay if isinstance(overlay, Mapping) else {}
+    for key, value in overlay.items():
+        if key == "schema_version":
+            continue
+        if isinstance(value, bool):
+            merged[key] = bool(merged.get(key)) or value
+        elif isinstance(value, list):
+            existing = list(merged.get(key) or [])
+            for item in value:
+                if item not in existing:
+                    existing.append(item)
+            merged[key] = existing
+        elif value not in ("", None, [], {}):
+            merged[key] = value
+    return merged
+
+
+def _timeline_startup_read_receipt_recording_status(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    runtime_context_id: str,
+    parent_task_id: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return recorded startup/read-receipt facts for a worker task.
+
+    Timeout handling may run after the worker has already written facade
+    evidence. Re-read the authoritative timeline so the terminal projection does
+    not report a missing read receipt that already exists.
+    """
+
+    if not project_id or not task_id:
+        return {}
+    try:
+        from governance import task_timeline
+        from governance.db import DBContext
+    except ImportError:  # pragma: no cover - package import path
+        from agent.governance import task_timeline
+        from agent.governance.db import DBContext
+
+    try:
+        with DBContext(project_id) as conn:
+            events = task_timeline.list_events(
+                conn,
+                project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                limit=1000,
+            )
+    except Exception as exc:
+        return {
+            "schema_version": "observer_startup_read_receipt_timeline_status.v1",
+            "timeline_status_error": str(exc),
+        }
+
+    lineage_filter = {
+        "route_context_hash": str(route_identity.get("route_context_hash") or ""),
+        "prompt_contract_id": str(route_identity.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(route_identity.get("prompt_contract_hash") or ""),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+    }
+    read_gate = task_timeline.mf_subagent_read_receipt_gate_verification(
+        events,
+        route_identity_filter={
+            key: value for key, value in lineage_filter.items() if value
+        },
+    )
+    read_event_id = str(read_gate.get("read_receipt_event_id") or "")
+    read_receipt_recorded = bool(read_event_id)
+    startup_events = [
+        event
+        for event in events
+        if str(event.get("event_kind") or event.get("event_type") or "")
+        == "mf_subagent_startup"
+    ]
+    startup_event = startup_events[-1] if startup_events else {}
+    startup_payload = (
+        startup_event.get("payload") if isinstance(startup_event, Mapping) else {}
+    )
+    startup_payload = startup_payload if isinstance(startup_payload, Mapping) else {}
+    startup_gate = startup_payload.get("mf_subagent_startup_gate")
+    startup_gate = startup_gate if isinstance(startup_gate, Mapping) else {}
+    return {
+        "schema_version": "observer_startup_read_receipt_timeline_status.v1",
+        "timeline_events_checked": len(events),
+        "timeline_read_receipt_gate": read_gate,
+        "read_receipt_recorded": read_receipt_recorded,
+        "read_receipt_recorded_before_implementation_wait": read_receipt_recorded,
+        "read_receipt_timeline_event_id": read_event_id,
+        "read_receipt_hash": str(read_gate.get("read_receipt_hash") or ""),
+        "read_receipt_prepared": read_receipt_recorded,
+        "startup_recorded": bool(startup_event),
+        "startup_timeline_event_recorded": bool(startup_event),
+        "startup_timeline_event_id": str(
+            startup_event.get("id") or startup_event.get("event_id") or ""
+        ),
+        "startup_event_kind": str(startup_event.get("event_kind") or ""),
+        "startup_status": str(startup_event.get("status") or ""),
+        "startup_close_satisfying": bool(
+            startup_gate.get("close_satisfying")
+            or startup_payload.get("close_satisfying")
+        ),
+        "startup_counts_as_real_worker_evidence": bool(
+            startup_gate.get("counts_as_real_worker_evidence")
+            or startup_payload.get("counts_as_real_worker_evidence")
+        ),
+        "timeline_read_receipt_event_ids": [
+            event.get("id")
+            for event in events
+            if str(event.get("event_kind") or event.get("event_type") or "")
+            == "mf_subagent_read_receipt"
+            and event.get("id") is not None
+        ],
+        "timeline_startup_event_ids": [
+            event.get("id") for event in startup_events if event.get("id") is not None
+        ],
+    }
+
+
 def _record_task_timeline_event(
     *,
     project_id: str,
@@ -2911,7 +3039,6 @@ def _dogfood_cli_timeout_blocker(
     no_output = bool(invocation.get("output_empty", True))
     invocation_blocker_id = str(invocation.get("blocker_id") or "")
     observer_command_id = request.task_id or context.task_id
-    startup_status = _startup_read_receipt_recording_status(observer_result)
     executable_worker_launch = (
         executable_worker_launch
         if isinstance(executable_worker_launch, Mapping)
@@ -2919,28 +3046,6 @@ def _dogfood_cli_timeout_blocker(
         if isinstance(observer_result.get("executable_worker_launch"), Mapping)
         else {}
     )
-    durable_startup_read_receipt = bool(
-        startup_status.get("startup_recorded")
-        and startup_status.get("read_receipt_recorded")
-    )
-    startup_close_satisfying = bool(startup_status.get("startup_close_satisfying"))
-    if invocation_blocker_id:
-        blocker_id = invocation_blocker_id
-    else:
-        blocker_id = (
-            f"{request.backend_mode}_timeout_no_output_no_finish"
-            if no_output
-            else f"{request.backend_mode}_timeout_no_finish"
-        )
-    if (
-        invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
-        and durable_startup_read_receipt
-    ):
-        blocker_id = (
-            f"{request.backend_mode}_timeout_no_output_no_finish"
-            if no_output
-            else f"{request.backend_mode}_timeout_no_finish"
-        )
     runtime_context_id = request.runtime_context_id or runtime_context_id_for_branch_context(
         context
     )
@@ -2952,8 +3057,57 @@ def _dogfood_cli_timeout_blocker(
         "route_token_ref": request.route.route_token_ref,
         "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
     }
+    parent_task_id = str(request.backlog_id or context.backlog_id or "")
+    startup_status = _startup_read_receipt_recording_status(observer_result)
+    timeline_status = _timeline_startup_read_receipt_recording_status(
+        project_id=request.project_id,
+        backlog_id=request.backlog_id,
+        task_id=str(context.task_id or request.task_id or ""),
+        runtime_context_id=runtime_context_id,
+        parent_task_id=parent_task_id,
+        route_identity=route_identity,
+    )
+    startup_status = _merge_startup_read_receipt_recording_status(
+        startup_status,
+        timeline_status,
+    )
+    read_receipt_recorded = bool(startup_status.get("read_receipt_recorded"))
+    startup_recorded = bool(startup_status.get("startup_recorded"))
+    durable_startup_read_receipt = bool(startup_recorded and read_receipt_recorded)
+    startup_close_satisfying = bool(startup_status.get("startup_close_satisfying"))
+    if invocation_blocker_id:
+        blocker_id = invocation_blocker_id
+    else:
+        blocker_id = (
+            f"{request.backend_mode}_timeout_no_output_no_finish"
+            if no_output
+            else f"{request.backend_mode}_timeout_no_finish"
+        )
+    if (
+        invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
+        and read_receipt_recorded
+    ):
+        blocker_id = (
+            f"{request.backend_mode}_timeout_no_output_no_finish"
+            if no_output
+            else f"{request.backend_mode}_timeout_no_finish"
+        )
     runtime_monitor = invocation.get("runtime_monitor") or {}
     runtime_monitor = runtime_monitor if isinstance(runtime_monitor, Mapping) else {}
+    startup_evidence_ref = (
+        (
+            "mf_subagent_startup_close_satisfying"
+            if startup_close_satisfying
+            else "mf_subagent_startup_recorded_not_close_satisfying"
+        )
+        if startup_recorded
+        else "mf_subagent_startup_not_recorded"
+    )
+    read_receipt_evidence_ref = (
+        "mf_subagent_read_receipt_recorded"
+        if read_receipt_recorded
+        else "mf_subagent_read_receipt_not_recorded"
+    )
     terminal_projection = {
         "schema_version": "observer_command_terminal_projection.v1",
         "passed": False,
@@ -2961,22 +3115,9 @@ def _dogfood_cli_timeout_blocker(
         "command_projection_status": "failed",
         "divergence_reason": blocker_id,
         "terminal_evidence_refs": [
-            *(
-                [
-                    (
-                        "mf_subagent_startup_close_satisfying"
-                        if startup_close_satisfying
-                        else "mf_subagent_startup_recorded_not_close_satisfying"
-                    ),
-                    "mf_subagent_read_receipt_recorded",
-                ]
-                if durable_startup_read_receipt
-                else [
-                    "executable_worker_launch_payload",
-                    "mf_subagent_startup_not_recorded",
-                    "mf_subagent_read_receipt_not_recorded",
-                ]
-            ),
+            "executable_worker_launch_payload",
+            startup_evidence_ref,
+            read_receipt_evidence_ref,
             "cli_timeout_blocker",
             "worktree_diff_scope",
         ],
@@ -2994,7 +3135,7 @@ def _dogfood_cli_timeout_blocker(
             "observer_cli_no_progress_blocker.v1"
             if (
                 invocation_blocker_id == "codex_cli_worker_no_progress_no_read_receipt"
-                and not durable_startup_read_receipt
+                and not read_receipt_recorded
             )
             else "observer_cli_timeout_blocker.v1"
         ),
@@ -3023,8 +3164,8 @@ def _dogfood_cli_timeout_blocker(
         "early_progress_timeout_sec": request.early_progress_timeout_sec,
         "no_output": no_output,
         "no_finish_evidence": True,
-        "startup_recorded": bool(startup_status.get("startup_recorded")),
-        "read_receipt_recorded": bool(startup_status.get("read_receipt_recorded")),
+        "startup_recorded": startup_recorded,
+        "read_receipt_recorded": read_receipt_recorded,
         "read_receipt_recorded_before_implementation_wait": bool(
             startup_status.get("read_receipt_recorded_before_implementation_wait")
         ),
@@ -3055,10 +3196,16 @@ def _dogfood_cli_timeout_blocker(
             "worktree diff scope is reported."
             if durable_startup_read_receipt
             else (
-                "CLI backend reached a terminal blocker before finish evidence; "
-                "an executable launch payload was produced, but startup/read "
-                "receipt evidence was not recorded, "
-                "and the isolated worktree diff scope is reported."
+                "CLI backend reached a terminal blocker after read receipt "
+                "evidence was recorded but before startup/finish evidence; the "
+                "isolated worktree diff scope is reported."
+                if read_receipt_recorded
+                else (
+                    "CLI backend reached a terminal blocker before finish evidence; "
+                    "an executable launch payload was produced, but startup/read "
+                    "receipt evidence was not recorded, "
+                    "and the isolated worktree diff scope is reported."
+                )
             )
         ),
     }

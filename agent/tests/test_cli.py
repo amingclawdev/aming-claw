@@ -1625,6 +1625,10 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
         )
 
     monkeypatch.setattr("agent.observer_runtime.invoke_ai", fake_invoke_ai)
+    monkeypatch.setattr(
+        "agent.observer_runtime._timeline_startup_read_receipt_recording_status",
+        lambda **_: {},
+    )
 
     result = runner.invoke(
         main,
