@@ -162,6 +162,7 @@ WORKER_LAUNCH_PACK_REQUIRED_FIELDS = (
     "blocked_actions",
     "next_legal_action",
     "startup_preflight",
+    "test_environment_preflight",
     "required_evidence",
     "transcript_refs",
     "transcript_digests",
@@ -833,6 +834,78 @@ def _runtime_text_secret_hash(value: str) -> str:
     if not token:
         return ""
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _runtime_text_test_environment_preflight(
+    test_commands: Sequence[str],
+) -> dict[str, Any]:
+    original_commands = [
+        str(item or "").strip()
+        for item in test_commands
+        if str(item or "").strip()
+    ]
+    normalized_commands: list[str] = []
+    pytest_required = False
+
+    for command in original_commands:
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        if not parts:
+            continue
+        runner = parts[0]
+        rewritten_parts = list(parts)
+        if runner in {"pytest", "py.test"}:
+            pytest_required = True
+            rewritten_parts[0] = ".venv/bin/pytest"
+        elif runner.endswith("/pytest") or runner.endswith("/py.test"):
+            pytest_required = True
+        elif (
+            runner in {"python", "python3"}
+            and len(parts) >= 3
+            and parts[1:3] == ["-m", "pytest"]
+        ):
+            pytest_required = True
+            rewritten_parts[0] = ".venv/bin/python"
+        elif any(part == "pytest" or part.endswith("/pytest") for part in parts):
+            pytest_required = True
+        normalized_commands.append(
+            " ".join(shlex.quote(part) for part in rewritten_parts)
+        )
+
+    setup_commands: list[str] = []
+    if pytest_required:
+        setup_commands = [
+            (
+                "if [ ! -x .venv/bin/python ] || "
+                "! .venv/bin/python -m pytest --version >/dev/null 2>&1 || "
+                "! .venv/bin/python -c \"import yaml\" >/dev/null 2>&1; then "
+                "python3 -m venv .venv && "
+                "if [ -f agent/requirements.txt ]; then "
+                ".venv/bin/python -m pip install -r agent/requirements.txt; "
+                "fi && "
+                ".venv/bin/python -m pip install pytest; "
+                "fi"
+            ),
+            ".venv/bin/python -m pytest --version",
+        ]
+
+    return {
+        "schema_version": "observer_worker_launch_pack.test_environment_preflight.v1",
+        "status": "required" if pytest_required else "not_required",
+        "run_before": "run_focused_tests",
+        "working_directory": "assigned_worktree",
+        "scope": "assigned_worktree_only",
+        "setup_commands": setup_commands,
+        "original_test_commands": original_commands,
+        "test_commands": normalized_commands,
+        "dependency_sources": ["agent/requirements.txt"] if pytest_required else [],
+        "package_installs": ["pytest"] if pytest_required else [],
+        "install_when_missing": pytest_required,
+        "may_use_network": pytest_required,
+        "raw_tokens_persisted": False,
+    }
 
 
 def _normalize_path(path: str) -> str:
@@ -3472,6 +3545,24 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         runtime_context_id=str(payload.get("runtime_context_id") or ""),
     )
     local_bridge_path = str(local_bridge.get("path") or "")
+    test_environment_preflight = (
+        payload.get("test_environment_preflight")
+        if isinstance(payload.get("test_environment_preflight"), Mapping)
+        else {}
+    )
+    test_environment_instruction = ""
+    if (
+        test_environment_preflight.get("setup_commands")
+        or test_environment_preflight.get("test_commands")
+    ):
+        test_environment_instruction = (
+            "Before run_focused_tests, execute "
+            "`test_environment_preflight.setup_commands` from the assigned "
+            "worktree when present; this creates `.venv` and installs missing "
+            "pytest runner dependencies before running "
+            "`test_environment_preflight.test_commands`. Record any setup "
+            "failure as a worker-owned blocker.\n\n"
+        )
 
     return (
         "You are a bounded mf_sub implementation worker for Aming Claw.\n\n"
@@ -3528,6 +3619,7 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "result hash or artifact path, and any model-corrected contract repair in "
         "final evidence; if the precheck is not applicable, record the concrete "
         "reason.\n\n"
+        f"{test_environment_instruction}"
         "Runtime contract JSON:\n"
         + json.dumps(compact_payload, indent=2, sort_keys=True)
     )
@@ -3942,6 +4034,14 @@ def _runtime_text_worker_launch_pack(
     )
     cli_runtime_requirements["env_additions"] = dict(launch_env_additions)
     cli_runtime_requirements["env_policy"] = dict(launch_env_policy)
+    test_environment_preflight = _runtime_text_test_environment_preflight(
+        request.test_commands
+    )
+    normalized_test_commands = tuple(
+        str(item)
+        for item in (test_environment_preflight.get("test_commands") or [])
+        if str(item or "").strip()
+    )
     startup_alternatives = {
         "schema_version": "observer_worker_launch_pack.startup_alternatives.v1",
         "default": "same_owner_session_token_startup",
@@ -4116,7 +4216,8 @@ def _runtime_text_worker_launch_pack(
         "same_owner_session_token_startup": dict(same_owner_session_token_startup),
         "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
         "startup_refusal_policy": startup_refusal_policy,
-        "tests_to_run": list(request.test_commands),
+        "test_environment_preflight": test_environment_preflight,
+        "tests_to_run": list(normalized_test_commands or request.test_commands),
         "evidence_to_file": required_evidence,
         "runtime_context_entrypoints": runtime_context_entrypoints,
         "done_state": ["review_ready", "waiting_merge"],
@@ -4286,6 +4387,7 @@ def _runtime_text_worker_launch_pack(
         "blocked_actions": list(WORKER_LAUNCH_PACK_BLOCKED_ACTIONS),
         "next_legal_action": next_legal_action,
         "startup_preflight": startup_preflight,
+        "test_environment_preflight": test_environment_preflight,
         "startup_refusal_policy": startup_refusal_policy,
         "required_evidence": required_evidence,
         "transcript_refs": _runtime_text_items(request.transcript_refs),
@@ -5291,6 +5393,14 @@ def build_observer_runtime_text_context(
         },
     }
     worker_prompt = _runtime_text_worker_prompt(request, owned_files=owned_files)
+    test_environment_preflight = _runtime_text_test_environment_preflight(
+        request.test_commands
+    )
+    normalized_test_commands = tuple(
+        str(item)
+        for item in (test_environment_preflight.get("test_commands") or [])
+        if str(item or "").strip()
+    )
     mf_subagent_input: dict[str, Any]
     input_error = ""
     try:
@@ -5299,7 +5409,7 @@ def build_observer_runtime_text_context(
             prompt=worker_prompt,
             acceptance_criteria=request.acceptance_criteria,
             target_files=owned_files,
-            test_commands=request.test_commands,
+            test_commands=normalized_test_commands or request.test_commands,
             operator_notes=(
                 "Prepared by observer runtime text service. Use bounded contract "
                 "fields only; raw private route/context-pack content is not present."
@@ -5385,6 +5495,7 @@ def build_observer_runtime_text_context(
         "graph_first_obligations": graph_first_obligations,
         "first_progress_contract": first_progress_contract,
         "finish_gate_contract": finish_gate_contract,
+        "test_environment_preflight": test_environment_preflight,
     }
     launch_text = _runtime_text_launch_text(launch_payload)
     launch_text_hash = "sha256:" + hashlib.sha256(

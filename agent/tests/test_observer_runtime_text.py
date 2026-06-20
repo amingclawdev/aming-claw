@@ -270,6 +270,8 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert "post-hoc read receipt after counted evidence does not satisfy" in result[
         "launch_text"
     ]
+    assert "test_environment_preflight.setup_commands" in result["launch_text"]
+    assert "installs missing pytest runner dependencies" in result["launch_text"]
     assert result["finish_gate_contract"]["required"] is True
     assert result["finish_gate_contract"]["close_sensitive_precheck"][
         "parent_main_status_short_must_be_clean"
@@ -341,6 +343,25 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert launch_pack["startup_preflight"]["allowed"] is True
     assert launch_pack["startup_preflight"]["status"] == "passed"
     assert launch_pack["startup_preflight"]["blockers"] == []
+    test_env = launch_pack["test_environment_preflight"]
+    assert test_env["status"] == "required"
+    assert test_env["run_before"] == "run_focused_tests"
+    assert test_env["install_when_missing"] is True
+    assert test_env["dependency_sources"] == ["agent/requirements.txt"]
+    assert test_env["package_installs"] == ["pytest"]
+    assert test_env["original_test_commands"] == [
+        "python -m pytest agent/tests/test_observer_runtime_text.py -q"
+    ]
+    assert test_env["test_commands"] == [
+        ".venv/bin/python -m pytest agent/tests/test_observer_runtime_text.py -q"
+    ]
+    assert "python3 -m venv .venv" in test_env["setup_commands"][0]
+    assert ".venv/bin/python -m pip install -r agent/requirements.txt" in test_env[
+        "setup_commands"
+    ][0]
+    assert ".venv/bin/python -m pip install pytest" in test_env["setup_commands"][0]
+    assert launch_pack["worker_guide"]["test_environment_preflight"] == test_env
+    assert launch_pack["worker_guide"]["tests_to_run"] == test_env["test_commands"]
     assert "runtime_context_read_receipt" in {
         item["id"] for item in launch_pack["required_evidence"]
     }
@@ -470,6 +491,25 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     }
     assert next_action["env_policy"] == env_policy
     assert next_action["startup_identity_policy"] == identity_policy
+
+
+def test_runtime_text_preflights_missing_venv_pytest_runner(tmp_path):
+    command = ".venv/bin/pytest agent/tests/test_observer_runtime_text.py -q"
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(tmp_path, test_commands=(command,))
+    )
+
+    assert result["ok"] is True
+    test_env = result["worker_launch_pack"]["test_environment_preflight"]
+    assert test_env["status"] == "required"
+    assert test_env["original_test_commands"] == [command]
+    assert test_env["test_commands"] == [command]
+    assert "python3 -m venv .venv" in test_env["setup_commands"][0]
+    assert ".venv/bin/python -m pip install -r agent/requirements.txt" in test_env[
+        "setup_commands"
+    ][0]
+    assert ".venv/bin/python -m pip install pytest" in test_env["setup_commands"][0]
+    assert result["worker_launch_pack"]["worker_guide"]["tests_to_run"] == [command]
 
 
 def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):
