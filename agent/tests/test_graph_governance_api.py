@@ -19099,6 +19099,58 @@ def test_observer_root_route_context_includes_contract_state_projection(conn):
     assert result["contract_state"]["legacy_no_contract"] is False
 
 
+def test_observer_root_route_context_resolves_route_token_ref_identity(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-ROUTE-REF"
+    task_id = "root-route-context-route-ref-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:route-ref-test"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        route_token_ref=issued["route_token_ref"],
+    )
+
+    token = issued["route_token"]
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert result[field] == token[field]
+        assert result["canonical_route_identity"][field] == token[field]
+    assert result["route_token_ref"] == issued["route_token_ref"]
+    assert result["canonical_route_identity"]["route_token_ref"] == (
+        issued["route_token_ref"]
+    )
+    assert result["canonical_route_identity_complete"] is True
+    assert result["route_token_ref_projection"]["resolved"] is True
+    assert (
+        result["canonical_route_identity_source"]["source"]
+        == "route_context_gate+observer_route_token_refs"
+    )
+    assert result["canonical_route_identity_source"]["missing_fields"] == []
+
+
 def test_task_timeline_record_event_centrally_rejects_meta_contract_bypass(conn):
     backlog_id = "AC-META-CONTRACT-CENTRAL-REJECT"
     _insert_simple_mf_close_backlog(conn, backlog_id)

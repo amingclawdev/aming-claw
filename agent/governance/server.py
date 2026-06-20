@@ -27599,6 +27599,62 @@ def _observer_root_route_next_legal_action_from_steps(
     }
 
 
+def _observer_root_route_identity_from_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str = "",
+    route_token_ref: Any = "",
+) -> dict[str, Any]:
+    token_ref = str(route_token_ref or "").strip()
+    if not token_ref:
+        return {
+            "schema_version": "observer_root_route_token_ref_projection.v1",
+            "route_token_ref": "",
+            "resolved": False,
+            "identity": {},
+        }
+    from . import observer_route_context as _orc
+
+    try:
+        resolved = _orc.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except _orc.RouteTokenRefError as exc:
+        return {
+            "schema_version": "observer_root_route_token_ref_projection.v1",
+            "route_token_ref": token_ref,
+            "resolved": False,
+            "identity": {},
+            "error": str(exc),
+        }
+    if not isinstance(resolved, Mapping):
+        return {
+            "schema_version": "observer_root_route_token_ref_projection.v1",
+            "route_token_ref": token_ref,
+            "resolved": False,
+            "identity": {},
+            "error": "route_token_ref_not_registered",
+        }
+    identity = {
+        field: str(resolved.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+        if str(resolved.get(field) or "").strip()
+    }
+    return {
+        "schema_version": "observer_root_route_token_ref_projection.v1",
+        "route_token_ref": token_ref,
+        "resolved": bool(identity),
+        "identity": identity,
+        "binding_source": "observer_route_token_refs",
+    }
+
+
 def _is_plausible_graph_trace_id(value: Any) -> bool:
     """Defensive format check for a caller-supplied graph query schema trace id.
 
@@ -27699,6 +27755,8 @@ def _observer_root_route_context_state(
     loaded_skills=None,
     loaded_resources=None,
     caller_graph_query_schema_trace_id: Any = None,
+    route_token_ref: Any = "",
+    task_id: Any = "",
     materialize_requested_work_mode: bool = False,
 ) -> dict[str, Any]:
     """Assemble the aming-owned observer root route context for a backlog row.
@@ -27764,6 +27822,22 @@ def _observer_root_route_context_state(
         contract=contract,
     )
     route_context_for_bootstrap = dict(identity_projection.get("identity") or {})
+    route_token_ref_projection = _observer_root_route_identity_from_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=str(task_id or "").strip(),
+        route_token_ref=route_token_ref,
+    )
+    route_token_ref_identity = route_token_ref_projection.get("identity") or {}
+    if route_token_ref_identity:
+        route_context_for_bootstrap = _observer_root_route_merge_identity(
+            route_context_for_bootstrap,
+            route_token_ref_identity,
+        )
+    token_ref = str(route_token_ref_projection.get("route_token_ref") or "").strip()
+    if token_ref:
+        route_context_for_bootstrap["route_token_ref"] = token_ref
     route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
 
     transition_gate = observer_session.work_mode_transition_gate(
@@ -27804,6 +27878,12 @@ def _observer_root_route_context_state(
         loaded_resources=loaded_resources,
         graph_query_schema_trace_id=graph_trace_id,
     )
+    if token_ref:
+        context["route_token_ref"] = token_ref
+        canonical_route_identity = context.get("canonical_route_identity")
+        if isinstance(canonical_route_identity, dict):
+            canonical_route_identity["route_token_ref"] = token_ref
+    context["route_token_ref_projection"] = route_token_ref_projection
     ordered_missing_steps = _observer_root_route_ordered_missing_steps(
         route_context_gate=route_context_gate,
         transition_gate=transition_gate,
@@ -27880,11 +27960,20 @@ def _observer_root_route_context_state(
         ),
         "ordered_missing_steps": ordered_missing_steps,
     }
+    route_identity_source = str(identity_projection.get("source") or "")
+    if route_token_ref_projection.get("resolved"):
+        route_identity_source = (
+            f"{route_identity_source}+observer_route_token_refs"
+            if route_identity_source
+            else "observer_route_token_refs"
+        )
     context["canonical_route_identity_source"] = {
         "schema_version": "observer_root_route_identity_source.v1",
-        "source": str(identity_projection.get("source") or ""),
+        "source": route_identity_source,
         "event_id": str(identity_projection.get("event_id") or ""),
-        "missing_fields": identity_projection.get("missing_fields") or [],
+        "missing_fields": _observer_root_route_identity_missing_fields(
+            route_context_for_bootstrap
+        ),
         "ambiguous": bool(identity_projection.get("ambiguous")),
         "raw_route_token_persisted": False,
     }
@@ -27970,6 +28059,8 @@ def handle_observer_root_route_context_get(ctx: RequestContext):
             project_id,
             backlog_id=backlog_id,
             work_mode=work_mode,
+            route_token_ref=ctx.query.get("route_token_ref"),
+            task_id=ctx.query.get("task_id"),
         )
 
 
@@ -28001,6 +28092,8 @@ def handle_observer_root_route_context_post(ctx: RequestContext):
             loaded_skills=body.get("loaded_skills") or body.get("skills"),
             loaded_resources=body.get("loaded_resources") or body.get("resources"),
             caller_graph_query_schema_trace_id=caller_trace_id,
+            route_token_ref=body.get("route_token_ref"),
+            task_id=body.get("task_id"),
             materialize_requested_work_mode=True,
         )
 

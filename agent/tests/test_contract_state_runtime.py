@@ -623,3 +623,108 @@ def test_nested_successor_binding_after_hotfix_is_parent_scoped():
     assert nested["contract_execution_id"] == "cex-qa"
     assert projection["next_legal_action"]["id"] == "successor_contract_selected"
     assert projection["next_legal_action"]["contract_execution_id"] == "cex-qa"
+
+
+def test_custom_requirement_next_action_recommends_contract_state_changed_wrapper():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_revision_id": "rev-custom-evidence",
+            "state": "selected",
+            "required_evidence": [
+                {
+                    "id": "related_backlog_review",
+                    "action": "record_related_backlog_review",
+                }
+            ],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    next_action = projection["next_legal_action"]
+    hint = next_action["timeline_append_hint"]
+    assert next_action["id"] == "related_backlog_review"
+    assert hint["event_kind"] == "contract_state_changed"
+    assert hint["satisfies_by"] == "payload.requirement_id"
+    assert hint["payload"]["requirement_id"] == "related_backlog_review"
+
+    completed = build_contract_state_projection(
+        [
+            _event(
+                110,
+                "contract_state_changed",
+                payload={"requirement_id": "related_backlog_review"},
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert completed["contract_complete"] is True
+    assert completed["missing_evidence"] == []
+
+
+def test_top_level_successor_binding_does_not_rebind_root_contract():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_chain_id": "cchain-top-level-successor",
+            "contract_execution_id": "cex-onboard-root",
+            "contract_revision_id": "rev-top-level-successor",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+            "successor_contract_policy": {
+                "candidates": [
+                    {"contract_template_id": "observer_hotfix_direct_mutation.v1"}
+                ]
+            },
+        }
+    }
+    hotfix_template = {
+        "template_id": "observer_hotfix_direct_mutation.v1",
+        "evidence_requirements": [
+            {"id": "hotfix_pre_reason", "event_kind": "hotfix_entered"}
+        ],
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(120, "route_context"),
+            _event(
+                121,
+                "contract_binding",
+                payload={
+                    "contract_chain_id": "cchain-top-level-successor",
+                    "parent_contract_execution_id": "cex-onboard-root",
+                    "successor_contract_execution_id": "cex-hotfix",
+                    "contract_id": "observer_hotfix_direct_mutation.v1",
+                    "contract_template_id": "observer_hotfix_direct_mutation.v1",
+                    "handoff_reason": "workflow hotfix",
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        contract_templates={
+            "observer_hotfix_direct_mutation.v1": hotfix_template,
+        },
+    )
+
+    assert projection["contract_id"] == "onboard_contract.v1"
+    assert projection["active_contract_execution"]["contract_execution_id"] == (
+        "cex-onboard-root"
+    )
+    assert projection["selected_successor_contract"]["contract_id"] == (
+        "observer_hotfix_direct_mutation.v1"
+    )
+    assert projection["selected_successor_contract_state"]["contract_execution_id"] == (
+        "cex-hotfix"
+    )
+    assert projection["next_legal_action"]["id"] == "hotfix_pre_reason"

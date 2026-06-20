@@ -157,6 +157,28 @@
       "handoff_preconditions",
       "route_token_ref"
     ],
+    "recommended_selection_event_shape": {
+      "event_kind": "contract_binding",
+      "event_type": "contract.successor.selected",
+      "status": "passed",
+      "payload": {
+        "successor_contract": {
+          "contract_chain_id": "<root active_contract_execution.contract_chain_id>",
+          "parent_contract_execution_id": "<root active_contract_execution.contract_execution_id>",
+          "successor_contract_execution_id": "<new successor execution id>",
+          "contract_template_id": "<selected successor contract_template_id>",
+          "successor_backlog_id": "<optional successor backlog id>",
+          "handoff_event_id": "<timeline event id or external evidence ref>",
+          "handoff_reason": "<why this successor is the next contract>"
+        }
+      },
+      "forbidden_root_rebind_fields": [
+        "top_level_contract_id",
+        "top_level_contract_template_id",
+        "top_level_contract_execution_id"
+      ],
+      "description": "Bind the selected successor inside payload.successor_contract. Do not put successor contract_id or contract_template_id at the payload top level, because top-level contract fields are reserved for root contract revision/binding events."
+    },
     "candidates": [
       {
         "id": "observer_hotfix_direct_mutation.v1",

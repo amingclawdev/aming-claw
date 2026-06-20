@@ -118,6 +118,54 @@ _ROUTE_BINDING_FIELD_NAMES = (
     "route_token_ref",
 )
 
+_DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
+    "architecture_review",
+    "close_after_clauses",
+    "close_ready",
+    "contract_binding",
+    "contract_binding_changed",
+    "contract_revision_created",
+    "contract_state_changed",
+    "cross_ref_lineage_bridge",
+    "design_review",
+    "dispatch_bounded_worker",
+    "forbidden_attempt_recorded",
+    "hotfix_entered",
+    "hotfix_under_action",
+    "implementation",
+    "lineage_bridge",
+    "merge",
+    "merge_preview",
+    "merge_queue_entry",
+    "no_progress_timeout",
+    "observer_command",
+    "observer_visual_smoke",
+    "observer_work_mode_transition",
+    "plan_precheck",
+    "reconcile",
+    "record_blocker",
+    "review_lane",
+    "route_action_precheck",
+    "route_context",
+    "route_identity_cleanup",
+    "route_token_gate",
+    "verification",
+}
+
+_SUCCESSOR_ONLY_CONTRACT_BINDING_FIELD_NAMES = {
+    "handoff_event_id",
+    "handoff_reason",
+    "successor_backlog_id",
+    "successor_contract_execution_id",
+    "successor_contract_template_id",
+}
+
+_SUCCESSOR_BINDING_MARKER_FIELD_NAMES = {
+    "successor_backlog_id",
+    "successor_contract_execution_id",
+    "successor_contract_template_id",
+}
+
 _TEST_ROUTE_FIELD_NAMES = (
     "test_route",
     "verification_route",
@@ -219,10 +267,29 @@ def _contract_binding_from_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
                 }
             )
     for field in _CONTRACT_BINDING_FIELD_NAMES:
+        if field in _SUCCESSOR_ONLY_CONTRACT_BINDING_FIELD_NAMES:
+            continue
         field_value = value.get(field)
         if field_value:
             binding[field] = field_value
     return binding
+
+
+def _payload_is_successor_binding_only(value: Mapping[str, Any]) -> bool:
+    has_root_binding_container = any(
+        isinstance(value.get(key), Mapping) for key in _CONTRACT_BINDING_CONTAINER_KEYS
+    )
+    if has_root_binding_container:
+        return False
+    if any(
+        isinstance(value.get(key), Mapping)
+        for key in _SUCCESSOR_CONTRACT_CONTAINER_KEYS
+    ):
+        return True
+    return any(
+        str(value.get(field) or "").strip()
+        for field in _SUCCESSOR_BINDING_MARKER_FIELD_NAMES
+    )
 
 
 def _latest_contract_binding(
@@ -233,6 +300,8 @@ def _latest_contract_binding(
     for event in events:
         event_kind = str(event.get("event_kind") or "").strip()
         for payload in _event_payloads(event):
+            if _payload_is_successor_binding_only(payload):
+                continue
             candidate = _contract_binding_from_mapping(payload)
             if not candidate:
                 continue
@@ -404,7 +473,74 @@ def _normalize_requirement(
             or sorted(CONTRACT_PASS_STATUSES)
         )
     ]
+    step["timeline_append_hint"] = _timeline_append_hint(step)
     return step
+
+
+def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
+    requirement_id = str(step.get("id") or "").strip()
+    accepted_event_kinds = _string_list(
+        step.get("accepted_event_kinds")
+        or step.get("event_kinds")
+        or step.get("event_kind")
+    )
+    direct_event_kind = next(
+        (
+            event_kind
+            for event_kind in accepted_event_kinds
+            if event_kind in _DIRECT_TIMELINE_APPEND_EVENT_KINDS
+        ),
+        "",
+    )
+    uses_requirement_payload_match = False
+    if not direct_event_kind:
+        direct_event_kind = "contract_state_changed"
+        uses_requirement_payload_match = True
+    accepted_statuses = _string_list(step.get("accepted_statuses"))
+    if "passed" in accepted_statuses:
+        status = "passed"
+    elif "accepted" in accepted_statuses:
+        status = "accepted"
+    else:
+        status = accepted_statuses[0] if accepted_statuses else "passed"
+    payload = {
+        "schema_version": "contract_state_evidence.v1",
+        "requirement_id": requirement_id,
+        "requirement_ids": [requirement_id] if requirement_id else [],
+    }
+    return {
+        "schema_version": "contract_state_timeline_append_hint.v1",
+        "event_kind": direct_event_kind,
+        "event_type": str(step.get("event_type") or "").strip()
+        or (
+            "contract.state.changed"
+            if uses_requirement_payload_match
+            else direct_event_kind.replace("_", ".")
+        ),
+        "status": status,
+        "payload": payload,
+        "satisfies_by": (
+            "payload.requirement_id"
+            if uses_requirement_payload_match
+            else "event_kind"
+        ),
+        "accepted_event_kinds": accepted_event_kinds,
+        "accepted_statuses": accepted_statuses,
+    }
+
+
+def _next_action_requirement_metadata(step: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in (
+        "accepted_event_kinds",
+        "accepted_statuses",
+        "timeline_append_hint",
+        "prerequisite_ids",
+    ):
+        value = step.get(key)
+        if value not in (None, "", [], {}):
+            metadata[key] = value
+    return metadata
 
 
 def _requirement_steps(
@@ -1040,6 +1176,7 @@ def build_contract_state_projection(
             "blocked_by": first.get("blocked_by") or [],
             "ordered_missing_steps_source": "contract_state",
             "ordered_missing_steps": ordered_next_steps,
+            **_next_action_requirement_metadata(first),
         }
 
     route_binding = _latest_route_binding(rows, root)
@@ -1238,6 +1375,7 @@ def build_contract_state_projection(
                 "projection_watermark": projection_watermark,
                 "selected_successor_contract": selected_successor,
                 "selected_successor_contract_state": selected_successor_contract_state,
+                **_next_action_requirement_metadata(first),
             }
         elif nested_selected_successor:
             successor_next_legal_action = {
