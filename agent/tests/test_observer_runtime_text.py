@@ -571,6 +571,46 @@ def test_runtime_text_carries_recorded_read_receipt_and_target_files(tmp_path):
     assert persistent["read_receipt_event_id"] == "4178"
 
 
+def test_runtime_text_carries_durable_projection_read_receipt_action(tmp_path):
+    projection = _runtime_context_projection(
+        tmp_path,
+        target_files=["agent/observer_runtime.py"],
+    )
+    worker_view = projection["worker_view"]
+    assert isinstance(worker_view, dict)
+    worker_view["timeline_refs"] = {"read_receipt_event_ref": "timeline:5633"}
+    worker_view["read_receipt_hash_action"] = {
+        "schema_version": "runtime_context.read_receipt_hash_action.v1",
+        "status": "present",
+        "read_receipt_event_ref": "timeline:5633",
+        "hash_bridge": {
+            "accepted_inputs": ["read_receipt_hash", "launch_text_hash"],
+            "launch_text_hash": "sha256:durable-launch-text",
+        },
+    }
+
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            owned_files=(),
+            runtime_context_projection=projection,
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["read_receipt_recorded"] is True
+    assert result["read_receipt_hash"] == "sha256:durable-launch-text"
+    assert result["read_receipt_event_id"] == "timeline:5633"
+    identity = result["read_receipt_identity"]
+    assert identity["status"] == "recorded"
+    assert identity["recorded"] is True
+    assert identity["supplied_unverified"] is False
+    assert identity["hash_source"] == "launch_text_hash"
+    assert identity["event_id_source"] == "read_receipt_event_ref"
+    assert result["worker_launch_pack"]["read_receipt_recorded"] is True
+    assert result["startup_recording"]["read_receipt_recorded"] is True
+
+
 def test_runtime_text_request_supplied_read_receipt_is_unverified(tmp_path):
     result = build_observer_runtime_text_context(
         _runtime_text_request(

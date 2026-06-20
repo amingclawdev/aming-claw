@@ -3940,13 +3940,16 @@ def _runtime_text_supplied_projection(
 def _runtime_text_projection_containers(
     projection: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
-    containers: list[Mapping[str, Any]] = [projection]
-    for key in (
+    containers: list[Mapping[str, Any]] = []
+    stack: list[Mapping[str, Any]] = [projection]
+    seen: set[int] = set()
+    projection_keys = (
         "worker_view",
         "runtime_context_worker_view",
         RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
         "current",
         "current_state",
+        "current_values",
         "runtime_context_current",
         RUNTIME_CONTEXT_CURRENT_SCHEMA_VERSION,
         "gate_inputs",
@@ -3958,15 +3961,28 @@ def _runtime_text_projection_containers(
         "branch_identity",
         "runtime_context",
         "graph_query_identity",
-    ):
-        value = projection.get(key)
-        if isinstance(value, Mapping):
-            containers.append(value)
-    views = projection.get("views")
-    if isinstance(views, Mapping):
-        for value in views.values():
+        "timeline_refs",
+        "read_receipt",
+        "read_receipt_identity",
+        "read_receipt_hash_action",
+        "hash_bridge",
+    )
+    while stack:
+        current = stack.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        containers.append(current)
+        for key in projection_keys:
+            value = current.get(key)
             if isinstance(value, Mapping):
-                containers.append(value)
+                stack.append(value)
+        views = current.get("views")
+        if isinstance(views, Mapping):
+            for value in views.values():
+                if isinstance(value, Mapping):
+                    stack.append(value)
     return containers
 
 
