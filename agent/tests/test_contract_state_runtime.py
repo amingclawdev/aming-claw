@@ -3,9 +3,17 @@ from __future__ import annotations
 from agent.governance.contract_state_runtime import build_contract_state_projection
 
 
-def _event(event_id: int, kind: str, *, status: str = "passed", payload=None):
+def _event(
+    event_id: int,
+    kind: str,
+    *,
+    status: str = "passed",
+    payload=None,
+    project_id: str = "",
+):
     return {
         "id": event_id,
+        "project_id": project_id,
         "backlog_id": "AC-CONTRACT-RUNTIME",
         "event_kind": kind,
         "phase": "contract",
@@ -121,6 +129,26 @@ def test_projection_exposes_active_contract_execution_handle():
     assert active["contract_template_id"] == "onboard_contract.v1"
     assert active["contract_revision_id"] == "rev-3"
     assert active["contract_execution_id"].startswith("cex-")
+
+
+def test_projection_falls_back_to_event_project_id_for_active_execution():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_revision_id": "rev-project-fallback",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [_event(44, "route_context", project_id="aming-claw")],
+        contract=contract,
+        backlog_row={"bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["active_contract_execution"]["project_id"] == "aming-claw"
 
 
 def test_non_onboard_contract_uses_same_projection_path():

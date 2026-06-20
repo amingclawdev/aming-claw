@@ -487,7 +487,17 @@ def build_contract_state_projection(
     rows = [event for event in (events or []) if isinstance(event, dict)]
     root = _contract_root(contract)
     row = dict(backlog_row or {})
-    project_id = str(row.get("project_id") or "").strip()
+    project_id = str(
+        row.get("project_id")
+        or root.get("project_id")
+        or root.get("target_project_id")
+        or ""
+    ).strip()
+    if not project_id:
+        for event in rows:
+            project_id = str(event.get("project_id") or "").strip()
+            if project_id:
+                break
     backlog_id = str(row.get("bug_id") or row.get("backlog_id") or "").strip()
     if not backlog_id:
         for event in rows:

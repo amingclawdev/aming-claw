@@ -1669,6 +1669,50 @@ class TestTaskTimeline(unittest.TestCase):
             ],
         )
 
+    def test_root_route_context_contract_next_action_omits_deferred_close_steps(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-CONTRACT-NEXT-ACTION-ONLY"
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "contract_id": "onboard_contract.v1",
+                "contract_template_id": "onboard_contract.v1",
+                "contract_revision_id": "rev-contract-next-only",
+                "state": "selected",
+                "required_evidence": ["graph_query_schema_trace"],
+            },
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        )
+
+        self.assertEqual(result["next_legal_action"]["id"], "graph_query_schema_trace")
+        self.assertEqual(
+            result["next_legal_action"]["missing_prerequisites"],
+            ["graph_query_schema_trace"],
+        )
+        self.assertNotIn(
+            "implementation",
+            result["next_legal_action"]["missing_prerequisites"],
+        )
+        self.assertIn(
+            "route_context",
+            result["next_legal_action"]["deferred_missing_prerequisites"],
+        )
+        self.assertNotIn(
+            "route_context",
+            result["next_legal_action"]["missing_prerequisites"],
+        )
+        self.assertEqual(
+            result["contract_state"]["active_contract_execution"]["project_id"],
+            "proj",
+        )
+
     def test_root_route_context_reports_missing_precheck_before_execution_supervisor(self):
         from agent.governance import observer_session, server, task_timeline
 

@@ -27738,7 +27738,10 @@ def _observer_root_route_context_state(
     contract_state = task_timeline.contract_state_projection(
         events,
         contract=contract,
-        backlog_row=dict(row) if row else {"bug_id": backlog_id},
+        backlog_row={
+            **(dict(row) if row else {"bug_id": backlog_id}),
+            "project_id": project_id,
+        },
     )
 
     # Graph query_schema trace id: if the caller supplied a plausible trace id
@@ -27887,13 +27890,20 @@ def _observer_root_route_context_state(
     }
     context["work_mode_transition_gate"] = transition_gate
     if contract_missing_step_active:
+        contract_missing_prerequisites = [
+            step["id"] for step in contract_ordered_steps
+        ]
+        deferred_missing_prerequisites = [
+            step["id"]
+            for step in ordered_missing_steps
+            if step["id"] not in contract_missing_prerequisites
+        ]
         context["contract_state_next_action"] = contract_next_action
         context["next_legal_action"] = {
             **contract_next_action,
-            "missing_prerequisites": [
-                step["id"] for step in ordered_missing_steps
-            ],
-            "ordered_missing_steps": ordered_missing_steps,
+            "missing_prerequisites": contract_missing_prerequisites,
+            "ordered_missing_steps": contract_ordered_steps,
+            "deferred_missing_prerequisites": deferred_missing_prerequisites,
             "source": contract_next_action.get("source") or "contract_state",
             "precedence": (
                 contract_next_action.get("precedence")
@@ -32453,7 +32463,7 @@ def handle_backlog_contract_state(ctx: RequestContext):
         projection = task_timeline.contract_state_projection(
             events,
             contract=contract,
-            backlog_row=dict(row),
+            backlog_row={**dict(row), "project_id": pid},
         )
         return {
             "ok": True,
