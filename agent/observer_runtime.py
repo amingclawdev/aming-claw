@@ -1147,6 +1147,318 @@ def _dogfood_execute_env_blocker(
     }
 
 
+def _dogfood_secret_redacted_copy(
+    value: Any,
+    *,
+    session_token: str = "",
+    fence_token: str = "",
+) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _dogfood_secret_redacted_copy(
+                nested,
+                session_token=session_token,
+                fence_token=fence_token,
+            )
+            for key, nested in value.items()
+            if str(key) not in {"session_token"}
+        }
+    if isinstance(value, list):
+        return [
+            _dogfood_secret_redacted_copy(
+                item,
+                session_token=session_token,
+                fence_token=fence_token,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _dogfood_secret_redacted_copy(
+                item,
+                session_token=session_token,
+                fence_token=fence_token,
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        text = value
+        if session_token:
+            text = text.replace(
+                session_token,
+                "<read from env:AMING_WORKER_SESSION_TOKEN at submission time>",
+            )
+        if fence_token:
+            text = text.replace(fence_token, _runtime_text_secret_hash(fence_token))
+        return text
+    return value
+
+
+def _dogfood_fill_read_receipt_body(
+    value: Any,
+    *,
+    session_token: str,
+    fence_token: str,
+    launch_text_hash: str,
+) -> Any:
+    if isinstance(value, Mapping):
+        filled: dict[str, Any] = {}
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            if key == "session_token":
+                filled[key] = session_token
+            elif key == "fence_token":
+                filled[key] = fence_token
+            elif key in {"read_receipt_hash", "launch_text_hash"}:
+                nested_text = str(nested or "").strip()
+                filled[key] = (
+                    launch_text_hash
+                    if not nested_text or nested_text.startswith("<")
+                    else nested
+                )
+            else:
+                filled[key] = _dogfood_fill_read_receipt_body(
+                    nested,
+                    session_token=session_token,
+                    fence_token=fence_token,
+                    launch_text_hash=launch_text_hash,
+                )
+        return filled
+    if isinstance(value, list):
+        return [
+            _dogfood_fill_read_receipt_body(
+                item,
+                session_token=session_token,
+                fence_token=fence_token,
+                launch_text_hash=launch_text_hash,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _dogfood_fill_read_receipt_body(
+                item,
+                session_token=session_token,
+                fence_token=fence_token,
+                launch_text_hash=launch_text_hash,
+            )
+            for item in value
+        ]
+    return value
+
+
+def _dogfood_submit_read_receipt_facade(
+    *,
+    request: "DogfoodObserverPlanRequest",
+    context: Any,
+    launch_env: Mapping[str, Any],
+    runtime_text: Mapping[str, Any],
+    executable_worker_launch: Mapping[str, Any],
+) -> dict[str, Any]:
+    if bool(runtime_text.get("read_receipt_recorded")):
+        return {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": True,
+            "status": "already_recorded",
+            "read_receipt_recorded": True,
+            "read_receipt_timeline_event_id": str(
+                runtime_text.get("read_receipt_event_id") or ""
+            ),
+            "read_receipt_hash": str(runtime_text.get("read_receipt_hash") or ""),
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        }
+
+    env = launch_env.get("env") if isinstance(launch_env.get("env"), Mapping) else {}
+    session_token = str(env.get("AMING_WORKER_SESSION_TOKEN") or "").strip()
+    fence_token = str(env.get("AMING_WORKER_FENCE_TOKEN") or "").strip()
+    launch_text_hash = str(runtime_text.get("launch_text_hash") or "").strip()
+    handoff = (
+        executable_worker_launch.get("handoff_packet")
+        if isinstance(executable_worker_launch.get("handoff_packet"), Mapping)
+        else {}
+    )
+    skeleton = (
+        handoff.get("read_receipt_facade_payload_skeleton")
+        if isinstance(handoff.get("read_receipt_facade_payload_skeleton"), Mapping)
+        else {}
+    )
+    copy_safe_body = (
+        skeleton.get("copy_safe_body")
+        if isinstance(skeleton.get("copy_safe_body"), Mapping)
+        else skeleton.get("body")
+        if isinstance(skeleton.get("body"), Mapping)
+        else {}
+    )
+    path = str(skeleton.get("path") or "").strip()
+    if not session_token or not fence_token or not launch_text_hash or not copy_safe_body or not path:
+        missing = [
+            name
+            for name, value in (
+                ("AMING_WORKER_SESSION_TOKEN", session_token),
+                ("AMING_WORKER_FENCE_TOKEN", fence_token),
+                ("launch_text_hash", launch_text_hash),
+                ("read_receipt_facade_payload_skeleton.copy_safe_body", copy_safe_body),
+                ("read_receipt_facade_payload_skeleton.path", path),
+            )
+            if not value
+        ]
+        return {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": False,
+            "status": "blocked",
+            "blocker_id": "read_receipt_facade_payload_incomplete",
+            "missing_fields": missing,
+            "read_receipt_recorded": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        }
+
+    body = _dogfood_fill_read_receipt_body(
+        copy_safe_body,
+        session_token=session_token,
+        fence_token=fence_token,
+        launch_text_hash=launch_text_hash,
+    )
+    body["actor"] = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or request.worker_id
+        or "mf_sub"
+    )
+    body.setdefault("event_type", "mf_subagent_read_receipt")
+    body.setdefault("event_kind", "mf_subagent_read_receipt")
+    body.setdefault("status", "accepted")
+    path = path if path.startswith("/") else f"/{path}"
+    base_url = str(env.get("AMING_GOVERNANCE_URL") or "http://localhost:40000").rstrip("/")
+    url = f"{base_url}{path}"
+    data = json.dumps(body, sort_keys=True).encode("utf-8")
+    http_request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method=str(skeleton.get("method") or "POST"),
+    )
+    public_request = {
+        "method": str(skeleton.get("method") or "POST"),
+        "url": url,
+        "body": _dogfood_secret_redacted_copy(
+            body,
+            session_token=session_token,
+            fence_token=fence_token,
+        ),
+    }
+    try:
+        with urllib.request.urlopen(http_request, timeout=10) as response:  # noqa: S310 - local governance URL
+            response_body = response.read().decode("utf-8")
+            status_code = int(getattr(response, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        payload: Any
+        try:
+            payload = json.loads(response_body) if response_body else {}
+        except json.JSONDecodeError:
+            payload = {"raw_body": response_body}
+        return {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": False,
+            "status": "http_error",
+            "blocker_id": "read_receipt_facade_submit_failed",
+            "status_code": int(exc.code),
+            "request": public_request,
+            "response": _dogfood_secret_redacted_copy(
+                payload,
+                session_token=session_token,
+                fence_token=fence_token,
+            ),
+            "read_receipt_recorded": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        }
+    except (OSError, urllib.error.URLError, TimeoutError) as exc:
+        return {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": False,
+            "status": "network_error",
+            "blocker_id": "read_receipt_facade_submit_failed",
+            "error": str(exc),
+            "request": public_request,
+            "read_receipt_recorded": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        }
+
+    try:
+        payload = json.loads(response_body) if response_body else {}
+    except json.JSONDecodeError:
+        payload = {"raw_body": response_body}
+    payload = payload if isinstance(payload, Mapping) else {}
+    event = payload.get("timeline_event") if isinstance(payload.get("timeline_event"), Mapping) else {}
+    receipt = payload.get("read_receipt") if isinstance(payload.get("read_receipt"), Mapping) else {}
+    event_id = str(event.get("id") or event.get("event_id") or "")
+    read_receipt_hash = str(
+        receipt.get("read_receipt_hash")
+        or receipt.get("launch_text_hash")
+        or body.get("read_receipt_hash")
+        or body.get("launch_text_hash")
+        or ""
+    )
+    ok = bool(payload.get("ok", 200 <= status_code < 300)) and bool(event_id)
+    return {
+        "schema_version": "observer_dogfood_read_receipt_submission.v1",
+        "ok": ok,
+        "status": "submitted" if ok else "blocked",
+        "blocker_id": "" if ok else "read_receipt_facade_submit_failed",
+        "status_code": status_code,
+        "request": public_request,
+        "response": _dogfood_secret_redacted_copy(
+            payload,
+            session_token=session_token,
+            fence_token=fence_token,
+        ),
+        "read_receipt_recorded": ok,
+        "read_receipt_timeline_event_id": event_id,
+        "read_receipt_hash": read_receipt_hash,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+    }
+
+
+def _dogfood_read_receipt_submission_blocker(
+    *,
+    request: "DogfoodObserverPlanRequest",
+    context: Any,
+    submission: Mapping[str, Any],
+    executable_worker_launch: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "observer_dogfood_read_receipt_submission_blocker.v1",
+        "ok": False,
+        "status": "blocked",
+        "terminal_dispatch_blocker": True,
+        "blocker_id": str(
+            submission.get("blocker_id") or "read_receipt_facade_submit_failed"
+        ),
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "task_id": str(getattr(context, "task_id", "") or request.task_id or ""),
+        "runtime_context_id": request.runtime_context_id
+        or runtime_context_id_for_branch_context(context),
+        "read_receipt_submission": dict(submission),
+        "executable_worker_launch": dict(executable_worker_launch),
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "reason": (
+            "execute requested for a bounded CLI worker, but the worker read "
+            "receipt facade could not be recorded before provider invocation."
+        ),
+        "next_action": (
+            "repair the runtime-context read receipt facade request, then retry "
+            "the bounded worker launch without invoking the provider first."
+        ),
+    }
+
+
 def _startup_read_receipt_recording_status(
     observer_result: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1249,6 +1561,131 @@ def _merge_startup_read_receipt_recording_status(
     return merged
 
 
+def _timeline_deep_text(value: Any, field: str) -> str:
+    stack: list[Any] = [value]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop(0)
+        if isinstance(current, Mapping):
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            direct = current.get(field)
+            if direct not in (None, "", [], {}):
+                return str(direct).strip()
+            for nested in current.values():
+                if isinstance(nested, (Mapping, list, tuple)):
+                    stack.append(nested)
+        elif isinstance(current, (list, tuple)):
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            stack.extend(
+                item for item in current if isinstance(item, (Mapping, list, tuple))
+            )
+    return ""
+
+
+def _timeline_event_route_identity(event: Mapping[str, Any]) -> dict[str, str]:
+    fields = (
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+    )
+    identity = {
+        field: _timeline_deep_text(event, field)
+        for field in fields
+        if _timeline_deep_text(event, field)
+    }
+    route_id = _timeline_deep_text(event, "route_id")
+    if route_id:
+        identity["route_id"] = route_id
+    return identity
+
+
+def _timeline_event_attempt_lineage(event: Mapping[str, Any]) -> dict[str, str]:
+    lineage = {
+        "runtime_context_id": _timeline_deep_text(event, "runtime_context_id"),
+        "task_id": _timeline_deep_text(event, "task_id"),
+        "parent_task_id": _timeline_deep_text(event, "parent_task_id"),
+    }
+    if not lineage["parent_task_id"]:
+        lineage["parent_task_id"] = str(event.get("backlog_id") or "").strip()
+    return {key: value for key, value in lineage.items() if value}
+
+
+def _timeline_mapping_matches_filter(
+    value: Mapping[str, str],
+    expected: Mapping[str, str],
+) -> bool:
+    return all(
+        str(value.get(key) or "").strip() == str(match or "").strip()
+        for key, match in expected.items()
+        if str(match or "").strip()
+    )
+
+
+def _timeline_event_ref(event: Mapping[str, Any], *, reason: str = "") -> dict[str, Any]:
+    ref = {
+        "id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "event_type": event.get("event_type"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+    }
+    if reason:
+        ref["reason"] = reason
+    return {key: value for key, value in ref.items() if value not in (None, "")}
+
+
+def _timeline_startup_events_for_lineage(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    identity_filter: Mapping[str, str],
+    attempt_lineage_filter: Mapping[str, str],
+) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
+    matched: list[Mapping[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    for event in events:
+        identity = _timeline_event_route_identity(event)
+        if identity_filter:
+            if not identity:
+                ignored.append(
+                    _timeline_event_ref(
+                        event,
+                        reason="missing_route_identity_for_current_lineage",
+                    )
+                )
+                continue
+            if not _timeline_mapping_matches_filter(identity, identity_filter):
+                ignored.append(
+                    _timeline_event_ref(event, reason="superseded_route_identity")
+                )
+                continue
+        attempt_lineage = _timeline_event_attempt_lineage(event)
+        if attempt_lineage_filter:
+            if not attempt_lineage:
+                ignored.append(
+                    _timeline_event_ref(
+                        event,
+                        reason="missing_attempt_lineage_for_current_route",
+                    )
+                )
+                continue
+            if not _timeline_mapping_matches_filter(
+                attempt_lineage,
+                attempt_lineage_filter,
+            ):
+                ignored.append(
+                    _timeline_event_ref(event, reason="superseded_attempt_lineage")
+                )
+                continue
+        matched.append(event)
+    return matched, ignored
+
+
 def _timeline_startup_read_receipt_recording_status(
     *,
     project_id: str,
@@ -1311,7 +1748,25 @@ def _timeline_startup_read_receipt_recording_status(
         if str(event.get("event_kind") or event.get("event_type") or "")
         == "mf_subagent_startup"
     ]
-    startup_event = startup_events[-1] if startup_events else {}
+    identity_filter = {
+        key: value
+        for key, value in lineage_filter.items()
+        if key in {"route_context_hash", "prompt_contract_id", "prompt_contract_hash"}
+        and value
+    }
+    attempt_lineage_filter = {
+        key: value
+        for key, value in lineage_filter.items()
+        if key in {"runtime_context_id", "task_id", "parent_task_id"} and value
+    }
+    matched_startup_events, ignored_startup_events = (
+        _timeline_startup_events_for_lineage(
+            startup_events,
+            identity_filter=identity_filter,
+            attempt_lineage_filter=attempt_lineage_filter,
+        )
+    )
+    startup_event = matched_startup_events[-1] if matched_startup_events else {}
     startup_payload = (
         startup_event.get("payload") if isinstance(startup_event, Mapping) else {}
     )
@@ -1352,6 +1807,15 @@ def _timeline_startup_read_receipt_recording_status(
         "timeline_startup_event_ids": [
             event.get("id") for event in startup_events if event.get("id") is not None
         ],
+        "timeline_startup_matched_event_ids": [
+            event.get("id")
+            for event in matched_startup_events
+            if event.get("id") is not None
+        ],
+        "timeline_startup_ignored_event_ids": [
+            item.get("id") for item in ignored_startup_events if item.get("id") is not None
+        ],
+        "timeline_startup_ignored_events": ignored_startup_events,
     }
 
 
@@ -2223,6 +2687,11 @@ def _runtime_text_branch_runtime_evidence(
             "supplied_source_ref": registration_ref,
             "supplied_evidence_status": supplied_status or supplied.get("status") or "",
             "supplied_message": str(supplied.get("message") or ""),
+            "missing_fields": (
+                list(supplied.get("missing_fields"))
+                if isinstance(supplied.get("missing_fields"), list)
+                else []
+            ),
             "mismatches": (
                 list(supplied.get("mismatches"))
                 if isinstance(supplied.get("mismatches"), list)
@@ -2673,16 +3142,42 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
     if _runtime_text_packet_registered(packet):
         return packet
 
+    expected = dict(expected_fields or {})
     lookup_runtime_context_id = _runtime_text_runtime_context_id_from_packet(
         branch_runtime_registration_ref=branch_runtime_registration_ref,
         packet=packet,
         runtime_context_id=runtime_context_id,
     )
     lookup_task_id = _runtime_text_task_id_from_packet(task_id=task_id, packet=packet)
+    source_ref = str(
+        packet.get("registration_ref")
+        or packet.get("source_ref")
+        or packet.get("allocation_source_ref")
+        or branch_runtime_registration_ref
+        or ""
+    ).strip()
+    marker_only_registration_ref = bool(
+        source_ref
+        and any(marker in source_ref for marker in RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS)
+        and not lookup_runtime_context_id
+        and not _runtime_text_packet_context(packet)
+    )
+    if marker_only_registration_ref:
+        missing_fields = ["runtime_context_id", "worktree_path"]
+        missing_fields.extend(
+            field for field, value in expected.items() if str(value or "").strip()
+        )
+        return _runtime_text_allocation_required_evidence(
+            supplied_source_ref=source_ref,
+            message=(
+                "Branch runtime registration ref is only an allocation marker; "
+                "pass persisted branch_runtime_evidence with runtime_context_id."
+            ),
+            missing_fields=sorted(set(missing_fields)),
+        )
     if not lookup_runtime_context_id and not lookup_task_id:
         return packet
 
-    expected = dict(expected_fields or {})
     if lookup_runtime_context_id:
         service_packet = _runtime_text_get_service_branch_runtime_evidence(
             project_id=project_id,
@@ -2694,13 +3189,6 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
         if service_packet:
             return service_packet
 
-    source_ref = str(
-        packet.get("registration_ref")
-        or packet.get("source_ref")
-        or packet.get("allocation_source_ref")
-        or branch_runtime_registration_ref
-        or ""
-    ).strip()
     try:
         context = _runtime_text_get_persisted_branch_context(
             project_id=project_id,
@@ -6590,6 +7078,46 @@ def build_dogfood_observer_run_plan(
         )
         return result
 
+    read_receipt_submission: dict[str, Any] = {}
+    if execute:
+        read_receipt_submission = _dogfood_submit_read_receipt_facade(
+            request=request,
+            context=context,
+            launch_env=launch_env,
+            runtime_text=runtime_text,
+            executable_worker_launch=executable_worker_launch,
+        )
+        result["read_receipt_submission"] = read_receipt_submission
+        if not read_receipt_submission.get("ok"):
+            blocker = _dogfood_read_receipt_submission_blocker(
+                request=request,
+                context=context,
+                submission=read_receipt_submission,
+                executable_worker_launch=executable_worker_launch,
+            )
+            result.update(
+                {
+                    "ok": False,
+                    "status": "blocked",
+                    "calls_models": False,
+                    "auth_status": "not_invoked",
+                    "read_receipt_submission_blocker": blocker,
+                    "terminal_dispatch_blocker": True,
+                    "command_projection_status": "failed",
+                    "canonical_contract_state": "blocked",
+                    "terminal_contract_projection": {
+                        "schema_version": "observer_command_terminal_projection.v1",
+                        "passed": False,
+                        "canonical_contract_state": "blocked",
+                        "command_projection_status": "failed",
+                        "divergence_reason": blocker["blocker_id"],
+                        "observer_command_id": observer_command_id,
+                    },
+                    "error": blocker["reason"],
+                }
+            )
+            return result
+
     observer_request = ObserverRunRequest(
         project_id=request.project_id,
         backlog_id=request.backlog_id,
@@ -6609,6 +7137,26 @@ def build_dogfood_observer_run_plan(
     observer_result = run_observer(observer_request, execute=execute)
     if execute:
         observer_result["executable_worker_launch"] = dict(executable_worker_launch)
+        observer_result["read_receipt_submission"] = dict(read_receipt_submission)
+        if read_receipt_submission.get("read_receipt_recorded"):
+            read_receipt_event_id = str(
+                read_receipt_submission.get("read_receipt_timeline_event_id") or ""
+            )
+            read_receipt_hash = str(
+                read_receipt_submission.get("read_receipt_hash") or ""
+            )
+            observer_result["read_receipt_recorded"] = True
+            observer_result["read_receipt_recorded_before_implementation_wait"] = True
+            observer_result["read_receipt"] = {
+                "timeline_event_id": read_receipt_event_id,
+                "read_receipt_hash": read_receipt_hash,
+                "hash": read_receipt_hash,
+                "source": "observer_dogfood_auto_submit_read_receipt",
+            }
+            observer_result["read_receipt_recording_append"] = {
+                "event_id": read_receipt_event_id,
+                "read_receipt_hash": read_receipt_hash,
+            }
     if execute and observer_result.get("status") == "blocked":
         timeout_blocker = _dogfood_cli_timeout_blocker(
             request,

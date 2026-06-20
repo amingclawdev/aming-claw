@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
 from pathlib import Path
 
 from agent.ai_invocation import RoutePromptContract
@@ -27,6 +28,7 @@ from agent.observer_runtime import (
     build_observer_prompt,
     observer_poll_timeline_payload,
     ObserverRunRequest,
+    _timeline_startup_read_receipt_recording_status,
 )
 
 
@@ -171,6 +173,42 @@ def _patch_dogfood_no_progress(monkeypatch):
         }
 
     monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
+    monkeypatch.setattr(
+        "agent.observer_runtime._dogfood_submit_read_receipt_facade",
+        lambda **_: {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": True,
+            "status": "test_skipped",
+            "read_receipt_recorded": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        },
+    )
+
+
+def _patch_timeline_events(monkeypatch, events):
+    class FakeDBContext:
+        def __init__(self, project_id):
+            self.project_id = project_id
+
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_list_events(*args, **kwargs):
+        return events
+
+    monkeypatch.setattr("agent.governance.db.DBContext", FakeDBContext)
+    monkeypatch.setattr("agent.governance.task_timeline.list_events", fake_list_events)
+    try:
+        import governance.db as direct_db
+        import governance.task_timeline as direct_task_timeline
+    except ImportError:
+        return
+    monkeypatch.setattr(direct_db, "DBContext", FakeDBContext)
+    monkeypatch.setattr(direct_task_timeline, "list_events", fake_list_events)
 
 
 def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tmp_path):
@@ -700,6 +738,218 @@ def test_dogfood_timeout_blocker_uses_timeline_read_receipt_status(
     ] is True
     assert event_payload["command_projection"]["divergence_reason"] == (
         "codex_cli_timeout_no_output_no_finish"
+    )
+
+
+def test_timeline_startup_status_ignores_superseded_runtime_lineage(monkeypatch):
+    old_startup = {
+        "id": 4207,
+        "event_kind": "mf_subagent_startup",
+        "event_type": "mf_subagent.startup",
+        "status": "passed",
+        "task_id": "task-a3",
+        "backlog_id": "AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                "runtime_context_id": "mfrctx-old",
+                "task_id": "task-a3",
+                "parent_task_id": "AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+                "route_context_hash": "sha256:old-route",
+                "prompt_contract_id": "rprompt-old",
+                "prompt_contract_hash": "sha256:old-prompt",
+                "actual_cwd": "/repo/.worktrees/old",
+                "actual_git_root": "/repo/.worktrees/old",
+                "branch": "refs/heads/old",
+                "head_commit": "old-head",
+                "fence_token_hash": "sha256:old-fence",
+            },
+        },
+    }
+
+    _patch_timeline_events(monkeypatch, [old_startup])
+
+    status = _timeline_startup_read_receipt_recording_status(
+        project_id="aming-claw",
+        backlog_id="AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        task_id="task-a3",
+        runtime_context_id="mfrctx-current",
+        parent_task_id="AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        route_identity={
+            "route_context_hash": "sha256:route-a3",
+            "prompt_contract_id": "rprompt-a3",
+            "prompt_contract_hash": "sha256:prompt-a3",
+        },
+    )
+
+    assert status["startup_recorded"] is False
+    assert status["startup_timeline_event_id"] == ""
+    assert status["timeline_startup_event_ids"] == [4207]
+    assert status["timeline_startup_matched_event_ids"] == []
+    assert status["timeline_startup_ignored_event_ids"] == [4207]
+    assert status["timeline_startup_ignored_events"][0]["reason"] == (
+        "superseded_route_identity"
+    )
+
+
+def test_timeline_startup_status_accepts_current_runtime_lineage(monkeypatch):
+    matching_startup = {
+        "id": 52,
+        "event_kind": "mf_subagent_startup",
+        "event_type": "mf_subagent.startup",
+        "status": "passed",
+        "task_id": "task-a3",
+        "backlog_id": "AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        "payload": {
+            "mf_subagent_startup_gate": {
+                "runtime_context_id": "mfrctx-current",
+                "task_id": "task-a3",
+                "parent_task_id": "AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+                "route_context_hash": "sha256:route-a3",
+                "prompt_contract_id": "rprompt-a3",
+                "prompt_contract_hash": "sha256:prompt-a3",
+                "actual_cwd": "/repo/.worktrees/current",
+                "actual_git_root": "/repo/.worktrees/current",
+                "branch": "refs/heads/current",
+                "head_commit": "current-head",
+                "fence_token_hash": "sha256:current-fence",
+                "close_satisfying": True,
+                "counts_as_real_worker_evidence": True,
+            },
+        },
+    }
+
+    _patch_timeline_events(monkeypatch, [matching_startup])
+
+    status = _timeline_startup_read_receipt_recording_status(
+        project_id="aming-claw",
+        backlog_id="AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        task_id="task-a3",
+        runtime_context_id="mfrctx-current",
+        parent_task_id="AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        route_identity={
+            "route_context_hash": "sha256:route-a3",
+            "prompt_contract_id": "rprompt-a3",
+            "prompt_contract_hash": "sha256:prompt-a3",
+        },
+    )
+
+    assert status["startup_recorded"] is True
+    assert status["startup_timeline_event_id"] == "52"
+    assert status["startup_close_satisfying"] is True
+    assert status["startup_counts_as_real_worker_evidence"] is True
+    assert status["timeline_startup_matched_event_ids"] == [52]
+    assert status["timeline_startup_ignored_event_ids"] == []
+
+
+def test_dogfood_execute_submits_read_receipt_before_provider(monkeypatch, tmp_path):
+    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
+    calls = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "timeline_event": {
+                        "id": 41,
+                        "event_kind": "mf_subagent_read_receipt",
+                        "status": "accepted",
+                    },
+                    "read_receipt": {
+                        "read_receipt_hash": "sha256:receipt-a3",
+                    },
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(http_request, timeout):
+        body = json.loads(http_request.data.decode("utf-8"))
+        calls.append(("read_receipt", body))
+        assert body["session_token"] == "worker-session-token-test"
+        assert body["fence_token"] == "fence-route-gate-fixture-parity-a3"
+        assert body["read_receipt_hash"] == body["launch_text_hash"]
+        return FakeResponse()
+
+    def fake_run_observer(observer_request, *, execute=False):
+        calls.append(("invoke", dict(observer_request.env)))
+        return {
+            "ok": False,
+            "status": "blocked",
+            "invocation": {
+                "auth_status": "cli_no_progress",
+                "blocker_id": "codex_cli_worker_no_progress_no_read_receipt",
+                "output_empty": True,
+            },
+        }
+
+    monkeypatch.setattr("agent.observer_runtime.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
+    monkeypatch.setattr(
+        "agent.observer_runtime._timeline_startup_read_receipt_recording_status",
+        lambda **_: {},
+    )
+    monkeypatch.setattr(
+        "agent.observer_runtime._record_task_timeline_event",
+        lambda *, project_id, event: {"id": 99, "project_id": project_id, **event},
+    )
+
+    result = build_dogfood_observer_run_plan(request, execute=True)
+
+    assert [item[0] for item in calls] == ["read_receipt", "invoke"]
+    submission = result["read_receipt_submission"]
+    assert submission["ok"] is True
+    assert submission["read_receipt_recorded"] is True
+    assert submission["read_receipt_timeline_event_id"] == "41"
+    assert "worker-session-token-test" not in json.dumps(submission["request"])
+    observer_run = result["observer_run"]
+    assert observer_run["read_receipt_recorded"] is True
+    blocker = result["cli_timeout_blocker"]
+    assert blocker["schema_version"] == "observer_cli_timeout_blocker.v1"
+    assert blocker["read_receipt_recorded"] is True
+    assert blocker["read_receipt_timeline_event_id"] == "41"
+    projection = blocker["terminal_contract_projection"]
+    assert "mf_subagent_read_receipt_recorded" in projection["terminal_evidence_refs"]
+    assert (
+        "mf_subagent_read_receipt_not_recorded"
+        not in projection["terminal_evidence_refs"]
+    )
+
+
+def test_dogfood_execute_blocks_when_read_receipt_facade_fails(monkeypatch, tmp_path):
+    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
+
+    def fake_urlopen(http_request, timeout):
+        raise urllib.error.URLError("governance unavailable")
+
+    def fail_run_observer(observer_request, *, execute=False):
+        raise AssertionError("provider must not be invoked before read receipt")
+
+    monkeypatch.setattr("agent.observer_runtime.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fail_run_observer)
+
+    result = build_dogfood_observer_run_plan(request, execute=True)
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["calls_models"] is False
+    assert result["auth_status"] == "not_invoked"
+    blocker = result["read_receipt_submission_blocker"]
+    assert blocker["blocker_id"] == "read_receipt_facade_submit_failed"
+    assert result["terminal_contract_projection"]["divergence_reason"] == (
+        "read_receipt_facade_submit_failed"
+    )
+    assert "observer_run" not in result
+    assert "worker-session-token-test" not in json.dumps(
+        result["read_receipt_submission"]
     )
 
 

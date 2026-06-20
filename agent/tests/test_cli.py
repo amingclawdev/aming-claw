@@ -1541,6 +1541,17 @@ def test_observer_dogfood_execute_launches_without_fabricating_startup(
     )
     captured = {}
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
+    monkeypatch.setattr(
+        "agent.observer_runtime._dogfood_submit_read_receipt_facade",
+        lambda **_: {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": True,
+            "status": "test_skipped",
+            "read_receipt_recorded": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        },
+    )
 
     def fake_invoke_ai(request):
         captured["prompt"] = request.prompt
@@ -1610,6 +1621,17 @@ def test_observer_dogfood_execute_timeout_records_no_diff_blocker(tmp_path, monk
         target_head_commit=commit,
     )
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
+    monkeypatch.setattr(
+        "agent.observer_runtime._dogfood_submit_read_receipt_facade",
+        lambda **_: {
+            "schema_version": "observer_dogfood_read_receipt_submission.v1",
+            "ok": True,
+            "status": "test_skipped",
+            "read_receipt_recorded": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        },
+    )
 
     def fake_invoke_ai(request):
         return AIInvocationResult(
