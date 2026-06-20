@@ -110,6 +110,65 @@ def test_projection_computes_completed_missing_and_next_action():
     ]
 
 
+def test_route_requirements_ignore_generic_requirement_id_batches():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_revision_id": "rev-route-direct",
+            "state": "selected",
+            "required_evidence": [
+                {
+                    "id": "route_context",
+                    "accepted_event_kinds": ["route_context"],
+                    "match_policy": "canonical_event_kind",
+                },
+                {
+                    "id": "route_action_precheck",
+                    "accepted_event_kinds": ["route_action_precheck"],
+                    "match_policy": "canonical_event_kind",
+                },
+            ],
+        }
+    }
+
+    generic = build_contract_state_projection(
+        [
+            _event(
+                51,
+                "contract_state_changed",
+                payload={
+                    "requirement_ids": [
+                        "route_context",
+                        "route_action_precheck",
+                    ]
+                },
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    canonical = build_contract_state_projection(
+        [
+            _event(52, "route_context"),
+            _event(53, "route_action_precheck"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert generic["completed_evidence"] == []
+    assert generic["missing_evidence"] == [
+        "route_context",
+        "route_action_precheck",
+    ]
+    assert [item["id"] for item in canonical["completed_evidence"]] == [
+        "route_context",
+        "route_action_precheck",
+    ]
+    assert canonical["missing_evidence"] == []
+
+
 def test_projection_keeps_no_contract_rows_without_chain_requirement():
     projection = build_contract_state_projection(
         [],

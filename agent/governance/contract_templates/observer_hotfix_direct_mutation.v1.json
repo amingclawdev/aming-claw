@@ -117,6 +117,21 @@
         ],
         "description": "A completed direct hotfix still needs an independent QA successor contract or equivalent independent QA evidence before close."
       },
+      "implementation_close_policy": {
+        "schema_version": "hotfix_implementation_close_policy.v1",
+        "allow_hotfix_under_action_as_implementation": true,
+        "default_counts_as_implementation": false,
+        "event_kind": "hotfix_under_action",
+        "payload_field": "implementation_close_evidence",
+        "required_payload_fields": [
+          "counts_as_implementation",
+          "changed_files",
+          "verification_evidence_refs",
+          "qa_lineage"
+        ],
+        "qa_lineage_required": true,
+        "description": "hotfix_under_action may satisfy the generic close-gate implementation item only when this policy is active and the event explicitly includes implementation_close_evidence with bounded changed files, verification refs, and QA lineage. Verification, independent QA, and close_ready remain separate gates."
+      },
       "close_timeline_evidence_still_required": [
         "implementation",
         "verification",
@@ -213,6 +228,29 @@
         "hotfix_under_action"
       ],
       "description": "Post-mutation timeline summary records what changed and points to verification evidence refs."
+    },
+    {
+      "id": "focused_verification",
+      "required": true,
+      "phase": "verification",
+      "event_kind": "verification",
+      "accepted_event_kinds": [
+        "verification",
+        "qa_verification"
+      ],
+      "match_policy": "canonical_event_kind",
+      "description": "Focused verification remains required after the direct hotfix action; hotfix_under_action cannot satisfy this item."
+    },
+    {
+      "id": "close_ready",
+      "required": true,
+      "phase": "pre_close_gate",
+      "event_kind": "close_ready",
+      "accepted_event_kinds": [
+        "close_ready"
+      ],
+      "match_policy": "canonical_event_kind",
+      "description": "Close readiness remains a separate required timeline event after implementation and verification evidence are present."
     }
   ],
   "forbidden_capabilities": [

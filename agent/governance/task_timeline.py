@@ -2840,7 +2840,10 @@ def _contract_close_gate_policy_source(
     if policy:
         return policy
     template = _contract_template_by_id(template_id)
-    return _mapping(template.get("close_gate_policy"))
+    timeline_contract = _mapping(template.get("timeline_contract"))
+    return _mapping(
+        template.get("close_gate_policy") or timeline_contract.get("close_gate_policy")
+    )
 
 
 def _successor_contract_from_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -3064,7 +3067,101 @@ def _contract_close_gate_policy_projection(
         "replaced_by_gate": replaced_by_gate,
         "qa_required": qa_required,
         "qa_satisfied_by": _string_list(qa_policy.get("satisfied_by")),
+        "implementation_close_policy": _mapping(policy.get("implementation_close_policy")),
         "reason": str(policy.get("reason") or "").strip(),
+    }
+
+
+def _nonempty_evidence_ref(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return bool(value)
+    return bool(_string_list(value))
+
+
+def _hotfix_under_action_implementation_projection(
+    event: dict[str, Any],
+    contract_close_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    marker = _route_marker(
+        event.get("event_kind") or event.get("event_type") or event.get("phase")
+    )
+    if marker != "hotfix_under_action":
+        return {"counts_as_implementation": False, "reason": "not_hotfix_under_action"}
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    if status not in MF_CLOSE_PASS_STATUSES:
+        return {"counts_as_implementation": False, "reason": "non_passing_status"}
+    if (
+        str(contract_close_policy.get("template_id") or "").strip()
+        != OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+    ):
+        return {
+            "counts_as_implementation": False,
+            "reason": "hotfix_contract_policy_not_active",
+        }
+    policy = _mapping(contract_close_policy.get("implementation_close_policy"))
+    enabled = _policy_bool(
+        policy.get("allow_hotfix_under_action_as_implementation"),
+        False,
+    )
+    if not enabled:
+        return {
+            "counts_as_implementation": False,
+            "reason": "implementation_close_policy_not_enabled",
+        }
+    payload = _mapping(event.get("payload"))
+    payload_field = str(
+        policy.get("payload_field") or "implementation_close_evidence"
+    ).strip()
+    evidence = _mapping(payload.get(payload_field))
+    if not evidence:
+        return {
+            "counts_as_implementation": False,
+            "reason": "missing_hotfix_implementation_policy_payload",
+            "payload_field": payload_field,
+        }
+    if not _truthy(evidence.get("counts_as_implementation")):
+        return {
+            "counts_as_implementation": False,
+            "reason": "event_does_not_claim_implementation_projection",
+        }
+    changed_files = _string_list(evidence.get("changed_files"))
+    verification_refs = evidence.get("verification_evidence_refs")
+    qa_lineage = _mapping(
+        evidence.get("qa_lineage")
+        or evidence.get("qa_successor")
+    )
+    qa_refs_present = _nonempty_evidence_ref(evidence.get("qa_evidence_refs"))
+    qa_lineage_present = bool(
+        qa_refs_present
+        or (
+            _truthy(qa_lineage.get("required"))
+            and (
+                str(qa_lineage.get("successor_contract_execution_id") or "").strip()
+                or str(qa_lineage.get("required_gate") or "").strip()
+                or str(qa_lineage.get("event_kind") or "").strip()
+            )
+        )
+    )
+    missing: list[str] = []
+    if not changed_files:
+        missing.append("changed_files")
+    if not _nonempty_evidence_ref(verification_refs):
+        missing.append("verification_evidence_refs")
+    if _policy_bool(policy.get("qa_lineage_required"), True) and not qa_lineage_present:
+        missing.append("qa_lineage")
+    if missing:
+        return {
+            "counts_as_implementation": False,
+            "reason": "missing_hotfix_implementation_close_evidence",
+            "missing_fields": missing,
+        }
+    return {
+        "counts_as_implementation": True,
+        "reason": "explicit_hotfix_implementation_close_policy",
+        "changed_files": changed_files,
+        "verification_evidence_refs": verification_refs,
+        "qa_lineage": qa_lineage,
+        "event_id": event.get("id") or event.get("event_id"),
     }
 
 
@@ -8145,6 +8242,11 @@ def mf_close_gate_verification(
     ) -> tuple[set[str], list[dict[str, Any]]]:
         close_present: set[str] = set()
         close_ignored: list[dict[str, Any]] = []
+        close_policy = _contract_close_gate_policy_projection(
+            close_rows,
+            contract,
+            _route_topology_policy(contract),
+        )
         for event in close_rows:
             if not isinstance(event, dict):
                 continue
@@ -8152,6 +8254,15 @@ def mf_close_gate_verification(
             phase = str(event.get("phase") or "").strip()
             status = str(event.get("status") or "").strip().lower()
             key = kind or phase
+            hotfix_projection = _hotfix_under_action_implementation_projection(
+                event,
+                close_policy,
+            )
+            if (
+                "implementation" in required_event_kinds
+                and hotfix_projection.get("counts_as_implementation")
+            ):
+                key = "implementation"
             if (
                 key not in MF_CLOSE_REQUIRED_EVENT_KINDS
                 and phase == "verification"
@@ -8166,6 +8277,15 @@ def mf_close_gate_verification(
                     "phase": phase,
                     "status": status,
                     "id": event.get("id"),
+                })
+            elif kind == "hotfix_under_action" and hotfix_projection.get("reason"):
+                close_ignored.append({
+                    "event_kind": kind,
+                    "phase": phase,
+                    "status": status,
+                    "id": event.get("id"),
+                    "reason": hotfix_projection.get("reason"),
+                    "implementation_close_projection": hotfix_projection,
                 })
         return close_present, close_ignored
 

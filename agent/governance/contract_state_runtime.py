@@ -619,6 +619,31 @@ def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int
     return False
 
 
+def _requirement_requires_event_kind_match(requirement: Mapping[str, Any]) -> bool:
+    policy = str(
+        requirement.get("match_policy")
+        or requirement.get("evidence_match_policy")
+        or requirement.get("satisfies_by")
+        or ""
+    ).strip().lower()
+    if policy in {
+        "event_kind",
+        "event_kind_only",
+        "canonical_event_kind",
+        "direct_timeline_event",
+    }:
+        return True
+    if policy in {
+        "payload.requirement_id",
+        "payload_requirement_id",
+        "requirement_id",
+        "event_kind_or_requirement_id",
+    }:
+        return False
+    accepted_kinds = set(_string_list(requirement.get("accepted_event_kinds")))
+    return bool(accepted_kinds.intersection(_DIRECT_TIMELINE_APPEND_EVENT_KINDS))
+
+
 def _event_satisfies_requirement(
     event: Mapping[str, Any],
     requirement: Mapping[str, Any],
@@ -633,7 +658,7 @@ def _event_satisfies_requirement(
     event_kind = str(event.get("event_kind") or "").strip()
     accepted_kinds = set(_string_list(requirement.get("accepted_event_kinds")))
     matched = event_kind in accepted_kinds
-    if not matched:
+    if not matched and not _requirement_requires_event_kind_match(requirement):
         matched = any(
             _payload_declares_requirement(payload, requirement_id)
             for payload in _event_payloads(event)

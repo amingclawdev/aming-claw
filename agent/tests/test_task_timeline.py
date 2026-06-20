@@ -209,6 +209,69 @@ def _observer_hotfix_contract_events():
     ]
 
 
+def _observer_hotfix_contract_events_with_implementation_projection():
+    events = _observer_hotfix_contract_events()
+    events[1] = {
+        **events[1],
+        "payload": {
+            **events[1]["payload"],
+            "implementation_close_evidence": {
+                "counts_as_implementation": True,
+                "changed_files": ["agent/governance/task_timeline.py"],
+                "verification_evidence_refs": {
+                    "focused_tests": "pytest -q agent/tests/test_task_timeline.py"
+                },
+                "qa_lineage": {
+                    "required": True,
+                    "required_gate": "independent_qa_gate",
+                    "successor_contract_execution_id": "cex-qa-hotfix",
+                },
+            },
+        },
+    }
+    return events
+
+
+def _observer_hotfix_contract_events_with_generic_implementation_alias():
+    events = _observer_hotfix_contract_events()
+    events[1] = {
+        **events[1],
+        "payload": {
+            **events[1]["payload"],
+            "implementation_evidence": {
+                "counts_as_implementation": True,
+                "changed_files": ["agent/governance/task_timeline.py"],
+                "verification_evidence_refs": {
+                    "focused_tests": "pytest -q agent/tests/test_task_timeline.py"
+                },
+                "qa_lineage": {
+                    "required": True,
+                    "required_gate": "independent_qa_gate",
+                },
+            },
+        },
+    }
+    return events
+
+
+def _observer_hotfix_contract_events_with_partial_nested_implementation_payload():
+    events = _observer_hotfix_contract_events()
+    events[1] = {
+        **events[1],
+        "payload": {
+            **events[1]["payload"],
+            "implementation_close_evidence": {
+                "counts_as_implementation": True,
+            },
+            "qa_lineage": {
+                "required": True,
+                "required_gate": "independent_qa_gate",
+            },
+        },
+    }
+    return events
+
+
 def _attach_server_action_scope_route_token_lineage(
     event,
     child_identity,
@@ -6761,6 +6824,90 @@ class TestTaskTimeline(unittest.TestCase):
             blocked["independent_qa_gate"]["missing_requirement_ids"],
             ["independent_qa"],
         )
+
+    def test_observer_hotfix_under_action_does_not_implement_without_policy_evidence(self):
+        from agent.governance import task_timeline
+
+        contract = {"template_id": "observer_hotfix_direct_mutation.v1"}
+        events = [
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            *_observer_hotfix_contract_events(),
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn("implementation", blocked["missing_event_kinds"])
+        self.assertTrue(blocked["independent_qa_gate"]["passed"], blocked)
+
+    def test_observer_hotfix_under_action_rejects_generic_implementation_alias(self):
+        from agent.governance import task_timeline
+
+        contract = {"template_id": "observer_hotfix_direct_mutation.v1"}
+        events = [
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            *_observer_hotfix_contract_events_with_generic_implementation_alias(),
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn("implementation", blocked["missing_event_kinds"])
+        self.assertEqual(
+            blocked["ignored_required_events"][0]["reason"],
+            "missing_hotfix_implementation_policy_payload",
+        )
+
+    def test_observer_hotfix_under_action_rejects_top_level_policy_field_fallbacks(self):
+        from agent.governance import task_timeline
+
+        contract = {"template_id": "observer_hotfix_direct_mutation.v1"}
+        events = [
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            *_observer_hotfix_contract_events_with_partial_nested_implementation_payload(),
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn("implementation", blocked["missing_event_kinds"])
+        self.assertEqual(
+            blocked["ignored_required_events"][0]["reason"],
+            "missing_hotfix_implementation_close_evidence",
+        )
+        self.assertEqual(
+            blocked["ignored_required_events"][0]["implementation_close_projection"][
+                "missing_fields"
+            ],
+            ["changed_files", "verification_evidence_refs", "qa_lineage"],
+        )
+
+    def test_observer_hotfix_under_action_can_implement_with_explicit_policy_evidence(self):
+        from agent.governance import task_timeline
+
+        contract = {"template_id": "observer_hotfix_direct_mutation.v1"}
+        events = [
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            *_observer_hotfix_contract_events_with_implementation_projection(),
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertNotIn("implementation", ready["missing_event_kinds"])
+        self.assertTrue(ready["independent_qa_gate"]["passed"], ready)
 
     def test_observer_hotfix_successor_policy_overrides_onboard_root_template(self):
         from agent.governance import task_timeline

@@ -52,11 +52,21 @@
     },
     {
       "id": "route_context",
-      "action": "record_route_context"
+      "action": "record_route_context",
+      "accepted_event_kinds": [
+        "route_context"
+      ],
+      "match_policy": "canonical_event_kind",
+      "source": "route_service"
     },
     {
       "id": "route_action_precheck",
       "action": "record_route_action_precheck",
+      "accepted_event_kinds": [
+        "route_action_precheck"
+      ],
+      "match_policy": "canonical_event_kind",
+      "source": "route_service",
       "prerequisite_ids": [
         "route_context"
       ]
