@@ -1,0 +1,165 @@
+{
+  "schema_version": "observer_onboard_contract_template.v1",
+  "template_id": "onboard_contract.v1",
+  "version": "v1",
+  "description": "Observer bootstrap contract that makes the next required observer action explicit before implementation dispatch.",
+  "contract_kind": "observer_onboard_contract",
+  "task_types": [
+    "observer_onboard",
+    "manual_fix",
+    "chain_rescue"
+  ],
+  "stages": [
+    "observer_bootstrap",
+    "design_alignment",
+    "pre_implementation"
+  ],
+  "lifecycle_states": [
+    "selected",
+    "evidence_in_progress",
+    "ready_for_route_transition",
+    "ready_for_worker_contract",
+    "blocked",
+    "complete"
+  ],
+  "required_evidence": [
+    {
+      "id": "graph_query_schema_trace",
+      "action": "record_graph_query_schema_trace",
+      "accepted_event_kinds": [
+        "graph_query_schema_trace",
+        "route_context"
+      ],
+      "accepted_statuses": [
+        "accepted",
+        "ok",
+        "passed",
+        "succeeded",
+        "not_applicable"
+      ]
+    },
+    {
+      "id": "related_backlog_review",
+      "action": "record_related_backlog_review"
+    },
+    {
+      "id": "observer_root_route_context_read",
+      "action": "read_observer_root_route_context"
+    },
+    {
+      "id": "contract_state_projection_read",
+      "action": "read_contract_state_projection"
+    },
+    {
+      "id": "route_context",
+      "action": "record_route_context"
+    },
+    {
+      "id": "route_action_precheck",
+      "action": "record_route_action_precheck",
+      "prerequisite_ids": [
+        "route_context"
+      ]
+    },
+    {
+      "id": "observer_work_mode_transition",
+      "action": "record_work_mode_transition",
+      "prerequisite_ids": [
+        "route_context",
+        "route_action_precheck"
+      ]
+    }
+  ],
+  "conditional_required_evidence": [
+    {
+      "condition": {
+        "target_kind": "generated_demo"
+      },
+      "evidence": [
+        "demo_target_identity_check",
+        "demo_graph_status_check",
+        "demo_backlog_scope_check",
+        "target_file_node_mapping",
+        "lane_overlap_scope",
+        "dirty_scope_review",
+        "demo_root_route_context_read",
+        "demo_contract_state_gap_detected",
+        "worker_contract_after_onboard"
+      ]
+    }
+  ],
+  "requirement_semantics": {
+    "schema_version": "contract_requirement_semantics.v1",
+    "runtime_must_not_hardcode_template_ids": true,
+    "projection_is_read_only": true,
+    "writes_use_timeline_adapter": true,
+    "requirement_fields": [
+      "id",
+      "condition",
+      "prerequisite_ids",
+      "accepted_event_kinds",
+      "accepted_statuses",
+      "blocked_by",
+      "action",
+      "source",
+      "precedence"
+    ]
+  },
+  "next_action_policy": {
+    "schema_version": "contract_state_next_action_policy.v2",
+    "first_missing_required_evidence_drives_next_legal_action": true,
+    "generic_close_gate_repairs_deferred_until_active_contract_complete": true,
+    "precedence": [
+      "active_contract_missing_step",
+      "route_identity_or_precheck",
+      "observer_work_mode",
+      "worker_dispatch",
+      "merge_or_close_repair"
+    ]
+  },
+  "active_contract_execution_schema": {
+    "schema_version": "active_contract_execution.v1",
+    "required_fields": [
+      "project_id",
+      "backlog_id",
+      "contract_execution_id",
+      "contract_id",
+      "contract_template_id",
+      "contract_revision_id",
+      "state",
+      "projection_watermark",
+      "route_identity_hash"
+    ],
+    "optional_fields": [
+      "contract_instance_id",
+      "observer_session_id",
+      "route_token_ref",
+      "prompt_contract_id",
+      "visible_injection_manifest_hash"
+    ]
+  },
+  "write_authority_policy": {
+    "schema_version": "contract_state_write_authority.v1",
+    "projection_module_may_write": false,
+    "write_facade_scope": "timeline_server_mcp_adapter_only",
+    "raw_route_tokens_persisted": false,
+    "append_only_timeline_required": true
+  },
+  "generated_demo_policy": {
+    "schema_version": "generated_demo_onboard_policy.v1",
+    "required_only_when_target_kind": "generated_demo",
+    "must_confirm_target_project_is_not_aming_claw_repo": true,
+    "must_record_ephemeral_fixture_root_warning": true,
+    "must_classify_unmapped_assets_and_planned_new_files": true,
+    "must_classify_dirty_generated_metadata": true,
+    "worker_contract_must_be_mf_parallel_after_onboard": true,
+    "worker_prompt_must_not_include_aming_claw_repo_implementation_context": true
+  },
+  "dogfood_policy": {
+    "schema_version": "onboard_contract_dogfood_policy.v1",
+    "after_redeploy": true,
+    "target_kind": "generated_demo",
+    "happy_path_may_block": true,
+    "record_blocker_as_contract_state_gap": true
+  }
+}

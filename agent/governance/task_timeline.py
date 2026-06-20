@@ -2479,64 +2479,27 @@ def contract_state_projection(
 ) -> dict[str, Any]:
     """Fold backlog contract JSON and timeline rows into a read-only state view."""
 
+    from .contract_state_runtime import build_contract_state_projection
+
     rows = [event for event in (events or []) if isinstance(event, dict)]
-    root = _contract_root(contract)
-    row = dict(backlog_row or {})
-    backlog_id = str(row.get("bug_id") or row.get("backlog_id") or "").strip()
-    if not backlog_id:
-        for event in rows:
-            backlog_id = str(event.get("backlog_id") or "").strip()
-            if backlog_id:
-                break
     mf_projection = mf_contract_projection(rows, contract)
-    binding = _latest_contract_binding(rows, root)
-    contract_id = str(
-        binding.get("contract_id")
-        or binding.get("contract_instance_id")
-        or root.get("contract_id")
-        or root.get("contract_instance_id")
-        or binding.get("contract_template_id")
-        or binding.get("template_id")
-        or root.get("contract_template_id")
-        or root.get("template_id")
-        or ""
-    ).strip()
-    current_revision_id = _latest_contract_revision_id(rows, root)
-    legacy_no_contract = not bool(root or binding)
-    binding_state = str(
-        binding.get("contract_state")
-        or binding.get("contract_status")
-        or binding.get("state")
-        or binding.get("status")
-        or root.get("contract_state")
-        or root.get("contract_status")
-        or root.get("state")
-        or root.get("status")
-        or ""
-    ).strip()
-    if not binding_state and (contract_id or current_revision_id) and not legacy_no_contract:
-        binding_state = "bound"
-    state = binding_state or str(mf_projection.get("status") or "no_contract")
-    return {
-        "schema_version": CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
-        "source_of_truth": "Contract/Revision/Event",
-        "contract_id": contract_id,
-        "backlog_id": backlog_id,
-        "current_revision_id": current_revision_id,
-        "state": state,
-        "status": state,
-        "legacy_no_contract": legacy_no_contract,
-        "contract_binding": binding,
-        "route_binding": _latest_route_binding(rows, root),
-        "test_route": _latest_test_route(rows, root),
-        "required_evidence": _contract_required_evidence(root),
-        "projection_watermark": mf_projection.get("projection_watermark", 0),
-        "contract_projection": mf_projection,
-        "close_ready_policy": {
-            "source": "rule_gate_projection",
-            "timeline_event_is_authoritative": False,
-        },
-    }
+    return build_contract_state_projection(
+        rows,
+        contract=contract,
+        backlog_row=backlog_row,
+        contract_projection=mf_projection,
+        default_required_evidence=_dedupe_nonempty(
+            [
+                "route_context",
+                "route_action_precheck",
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+                "independent_verification_lane",
+                *sorted(MF_CLOSE_REQUIRED_EVENT_KINDS),
+            ]
+        ),
+        schema_version=CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
+    )
 
 
 def _projection_close_gate_required(

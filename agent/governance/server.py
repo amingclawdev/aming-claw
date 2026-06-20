@@ -27837,6 +27837,34 @@ def _observer_root_route_context_state(
         for step in close_gate_steps:
             if not any(existing["id"] == step["id"] for existing in ordered_missing_steps):
                 ordered_missing_steps.append(step)
+    contract_ordered_steps = [
+        step
+        for step in (contract_state.get("ordered_next_steps") or [])
+        if isinstance(step, dict) and str(step.get("id") or "").strip()
+    ]
+    contract_next_action = (
+        dict(contract_state.get("next_legal_action") or {})
+        if isinstance(contract_state.get("next_legal_action"), dict)
+        else {}
+    )
+    active_contract_execution = (
+        contract_state.get("active_contract_execution")
+        if isinstance(contract_state.get("active_contract_execution"), dict)
+        else {}
+    )
+    contract_missing_step_active = bool(
+        active_contract_execution and contract_next_action and contract_ordered_steps
+    )
+    if contract_missing_step_active:
+        merged_steps: list[dict[str, Any]] = []
+        seen_step_ids: set[str] = set()
+        for step in [*contract_ordered_steps, *ordered_missing_steps]:
+            step_id = str(step.get("id") or "").strip()
+            if not step_id or step_id in seen_step_ids:
+                continue
+            seen_step_ids.add(step_id)
+            merged_steps.append(step)
+        ordered_missing_steps = merged_steps
     context["requested_work_mode"] = requested_work_mode
     context["work_mode_projection"] = {
         "schema_version": "observer_root_route_context_work_mode_projection.v1",
@@ -27858,7 +27886,21 @@ def _observer_root_route_context_state(
         "raw_route_token_persisted": False,
     }
     context["work_mode_transition_gate"] = transition_gate
-    if ordered_missing_steps and context["work_mode"] == observer_session.WORK_MODE_LOOK_BEFORE_ACT:
+    if contract_missing_step_active:
+        context["contract_state_next_action"] = contract_next_action
+        context["next_legal_action"] = {
+            **contract_next_action,
+            "missing_prerequisites": [
+                step["id"] for step in ordered_missing_steps
+            ],
+            "ordered_missing_steps": ordered_missing_steps,
+            "source": contract_next_action.get("source") or "contract_state",
+            "precedence": (
+                contract_next_action.get("precedence")
+                or "active_contract_missing_step"
+            ),
+        }
+    elif ordered_missing_steps and context["work_mode"] == observer_session.WORK_MODE_LOOK_BEFORE_ACT:
         context["next_legal_action"] = {
             **dict(context.get("next_legal_action") or {}),
             "missing_prerequisites": [step["id"] for step in ordered_missing_steps],
