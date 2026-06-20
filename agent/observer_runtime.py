@@ -2649,7 +2649,10 @@ def _runtime_text_branch_runtime_evidence(
     def _evidence_field(*keys: str) -> str:
         for source in _nested_mappings(supplied):
             for key in keys:
-                value = str(source.get(key) or "").strip()
+                raw_value = source.get(key)
+                if isinstance(raw_value, (Mapping, list, tuple)):
+                    continue
+                value = str(raw_value or "").strip()
                 if value:
                     return value
         return ""

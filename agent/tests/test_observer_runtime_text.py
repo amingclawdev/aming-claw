@@ -496,6 +496,25 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert next_action["startup_identity_policy"] == identity_policy
 
 
+def test_runtime_text_builder_ignores_top_level_worktree_object_for_path(tmp_path):
+    evidence = _branch_runtime_evidence(tmp_path)
+    evidence["worktree"] = {
+        "created": True,
+        "worktree_path": evidence["context"]["worktree_path"],
+        "branch_graph": {"status": "ready"},
+    }
+
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(tmp_path, branch_runtime_evidence=evidence)
+    )
+
+    assert result["ok"] is True
+    assert result["branch_runtime_evidence"]["registered"] is True
+    assert result["branch_runtime_evidence"]["context"]["worktree_path"] == (
+        evidence["context"]["worktree_path"]
+    )
+
+
 def test_runtime_text_preflights_missing_venv_pytest_runner(tmp_path):
     command = ".venv/bin/pytest agent/tests/test_observer_runtime_text.py -q"
     result = build_observer_runtime_text_context(
