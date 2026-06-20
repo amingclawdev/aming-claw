@@ -2310,6 +2310,30 @@ def _runtime_text_first_text_from_mappings(
 def _runtime_text_read_receipt_values(
     mappings: Sequence[Mapping[str, Any]],
 ) -> dict[str, str]:
+    expanded_mappings: list[Mapping[str, Any]] = []
+    seen: set[int] = set()
+
+    def append_mapping(source: Mapping[str, Any]) -> None:
+        marker = id(source)
+        if marker in seen:
+            return
+        seen.add(marker)
+        expanded_mappings.append(source)
+        for key in (
+            "read_receipt",
+            "read_receipt_recording",
+            "timeline_refs",
+            "timeline_event_recorded",
+            "current_values",
+        ):
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                append_mapping(value)
+
+    for mapping in mappings:
+        append_mapping(mapping)
+    mappings = expanded_mappings
+
     read_receipt_hash, hash_source = _runtime_text_first_text_from_mappings(
         mappings,
         "read_receipt_hash",

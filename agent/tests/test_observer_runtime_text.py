@@ -611,6 +611,40 @@ def test_runtime_text_carries_durable_projection_read_receipt_action(tmp_path):
     assert result["startup_recording"]["read_receipt_recorded"] is True
 
 
+def test_runtime_text_records_durable_timeline_style_read_receipt(tmp_path):
+    projection = _runtime_context_projection(
+        tmp_path,
+        target_files=["agent/observer_runtime.py"],
+    )
+    projection["gate_inputs"]["read_receipt_event_ref"] = "timeline:5633"
+    projection["gate_inputs"]["read_receipt"] = {
+        "event_kind": "mf_subagent_read_receipt",
+        "timeline_event_id": "5633",
+        "launch_text_hash": "sha256:durable-launch-text",
+    }
+
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            owned_files=(),
+            runtime_context_projection=projection,
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["read_receipt_recorded"] is True
+    assert result["read_receipt_hash"] == "sha256:durable-launch-text"
+    assert result["read_receipt_event_id"] == "timeline:5633"
+    identity = result["read_receipt_identity"]
+    assert identity["status"] == "recorded"
+    assert identity["recorded"] is True
+    assert identity["supplied_unverified"] is False
+    assert identity["hash_source"] == "launch_text_hash"
+    assert identity["event_id_source"] == "read_receipt_event_ref"
+    assert result["worker_launch_pack"]["read_receipt_recorded"] is True
+    assert result["startup_recording"]["read_receipt_recorded"] is True
+
+
 def test_runtime_text_request_supplied_read_receipt_is_unverified(tmp_path):
     result = build_observer_runtime_text_context(
         _runtime_text_request(
