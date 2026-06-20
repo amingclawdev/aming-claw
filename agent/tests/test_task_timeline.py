@@ -6762,6 +6762,135 @@ class TestTaskTimeline(unittest.TestCase):
             ["independent_qa"],
         )
 
+    def test_observer_hotfix_successor_policy_overrides_onboard_root_template(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "contract": {
+                "contract_id": "onboard_contract.v1",
+                "contract_template_id": "onboard_contract.v1",
+                "contract_chain_id": "cchain-onboard-hotfix",
+                "contract_execution_id": "cex-onboard",
+                "route_topology_policy": {
+                    "selected_topology": "observer_led_parallel_lanes",
+                    "recommended_topology": "mf_parallel.v1",
+                    "required_lanes": [
+                        "observer_coordinator",
+                        "bounded_implementation_worker",
+                        "independent_verification_lane",
+                        "observer_merge_close_gate",
+                    ],
+                    "independent_verification_required": True,
+                },
+            }
+        }
+        successor_binding = {
+            "id": 999,
+            "event_kind": "contract_binding",
+            "phase": "successor_contract_selection",
+            "status": "passed",
+            "payload": {
+                "successor_contract": {
+                    "contract_chain_id": "cchain-onboard-hotfix",
+                    "parent_contract_execution_id": "cex-onboard",
+                    "successor_contract_execution_id": "cex-hotfix",
+                    "contract_template_id": "observer_hotfix_direct_mutation.v1",
+                }
+            },
+        }
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            successor_binding,
+            *_observer_hotfix_contract_events(),
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        route_gate = ready["route_context_gate"]
+        self.assertEqual(route_gate["missing_requirement_ids"], [])
+        self.assertEqual(
+            route_gate["contract_close_gate_policy"]["explicit_template_id"],
+            "onboard_contract.v1",
+        )
+        self.assertEqual(
+            route_gate["contract_close_gate_policy"]["successor_template_id"],
+            "observer_hotfix_direct_mutation.v1",
+        )
+        self.assertEqual(
+            route_gate["contract_close_gate_policy"]["template_id"],
+            "observer_hotfix_direct_mutation.v1",
+        )
+        self.assertTrue(
+            route_gate["checks"]["bounded_worker_not_applicable_by_contract"],
+            route_gate,
+        )
+
+    def test_observer_hotfix_successor_policy_waits_for_hotfix_evidence(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "contract": {
+                "contract_id": "onboard_contract.v1",
+                "contract_template_id": "onboard_contract.v1",
+                "contract_chain_id": "cchain-onboard-hotfix",
+                "contract_execution_id": "cex-onboard",
+                "route_topology_policy": {
+                    "selected_topology": "observer_led_parallel_lanes",
+                    "recommended_topology": "mf_parallel.v1",
+                    "required_lanes": [
+                        "observer_coordinator",
+                        "bounded_implementation_worker",
+                        "independent_verification_lane",
+                        "observer_merge_close_gate",
+                    ],
+                    "independent_verification_required": True,
+                },
+            }
+        }
+        events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            {
+                "id": 999,
+                "event_kind": "contract_binding",
+                "phase": "successor_contract_selection",
+                "status": "passed",
+                "payload": {
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-onboard-hotfix",
+                        "parent_contract_execution_id": "cex-onboard",
+                        "successor_contract_execution_id": "cex-hotfix",
+                        "contract_template_id": "observer_hotfix_direct_mutation.v1",
+                    }
+                },
+            },
+            _route_context_qa_verification_event(),
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["route_context_gate"]["contract_close_gate_policy"][
+                "successor_template_id"
+            ],
+            "",
+        )
+        self.assertEqual(
+            blocked["route_context_gate"]["missing_requirement_ids"],
+            [
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+            ],
+        )
+
     def test_mf_parallel_close_gate_blocks_missing_read_receipt_for_contract_projection(self):
         from agent.governance import task_timeline
 

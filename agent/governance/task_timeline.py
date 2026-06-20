@@ -358,6 +358,35 @@ MF_ROUTE_SOURCE_PASS_STATUSES = {
 }
 OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID = "observer_hotfix_direct_mutation.v1"
 
+_SUCCESSOR_CONTRACT_CONTAINER_KEYS = (
+    "successor_contract",
+    "selected_successor_contract",
+    "successor_contract_binding",
+)
+
+_SUCCESSOR_CONTRACT_FIELD_NAMES = {
+    "backlog_id",
+    "contract_id",
+    "contract_chain_id",
+    "contract_execution_id",
+    "contract_instance_id",
+    "contract_revision_id",
+    "contract_template",
+    "contract_template_id",
+    "handoff_event_id",
+    "handoff_preconditions",
+    "handoff_reason",
+    "parent_contract_execution_id",
+    "selected_by_actor",
+    "state",
+    "status",
+    "successor_backlog_id",
+    "successor_contract_execution_id",
+    "successor_contract_instance_id",
+    "successor_contract_template_id",
+    "template_id",
+}
+
 
 def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
     """Return true when a timeline append can satisfy MF close evidence."""
@@ -2814,6 +2843,92 @@ def _contract_close_gate_policy_source(
     return _mapping(template.get("close_gate_policy"))
 
 
+def _successor_contract_from_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    successor: dict[str, Any] = {}
+    for key in _SUCCESSOR_CONTRACT_CONTAINER_KEYS:
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            successor.update(
+                {
+                    field: nested_value
+                    for field, nested_value in nested.items()
+                    if field in _SUCCESSOR_CONTRACT_FIELD_NAMES
+                }
+            )
+    for field in _SUCCESSOR_CONTRACT_FIELD_NAMES:
+        field_value = value.get(field)
+        if field_value:
+            successor[field] = field_value
+    if not successor:
+        return {}
+    template_id = str(
+        successor.get("successor_contract_template_id")
+        or successor.get("contract_template_id")
+        or successor.get("template_id")
+        or successor.get("contract_template")
+        or ""
+    ).strip()
+    if template_id:
+        successor["contract_template_id"] = template_id
+        successor.setdefault("contract_id", template_id)
+    execution_id = str(
+        successor.get("successor_contract_execution_id")
+        or successor.get("contract_execution_id")
+        or ""
+    ).strip()
+    if execution_id:
+        successor["successor_contract_execution_id"] = execution_id
+        successor["contract_execution_id"] = execution_id
+    return successor
+
+
+def _active_hotfix_successor_contract(
+    rows: list[dict[str, Any]],
+    root: Mapping[str, Any],
+) -> dict[str, Any]:
+    root_chain_id = str(root.get("contract_chain_id") or "").strip()
+    root_execution_id = str(
+        root.get("contract_execution_id")
+        or root.get("contract_instance_id")
+        or root.get("successor_contract_execution_id")
+        or ""
+    ).strip()
+    selected: dict[str, Any] = {}
+    for raw_event in rows:
+        event = _mapping(raw_event)
+        if not event or not _route_event_passed(event):
+            continue
+        event_kind = str(event.get("event_kind") or "").strip()
+        for payload in _event_payloads(event):
+            successor = _successor_contract_from_mapping(payload)
+            if not successor:
+                continue
+            has_nested_successor = any(
+                isinstance(payload.get(key), Mapping)
+                for key in _SUCCESSOR_CONTRACT_CONTAINER_KEYS
+            )
+            if event_kind not in _CONTRACT_BINDING_EVENT_KINDS and not has_nested_successor:
+                continue
+            template_id = str(successor.get("contract_template_id") or "").strip()
+            if template_id != OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID:
+                continue
+            successor_chain_id = str(successor.get("contract_chain_id") or "").strip()
+            if root_chain_id and successor_chain_id and successor_chain_id != root_chain_id:
+                continue
+            successor_parent_id = str(
+                successor.get("parent_contract_execution_id") or ""
+            ).strip()
+            if root_execution_id and successor_parent_id and successor_parent_id != root_execution_id:
+                continue
+            event_id = event.get("id") or event.get("event_id") or ""
+            selected = {
+                **successor,
+                "source_event_id": event_id,
+                "status": str(event.get("status") or successor.get("status") or ""),
+            }
+    return selected
+
+
 def _hotfix_contract_events(rows: list[dict[str, Any]]) -> dict[str, Any]:
     pre_events: list[dict[str, Any]] = []
     post_events: list[dict[str, Any]] = []
@@ -2864,10 +2979,16 @@ def _contract_close_gate_policy_projection(
         or ""
     ).strip()
     hotfix_events = _hotfix_contract_events(rows)
+    selected_hotfix_successor = _active_hotfix_successor_contract(rows, root)
+    successor_template_id = str(
+        selected_hotfix_successor.get("contract_template_id") or ""
+    ).strip()
+    if not hotfix_events["active"]:
+        successor_template_id = ""
     inferred_template_id = (
         OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID if hotfix_events["active"] else ""
     )
-    template_id = explicit_template_id or inferred_template_id
+    template_id = successor_template_id or explicit_template_id or inferred_template_id
     policy = _contract_close_gate_policy_source(contract, template_id)
     route_overrides = _mapping(policy.get("route_context_requirement_overrides"))
 
@@ -2928,7 +3049,9 @@ def _contract_close_gate_policy_projection(
         "applied": applied,
         "template_id": template_id,
         "explicit_template_id": explicit_template_id,
+        "successor_template_id": successor_template_id,
         "inferred_template_id": inferred_template_id,
+        "selected_successor_contract": selected_hotfix_successor,
         "policy_status": "active" if applied else "not_applicable",
         "hotfix_contract_active": bool(hotfix_events["active"]),
         "hotfix_contract_completed": bool(hotfix_events["completed"]),
