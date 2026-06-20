@@ -7458,7 +7458,7 @@ def _cross_ref_route_token_child_diagnostics(
             continue
         if _cross_ref_row_scoped_independent_qa(event, anchor):
             continue
-        if _cross_ref_observer_hotfix_direct_evidence(event, anchor):
+        if _cross_ref_observer_contract_evidence(event, anchor):
             continue
         route_scope = _cross_ref_public_route_scope(event)
         parent_task_id = _first_deep_text(event, "parent_task_id")
@@ -7498,14 +7498,14 @@ def _cross_ref_row_scoped_independent_qa(
     return _cross_ref_same_row_floor(event, anchor)
 
 
-def _cross_ref_observer_hotfix_direct_evidence(
+def _cross_ref_observer_contract_evidence(
     event: dict[str, Any],
     anchor: Mapping[str, Any],
 ) -> bool:
     marker = _route_marker(
         event.get("event_kind") or event.get("event_type") or event.get("phase")
     )
-    if marker != "hotfix_under_action":
+    if marker not in {"hotfix_under_action", "verification", "close_ready"}:
         return False
     meta_gate = _first_deep_mapping(event, "meta_contract_gate")
     meta_action = _route_marker(meta_gate.get("action"))
@@ -7513,8 +7513,11 @@ def _cross_ref_observer_hotfix_direct_evidence(
     meta_status = str(
         meta_gate.get("status") or meta_gate.get("decision") or ""
     ).strip().lower()
+    allowed_meta_actions = {marker}
+    if marker == "verification":
+        allowed_meta_actions.add("observer_command")
     meta_allowed = bool(
-        meta_action == "hotfix_under_action"
+        meta_action in allowed_meta_actions
         and meta_role == "observer"
         and (
             _truthy(meta_gate.get("allowed"))
@@ -7751,7 +7754,7 @@ def mf_close_cross_ref_gate_verification(
             continue
         if _cross_ref_row_scoped_independent_qa(event, anchor):
             continue
-        if _cross_ref_observer_hotfix_direct_evidence(event, anchor):
+        if _cross_ref_observer_contract_evidence(event, anchor):
             continue
         identity = _close_evidence_ref_identity(event)
         # If this evidence's lane {backlog_id, project_id, task_id} is covered by

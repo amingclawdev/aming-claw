@@ -8515,6 +8515,120 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertTrue(ready["passed"], ready)
         self.assertEqual(ready["cross_ref_gate"]["rejected_cross_ref_evidence"], [])
 
+    def test_observer_verification_and_close_ready_route_token_are_not_worker_lineage(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-HOTFIX-OBSERVER-CLOSE-READY-ROUTE-TOKEN"
+        contract = {
+            "template_id": "observer_hotfix_direct_mutation.v1",
+            "contract_instance_id": bug_id,
+            "route_topology_policy": {
+                "selected_topology": "observer_hotfix_direct_mutation",
+                "independent_verification_required": True,
+            },
+        }
+        child_identity = {
+            "route_id": "route-observer-close-child",
+            "route_context_hash": "sha256:observer-close-child-route",
+            "prompt_contract_id": "rprompt-observer-close-child",
+            "prompt_contract_hash": "sha256:observer-close-child-contract",
+        }
+        hotfix_event = {
+            "id": 5719,
+            "event_type": "hotfix.under_action",
+            "event_kind": "hotfix_under_action",
+            "phase": "implementation",
+            "status": "accepted",
+            "actor": "observer-codex",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-hotfix-observer-close-r3",
+            "payload": {
+                "meta_contract_gate": {
+                    "action": "hotfix_under_action",
+                    "role": "observer",
+                    "status": "passed",
+                    "allowed": True,
+                },
+                "implementation_close_evidence": {
+                    "counts_as_implementation": True,
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                    "verification_evidence_refs": ["qa-subagent-Pasteur"],
+                    "qa_lineage": {
+                        "required": True,
+                        "required_gate": "independent_qa_gate",
+                    },
+                },
+            },
+        }
+        observer_verification = {
+            "id": 5710,
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "observer-codex",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-qa-observer-close",
+            "payload": {
+                "meta_contract_gate": {
+                    "action": "observer_command",
+                    "role": "observer",
+                    "status": "passed",
+                    "allowed": True,
+                }
+            },
+        }
+        close_ready = {
+            "id": 5726,
+            "event_type": "close.ready",
+            "event_kind": "close_ready",
+            "phase": "pre_close_gate",
+            "status": "passed",
+            "actor": "observer",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-hotfix-observer-close",
+            "payload": {
+                "meta_contract_gate": {
+                    "action": "close_ready",
+                    "role": "observer",
+                    "status": "passed",
+                    "allowed": True,
+                }
+            },
+        }
+        for event in (hotfix_event, observer_verification, close_ready):
+            _attach_server_action_scope_route_token_lineage(
+                event,
+                child_identity,
+                route_token_ref="rtok-observer-close",
+                acceptance_source="server_route_token_action_scope",
+            )
+
+        qa_event = _route_context_qa_verification_event()
+        qa_event.update({
+            "actor": "qa-subagent-Pasteur",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+        })
+        qa_event["verification"]["reviewer"] = "qa-subagent-Pasteur"
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                hotfix_event,
+                observer_verification,
+                close_ready,
+                *_route_context_consumption_events(),
+                qa_event,
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["cross_ref_gate"]["rejected_cross_ref_evidence"], [])
+
     def test_mf_parallel_close_gate_rejects_unprotected_action_scoped_qa_route(self):
         from agent.governance import task_timeline
 

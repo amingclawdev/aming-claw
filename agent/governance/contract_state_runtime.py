@@ -856,6 +856,42 @@ def _successor_policy_summary(root: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _policy_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "required"}
+    return bool(value)
+
+
+def _successor_selection_required(root: Mapping[str, Any]) -> bool:
+    policy = root.get("successor_contract_policy")
+    if not isinstance(policy, Mapping):
+        return bool(root.get("successor_contract_candidates"))
+    if _policy_truthy(policy.get("selection_required_when_followup_needed")):
+        return False
+    return bool(
+        _policy_truthy(policy.get("selection_required_after_hotfix_complete"))
+        or _policy_truthy(policy.get("selection_required"))
+        or policy.get("selection_action")
+        or policy.get("candidates")
+        or policy.get("successor_contract_candidates")
+        or root.get("successor_contract_candidates")
+    )
+
+
+def _successor_lane_role(depth: int) -> str:
+    if depth == 1:
+        return "successor"
+    if depth == 2:
+        return "nested_successor"
+    if depth == 3:
+        return "deep_successor"
+    return f"successor_depth_{depth}"
+
+
 def _successor_contract_from_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     successor: dict[str, Any] = {}
     for key in _SUCCESSOR_CONTRACT_CONTAINER_KEYS:
@@ -1033,6 +1069,42 @@ def _successor_contract_root(
     ).strip()
     root["state"] = str(successor.get("state") or successor.get("status") or "selected")
     return root
+
+
+def _successor_active_execution(
+    successor: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_chain_id: str,
+    parent_execution_id: str,
+    projection_watermark: Any,
+    route_identity_hash: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    execution_id = str(
+        successor.get("successor_contract_execution_id")
+        or successor.get("contract_execution_id")
+        or ""
+    ).strip()
+    return {
+        "schema_version": "active_contract_execution.v1",
+        "project_id": project_id,
+        "backlog_id": successor.get("successor_backlog_id") or backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": successor.get("contract_id") or "",
+        "contract_template_id": successor.get("contract_template_id") or "",
+        "contract_instance_id": successor.get("contract_instance_id") or "",
+        "contract_revision_id": successor.get("contract_revision_id") or "",
+        "state": successor.get("state") or successor.get("status") or "selected",
+        "projection_watermark": projection_watermark,
+        "route_identity_hash": route_identity_hash,
+        "route_token_ref": route_token_ref,
+        "contract_chain_id": contract_chain_id,
+        "parent_contract_execution_id": (
+            successor.get("parent_contract_execution_id") or parent_execution_id
+        ),
+    }
 
 
 def _contract_requirements_state(
@@ -1348,6 +1420,9 @@ def build_contract_state_projection(
     selected_successor_bindings: list[dict[str, Any]] = []
     nested_selected_successor: dict[str, Any] = {}
     nested_successor_contract_state: dict[str, Any] = {}
+    deep_selected_successor: dict[str, Any] = {}
+    deep_successor_bindings: list[dict[str, Any]] = []
+    deep_successor_contract_state: dict[str, Any] = {}
     if selected_successor:
         successor_execution_id = str(
             selected_successor.get("successor_contract_execution_id")
@@ -1470,6 +1545,108 @@ def build_contract_state_projection(
                 contract_execution_id=nested_execution_id,
                 missing_precedence="nested_successor_contract_missing_step",
             )
+            deep_successor_bindings = _successor_contract_bindings(
+                rows,
+                project_id=project_id,
+                backlog_id=str(
+                    nested_selected_successor.get("successor_backlog_id")
+                    or selected_successor.get("successor_backlog_id")
+                    or backlog_id
+                ),
+                contract_chain_id=contract_chain_id,
+                active_contract_execution=nested_execution,
+            )
+            deep_selected_successor = (
+                deep_successor_bindings[-1] if deep_successor_bindings else {}
+            )
+            if deep_selected_successor:
+                deep_execution_id = str(
+                    deep_selected_successor.get("successor_contract_execution_id")
+                    or deep_selected_successor.get("contract_execution_id")
+                    or ""
+                ).strip()
+                deep_root = _successor_contract_root(
+                    deep_selected_successor,
+                    contract_templates=template_catalog,
+                )
+                deep_execution = {
+                    "schema_version": "active_contract_execution.v1",
+                    "project_id": project_id,
+                    "backlog_id": deep_selected_successor.get("successor_backlog_id")
+                    or nested_selected_successor.get("successor_backlog_id")
+                    or selected_successor.get("successor_backlog_id")
+                    or backlog_id,
+                    "contract_execution_id": deep_execution_id,
+                    "contract_id": deep_selected_successor.get("contract_id") or "",
+                    "contract_template_id": deep_selected_successor.get(
+                        "contract_template_id"
+                    )
+                    or "",
+                    "contract_instance_id": deep_selected_successor.get(
+                        "contract_instance_id"
+                    )
+                    or "",
+                    "contract_revision_id": deep_selected_successor.get(
+                        "contract_revision_id"
+                    )
+                    or "",
+                    "state": deep_selected_successor.get("state")
+                    or deep_selected_successor.get("status")
+                    or "selected",
+                    "projection_watermark": projection_watermark,
+                    "route_identity_hash": route_identity_hash,
+                    "route_token_ref": active_execution.get("route_token_ref") or "",
+                    "contract_chain_id": contract_chain_id,
+                    "parent_contract_execution_id": deep_selected_successor.get(
+                        "parent_contract_execution_id"
+                    )
+                    or nested_execution_id,
+                }
+                deep_requirement_state = _contract_requirements_state(
+                    rows,
+                    root=deep_root,
+                    backlog_row={
+                        **row,
+                        "bug_id": deep_selected_successor.get("successor_backlog_id")
+                        or nested_selected_successor.get("successor_backlog_id")
+                        or selected_successor.get("successor_backlog_id")
+                        or backlog_id,
+                        "backlog_id": deep_selected_successor.get(
+                            "successor_backlog_id"
+                        )
+                        or nested_selected_successor.get("successor_backlog_id")
+                        or selected_successor.get("successor_backlog_id")
+                        or backlog_id,
+                    },
+                    default_required_evidence=[],
+                    contract_execution_id=deep_execution_id,
+                    missing_precedence="deep_successor_contract_missing_step",
+                )
+                deep_successor_contract_state = {
+                    "schema_version": "deep_successor_contract_state.v1",
+                    "source": "contract_state",
+                    "selected_successor_contract": deep_selected_successor,
+                    "parent_successor_contract": nested_selected_successor,
+                    "root_successor_contract": selected_successor,
+                    "active_contract_execution": deep_execution,
+                    "contract_id": deep_execution["contract_id"],
+                    "contract_template_id": deep_execution["contract_template_id"],
+                    "contract_execution_id": deep_execution_id,
+                    "contract_chain_id": contract_chain_id,
+                    "parent_contract_execution_id": deep_execution[
+                        "parent_contract_execution_id"
+                    ],
+                    "successor_contract_policy": _successor_policy_summary(deep_root),
+                    "successor_contract_candidates": _successor_candidates(
+                        deep_root,
+                        contract_chain_id=contract_chain_id,
+                        active_contract_execution=deep_execution,
+                        contract_complete=bool(
+                            deep_requirement_state["contract_complete"]
+                        ),
+                    ),
+                    **deep_requirement_state,
+                }
             nested_successor_contract_state = {
                 "schema_version": "nested_successor_contract_state.v1",
                 "source": "contract_state",
@@ -1492,6 +1669,9 @@ def build_contract_state_projection(
                         nested_requirement_state["contract_complete"]
                     ),
                 ),
+                "selected_successor_contract_binding": deep_selected_successor,
+                "successor_contract_bindings": deep_successor_bindings,
+                "deep_selected_successor_contract_state": deep_successor_contract_state,
                 **nested_requirement_state,
             }
         selected_successor_contract_state = {
@@ -1581,33 +1761,210 @@ def build_contract_state_projection(
                     "selected_successor_contract_state": (
                         nested_successor_contract_state
                     ),
-                    **_next_action_requirement_metadata(first),
-                }
-            else:
-                successor_next_legal_action = {
-                    "id": "successor_contract_selected",
-                    "action": "read_successor_contract_state",
-                    "requirement_id": "successor_contract_selected",
-                    "detail": "continue with selected nested successor contract execution",
-                    "source": "contract_state",
-                    "precedence": "nested_successor_contract_selected",
-                    "contract_chain_id": contract_chain_id,
-                    "contract_execution_id": nested_selected_successor.get(
-                        "successor_contract_execution_id"
+                        **_next_action_requirement_metadata(first),
+                    }
+            elif deep_successor_contract_state:
+                deep_missing_steps = deep_successor_contract_state.get(
+                    "ordered_next_steps"
+                ) or []
+                if deep_missing_steps:
+                    first = dict(deep_missing_steps[0])
+                    successor_next_legal_action = {
+                        "id": first["id"],
+                        "action": first.get("action") or f"record_{first['id']}",
+                        "requirement_id": first["id"],
+                        "detail": (
+                            f"record deep successor contract evidence for {first['id']}"
+                        ),
+                        "source": first.get("source") or "contract_state",
+                        "precedence": first.get("precedence")
+                        or "deep_successor_contract_missing_step",
+                        "blocked_by": first.get("blocked_by") or [],
+                        "ordered_missing_steps_source": "deep_successor_contract_state",
+                        "ordered_missing_steps": deep_missing_steps,
+                        "contract_chain_id": contract_chain_id,
+                        "contract_execution_id": deep_successor_contract_state.get(
+                            "contract_execution_id"
+                        )
+                        or "",
+                        "backlog_id": deep_selected_successor.get(
+                            "successor_backlog_id"
+                        )
+                        or nested_selected_successor.get("successor_backlog_id")
+                        or selected_successor.get("successor_backlog_id")
+                        or backlog_id,
+                        "route_token_ref": active_execution.get("route_token_ref")
+                        or "",
+                        "projection_watermark": projection_watermark,
+                        "selected_successor_contract": deep_selected_successor,
+                        "parent_successor_contract": nested_selected_successor,
+                        "selected_successor_contract_state": (
+                            deep_successor_contract_state
+                        ),
+                        **_next_action_requirement_metadata(first),
+                    }
+                else:
+                    deep_successor_contract_candidates = (
+                        deep_successor_contract_state.get(
+                            "successor_contract_candidates"
+                        )
+                        or []
                     )
-                    or nested_selected_successor.get("contract_execution_id")
-                    or "",
-                    "backlog_id": nested_selected_successor.get("successor_backlog_id")
-                    or selected_successor.get("successor_backlog_id")
-                    or backlog_id,
-                    "route_token_ref": active_execution.get("route_token_ref") or "",
-                    "projection_watermark": projection_watermark,
-                    "selected_successor_contract": nested_selected_successor,
-                    "parent_successor_contract": selected_successor,
-                    "selected_successor_contract_state": (
-                        nested_successor_contract_state
-                    ),
-                }
+                    if deep_successor_contract_candidates:
+                        successor_next_legal_action = {
+                            "id": "select_successor_contract",
+                            "action": "select_successor_contract",
+                            "requirement_id": "successor_contract_selection",
+                            "detail": (
+                                "select the next contract execution after the "
+                                "active deep successor contract"
+                            ),
+                            "source": "contract_state",
+                            "precedence": "deep_successor_contract_selection",
+                            "contract_chain_id": contract_chain_id,
+                            "contract_execution_id": (
+                                deep_successor_contract_state.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "backlog_id": deep_selected_successor.get(
+                                "successor_backlog_id"
+                            )
+                            or nested_selected_successor.get("successor_backlog_id")
+                            or selected_successor.get("successor_backlog_id")
+                            or backlog_id,
+                            "route_token_ref": active_execution.get(
+                                "route_token_ref"
+                            )
+                            or "",
+                            "projection_watermark": projection_watermark,
+                            "successor_contract_policy": (
+                                deep_successor_contract_state.get(
+                                    "successor_contract_policy"
+                                )
+                                or {}
+                            ),
+                            "successor_contract_candidates": (
+                                deep_successor_contract_candidates
+                            ),
+                            "selected_successor_contract": deep_selected_successor,
+                            "parent_successor_contract": nested_selected_successor,
+                            "selected_successor_contract_state": (
+                                deep_successor_contract_state
+                            ),
+                        }
+                    else:
+                        successor_next_legal_action = {
+                            "id": "successor_contract_selected",
+                            "action": "read_successor_contract_state",
+                            "requirement_id": "successor_contract_selected",
+                            "detail": (
+                                "continue with selected deep successor contract execution"
+                            ),
+                            "source": "contract_state",
+                            "precedence": "deep_successor_contract_selected",
+                            "contract_chain_id": contract_chain_id,
+                            "contract_execution_id": deep_selected_successor.get(
+                                "successor_contract_execution_id"
+                            )
+                            or deep_selected_successor.get("contract_execution_id")
+                            or "",
+                            "backlog_id": deep_selected_successor.get(
+                                "successor_backlog_id"
+                            )
+                            or nested_selected_successor.get("successor_backlog_id")
+                            or selected_successor.get("successor_backlog_id")
+                            or backlog_id,
+                            "route_token_ref": active_execution.get(
+                                "route_token_ref"
+                            )
+                            or "",
+                            "projection_watermark": projection_watermark,
+                            "selected_successor_contract": deep_selected_successor,
+                            "parent_successor_contract": nested_selected_successor,
+                            "selected_successor_contract_state": (
+                                deep_successor_contract_state
+                            ),
+                        }
+            else:
+                nested_successor_contract_candidates = (
+                    nested_successor_contract_state.get(
+                        "successor_contract_candidates"
+                    )
+                    or []
+                )
+                if nested_successor_contract_candidates:
+                    successor_next_legal_action = {
+                        "id": "select_successor_contract",
+                        "action": "select_successor_contract",
+                        "requirement_id": "successor_contract_selection",
+                        "detail": (
+                            "select the next contract execution after the active "
+                            "nested successor contract"
+                        ),
+                        "source": "contract_state",
+                        "precedence": "nested_successor_contract_selection",
+                        "contract_chain_id": contract_chain_id,
+                        "contract_execution_id": (
+                            nested_successor_contract_state.get(
+                                "contract_execution_id"
+                            )
+                            or ""
+                        ),
+                        "backlog_id": nested_selected_successor.get(
+                            "successor_backlog_id"
+                        )
+                        or selected_successor.get("successor_backlog_id")
+                        or backlog_id,
+                        "route_token_ref": active_execution.get("route_token_ref")
+                        or "",
+                        "projection_watermark": projection_watermark,
+                        "successor_contract_policy": (
+                            nested_successor_contract_state.get(
+                                "successor_contract_policy"
+                            )
+                            or {}
+                        ),
+                        "successor_contract_candidates": (
+                            nested_successor_contract_candidates
+                        ),
+                        "selected_successor_contract": nested_selected_successor,
+                        "parent_successor_contract": selected_successor,
+                        "selected_successor_contract_state": (
+                            nested_successor_contract_state
+                        ),
+                    }
+                else:
+                    successor_next_legal_action = {
+                        "id": "successor_contract_selected",
+                        "action": "read_successor_contract_state",
+                        "requirement_id": "successor_contract_selected",
+                        "detail": (
+                            "continue with selected nested successor contract execution"
+                        ),
+                        "source": "contract_state",
+                        "precedence": "nested_successor_contract_selected",
+                        "contract_chain_id": contract_chain_id,
+                        "contract_execution_id": nested_selected_successor.get(
+                            "successor_contract_execution_id"
+                        )
+                        or nested_selected_successor.get("contract_execution_id")
+                        or "",
+                        "backlog_id": nested_selected_successor.get(
+                            "successor_backlog_id"
+                        )
+                        or selected_successor.get("successor_backlog_id")
+                        or backlog_id,
+                        "route_token_ref": active_execution.get("route_token_ref")
+                        or "",
+                        "projection_watermark": projection_watermark,
+                        "selected_successor_contract": nested_selected_successor,
+                        "parent_successor_contract": selected_successor,
+                        "selected_successor_contract_state": (
+                            nested_successor_contract_state
+                        ),
+                    }
         elif nested_selected_successor:
             successor_next_legal_action = {
                 "id": "successor_contract_selected",
@@ -1874,6 +2231,309 @@ def build_contract_state_projection(
                         "missing_evidence"
                     )
                     or [],
+                }
+            )
+    if deep_successor_contract_state:
+        deep_execution = deep_successor_contract_state.get("active_contract_execution")
+        if isinstance(deep_execution, Mapping):
+            deep_action = (
+                successor_next_legal_action
+                if str(
+                    (successor_next_legal_action or {}).get("contract_execution_id")
+                    or ""
+                )
+                == str(
+                    deep_successor_contract_state.get("contract_execution_id") or ""
+                )
+                else None
+            )
+            lane_contract_executions.append(
+                {
+                    "schema_version": "contract_lane_execution.v1",
+                    "role": "deep_successor",
+                    "source": "contract_state",
+                    "contract_chain_id": contract_chain_id,
+                    "backlog_id": deep_selected_successor.get("successor_backlog_id")
+                    or nested_selected_successor.get("successor_backlog_id")
+                    or selected_successor.get("successor_backlog_id")
+                    or backlog_id,
+                    "active_contract_execution": dict(deep_execution),
+                    "contract_id": deep_successor_contract_state.get("contract_id")
+                    or "",
+                    "contract_template_id": deep_successor_contract_state.get(
+                        "contract_template_id"
+                    )
+                    or "",
+                    "contract_execution_id": deep_successor_contract_state.get(
+                        "contract_execution_id"
+                    )
+                    or "",
+                    "parent_contract_execution_id": deep_successor_contract_state.get(
+                        "parent_contract_execution_id"
+                    )
+                    or "",
+                    "state": deep_execution.get("state") or "",
+                    "next_legal_action": _next_action_summary(deep_action),
+                    "selected_successor_contract": deep_selected_successor,
+                    "required_evidence": deep_successor_contract_state.get(
+                        "required_evidence"
+                    )
+                    or [],
+                    "completed_evidence": [
+                        item.get("id")
+                        for item in (
+                            deep_successor_contract_state.get("completed_evidence")
+                            or []
+                        )
+                        if isinstance(item, Mapping) and item.get("id")
+                    ],
+                    "missing_evidence": deep_successor_contract_state.get(
+                        "missing_evidence"
+                    )
+                    or [],
+                }
+            )
+    recursive_successor_states: list[dict[str, Any]] = []
+    if active_execution and contract_chain_id:
+        parent_execution: Mapping[str, Any] = active_execution
+        parent_successor: Mapping[str, Any] = {}
+        seen_executions = {str(active_execution.get("contract_execution_id") or "")}
+        for depth in range(1, 16):
+            parent_execution_id = str(
+                parent_execution.get("contract_execution_id") or ""
+            ).strip()
+            if not parent_execution_id:
+                break
+            bindings = _successor_contract_bindings(
+                rows,
+                project_id=project_id,
+                backlog_id=str(parent_execution.get("backlog_id") or backlog_id),
+                contract_chain_id=contract_chain_id,
+                active_contract_execution=parent_execution,
+            )
+            selected = bindings[-1] if bindings else {}
+            if not selected:
+                break
+            execution_id = str(
+                selected.get("successor_contract_execution_id")
+                or selected.get("contract_execution_id")
+                or ""
+            ).strip()
+            if not execution_id or execution_id in seen_executions:
+                break
+            seen_executions.add(execution_id)
+            successor_root = _successor_contract_root(
+                selected,
+                contract_templates=template_catalog,
+            )
+            successor_execution = _successor_active_execution(
+                selected,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_chain_id=contract_chain_id,
+                parent_execution_id=parent_execution_id,
+                projection_watermark=projection_watermark,
+                route_identity_hash=route_identity_hash,
+                route_token_ref=str(active_execution.get("route_token_ref") or ""),
+            )
+            requirement_state = _contract_requirements_state(
+                rows,
+                root=successor_root,
+                backlog_row={
+                    **row,
+                    "bug_id": selected.get("successor_backlog_id") or backlog_id,
+                    "backlog_id": selected.get("successor_backlog_id") or backlog_id,
+                },
+                default_required_evidence=[],
+                contract_execution_id=execution_id,
+                missing_precedence=(
+                    "successor_contract_missing_step"
+                    if depth == 1
+                    else (
+                        "nested_successor_contract_missing_step"
+                        if depth == 2
+                        else (
+                            "deep_successor_contract_missing_step"
+                            if depth == 3
+                            else f"successor_depth_{depth}_contract_missing_step"
+                        )
+                    )
+                ),
+            )
+            successor_state = {
+                "schema_version": f"successor_depth_{depth}_contract_state.v1",
+                "source": "contract_state",
+                "depth": depth,
+                "role": _successor_lane_role(depth),
+                "selected_successor_contract": selected,
+                "parent_successor_contract": parent_successor,
+                "active_contract_execution": successor_execution,
+                "contract_id": successor_execution.get("contract_id") or "",
+                "contract_template_id": successor_execution.get(
+                    "contract_template_id"
+                )
+                or "",
+                "contract_execution_id": execution_id,
+                "contract_chain_id": contract_chain_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "successor_contract_policy": _successor_policy_summary(
+                    successor_root
+                ),
+                "successor_contract_candidates": _successor_candidates(
+                    successor_root,
+                    contract_chain_id=contract_chain_id,
+                    active_contract_execution=successor_execution,
+                    contract_complete=bool(requirement_state["contract_complete"]),
+                ),
+                "successor_selection_required": _successor_selection_required(
+                    successor_root
+                ),
+                **requirement_state,
+            }
+            recursive_successor_states.append(
+                {
+                    "depth": depth,
+                    "role": _successor_lane_role(depth),
+                    "selected": selected,
+                    "state": successor_state,
+                    "root": successor_root,
+                }
+            )
+            parent_execution = successor_execution
+            parent_successor = selected
+
+    recursive_next_legal_action: dict[str, Any] | None = None
+    if recursive_successor_states:
+        latest = recursive_successor_states[-1]
+        latest_state = latest["state"]
+        latest_selected = latest["selected"]
+        latest_missing_steps = latest_state.get("ordered_next_steps") or []
+        latest_depth = int(latest.get("depth") or 0)
+        latest_role = str(latest.get("role") or "successor")
+        if latest_missing_steps:
+            first = dict(latest_missing_steps[0])
+            recursive_next_legal_action = {
+                "id": first["id"],
+                "action": first.get("action") or f"record_{first['id']}",
+                "requirement_id": first["id"],
+                "detail": f"record {latest_role} contract evidence for {first['id']}",
+                "source": first.get("source") or "contract_state",
+                "precedence": first.get("precedence")
+                or f"successor_depth_{latest_depth}_contract_missing_step",
+                "blocked_by": first.get("blocked_by") or [],
+                "ordered_missing_steps_source": latest_state.get("schema_version")
+                or "successor_contract_state",
+                "ordered_missing_steps": latest_missing_steps,
+                "contract_chain_id": contract_chain_id,
+                "contract_execution_id": latest_state.get("contract_execution_id")
+                or "",
+                "backlog_id": latest_selected.get("successor_backlog_id")
+                or backlog_id,
+                "route_token_ref": active_execution.get("route_token_ref") or "",
+                "projection_watermark": projection_watermark,
+                "selected_successor_contract": latest_selected,
+                "selected_successor_contract_state": latest_state,
+                **_next_action_requirement_metadata(first),
+            }
+        elif (
+            latest_state.get("successor_contract_candidates")
+            and latest_state.get("successor_selection_required")
+        ):
+            recursive_next_legal_action = {
+                "id": "select_successor_contract",
+                "action": "select_successor_contract",
+                "requirement_id": "successor_contract_selection",
+                "detail": (
+                    "select the next contract execution after the active "
+                    f"{latest_role} contract"
+                ),
+                "source": "contract_state",
+                "precedence": f"successor_depth_{latest_depth}_contract_selection",
+                "contract_chain_id": contract_chain_id,
+                "contract_execution_id": latest_state.get("contract_execution_id")
+                or "",
+                "backlog_id": latest_selected.get("successor_backlog_id")
+                or backlog_id,
+                "route_token_ref": active_execution.get("route_token_ref") or "",
+                "projection_watermark": projection_watermark,
+                "successor_contract_policy": latest_state.get(
+                    "successor_contract_policy"
+                )
+                or {},
+                "successor_contract_candidates": latest_state.get(
+                    "successor_contract_candidates"
+                )
+                or [],
+                "selected_successor_contract": latest_selected,
+                "selected_successor_contract_state": latest_state,
+            }
+        elif latest_state.get("contract_complete"):
+            recursive_next_legal_action = {
+                "id": "close_ready",
+                "action": "record_close_ready",
+                "requirement_id": "close_ready",
+                "detail": (
+                    "record close_ready and run the close gate after the terminal "
+                    f"{latest_role} contract completes"
+                ),
+                "source": "contract_state",
+                "precedence": f"successor_depth_{latest_depth}_terminal_close_ready",
+                "contract_chain_id": contract_chain_id,
+                "contract_execution_id": latest_state.get("contract_execution_id")
+                or "",
+                "backlog_id": latest_selected.get("successor_backlog_id")
+                or backlog_id,
+                "route_token_ref": active_execution.get("route_token_ref") or "",
+                "projection_watermark": projection_watermark,
+                "selected_successor_contract": latest_selected,
+                "selected_successor_contract_state": latest_state,
+            }
+        if recursive_next_legal_action and len(recursive_successor_states) > 3:
+            next_legal_action = dict(recursive_next_legal_action)
+            successor_next_legal_action = dict(recursive_next_legal_action)
+        for item in recursive_successor_states[3:]:
+            state_item = item["state"]
+            execution_item = state_item.get("active_contract_execution")
+            if not isinstance(execution_item, Mapping):
+                continue
+            state_action = (
+                recursive_next_legal_action
+                if str((recursive_next_legal_action or {}).get("contract_execution_id") or "")
+                == str(state_item.get("contract_execution_id") or "")
+                else None
+            )
+            lane_contract_executions.append(
+                {
+                    "schema_version": "contract_lane_execution.v1",
+                    "role": item.get("role") or _successor_lane_role(
+                        int(item.get("depth") or 0)
+                    ),
+                    "source": "contract_state",
+                    "contract_chain_id": contract_chain_id,
+                    "backlog_id": (item.get("selected") or {}).get(
+                        "successor_backlog_id"
+                    )
+                    or backlog_id,
+                    "active_contract_execution": dict(execution_item),
+                    "contract_id": state_item.get("contract_id") or "",
+                    "contract_template_id": state_item.get("contract_template_id")
+                    or "",
+                    "contract_execution_id": state_item.get("contract_execution_id")
+                    or "",
+                    "parent_contract_execution_id": state_item.get(
+                        "parent_contract_execution_id"
+                    )
+                    or "",
+                    "state": execution_item.get("state") or "",
+                    "next_legal_action": _next_action_summary(state_action),
+                    "selected_successor_contract": item.get("selected") or {},
+                    "required_evidence": state_item.get("required_evidence") or [],
+                    "completed_evidence": [
+                        completed.get("id")
+                        for completed in (state_item.get("completed_evidence") or [])
+                        if isinstance(completed, Mapping) and completed.get("id")
+                    ],
+                    "missing_evidence": state_item.get("missing_evidence") or [],
                 }
             )
     contract_execution_index = {
