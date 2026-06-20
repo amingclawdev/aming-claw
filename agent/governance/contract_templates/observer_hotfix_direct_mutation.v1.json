@@ -87,12 +87,61 @@
     ],
     "close_gate_policy": "This contract does not replace the existing MF close gate. If backlog close requires R18 evidence, append implementation, verification, and close_ready timeline events with the normal route-token or waiver evidence."
   },
+  "successor_contract_policy": {
+    "schema_version": "successor_contract_policy.v1",
+    "selection_required_after_hotfix_complete": true,
+    "selection_event_kind": "contract_binding",
+    "selection_action": "select_successor_contract",
+    "same_row_binding_required": true,
+    "separate_backlog_row_allowed_when_successor_has_own_lifecycle": true,
+    "required_identity_fields": [
+      "contract_chain_id",
+      "parent_contract_execution_id",
+      "successor_contract_execution_id",
+      "handoff_event_id",
+      "handoff_reason"
+    ],
+    "optional_identity_fields": [
+      "successor_backlog_id",
+      "handoff_preconditions",
+      "route_token_ref"
+    ],
+    "candidates": [
+      {
+        "id": "mf_parallel.v1",
+        "contract_template_id": "mf_parallel.v1",
+        "successor_kind": "parallel_worker",
+        "description": "Return to ordinary bounded worker implementation when the hotfix only repaired the workflow or established that product work still needs implementation evidence."
+      },
+      {
+        "id": "qa_evidence_gate_review.v1",
+        "contract_template_id": "qa_evidence_gate_review.v1",
+        "successor_kind": "qa_review",
+        "description": "Independent QA evidence review after a completed hotfix or implementation has concrete verification artifacts to inspect."
+      },
+      {
+        "id": "review_contract.v1",
+        "contract_template_id": "review_contract.v1",
+        "successor_kind": "review",
+        "description": "Non-close-satisfying review lane when the hotfix needs design, architecture, or safety assessment before implementation or close."
+      },
+      {
+        "id": "audit_close_with_qa_acceptance.v1",
+        "contract_template_id": "audit_close_with_qa_acceptance.v1",
+        "successor_kind": "audit_close",
+        "description": "Exceptional audit-close successor only for implemented historical rows whose normal close evidence cannot be reconstructed without fabrication."
+      }
+    ]
+  },
   "evidence_requirements": [
     {
       "id": "hotfix_pre_reason",
       "required": true,
       "phase": "pre_mutation",
       "event_kind": "hotfix_entered",
+      "accepted_event_kinds": [
+        "hotfix_entered"
+      ],
       "description": "Pre-mutation timeline reason exists before any allowed file changes."
     },
     {
@@ -100,21 +149,10 @@
       "required": true,
       "phase": "post_implementation",
       "event_kind": "hotfix_under_action",
+      "accepted_event_kinds": [
+        "hotfix_under_action"
+      ],
       "description": "Post-mutation timeline summary records what changed and points to verification evidence refs."
-    },
-    {
-      "id": "focused_verification",
-      "required": true,
-      "phase": "verification",
-      "event_kind": "verification",
-      "description": "Focused tests or an explicit no-test decision still must be recorded before close."
-    },
-    {
-      "id": "close_ready",
-      "required": true,
-      "phase": "pre_close_gate",
-      "event_kind": "close_ready",
-      "description": "Close-ready evidence is still required by the normal MF close gate."
     }
   ],
   "forbidden_capabilities": [

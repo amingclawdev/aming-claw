@@ -2483,11 +2483,23 @@ def contract_state_projection(
 
     rows = [event for event in (events or []) if isinstance(event, dict)]
     mf_projection = mf_contract_projection(rows, contract)
+    contract_templates: dict[str, dict[str, Any]] = {}
+    try:
+        from .contract_template_registry import load_contract_templates
+
+        contract_templates = {
+            str(template.get("template_id") or ""): dict(template)
+            for template in load_contract_templates()
+            if isinstance(template, Mapping) and template.get("template_id")
+        }
+    except Exception:
+        contract_templates = {}
     return build_contract_state_projection(
         rows,
         contract=contract,
         backlog_row=backlog_row,
         contract_projection=mf_projection,
+        contract_templates=contract_templates,
         default_required_evidence=_dedupe_nonempty(
             [
                 "route_context",
