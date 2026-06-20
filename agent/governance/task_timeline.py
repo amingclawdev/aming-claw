@@ -3877,7 +3877,7 @@ def _mf_subagent_finish_gate_projection(event: dict[str, Any]) -> dict[str, Any]
         return {}
     if not _truthy(worker_attestation_gate.get("passed")):
         return {}
-    if not _string_list(gate.get("changed_files")):
+    if not _changed_files_scope_declared(gate):
         return {}
     if not (
         _first_deep_text(gate, "head_commit")
@@ -4495,6 +4495,34 @@ def _finish_gate_changed_files(event: dict[str, Any]) -> list[str]:
     )
 
 
+def _changed_files_scope_declared_value(value: Any) -> bool:
+    if isinstance(value, (list, tuple)):
+        return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False
+
+
+def _changed_files_scope_declared(value: Any) -> bool:
+    return any(
+        _changed_files_scope_declared_value(item)
+        for item in _field_values(
+            value,
+            {"changed_files", "owned_changed_files", "modified_files", "files_changed"},
+        )
+    )
+
+
+def _finish_gate_changed_files_declared(event: Mapping[str, Any]) -> bool:
+    return any(
+        _changed_files_scope_declared_value(item)
+        for item in _event_field_values(
+            event,
+            {"changed_files", "owned_changed_files", "modified_files", "files_changed"},
+        )
+    )
+
+
 def _finish_gate_observer_command_id(event: dict[str, Any]) -> str:
     return _first_event_string(
         event,
@@ -4553,7 +4581,7 @@ def _finish_gate_missing_fields(
         missing.append("finish_gate_observer_command_id")
     if not _finish_gate_commit(event):
         missing.append("finish_gate_implementation_commit")
-    if not _finish_gate_changed_files(event):
+    if not _finish_gate_changed_files_declared(event):
         missing.append("finish_gate_changed_files")
     if not _finish_gate_review_ready(event):
         missing.append("finish_gate_review_ready")

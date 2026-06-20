@@ -13,6 +13,7 @@ if str(_repo_root) not in sys.path:
 
 from agent.governance.mf_workflow_runtime import load_workflow_contract
 from agent.governance.precheck_service import run_precheck
+from agent.governance import task_timeline
 from agent.tests.fixtures.mf_workflow_runtime import (
     CONTRACT_ID,
     FENCE_TOKEN,
@@ -228,6 +229,75 @@ def _child_lane_finish_gate_event(parent_task_id: str, task_id: str) -> dict[str
             }
         },
     }
+
+
+def test_finish_gate_projection_accepts_explicit_empty_changed_files_for_no_code_review() -> None:
+    parent_task_id = "AC-PARENT-ROW"
+    child_task_id = f"{parent_task_id}-impl-b"
+    event = _child_lane_finish_gate_event(parent_task_id, child_task_id)
+    finish_gate = event["payload"]["mf_subagent_finish_gate"]
+    finish_gate["changed_files"] = []
+
+    projection = task_timeline.mf_subagent_finish_gate_close_projection(
+        [event],
+        needed_event_kinds={"implementation", "close_ready"},
+    )
+
+    assert projection["passed"] is True
+    assert projection["missing_fields"] == []
+    assert projection["projected_event_kinds"] == ["close_ready", "implementation"]
+    assert all(
+        item["payload"]["changed_files"] == []
+        for item in projection["projected_events"]
+    )
+
+
+def test_finish_gate_projection_still_requires_changed_files_scope() -> None:
+    parent_task_id = "AC-PARENT-ROW"
+    child_task_id = f"{parent_task_id}-impl-b"
+    event = _child_lane_finish_gate_event(parent_task_id, child_task_id)
+    finish_gate = event["payload"]["mf_subagent_finish_gate"]
+    finish_gate.pop("changed_files", None)
+
+    projection = task_timeline.mf_subagent_finish_gate_close_projection(
+        [event],
+        needed_event_kinds={"implementation", "close_ready"},
+    )
+
+    assert projection["passed"] is False
+    assert projection["missing_fields"] == ["finish_gate_changed_files"]
+
+
+def test_finish_gate_projection_rejects_malformed_changed_files_scope_values() -> None:
+    parent_task_id = "AC-PARENT-ROW"
+    child_task_id = f"{parent_task_id}-impl-b"
+
+    for malformed_scope in (False, 0, {"unexpected": "shape"}):
+        event = _child_lane_finish_gate_event(parent_task_id, child_task_id)
+        finish_gate = event["payload"]["mf_subagent_finish_gate"]
+        finish_gate["changed_files"] = malformed_scope
+
+        projection = task_timeline.mf_subagent_finish_gate_close_projection(
+            [event],
+            needed_event_kinds={"implementation", "close_ready"},
+        )
+
+        assert projection["passed"] is False
+        assert projection["missing_fields"] == ["finish_gate_changed_files"]
+
+
+def test_finish_gate_projection_accepts_nonempty_changed_files_scope() -> None:
+    parent_task_id = "AC-PARENT-ROW"
+    child_task_id = f"{parent_task_id}-impl-b"
+    event = _child_lane_finish_gate_event(parent_task_id, child_task_id)
+
+    projection = task_timeline.mf_subagent_finish_gate_close_projection(
+        [event],
+        needed_event_kinds={"implementation", "close_ready"},
+    )
+
+    assert projection["passed"] is True
+    assert projection["missing_fields"] == []
 
 
 def _bounded_dispatch_evidence() -> dict[str, object]:
