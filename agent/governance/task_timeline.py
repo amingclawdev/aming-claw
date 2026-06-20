@@ -253,6 +253,7 @@ MF_ROUTE_CONTEXT_GATE_SCHEMA_VERSION = "mf_route_context_consumption_gate.v1"
 MF_ROUTE_OWNED_SOURCE_EVENT_GATE_SCHEMA_VERSION = "mf_route_owned_source_event_gate.v1"
 MF_CLOSE_MISSING_GROUPS_SCHEMA_VERSION = "mf_close_missing_evidence_groups.v1"
 MF_ROUTE_CONTEXT_REMINDER_SCHEMA_VERSION = "mf_route_context_reminder.v1"
+MF_CONTRACT_CLOSE_GATE_POLICY_SCHEMA_VERSION = "contract_close_gate_policy_projection.v1"
 MF_ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1"
 MF_ROUTE_GUIDANCE_ALLOWED_STAGES = (
     "dispatch",
@@ -355,6 +356,7 @@ MF_ROUTE_SOURCE_PASS_STATUSES = {
     "succeeded",
     "success",
 }
+OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID = "observer_hotfix_direct_mutation.v1"
 
 
 def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
@@ -1324,7 +1326,9 @@ def _independent_qa_gate(
     - The governance policy profile flags independent_qa=true (e.g. aming-claw
       profile), OR
     - The row's topology policy declares independent_verification_required=true
-      or includes an independent_verification/qa lane in required_lanes.
+      or includes an independent_verification/qa lane in required_lanes, OR
+    - The selected contract close policy requires a QA successor/equivalent
+      independent QA gate.
 
     Independence-by-identity rule (AC BUG-ROUTE-CONTEXT-CLOSE-GATE-QA-20260531):
     - Evidence whose *reviewer identity* is the same as any known worker_slot_id
@@ -1339,10 +1343,21 @@ def _independent_qa_gate(
     # Determine required from both governance policy and topology policy.
     policy_required = _policy_requires(policy, "independent_qa")
     topology_required = False
+    contract_policy_required = False
+    contract_close_policy: dict[str, Any] = {}
     if contract is not None:
         topology_policy = _route_topology_policy(contract)
         topology_required = _route_independent_verification_required(topology_policy)
-    required = policy_required or topology_required
+        contract_close_policy = _contract_close_gate_policy_projection(
+            rows,
+            contract,
+            topology_policy,
+        )
+        contract_policy_required = bool(
+            contract_close_policy.get("applied")
+            and contract_close_policy.get("qa_required")
+        )
+    required = policy_required or topology_required or contract_policy_required
 
     # Collect worker identities from startup events in this timeline so we can
     # apply the independence-by-identity test.
@@ -1517,6 +1532,8 @@ def _independent_qa_gate(
         "required": required,
         "topology_required": topology_required,
         "policy_required": policy_required,
+        "contract_policy_required": contract_policy_required,
+        "contract_close_gate_policy": contract_close_policy,
         "passed": passed,
         "status": "passed" if passed else "failed",
         "missing_requirement_ids": missing_ids,
@@ -2767,6 +2784,165 @@ def _route_independent_verification_required(topology_policy: dict[str, Any]) ->
             }
         )
     )
+
+
+def _contract_template_by_id(template_id: str) -> dict[str, Any]:
+    if not template_id:
+        return {}
+    try:
+        from .contract_template_registry import load_contract_templates
+
+        for template in load_contract_templates():
+            if not isinstance(template, Mapping):
+                continue
+            if str(template.get("template_id") or "").strip() == template_id:
+                return dict(template)
+    except Exception:
+        return {}
+    return {}
+
+
+def _contract_close_gate_policy_source(
+    contract: dict[str, Any] | None,
+    template_id: str,
+) -> dict[str, Any]:
+    root = _contract_root(contract)
+    policy = _mapping(root.get("close_gate_policy"))
+    if policy:
+        return policy
+    template = _contract_template_by_id(template_id)
+    return _mapping(template.get("close_gate_policy"))
+
+
+def _hotfix_contract_events(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    pre_events: list[dict[str, Any]] = []
+    post_events: list[dict[str, Any]] = []
+    for raw_event in rows:
+        event = _mapping(raw_event)
+        if not event or not _route_event_passed(event):
+            continue
+        marker = _route_marker(
+            event.get("event_kind")
+            or event.get("event_type")
+            or event.get("phase")
+        )
+        payload = _mapping(event.get("payload"))
+        payload_schema = str(payload.get("schema_version") or "").strip()
+        event_ref = {
+            "id": event.get("id") or event.get("event_id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "status": event.get("status") or event.get("decision"),
+            "payload_schema_version": payload_schema,
+        }
+        if marker == "hotfix_entered":
+            if payload_schema in {"", "observer_hotfix_pre_reason.v1"}:
+                pre_events.append(event_ref)
+        elif marker == "hotfix_under_action":
+            if payload_schema in {"", "observer_hotfix_action_summary.v1"}:
+                post_events.append(event_ref)
+    return {
+        "pre_events": pre_events,
+        "post_events": post_events,
+        "active": bool(pre_events or post_events),
+        "completed": bool(post_events),
+    }
+
+
+def _contract_close_gate_policy_projection(
+    rows: list[dict[str, Any]],
+    contract: dict[str, Any] | None,
+    topology_policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Project contract-specific close-gate overrides without weakening defaults."""
+
+    root = _contract_root(contract)
+    explicit_template_id = str(
+        root.get("template_id")
+        or root.get("contract_template_id")
+        or root.get("selected_contract_template_id")
+        or ""
+    ).strip()
+    hotfix_events = _hotfix_contract_events(rows)
+    inferred_template_id = (
+        OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID if hotfix_events["active"] else ""
+    )
+    template_id = explicit_template_id or inferred_template_id
+    policy = _contract_close_gate_policy_source(contract, template_id)
+    route_overrides = _mapping(policy.get("route_context_requirement_overrides"))
+
+    not_applicable: list[str] = []
+    not_applicable_details: list[dict[str, str]] = []
+    for item in _list(route_overrides.get("not_applicable_by_contract")):
+        detail = _mapping(item)
+        req_id = str(detail.get("id") or item or "").strip()
+        if req_id:
+            not_applicable.append(req_id)
+            if detail:
+                not_applicable_details.append({
+                    "id": req_id,
+                    "reason": str(detail.get("reason") or "").strip(),
+                })
+
+    replaced_by_gate: dict[str, str] = {}
+    for key, value in _mapping(route_overrides.get("replaced_by_gate")).items():
+        req_id = str(key or "").strip()
+        gate = str(value or "").strip()
+        if req_id and gate:
+            replaced_by_gate[req_id] = gate
+
+    if (
+        template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+        and hotfix_events["active"]
+        and not not_applicable
+    ):
+        not_applicable = list(MF_ROUTE_WORKER_REQUIREMENTS)
+        not_applicable_details = [
+            {
+                "id": req_id,
+                "reason": "observer_hotfix_direct_mutation_contract_replaces_bounded_worker_lane",
+            }
+            for req_id in not_applicable
+        ]
+    if (
+        template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+        and hotfix_events["active"]
+        and MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID not in replaced_by_gate
+    ):
+        replaced_by_gate[MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID] = (
+            "independent_qa_gate"
+        )
+
+    qa_policy = _mapping(policy.get("qa_policy"))
+    qa_required = _policy_bool(
+        qa_policy.get("required"),
+        template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID,
+    )
+    applied = bool(
+        template_id
+        and (policy or template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID)
+        and (not_applicable or replaced_by_gate)
+    )
+    return {
+        "schema_version": MF_CONTRACT_CLOSE_GATE_POLICY_SCHEMA_VERSION,
+        "applied": applied,
+        "template_id": template_id,
+        "explicit_template_id": explicit_template_id,
+        "inferred_template_id": inferred_template_id,
+        "policy_status": "active" if applied else "not_applicable",
+        "hotfix_contract_active": bool(hotfix_events["active"]),
+        "hotfix_contract_completed": bool(hotfix_events["completed"]),
+        "hotfix_events": hotfix_events,
+        "selected_topology": str(topology_policy.get("selected_topology") or ""),
+        "recommended_topology": str(topology_policy.get("recommended_topology") or ""),
+        "not_applicable_requirement_ids": _dedupe_nonempty(not_applicable),
+        "not_applicable_by_contract": not_applicable_details,
+        "replaced_requirement_ids": _dedupe_nonempty(list(replaced_by_gate.keys())),
+        "replaced_by_gate": replaced_by_gate,
+        "qa_required": qa_required,
+        "qa_satisfied_by": _string_list(qa_policy.get("satisfied_by")),
+        "reason": str(policy.get("reason") or "").strip(),
+    }
 
 
 def _route_architecture_review_required(
@@ -4890,6 +5066,21 @@ def mf_route_context_gate_verification(
         topology_policy,
         contract,
     )
+    contract_close_policy = _contract_close_gate_policy_projection(
+        rows,
+        contract,
+        topology_policy,
+    )
+    not_applicable_by_contract = {
+        str(item)
+        for item in _list(contract_close_policy.get("not_applicable_requirement_ids"))
+        if str(item)
+    }
+    replaced_by_contract_gate = {
+        str(item)
+        for item in _list(contract_close_policy.get("replaced_requirement_ids"))
+        if str(item)
+    }
     required = (
         route_context_required
         or independent_verification_required
@@ -4900,6 +5091,12 @@ def mf_route_context_gate_verification(
         required_requirement_ids.append(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
     if architecture_review_required:
         required_requirement_ids.append(MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID)
+    required_requirement_ids = [
+        req_id
+        for req_id in required_requirement_ids
+        if req_id not in not_applicable_by_contract
+        and req_id not in replaced_by_contract_gate
+    ]
     present: dict[str, list[dict[str, Any]]] = {
         req_id: [] for req_id in required_requirement_ids
     }
@@ -5266,6 +5463,9 @@ def mf_route_context_gate_verification(
         "present_requirement_ids": [req_id for req_id in required_requirement_ids if present[req_id]],
         "missing_requirement_ids": missing,
         "topology_policy": topology_policy,
+        "contract_close_gate_policy": contract_close_policy,
+        "not_applicable_requirement_ids": sorted(not_applicable_by_contract),
+        "replaced_requirement_ids": sorted(replaced_by_contract_gate),
         "route_identity": route_identity,
         "same_route_identity": same_route_identity,
         "next_legal_action": (
@@ -5295,21 +5495,32 @@ def mf_route_context_gate_verification(
                 (*MF_ROUTE_LINEAGE_IDENTITY_FIELDS, *MF_ROUTE_OPTIONAL_IDENTITY_FIELDS)
             ),
             "required_evidence_ids": list(MF_ROUTE_CONTEXT_REQUIRED_EVIDENCE_IDS),
+            "effective_required_evidence_ids": list(required_requirement_ids),
         },
         "evidence_events": {
             req_id: present[req_id] for req_id in required_requirement_ids
         },
         "ignored_route_events": ignored,
         "checks": {
-            "route_context_present": bool(present["route_context"]),
-            "route_action_precheck_present": bool(present["route_action_precheck"]),
+            "route_context_present": bool(present.get("route_context")),
+            "route_action_precheck_present": bool(present.get("route_action_precheck")),
             "bounded_implementation_worker_dispatch_present": bool(
-                present["bounded_implementation_worker_dispatch"]
+                present.get("bounded_implementation_worker_dispatch")
             ),
-            "mf_subagent_startup_present": bool(present["mf_subagent_startup"]),
+            "mf_subagent_startup_present": bool(present.get("mf_subagent_startup")),
+            "bounded_worker_not_applicable_by_contract": bool(
+                {
+                    "bounded_implementation_worker_dispatch",
+                    "mf_subagent_startup",
+                }.issubset(not_applicable_by_contract)
+            ),
             "independent_verification_required": independent_verification_required,
             "independent_verification_lane_present": bool(
                 present.get(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
+            ),
+            "independent_verification_replaced_by_contract_gate": (
+                MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID
+                in replaced_by_contract_gate
             ),
             "architecture_review_required": architecture_review_required,
             "architecture_review_lane_present": bool(
@@ -5400,6 +5611,16 @@ def mf_close_missing_evidence_groups(
             "missing": other_route,
             "next_action": "inspect route_context_gate.missing_requirement_ids",
         }
+    contract_policy = _mapping(route_gate.get("contract_close_gate_policy"))
+    not_applicable = _list(route_gate.get("not_applicable_requirement_ids"))
+    replaced = _list(route_gate.get("replaced_requirement_ids"))
+    if not_applicable or replaced:
+        groups["contract_policy"] = {
+            "label": "contract close policy",
+            "not_applicable_by_contract": not_applicable,
+            "replaced_by_gate": _mapping(contract_policy.get("replaced_by_gate")),
+            "next_action": "continue through the remaining route service, QA, and timeline evidence gates",
+        }
     return {
         "schema_version": MF_CLOSE_MISSING_GROUPS_SCHEMA_VERSION,
         "groups": groups,
@@ -5415,55 +5636,81 @@ def mf_route_context_reminder(
     route_gate = _mapping(route_context_gate)
     groups = _mapping(missing_evidence_groups).get("groups")
     topology_policy = _mapping(route_gate.get("topology_policy"))
+    contract_policy = _mapping(route_gate.get("contract_close_gate_policy"))
+    not_applicable = {
+        str(item)
+        for item in _list(route_gate.get("not_applicable_requirement_ids"))
+        if str(item)
+    }
+    bounded_worker_not_applicable = {
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+    }.issubset(not_applicable)
     required = bool(route_gate.get("required"))
     passed = bool(route_gate.get("passed"))
+    next_actions = [
+        {
+            "id": "request_route_prompt_alert_bundle",
+            "command": "route.prompt_alert_bundle",
+            "detail": "request the service-generated route context bundle",
+        },
+        {
+            "id": "run_route_action_precheck",
+            "command": "route.action_precheck",
+            "detail": "run the local action gate with an allowed stage before mutation",
+        },
+        {
+            "id": "dispatch_bounded_worker",
+            "command": "dispatch bounded implementation worker",
+            "detail": "observer or judge coordination does not count as implementation worker evidence",
+        },
+        {
+            "id": "start_worker",
+            "command": "start worker",
+            "detail": "record mf_subagent startup with matching route identity",
+        },
+        {
+            "id": "run_independent_verification",
+            "command": "run independent verification",
+            "detail": "record QA verification separate from observer and implementation worker",
+        },
+        {
+            "id": "run_architecture_review",
+            "command": "run architecture review",
+            "detail": "record architecture/data-continuity review only when the route or contract requires architecture_review_lane",
+        },
+        {
+            "id": "retry_close",
+            "command": "retry close",
+            "detail": "retry only after implementation, verification, and close_ready evidence are present",
+        },
+    ]
+    if bounded_worker_not_applicable:
+        next_actions = [
+            action
+            for action in next_actions
+            if action["id"] not in {"dispatch_bounded_worker", "start_worker"}
+        ]
+        next_actions.insert(
+            2,
+            {
+                "id": "honor_contract_close_policy",
+                "command": "honor contract close policy",
+                "detail": "bounded worker dispatch/startup is not applicable for this direct hotfix contract; QA remains required",
+            },
+        )
     return {
         "schema_version": MF_ROUTE_CONTEXT_REMINDER_SCHEMA_VERSION,
         "required": required,
         "blocked": required and not passed,
         "status": str(route_gate.get("status") or ("passed" if passed else "blocked")),
         "contract_template_id": MF_ROUTE_GUIDANCE_TEMPLATE_ID,
+        "contract_close_gate_policy": contract_policy,
         "allowed_stages": list(MF_ROUTE_GUIDANCE_ALLOWED_STAGES),
         "selected_topology": str(topology_policy.get("selected_topology") or ""),
         "recommended_topology": str(topology_policy.get("recommended_topology") or ""),
         "priority": str(topology_policy.get("priority") or ""),
-        "next_actions": [
-            {
-                "id": "request_route_prompt_alert_bundle",
-                "command": "route.prompt_alert_bundle",
-                "detail": "request the service-generated route context bundle",
-            },
-            {
-                "id": "run_route_action_precheck",
-                "command": "route.action_precheck",
-                "detail": "run the local action gate with an allowed stage before mutation",
-            },
-            {
-                "id": "dispatch_bounded_worker",
-                "command": "dispatch bounded implementation worker",
-                "detail": "observer or judge coordination does not count as implementation worker evidence",
-            },
-            {
-                "id": "start_worker",
-                "command": "start worker",
-                "detail": "record mf_subagent startup with matching route identity",
-            },
-            {
-                "id": "run_independent_verification",
-                "command": "run independent verification",
-                "detail": "record QA verification separate from observer and implementation worker",
-            },
-            {
-                "id": "run_architecture_review",
-                "command": "run architecture review",
-                "detail": "record architecture/data-continuity review only when the route or contract requires architecture_review_lane",
-            },
-            {
-                "id": "retry_close",
-                "command": "retry close",
-                "detail": "retry only after implementation, verification, and close_ready evidence are present",
-            },
-        ],
+        "next_actions": next_actions,
         "missing_evidence_groups": groups if isinstance(groups, dict) else {},
         "identity_recovery": {
             "stale_or_mismatched_route_evidence": "supersede or start a fresh service-generated route attempt",

@@ -85,7 +85,45 @@
       "verification",
       "close_ready"
     ],
-    "close_gate_policy": "This contract does not replace the existing MF close gate. If backlog close requires R18 evidence, append implementation, verification, and close_ready timeline events with the normal route-token or waiver evidence."
+    "close_gate_policy": {
+      "schema_version": "contract_close_gate_policy.v1",
+      "reason": "A direct observer hotfix replaces the bounded implementation worker lane only for tiny deterministic repair of blocked governance flow. It does not replace route service, QA, implementation, verification, close_ready, close-commit, or blocker-resolution gates.",
+      "route_context_requirement_overrides": {
+        "not_applicable_by_contract": [
+          {
+            "id": "bounded_implementation_worker_dispatch",
+            "reason": "The selected hotfix contract is the audited direct-observer mutation exception; dispatching a bounded implementation worker would be false evidence for the already-completed direct patch."
+          },
+          {
+            "id": "mf_subagent_startup",
+            "reason": "The selected hotfix contract is the audited direct-observer mutation exception; worker startup is not applicable and must not be fabricated."
+          }
+        ],
+        "replaced_by_gate": {
+          "independent_verification_lane": "independent_qa_gate"
+        },
+        "still_required": [
+          "route_context",
+          "route_action_precheck"
+        ]
+      },
+      "qa_policy": {
+        "required": true,
+        "satisfied_by": [
+          "qa_evidence_gate_review.v1",
+          "qa_review",
+          "qa_verification",
+          "independent_verification"
+        ],
+        "description": "A completed direct hotfix still needs an independent QA successor contract or equivalent independent QA evidence before close."
+      },
+      "close_timeline_evidence_still_required": [
+        "implementation",
+        "verification",
+        "close_ready"
+      ],
+      "legacy_gate_must_not_weaken": true
+    }
   },
   "successor_contract_policy": {
     "schema_version": "successor_contract_policy.v1",
