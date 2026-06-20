@@ -5542,7 +5542,10 @@ def mf_route_context_gate_verification(
             )
         ):
             if _route_independent_verification_row_scoped(event):
-                present[MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID].append(event_ref)
+                present.setdefault(
+                    MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID,
+                    [],
+                ).append(event_ref)
                 ignored.append({
                     **event_ref,
                     "reason": "independent_verification_row_scoped_route_identity_not_adopted",

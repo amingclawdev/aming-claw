@@ -8345,6 +8345,95 @@ class TestTaskTimeline(unittest.TestCase):
             ]
         )
 
+    def test_contract_state_projection_accepts_hotfix_row_scoped_qa_replaced_lane(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-HOTFIX-ROW-SCOPED-QA-PROJECTION"
+        contract = {
+            "template_id": "observer_hotfix_direct_mutation.v1",
+            "contract_instance_id": bug_id,
+            "route_topology_policy": {
+                "selected_topology": "observer_hotfix_direct_mutation",
+                "independent_verification_required": True,
+            },
+        }
+        child_identity = {
+            "route_id": "route-hotfix-row-scoped-child",
+            "route_context_hash": "sha256:hotfix-row-scoped-child-route",
+            "prompt_contract_id": "rprompt-hotfix-row-scoped-child",
+            "prompt_contract_hash": "sha256:hotfix-row-scoped-child-contract",
+        }
+        parent_identity = {
+            "route_id": "route-hotfix-row-scoped-parent",
+            "route_context_hash": "sha256:hotfix-row-scoped-parent-route",
+            "prompt_contract_id": "rprompt-hotfix-row-scoped-parent",
+            "prompt_contract_hash": "sha256:hotfix-row-scoped-parent-contract",
+        }
+        qa_event = _route_context_qa_verification_event(child_identity)
+        qa_event.update({
+            "id": 5722,
+            "actor": "qa-subagent-Kuhn",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-qa-hotfix-row-scoped",
+        })
+        qa_event["payload"] = {
+            "meta_contract_gate": {
+                "action": "qa_verification",
+                "role": "qa",
+                "status": "passed",
+                "allowed": True,
+            },
+        }
+        _attach_server_action_scope_route_token_lineage(
+            qa_event,
+            child_identity,
+            parent_identity=parent_identity,
+            route_token_ref="rtok-hotfix-row-scoped-qa",
+            acceptance_source="server_route_token_action_scope",
+        )
+
+        events = [
+            {
+                "id": 5720,
+                "event_kind": "hotfix_entered",
+                "phase": "pre_mutation_reason",
+                "status": "accepted",
+                "backlog_id": bug_id,
+                "project_id": "aming-claw",
+                "task_id": "cex-hotfix-row-scoped",
+            },
+            *_route_context_consumption_events(),
+            qa_event,
+        ]
+
+        projection = task_timeline.contract_state_projection(
+            events,
+            contract=contract,
+            backlog_row={"project_id": "aming-claw", "bug_id": bug_id},
+        )
+        self.assertEqual(
+            projection["contract_projection"]["schema_version"],
+            task_timeline.MF_CONTRACT_PROJECTION_SCHEMA_VERSION,
+        )
+
+        route_gate = task_timeline.mf_route_context_gate_verification(events, contract)
+        self.assertTrue(
+            route_gate["checks"]["independent_verification_replaced_by_contract_gate"]
+        )
+        self.assertEqual(route_gate["missing_requirement_ids"], [])
+        self.assertNotIn(
+            "independent_verification_lane",
+            route_gate["evidence_events"],
+        )
+        self.assertIn(
+            "independent_verification_row_scoped_route_identity_not_adopted",
+            {
+                str(item.get("reason") or "")
+                for item in route_gate["ignored_route_events"]
+            },
+        )
+
     def test_observer_hotfix_route_token_evidence_does_not_require_worker_lineage(self):
         from agent.governance import task_timeline
 
