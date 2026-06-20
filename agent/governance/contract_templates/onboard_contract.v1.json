@@ -138,6 +138,52 @@
       "visible_injection_manifest_hash"
     ]
   },
+  "successor_contract_policy": {
+    "schema_version": "successor_contract_policy.v1",
+    "selection_required_after_onboard_complete": true,
+    "selection_event_kind": "contract_binding",
+    "selection_action": "select_successor_contract",
+    "same_row_binding_required": true,
+    "separate_backlog_row_allowed_when_successor_has_own_lifecycle": true,
+    "required_identity_fields": [
+      "contract_chain_id",
+      "parent_contract_execution_id",
+      "successor_contract_execution_id",
+      "handoff_event_id",
+      "handoff_reason"
+    ],
+    "optional_identity_fields": [
+      "successor_backlog_id",
+      "handoff_preconditions",
+      "route_token_ref"
+    ],
+    "candidates": [
+      {
+        "id": "observer_hotfix_direct_mutation.v1",
+        "contract_template_id": "observer_hotfix_direct_mutation.v1",
+        "successor_kind": "observer_hotfix",
+        "description": "Tiny deterministic observer hotfix when the governed normal route is blocked. Non-close-satisfying; must hand off to review or close successor afterward."
+      },
+      {
+        "id": "mf_parallel.v1",
+        "contract_template_id": "mf_parallel.v1",
+        "successor_kind": "parallel_worker",
+        "description": "Ordinary bounded worker/parallel implementation successor for nontrivial work."
+      },
+      {
+        "id": "review_contract.v1",
+        "contract_template_id": "review_contract.v1",
+        "successor_kind": "review",
+        "description": "Top-level or nested non-close-satisfying review lane."
+      },
+      {
+        "id": "audit_close_with_qa_acceptance.v1",
+        "contract_template_id": "audit_close_with_qa_acceptance.v1",
+        "successor_kind": "audit_close",
+        "description": "Exceptional audit-close successor only when normal close has failed and evidence cannot be reconstructed."
+      }
+    ]
+  },
   "write_authority_policy": {
     "schema_version": "contract_state_write_authority.v1",
     "projection_module_may_write": false,
@@ -152,7 +198,7 @@
     "must_record_ephemeral_fixture_root_warning": true,
     "must_classify_unmapped_assets_and_planned_new_files": true,
     "must_classify_dirty_generated_metadata": true,
-    "worker_contract_must_be_mf_parallel_after_onboard": true,
+    "successor_contract_must_be_selected_after_onboard": true,
     "worker_prompt_must_not_include_aming_claw_repo_implementation_context": true
   },
   "dogfood_policy": {

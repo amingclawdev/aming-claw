@@ -102,6 +102,27 @@ def test_projection_computes_completed_missing_and_next_action():
     assert projection["next_legal_action"]["id"] == "route_action_precheck"
     assert projection["next_legal_action"]["source"] == "contract_state"
     assert projection["next_legal_action"]["precedence"] == "active_contract_missing_step"
+    assert projection["next_legal_action"]["contract_execution_id"] == projection[
+        "active_contract_execution"
+    ]["contract_execution_id"]
+    assert projection["next_legal_action"]["contract_chain_id"] == projection[
+        "contract_chain_id"
+    ]
+
+
+def test_projection_keeps_no_contract_rows_without_chain_requirement():
+    projection = build_contract_state_projection(
+        [],
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["legacy_no_contract"] is True
+    assert projection["contract_chain_id"] == ""
+    assert projection["contract_chain"] == []
+    assert projection["successor_contract_candidates"] == []
+    assert projection["selected_successor_contract"] == {}
+    assert projection["next_legal_action"] is None
 
 
 def test_projection_exposes_active_contract_execution_handle():
@@ -129,6 +150,11 @@ def test_projection_exposes_active_contract_execution_handle():
     assert active["contract_template_id"] == "onboard_contract.v1"
     assert active["contract_revision_id"] == "rev-3"
     assert active["contract_execution_id"].startswith("cex-")
+    assert active["contract_chain_id"].startswith("cchain-")
+    assert projection["root_contract_execution"]["contract_execution_id"] == active[
+        "contract_execution_id"
+    ]
+    assert projection["contract_chain"][0]["role"] == "root"
 
 
 def test_projection_falls_back_to_event_project_id_for_active_execution():
@@ -177,3 +203,212 @@ def test_non_onboard_contract_uses_same_projection_path():
     ]
     assert projection["missing_evidence"] == ["verification"]
     assert projection["next_legal_action"]["id"] == "verification"
+
+
+def test_onboard_complete_exposes_successor_candidates_as_next_action():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_revision_id": "rev-successor",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+            "successor_contract_policy": {
+                "selection_action": "select_successor_contract",
+                "candidates": [
+                    {"contract_template_id": "observer_hotfix_direct_mutation.v1"},
+                    {"contract_template_id": "mf_parallel.v1"},
+                ]
+            },
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [_event(60, "route_context")],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["contract_complete"] is True
+    assert [item["contract_template_id"] for item in projection["successor_contract_candidates"]] == [
+        "observer_hotfix_direct_mutation.v1",
+        "mf_parallel.v1",
+    ]
+    assert projection["successor_next_legal_action"]["id"] == "select_successor_contract"
+    assert projection["next_legal_action"]["id"] == "select_successor_contract"
+    assert projection["next_legal_action"]["contract_chain_id"] == projection[
+        "contract_chain_id"
+    ]
+    assert projection["next_legal_action"]["successor_contract_policy"][
+        "selection_action"
+    ] == "select_successor_contract"
+
+
+def test_successor_binding_selects_latest_successor_with_distinct_execution_ids():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_chain_id": "cchain-onboard-successor",
+            "contract_execution_id": "cex-onboard-root",
+            "contract_revision_id": "rev-successor-binding",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+            "successor_contract_policy": {
+                "candidates": [{"contract_template_id": "review_contract.v1"}]
+            },
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(70, "route_context"),
+            _event(
+                71,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-onboard-successor",
+                        "parent_contract_execution_id": "cex-onboard-root",
+                        "contract_template_id": "review_contract.v1",
+                        "handoff_reason": "first review",
+                    }
+                },
+            ),
+            _event(
+                72,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-onboard-successor",
+                        "parent_contract_execution_id": "cex-onboard-root",
+                        "contract_template_id": "review_contract.v1",
+                        "handoff_reason": "second review",
+                    }
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    successors = [
+        item for item in projection["contract_chain"] if item["role"] == "successor"
+    ]
+    assert len(successors) == 2
+    assert successors[0]["successor_contract_execution_id"] != successors[1][
+        "successor_contract_execution_id"
+    ]
+    assert projection["selected_successor_contract"]["handoff_reason"] == "second review"
+    assert projection["successor_next_legal_action"]["contract_execution_id"] == (
+        projection["selected_successor_contract"]["successor_contract_execution_id"]
+    )
+
+
+def test_successor_binding_requires_chain_and_parent_match():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_chain_id": "cchain-onboard-successor",
+            "contract_execution_id": "cex-onboard-root",
+            "contract_revision_id": "rev-successor-binding",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+            "successor_contract_policy": {
+                "candidates": [{"contract_template_id": "review_contract.v1"}]
+            },
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(75, "route_context"),
+            _event(
+                76,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_template_id": "review_contract.v1",
+                        "handoff_reason": "missing parent and chain",
+                    }
+                },
+            ),
+            _event(
+                77,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-other",
+                        "parent_contract_execution_id": "cex-onboard-root",
+                        "contract_template_id": "review_contract.v1",
+                        "handoff_reason": "wrong chain",
+                    }
+                },
+            ),
+            _event(
+                78,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-onboard-successor",
+                        "parent_contract_execution_id": "cex-other-root",
+                        "contract_template_id": "review_contract.v1",
+                        "handoff_reason": "wrong parent",
+                    }
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["selected_successor_contract"] == {}
+    assert projection["successor_next_legal_action"]["id"] == "select_successor_contract"
+
+
+def test_requirement_evidence_is_scoped_by_contract_execution_id():
+    contract = {
+        "contract": {
+            "contract_id": "review_contract.v1",
+            "contract_template_id": "review_contract.v1",
+            "contract_execution_id": "cex-review-expected",
+            "contract_revision_id": "rev-review",
+            "state": "selected",
+            "required_evidence": [
+                {
+                    "id": "review_done",
+                    "accepted_event_kinds": ["review_lane"],
+                    "contract_execution_id": "cex-review-expected",
+                }
+            ],
+        }
+    }
+
+    wrong = build_contract_state_projection(
+        [
+            _event(
+                80,
+                "review_lane",
+                payload={"contract_execution_id": "cex-review-other"},
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    right = build_contract_state_projection(
+        [
+            _event(
+                81,
+                "review_lane",
+                payload={"contract_execution_id": "cex-review-expected"},
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert wrong["completed_evidence"] == []
+    assert wrong["missing_evidence"] == ["review_done"]
+    assert [item["id"] for item in right["completed_evidence"]] == ["review_done"]
+    assert right["missing_evidence"] == []
