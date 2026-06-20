@@ -152,6 +152,111 @@ def _route_context_consumption_events(identity=None):
     ]
 
 
+def test_contract_state_projection_wrapper_exposes_qa_hotfix_qa_lane_runtime():
+    from agent.governance import task_timeline
+
+    contract = {
+        "contract": {
+            "contract_id": "qa_evidence_gate_review.v1",
+            "contract_template_id": "qa_evidence_gate_review.v1",
+            "contract_chain_id": "cchain-task-timeline-qa-hotfix-qa",
+            "contract_execution_id": "cex-qa-root",
+            "contract_revision_id": "rev-qa-root",
+            "state": "selected",
+            "evidence_requirements": [
+                {"id": "qa_review", "event_kind": "qa_review"},
+            ],
+            "successor_contract_policy": {
+                "candidates": [
+                    {"contract_template_id": "observer_hotfix_direct_mutation.v1"}
+                ]
+            },
+        }
+    }
+    events = [
+        {
+            "id": 10,
+            "event_kind": "qa_review",
+            "phase": "verification",
+            "status": "passed",
+            "payload": {"contract_execution_id": "cex-qa-root"},
+        },
+        {
+            "id": 11,
+            "event_kind": "contract_binding",
+            "phase": "contract_binding",
+            "status": "passed",
+            "payload": {
+                "successor_contract": {
+                    "contract_chain_id": "cchain-task-timeline-qa-hotfix-qa",
+                    "parent_contract_execution_id": "cex-qa-root",
+                    "successor_contract_execution_id": "cex-hotfix",
+                    "contract_template_id": "observer_hotfix_direct_mutation.v1",
+                }
+            },
+        },
+        {
+            "id": 12,
+            "event_kind": "hotfix_entered",
+            "phase": "pre_mutation_reason",
+            "status": "passed",
+            "payload": {"successor_contract_execution_id": "cex-hotfix"},
+        },
+        {
+            "id": 13,
+            "event_kind": "hotfix_under_action",
+            "phase": "post_implementation_summary",
+            "status": "passed",
+            "payload": {"successor_contract_execution_id": "cex-hotfix"},
+        },
+        {
+            "id": 14,
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "payload": {"successor_contract_execution_id": "cex-hotfix"},
+        },
+        {
+            "id": 15,
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "passed",
+            "payload": {"successor_contract_execution_id": "cex-hotfix"},
+        },
+        {
+            "id": 16,
+            "event_kind": "contract_binding",
+            "phase": "contract_binding",
+            "status": "passed",
+            "payload": {
+                "successor_contract": {
+                    "contract_chain_id": "cchain-task-timeline-qa-hotfix-qa",
+                    "parent_contract_execution_id": "cex-hotfix",
+                    "successor_contract_execution_id": "cex-qa-followup",
+                    "contract_template_id": "qa_evidence_gate_review.v1",
+                }
+            },
+        },
+    ]
+
+    projection = task_timeline.contract_state_projection(
+        events,
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-TASK-TIMELINE"},
+    )
+
+    assert projection["active_lane_contract"]["contract_execution_id"] == (
+        "cex-qa-followup"
+    )
+    assert projection["active_lane_contract"]["contract_template_id"] == (
+        "qa_evidence_gate_review.v1"
+    )
+    assert projection["next_legal_action"]["id"] == "qa_review"
+    assert projection["next_legal_action"]["contract_execution_id"] == (
+        "cex-qa-followup"
+    )
+
+
 def _route_context_qa_verification_event(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     return {

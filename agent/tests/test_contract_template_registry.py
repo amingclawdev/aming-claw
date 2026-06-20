@@ -217,6 +217,19 @@ def test_observer_hotfix_direct_mutation_template_resolves_for_pre_mutation_stag
     ]
 
 
+def test_qa_evidence_gate_template_declares_evidence_and_successors():
+    template = get_contract_template("qa_evidence_gate_review.v1")
+    evidence_ids = {item["id"] for item in template["evidence_requirements"]}
+    successor_ids = {
+        item["contract_template_id"]
+        for item in template["successor_contract_policy"]["candidates"]
+    }
+
+    assert "qa_review" in evidence_ids
+    assert "observer_hotfix_direct_mutation.v1" in successor_ids
+    assert "audit_close_with_qa_acceptance.v1" in successor_ids
+
+
 def test_audit_close_with_qa_acceptance_template_declares_no_backfill_policy():
     template = get_contract_template("audit_close_with_qa_acceptance.v1")
     evidence_ids = {item["id"] for item in template["evidence_requirements"]}
