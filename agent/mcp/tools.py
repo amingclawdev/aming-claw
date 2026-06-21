@@ -197,6 +197,9 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "route_token_ref": {"type": "string"},
             "route_token": {"type": "object"},
             "route_waiver": {"type": "object"},
+            "reason": {"type": "string"},
+            "rejoin_reason": {"type": "string"},
+            "ttl_seconds": {"type": "integer"},
         }
     )
     return properties
@@ -1179,6 +1182,15 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
             "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_session_token_rejoin",
+        "description": "Observer recovery facade that issues an audited worker host envelope when a resumed mf_sub session lost raw worker auth material. Does not authorize ref-only worker writes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": ["project_id", "runtime_context_id", "task_id", "reason"],
         },
     },
     {
@@ -2175,6 +2187,7 @@ class ToolDispatcher:
             "runtime_context_implementation_evidence",
             "runtime_context_finish_time_worker_attestation",
             "runtime_context_finish_gate",
+            "runtime_context_session_token_rejoin",
         }:
             pid = args["project_id"]
             runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
@@ -2184,6 +2197,7 @@ class ToolDispatcher:
                     "finish-time-worker-attestation"
                 ),
                 "runtime_context_finish_gate": "finish-gate",
+                "runtime_context_session_token_rejoin": "session-token/rejoin",
             }
             return self._api(
                 "POST",

@@ -14778,6 +14778,184 @@ def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
     assert wrong_token.value.code == "fence_invalidated_or_unknown"
 
 
+def test_runtime_context_worker_guide_missing_auth_points_to_rejoin(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-auth-missing"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-auth-missing",
+            root_task_id="parent-auth-missing",
+            backlog_id="AC-RUNTIME-AUTH-MISSING",
+            stage_task_id="worker-auth-missing",
+            worker_id="worker-auth-missing",
+            worker_slot_id="slot-auth-missing",
+            branch_ref="refs/heads/codex/worker-auth-missing",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-auth-missing",
+            session_token_hash=mf_subagent_session_token_hash("auth-missing-token"),
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as blocked:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                query={
+                    "parent_task_id": "parent-auth-missing",
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+
+    assert blocked.value.code == "fence_invalidated_or_unknown"
+    details = blocked.value.details
+    assert details["diagnostics"]["reason"] == "worker_auth_material_missing"
+    assert details["next_legal_action"] == "request_runtime_context_rejoin_host_envelope"
+    submission = details["actionable_payloads"]["session_token_rejoin_submission"]
+    assert submission["action"] == "request_runtime_context_rejoin_host_envelope"
+    assert submission["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
+
+
+def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_only_write(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-rejoin"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-rejoin",
+            root_task_id="parent-runtime-rejoin",
+            backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+            stage_task_id="worker-runtime-rejoin",
+            worker_id="worker-runtime-rejoin",
+            worker_slot_id="slot-runtime-rejoin",
+            branch_ref="refs/heads/codex/worker-runtime-rejoin",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-rejoin",
+            session_token_hash=mf_subagent_session_token_hash("lost-runtime-token"),
+        ),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="worker-runtime-rejoin",
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="read_receipt",
+        status="accepted",
+        actor="slot-runtime-rejoin",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": "worker-runtime-rejoin",
+            "parent_task_id": "parent-runtime-rejoin",
+            "worker_slot_id": "slot-runtime-rejoin",
+            "read_receipt_hash": "sha256:runtime-rejoin-read",
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="worker-runtime-rejoin",
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup",
+        status="accepted",
+        actor="slot-runtime-rejoin",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": "worker-runtime-rejoin",
+            "parent_task_id": "parent-runtime-rejoin",
+            "worker_role": "mf_sub",
+            "worker_session_id": "slot-runtime-rejoin",
+            "filer_principal": "slot-runtime-rejoin",
+            "session_token_evidence_type": "server_verified",
+        },
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": "worker-runtime-rejoin",
+                "parent_task_id": "parent-runtime-rejoin",
+                "target_project_root": str(target_root),
+                "reason": "host worker session lost raw auth env after resume",
+                "ttl_seconds": 1200,
+                "now_iso": "2026-06-21T18:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_rejoin_issued"
+    assert result["session_token"]
+    assert result["fence_token"] == "fence-runtime-rejoin"
+    assert result["raw_tokens_persisted_to_timeline"] is False
+    saved = get_branch_context(conn, PID, "worker-runtime-rejoin")
+    assert saved is not None
+    assert saved.session_token_hash == mf_subagent_session_token_hash(
+        result["session_token"]
+    )
+    assert runtime_context_session_token_ref(saved) == result["session_token_ref"]
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        event_kind="observer_command",
+    )
+    rejoin_events = [
+        event
+        for event in events
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_rejoin"
+    ]
+    assert len(rejoin_events) == 1
+    serialized_event = json.dumps(rejoin_events[0], sort_keys=True)
+    assert result["session_token"] not in serialized_event
+    assert "fence-runtime-rejoin" not in serialized_event
+
+    with pytest.raises(GovernanceError) as ref_only_write:
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-rejoin",
+                    "parent_task_id": "parent-runtime-rejoin",
+                    "session_token_ref": result["session_token_ref"],
+                    "target_project_root": str(target_root),
+                    "test_results": {"status": "passed", "commands": ["true"]},
+                },
+            )
+        )
+    assert ref_only_write.value.code == "fence_invalidated_or_unknown"
+    assert ref_only_write.value.details["diagnostics"]["reason"] == (
+        "worker_auth_material_missing"
+    )
+
+
 def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_context(
     conn,
     tmp_path,

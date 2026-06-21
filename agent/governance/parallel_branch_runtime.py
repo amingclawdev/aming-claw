@@ -7310,6 +7310,113 @@ def reissue_mf_subagent_runtime_session_token(
     }
 
 
+def rejoin_mf_subagent_runtime_session_token(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str = "",
+    target_project_root: str = "",
+    ttl_seconds: Any = None,
+    reason: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Issue a new host envelope for an existing worker context.
+
+    This is narrower than changing write gates to accept refs. It is an
+    observer-audited recovery path for host/session resets where the raw worker
+    auth environment was lost; the raw replacement values are returned only to
+    the caller and are not persisted in audit payloads.
+    """
+
+    ensure_branch_runtime_schema(conn)
+    runtime_id = str(runtime_context_id or "").strip()
+    task = str(task_id or "").strip()
+    if not runtime_id or not task or not str(reason or "").strip():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
+    if context is None or not context.fence_token:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.task_id != task:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    requested_target_root = _startup_path_text(target_project_root)
+    context_target_root = _startup_path_text(
+        runtime_context_effective_target_project_root(context)
+    )
+    if requested_target_root and context_target_root and requested_target_root != context_target_root:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    parent = str(parent_task_id or "").strip()
+    if parent:
+        allowed_parent_ids = {
+            value
+            for value in (
+                context.root_task_id,
+                context.chain_id,
+                context.stage_task_id,
+                context.task_id,
+                context.backlog_id,
+            )
+            if value
+        }
+        if allowed_parent_ids and parent not in allowed_parent_ids:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    ttl = _bounded_reissue_ttl_seconds(ttl_seconds)
+    now_dt = _runtime_context_now_dt(now_iso)
+    expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
+    new_token = secrets.token_urlsafe(32)
+    new_hash = mf_subagent_session_token_hash(new_token)
+    lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
+    saved = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            lease_id=lease_id,
+            lease_expires_at=expires_at,
+            session_token_hash=new_hash,
+            last_recovery_action="mf_subagent_session_token_rejoin_issued",
+        ),
+        now_iso=_runtime_context_iso(now_dt),
+    )
+    lease = runtime_context_session_token_lease_view(
+        saved,
+        now_iso=_runtime_context_iso(now_dt),
+    )
+    fence_hash = runtime_context_secret_hash(saved.fence_token)
+    return {
+        "ok": True,
+        "schema_version": "mf_subagent_session_token_rejoin_response.v1",
+        "status": "session_token_rejoin_issued",
+        "project_id": saved.project_id,
+        "runtime_context_id": runtime_id,
+        "task_id": saved.task_id,
+        "parent_task_id": _parent_task_id_for_context(saved),
+        "backlog_id": saved.backlog_id,
+        "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "worker_id": saved.worker_id,
+        "worker_slot_id": saved.worker_slot_id or saved.worker_id,
+        "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
+        "session_token": new_token,
+        "session_token_hash": new_hash,
+        "session_token_ref": runtime_context_session_token_ref(saved),
+        "session_token_persisted": False,
+        "raw_session_token_persisted": False,
+        "fence_token": saved.fence_token,
+        "fence_token_hash": fence_hash,
+        "raw_fence_token_returned_for_host_envelope": True,
+        "raw_fence_token_persisted_to_timeline": False,
+        "delivery": "worker_host_envelope",
+        "ttl_seconds": ttl,
+        "expires_at": expires_at,
+        "session_token_lease": lease,
+    }
+
+
 def _contract_revision_from_row(row: sqlite3.Row) -> BranchRuntimeContractRevision:
     return BranchRuntimeContractRevision(
         project_id=row["project_id"],
