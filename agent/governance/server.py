@@ -27599,6 +27599,265 @@ def _observer_root_route_next_legal_action_from_steps(
     }
 
 
+def _observer_root_route_normalize_action(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _observer_root_route_close_evidence_refs(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    close_evidence_kinds = {
+        "route_context",
+        "route_action_precheck",
+        "bounded_implementation_worker_dispatch",
+        "dispatch_bounded_worker",
+        "mf_subagent_dispatch",
+        "mf_subagent_startup",
+        "implementation",
+        "verification",
+        "qa_review",
+        "independent_verification",
+        "independent_verification_lane",
+        "independent_qa",
+        "independent_qa_lane",
+        "qa_verification",
+        "close_ready",
+    }
+
+    def _evidence_markers(value: Any) -> list[str]:
+        markers: list[str] = []
+
+        def _add(candidate: Any) -> None:
+            text = _observer_root_route_normalize_action(candidate)
+            if text and text not in markers:
+                markers.append(text)
+
+        if isinstance(value, Mapping):
+            for field in ("requirement_id", "id", "event_kind", "phase", "action"):
+                _add(value.get(field))
+            for field in ("requirement_ids", "required_evidence"):
+                items = value.get(field)
+                if isinstance(items, list):
+                    for item in items:
+                        _add(item)
+            contract_evidence = value.get("contract_evidence")
+            if isinstance(contract_evidence, list):
+                for item in contract_evidence:
+                    markers.extend(_evidence_markers(item))
+            for field in ("payload", "verification"):
+                child = value.get(field)
+                if isinstance(child, Mapping):
+                    markers.extend(_evidence_markers(child))
+        return list(dict.fromkeys(markers))
+
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        event_id = str(event.get("id") or event.get("event_id") or "").strip()
+        if not event_id:
+            continue
+        event_kind = str(event.get("event_kind") or "").strip()
+        phase = str(event.get("phase") or "").strip()
+        markers = _evidence_markers(event)
+        evidence_kind = next(
+            (marker for marker in markers if marker in close_evidence_kinds),
+            "",
+        )
+        if phase == "verification" and _observer_root_route_normalize_action(event_kind) in {
+            "independent_verification",
+            "qa_review",
+            "qa_verification",
+        }:
+            evidence_kind = "verification"
+        if not evidence_kind:
+            continue
+        ref = f"timeline:{event_id}"
+        if ref in seen:
+            continue
+        seen.add(ref)
+        item = {
+            "ref": ref,
+            "event_kind": event_kind,
+            "phase": phase,
+            "status": str(event.get("status") or event.get("decision") or ""),
+        }
+        if evidence_kind != event_kind:
+            item["evidence_kind"] = evidence_kind
+        refs.append({key: value for key, value in item.items() if value})
+    return refs
+
+
+def _observer_root_route_close_action_card(
+    close_gate: Mapping[str, Any],
+    route_token_ref_projection: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    target_files: list[str],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    passed = bool(close_gate.get("passed"))
+    current_ref = str(route_token_ref_projection.get("route_token_ref") or "").strip()
+    current_allowed_actions = [
+        str(item or "").strip()
+        for item in (route_token_ref_projection.get("allowed_actions") or [])
+        if str(item or "").strip()
+    ]
+    current_allowed_set = {
+        _observer_root_route_normalize_action(action)
+        for action in current_allowed_actions
+        if action
+    }
+    has_close_ref = bool(current_ref and "backlog_close" in current_allowed_set)
+    evidence_refs = _observer_root_route_close_evidence_refs(events)
+    seen_refs = {str(item.get("ref") or "") for item in evidence_refs}
+    for ref in route_token_ref_projection.get("evidence_refs") or []:
+        ref_text = str(ref or "").strip()
+        if not ref_text or ref_text in seen_refs:
+            continue
+        seen_refs.add(ref_text)
+        evidence_refs.append({"ref": ref_text, "source": "route_token_ref"})
+
+    required_scope = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+    }
+    if task_id:
+        required_scope["task_id"] = task_id
+
+    issue_body = {
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": task_id or backlog_id,
+        "target_files": target_files,
+        "allowed_actions": ["backlog_close"],
+        "evidence_refs": [
+            str(item.get("ref") or "").strip()
+            for item in evidence_refs
+            if str(item.get("ref") or "").strip()
+        ],
+    }
+    if current_ref:
+        issue_body["parent_route_token_ref"] = current_ref
+    for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
+        value = str(route_token_ref_projection.get("identity", {}).get(field) or "").strip()
+        if value:
+            issue_body[f"parent_{field}"] = value
+
+    card = {
+        "schema_version": "observer_root_route_close_action_card.v1",
+        "action": "backlog_close",
+        "allowed_action": "backlog_close",
+        "protected_action": True,
+        "close_gate_passed": passed,
+        "status": "blocked",
+        "protected_entrypoint": {
+            "method": "POST",
+            "path": "/api/backlog/{project_id}/{bug_id}/close",
+            "path_params": {"project_id": project_id, "bug_id": backlog_id},
+            "mcp_tool": "backlog_close",
+        },
+        "route_token_issue_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "path_params": {"project_id": project_id},
+            "mcp_tool": "observer_route_context_issue",
+        },
+        "required_scope": required_scope,
+        "current_route_token_ref": current_ref,
+        "current_route_token_allowed_actions": current_allowed_actions,
+        "route_token_ref_resolved": bool(route_token_ref_projection.get("resolved")),
+        "evidence_refs": evidence_refs,
+        "issue_route_token_request": issue_body,
+        "raw_route_token_exposed": False,
+        "raw_secret_exposed": False,
+    }
+    if not target_files:
+        card["target_files_required"] = True
+        card["target_files_hint"] = (
+            "route-token issue requires target_files from the backlog row, "
+            "contract scope, or owned-file fence"
+        )
+    if not passed:
+        card.update(
+            {
+                "next_action": "satisfy_close_gate_before_backlog_close",
+                "detail": "close gate is not yet passed; follow missing close evidence first",
+                "missing_event_kinds": close_gate.get("missing_event_kinds") or [],
+                "missing_evidence_groups": close_gate.get("missing_evidence_groups") or {},
+            }
+        )
+        return card
+    if has_close_ref:
+        card.update(
+            {
+                "status": "ready",
+                "next_action": "backlog_close",
+                "route_token_ref": current_ref,
+                "route_token_refresh_required": False,
+                "detail": (
+                    "close gate passed and current route_token_ref authorizes "
+                    "backlog_close; call backlog_close by ref"
+                ),
+            }
+        )
+    else:
+        card.update(
+            {
+                "status": "refresh_required",
+                "next_action": "issue_close_scoped_route_token_ref",
+                "route_token_refresh_required": True,
+                "classification": "expected_action_token_refresh",
+                "expected_behavior": True,
+                "is_system_bug": False,
+                "do_not_waive": True,
+                "detail": (
+                    "close gate passed, but the current route_token_ref does not "
+                    "authorize backlog_close; mint a close-scoped route_token_ref "
+                    "with allowed_actions=['backlog_close'], then call backlog_close by ref"
+                ),
+            }
+        )
+    return card
+
+
+def _observer_root_route_close_next_legal_action(
+    close_action_card: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not close_action_card.get("close_gate_passed"):
+        return {}
+    action_id = str(close_action_card.get("next_action") or "").strip()
+    if not action_id:
+        return {}
+    next_action = {
+        "id": action_id,
+        "action": action_id,
+        "detail": str(close_action_card.get("detail") or ""),
+        "source": "close_gate_projection",
+        "precedence": "close_gate_passed",
+        "allowed_action": "backlog_close",
+        "protected_action": True,
+        "action_card": dict(close_action_card),
+    }
+    scope = close_action_card.get("required_scope")
+    if isinstance(scope, Mapping):
+        for field in ("project_id", "backlog_id", "task_id"):
+            value = str(scope.get(field) or "").strip()
+            if value:
+                next_action[field] = value
+    route_token_ref = str(
+        close_action_card.get("route_token_ref")
+        or close_action_card.get("current_route_token_ref")
+        or ""
+    ).strip()
+    if route_token_ref:
+        next_action["route_token_ref"] = route_token_ref
+    return next_action
+
+
 def _observer_root_route_identity_from_route_token_ref(
     conn,
     *,
@@ -27646,12 +27905,28 @@ def _observer_root_route_identity_from_route_token_ref(
         for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
         if str(resolved.get(field) or "").strip()
     }
+    allowed_actions = [
+        str(item or "").strip()
+        for item in (resolved.get("allowed_actions") or [])
+        if str(item or "").strip()
+    ]
+    evidence_refs = [
+        str(item or "").strip()
+        for item in (resolved.get("evidence_refs") or [])
+        if str(item or "").strip()
+    ]
     return {
         "schema_version": "observer_root_route_token_ref_projection.v1",
         "route_token_ref": token_ref,
         "resolved": bool(identity),
         "identity": identity,
         "binding_source": "observer_route_token_refs",
+        "allowed_actions": allowed_actions,
+        "evidence_refs": evidence_refs,
+        "scope": resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {},
+        "expires_at": str(resolved.get("expires_at") or ""),
+        "status": str(resolved.get("status") or ""),
+        "caller_role": str(resolved.get("caller_role") or ""),
     }
 
 
@@ -28010,6 +28285,26 @@ def _observer_root_route_context_state(
             ordered_missing_steps,
             default=dict(context.get("next_legal_action") or {}),
         )
+    row_target_files = (
+        _string_list_field(_row_get(row, "target_files", ""))
+        if row is not None
+        else []
+    )
+    contract_target_files = _string_list_field(contract.get("target_files"))
+    close_action_card = _observer_root_route_close_action_card(
+        close_gate,
+        route_token_ref_projection,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=str(task_id or "").strip(),
+        target_files=row_target_files or contract_target_files,
+        events=events,
+    )
+    close_next_legal_action = _observer_root_route_close_next_legal_action(
+        close_action_card
+    )
+    if close_next_legal_action:
+        context["next_legal_action"] = close_next_legal_action
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),
         "passed": bool(route_context_gate.get("passed")),
@@ -28029,10 +28324,13 @@ def _observer_root_route_context_state(
     context["close_gate_projection"] = {
         "schema_version": "observer_root_route_close_gate_projection.v1",
         "passed": bool(close_gate.get("passed")),
+        "can_close": bool(close_gate.get("passed")),
         "status": str(close_gate.get("status") or ""),
         "missing_event_kinds": close_gate.get("missing_event_kinds") or [],
         "checks": close_gate.get("checks") or {},
         "missing_evidence_groups": close_gate.get("missing_evidence_groups") or {},
+        "action_card": close_action_card,
+        "close_action_card": close_action_card,
     }
     context["backlog_row_present"] = bool(row)
     return context

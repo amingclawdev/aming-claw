@@ -2196,6 +2196,21 @@ class TestTaskTimeline(unittest.TestCase):
         self._record_root_context_event(
             bug_id,
             {
+                "event_type": "qa.review",
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "independent_qa",
+                "status": "passed",
+                "payload": {
+                    **identity,
+                    "reviewer": "independent-qa",
+                    "requirement_id": "independent_verification_lane",
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
                 "event_type": "mf.implementation",
                 "event_kind": "implementation",
                 "phase": "implementation",
@@ -2247,6 +2262,287 @@ class TestTaskTimeline(unittest.TestCase):
             "close_ready",
         )
         self.assertEqual(result["close_gate_projection"]["missing_event_kinds"], ["close_ready"])
+
+    def test_root_route_context_close_action_card_requests_close_scoped_token(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-CLOSE-ACTION-CARD"
+        issued = self._issue_route_token(
+            bug_id,
+            allowed_actions=["task_timeline_append"],
+        )
+        token = issued["route_token"]
+        identity = {
+            "route_id": token["route_id"],
+            "route_context_hash": token["route_context_hash"],
+            "prompt_contract_id": token["prompt_contract_id"],
+            "prompt_contract_hash": token["prompt_contract_hash"],
+            "visible_injection_manifest_hash": token["visible_injection_manifest_hash"],
+        }
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+                "target_files": ["agent/governance/server.py"],
+                "governance_policy": {
+                    "requirements": {
+                        "close_timeline": True,
+                        "independent_qa": False,
+                        "worker_graph_trace": False,
+                    }
+                },
+                "route_topology_policy": {
+                    "selected_topology": "observer_led_parallel_lanes",
+                    "recommended_topology": "mf_parallel.v1",
+                },
+            },
+        )
+        precheck_ref = ""
+        for event in _route_context_consumption_events(identity=identity):
+            if event["event_kind"] == "mf_subagent_startup":
+                self._make_startup_close_satisfying(event)
+            recorded = self._record_root_context_event(bug_id, event)
+            if event.get("event_kind") == "route_action_precheck":
+                precheck_ref = f"timeline:{recorded['id']}"
+        self._record_root_context_event(
+            bug_id,
+            _mf_subagent_read_receipt_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            _route_context_qa_verification_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "qa.review",
+                "event_kind": "qa_review",
+                "phase": "verification",
+                "actor": "independent_qa",
+                "status": "passed",
+                "payload": {
+                    **identity,
+                    "reviewer": "independent-qa",
+                    "requirement_id": "independent_verification_lane",
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "phase": "routing",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "from_work_mode": "observer_look_before_act",
+                    "to_work_mode": "observer_execution_supervisor",
+                    "route_identity": identity,
+                    "route_action_precheck_event_id": precheck_ref,
+                    **identity,
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "mf_sub",
+                "status": "passed",
+                "payload": {**identity, "changed_files": ["agent/governance/server.py"]},
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.verification",
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "qa",
+                "status": "passed",
+                "verification": {**identity, "tests_run": ["pytest focused"]},
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.close_ready",
+                "event_kind": "close_ready",
+                "phase": "close",
+                "actor": "observer",
+                "status": "passed",
+                "payload": identity,
+            },
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            task_id=bug_id,
+            route_token_ref=issued["route_token_ref"],
+            work_mode=observer_session.normalize_work_mode(None),
+        )
+
+        self.assertTrue(result["close_gate_projection"]["can_close"])
+        action_card = result["close_gate_projection"]["action_card"]
+        self.assertEqual(action_card["schema_version"], "observer_root_route_close_action_card.v1")
+        self.assertEqual(action_card["status"], "refresh_required")
+        self.assertEqual(action_card["classification"], "expected_action_token_refresh")
+        self.assertTrue(action_card["expected_behavior"])
+        self.assertFalse(action_card["is_system_bug"])
+        self.assertTrue(action_card["do_not_waive"])
+        self.assertEqual(
+            action_card["current_route_token_allowed_actions"],
+            ["task_timeline_append"],
+        )
+        self.assertEqual(
+            action_card["issue_route_token_request"]["allowed_actions"],
+            ["backlog_close"],
+        )
+        self.assertEqual(
+            action_card["issue_route_token_request"]["parent_route_token_ref"],
+            issued["route_token_ref"],
+        )
+        self.assertIn(
+            "qa_review",
+            {item.get("event_kind") for item in action_card["evidence_refs"]},
+        )
+        self.assertIn(
+            "mf_subagent_dispatch",
+            {item.get("event_kind") for item in action_card["evidence_refs"]},
+        )
+        self.assertIn(
+            "agent/governance/server.py",
+            action_card["issue_route_token_request"]["target_files"],
+        )
+        self.assertEqual(result["next_legal_action"]["id"], "issue_close_scoped_route_token_ref")
+        self.assertEqual(result["next_legal_action"]["allowed_action"], "backlog_close")
+        self.assertFalse(action_card["raw_route_token_exposed"])
+        self.assertNotIn('"route_token":', json.dumps(result, sort_keys=True))
+        self.assertNotIn("session_token", json.dumps(result, sort_keys=True))
+
+    def test_root_route_context_close_action_card_uses_close_token_ref_when_ready(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-CLOSE-ACTION-READY"
+        issued = self._issue_route_token(
+            bug_id,
+            allowed_actions=["backlog_close"],
+        )
+        token = issued["route_token"]
+        identity = {
+            "route_id": token["route_id"],
+            "route_context_hash": token["route_context_hash"],
+            "prompt_contract_id": token["prompt_contract_id"],
+            "prompt_contract_hash": token["prompt_contract_hash"],
+            "visible_injection_manifest_hash": token["visible_injection_manifest_hash"],
+        }
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+                "target_files": ["agent/governance/server.py"],
+                "governance_policy": {
+                    "requirements": {
+                        "close_timeline": True,
+                        "independent_qa": False,
+                        "worker_graph_trace": False,
+                    }
+                },
+                "route_topology_policy": {
+                    "selected_topology": "observer_led_parallel_lanes",
+                    "recommended_topology": "mf_parallel.v1",
+                },
+            },
+        )
+        precheck_ref = ""
+        for event in _route_context_consumption_events(identity=identity):
+            if event["event_kind"] == "mf_subagent_startup":
+                self._make_startup_close_satisfying(event)
+            recorded = self._record_root_context_event(bug_id, event)
+            if event.get("event_kind") == "route_action_precheck":
+                precheck_ref = f"timeline:{recorded['id']}"
+        self._record_root_context_event(
+            bug_id,
+            _mf_subagent_read_receipt_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            _route_context_qa_verification_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "phase": "routing",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "from_work_mode": "observer_look_before_act",
+                    "to_work_mode": "observer_execution_supervisor",
+                    "route_identity": identity,
+                    "route_action_precheck_event_id": precheck_ref,
+                    **identity,
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "mf_sub",
+                "status": "passed",
+                "payload": {**identity, "changed_files": ["agent/governance/server.py"]},
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.verification",
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "qa",
+                "status": "passed",
+                "verification": {**identity, "tests_run": ["pytest focused"]},
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.close_ready",
+                "event_kind": "close_ready",
+                "phase": "close",
+                "actor": "observer",
+                "status": "passed",
+                "payload": identity,
+            },
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            task_id=bug_id,
+            route_token_ref=issued["route_token_ref"],
+            work_mode=observer_session.normalize_work_mode(None),
+        )
+
+        action_card = result["close_gate_projection"]["action_card"]
+        self.assertEqual(action_card["status"], "ready")
+        self.assertEqual(action_card["next_action"], "backlog_close")
+        self.assertEqual(action_card["route_token_ref"], issued["route_token_ref"])
+        self.assertFalse(action_card["route_token_refresh_required"])
+        self.assertEqual(result["next_legal_action"]["id"], "backlog_close")
+        self.assertEqual(result["next_legal_action"]["route_token_ref"], issued["route_token_ref"])
 
     def test_root_route_context_next_action_skips_already_applied_cleanup(self):
         from agent.governance import server
