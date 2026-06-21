@@ -11243,6 +11243,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         audit_payload.update(
             {
                 "action": "runtime_context_session_token_rejoin",
+                "caller_role": "observer",
                 "raw_session_token_persisted": False,
                 "raw_fence_token_persisted_to_timeline": False,
                 "reason": reason,

@@ -14932,6 +14932,11 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
         == "runtime_context_session_token_rejoin"
     ]
     assert len(rejoin_events) == 1
+    rejoin_payload = rejoin_events[0]["payload"]
+    assert rejoin_payload["caller_role"] == "observer"
+    assert rejoin_payload["worker_role"] == "mf_sub"
+    assert rejoin_payload["meta_contract_gate"]["role"] == "observer"
+    assert rejoin_payload["meta_contract_gate"]["action"] == "observer_command"
     serialized_event = json.dumps(rejoin_events[0], sort_keys=True)
     assert result["session_token"] not in serialized_event
     assert "fence-runtime-rejoin" not in serialized_event
