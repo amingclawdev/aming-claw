@@ -4036,6 +4036,50 @@ def _route_action_scope_server_lineage(
     return {}
 
 
+def _route_token_gate_scope(value: Any) -> dict[str, str]:
+    gate = _first_deep_mapping(value, "route_token_gate")
+    scope = _mapping(gate.get("scope"))
+    return {
+        "backlog_id": str(
+            scope.get("backlog_id")
+            or scope.get("bug_id")
+            or gate.get("scope_backlog_id")
+            or gate.get("scope_bug_id")
+            or ""
+        ).strip(),
+        "project_id": str(
+            scope.get("project_id") or gate.get("scope_project_id") or ""
+        ).strip(),
+        "task_id": str(
+            scope.get("task_id")
+            or scope.get("root_task_id")
+            or gate.get("scope_task_id")
+            or gate.get("scope_root_task_id")
+            or ""
+        ).strip(),
+    }
+
+
+def _route_token_gate_parent_task_scope_missing(
+    value: Any,
+    *,
+    row_backlog: str,
+    row_project: str,
+    parent_task_id: str,
+) -> tuple[list[str], dict[str, str]]:
+    scope = _route_token_gate_scope(value)
+    missing: list[str] = []
+    if not scope.get("backlog_id") or (
+        row_backlog and scope["backlog_id"] != row_backlog
+    ):
+        missing.append("route_token_gate.scope.backlog_id")
+    if scope.get("project_id") and row_project and scope["project_id"] != row_project:
+        missing.append("route_token_gate.scope.project_id")
+    if not scope.get("task_id") or scope["task_id"] != parent_task_id:
+        missing.append("parent_task_id_matches_root_backlog")
+    return missing, scope
+
+
 def _route_action_scoped_verification_identity(
     value: Any,
     identity: dict[str, str],
@@ -7424,10 +7468,11 @@ def _cross_ref_route_token_child_lineage_diagnosis(
         missing.append("child_route_context_hash")
     if not route_scope.get("prompt_contract_id"):
         missing.append("child_prompt_contract_id")
+    parent_task_needs_registry_scope = False
     if not parent_task_id:
         missing.append("parent_task_id")
     elif row_backlog and parent_task_id != row_backlog:
-        missing.append("parent_task_id_matches_root_backlog")
+        parent_task_needs_registry_scope = True
     if not runtime_context_id:
         missing.append("runtime_context_id")
     if not worker_slot_id:
@@ -7447,6 +7492,7 @@ def _cross_ref_route_token_child_lineage_diagnosis(
         missing.append("canonical_parent_prompt_contract_id")
     parent_hint = _route_lineage_identity_hint(canonical_route_scope)
     route_lineage: dict[str, Any] = {}
+    route_token_gate_scope: dict[str, str] = {}
     if not missing:
         route_lineage = _route_action_scope_server_lineage(
             event,
@@ -7458,8 +7504,30 @@ def _cross_ref_route_token_child_lineage_diagnosis(
             missing.append("route_token_registry_proof")
         elif route_lineage.get("allowed_action") not in {"", "task_timeline_append"}:
             missing.append("allowed_action")
-        elif row_command and command and command != row_command:
+        elif parent_task_needs_registry_scope:
+            scope_missing, route_token_gate_scope = (
+                _route_token_gate_parent_task_scope_missing(
+                    event,
+                    row_backlog=row_backlog,
+                    row_project=row_project,
+                    parent_task_id=parent_task_id,
+                )
+            )
+            missing.extend(scope_missing)
+        if (
+            route_lineage
+            and not missing
+            and row_command
+            and command
+            and command != row_command
+        ):
             command_superseded_by_registry_lineage = True
+        if (
+            route_lineage
+            and parent_task_needs_registry_scope
+            and not route_token_gate_scope
+        ):
+            route_token_gate_scope = _route_token_gate_scope(event)
     accepted = bool(route_lineage and not missing)
     event_scope_complete = bool(accepted or missing == ["route_token_registry_proof"])
     registry_verified = bool(accepted and route_lineage.get("server_backed"))
@@ -7490,6 +7558,9 @@ def _cross_ref_route_token_child_lineage_diagnosis(
         "worker_slot_id": worker_slot_id,
         "fence_proof": fence_proof,
         "child_route_scope": route_scope,
+        "route_token_gate_scope": {
+            key: value for key, value in route_token_gate_scope.items() if value
+        },
         "canonical_parent_route_scope": {
             field: str(canonical_route_scope.get(field) or "").strip()
             for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS

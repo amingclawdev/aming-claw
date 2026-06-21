@@ -384,24 +384,29 @@ def _attach_server_action_scope_route_token_lineage(
     parent_identity=None,
     route_token_ref="rtok-qa-action",
     acceptance_source="protected_route_token_ref_action_scope",
+    scope=None,
 ):
     parent = dict(parent_identity or ROUTE_IDENTITY)
     child = dict(child_identity)
+    gate_scope = dict(scope or {})
+    gate = {
+        **child,
+        "schema_version": "route_token_gate.v1",
+        "decision": "route_token_ref_resolved",
+        "status": "passed",
+        "allowed": True,
+        "action": "task_timeline_append",
+        "route_token_ref": route_token_ref,
+        "resolved_from_ref": True,
+        "server_issued_binding": True,
+        "binding_source": "observer_route_token_refs",
+    }
+    if gate_scope:
+        gate["scope"] = gate_scope
     payload = dict(event.get("payload") or {})
     payload.update({
         "route_token_ref": route_token_ref,
-        "route_token_gate": {
-            **child,
-            "schema_version": "route_token_gate.v1",
-            "decision": "route_token_ref_resolved",
-            "status": "passed",
-            "allowed": True,
-            "action": "task_timeline_append",
-            "route_token_ref": route_token_ref,
-            "resolved_from_ref": True,
-            "server_issued_binding": True,
-            "binding_source": "observer_route_token_refs",
-        },
+        "route_token_gate": gate,
         "route_action_scope_lineage": {
             "schema_version": "route_action_scope_lineage.v1",
             "accepted": True,
@@ -419,6 +424,7 @@ def _attach_server_action_scope_route_token_lineage(
             "child_route_identity": child,
             "parent_route_lineage": parent,
             "child_route_lineage": child,
+            "route_token_gate": gate,
         },
     })
     event["payload"] = payload
@@ -11077,6 +11083,130 @@ def test_cross_ref_accepts_registry_backed_route_token_child_lineage_without_bri
     assert "AC-ROUTE-TOKEN-CHILD|aming-claw|worker-a-task" in gate[
         "bridged_lane_membership"
     ]
+
+
+def test_cross_ref_accepts_registry_child_lineage_with_observer_parent_task_scope():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    worker_implementation = copy.deepcopy(worker_implementation)
+    worker_implementation["payload"]["parent_task_id"] = "observer-root-task"
+    canonical = route_context_gate["route_identity"]
+    child = {
+        field: worker_implementation["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    worker_implementation = _attach_server_action_scope_route_token_lineage(
+        worker_implementation,
+        child,
+        parent_identity=canonical,
+        route_token_ref=worker_implementation["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+        scope={
+            "backlog_id": row_identity["backlog_id"],
+            "project_id": row_identity["project_id"],
+            "task_id": "observer-root-task",
+        },
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+    accepted = gate["accepted_route_token_child_lineages"][0]
+    assert accepted["accepted"] is True
+    assert accepted["registry_verified"] is True
+    assert accepted["missing_fields"] == []
+    assert accepted["parent_task_id"] == "observer-root-task"
+    assert accepted["route_token_gate_scope"] == {
+        "backlog_id": row_identity["backlog_id"],
+        "project_id": row_identity["project_id"],
+        "task_id": "observer-root-task",
+    }
+    assert gate["advisory_route_token_child_lineages"] == []
+
+
+def test_cross_ref_rejects_observer_parent_task_without_registry_child_lineage():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    worker_implementation = copy.deepcopy(worker_implementation)
+    worker_implementation["payload"]["parent_task_id"] = "observer-root-task"
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is False
+    assert gate["accepted_route_token_child_lineages"] == []
+    lineage = gate["rejected_cross_ref_evidence"][0]["route_token_child_lineage"]
+    assert lineage["accepted"] is False
+    assert lineage["advisory_only"] is True
+    assert "route_token_registry_proof" in lineage["missing_fields"]
+
+
+def test_cross_ref_rejects_registry_child_lineage_with_wrong_parent_scope():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    worker_implementation = copy.deepcopy(worker_implementation)
+    worker_implementation["payload"]["parent_task_id"] = "observer-root-task"
+    canonical = route_context_gate["route_identity"]
+    child = {
+        field: worker_implementation["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    worker_implementation = _attach_server_action_scope_route_token_lineage(
+        worker_implementation,
+        child,
+        parent_identity=canonical,
+        route_token_ref=worker_implementation["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+        scope={
+            "backlog_id": "AC-FOREIGN",
+            "project_id": row_identity["project_id"],
+            "task_id": "wrong-observer-task",
+        },
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is False
+    assert gate["accepted_route_token_child_lineages"] == []
+    lineage = gate["rejected_cross_ref_evidence"][0]["route_token_child_lineage"]
+    assert lineage["accepted"] is False
+    assert "route_token_gate.scope.backlog_id" in lineage["missing_fields"]
+    assert "parent_task_id_matches_root_backlog" in lineage["missing_fields"]
+    assert lineage["route_token_gate_scope"]["backlog_id"] == "AC-FOREIGN"
+    assert lineage["route_token_gate_scope"]["task_id"] == "wrong-observer-task"
 
 
 def test_cross_ref_accepts_registry_child_lane_with_new_observer_command():
