@@ -496,6 +496,23 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert next_action["startup_identity_policy"] == identity_policy
 
 
+def test_runtime_text_prepare_is_stable_across_repeated_host_adapter_registration(
+    tmp_path,
+):
+    first = build_observer_runtime_text_context(_runtime_text_request(tmp_path))
+    second = build_observer_runtime_text_context(_runtime_text_request(tmp_path))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert first["launch_text_hash"] == second["launch_text_hash"]
+    assert first["registered_host_adapter_spawn"] == (
+        second["registered_host_adapter_spawn"]
+    )
+    assert first["executable_worker_launch"]["payload"]["host_startup_id"] == (
+        second["executable_worker_launch"]["payload"]["host_startup_id"]
+    )
+
+
 def test_runtime_text_builder_ignores_top_level_worktree_object_for_path(tmp_path):
     evidence = _branch_runtime_evidence(tmp_path)
     evidence["worktree"] = {

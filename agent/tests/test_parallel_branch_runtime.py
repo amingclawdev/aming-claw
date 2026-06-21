@@ -614,6 +614,103 @@ def test_runtime_context_current_view_and_gate_inputs_report_missing_fields() ->
     assert ("startup", "target_files") in missing
 
 
+def test_runtime_context_current_view_uses_same_lineage_timeline_over_stale_refs() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:old-startup",
+            "read_receipt_event_ref": "timeline:old-read-receipt",
+        },
+        timeline_events=[
+            {
+                "id": 5770,
+                "event_kind": "mf_subagent_startup",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                },
+            },
+            {
+                "id": 5768,
+                "event_kind": "mf_subagent_read_receipt",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    "fence_token": context.fence_token,
+                    "worker_role": "mf_sub",
+                },
+            },
+        ],
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    current = projection["views"]["current"]
+
+    assert current["timeline_refs"]["startup_event_ref"] == "5770"
+    assert current["timeline_refs"]["read_receipt_event_ref"] == "5768"
+    assert current["current_values"]["startup_event_ref"] == "5770"
+    assert current["current_values"]["read_receipt_event_ref"] == "5768"
+
+
+def test_runtime_context_current_view_hydrates_work_scope_from_startup_gate() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        startup_gate={
+            "observer_command_id": "cmd-runtime-context",
+            "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+            "acceptance_criteria": [
+                "runtime context exposes bounded worker next action",
+            ],
+            "required_evidence": ["worker_graph_trace"],
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    current = projection["views"]["current"]
+    capability_boundary = projection["views"]["capability_boundary"]
+
+    assert current["work"]["target_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+    assert current["work"]["acceptance_criteria"] == [
+        "runtime context exposes bounded worker next action"
+    ]
+    assert current["work"]["required_evidence"] == ["worker_graph_trace"]
+    assert current["current_values"]["owned_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+    assert capability_boundary["owned_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+    assert capability_boundary["target_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+
+
 def test_runtime_context_lane_plan_fold_is_deterministic_and_reports_missing() -> None:
     events = [
         {
@@ -929,6 +1026,8 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert read_action["entrypoint"] == {
         "method": "POST",
         "path": "/api/task/{project_id}/timeline",
+        "mcp_tool": "task_timeline_append",
+        "runtime_action_alias": "submit_mf_subagent_read_receipt",
         "event_kind": "mf_subagent_read_receipt",
         "required_payload_fields": [
             "runtime_context_id",

@@ -3935,8 +3935,8 @@ def build_runtime_context_current_view(
             route[key] = value
     timeline = _runtime_context_timeline_refs(
         {
-            **_runtime_context_mapping(derived.get("timeline_refs")),
             **public_contract_revision_payload(timeline_refs or {}),
+            **_runtime_context_mapping(derived.get("timeline_refs")),
         }
     )
     explicit_graph_trace = _runtime_context_graph_trace_refs(graph_trace_refs)
@@ -3950,6 +3950,13 @@ def build_runtime_context_current_view(
     )
     if not graph_trace.get("source_details"):
         graph_trace["source_details"] = derived_graph_trace.get("source_details", {})
+    startup = _runtime_context_startup_gate_payload(startup_gate or {})
+    startup_target_file_values = _runtime_context_revision_string_list(
+        startup,
+        "target_files",
+        "owned_files",
+        "write_scope",
+    )
     target_file_values = _runtime_context_dedupe(
         list(target_files or ())
         or _runtime_context_revision_string_list(
@@ -3958,11 +3965,17 @@ def build_runtime_context_current_view(
             "owned_files",
             "write_scope",
         )
+        or startup_target_file_values
     )
     acceptance_values = _runtime_context_dedupe(
         list(acceptance_criteria or ())
         or _runtime_context_revision_string_list(
             revision_payload,
+            "acceptance_criteria",
+            "acceptance",
+        )
+        or _runtime_context_revision_string_list(
+            startup,
             "acceptance_criteria",
             "acceptance",
         )
@@ -3974,8 +3987,12 @@ def build_runtime_context_current_view(
             "required_evidence",
             "required_evidence_ids",
         )
+        or _runtime_context_revision_string_list(
+            startup,
+            "required_evidence",
+            "required_evidence_ids",
+        )
     )
-    startup = _runtime_context_startup_gate_payload(startup_gate or {})
     finish = public_contract_revision_payload(
         finish_gate or derived.get("finish_gate") or {}
     )
@@ -4587,6 +4604,8 @@ def _runtime_context_read_receipt_hash_action(
         "entrypoint": {
             "method": "POST",
             "path": "/api/task/{project_id}/timeline",
+            "mcp_tool": "task_timeline_append",
+            "runtime_action_alias": "submit_mf_subagent_read_receipt",
             "event_kind": "mf_subagent_read_receipt",
             "required_payload_fields": [
                 "runtime_context_id",
