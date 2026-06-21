@@ -2444,6 +2444,11 @@ def _runtime_context_timeline_refs(
             or source.get("read_receipt_event_id")
             or source.get("read_receipt_ref")
         ),
+        "route_action_precheck_event_ref": _runtime_context_text(
+            source.get("route_action_precheck_event_ref")
+            or source.get("route_action_precheck_event_id")
+            or source.get("route_action_precheck_ref")
+        ),
         "finish_event_ref": _runtime_context_text(
             source.get("finish_event_ref") or source.get("finish_event_id")
         ),
@@ -2545,12 +2550,19 @@ def _runtime_context_deep_text(value: Any, key: str) -> str:
 
 
 def _runtime_context_event_ref(event: Mapping[str, Any]) -> str:
-    return _runtime_context_text(
-        event.get("id")
-        or event.get("event_id")
-        or event.get("trace_id")
-        or _runtime_context_deep_text(event, "event_id")
-    )
+    explicit_ref = _runtime_context_text(event.get("event_ref"))
+    if explicit_ref:
+        return explicit_ref
+    for key in ("id", "event_id"):
+        event_id = _runtime_context_text(event.get(key))
+        if event_id:
+            if event_id.isdigit():
+                return f"timeline:{event_id}"
+            return event_id
+    trace_id = _runtime_context_text(event.get("trace_id"))
+    if trace_id:
+        return trace_id
+    return _runtime_context_deep_text(event, "event_id")
 
 
 def _runtime_context_event_same_lineage(
@@ -2662,6 +2674,33 @@ def _runtime_context_event_lane_bound(
     return False
 
 
+def _runtime_context_event_matches_route_identity(
+    event: Mapping[str, Any],
+    route_identity: Mapping[str, Any] | None,
+) -> bool:
+    identity = _runtime_context_mapping(route_identity)
+    required_fields = ("route_context_hash", "prompt_contract_id")
+    for field in required_fields:
+        expected = _runtime_context_text(identity.get(field))
+        if not expected:
+            continue
+        actual = _runtime_context_deep_text(event, field)
+        if actual != expected:
+            return False
+    for field in (
+        "route_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        expected = _runtime_context_text(identity.get(field))
+        if not expected:
+            continue
+        actual = _runtime_context_deep_text(event, field)
+        if actual and actual != expected:
+            return False
+    return True
+
+
 def _runtime_context_timeline_derived_evidence(
     events: Sequence[Mapping[str, Any]] | None,
     *,
@@ -2670,8 +2709,49 @@ def _runtime_context_timeline_derived_evidence(
     parent_task_id: str,
     backlog_id: str,
     fence_token: str = "",
+    route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    route_identity: dict[str, str] = {}
+    explicit_route_identity = {
+        key: value
+        for key, value in _runtime_context_mapping(route_identity).items()
+        if _runtime_context_text(value)
+    }
+    derived_route_identity: dict[str, str] = {}
+    route_identity_keys = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    )
+
+    def _collect_route_identity(event: Mapping[str, Any]) -> None:
+        for key in route_identity_keys:
+            if derived_route_identity.get(key):
+                continue
+            value = _runtime_context_deep_text(event, key)
+            if value:
+                derived_route_identity[key] = value
+
+    for raw_event in events or ():
+        if not isinstance(raw_event, Mapping):
+            continue
+        event = public_contract_revision_payload(raw_event)
+        if not _runtime_context_event_same_lineage(
+            event,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=backlog_id,
+        ):
+            continue
+        if not _runtime_context_event_status_ok(event):
+            continue
+        if _runtime_context_event_kind_token(event) == "route_action_precheck":
+            continue
+        _collect_route_identity(event)
+
     timeline_refs: dict[str, Any] = {}
     graph_trace_ids: list[str] = []
     graph_trace_event_refs: list[str] = []
@@ -2723,19 +2803,8 @@ def _runtime_context_timeline_derived_evidence(
                 fence_token=fence_token,
             )
         )
-        for key in (
-            "route_id",
-            "route_context_hash",
-            "prompt_contract_id",
-            "prompt_contract_hash",
-            "route_token_ref",
-            "visible_injection_manifest_hash",
-        ):
-            if route_identity.get(key):
-                continue
-            value = _runtime_context_deep_text(event, key)
-            if value:
-                route_identity[key] = value
+        if event_kind != "route_action_precheck":
+            _collect_route_identity(event)
         if event_kind in {
             "mf_subagent_startup",
             "mf_subagent_startup_gate",
@@ -2749,6 +2818,14 @@ def _runtime_context_timeline_derived_evidence(
             "read_receipt",
         }:
             timeline_refs.setdefault("read_receipt_event_ref", event_ref)
+        if (
+            event_kind == "route_action_precheck"
+            and _runtime_context_event_matches_route_identity(
+                event,
+                {**derived_route_identity, **explicit_route_identity},
+            )
+        ):
+            timeline_refs.setdefault("route_action_precheck_event_ref", event_ref)
         if event_kind in {"implementation", "worker_implementation"} and event_ref:
             implementation_refs.append(event_ref)
         if (
@@ -2828,7 +2905,7 @@ def _runtime_context_timeline_derived_evidence(
             verification_refs
         )
     return {
-        "route_identity": route_identity,
+        "route_identity": derived_route_identity,
         "timeline_refs": timeline_refs,
         "graph_trace_refs": {
             "source": "task_timeline.same_lineage",
@@ -3165,6 +3242,10 @@ def _runtime_context_current_values(
         "dispatch_event_ref": timeline_refs.get("dispatch_event_ref", ""),
         "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
         "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
+        "route_action_precheck_event_ref": timeline_refs.get(
+            "route_action_precheck_event_ref",
+            "",
+        ),
         "finish_event_ref": timeline_refs.get("finish_event_ref", ""),
         "close_ready_event_ref": _runtime_context_text(
             timeline_refs.get("close_ready_event_ref")
@@ -3702,6 +3783,13 @@ _RUNTIME_CONTEXT_GATE_REQUIREMENTS: dict[str, tuple[dict[str, str], ...]] = {
             "evidence_ref": "timeline",
         },
         {
+            "field": "route_action_precheck_event_ref",
+            "expected_source": "task_timeline.route_action_precheck",
+            "producer": "task_timeline",
+            "consumer": "close_gate",
+            "evidence_ref": "timeline",
+        },
+        {
             "field": "verification_event_refs",
             "expected_source": "task_timeline.verification",
             "producer": "task_timeline",
@@ -3929,6 +4017,7 @@ def build_runtime_context_current_view(
         parent_task_id=parent_task_id,
         backlog_id=context.backlog_id,
         fence_token=context.fence_token,
+        route_identity=route,
     )
     for key, value in _runtime_context_mapping(derived.get("route_identity")).items():
         if value and not route.get(key):
@@ -4145,6 +4234,7 @@ def build_runtime_context_close_gate_view(
         ("observer_command", "observer_command_id"),
         ("startup_evidence", "startup_event_ref"),
         ("read_receipt", "read_receipt_event_ref"),
+        ("route_action_precheck", "route_action_precheck_event_ref"),
         ("finish_time_worker_attestation", "worker_self_attesting"),
         ("finish_gate", "finish_gate_ref"),
         ("close_ready", "close_ready_event_ref"),
@@ -4178,6 +4268,10 @@ def build_runtime_context_close_gate_view(
         "checkpoint_id": values.get("checkpoint_id", ""),
         "finish_gate_ref": values.get("finish_gate_ref", ""),
         "close_ready_event_ref": values.get("close_ready_event_ref", ""),
+        "route_action_precheck_event_ref": values.get(
+            "route_action_precheck_event_ref",
+            "",
+        ),
         "route_context_hash": values.get("route_context_hash", ""),
         "prompt_contract_hash": values.get("prompt_contract_hash", ""),
         "route_token_ref": values.get("route_token_ref", ""),
@@ -4207,6 +4301,13 @@ def build_runtime_context_close_gate_view(
                 "source": "task_timeline.close_ready",
                 "payload": public_contract_revision_payload(
                     current_view.get("close_evidence") or {}
+                ),
+            },
+            "route_action_precheck": {
+                "producer": "task_timeline",
+                "source": "task_timeline.route_action_precheck",
+                "source_ref": _runtime_context_text(
+                    values.get("route_action_precheck_event_ref")
                 ),
             },
         },
@@ -4699,6 +4800,10 @@ def _runtime_context_close_blocker_explanation(
     field_messages = {
         "checkpoint_id": "record a checkpoint id or finish-gate checkpoint for this branch",
         "finish_gate_ref": "record the worker finish gate after implementation is complete",
+        "route_action_precheck_event_ref": (
+            "record observer-owned route_action_precheck evidence for the "
+            "canonical route identity"
+        ),
         "verification_event_refs": "record independent verification evidence for the focused tests/checks",
         "graph_trace_ids": "run worker-scoped graph queries and attach trace ids",
         "worker_self_attesting": (
@@ -5011,6 +5116,12 @@ def _runtime_context_close_precheck_gap_projection(
             "record_finish_gate",
             "Run the mf_subagent finish gate after startup, graph, tests, and finish attestation are present.",
         ),
+        (
+            "route_action_precheck_event_ref",
+            "route_action_precheck_missing",
+            "record_route_action_precheck",
+            "Record observer-owned route_action_precheck timeline evidence for the canonical route identity.",
+        ),
     )
     for field, code, next_action, message in close_gap_specs:
         if not _runtime_context_value_present(values.get(field)):
@@ -5154,6 +5265,7 @@ def _runtime_context_next_legal_action(
         ("finish_gate_ref", "record_finish_gate"),
         ("checkpoint_id", "record_checkpoint"),
         ("verification_event_refs", "record_independent_verification"),
+        ("route_action_precheck_event_ref", "record_route_action_precheck"),
         ("close_ready_event_ref", "record_close_ready"),
     ):
         if field in missing_fields:
@@ -5358,6 +5470,13 @@ def _runtime_context_next_required_evidence(
             "task_timeline.verification",
         ),
         (
+            "route_action_precheck_event_ref",
+            "route_action_precheck",
+            "record_route_action_precheck",
+            "route_service",
+            "task_timeline.route_action_precheck",
+        ),
+        (
             "close_ready_event_ref",
             "close_ready",
             "record_close_ready",
@@ -5375,7 +5494,7 @@ def _runtime_context_next_required_evidence(
                 consumer="close_gate",
                 expected_source=expected_source,
                 evidence_ref="timeline",
-                worker_owned=item_id != "close_ready",
+                worker_owned=item_id not in {"close_ready", "route_action_precheck"},
                 requires=["finish_gate"] if "finish_gate" in seen else [],
             )
     if lane_plan.get("blocking_events"):

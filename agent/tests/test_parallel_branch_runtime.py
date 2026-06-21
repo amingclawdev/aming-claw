@@ -662,10 +662,10 @@ def test_runtime_context_current_view_uses_same_lineage_timeline_over_stale_refs
 
     current = projection["views"]["current"]
 
-    assert current["timeline_refs"]["startup_event_ref"] == "5770"
-    assert current["timeline_refs"]["read_receipt_event_ref"] == "5768"
-    assert current["current_values"]["startup_event_ref"] == "5770"
-    assert current["current_values"]["read_receipt_event_ref"] == "5768"
+    assert current["timeline_refs"]["startup_event_ref"] == "timeline:5770"
+    assert current["timeline_refs"]["read_receipt_event_ref"] == "timeline:5768"
+    assert current["current_values"]["startup_event_ref"] == "timeline:5770"
+    assert current["current_values"]["read_receipt_event_ref"] == "timeline:5768"
 
 
 def test_runtime_context_current_view_hydrates_work_scope_from_startup_gate() -> None:
@@ -1472,6 +1472,7 @@ def test_runtime_context_gate_projection_close_gate_ready_still_revalidates_on_w
         target_files=["agent/governance/parallel_branch_runtime.py"],
         graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
         timeline_refs={
+            "route_action_precheck_event_ref": "timeline:route-precheck-runtime-context",
             "finish_event_ref": "timeline:finish-runtime-context",
             "verification_event_refs": ["timeline:verify-runtime-context"],
         },
@@ -1516,6 +1517,116 @@ def test_runtime_context_gate_projection_close_gate_ready_still_revalidates_on_w
     assert not {"can_close", "close_ready", "close_satisfying"} & set(
         gate_projection
     )
+
+
+def test_runtime_context_close_gate_blocks_handoff_when_route_action_precheck_missing() -> None:
+    def _projection(*, close_ready: bool) -> dict[str, object]:
+        timeline_refs = {
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+            "finish_event_ref": "timeline:finish-runtime-context",
+            "verification_event_refs": ["timeline:verify-runtime-context"],
+        }
+        close_evidence = {}
+        if close_ready:
+            timeline_refs["close_ready_event_ref"] = (
+                "timeline:close-ready-runtime-context"
+            )
+            close_evidence = {"event_id": "timeline:close-ready-runtime-context"}
+        return build_runtime_context_projection(
+            _runtime_projection_context(checkpoint_id="checkpoint-runtime-context"),
+            route_identity={
+                "route_id": "route-runtime-context",
+                "route_context_hash": "sha256:route-runtime-context",
+                "prompt_contract_id": "rprompt-runtime-context",
+                "prompt_contract_hash": "sha256:prompt-runtime-context",
+                "route_token_ref": "rtok-runtime-context",
+            },
+            target_files=["agent/governance/parallel_branch_runtime.py"],
+            graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+            timeline_refs=timeline_refs,
+            startup_gate={
+                "runtime_context_id": branch_runtime_context_id(
+                    PROJECT_ID,
+                    "mf-sub-runtime-context",
+                ),
+                "fence_token_matches": True,
+                "worker_session_id": "session-runtime-context",
+                "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+                "harness_type": "codex",
+                "route_id": "route-runtime-context",
+                "route_context_hash": "sha256:route-runtime-context",
+                "prompt_contract_id": "rprompt-runtime-context",
+                "prompt_contract_hash": "sha256:prompt-runtime-context",
+                "route_token_ref": "rtok-runtime-context",
+                "read_receipt_hash": "sha256:read-runtime-context",
+                "read_receipt_event_id": "timeline:read-runtime-context",
+            },
+            finish_gate={
+                "event_id": "timeline:finish-runtime-context",
+                "checkpoint_id": "checkpoint-runtime-context",
+                "worker_self_attestation": {
+                    "status": "passed",
+                    "worker_self_attesting": True,
+                    "finish_time_self_attesting": True,
+                    "attestation_phase": "finish",
+                },
+                "worker_self_attestation_gate": {
+                    "status": "passed",
+                    "passed": True,
+                },
+            },
+            close_evidence=close_evidence,
+            generated_at=NOW,
+        ).to_dict()
+
+    projection = _projection(close_ready=True)
+
+    close_gate = projection["views"]["close_gate_view"]
+    action_plan = projection["views"]["action_plan"]
+    by_id = {item["id"]: item for item in action_plan["next_required_evidence"]}
+
+    assert close_gate["ready"] is False
+    assert close_gate["status"] == "missing_required_fields"
+    assert close_gate["route_action_precheck_event_ref"] == ""
+    assert any(
+        item["id"] == "route_action_precheck"
+        and item["field"] == "route_action_precheck_event_ref"
+        and item["status"] == "missing"
+        for item in close_gate["checklist"]
+    )
+    assert any(
+        item["field"] == "route_action_precheck_event_ref"
+        and item["expected_source"] == "task_timeline.route_action_precheck"
+        for item in close_gate["missing"]
+    )
+    assert action_plan["next_legal_action"] == "record_route_action_precheck"
+    assert by_id["route_action_precheck"]["worker_owned"] is False
+    assert by_id["route_action_precheck"]["producer"] == "route_service"
+    assert by_id["route_action_precheck"]["expected_source"] == (
+        "task_timeline.route_action_precheck"
+    )
+    assert any(
+        item["code"] == "route_action_precheck_missing"
+        and item["next_action"] == "record_route_action_precheck"
+        for item in action_plan["close_precheck_gap_projection"]["gaps"]
+    )
+
+    missing_close_ready_projection = _projection(close_ready=False)
+    missing_close_ready_plan = missing_close_ready_projection["views"]["action_plan"]
+    close_order = [
+        item["id"]
+        for item in missing_close_ready_plan["next_required_evidence"]
+        if item["id"] in {"route_action_precheck", "close_ready"}
+    ]
+    assert missing_close_ready_plan["next_legal_action"] == (
+        "record_route_action_precheck"
+    )
+    assert close_order[0] == "route_action_precheck"
+    if "close_ready" in close_order:
+        assert close_order.index("route_action_precheck") < close_order.index(
+            "close_ready"
+        )
 
 
 def test_runtime_context_gate_projection_consumes_authoritative_timeline_gate_summary() -> None:
@@ -2552,6 +2663,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
         timeline_refs={
             "startup_event_ref": "timeline:startup",
             "read_receipt_event_ref": "timeline:read-receipt",
+            "route_action_precheck_event_ref": "timeline:route-precheck",
             "finish_event_ref": "timeline:finish",
             "verification_event_refs": ["timeline:verification"],
         },
@@ -2863,6 +2975,40 @@ def test_runtime_context_close_gate_view_derives_same_lineage_timeline_evidence(
                 },
             },
             {
+                "id": 44235,
+                "event_kind": "route_action_precheck",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    "route_id": "route-other",
+                    "route_context_hash": "sha256:other-route",
+                    "prompt_contract_id": "rprompt-other",
+                    "prompt_contract_hash": "sha256:other-prompt",
+                    "route_token_ref": "rtok-other",
+                },
+            },
+            {
+                "id": 4424,
+                "event_kind": "route_action_precheck",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    "route_id": "route-timeline",
+                    "route_context_hash": "sha256:timeline-route",
+                    "prompt_contract_id": "rprompt-timeline",
+                    "prompt_contract_hash": "sha256:timeline-prompt",
+                    "route_token_ref": "rtok-timeline",
+                },
+            },
+            {
                 "id": 4425,
                 "event_kind": "mf_subagent_read_receipt",
                 "actor": "worker-runtime-context",
@@ -2952,7 +3098,8 @@ def test_runtime_context_close_gate_view_derives_same_lineage_timeline_evidence(
     assert close_gate["route_context_hash"] == "sha256:timeline-route"
     assert close_gate["prompt_contract_hash"] == "sha256:timeline-prompt"
     assert close_gate["route_token_ref"] == "rtok-timeline"
-    assert close_gate["finish_gate_ref"] == "4427"
+    assert close_gate["route_action_precheck_event_ref"] == "timeline:4424"
+    assert close_gate["finish_gate_ref"] == "timeline:4427"
     assert close_gate["checkpoint_id"] == "ckpt-derived-runtime-context"
     assert close_gate["graph_trace_ids"] == [
         "gqt-worker-read",

@@ -6843,6 +6843,28 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
         status="passed",
         payload={"graph_query_trace_ids": ["gqt-verification"]},
     )
+    route_action_precheck = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-a4-task",
+        backlog_id="AC-RUNTIME-A4",
+        event_type="route_action_precheck",
+        event_kind="route_action_precheck",
+        phase="route_action_precheck",
+        status="accepted",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": "runtime-a4-task",
+            "parent_task_id": "AC-RUNTIME-A4",
+            "backlog_id": "AC-RUNTIME-A4",
+            "route_id": "route-a4",
+            "route_context_hash": "sha256:route-a4",
+            "prompt_contract_id": "rprompt-a4",
+            "prompt_contract_hash": "sha256:prompt-a4",
+            "route_token_ref": "rtok-a4",
+            "visible_injection_manifest_hash": "sha256:visible-a4",
+        },
+    )
     close_ready = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -6899,6 +6921,9 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
     )
     assert current["timeline_refs"]["close_ready_event_ref"] == (
         f"timeline:{close_ready['id']}"
+    )
+    assert current["timeline_refs"]["route_action_precheck_event_ref"] == (
+        f"timeline:{route_action_precheck['id']}"
     )
     assert current["graph_trace_refs"]["trace_ids"] == [
         "gqt-finish-payload",
