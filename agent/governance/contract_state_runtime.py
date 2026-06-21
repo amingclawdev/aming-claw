@@ -161,10 +161,8 @@ _STRICT_REQUIREMENT_IDENTITY_FIELD_ALIASES = {
 
 _STRICT_EVENT_IDENTITY_FIELD_ALIASES = {
     "writer_role": (
-        "writer_role",
         "actor_role",
         "lane_actor_role",
-        "worker_role",
         "role",
     ),
     "route_token_ref": ("route_token_ref",),
@@ -504,6 +502,33 @@ def _normalized_writer_role(value: Any) -> str:
     return role
 
 
+def _trusted_meta_contract_gate_containers(
+    event: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = []
+    gate = event.get("meta_contract_gate")
+    if isinstance(gate, Mapping):
+        containers.append(gate)
+    for payload in _event_payloads(event):
+        gate = payload.get("meta_contract_gate")
+        if isinstance(gate, Mapping):
+            containers.append(gate)
+    return containers
+
+
+def _trusted_writer_role_value(event: Mapping[str, Any]) -> str:
+    for gate in _trusted_meta_contract_gate_containers(event):
+        for field in ("role", "actor_role"):
+            token = str(gate.get(field) or "").strip()
+            if token:
+                return token
+    for field in ("actor_role", "lane_actor_role", "role"):
+        token = str(event.get(field) or "").strip()
+        if token:
+            return token
+    return ""
+
+
 def _strict_requirement_identity_expectations(
     requirement: Mapping[str, Any],
 ) -> dict[str, str]:
@@ -536,6 +561,8 @@ def _strict_event_identity_value(
     event: Mapping[str, Any],
     canonical: str,
 ) -> str:
+    if canonical == "writer_role":
+        return _trusted_writer_role_value(event)
     aliases = set(_STRICT_EVENT_IDENTITY_FIELD_ALIASES.get(canonical) or ())
     if not aliases:
         return ""
@@ -585,6 +612,13 @@ def _strict_requirement_identity_hint(
         "expected_identity": dict(expectations),
         "required_payload_fields": _dedupe_nonempty(required_payload_fields),
         "match_policy": "all_declared_identity_fields",
+        "trusted_writer_role_sources": [
+            "meta_contract_gate.role",
+            "meta_contract_gate.actor_role",
+            "event.actor_role",
+            "event.lane_actor_role",
+            "event.role",
+        ],
     }
 
 

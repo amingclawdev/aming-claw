@@ -1906,6 +1906,7 @@ def _strict_worker_identity_contract():
 def _strict_worker_identity_payload(**overrides):
     payload = {
         "writer_role": "mf_sub",
+        "meta_contract_gate": {"role": "mf_sub"},
         "route_token_ref": "rtok-expected",
         "runtime_context_id": "mfrctx-expected",
         "task_id": "task-expected",
@@ -1915,6 +1916,42 @@ def _strict_worker_identity_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_strict_worker_identity_requirement_rejects_payload_self_declared_writer_role():
+    payload = _strict_worker_identity_payload(worker_role="mf_sub")
+    payload.pop("meta_contract_gate")
+
+    projection = build_contract_state_projection(
+        [_event(899, "implementation", payload=payload)],
+        contract=_strict_worker_identity_contract(),
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["contract_complete"] is False
+    assert projection["missing_evidence"] == ["worker_implementation"]
+    assert projection["completed_evidence"] == []
+
+
+def test_strict_worker_identity_requirement_rejects_conflicting_trusted_writer_role():
+    projection = build_contract_state_projection(
+        [
+            _event(
+                899,
+                "implementation",
+                payload=_strict_worker_identity_payload(
+                    writer_role="mf_sub",
+                    meta_contract_gate={"role": "observer"},
+                ),
+            )
+        ],
+        contract=_strict_worker_identity_contract(),
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["contract_complete"] is False
+    assert projection["missing_evidence"] == ["worker_implementation"]
+    assert projection["completed_evidence"] == []
 
 
 def test_strict_worker_identity_requirement_accepts_matching_event():
@@ -1939,23 +1976,23 @@ def test_strict_worker_identity_requirement_accepts_matching_event():
 
 
 def test_strict_worker_identity_requirement_rejects_wrong_identity_fields():
-    wrong_values = {
-        "writer_role": "observer",
-        "route_token_ref": "rtok-wrong",
-        "runtime_context_id": "mfrctx-wrong",
-        "task_id": "task-wrong",
-        "parent_task_id": "parent-wrong",
-        "worker_slot_id": "worker-slot-wrong",
-        "fence_token_hash": "sha256:fence-wrong",
+    wrong_overrides = {
+        "writer_role": {"meta_contract_gate": {"role": "observer"}},
+        "route_token_ref": {"route_token_ref": "rtok-wrong"},
+        "runtime_context_id": {"runtime_context_id": "mfrctx-wrong"},
+        "task_id": {"task_id": "task-wrong"},
+        "parent_task_id": {"parent_task_id": "parent-wrong"},
+        "worker_slot_id": {"worker_slot_id": "worker-slot-wrong"},
+        "fence_token_hash": {"fence_token_hash": "sha256:fence-wrong"},
     }
 
-    for field, wrong_value in wrong_values.items():
+    for field, overrides in wrong_overrides.items():
         projection = build_contract_state_projection(
             [
                 _event(
                     901,
                     "implementation",
-                    payload=_strict_worker_identity_payload(**{field: wrong_value}),
+                    payload=_strict_worker_identity_payload(**overrides),
                 )
             ],
             contract=_strict_worker_identity_contract(),
@@ -1978,6 +2015,12 @@ def test_strict_worker_identity_next_action_hint_exposes_expected_fields():
     assert hint["event_kind"] == "implementation"
     assert hint["actor_role"] == "mf_sub"
     assert hint["strict_identity"]["match_policy"] == "all_declared_identity_fields"
+    assert "meta_contract_gate.role" in hint["strict_identity"][
+        "trusted_writer_role_sources"
+    ]
+    assert "payload.writer_role" not in hint["strict_identity"][
+        "trusted_writer_role_sources"
+    ]
     assert hint["expected_identity"] == {
         "writer_role": "mf_sub",
         "route_token_ref": "rtok-expected",
