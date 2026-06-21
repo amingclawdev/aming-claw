@@ -25,6 +25,31 @@ CONTRACT_PASS_STATUSES = {
     "succeeded",
 }
 
+_DEFAULT_REQUIREMENT_ORDER = {
+    "route_context": 100,
+    "route_action_precheck": 200,
+    "observer_work_mode_transition": 250,
+    "bounded_implementation_worker_dispatch": 300,
+    "dispatch_bounded_worker": 300,
+    "mf_subagent_dispatch": 300,
+    "read_receipt": 350,
+    "mf_subagent_startup": 400,
+    "worker_graph_trace": 450,
+    "graph_trace": 450,
+    "implementation": 500,
+    "worker_implementation": 500,
+    "record_finish_time_worker_attestation": 550,
+    "finish_gate": 600,
+    "independent_verification_lane": 700,
+    "independent_verification": 700,
+    "independent_qa": 700,
+    "independent_qa_lane": 700,
+    "qa_review": 720,
+    "qa_verification": 720,
+    "verification": 800,
+    "close_ready": 900,
+}
+
 _CONTRACT_REVISION_FIELD_NAMES = {
     "contract_revision_id",
     "current_revision_id",
@@ -838,6 +863,7 @@ def _normalize_requirement(
     index: int,
     condition: Mapping[str, Any] | None = None,
     conditional: bool = False,
+    semantic_default_order: bool = False,
 ) -> dict[str, Any] | None:
     if isinstance(item, Mapping):
         requirement_id = str(
@@ -858,7 +884,12 @@ def _normalize_requirement(
     step.setdefault("action", f"record_{requirement_id}")
     step.setdefault("source", "contract_state")
     step.setdefault("precedence", "active_contract_missing_step")
-    step.setdefault("order", index)
+    if "order" not in step or step.get("order") in (None, ""):
+        step["order"] = (
+            _DEFAULT_REQUIREMENT_ORDER.get(requirement_id, 10000) + index
+            if semantic_default_order
+            else index
+        )
     step["conditional"] = bool(conditional)
     if condition:
         step["condition"] = dict(condition)
@@ -1522,11 +1553,17 @@ def _requirement_steps(
     default_required_evidence: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     raw = root.get("evidence_requirements") or root.get("required_evidence") or []
+    raw_from_default = False
     if not raw:
         raw = default_required_evidence
+        raw_from_default = True
     required: list[dict[str, Any]] = []
     for index, item in enumerate(raw):
-        step = _normalize_requirement(item, index=index)
+        step = _normalize_requirement(
+            item,
+            index=index,
+            semantic_default_order=raw_from_default,
+        )
         if step:
             required.append(step)
 
@@ -2460,8 +2497,9 @@ def build_contract_state_projection(
         missing_steps,
         key=lambda step: int(step.get("order") or 0),
     )
+    requirement_contract_active = bool(has_explicit_contract and requirement_steps)
     next_legal_action: dict[str, Any] | None = None
-    if has_explicit_contract and requirements_explicit and ordered_next_steps:
+    if requirement_contract_active and ordered_next_steps:
         first = ordered_next_steps[0]
         next_legal_action = {
             "id": first["id"],

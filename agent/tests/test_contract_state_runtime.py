@@ -537,6 +537,42 @@ def test_non_onboard_contract_uses_same_projection_path():
     assert projection["next_legal_action"]["id"] == "verification"
 
 
+def test_default_mf_parallel_requirements_still_drive_next_action_order():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_revision_id": "rev-mf-defaults",
+            "state": "bound",
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        default_required_evidence=[
+            "close_ready",
+            "implementation",
+            "verification",
+        ],
+    )
+
+    assert projection["requirements_explicit"] is False
+    assert projection["missing_evidence"] == [
+        "implementation",
+        "verification",
+        "close_ready",
+    ]
+    assert projection["next_legal_action"]["id"] == "implementation"
+    assert projection["next_legal_action"]["contract_execution_id"] == projection[
+        "active_contract_execution"
+    ]["contract_execution_id"]
+    assert projection["active_lane_contract"]["next_legal_action"]["id"] == (
+        "implementation"
+    )
+
+
 def test_onboard_complete_exposes_successor_candidates_as_next_action():
     contract = {
         "contract": {
