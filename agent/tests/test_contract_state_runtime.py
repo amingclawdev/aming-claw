@@ -681,6 +681,66 @@ def test_selected_hotfix_successor_uses_template_requirements_before_next_succes
     ] == ["mf_parallel.v1", "qa_evidence_gate_review.v1"]
 
 
+def test_successor_missing_step_does_not_inherit_selection_event_id():
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_chain_id": "cchain-selection-pollution",
+            "contract_execution_id": "cex-onboard-root",
+            "contract_revision_id": "rev-selection-pollution",
+            "state": "selected",
+            "required_evidence": ["route_context"],
+            "successor_contract_policy": {
+                "candidates": [
+                    {"contract_template_id": "observer_hotfix_direct_mutation.v1"}
+                ]
+            },
+        }
+    }
+    hotfix_template = {
+        "template_id": "observer_hotfix_direct_mutation.v1",
+        "evidence_requirements": [
+            {"id": "hotfix_pre_reason", "event_kind": "hotfix_entered"},
+            {"id": "hotfix_post_action_summary", "event_kind": "hotfix_under_action"},
+        ],
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(5920, "route_context"),
+            _event(
+                5921,
+                "contract_binding",
+                payload={
+                    "successor_contract": {
+                        "contract_chain_id": "cchain-selection-pollution",
+                        "parent_contract_execution_id": "cex-onboard-root",
+                        "successor_contract_execution_id": "cex-hotfix",
+                        "contract_template_id": "observer_hotfix_direct_mutation.v1",
+                    }
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        contract_templates={
+            "observer_hotfix_direct_mutation.v1": hotfix_template,
+        },
+    )
+
+    state = projection["selected_successor_contract_state"]
+    assert state["missing_evidence"] == [
+        "hotfix_pre_reason",
+        "hotfix_post_action_summary",
+    ]
+    assert projection["next_legal_action"]["id"] == "hotfix_pre_reason"
+    for step in state["ordered_next_steps"]:
+        assert "5921" not in step.get("accepted_event_ids", [])
+    for step in projection["next_legal_action"]["ordered_missing_steps"]:
+        assert "5921" not in step.get("accepted_event_ids", [])
+
+
 def test_nested_successor_binding_after_hotfix_is_parent_scoped():
     contract = {
         "contract": {

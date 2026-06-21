@@ -475,6 +475,10 @@ def _event_numeric_id(event: Mapping[str, Any]) -> int:
     return 0
 
 
+def _event_ref_id(event: Mapping[str, Any]) -> str:
+    return str(event.get("id") or event.get("event_id") or "").strip()
+
+
 def _payload_field_value(value: Any, field_names: set[str], *, depth: int = 0) -> str:
     if depth > 6:
         return ""
@@ -1345,7 +1349,7 @@ def _event_satisfies_requirement(
         or ""
     ).strip()
     if required_execution_id:
-        event_id = str(event.get("id") or event.get("event_id") or "").strip()
+        event_id = _event_ref_id(event)
         accepted_event_ids = set(_string_list(requirement.get("accepted_event_ids")))
         execution_ids = {
             str(event.get(field) or "").strip()
@@ -1949,13 +1953,32 @@ def _contract_requirements_state(
         backlog_row,
         default_required_evidence=default_required_evidence,
     )
+    handoff_event_id = str(root.get("handoff_event_id") or "").strip()
+    handoff_event = next(
+        (
+            event
+            for event in events
+            if handoff_event_id and _event_ref_id(event) == handoff_event_id
+        ),
+        None,
+    )
     scoped_steps: list[dict[str, Any]] = []
     for requirement in requirement_steps:
         step = dict(requirement)
         if contract_execution_id:
             step.setdefault("contract_execution_id", contract_execution_id)
-        handoff_event_id = str(root.get("handoff_event_id") or "").strip()
-        if handoff_event_id:
+        if handoff_event_id and handoff_event is not None:
+            handoff_probe = dict(step)
+            handoff_probe.pop("contract_execution_id", None)
+            handoff_probe.pop("required_contract_execution_id", None)
+            handoff_probe.pop("accepted_event_ids", None)
+            handoff_matches_requirement, _ = _event_satisfies_requirement(
+                handoff_event,
+                handoff_probe,
+            )
+        else:
+            handoff_matches_requirement = False
+        if handoff_matches_requirement:
             accepted_event_ids = _string_list(step.get("accepted_event_ids"))
             if handoff_event_id not in accepted_event_ids:
                 accepted_event_ids.append(handoff_event_id)

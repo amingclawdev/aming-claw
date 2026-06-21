@@ -27629,6 +27629,45 @@ def _observer_root_route_next_legal_action_from_steps(
     }
 
 
+def _observer_root_route_contract_state_action_has_priority(
+    action: Mapping[str, Any],
+) -> bool:
+    action_id = str(action.get("id") or action.get("action") or "").strip()
+    if not action_id or action_id in {"close_ready", "successor_contract_complete"}:
+        return False
+    source = str(action.get("source") or "").strip()
+    if source and source != "contract_state":
+        return False
+    if action_id == "select_successor_contract" and action.get(
+        "successor_contract_candidates"
+    ):
+        return True
+    selected_state = action.get("selected_successor_contract_state")
+    if not isinstance(selected_state, Mapping) or not selected_state:
+        return False
+    ordered_steps = action.get("ordered_missing_steps")
+    if isinstance(ordered_steps, list) and ordered_steps:
+        return True
+    precedence = str(action.get("precedence") or "").strip().lower()
+    missing_source = str(action.get("ordered_missing_steps_source") or "").strip().lower()
+    if "successor" in precedence and (
+        "missing_step" in precedence or "contract_selection" in precedence
+    ):
+        return True
+    return (
+        missing_source
+        in {
+            "selected_successor_contract_state",
+            "nested_successor_contract_state",
+            "deep_successor_contract_state",
+        }
+        or (
+            missing_source.startswith("successor_depth_")
+            and missing_source.endswith("_contract_state.v1")
+        )
+    )
+
+
 def _observer_root_route_normalize_action(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
 
@@ -28280,18 +28319,30 @@ def _observer_root_route_context_state(
         if isinstance(contract_state.get("next_legal_action"), dict)
         else {}
     )
+    contract_state_action_has_priority = (
+        _observer_root_route_contract_state_action_has_priority(contract_next_action)
+    )
+    contract_action_steps = contract_ordered_steps
+    if not contract_action_steps and contract_state_action_has_priority:
+        contract_action_steps = [
+            step
+            for step in (contract_next_action.get("ordered_missing_steps") or [])
+            if isinstance(step, dict) and str(step.get("id") or "").strip()
+        ]
     active_contract_execution = (
         contract_state.get("active_contract_execution")
         if isinstance(contract_state.get("active_contract_execution"), dict)
         else {}
     )
     contract_missing_step_active = bool(
-        active_contract_execution and contract_next_action and contract_ordered_steps
+        active_contract_execution
+        and contract_next_action
+        and (contract_ordered_steps or contract_state_action_has_priority)
     )
     if contract_missing_step_active:
         merged_steps: list[dict[str, Any]] = []
         seen_step_ids: set[str] = set()
-        for step in [*contract_ordered_steps, *ordered_missing_steps]:
+        for step in [*contract_action_steps, *ordered_missing_steps]:
             step_id = str(step.get("id") or "").strip()
             if not step_id or step_id in seen_step_ids:
                 continue
@@ -28329,9 +28380,9 @@ def _observer_root_route_context_state(
     }
     context["work_mode_transition_gate"] = transition_gate
     if contract_missing_step_active:
-        contract_missing_prerequisites = [
-            step["id"] for step in contract_ordered_steps
-        ]
+        contract_missing_prerequisites = [step["id"] for step in contract_action_steps]
+        if not contract_missing_prerequisites and contract_next_action.get("id"):
+            contract_missing_prerequisites = [str(contract_next_action["id"])]
         deferred_missing_prerequisites = [
             step["id"]
             for step in ordered_missing_steps
@@ -28379,7 +28430,7 @@ def _observer_root_route_context_state(
     close_next_legal_action = _observer_root_route_close_next_legal_action(
         close_action_card
     )
-    if close_next_legal_action:
+    if close_next_legal_action and not contract_missing_step_active:
         context["next_legal_action"] = close_next_legal_action
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),

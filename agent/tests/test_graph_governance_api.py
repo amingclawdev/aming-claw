@@ -19124,6 +19124,126 @@ def test_observer_root_route_context_includes_contract_state_projection(conn):
     assert result["contract_state"]["legacy_no_contract"] is False
 
 
+def test_observer_root_route_context_prioritizes_successor_contract_state_action(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-SUCCESSOR-STATE-ACTION"
+    task_id = "root-route-context-successor-state-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "contract": {
+                        "contract_id": "onboard_contract.v1",
+                        "contract_template_id": "onboard_contract.v1",
+                        "contract_chain_id": "cchain-root-route-successor",
+                        "contract_execution_id": "cex-onboard-root",
+                        "contract_revision_id": "crev-root-successor",
+                        "state": "selected",
+                        "required_evidence": ["route_context"],
+                        "route_topology_policy": {
+                            "selected_topology": "observer_led_parallel_lanes",
+                            "recommended_topology": "mf_parallel.v1",
+                        },
+                        "successor_contract_policy": {
+                            "candidates": [
+                                {
+                                    "contract_template_id": (
+                                        "observer_hotfix_direct_mutation.v1"
+                                    )
+                                }
+                            ]
+                        },
+                    },
+                    "contract_templates": {
+                        "observer_hotfix_direct_mutation.v1": {
+                            "template_id": "observer_hotfix_direct_mutation.v1",
+                            "evidence_requirements": [
+                                {
+                                    "id": "hotfix_pre_reason",
+                                    "event_kind": "hotfix_entered",
+                                },
+                                {
+                                    "id": "hotfix_post_action_summary",
+                                    "event_kind": "hotfix_under_action",
+                                },
+                            ],
+                        }
+                    },
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    route_identity = {
+        "route_id": "route-root-successor-state",
+        "route_context_hash": _fake_sha("root-successor-state-route"),
+        "prompt_contract_id": "rprompt-root-successor-state",
+        "prompt_contract_hash": _fake_sha("root-successor-state-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("root-successor-state-visible"),
+    }
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="route.context",
+        event_kind="route_context",
+        phase="route_context",
+        actor="observer",
+        status="passed",
+        payload={
+            **route_identity,
+            "route_context": {
+                **route_identity,
+                "caller_role": "observer",
+                "allowed_actions": ["dispatch_worker"],
+            },
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="contract.binding",
+        event_kind="contract_binding",
+        phase="contract_binding",
+        actor="observer",
+        status="passed",
+        payload={
+            "successor_contract": {
+                "contract_chain_id": "cchain-root-route-successor",
+                "parent_contract_execution_id": "cex-onboard-root",
+                "successor_contract_execution_id": "cex-hotfix",
+                "contract_template_id": "observer_hotfix_direct_mutation.v1",
+            }
+        },
+    )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        caller_graph_query_schema_trace_id="gqt-20260621-abcdef1234",
+        materialize_requested_work_mode=True,
+    )
+
+    assert result["work_mode"] == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
+    assert result["contract_state"]["next_legal_action"]["id"] == "hotfix_pre_reason"
+    assert result["next_legal_action"]["id"] == "hotfix_pre_reason"
+    assert result["next_legal_action"]["contract_execution_id"] == "cex-hotfix"
+    assert result["next_legal_action"]["ordered_missing_steps_source"] == (
+        "selected_successor_contract_state"
+    )
+    assert "dispatch_bounded_worker" in result["next_legal_action"][
+        "deferred_missing_prerequisites"
+    ]
+
+
 def test_observer_root_route_context_resolves_route_token_ref_identity(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-ROUTE-REF"
     task_id = "root-route-context-route-ref-task"
