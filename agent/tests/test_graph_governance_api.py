@@ -4778,7 +4778,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "target_project_root",
                 "worker_session_id",
                 "filer_principal",
-                "worker_transcript_path",
+                "worker_transcript_ref or worker_transcript_path",
                 "harness_type",
                 "graph_trace_ids",
                 "read_receipt_event_id",
@@ -4881,6 +4881,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert finish_time_submission["body"]["finish_time_worker_self_attestation"] == (
         "<returned finish_time_worker_self_attestation>"
     )
+    finish_time_guidance = write_guides["finish_time_worker_attestation"][
+        "transcript_guidance"
+    ]
+    assert finish_time_guidance["ref_only_supported"] is True
+    assert "worker_transcript_ref" in finish_time_guidance["codex_multi_agent"]
+    assert "omit worker_transcript_path" in finish_time_guidance["codex_multi_agent"]
     assert finish_time_submission["reminders"][
         "raw_finish_time_attestation_alone_close_satisfying"
     ] is False

@@ -7957,12 +7957,23 @@ def _runtime_context_worker_guide_response(
                 "target_project_root",
                 "worker_session_id",
                 "filer_principal",
-                "worker_transcript_path",
+                "worker_transcript_ref or worker_transcript_path",
                 "harness_type",
                 "graph_trace_ids",
                 "read_receipt_event_id",
                 "test_results",
             ],
+            "transcript_guidance": {
+                "codex_multi_agent": (
+                    "Use worker_transcript_ref with harness_type=codex and omit "
+                    "worker_transcript_path unless a readable local JSONL path exists."
+                ),
+                "path_rule": (
+                    "If worker_transcript_path is supplied it must resolve on the "
+                    "governance host; otherwise use ref-only transcript evidence."
+                ),
+                "ref_only_supported": True,
+            },
             "server_derived_fields": [
                 "route_identity",
                 "head_commit",
