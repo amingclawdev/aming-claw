@@ -20710,6 +20710,99 @@ def test_timeline_append_meta_contract_prefers_worker_role_over_route_gate_obser
     assert payload["route_token_gate"]["caller_role"] == "observer"
 
 
+def test_timeline_append_meta_contract_allows_worker_authored_verification(conn):
+    backlog_id = "AC-META-CONTRACT-WORKER-VERIFICATION"
+    task_id = "worker-verification-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "mf.verification",
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "worker-runtime-context-1",
+                "status": "passed",
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "runtime_context_id": "mfrctx-worker-verification",
+                    "task_id": task_id,
+                    "parent_task_id": backlog_id,
+                    "test_results": {
+                        "status": "passed",
+                        "commands": ["node tests/planner.test.mjs"],
+                    },
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    assert result["event_kind"] == "verification"
+    assert result["meta_contract_gate"]["role"] == "mf_sub"
+    assert result["meta_contract_gate"]["action"] == "worker_progress"
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="verification",
+    )[0]
+    assert event["payload"]["worker_role"] == "mf_sub"
+    assert event["payload"]["meta_contract_gate"]["action"] == "worker_progress"
+
+
+def test_timeline_append_meta_contract_rejects_observer_authored_worker_verification(conn):
+    backlog_id = "AC-META-CONTRACT-OBSERVER-WORKER-VERIFICATION"
+    task_id = "observer-worker-verification-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": "mf.verification",
+                    "event_kind": "verification",
+                    "phase": "verification",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "worker_role": "mf_sub",
+                        "runtime_context_id": "mfrctx-observer-worker-verification",
+                        "task_id": task_id,
+                        "parent_task_id": backlog_id,
+                        "test_results": {"status": "passed"},
+                    },
+                    "route_waiver": _route_waiver(
+                        "task_timeline_append",
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "meta_contract_whitelist_rejected"
+    assert "author_worker_evidence" in exc.value.message
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="verification",
+    ) == []
+
+
 def _route_identity_from_issued_route(issued: dict) -> dict:
     return {
         "route_id": issued["route_id"],

@@ -5517,9 +5517,24 @@ def _meta_generic_verification_is_qa(event: Mapping[str, Any]) -> bool:
     return False
 
 
+def _meta_generic_verification_is_worker(event: Mapping[str, Any]) -> bool:
+    actor_role = _meta_normalize_role(event.get("actor"))
+    if actor_role == MF_SUB_ROLE:
+        return True
+    for key in ("worker_role", "lane_role", "role", "caller_role", "actor_role"):
+        if (
+            _meta_normalize_role(_meta_first_evidence_string(event, (key,)))
+            == MF_SUB_ROLE
+        ):
+            return True
+    return _meta_worker_evidence_present(event)
+
+
 def _meta_action_from_event(event: Mapping[str, Any]) -> str:
     for marker in _meta_event_markers(event):
         if marker == "verification":
+            if _meta_generic_verification_is_worker(event):
+                return "worker_progress"
             return (
                 "qa_verification"
                 if _meta_generic_verification_is_qa(event)
