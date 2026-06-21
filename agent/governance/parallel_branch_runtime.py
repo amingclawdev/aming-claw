@@ -2764,6 +2764,14 @@ def _runtime_context_event_kind_token(event: Mapping[str, Any]) -> str:
     )
 
 
+def _runtime_context_is_implementation_event_kind(event_kind: str) -> bool:
+    return event_kind in {
+        "implementation",
+        "implementation_evidence",
+        "worker_implementation",
+    }
+
+
 def _runtime_context_is_finish_time_worker_attestation_event(
     event: Mapping[str, Any],
     *,
@@ -2985,7 +2993,7 @@ def _runtime_context_timeline_derived_evidence(
             )
         ):
             timeline_refs.setdefault("route_action_precheck_event_ref", event_ref)
-        if event_kind in {"implementation", "worker_implementation"} and event_ref:
+        if _runtime_context_is_implementation_event_kind(event_kind) and event_ref:
             implementation_refs.append(event_ref)
         if (
             event_kind in {"verification", "qa_verification", "independent_verification"}

@@ -6503,6 +6503,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_re
                     "worker_role": "mf_sub",
                     "summary": "copy-safe parent backlog route ref path",
                 },
+                "event_kind": "implementation_evidence",
                 "route_id": backlog_scoped_parent["route_id"],
                 "route_context_hash": backlog_scoped_parent["route_context_hash"],
                 "prompt_contract_id": backlog_scoped_parent["prompt_contract_id"],
@@ -6533,6 +6534,45 @@ def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_re
     assert "parent_route_lineage" not in payload
     assert payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
     assert "route_token" not in payload
+
+
+def test_runtime_context_service_refs_accept_legacy_implementation_evidence_kind(
+    conn,
+):
+    event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-service-legacy-impl-task",
+        backlog_id="AC-RUNTIME-SERVICE-LEGACY-IMPL",
+        event_type="mf.implementation",
+        event_kind="implementation_evidence",
+        phase="implementation",
+        actor="worker-runtime-service-legacy-impl",
+        status="passed",
+        payload={
+            "runtime_context_id": "mfrctx-runtime-service-legacy-impl",
+            "task_id": "runtime-service-legacy-impl-task",
+            "parent_task_id": "runtime-service-legacy-impl-parent",
+            "worker_role": "mf_sub",
+            "graph_trace_ids": ["gqt-runtime-service-legacy-impl"],
+        },
+        commit_sha="impl-runtime-service-legacy-impl",
+    )
+
+    refs, startup_event, finish_event, close_event = (
+        server._runtime_context_service_timeline_refs(
+            conn,
+            project_id=PID,
+            task_id="runtime-service-legacy-impl-task",
+            backlog_id="AC-RUNTIME-SERVICE-LEGACY-IMPL",
+        )
+    )
+
+    assert refs["implementation_event_refs"] == [f"timeline:{event['id']}"]
+    assert refs["graph_trace_ids"] == ["gqt-runtime-service-legacy-impl"]
+    assert not startup_event.get("event_id")
+    assert not finish_event.get("event_id")
+    assert not close_event.get("event_id")
 
 
 def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_lineage(

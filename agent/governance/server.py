@@ -6898,6 +6898,12 @@ def _runtime_context_service_timeline_refs(
         ref = _runtime_context_event_ref(event)
         if not ref:
             continue
+        is_implementation = (
+            event_kind_normalized
+            in {"implementation", "implementation_evidence", "worker_implementation"}
+            or event_type_normalized in {"mf.implementation", "worker.implementation"}
+            or action_normalized == "record_implementation_evidence"
+        )
         is_read_receipt = "read_receipt" in haystack
         is_startup = (
             event_kind_normalized == "mf_subagent_startup"
@@ -6955,7 +6961,7 @@ def _runtime_context_service_timeline_refs(
         ):
             refs["close_ready_event_ref"] = ref
             close_event = dict(event)
-        if event_kind_normalized == "implementation":
+        if is_implementation:
             refs["implementation_event_refs"].append(ref)
         is_verification = (
             event_kind_normalized in {"verification", "qa_verification"}
@@ -6965,6 +6971,7 @@ def _runtime_context_service_timeline_refs(
             refs["verification_event_refs"].append(ref)
         if (
             is_verification
+            or is_implementation
             or is_finish_gate
             or is_finish_time_worker_attestation
             or event_kind_normalized == "close_ready"
@@ -11522,6 +11529,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     if isinstance(body.get("route_token_gate"), Mapping):
         payload["route_token_gate"] = body.get("route_token_gate")
 
+    requested_event_kind = str(body.get("event_kind") or "implementation").strip()
+    normalized_event_kind = requested_event_kind.lower().replace("-", "_")
+    event_kind = (
+        "implementation"
+        if normalized_event_kind
+        in {"implementation", "implementation_evidence", "worker_implementation"}
+        else requested_event_kind
+    )
+
     event_body = {
         "task_id": context.task_id,
         "backlog_id": context.backlog_id,
@@ -11531,7 +11547,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "prompt_contract_hash": event_route_identity.get("prompt_contract_hash") or "",
         "route_token_ref": event_route_identity.get("route_token_ref") or "",
         "event_type": body.get("event_type") or "mf.implementation",
-        "event_kind": body.get("event_kind") or "implementation",
+        "event_kind": event_kind,
         "phase": body.get("phase") or "implementation",
         "actor": (
             body.get("actor")

@@ -2245,6 +2245,85 @@ def test_runtime_context_current_values_prefer_finish_time_worker_attestation() 
     assert "finish_time_worker_attestation" not in next_required_ids
 
 
+def test_runtime_context_current_values_accept_legacy_implementation_evidence_kind() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    route_identity = {
+        "route_id": "route-runtime-context",
+        "route_context_hash": "sha256:route-runtime-context",
+        "prompt_contract_id": "rprompt-runtime-context",
+        "prompt_contract_hash": "sha256:prompt-runtime-context",
+        "route_token_ref": "rtok-runtime-context",
+        "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+    }
+
+    projection = build_runtime_context_projection(
+        context,
+        route_identity=route_identity,
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-runtime-context",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        timeline_events=[
+            {
+                "id": 7001,
+                "project_id": PROJECT_ID,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "mf.implementation",
+                "event_kind": "implementation_evidence",
+                "phase": "implementation",
+                "status": "passed",
+                "actor": context.worker_slot_id,
+                "commit_sha": "impl-runtime-context",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": context.fence_token,
+                    "graph_trace_ids": ["gqt-runtime-context"],
+                },
+            }
+        ],
+        startup_gate={
+            "runtime_context_id": runtime_context_id,
+            "fence_token_matches": True,
+            "route_id": route_identity["route_id"],
+            "route_context_hash": route_identity["route_context_hash"],
+            "prompt_contract_id": route_identity["prompt_contract_id"],
+            "prompt_contract_hash": route_identity["prompt_contract_hash"],
+            "route_token_ref": route_identity["route_token_ref"],
+            "read_receipt_hash": "sha256:read-runtime-context",
+            "read_receipt_event_id": "timeline:read-runtime-context",
+            "worker_session_id": "session-runtime-context",
+            "filer_principal": "session-runtime-context",
+            "worker_transcript_ref": "codex:test-runtime-context",
+            "harness_type": "codex",
+            "worker_self_attestation": {
+                "status": "passed",
+                "attestation_phase": "startup",
+                "worker_self_attesting": True,
+                "finish_time_self_attesting": False,
+            },
+        },
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        generated_at=NOW,
+    ).to_dict()
+
+    current_values = projection["views"]["current"]["current_values"]
+    action_plan = projection["views"]["action_plan"]
+    next_required_ids = {
+        item["id"] for item in action_plan["next_required_evidence"]
+    }
+
+    assert current_values["implementation_event_refs"] == ["timeline:7001"]
+    assert "implementation_evidence" not in next_required_ids
+    assert action_plan["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+
+
 def test_runtime_context_current_values_read_worker_progress_finish_time_attestation() -> None:
     context = _runtime_projection_context()
     runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
