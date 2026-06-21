@@ -8042,7 +8042,11 @@ def _runtime_context_worker_guide_response(
             finish_attestation_hint.get("actual_git_root") or target_project_root
         ),
         "test_results": hinted_test_results
-        or {"status": "passed", "passed": True},
+        or {
+            "status": "<worker-provided passed status>",
+            "passed": "<true only after worker-owned tests pass>",
+            "commands": ["<worker-owned test command evidence>"],
+        },
         **{
             field: str(route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS

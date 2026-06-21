@@ -4865,6 +4865,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     finish_time_submission = write_guides["finish_time_worker_attestation"][
         "finish_gate_submission"
     ]
+    finish_time_attestation_body = write_guides["finish_time_worker_attestation"][
+        "finish_time_worker_attestation_submission"
+    ]["body"]
+    assert finish_time_attestation_body["test_results"]["status"] == (
+        "<worker-provided passed status>"
+    )
     assert finish_time_submission["action"] == "record_finish_gate"
     assert finish_time_submission["name"] == "record_finish_gate"
     assert finish_time_submission["endpoint"] == "runtime_context.finish_gate"
