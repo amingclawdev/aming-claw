@@ -9503,20 +9503,10 @@ def _runtime_context_implementation_event_route_identity(
             from .mf_subagent_contract import route_token_required_failure_details
 
             try:
-                resolved = _resolve_route_token_ref_server_side(
-                    dict(body),
-                    pid=project_id,
-                    backlog_id=str(getattr(context, "backlog_id", "") or ""),
-                    task_id=str(getattr(context, "task_id", "") or ""),
-                    route_id=_route_request_identity_value(body, "route_id"),
-                    route_context_hash=_route_request_identity_value(
-                        body,
-                        "route_context_hash",
-                    ),
-                    prompt_contract_id=_route_request_identity_value(
-                        body,
-                        "prompt_contract_id",
-                    ),
+                resolved = _runtime_context_resolve_implementation_route_token_ref(
+                    body,
+                    project_id=project_id,
+                    context=context,
                 )
             except _orc.RouteTokenRefError as exc:
                 raise GovernanceError(
@@ -9552,6 +9542,66 @@ def _runtime_context_implementation_event_route_identity(
         context=context,
         parent_route_identity=parent_route_identity,
     )
+
+
+def _runtime_context_resolve_implementation_route_token_ref(
+    body: Mapping[str, Any],
+    *,
+    project_id: str,
+    context,
+) -> dict | None:
+    """Resolve implementation-evidence refs across child and parent scopes.
+
+    Bounded worker implementation evidence is recorded against the child
+    runtime task, but the observer-issued route token ref may be scoped to the
+    parent/root backlog route.  Resolve child first, then parent/root/backlog
+    candidates; the caller still validates the returned route identity against
+    the latest parent route before accepting it.
+    """
+
+    from . import observer_route_context as _orc
+
+    route_token_ref = str(body.get("route_token_ref") or "").strip()
+    if not route_token_ref or body.get("route_token"):
+        return None
+
+    route_id = _route_request_identity_value(body, "route_id")
+    route_context_hash = _route_request_identity_value(body, "route_context_hash")
+    prompt_contract_id = _route_request_identity_value(body, "prompt_contract_id")
+    backlog_id = str(getattr(context, "backlog_id", "") or "")
+    candidates = _runtime_context_service_dedupe(
+        [
+            str(getattr(context, "task_id", "") or ""),
+            str(body.get("parent_task_id") or ""),
+            str(getattr(context, "root_task_id", "") or ""),
+            backlog_id,
+        ]
+    )
+    if not candidates:
+        candidates = [""]
+
+    first_error: _orc.RouteTokenRefError | None = None
+    for task_id in candidates:
+        try:
+            resolved = _resolve_route_token_ref_server_side(
+                dict(body),
+                pid=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_id=route_id,
+                route_context_hash=route_context_hash,
+                prompt_contract_id=prompt_contract_id,
+            )
+        except _orc.RouteTokenRefError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        if resolved is not None:
+            return resolved
+
+    if first_error is not None:
+        raise first_error
+    return None
 
 
 def _runtime_context_validate_parent_bound_route_identity(

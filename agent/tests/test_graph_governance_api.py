@@ -6423,6 +6423,118 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
     assert "route_token" not in ref_only_payload
 
 
+def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_ref(
+    conn,
+    tmp_path,
+):
+    from agent.governance import observer_route_context
+
+    target_root = tmp_path / "runtime-parent-backlog-route-ref"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="runtime-parent-backlog-route-ref-task",
+            root_task_id="runtime-parent-backlog-route-ref-parent",
+            backlog_id="AC-RUNTIME-PARENT-BACKLOG-ROUTE-REF",
+            stage_task_id="runtime-parent-backlog-route-ref-task",
+            worker_id="worker-parent-backlog-route-ref",
+            worker_slot_id="slot-parent-backlog-route-ref",
+            branch_ref="refs/heads/codex/runtime-parent-backlog-route-ref-task",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-parent-backlog-route-ref",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-parent-backlog-route-ref"
+            ),
+        ),
+    )
+    backlog_scoped_parent = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.backlog_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-runtime-backlog-parent-route-ref"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=backlog_scoped_parent["route_token_ref"],
+        token=backlog_scoped_parent["route_token"],
+    )
+    backlog_parent_identity = {
+        "route_id": backlog_scoped_parent["route_id"],
+        "route_context_hash": backlog_scoped_parent["route_context_hash"],
+        "prompt_contract_id": backlog_scoped_parent["prompt_contract_id"],
+        "prompt_contract_hash": backlog_scoped_parent["route_token"][
+            "prompt_contract_hash"
+        ],
+        "route_token_ref": backlog_scoped_parent["route_token_ref"],
+        "visible_injection_manifest_hash": backlog_scoped_parent[
+            "visible_injection_manifest_hash"
+        ],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-backlog-parent-ref",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=backlog_parent_identity,
+    )
+
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": context.root_task_id,
+                "fence_token": "fence-parent-backlog-route-ref",
+                "session_token": "session-parent-backlog-route-ref",
+                "target_project_root": str(target_root),
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "summary": "copy-safe parent backlog route ref path",
+                },
+                "route_id": backlog_scoped_parent["route_id"],
+                "route_context_hash": backlog_scoped_parent["route_context_hash"],
+                "prompt_contract_id": backlog_scoped_parent["prompt_contract_id"],
+                "route_token_ref": backlog_scoped_parent["route_token_ref"],
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["timeline_event"]["event_kind"] == "implementation"
+    assert response["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    assert response["route_token_gate"]["route_token_ref"] == (
+        backlog_scoped_parent["route_token_ref"]
+    )
+    stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (response["timeline_event"]["id"],),
+    ).fetchone()
+    payload = json.loads(stored["payload_json"])
+    assert payload["route_id"] == backlog_parent_identity["route_id"]
+    assert payload["route_context_hash"] == backlog_parent_identity[
+        "route_context_hash"
+    ]
+    assert payload["prompt_contract_id"] == backlog_parent_identity[
+        "prompt_contract_id"
+    ]
+    assert payload["route_token_ref"] == backlog_scoped_parent["route_token_ref"]
+    assert "parent_route_lineage" not in payload
+    assert payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    assert "route_token" not in payload
+
+
 def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_lineage(
     conn,
     tmp_path,
