@@ -5479,8 +5479,6 @@ def _runtime_context_next_legal_action(
         for field in startup_identity_fields
     ):
         return "record_mf_subagent_startup"
-    if lane_plan.get("blocking_events"):
-        return "resolve_blocking_timeline_event"
     missing_fields = {
         _runtime_context_text(item.get("field"))
         for item in close_gate_view.get("missing") or []
@@ -5500,6 +5498,8 @@ def _runtime_context_next_legal_action(
     ):
         if field in missing_fields:
             return action
+    if lane_plan.get("blocking_events"):
+        return "resolve_blocking_timeline_event"
     if close_gate_view.get("ready"):
         return "handoff_review_ready"
     return "record_missing_evidence"

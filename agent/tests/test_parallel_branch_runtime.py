@@ -2707,6 +2707,65 @@ def test_runtime_context_lane_plan_blocking_event_does_not_fulfill_clause() -> N
     ]
 
 
+def test_runtime_context_action_plan_prioritizes_current_worker_step_over_old_blocker() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "startup_event_ref": "timeline:startup-accepted",
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+        },
+        timeline_events=[
+            {
+                "event_id": "timeline:startup-refused",
+                "event_kind": "mf_subagent_startup",
+                "task_id": context.task_id,
+                "created_at": "2026-06-21T15:00:00Z",
+                "status": "failed",
+            }
+        ],
+        startup_gate={
+            "runtime_context_id": branch_runtime_context_id(
+                PROJECT_ID,
+                context.task_id,
+            ),
+            "fence_token_matches": True,
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+            "read_receipt_hash": "sha256:read-runtime-context",
+            "read_receipt_event_id": "timeline:read-runtime-context",
+            "worker_session_id": "session-runtime-context",
+            "filer_principal": "session-runtime-context",
+            "worker_transcript_path": "/tmp/transcript-runtime-context.jsonl",
+            "harness_type": "codex",
+        },
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    next_required = action_plan["next_required_evidence"]
+    by_id = {item["id"]: item for item in next_required}
+
+    assert action_plan["next_legal_action"] == "record_implementation_evidence"
+    assert next_required[0]["id"] == "implementation_evidence"
+    assert "lane_blocking_event" in by_id
+    assert by_id["lane_blocking_event"]["next_action"] == (
+        "resolve_blocking_timeline_event"
+    )
+
+
 def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -> None:
     context = _runtime_projection_context(checkpoint_id="ckpt-runtime-context")
     private_secret = "raw-private-memory-secret"
