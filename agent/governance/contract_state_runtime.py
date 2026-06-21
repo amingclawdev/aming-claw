@@ -315,6 +315,34 @@ _QA_TIMELINE_EVENT_KINDS = {
     "qa_verification",
 }
 
+_QA_REQUIREMENT_EVENT_KIND_ALIASES = {
+    "independent_verification_lane": (
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+    ),
+    "independent_verification_evidence": (
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+    ),
+    "independent_qa": (
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+    ),
+    "independent_qa_lane": (
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+    ),
+    "qa_evidence_gate_review": (
+        "qa_review",
+        "qa_verification",
+        "independent_verification",
+    ),
+}
+
 _WORKER_TIMELINE_EVENT_KINDS = {
     "graph_trace",
     "implementation",
@@ -841,7 +869,11 @@ def _normalize_requirement(
         step.get("accepted_event_kinds")
         or step.get("event_kinds")
         or step.get("event_kind")
-    ) or [requirement_id]
+    )
+    step["accepted_event_kinds"] = _qa_requirement_event_kinds(
+        requirement_id,
+        step["accepted_event_kinds"],
+    )
     step["accepted_statuses"] = [
         item.lower()
         for item in (
@@ -853,12 +885,33 @@ def _normalize_requirement(
     return step
 
 
+def _qa_requirement_event_kinds(
+    requirement_id: str,
+    accepted_event_kinds: list[str],
+) -> list[str]:
+    aliases = list(_QA_REQUIREMENT_EVENT_KIND_ALIASES.get(requirement_id) or ())
+    if not aliases:
+        return accepted_event_kinds or [requirement_id]
+    if not accepted_event_kinds:
+        return aliases
+    if accepted_event_kinds == [requirement_id] or not any(
+        event_kind in _DIRECT_TIMELINE_APPEND_EVENT_KINDS
+        for event_kind in accepted_event_kinds
+    ):
+        return _dedupe_nonempty([*aliases, *accepted_event_kinds])
+    return accepted_event_kinds
+
+
 def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
     requirement_id = str(step.get("id") or "").strip()
     accepted_event_kinds = _string_list(
         step.get("accepted_event_kinds")
         or step.get("event_kinds")
         or step.get("event_kind")
+    )
+    accepted_event_kinds = _qa_requirement_event_kinds(
+        requirement_id,
+        accepted_event_kinds,
     )
     direct_event_kind = next(
         (
@@ -971,6 +1024,209 @@ def _completed_requirement_event_ref(
         for key in ("event_id", "event_kind", "status", "phase")
         if source.get(key) not in (None, "", [], {})
     }
+
+
+def _event_contract_execution_ids(event: Mapping[str, Any]) -> set[str]:
+    execution_ids = {
+        str(event.get(field) or "").strip()
+        for field in (
+            "active_contract_execution_id",
+            "contract_execution_id",
+            "parent_contract_execution_id",
+            "reviewed_contract_execution_id",
+            "successor_contract_execution_id",
+        )
+        if str(event.get(field) or "").strip()
+    }
+    for payload in _event_payloads(event):
+        for field in (
+            "active_contract_execution_id",
+            "contract_execution_id",
+            "parent_contract_execution_id",
+            "reviewed_contract_execution_id",
+            "successor_contract_execution_id",
+        ):
+            execution_id = _payload_field_value(payload, {field})
+            if execution_id:
+                execution_ids.add(execution_id)
+    return execution_ids
+
+
+def _close_ready_evidence_refs(
+    events: list[dict[str, Any]],
+    *,
+    contract_execution_id: str = "",
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    expected_execution_id = str(contract_execution_id or "").strip()
+    for event in events:
+        event_kind = str(event.get("event_kind") or "").strip()
+        is_close_ready = event_kind == "close_ready" or any(
+            _payload_declares_requirement(payload, "close_ready")
+            for payload in _event_payloads(event)
+        )
+        if not is_close_ready:
+            continue
+        status = str(event.get("status") or "").strip().lower()
+        if status and status not in CONTRACT_PASS_STATUSES:
+            continue
+        execution_ids = _event_contract_execution_ids(event)
+        if (
+            expected_execution_id
+            and execution_ids
+            and expected_execution_id not in execution_ids
+        ):
+            continue
+        event_id = _event_ref_id(event)
+        if not event_id:
+            continue
+        ref = f"timeline:{event_id}"
+        if ref in seen:
+            continue
+        seen.add(ref)
+        item = {
+            "ref": ref,
+            "event_id": event_id,
+            "event_kind": event_kind,
+            "status": str(event.get("status") or ""),
+        }
+        if expected_execution_id:
+            item["contract_execution_id"] = expected_execution_id
+        refs.append({key: value for key, value in item.items() if value})
+    return refs
+
+
+def _projection_task_id(row: Mapping[str, Any], backlog_id: str) -> str:
+    return str(
+        row.get("task_id")
+        or row.get("parent_task_id")
+        or row.get("bug_id")
+        or row.get("backlog_id")
+        or backlog_id
+        or ""
+    ).strip()
+
+
+def _backlog_target_files(row: Mapping[str, Any]) -> list[str]:
+    value = row.get("target_files") or row.get("target_file") or row.get("owned_files")
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = value
+        return _string_list(parsed)
+    return _string_list(value)
+
+
+def _backlog_close_route_token_request_hint(
+    *,
+    row: Mapping[str, Any],
+    backlog_id: str,
+    task_id: str,
+    route_binding: Mapping[str, Any],
+    route_token_ref: str,
+    close_ready_evidence_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    evidence_refs = [
+        str(item.get("ref") or "").strip()
+        for item in close_ready_evidence_refs
+        if str(item.get("ref") or "").strip()
+    ]
+    target_files = _backlog_target_files(row)
+    issue_request = {
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": task_id or backlog_id,
+        "target_files": target_files,
+        "allowed_actions": ["backlog_close"],
+        "evidence_refs": evidence_refs,
+    }
+    if route_token_ref:
+        issue_request["parent_route_token_ref"] = route_token_ref
+    route_identity = _public_route_identity(route_binding)
+    for field, value in route_identity.items():
+        if field == "route_token_ref":
+            continue
+        issue_request[f"parent_{field}"] = value
+    return {
+        "schema_version": "contract_state_backlog_close_route_token_request_hint.v1",
+        "action": "issue_route_token_ref",
+        "allowed_action": "backlog_close",
+        "allowed_actions": ["backlog_close"],
+        "protected_action": True,
+        "backlog_id": backlog_id,
+        "task_id": task_id or backlog_id,
+        "target_files": target_files,
+        "evidence_refs": evidence_refs,
+        "close_ready_evidence_refs": close_ready_evidence_refs,
+        "current_route_token_ref": route_token_ref,
+        "route_identity": route_identity,
+        "issue_route_token_request": issue_request,
+        "protected_entrypoint": {
+            "mcp_tool": "backlog_close",
+            "allowed_action": "backlog_close",
+        },
+        "route_token_issue_entrypoint": {
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "allowed_actions": ["backlog_close"],
+        },
+        "raw_route_token_exposed": False,
+        "raw_secret_exposed": False,
+    }
+
+
+def _backlog_close_next_action_after_close_ready(
+    *,
+    row: Mapping[str, Any],
+    backlog_id: str,
+    contract_chain_id: str,
+    contract_execution_id: str,
+    route_binding: Mapping[str, Any],
+    route_token_ref: str,
+    projection_watermark: Any,
+    close_ready_evidence_refs: list[dict[str, Any]],
+    precedence: str,
+    selected_successor_contract: Mapping[str, Any] | None = None,
+    selected_successor_contract_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    task_id = _projection_task_id(row, backlog_id)
+    route_token_request_hint = _backlog_close_route_token_request_hint(
+        row=row,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_binding=route_binding,
+        route_token_ref=route_token_ref,
+        close_ready_evidence_refs=close_ready_evidence_refs,
+    )
+    action = {
+        "id": "issue_backlog_close_route_token_then_backlog_close",
+        "action": "backlog_close",
+        "requirement_id": "backlog_close",
+        "detail": (
+            "close_ready evidence already exists; issue a backlog_close-scoped "
+            "route token and then call backlog_close by ref"
+        ),
+        "source": "contract_state",
+        "precedence": precedence,
+        "allowed_action": "backlog_close",
+        "protected_action": True,
+        "contract_chain_id": contract_chain_id,
+        "contract_execution_id": contract_execution_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "projection_watermark": projection_watermark,
+        "close_ready_evidence_refs": close_ready_evidence_refs,
+        "route_token_request_hint": route_token_request_hint,
+    }
+    if selected_successor_contract:
+        action["selected_successor_contract"] = dict(selected_successor_contract)
+    if selected_successor_contract_state:
+        action["selected_successor_contract_state"] = dict(
+            selected_successor_contract_state
+        )
+    return action
 
 
 def _action_candidate_template_ids(action: Mapping[str, Any]) -> list[str]:
@@ -1207,6 +1463,25 @@ def _next_action_summary(action: Mapping[str, Any] | None) -> dict[str, Any]:
     hint = action.get("timeline_append_hint")
     if isinstance(hint, Mapping) and hint:
         summary["timeline_append_hint"] = dict(hint)
+    for key in (
+        "protected_action",
+        "allowed_action",
+        "allowed_actions",
+        "route_token_request_hint",
+        "close_ready_evidence_refs",
+        "terminal_semantics",
+    ):
+        value = action.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, Mapping):
+            summary[key] = dict(value)
+        elif isinstance(value, list):
+            summary[key] = [
+                dict(item) if isinstance(item, Mapping) else item for item in value
+            ]
+        else:
+            summary[key] = value
     for key in ("blocked_by", "prerequisite_ids"):
         value = action.get(key)
         if value:
@@ -2939,21 +3214,41 @@ def build_contract_state_projection(
             "successor_contract_candidates": successor_candidates,
         }
     elif contract_complete:
-        successor_next_legal_action = {
-            "id": "close_ready",
-            "action": "record_close_ready",
-            "requirement_id": "close_ready",
-            "detail": "record close_ready and run the close gate after the active contract completes",
-            "source": "contract_state",
-            "precedence": "active_contract_terminal_close_ready",
-            "contract_chain_id": contract_chain_id,
-            "contract_execution_id": active_execution.get("contract_execution_id") or "",
-            "backlog_id": backlog_id,
-            "route_token_ref": active_execution.get("route_token_ref") or "",
-            "projection_watermark": projection_watermark,
-            "successor_contract_policy": successor_policy,
-            "successor_contract_candidates": successor_candidates,
-        }
+        active_contract_execution_id = str(
+            active_execution.get("contract_execution_id") or ""
+        ).strip()
+        close_ready_refs = _close_ready_evidence_refs(
+            rows,
+            contract_execution_id=active_contract_execution_id,
+        )
+        if close_ready_refs:
+            successor_next_legal_action = _backlog_close_next_action_after_close_ready(
+                row=row,
+                backlog_id=backlog_id,
+                contract_chain_id=contract_chain_id,
+                contract_execution_id=active_contract_execution_id,
+                route_binding=route_binding,
+                route_token_ref=str(active_execution.get("route_token_ref") or ""),
+                projection_watermark=projection_watermark,
+                close_ready_evidence_refs=close_ready_refs,
+                precedence="active_contract_terminal_backlog_close",
+            )
+        else:
+            successor_next_legal_action = {
+                "id": "close_ready",
+                "action": "record_close_ready",
+                "requirement_id": "close_ready",
+                "detail": "record close_ready and run the close gate after the active contract completes",
+                "source": "contract_state",
+                "precedence": "active_contract_terminal_close_ready",
+                "contract_chain_id": contract_chain_id,
+                "contract_execution_id": active_contract_execution_id,
+                "backlog_id": backlog_id,
+                "route_token_ref": active_execution.get("route_token_ref") or "",
+                "projection_watermark": projection_watermark,
+                "successor_contract_policy": successor_policy,
+                "successor_contract_candidates": successor_candidates,
+            }
 
     root_next_legal_action: dict[str, Any] | None = None
     if next_legal_action and active_execution:
@@ -3357,26 +3652,55 @@ def build_contract_state_projection(
                 "selected_successor_contract_state": latest_state,
             }
         elif latest_state.get("contract_complete"):
-            recursive_next_legal_action = {
-                "id": "close_ready",
-                "action": "record_close_ready",
-                "requirement_id": "close_ready",
-                "detail": (
-                    "record close_ready and run the close gate after the terminal "
-                    f"{latest_role} contract completes"
-                ),
-                "source": "contract_state",
-                "precedence": f"successor_depth_{latest_depth}_terminal_close_ready",
-                "contract_chain_id": contract_chain_id,
-                "contract_execution_id": latest_state.get("contract_execution_id")
-                or "",
-                "backlog_id": latest_selected.get("successor_backlog_id")
-                or backlog_id,
-                "route_token_ref": active_execution.get("route_token_ref") or "",
-                "projection_watermark": projection_watermark,
-                "selected_successor_contract": latest_selected,
-                "selected_successor_contract_state": latest_state,
-            }
+            latest_contract_execution_id = str(
+                latest_state.get("contract_execution_id") or ""
+            ).strip()
+            close_ready_refs = _close_ready_evidence_refs(
+                rows,
+                contract_execution_id=latest_contract_execution_id,
+            )
+            latest_backlog_id = (
+                latest_selected.get("successor_backlog_id") or backlog_id
+            )
+            if close_ready_refs:
+                recursive_next_legal_action = (
+                    _backlog_close_next_action_after_close_ready(
+                        row=row,
+                        backlog_id=latest_backlog_id,
+                        contract_chain_id=contract_chain_id,
+                        contract_execution_id=latest_contract_execution_id,
+                        route_binding=route_binding,
+                        route_token_ref=str(
+                            active_execution.get("route_token_ref") or ""
+                        ),
+                        projection_watermark=projection_watermark,
+                        close_ready_evidence_refs=close_ready_refs,
+                        precedence=(
+                            f"successor_depth_{latest_depth}_terminal_backlog_close"
+                        ),
+                        selected_successor_contract=latest_selected,
+                        selected_successor_contract_state=latest_state,
+                    )
+                )
+            else:
+                recursive_next_legal_action = {
+                    "id": "close_ready",
+                    "action": "record_close_ready",
+                    "requirement_id": "close_ready",
+                    "detail": (
+                        "record close_ready and run the close gate after the terminal "
+                        f"{latest_role} contract completes"
+                    ),
+                    "source": "contract_state",
+                    "precedence": f"successor_depth_{latest_depth}_terminal_close_ready",
+                    "contract_chain_id": contract_chain_id,
+                    "contract_execution_id": latest_contract_execution_id,
+                    "backlog_id": latest_backlog_id,
+                    "route_token_ref": active_execution.get("route_token_ref") or "",
+                    "projection_watermark": projection_watermark,
+                    "selected_successor_contract": latest_selected,
+                    "selected_successor_contract_state": latest_state,
+                }
         if recursive_next_legal_action:
             next_legal_action = dict(recursive_next_legal_action)
             successor_next_legal_action = dict(recursive_next_legal_action)
@@ -3438,14 +3762,7 @@ def build_contract_state_projection(
                     lane["next_legal_action"] = _next_action_summary(
                         recursive_next_legal_action
                     )
-    task_id = str(
-        row.get("task_id")
-        or row.get("parent_task_id")
-        or row.get("bug_id")
-        or row.get("backlog_id")
-        or backlog_id
-        or ""
-    ).strip()
+    task_id = _projection_task_id(row, backlog_id)
     route_action_precheck_ref = _completed_requirement_event_ref(
         completed_sources,
         "route_action_precheck",

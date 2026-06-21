@@ -31912,6 +31912,13 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
     bug_ids = {str(bug.get("bug_id") or "").strip() for bug in bugs if bug.get("bug_id")}
     if not bug_ids:
         return
+    bug_terminal_status_by_id = {
+        str(bug.get("bug_id") or "").strip(): (
+            str(bug.get("status") or "").strip().upper() in _BACKLOG_CLOSED_STATUSES
+        )
+        for bug in bugs
+        if bug.get("bug_id")
+    }
     try:
         rows = conn.execute(
             """SELECT *
@@ -31952,6 +31959,11 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
             and not is_recovery_command
         ):
             continue
+        if (
+            bug_terminal_status_by_id.get(backlog_id)
+            and not _observer_command_projection_is_terminal(command, projection)
+        ):
+            continue
         backlog_projection = {
             "schema_version": "observer_command_backlog_projection.v1",
             "source_of_truth": "Contract/Revision/Event",
@@ -31981,6 +31993,36 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
         projection = projections.get(str(bug.get("bug_id") or "").strip())
         if projection:
             bug["observer_command_projection"] = projection
+
+
+def _observer_command_projection_is_terminal(command: Mapping[str, Any], projection: Any) -> bool:
+    terminal_values = {
+        "completed",
+        "complete",
+        "closed",
+        "fixed",
+        "terminal",
+        "done",
+        "succeeded",
+    }
+    command_projection_status = str(
+        command.get("command_projection_status") or ""
+    ).strip().lower()
+    command_contract_state = str(command.get("canonical_contract_state") or "").strip().lower()
+    if command_projection_status in terminal_values or command_contract_state in terminal_values:
+        return True
+    if isinstance(projection, Mapping):
+        projection_status = str(
+            projection.get("command_projection_status") or ""
+        ).strip().lower()
+        projection_contract_state = str(
+            projection.get("canonical_contract_state") or ""
+        ).strip().lower()
+        if projection_status in terminal_values or projection_contract_state in terminal_values:
+            return True
+        if bool(projection.get("passed")) and projection_contract_state in terminal_values:
+            return True
+    return False
 
 
 def _backlog_summary(conn) -> dict:
@@ -34964,6 +35006,8 @@ def _mf_close_contract_with_route_context(contract: dict, row, body: Mapping[str
 
 def _mf_close_timeline_applicability(row) -> dict:
     policy = backlog_runtime.parse_json_object(_row_get(row, "bypass_policy_json", "{}"))
+    chain_trigger = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
+    contract_reasons = _contract_state_backlog_applicability_reasons(chain_trigger)
     raw_mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
     mf_type = backlog_runtime.normalize_mf_type(raw_mf_type, policy) if raw_mf_type else ""
     chain_stage = str(_row_get(row, "chain_stage", "") or "").strip()
@@ -34973,6 +35017,7 @@ def _mf_close_timeline_applicability(row) -> dict:
         prior_status == "MF_IN_PROGRESS"
         or mf_type
         or chain_stage_key in {"manual-fix", "observer-hotfix", "chain-rescue"}
+        or contract_reasons
     )
     reasons = []
     if prior_status == "MF_IN_PROGRESS":
@@ -34981,10 +35026,52 @@ def _mf_close_timeline_applicability(row) -> dict:
         reasons.append(f"mf_type={mf_type}")
     if chain_stage_key in {"manual-fix", "observer-hotfix", "chain-rescue"}:
         reasons.append(f"chain_stage={chain_stage}")
+    reasons.extend(contract_reasons)
     return {
         "is_mf": is_mf,
         "reason": ", ".join(reasons) if reasons else "not an MF/observer backlog row",
     }
+
+
+def _contract_state_backlog_applicability_reasons(chain_trigger: Any) -> list[str]:
+    trigger = chain_trigger if isinstance(chain_trigger, Mapping) else {}
+    if not trigger:
+        return []
+    keys: list[str] = []
+    direct_keys = (
+        "contract",
+        "contract_template_id",
+        "contract_execution_id",
+        "required_evidence",
+        "successor_contract_policy",
+        "active_contract_execution",
+        "parallel_contract",
+    )
+    for key in direct_keys:
+        value = trigger.get(key)
+        if value not in (None, "", [], {}):
+            keys.append(key)
+    nested_contract_keys = (
+        "template_id",
+        "contract_template_id",
+        "contract_execution_id",
+        "contract_instance_id",
+        "required_evidence",
+        "evidence_requirements",
+        "successor_contract_policy",
+    )
+    for parent_key in ("contract", "active_contract_execution", "parallel_contract"):
+        nested = trigger.get(parent_key)
+        if not isinstance(nested, Mapping):
+            continue
+        for key in nested_contract_keys:
+            value = nested.get(key)
+            if value not in (None, "", [], {}):
+                keys.append(f"{parent_key}.{key}")
+    if not keys:
+        return []
+    compact_keys = ",".join(sorted(set(keys))[:6])
+    return [f"chain_trigger_json.contract_state:{compact_keys}"]
 
 
 _MF_TIMELINE_REASON_HUMAN = {

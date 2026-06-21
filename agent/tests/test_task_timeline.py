@@ -10485,6 +10485,57 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("appropriate workflow", summary["next_legal_actions"][0])
         self.assertIn("close_ready/can_close success", summary["next_legal_actions"][0])
 
+    def test_contract_state_row_without_mf_label_is_applicable_to_timeline_precheck(self):
+        from agent.governance import server
+
+        contract_bug_id = "BUG-CONTRACT-STATE-NO-MF-PRECHECK"
+        plain_bug_id = "BUG-PLAIN-NON-MF-PRECHECK"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, chain_trigger_json, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', ?, '2026-06-18T00:00:00Z',
+                       '2026-06-18T00:00:00Z')""",
+            (
+                contract_bug_id,
+                "Contract-state row without MF label",
+                json.dumps(
+                    {
+                        "contract_template_id": "onboard_contract.v1",
+                        "contract_execution_id": "cex-contract-state-precheck",
+                        "required_evidence": ["route_context"],
+                        "successor_contract_policy": {
+                            "mode": "select_successor_contract",
+                            "candidates": ["observer_hotfix_direct_mutation.v1"],
+                        },
+                    }
+                ),
+            ),
+        )
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', '2026-06-18T00:00:00Z',
+                       '2026-06-18T00:00:00Z')""",
+            (plain_bug_id, "Plain non-MF precheck"),
+        )
+        self.conn.commit()
+
+        contract_result = server.handle_backlog_timeline_gate(
+            _ctx({"view": "compact"}, path_params={"bug_id": contract_bug_id})
+        )
+        plain_result = server.handle_backlog_timeline_gate(
+            _ctx({"view": "compact"}, path_params={"bug_id": plain_bug_id})
+        )
+
+        self.assertTrue(contract_result["applicable"], contract_result)
+        self.assertFalse(contract_result["can_close"])
+        self.assertIn("chain_trigger_json.contract_state", contract_result["reason"])
+        self.assertTrue(contract_result["gate_summary"]["applicable"])
+        self.assertFalse(contract_result["gate_summary"]["can_close"])
+        self.assertFalse(plain_result["applicable"], plain_result)
+        self.assertEqual(plain_result["reason"], "not an MF/observer backlog row")
+        self.assertFalse(plain_result["gate_summary"]["applicable"])
+
     def test_fixed_close_waiver_alert_still_flags_fixed_mf_compact_precheck(self):
         from agent.governance import server
 

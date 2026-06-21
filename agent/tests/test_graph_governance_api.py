@@ -1289,6 +1289,64 @@ def test_backlog_list_compact_includes_observer_command_terminal_projection(conn
     assert projection["superseded_route_identity"]["route_id"] == "route-repair-01c5a0404ba10777"
 
 
+def test_backlog_list_compact_hides_completed_command_with_stale_projection_for_fixed_row(conn):
+    observer_session.ensure_schema(conn)
+    backlog_id = "AC-OBSERVER-COMMAND-STALE-PROJECTION-FIXED-ROW"
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            backlog_id,
+            "Fixed row should not expose stale command next action",
+            "FIXED",
+            "2026-06-04T00:00:00Z",
+            "2026-06-04T00:00:00Z",
+        ),
+    )
+    stale_projection = {
+        "schema_version": "observer_command_terminal_projection.v1",
+        "source_of_truth": "Contract/Revision/Event",
+        "passed": False,
+        "canonical_contract_state": "running",
+        "command_projection_status": "claimed",
+        "next_legal_action": "dispatch_bounded_worker",
+        "canonical_route_identity": {"route_id": "route-stale-live-action"},
+    }
+    conn.execute(
+        """INSERT INTO observer_command_queue (
+               command_id, project_id, command_type, payload_json, status,
+               target_session_id, claimed_by_session_id, created_by, created_at,
+               notified_at, claimed_at, completed_at, result_json, error
+           ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, '')""",
+        (
+            "cmd-stale-fixed-row",
+            PID,
+            observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            observer_session._json_dumps({"backlog_id": backlog_id}),
+            observer_session.COMMAND_STATUS_COMPLETED,
+            "observer-session",
+            "observer",
+            "2026-06-04T00:00:00Z",
+            "2026-06-04T00:00:01Z",
+            "2026-06-04T00:00:02Z",
+            "2026-06-04T00:00:03Z",
+            observer_session._json_dumps({
+                "ok": False,
+                "terminal_contract_projection": stale_projection,
+            }),
+        ),
+    )
+    conn.commit()
+
+    result = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={"view": "compact", "include_closed": "true"})
+    )
+
+    bug = next(item for item in result["bugs"] if item["bug_id"] == backlog_id)
+    assert "observer_command_projection" not in bug
+
+
 def test_graph_governance_asset_drift_state_and_proposal_api_are_auditable(conn):
     code, recorded = server.handle_graph_governance_asset_drift_state_record(
         _ctx(
