@@ -133,6 +133,7 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "hotfix_entered",
     "hotfix_under_action",
     "implementation",
+    "independent_verification",
     "lineage_bridge",
     "merge",
     "merge_preview",
@@ -142,6 +143,8 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "observer_visual_smoke",
     "observer_work_mode_transition",
     "plan_precheck",
+    "qa_review",
+    "qa_verification",
     "reconcile",
     "record_blocker",
     "review_lane",
@@ -151,6 +154,130 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "route_token_gate",
     "verification",
 }
+
+_QA_EVIDENCE_CONTRACT_TEMPLATE_ID = "qa_evidence_gate_review.v1"
+_AUDIT_CLOSE_CONTRACT_TEMPLATE_ID = "audit_close_with_qa_acceptance.v1"
+
+_META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
+    "observer": {
+        "route_context",
+        "route_identity_cleanup",
+        "route_action_precheck",
+        "design_review",
+        "architecture_review",
+        "review_lane",
+        "plan_precheck",
+        "adversarial_review",
+        "contract_binding",
+        "contract_revision_created",
+        "contract_binding_changed",
+        "contract_state_changed",
+        "observer_work_mode_transition",
+        "dispatch_bounded_worker",
+        "merge_preview",
+        "merge_queue_entry",
+        "live_merge",
+        "merge",
+        "reconcile",
+        "record_blocker",
+        "close_ready",
+        "close_after_clauses",
+        "hotfix_entered",
+        "hotfix_under_action",
+        "observer_command",
+        "cross_ref_lineage_bridge",
+        "lineage_bridge",
+        "route_token_gate",
+        "no_progress_timeout",
+        "forbidden_attempt_recorded",
+    },
+    "mf_sub": {
+        "read_receipt",
+        "mf_subagent_startup",
+        "record_finish_time_worker_attestation",
+        "implementation",
+        "review_ready",
+        "worker_progress",
+        "patch",
+        "close_ready",
+        "record_blocker",
+        "graph_trace",
+    },
+    "qa": {
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+        "record_blocker",
+        "review_ready",
+    },
+    "judge": {
+        "design_review",
+        "architecture_review",
+        "review_lane",
+        "plan_precheck",
+        "adversarial_review",
+        "contract_binding",
+        "contract_revision_created",
+        "contract_binding_changed",
+        "contract_state_changed",
+        "independent_verification",
+        "qa_review",
+        "record_blocker",
+        "forbidden_attempt_recorded",
+    },
+    "system": {
+        "service_route",
+        "route_token_gate",
+        "observer_command",
+        "no_progress_timeout",
+        "forbidden_attempt_recorded",
+        "record_blocker",
+        "hotfix_entered",
+        "hotfix_under_action",
+        "stale_artifact_cleanup",
+    },
+    "operator": {
+        "hotfix_entered",
+        "hotfix_under_action",
+        "record_blocker",
+        "close_after_clauses",
+    },
+}
+
+_QA_TIMELINE_EVENT_KINDS = {
+    "independent_verification",
+    "qa_review",
+    "qa_verification",
+}
+
+_WORKER_TIMELINE_EVENT_KINDS = {
+    "graph_trace",
+    "implementation",
+    "mf_subagent_startup",
+    "patch",
+    "read_receipt",
+    "record_finish_time_worker_attestation",
+    "review_ready",
+    "worker_progress",
+}
+
+_CONDITION_JSON_CONTEXT_FIELDS = (
+    "chain_trigger_json",
+    "target_json",
+    "metadata_json",
+    "bypass_policy_json",
+    "contract_json",
+)
+
+_CONDITION_NESTED_CONTEXT_FIELDS = (
+    "chain_trigger",
+    "target",
+    "target_project",
+    "project",
+    "metadata",
+    "manual_fix",
+    "contract",
+)
 
 _SUCCESSOR_ONLY_CONTRACT_BINDING_FIELD_NAMES = {
     "handoff_event_id",
@@ -222,6 +349,56 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, list | tuple | set):
         return _dedupe_nonempty([str(item or "").strip() for item in value])
     return []
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _condition_contexts(
+    root: Mapping[str, Any],
+    backlog_row: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    for source in (root, backlog_row):
+        if isinstance(source, Mapping):
+            contexts.append(dict(source))
+            for field in _CONDITION_JSON_CONTEXT_FIELDS:
+                nested = _json_mapping(source.get(field))
+                if nested:
+                    contexts.append(nested)
+            for field in _CONDITION_NESTED_CONTEXT_FIELDS:
+                nested = _json_mapping(source.get(field))
+                if nested:
+                    contexts.append(nested)
+    for context in list(contexts):
+        for field in _CONDITION_NESTED_CONTEXT_FIELDS:
+            nested = _json_mapping(context.get(field))
+            if nested:
+                contexts.append(nested)
+    return contexts
+
+
+def _first_condition_value(
+    contexts: list[dict[str, Any]],
+    *field_names: str,
+) -> Any:
+    for context in contexts:
+        for field in field_names:
+            if field not in context:
+                continue
+            value = context.get(field)
+            if value not in (None, "", [], {}):
+                return value
+    return None
 
 
 def _event_numeric_id(event: Mapping[str, Any]) -> int:
@@ -407,22 +584,25 @@ def _condition_matches(
 ) -> bool:
     if not condition:
         return True
+    contexts = _condition_contexts(root, backlog_row)
     for key, expected in condition.items():
         if key == "target_kind":
-            actual = (
-                root.get("target_kind")
-                or root.get("target_project_kind")
-                or backlog_row.get("target_kind")
-                or backlog_row.get("target_project_kind")
-                or backlog_row.get("project_kind")
+            actual = _first_condition_value(
+                contexts,
+                "target_kind",
+                "target_project_kind",
+                "project_kind",
             )
             if not actual and (
-                root.get("generated_demo") is True
-                or backlog_row.get("generated_demo") is True
+                _first_condition_value(contexts, "generated_demo") is True
+                or str(
+                    _first_condition_value(contexts, "generated_demo") or ""
+                ).strip().lower()
+                in {"1", "true", "yes", "y", "on"}
             ):
                 actual = "generated_demo"
         else:
-            actual = root.get(key, backlog_row.get(key))
+            actual = _first_condition_value(contexts, key)
         if str(actual or "").strip() != str(expected or "").strip():
             return False
     return True
@@ -508,6 +688,7 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         "requirement_id": requirement_id,
         "requirement_ids": [requirement_id] if requirement_id else [],
     }
+    actor_role = _actor_role_for_append_event(direct_event_kind, requirement_id)
     return {
         "schema_version": "contract_state_timeline_append_hint.v1",
         "event_kind": direct_event_kind,
@@ -519,6 +700,12 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "status": status,
         "payload": payload,
+        "actor_role": actor_role,
+        "lane_actor_role": actor_role,
+        "meta_contract_gate": _meta_contract_append_gate(
+            direct_event_kind,
+            actor_role,
+        ),
         "satisfies_by": (
             "payload.requirement_id"
             if uses_requirement_payload_match
@@ -527,6 +714,252 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         "accepted_event_kinds": accepted_event_kinds,
         "accepted_statuses": accepted_statuses,
     }
+
+
+def _actor_role_for_append_event(event_kind: str, requirement_id: str = "") -> str:
+    marker = str(event_kind or requirement_id or "").strip()
+    if marker in _QA_TIMELINE_EVENT_KINDS:
+        return "qa"
+    if marker in _WORKER_TIMELINE_EVENT_KINDS:
+        return "mf_sub"
+    return "observer"
+
+
+def _meta_contract_append_gate(event_kind: str, actor_role: str) -> dict[str, Any]:
+    role = str(actor_role or "").strip() or "observer"
+    allowed_actions = set(_META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE.get(role) or set())
+    if role == "worker":
+        allowed_actions.update(_META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE["mf_sub"])
+    allowed = str(event_kind or "").strip() in allowed_actions
+    return {
+        "schema_version": "meta_contract_append_hint_gate.v1",
+        "checked": True,
+        "meta_contract_id": "meta_contract.v1",
+        "actor_role": role,
+        "action": str(event_kind or "").strip(),
+        "allowed": allowed,
+        "reason": "role_action_whitelist_allows_action"
+        if allowed
+        else "role_action_whitelist_does_not_allow_action",
+    }
+
+
+def _public_route_identity(route_binding: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        field: str(route_binding.get(field) or "").strip()
+        for field in _ROUTE_BINDING_FIELD_NAMES
+        if str(route_binding.get(field) or "").strip()
+    }
+
+
+def _completed_requirement_event_ref(
+    completed_sources: Mapping[str, Mapping[str, Any]],
+    requirement_id: str,
+) -> dict[str, Any]:
+    source = completed_sources.get(requirement_id)
+    if not isinstance(source, Mapping):
+        return {}
+    return {
+        key: source.get(key)
+        for key in ("event_id", "event_kind", "status", "phase")
+        if source.get(key) not in (None, "", [], {})
+    }
+
+
+def _action_candidate_template_ids(action: Mapping[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for item in action.get("successor_contract_candidates") or []:
+        if not isinstance(item, Mapping):
+            continue
+        template_id = str(item.get("contract_template_id") or item.get("id") or "")
+        if template_id:
+            ids.append(template_id)
+    return _dedupe_nonempty(ids)
+
+
+def _default_timeline_append_hint_for_action(
+    action: Mapping[str, Any],
+) -> dict[str, Any]:
+    action_id = str(action.get("id") or action.get("action") or "").strip()
+    if action_id == "close_ready":
+        event_kind = "close_ready"
+        actor_role = _actor_role_for_append_event(event_kind, action_id)
+        return {
+            "schema_version": "contract_state_timeline_append_hint.v1",
+            "event_kind": event_kind,
+            "event_type": "close.ready",
+            "status": "accepted",
+            "payload": {
+                "schema_version": "contract_state_evidence.v1",
+                "requirement_id": "close_ready",
+                "requirement_ids": ["close_ready"],
+            },
+            "actor_role": actor_role,
+            "lane_actor_role": actor_role,
+            "meta_contract_gate": _meta_contract_append_gate(event_kind, actor_role),
+            "satisfies_by": "event_kind",
+            "accepted_event_kinds": [event_kind],
+            "accepted_statuses": sorted(CONTRACT_PASS_STATUSES),
+        }
+    if action_id == "select_successor_contract":
+        event_kind = "contract_binding"
+        actor_role = _actor_role_for_append_event(event_kind, action_id)
+        return {
+            "schema_version": "contract_state_timeline_append_hint.v1",
+            "event_kind": event_kind,
+            "event_type": "contract.successor.selected",
+            "status": "passed",
+            "payload": {
+                "schema_version": "contract_successor_selection_hint.v1",
+                "requirement_id": "successor_contract_selection",
+                "requirement_ids": ["successor_contract_selection"],
+                "successor_contract": {
+                    "contract_chain_id": str(
+                        action.get("contract_chain_id") or ""
+                    ).strip(),
+                    "parent_contract_execution_id": str(
+                        action.get("contract_execution_id") or ""
+                    ).strip(),
+                    "successor_contract_execution_id": (
+                        "<new successor execution id>"
+                    ),
+                    "contract_template_id": "<selected successor contract_template_id>",
+                    "handoff_event_id": "<timeline event id or external evidence ref>",
+                    "handoff_reason": "<why this successor is the next contract>",
+                },
+            },
+            "actor_role": actor_role,
+            "lane_actor_role": actor_role,
+            "meta_contract_gate": _meta_contract_append_gate(event_kind, actor_role),
+            "satisfies_by": "event_kind",
+            "accepted_event_kinds": [event_kind],
+            "accepted_statuses": sorted(CONTRACT_PASS_STATUSES),
+        }
+    return {}
+
+
+def _lane_context_for_action(
+    action: Mapping[str, Any],
+    lane_contract_executions: list[dict[str, Any]],
+    active_execution: Mapping[str, Any],
+) -> dict[str, Any]:
+    action_execution_id = str(action.get("contract_execution_id") or "").strip()
+    for lane in lane_contract_executions:
+        if str(lane.get("contract_execution_id") or "").strip() == action_execution_id:
+            return lane
+    return {
+        "role": "root",
+        "contract_execution_id": active_execution.get("contract_execution_id") or "",
+        "parent_contract_execution_id": active_execution.get(
+            "parent_contract_execution_id"
+        )
+        or "",
+        "contract_template_id": active_execution.get("contract_template_id") or "",
+    }
+
+
+def _enrich_next_action_append_hint(
+    action: Mapping[str, Any] | None,
+    *,
+    lane_contract_executions: list[dict[str, Any]],
+    active_execution: Mapping[str, Any],
+    route_binding: Mapping[str, Any],
+    task_id: str,
+    route_action_precheck_ref: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(action, Mapping):
+        return None
+    enriched = dict(action)
+    hint = _mapping(enriched.get("timeline_append_hint"))
+    if not hint:
+        hint = _default_timeline_append_hint_for_action(enriched)
+    if not hint:
+        return enriched
+
+    lane = _lane_context_for_action(enriched, lane_contract_executions, active_execution)
+    lane_role = str(lane.get("role") or "root").strip()
+    event_kind = str(hint.get("event_kind") or "").strip()
+    actor_role = str(hint.get("actor_role") or "").strip() or (
+        _actor_role_for_append_event(
+            event_kind,
+            str(enriched.get("requirement_id") or enriched.get("id") or ""),
+        )
+    )
+    route_identity = _public_route_identity(route_binding)
+    payload = _mapping(hint.get("payload"))
+    contract_execution_id = str(enriched.get("contract_execution_id") or "").strip()
+    parent_expected = str(lane.get("parent_contract_execution_id") or "").strip()
+    if contract_execution_id:
+        payload.setdefault("contract_execution_id", contract_execution_id)
+        payload.setdefault("active_contract_execution_id", contract_execution_id)
+    if parent_expected:
+        payload.setdefault("parent_contract_execution_id_expected", parent_expected)
+    if task_id:
+        payload.setdefault("task_id", task_id)
+    if route_identity:
+        payload.setdefault("route_identity", route_identity)
+        for field, value in route_identity.items():
+            payload.setdefault(field, value)
+    if (
+        str(enriched.get("id") or enriched.get("requirement_id") or "")
+        == "observer_work_mode_transition"
+        and route_action_precheck_ref
+    ):
+        payload.setdefault(
+            "route_action_precheck_ref",
+            dict(route_action_precheck_ref),
+        )
+
+    hint.update(
+        {
+            "payload": payload,
+            "actor_role": actor_role,
+            "lane_actor_role": actor_role,
+            "lane_role": lane_role,
+            "task_id": task_id,
+            "contract_execution_id": contract_execution_id,
+            "parent_contract_execution_id_expected": parent_expected,
+            "route_identity_required": bool(route_identity),
+            "route_identity": route_identity,
+            "meta_contract_gate": _meta_contract_append_gate(event_kind, actor_role),
+        }
+    )
+    candidate_template_ids = _action_candidate_template_ids(enriched)
+    if candidate_template_ids:
+        hint["successor_semantics"] = {
+            "schema_version": "successor_next_action_semantics.v1",
+            "selection_required": enriched.get("id") == "select_successor_contract",
+            "candidate_template_ids": candidate_template_ids,
+            "audit_close_candidate": _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID
+            in candidate_template_ids,
+            "hotfix_candidate": "observer_hotfix_direct_mutation.v1"
+            in candidate_template_ids,
+        }
+    if str(enriched.get("id") or "") == "close_ready":
+        selected_state = _mapping(enriched.get("selected_successor_contract_state"))
+        state_candidates = _action_candidate_template_ids(
+            {
+                "successor_contract_candidates": selected_state.get(
+                    "successor_contract_candidates"
+                )
+                or [],
+            }
+        )
+        if not state_candidates:
+            state_candidates = _action_candidate_template_ids(enriched)
+        hint["terminal_semantics"] = {
+            "schema_version": "terminal_successor_semantics.v1",
+            "terminal_contract_complete": True,
+            "successor_selection_required": False,
+            "candidate_template_ids": state_candidates,
+            "audit_close_candidate": _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID
+            in state_candidates,
+            "hotfix_candidate": "observer_hotfix_direct_mutation.v1"
+            in state_candidates,
+            "close_gate_next": "audit_close_with_qa_acceptance_or_terminal_close",
+        }
+    enriched["timeline_append_hint"] = hint
+    return enriched
 
 
 def _next_action_requirement_metadata(step: Mapping[str, Any]) -> dict[str, Any]:
@@ -564,6 +997,9 @@ def _next_action_summary(action: Mapping[str, Any] | None) -> dict[str, Any]:
         value = action.get(key)
         if value not in (None, "", [], {}):
             summary[key] = value
+    hint = action.get("timeline_append_hint")
+    if isinstance(hint, Mapping) and hint:
+        summary["timeline_append_hint"] = dict(hint)
     for key in ("blocked_by", "prerequisite_ids"):
         value = action.get(key)
         if value:
@@ -866,8 +1302,179 @@ def _policy_truthy(value: Any) -> bool:
     return bool(value)
 
 
-def _successor_selection_required(root: Mapping[str, Any]) -> bool:
+_QA_FOLLOWUP_DECISIONS = {"block", "pass_with_followups"}
+_QA_FOLLOWUP_FINDING_SEVERITIES = {"blocking", "major", "critical"}
+
+
+def _normal_signal_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _meaningful_followup_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return _normal_signal_token(value) not in {
+            "",
+            "0",
+            "false",
+            "none",
+            "null",
+            "no",
+            "n",
+            "off",
+        }
+    if isinstance(value, Mapping):
+        return any(_meaningful_followup_value(child) for child in value.values())
+    if isinstance(value, list | tuple | set):
+        return any(_meaningful_followup_value(child) for child in value)
+    return bool(value)
+
+
+def _findings_include_blocking_followup(value: Any, *, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    if isinstance(value, Mapping):
+        severity = _normal_signal_token(value.get("severity"))
+        if severity in _QA_FOLLOWUP_FINDING_SEVERITIES:
+            return True
+        return any(
+            _findings_include_blocking_followup(child, depth=depth + 1)
+            for child in value.values()
+        )
+    if isinstance(value, list | tuple | set):
+        return any(
+            _findings_include_blocking_followup(child, depth=depth + 1)
+            for child in value
+        )
+    return False
+
+
+def _qa_followup_signal_present(value: Any, *, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_token = _normal_signal_token(key)
+            child_token = _normal_signal_token(child)
+            if (
+                key_token in {"gate_decision", "decision", "result", "output"}
+                and child_token in _QA_FOLLOWUP_DECISIONS
+            ):
+                return True
+            if key_token in {"followup_needed", "requires_followup"} and _policy_truthy(
+                child
+            ):
+                return True
+            if key_token == "follow_up_backlog" and _meaningful_followup_value(child):
+                return True
+            if key_token == "findings" and _findings_include_blocking_followup(child):
+                return True
+            if _qa_followup_signal_present(child, depth=depth + 1):
+                return True
+    elif isinstance(value, list | tuple | set):
+        return any(
+            _qa_followup_signal_present(child, depth=depth + 1) for child in value
+        )
+    return False
+
+
+def _event_mentions_contract_execution(
+    event: Mapping[str, Any],
+    contract_execution_id: str,
+) -> bool:
+    execution_id = str(contract_execution_id or "").strip()
+    if not execution_id:
+        return True
+    for field in (
+        "active_contract_execution_id",
+        "contract_execution_id",
+        "parent_contract_execution_id",
+        "reviewed_contract_execution_id",
+        "successor_contract_execution_id",
+    ):
+        if str(event.get(field) or "").strip() == execution_id:
+            return True
+    for payload in _event_payloads(event):
+        for field in (
+            "active_contract_execution_id",
+            "contract_execution_id",
+            "parent_contract_execution_id",
+            "reviewed_contract_execution_id",
+            "successor_contract_execution_id",
+        ):
+            if _payload_field_value(payload, {field}) == execution_id:
+                return True
+    return False
+
+
+def _qa_followup_needed_from_completed_evidence(
+    events: list[dict[str, Any]],
+    *,
+    requirement_state: Mapping[str, Any] | None,
+    contract_execution_id: str,
+) -> bool:
+    state = requirement_state or {}
+    if state and not state.get("contract_complete"):
+        return False
+    completed_event_ids = {
+        str(item.get("event_id") or "").strip()
+        for item in state.get("completed_evidence") or []
+        if isinstance(item, Mapping) and str(item.get("event_id") or "").strip()
+    }
+    matched_events: list[dict[str, Any]] = []
+    if completed_event_ids:
+        matched_events = [
+            event
+            for event in events
+            if str(event.get("id") or event.get("event_id") or "").strip()
+            in completed_event_ids
+        ]
+    if not matched_events:
+        matched_events = [
+            event
+            for event in events
+            if str(event.get("event_kind") or "").strip() in _QA_TIMELINE_EVENT_KINDS
+            and _event_mentions_contract_execution(event, contract_execution_id)
+        ]
+    for event in matched_events:
+        for key in ("payload", "verification", "result", "output", "decision"):
+            if key not in event:
+                continue
+            value = event.get(key)
+            if (
+                key in {"result", "output", "decision"}
+                and _normal_signal_token(value) in _QA_FOLLOWUP_DECISIONS
+            ):
+                return True
+            if _qa_followup_signal_present(value):
+                return True
+    return False
+
+
+def _successor_selection_required(
+    root: Mapping[str, Any],
+    *,
+    events: list[dict[str, Any]] | None = None,
+    requirement_state: Mapping[str, Any] | None = None,
+    contract_execution_id: str = "",
+) -> bool:
+    template_id = str(
+        root.get("contract_template_id") or root.get("template_id") or ""
+    ).strip()
     policy = root.get("successor_contract_policy")
+    if template_id == _QA_EVIDENCE_CONTRACT_TEMPLATE_ID:
+        return bool(
+            isinstance(policy, Mapping)
+            and _policy_truthy(policy.get("selection_required_when_followup_needed"))
+            and _qa_followup_needed_from_completed_evidence(
+                events or [],
+                requirement_state=requirement_state,
+                contract_execution_id=contract_execution_id,
+            )
+        )
     if not isinstance(policy, Mapping):
         return bool(root.get("successor_contract_candidates"))
     if _policy_truthy(policy.get("selection_required_when_followup_needed")):
@@ -890,6 +1497,16 @@ def _successor_lane_role(depth: int) -> str:
     if depth == 3:
         return "deep_successor"
     return f"successor_depth_{depth}"
+
+
+def _successor_missing_steps_source(depth: int) -> str:
+    if depth == 1:
+        return "selected_successor_contract_state"
+    if depth == 2:
+        return "nested_successor_contract_state"
+    if depth == 3:
+        return "deep_successor_contract_state"
+    return f"successor_depth_{depth}_contract_state.v1"
 
 
 def _successor_contract_from_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -1370,6 +1987,13 @@ def build_contract_state_projection(
     contract_complete = (
         has_explicit_contract and requirements_explicit and not ordered_next_steps
     )
+    root_requirement_state = {
+        "contract_complete": contract_complete,
+        "completed_evidence": [
+            {"id": requirement_id, **source}
+            for requirement_id, source in completed_sources.items()
+        ],
+    }
     contract_chain_id = _contract_chain_id(
         project_id=project_id,
         backlog_id=backlog_id,
@@ -2053,7 +2677,18 @@ def build_contract_state_projection(
             "successor_contract_policy": successor_policy,
             "selected_successor_contract": selected_successor,
         }
-    elif contract_complete and successor_candidates:
+    elif (
+        contract_complete
+        and successor_candidates
+        and _successor_selection_required(
+            root,
+            events=rows,
+            requirement_state=root_requirement_state,
+            contract_execution_id=str(
+                active_execution.get("contract_execution_id") or ""
+            ),
+        )
+    ):
         successor_next_legal_action = {
             "id": "select_successor_contract",
             "action": "select_successor_contract",
@@ -2061,6 +2696,22 @@ def build_contract_state_projection(
             "detail": "select the next contract execution before implementation or close",
             "source": "contract_state",
             "precedence": "successor_contract_selection",
+            "contract_chain_id": contract_chain_id,
+            "contract_execution_id": active_execution.get("contract_execution_id") or "",
+            "backlog_id": backlog_id,
+            "route_token_ref": active_execution.get("route_token_ref") or "",
+            "projection_watermark": projection_watermark,
+            "successor_contract_policy": successor_policy,
+            "successor_contract_candidates": successor_candidates,
+        }
+    elif contract_complete:
+        successor_next_legal_action = {
+            "id": "close_ready",
+            "action": "record_close_ready",
+            "requirement_id": "close_ready",
+            "detail": "record close_ready and run the close gate after the active contract completes",
+            "source": "contract_state",
+            "precedence": "active_contract_terminal_close_ready",
             "contract_chain_id": contract_chain_id,
             "contract_execution_id": active_execution.get("contract_execution_id") or "",
             "backlog_id": backlog_id,
@@ -2386,7 +3037,10 @@ def build_contract_state_projection(
                     contract_complete=bool(requirement_state["contract_complete"]),
                 ),
                 "successor_selection_required": _successor_selection_required(
-                    successor_root
+                    successor_root,
+                    events=rows,
+                    requirement_state=requirement_state,
+                    contract_execution_id=execution_id,
                 ),
                 **requirement_state,
             }
@@ -2421,8 +3075,9 @@ def build_contract_state_projection(
                 "precedence": first.get("precedence")
                 or f"successor_depth_{latest_depth}_contract_missing_step",
                 "blocked_by": first.get("blocked_by") or [],
-                "ordered_missing_steps_source": latest_state.get("schema_version")
-                or "successor_contract_state",
+                "ordered_missing_steps_source": _successor_missing_steps_source(
+                    latest_depth
+                ),
                 "ordered_missing_steps": latest_missing_steps,
                 "contract_chain_id": contract_chain_id,
                 "contract_execution_id": latest_state.get("contract_execution_id")
@@ -2488,7 +3143,7 @@ def build_contract_state_projection(
                 "selected_successor_contract": latest_selected,
                 "selected_successor_contract_state": latest_state,
             }
-        if recursive_next_legal_action and len(recursive_successor_states) > 3:
+        if recursive_next_legal_action:
             next_legal_action = dict(recursive_next_legal_action)
             successor_next_legal_action = dict(recursive_next_legal_action)
         for item in recursive_successor_states[3:]:
@@ -2536,6 +3191,66 @@ def build_contract_state_projection(
                     "missing_evidence": state_item.get("missing_evidence") or [],
                 }
             )
+    if recursive_next_legal_action:
+        recursive_action_execution_id = str(
+            recursive_next_legal_action.get("contract_execution_id") or ""
+        ).strip()
+        if recursive_action_execution_id:
+            for lane in lane_contract_executions:
+                if (
+                    str(lane.get("contract_execution_id") or "").strip()
+                    == recursive_action_execution_id
+                ):
+                    lane["next_legal_action"] = _next_action_summary(
+                        recursive_next_legal_action
+                    )
+    task_id = str(
+        row.get("task_id")
+        or row.get("parent_task_id")
+        or row.get("bug_id")
+        or row.get("backlog_id")
+        or backlog_id
+        or ""
+    ).strip()
+    route_action_precheck_ref = _completed_requirement_event_ref(
+        completed_sources,
+        "route_action_precheck",
+    )
+    next_legal_action = _enrich_next_action_append_hint(
+        next_legal_action,
+        lane_contract_executions=lane_contract_executions,
+        active_execution=active_execution,
+        route_binding=route_binding,
+        task_id=task_id,
+        route_action_precheck_ref=route_action_precheck_ref,
+    )
+    successor_next_legal_action = _enrich_next_action_append_hint(
+        successor_next_legal_action,
+        lane_contract_executions=lane_contract_executions,
+        active_execution=active_execution,
+        route_binding=route_binding,
+        task_id=task_id,
+        route_action_precheck_ref=route_action_precheck_ref,
+    )
+    if next_legal_action:
+        action_execution_id = str(
+            next_legal_action.get("contract_execution_id") or ""
+        ).strip()
+        for lane in lane_contract_executions:
+            if (
+                action_execution_id
+                and str(lane.get("contract_execution_id") or "").strip()
+                != action_execution_id
+            ):
+                continue
+            lane_action = _mapping(lane.get("next_legal_action"))
+            if not lane_action:
+                continue
+            if str(lane_action.get("id") or "") != str(
+                next_legal_action.get("id") or ""
+            ):
+                continue
+            lane["next_legal_action"] = _next_action_summary(next_legal_action)
     contract_execution_index = {
         str(item.get("contract_execution_id") or ""): item
         for item in lane_contract_executions

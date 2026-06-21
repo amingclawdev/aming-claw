@@ -2932,6 +2932,73 @@ def _active_hotfix_successor_contract(
     return selected
 
 
+def _deepest_close_policy_contract_lane(
+    rows: list[dict[str, Any]],
+    contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the deepest active lane whose template carries close-gate policy."""
+
+    try:
+        from .contract_state_runtime import build_contract_state_projection
+
+        contract_templates: dict[str, dict[str, Any]] = {}
+        try:
+            from .contract_template_registry import load_contract_templates
+
+            contract_templates = {
+                str(template.get("template_id") or ""): dict(template)
+                for template in load_contract_templates()
+                if isinstance(template, Mapping) and template.get("template_id")
+            }
+        except Exception:
+            contract_templates = {}
+        projection = build_contract_state_projection(
+            rows,
+            contract=contract,
+            contract_templates=contract_templates,
+            default_required_evidence=[],
+            contract_projection={
+                "projection_watermark": max(
+                    (_event_numeric_id(event) for event in rows),
+                    default=0,
+                )
+                or len(rows)
+            },
+        )
+    except Exception:
+        return {}
+
+    lanes = [
+        _mapping(item)
+        for item in _list(projection.get("contract_lane_executions"))
+        if isinstance(item, Mapping)
+    ]
+    active_lane = _mapping(projection.get("active_lane_contract"))
+    for lane in reversed(lanes):
+        template_id = str(lane.get("contract_template_id") or "").strip()
+        if not template_id:
+            continue
+        policy = _contract_close_gate_policy_source(
+            {"template_id": template_id},
+            template_id,
+        )
+        if policy or template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID:
+            return {
+                **lane,
+                "active_lane_contract": active_lane,
+                "close_policy_template_id": template_id,
+            }
+    if active_lane:
+        return {
+            **active_lane,
+            "active_lane_contract": active_lane,
+            "close_policy_template_id": str(
+                active_lane.get("contract_template_id") or ""
+            ).strip(),
+        }
+    return {}
+
+
 def _hotfix_contract_events(rows: list[dict[str, Any]]) -> dict[str, Any]:
     pre_events: list[dict[str, Any]] = []
     post_events: list[dict[str, Any]] = []
@@ -2983,9 +3050,28 @@ def _contract_close_gate_policy_projection(
     ).strip()
     hotfix_events = _hotfix_contract_events(rows)
     selected_hotfix_successor = _active_hotfix_successor_contract(rows, root)
+    close_policy_lane = _deepest_close_policy_contract_lane(rows, contract)
+    active_lane_contract = _mapping(close_policy_lane.get("active_lane_contract"))
+    close_policy_lane_template_id = str(
+        close_policy_lane.get("close_policy_template_id")
+        or close_policy_lane.get("contract_template_id")
+        or ""
+    ).strip()
+    if (
+        close_policy_lane_template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+        and close_policy_lane.get("selected_successor_contract")
+    ):
+        selected_hotfix_successor = _mapping(
+            close_policy_lane.get("selected_successor_contract")
+        ) or selected_hotfix_successor
     successor_template_id = str(
         selected_hotfix_successor.get("contract_template_id") or ""
     ).strip()
+    if (
+        close_policy_lane_template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+        and hotfix_events["active"]
+    ):
+        successor_template_id = close_policy_lane_template_id
     if not hotfix_events["active"]:
         successor_template_id = ""
     inferred_template_id = (
@@ -3055,6 +3141,9 @@ def _contract_close_gate_policy_projection(
         "successor_template_id": successor_template_id,
         "inferred_template_id": inferred_template_id,
         "selected_successor_contract": selected_hotfix_successor,
+        "active_lane_contract": active_lane_contract,
+        "selected_close_policy_lane": close_policy_lane,
+        "selected_close_policy_lane_template_id": close_policy_lane_template_id,
         "policy_status": "active" if applied else "not_applicable",
         "hotfix_contract_active": bool(hotfix_events["active"]),
         "hotfix_contract_completed": bool(hotfix_events["completed"]),
