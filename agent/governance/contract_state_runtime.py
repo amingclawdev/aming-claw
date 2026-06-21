@@ -118,6 +118,73 @@ _ROUTE_BINDING_FIELD_NAMES = (
     "route_token_ref",
 )
 
+_STRICT_REQUIREMENT_IDENTITY_FIELD_ALIASES = {
+    "writer_role": (
+        "expected_writer_role",
+        "required_writer_role",
+        "expected_actor_role",
+        "required_actor_role",
+        "allowed_writer_role",
+        "writer_role",
+    ),
+    "route_token_ref": (
+        "expected_route_token_ref",
+        "required_route_token_ref",
+        "route_token_ref",
+    ),
+    "runtime_context_id": (
+        "expected_runtime_context_id",
+        "required_runtime_context_id",
+        "runtime_context_id",
+    ),
+    "task_id": (
+        "expected_task_id",
+        "required_task_id",
+        "task_id",
+    ),
+    "parent_task_id": (
+        "expected_parent_task_id",
+        "required_parent_task_id",
+        "parent_task_id",
+    ),
+    "worker_slot_id": (
+        "expected_worker_slot_id",
+        "required_worker_slot_id",
+        "worker_slot_id",
+    ),
+    "fence_token_hash": (
+        "expected_fence_token_hash",
+        "required_fence_token_hash",
+        "fence_token_hash",
+    ),
+}
+
+_STRICT_EVENT_IDENTITY_FIELD_ALIASES = {
+    "writer_role": (
+        "writer_role",
+        "actor_role",
+        "lane_actor_role",
+        "worker_role",
+        "role",
+    ),
+    "route_token_ref": ("route_token_ref",),
+    "runtime_context_id": ("runtime_context_id",),
+    "task_id": ("task_id",),
+    "parent_task_id": ("parent_task_id",),
+    "worker_slot_id": ("worker_slot_id",),
+    "fence_token_hash": ("fence_token_hash",),
+}
+
+_STRICT_REQUIREMENT_PAYLOAD_FIELDS = {
+    "writer_role": "writer_role",
+    "route_token_ref": "route_token_ref",
+    "runtime_context_id": "runtime_context_id",
+    "task_id": "task_id",
+    "parent_task_id": "parent_task_id",
+    "worker_slot_id": "worker_slot_id",
+    "fence_token_hash": "fence_token_hash",
+}
+
 _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "architecture_review",
     "close_after_clauses",
@@ -430,6 +497,97 @@ def _payload_field_value(value: Any, field_names: set[str], *, depth: int = 0) -
     return ""
 
 
+def _normalized_writer_role(value: Any) -> str:
+    role = str(value or "").strip().lower()
+    if role in {"worker", "mf_subagent", "mf-sub"}:
+        return "mf_sub"
+    return role
+
+
+def _strict_requirement_identity_expectations(
+    requirement: Mapping[str, Any],
+) -> dict[str, str]:
+    containers: list[Mapping[str, Any]] = [requirement]
+    strict_identity = requirement.get("strict_identity")
+    if isinstance(strict_identity, Mapping):
+        containers.append(strict_identity)
+        expected = strict_identity.get("expected")
+        if isinstance(expected, Mapping):
+            containers.append(expected)
+    for key in ("expected_identity", "required_identity", "identity"):
+        value = requirement.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+
+    expectations: dict[str, str] = {}
+    for canonical, aliases in _STRICT_REQUIREMENT_IDENTITY_FIELD_ALIASES.items():
+        for container in containers:
+            for alias in aliases:
+                token = str(container.get(alias) or "").strip()
+                if token:
+                    expectations[canonical] = token
+                    break
+            if canonical in expectations:
+                break
+    return expectations
+
+
+def _strict_event_identity_value(
+    event: Mapping[str, Any],
+    canonical: str,
+) -> str:
+    aliases = set(_STRICT_EVENT_IDENTITY_FIELD_ALIASES.get(canonical) or ())
+    if not aliases:
+        return ""
+    for alias in aliases:
+        token = str(event.get(alias) or "").strip()
+        if token:
+            return token
+    for payload in _event_payloads(event):
+        token = _payload_field_value(payload, aliases)
+        if token:
+            return token
+    return ""
+
+
+def _event_matches_strict_requirement_identity(
+    event: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+) -> tuple[bool, dict[str, str]]:
+    expectations = _strict_requirement_identity_expectations(requirement)
+    if not expectations:
+        return True, {}
+    matched: dict[str, str] = {}
+    for canonical, expected in expectations.items():
+        actual = _strict_event_identity_value(event, canonical)
+        if canonical == "writer_role":
+            if _normalized_writer_role(actual) != _normalized_writer_role(expected):
+                return False, {}
+        elif actual != expected:
+            return False, {}
+        matched[canonical] = expected
+    return True, matched
+
+
+def _strict_requirement_identity_hint(
+    requirement: Mapping[str, Any],
+) -> dict[str, Any]:
+    expectations = _strict_requirement_identity_expectations(requirement)
+    if not expectations:
+        return {}
+    required_payload_fields = [
+        _STRICT_REQUIREMENT_PAYLOAD_FIELDS[canonical]
+        for canonical in expectations
+        if canonical in _STRICT_REQUIREMENT_PAYLOAD_FIELDS
+    ]
+    return {
+        "schema_version": "contract_state_strict_requirement_identity.v1",
+        "expected_identity": dict(expectations),
+        "required_payload_fields": _dedupe_nonempty(required_payload_fields),
+        "match_policy": "all_declared_identity_fields",
+    }
+
+
 def _contract_binding_from_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     binding: dict[str, Any] = {}
     for key in _CONTRACT_BINDING_CONTAINER_KEYS:
@@ -689,7 +847,13 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         "requirement_ids": [requirement_id] if requirement_id else [],
     }
     actor_role = _actor_role_for_append_event(direct_event_kind, requirement_id)
-    return {
+    strict_identity = _strict_requirement_identity_hint(step)
+    if strict_identity:
+        for canonical, value in strict_identity["expected_identity"].items():
+            payload_field = _STRICT_REQUIREMENT_PAYLOAD_FIELDS.get(canonical)
+            if payload_field:
+                payload.setdefault(payload_field, value)
+    hint = {
         "schema_version": "contract_state_timeline_append_hint.v1",
         "event_kind": direct_event_kind,
         "event_type": str(step.get("event_type") or "").strip()
@@ -714,6 +878,11 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         "accepted_event_kinds": accepted_event_kinds,
         "accepted_statuses": accepted_statuses,
     }
+    if strict_identity:
+        hint["strict_identity"] = strict_identity
+        hint["expected_identity"] = dict(strict_identity["expected_identity"])
+        hint["required_payload_fields"] = strict_identity["required_payload_fields"]
+    return hint
 
 
 def _actor_role_for_append_event(event_kind: str, requirement_id: str = "") -> str:
@@ -1171,6 +1340,12 @@ def _event_satisfies_requirement(
             and event_id not in accepted_event_ids
         ):
             return False, None
+    strict_identity_matched, strict_identity = _event_matches_strict_requirement_identity(
+        event,
+        requirement,
+    )
+    if not strict_identity_matched:
+        return False, None
     source = {
         "event_id": event.get("id") or event.get("event_id") or "",
         "event_kind": event_kind,
@@ -1179,6 +1354,8 @@ def _event_satisfies_requirement(
     }
     if required_execution_id:
         source["contract_execution_id"] = required_execution_id
+    if strict_identity:
+        source["strict_identity"] = strict_identity
     return True, source
 
 

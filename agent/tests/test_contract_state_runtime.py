@@ -1877,3 +1877,124 @@ def test_completed_deep_successor_followup_qa_prompts_close_ready():
     )
     assert projection["next_legal_action"]["id"] == "close_ready"
     assert projection["next_legal_action"]["contract_execution_id"] == "cex-qa-r2"
+
+
+def _strict_worker_identity_contract():
+    return {
+        "contract": {
+            "contract_id": "strict_worker_contract.v1",
+            "contract_template_id": "strict_worker_contract.v1",
+            "contract_revision_id": "rev-strict-worker",
+            "state": "selected",
+            "evidence_requirements": [
+                {
+                    "id": "worker_implementation",
+                    "event_kind": "implementation",
+                    "expected_writer_role": "mf_sub",
+                    "required_route_token_ref": "rtok-expected",
+                    "required_runtime_context_id": "mfrctx-expected",
+                    "required_task_id": "task-expected",
+                    "required_parent_task_id": "parent-expected",
+                    "required_worker_slot_id": "worker-slot-expected",
+                    "required_fence_token_hash": "sha256:fence-expected",
+                }
+            ],
+        }
+    }
+
+
+def _strict_worker_identity_payload(**overrides):
+    payload = {
+        "writer_role": "mf_sub",
+        "route_token_ref": "rtok-expected",
+        "runtime_context_id": "mfrctx-expected",
+        "task_id": "task-expected",
+        "parent_task_id": "parent-expected",
+        "worker_slot_id": "worker-slot-expected",
+        "fence_token_hash": "sha256:fence-expected",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_strict_worker_identity_requirement_accepts_matching_event():
+    projection = build_contract_state_projection(
+        [
+            _event(
+                900,
+                "implementation",
+                payload=_strict_worker_identity_payload(),
+            )
+        ],
+        contract=_strict_worker_identity_contract(),
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["contract_complete"] is True
+    assert projection["missing_evidence"] == []
+    completed = projection["completed_evidence"][0]
+    assert completed["id"] == "worker_implementation"
+    assert completed["strict_identity"]["writer_role"] == "mf_sub"
+    assert completed["strict_identity"]["route_token_ref"] == "rtok-expected"
+
+
+def test_strict_worker_identity_requirement_rejects_wrong_identity_fields():
+    wrong_values = {
+        "writer_role": "observer",
+        "route_token_ref": "rtok-wrong",
+        "runtime_context_id": "mfrctx-wrong",
+        "task_id": "task-wrong",
+        "parent_task_id": "parent-wrong",
+        "worker_slot_id": "worker-slot-wrong",
+        "fence_token_hash": "sha256:fence-wrong",
+    }
+
+    for field, wrong_value in wrong_values.items():
+        projection = build_contract_state_projection(
+            [
+                _event(
+                    901,
+                    "implementation",
+                    payload=_strict_worker_identity_payload(**{field: wrong_value}),
+                )
+            ],
+            contract=_strict_worker_identity_contract(),
+            backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        )
+
+        assert projection["contract_complete"] is False, field
+        assert projection["missing_evidence"] == ["worker_implementation"], field
+        assert projection["completed_evidence"] == [], field
+
+
+def test_strict_worker_identity_next_action_hint_exposes_expected_fields():
+    projection = build_contract_state_projection(
+        [],
+        contract=_strict_worker_identity_contract(),
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    hint = projection["next_legal_action"]["timeline_append_hint"]
+    assert hint["event_kind"] == "implementation"
+    assert hint["actor_role"] == "mf_sub"
+    assert hint["strict_identity"]["match_policy"] == "all_declared_identity_fields"
+    assert hint["expected_identity"] == {
+        "writer_role": "mf_sub",
+        "route_token_ref": "rtok-expected",
+        "runtime_context_id": "mfrctx-expected",
+        "task_id": "task-expected",
+        "parent_task_id": "parent-expected",
+        "worker_slot_id": "worker-slot-expected",
+        "fence_token_hash": "sha256:fence-expected",
+    }
+    assert set(hint["required_payload_fields"]) == {
+        "writer_role",
+        "route_token_ref",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_slot_id",
+        "fence_token_hash",
+    }
+    for field in hint["required_payload_fields"]:
+        assert hint["payload"][field] == hint["expected_identity"][field]
