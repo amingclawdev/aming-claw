@@ -10943,6 +10943,15 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             allow_validated=True,
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
+        event_route_identity, route_lineage_payload = (
+            _runtime_context_implementation_event_route_identity(
+                body,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                context=context,
+                parent_route_identity=route_identity,
+            )
+        )
         parent_task_id = (
             str(body.get("parent_task_id") or "").strip()
             or _runtime_context_mf_sub_parent_task_id(context)
@@ -10961,7 +10970,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             supplied_route["route_identity"] = supplied_nested
         route_mismatches = _runtime_context_gate_identity_mismatches(
             supplied_route,
-            route_identity,
+            event_route_identity,
             expected_scope={
                 "project_id": project_id,
                 "backlog_id": context.backlog_id,
@@ -10979,7 +10988,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 {
                     "runtime_context_id": runtime_context_id,
                     "mismatched_fields": route_mismatches,
-                    "source": "runtime_context_latest_route_identity",
+                    "source": "runtime_context_worker_event_route_identity",
                 },
             )
 
@@ -11141,11 +11150,14 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "observer_command_id": str(body.get("observer_command_id") or ""),
             "read_receipt_hash": read_receipt_hash,
             "read_receipt_event_id": read_receipt_event_id,
-            "route_token_ref": route_identity.get("route_token_ref") or "",
+            "route_token_ref": event_route_identity.get("route_token_ref") or "",
             "graph_trace_ids": graph_trace_ids,
             "graph_trace_db_evidence": graph_trace_db_evidence,
             "test_results": test_results,
         }
+        for key, value in route_lineage_payload.items():
+            if value:
+                attestation_payload[key] = value
         attestation = verify_worker_transcript(attestation_payload)
         if not attestation.get("ok"):
             raise ValidationError(
@@ -11167,12 +11179,12 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "worker_slot_id": context.worker_slot_id or context.worker_id,
             "worker_session_id": worker_session_id,
             "filer_principal": filer_principal,
-            "route_id": route_identity.get("route_id") or "",
-            "route_context_hash": route_identity.get("route_context_hash") or "",
-            "prompt_contract_id": route_identity.get("prompt_contract_id") or "",
-            "prompt_contract_hash": route_identity.get("prompt_contract_hash") or "",
-            "route_token_ref": route_identity.get("route_token_ref") or "",
-            "visible_injection_manifest_hash": route_identity.get(
+            "route_id": event_route_identity.get("route_id") or "",
+            "route_context_hash": event_route_identity.get("route_context_hash") or "",
+            "prompt_contract_id": event_route_identity.get("prompt_contract_id") or "",
+            "prompt_contract_hash": event_route_identity.get("prompt_contract_hash") or "",
+            "route_token_ref": event_route_identity.get("route_token_ref") or "",
+            "visible_injection_manifest_hash": event_route_identity.get(
                 "visible_injection_manifest_hash"
             )
             or "",
@@ -11184,6 +11196,9 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "test_results": test_results,
             "finish_time_worker_self_attestation": public_attestation,
         }
+        for key, value in route_lineage_payload.items():
+            if value:
+                payload[key] = value
         event = task_timeline.record_event(
             conn,
             project_id=project_id,
@@ -11229,7 +11244,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             runtime_context_id=runtime_context_id,
             context=context,
             parent_task_id=parent_task_id,
-            route_identity=route_identity,
+            route_identity=event_route_identity,
             finish_time_worker_self_attestation=public_attestation,
             head_commit=head_commit,
             changed_files=changed_files,

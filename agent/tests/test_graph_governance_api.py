@@ -5558,6 +5558,19 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert implementation["ok"] is True
     assert implementation["action"] == "implementation_evidence"
     assert implementation["timeline_event"]["event_kind"] == "implementation"
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-facade-ref-only-route-lineage",
+        contract_version="mf_parallel.v1",
+        payload={
+            "target_files": ["agent/governance/server.py"],
+            "route_identity": {
+                "route_token_ref": issued_route["route_token_ref"],
+            },
+        },
+        now_iso="2026-06-15T11:02:00Z",
+    )
 
     finish_attestation_body = {
         **common_body,
@@ -5579,6 +5592,14 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             "passed": True,
             "command": "pytest -q",
         },
+        "route_id": issued_route["route_id"],
+        "route_context_hash": issued_route["route_context_hash"],
+        "prompt_contract_id": issued_route["prompt_contract_id"],
+        "prompt_contract_hash": issued_route["route_token"]["prompt_contract_hash"],
+        "route_token_ref": issued_route["route_token_ref"],
+        "visible_injection_manifest_hash": issued_route[
+            "visible_injection_manifest_hash"
+        ],
     }
     with pytest.raises(GovernanceError) as observer_attestation_exc:
         server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
@@ -5853,6 +5874,16 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_attestation_payload["meta_contract_gate"]["action"] == (
         "worker_progress"
     )
+    assert stored_attestation_payload["route_id"] == issued_route["route_id"]
+    assert stored_attestation_payload["route_context_hash"] == issued_route[
+        "route_context_hash"
+    ]
+    assert stored_attestation_payload["prompt_contract_id"] == issued_route[
+        "prompt_contract_id"
+    ]
+    assert stored_attestation_payload["route_token_ref"] == issued_route[
+        "route_token_ref"
+    ]
     task_timeline.record_event(
         conn,
         project_id=PID,
