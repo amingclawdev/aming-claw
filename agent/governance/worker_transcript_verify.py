@@ -17,6 +17,7 @@ HARNESS_TYPE_ALIASES = {
     "codex_cli": "codex",
     "claude_code": "claude",
 }
+GOVERNANCE_WORKTREE_ARTIFACT_PREFIXES = (".worker-transcripts", ".aming-claw")
 
 
 def _text(value: Any) -> str:
@@ -59,6 +60,16 @@ def _dedupe(values: Sequence[str] | Any) -> list[str]:
             seen.add(text)
             out.append(text)
     return out
+
+
+def _is_governance_worktree_artifact(path: str) -> bool:
+    normalized = _text(path)
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return any(
+        normalized == prefix or normalized.startswith(f"{prefix}/")
+        for prefix in GOVERNANCE_WORKTREE_ARTIFACT_PREFIXES
+    )
 
 
 def _flatten_json(value: Any) -> str:
@@ -257,29 +268,43 @@ def _git_diff_truth(
     command = ["git", "-C", str(worktree), "diff", "--name-only", f"{base}..{head}"]
     changed: list[str] = []
     blockers: list[str] = []
-    try:
-        diff = subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {
-            "changed_files": [],
-            "blockers": [f"git_diff_failed:{exc}"],
-            "worktree_path": str(worktree),
-            "base_commit": base,
-            "head_commit": head,
-        }
-    if diff.returncode == 0:
-        changed.extend(line.strip() for line in diff.stdout.splitlines() if line.strip())
-    else:
-        blockers.append("git_diff_failed")
+    for diff_command, failure_label in (
+        (command, "git_diff_failed"),
+        (
+            ["git", "-C", str(worktree), "diff", "--name-only", "--cached"],
+            "git_cached_diff_failed",
+        ),
+        (
+            ["git", "-C", str(worktree), "diff", "--name-only"],
+            "git_worktree_diff_failed",
+        ),
+        (
+            ["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard"],
+            "git_untracked_files_failed",
+        ),
+    ):
+        try:
+            diff = subprocess.run(
+                diff_command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            blockers.append(f"{failure_label}:{exc}")
+            continue
+        if diff.returncode == 0:
+            changed.extend(line.strip() for line in diff.stdout.splitlines() if line.strip())
+        else:
+            blockers.append(failure_label)
     return {
-        "changed_files": _dedupe(changed),
+        "changed_files": [
+            item
+            for item in _dedupe(changed)
+            if not _is_governance_worktree_artifact(item)
+        ],
         "blockers": blockers,
         "worktree_path": str(worktree),
         "base_commit": base,

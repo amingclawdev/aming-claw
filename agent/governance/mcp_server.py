@@ -129,6 +129,7 @@ _RUNTIME_CONTEXT_QUERY_FIELDS = (
     "view",
     "graph_trace_id",
     "session_token",
+    "session_token_ref",
     "target_project_root",
 )
 
@@ -169,10 +170,68 @@ def _runtime_context_schema_properties() -> dict[str, Any]:
             "type": "string",
             "description": "Scoped worker session token issued at allocation.",
         },
+        "session_token_ref": {
+            "type": "string",
+            "description": "Opaque scoped worker session-token reference.",
+        },
         "target_project_root": {
             "type": "string",
             "description": "Target project root used to validate worker route identity.",
         },
+    }
+
+
+def _runtime_context_write_schema_properties() -> dict[str, Any]:
+    properties = dict(_runtime_context_schema_properties())
+    properties.update(
+        {
+            "task_id": {"type": "string"},
+            "worker_session_id": {"type": "string"},
+            "filer_principal": {"type": "string"},
+            "worker_transcript_ref": {"type": "string"},
+            "worker_transcript_path": {"type": "string"},
+            "harness_type": {"type": "string"},
+            "checkpoint_id": {"type": "string"},
+            "head_commit": {"type": "string"},
+            "changed_files": {"type": "array", "items": {"type": "string"}},
+            "owned_changed_files": {"type": "array", "items": {"type": "string"}},
+            "worker_changed_files": {"type": "array", "items": {"type": "string"}},
+            "owned_files": {"type": "array", "items": {"type": "string"}},
+            "graph_trace_ids": {"type": "array", "items": {"type": "string"}},
+            "graph_query_trace_ids": {"type": "array", "items": {"type": "string"}},
+            "read_receipt_event_id": {"type": "string"},
+            "read_receipt_hash": {"type": "string"},
+            "tests": {"type": "array", "items": {"type": "object"}},
+            "test_results": {"type": "object"},
+            "finish_time_worker_self_attestation": {"type": "object"},
+            "payload": {"type": "object"},
+            "verification": {"type": "object"},
+            "artifact_refs": {"type": "object"},
+            "event_type": {"type": "string"},
+            "event_kind": {"type": "string"},
+            "phase": {"type": "string"},
+            "actor": {"type": "string"},
+            "status": {"type": "string"},
+            "trace_id": {"type": "string"},
+            "commit_sha": {"type": "string"},
+            "route_id": {"type": "string"},
+            "route_context_hash": {"type": "string"},
+            "prompt_contract_id": {"type": "string"},
+            "prompt_contract_hash": {"type": "string"},
+            "visible_injection_manifest_hash": {"type": "string"},
+            "route_token_ref": {"type": "string"},
+            "route_token": {"type": "object"},
+            "route_waiver": {"type": "object"},
+        }
+    )
+    return properties
+
+
+def _runtime_context_write_body(args: dict) -> dict:
+    return {
+        key: value
+        for key, value in args.items()
+        if key != "project_id" and value is not None
     }
 
 
@@ -446,6 +505,33 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_implementation_evidence",
+        "description": "Worker-authored canonical Runtime Context implementation-evidence facade. Prefer this over legacy task_timeline_append for mf_sub happy paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_finish_time_worker_attestation",
+        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_finish_gate",
+        "description": "Canonical Runtime Context finish-gate facade that records mf_subagent_finish_gate evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
             "required": ["project_id", "runtime_context_id"],
         },
     },
@@ -771,6 +857,27 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             "GET",
             f"/api/graph-governance/{pid}/runtime-contexts/"
             f"{runtime_context_id}/{suffix}{qs}",
+        )
+
+    if name in {
+        "runtime_context_implementation_evidence",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+    }:
+        pid = args["project_id"]
+        runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
+        suffix_by_name = {
+            "runtime_context_implementation_evidence": "implementation-evidence",
+            "runtime_context_finish_time_worker_attestation": (
+                "finish-time-worker-attestation"
+            ),
+            "runtime_context_finish_gate": "finish-gate",
+        }
+        return _http(
+            "POST",
+            f"/api/graph-governance/{pid}/runtime-contexts/"
+            f"{runtime_context_id}/{suffix_by_name[name]}",
+            _runtime_context_write_body(args),
         )
 
     if name == "observer_repair_run_plan":

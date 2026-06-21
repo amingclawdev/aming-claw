@@ -29,6 +29,7 @@ BRANCH_GRAPH_CACHE_REL = ".aming-claw/cache/branches"
 BRANCH_GRAPH_POLICY_ONE_HOP = "one_hop_target_graph_candidate"
 BRANCH_GRAPH_CANDIDATE_KIND = "branch_delta"
 GRAPH_JSON_FILENAME = "graph.json"
+GOVERNANCE_WORKTREE_ARTIFACT_PREFIXES = (".worker-transcripts", ".aming-claw")
 
 VALID_JOB_TYPES = {
     JOB_FEATURE_WORK,
@@ -173,6 +174,46 @@ def git_changed_files(
     root = repo_root(path)
     output = _git_output(["diff", "--name-only", f"{base}..{head}"], cwd=root)
     return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def git_changed_files_with_worktree(
+    path: str | Path | None = None,
+    *,
+    base_ref: str,
+    head_ref: str = "HEAD",
+) -> list[str]:
+    """Return committed, staged, unstaged, and untracked changed files.
+
+    Runtime-context worker finish evidence is recorded before the observer
+    merge. A bounded worker may therefore have valid owned changes that are
+    staged or uncommitted, so base..HEAD alone is too narrow for finish gates.
+    """
+
+    root = repo_root(path)
+    changed: list[str] = []
+    changed.extend(git_changed_files(root, base_ref=base_ref, head_ref=head_ref))
+    for args in (
+        ["diff", "--name-only", "--cached"],
+        ["diff", "--name-only"],
+        ["ls-files", "--others", "--exclude-standard"],
+    ):
+        output = _git_output(args, cwd=root)
+        changed.extend(line.strip() for line in output.splitlines() if line.strip())
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in changed:
+        normalized = item.strip()
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if any(
+            normalized == prefix or normalized.startswith(f"{prefix}/")
+            for prefix in GOVERNANCE_WORKTREE_ARTIFACT_PREFIXES
+        ):
+            continue
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
 
 
 def infer_job_type(task_type: str = "task", metadata: dict[str, Any] | None = None) -> str:

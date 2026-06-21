@@ -82,6 +82,73 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     names = {tool["name"] for tool in responses[0]["result"]["tools"]}
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
+    assert {
+        "runtime_context_implementation_evidence",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+    }.issubset(names)
+
+
+def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "path": path}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    common = {
+        "project_id": "demo",
+        "runtime_context_id": "mfrctx-demo",
+        "session_token": "worker-session",
+        "fence_token": "fence-demo",
+    }
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_implementation_evidence",
+        {**common, "changed_files": ["src/app.js"]},
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_finish_time_worker_attestation",
+        {**common, "graph_trace_ids": ["gqt-demo"]},
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_finish_gate",
+        {**common, "checkpoint_id": "ckpt-demo"},
+    )["ok"] is True
+
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/demo/runtime-contexts/mfrctx-demo/implementation-evidence",
+            {
+                "runtime_context_id": "mfrctx-demo",
+                "session_token": "worker-session",
+                "fence_token": "fence-demo",
+                "changed_files": ["src/app.js"],
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/demo/runtime-contexts/mfrctx-demo/finish-time-worker-attestation",
+            {
+                "runtime_context_id": "mfrctx-demo",
+                "session_token": "worker-session",
+                "fence_token": "fence-demo",
+                "graph_trace_ids": ["gqt-demo"],
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/demo/runtime-contexts/mfrctx-demo/finish-gate",
+            {
+                "runtime_context_id": "mfrctx-demo",
+                "session_token": "worker-session",
+                "fence_token": "fence-demo",
+                "checkpoint_id": "ckpt-demo",
+            },
+        ),
+    ]
 
 
 def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():

@@ -22,6 +22,7 @@ from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
     validate_mf_subagent_finish_gate,
 )
+from agent.governance.worker_transcript_verify import verify_worker_transcript
 from agent.governance.parallel_branch_runtime import (
     ACTION_LEAVE_MERGED,
     ACTION_OBSERVER_DECISION_REQUIRED,
@@ -4199,6 +4200,71 @@ def test_worker_transcript_mf_sub_startup_accepts_identity_before_owned_diff(
         "finish_time_blockers"
     ]
     assert idle_gate["close_satisfying"] is False
+
+
+def test_worker_transcript_finish_accepts_uncommitted_owned_diff(
+    tmp_path,
+) -> None:
+    worktree = tmp_path / "workers" / "mf-sub-finish-uncommitted"
+    _base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    source_path = worktree / "agent" / "governance" / "parallel_branch_runtime.py"
+    source_path.write_text(
+        "base runtime\nhead runtime\nworker uncommitted runtime\n",
+        encoding="utf-8",
+    )
+    test_path = worktree / "tests" / "reminders.test.mjs"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text("console.log('worker test');\n", encoding="utf-8")
+
+    payload = {
+        "task_id": "mf-sub-finish-uncommitted",
+        "runtime_context_id": branch_runtime_context_id(
+            PROJECT_ID,
+            "mf-sub-finish-uncommitted",
+        ),
+        "fence_token": "fence-finish-uncommitted",
+        "worktree_path": str(worktree),
+        "branch_ref": "refs/heads/codex/mf-sub-finish-uncommitted",
+        "base_commit": head_commit,
+        "head_commit": head_commit,
+        "owned_files": [
+            "agent/governance/parallel_branch_runtime.py",
+            "tests/reminders.test.mjs",
+        ],
+        "changed_files": [
+            "agent/governance/parallel_branch_runtime.py",
+            "tests/reminders.test.mjs",
+        ],
+        "graph_trace_ids": ["gqt-finish-uncommitted"],
+        "graph_trace_db_evidence": {
+            "db_verified": True,
+            "verified_trace_ids": ["gqt-finish-uncommitted"],
+            "missing_trace_ids": [],
+            "identity_mismatches": [],
+        },
+        "observer_command_id": "cmd-finish-uncommitted",
+        "read_receipt_hash": "sha256:read-finish-uncommitted",
+        "read_receipt_event_id": "4187",
+        "route_token_ref": "rtok-finish-uncommitted",
+        "worker_session_id": "codex-finish-uncommitted",
+        "filer_principal": "codex-finish-uncommitted",
+        "worker_transcript_ref": "multi_agent:codex-finish-uncommitted",
+        "harness_type": "codex",
+        "attestation_phase": "finish",
+        "test_results": {"status": "passed", "passed": True},
+    }
+
+    result = verify_worker_transcript(payload)
+
+    assert result["ok"] is True, result
+    assert result["finish_time_self_attesting"] is True
+    diff_layer = next(
+        layer for layer in result["layers"] if layer["id"] == "owned_files_diff"
+    )
+    assert diff_layer["changed_files"] == [
+        "agent/governance/parallel_branch_runtime.py",
+        "tests/reminders.test.mjs",
+    ]
 
 
 def test_worker_transcript_mf_sub_startup_marks_no_graph_trace_not_self_attesting(

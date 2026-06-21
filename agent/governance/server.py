@@ -7938,6 +7938,8 @@ def _runtime_context_worker_guide_response(
                 "path": "/api/task/{project_id}/timeline",
                 "event_kind": "worker_progress",
                 "payload_action": "record_finish_time_worker_attestation",
+                "happy_path_allowed": False,
+                "policy": "recovery_or_diagnostic_only_use_canonical_facade_for_worker_happy_path",
             },
             "canonical_facade_status": "available",
             "path": (
@@ -7999,6 +8001,8 @@ def _runtime_context_worker_guide_response(
             "legacy_bridge": {
                 "method": "POST",
                 "path": "/api/graph-governance/{project_id}/parallel-branches/finish-gate",
+                "happy_path_allowed": False,
+                "policy": "recovery_or_diagnostic_only_use_canonical_facade_for_worker_happy_path",
             },
             "canonical_facade_status": "available",
             "path": (
@@ -8031,6 +8035,8 @@ def _runtime_context_worker_guide_response(
                 "method": "POST",
                 "path": "/api/task/{project_id}/timeline",
                 "event_kind": "implementation",
+                "happy_path_allowed": False,
+                "policy": "recovery_or_diagnostic_only_use_canonical_facade_for_worker_happy_path",
             },
             "canonical_facade_status": "available",
             "path": (
@@ -10991,7 +10997,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         changed_files: list[str] = []
         if worktree_path and os.path.exists(worktree_path) and context.base_commit:
             try:
-                changed_files = batch_jobs.git_changed_files(
+                changed_files = batch_jobs.git_changed_files_with_worktree(
                     worktree_path,
                     base_ref=context.base_commit,
                     head_ref=head_commit or "HEAD",
@@ -11274,7 +11280,7 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
         )
         if worktree_path and os.path.exists(worktree_path) and context.base_commit:
             try:
-                expected_changed_files = batch_jobs.git_changed_files(
+                expected_changed_files = batch_jobs.git_changed_files_with_worktree(
                     worktree_path,
                     base_ref=context.base_commit,
                     head_ref=expected_head_commit or "HEAD",

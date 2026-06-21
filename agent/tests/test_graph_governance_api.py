@@ -6227,6 +6227,166 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         assert "raw-route-token-facade" not in response_json
 
 
+def test_runtime_context_finish_attestation_accepts_uncommitted_owned_diff(
+    conn,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="runtime-context-uncommitted-worker",
+    )
+    worktree = fixture.root
+    task_id = "runtime-uncommitted-task"
+    parent_task_id = "runtime-uncommitted-parent"
+    backlog_id = "AC-RUNTIME-UNCOMMITTED-FINISH"
+    branch_name = "codex/runtime-uncommitted-task"
+    branch_ref = f"refs/heads/{branch_name}"
+    changed_path = "tests/reminders.test.mjs"
+    subprocess.run(
+        ["git", "checkout", "-B", branch_name, fixture.main_head],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target_file = worktree / changed_path
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("console.log('worker-owned test');\n", encoding="utf-8")
+
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            worker_id="worker-runtime-uncommitted",
+            worker_slot_id="worker-runtime-uncommitted",
+            actual_host_worker_id="agent-runtime-uncommitted",
+            agent_id="agent-runtime-uncommitted",
+            allocation_owner="agent-runtime-uncommitted",
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(worktree),
+            branch_ref=branch_ref,
+            worktree_path=str(worktree),
+            base_commit=fixture.main_head,
+            head_commit=fixture.main_head,
+            target_head_commit=fixture.main_head,
+            snapshot_id="scope-uncommitted",
+            projection_id="semproj-uncommitted",
+            merge_queue_id="mq-uncommitted",
+            fence_token="fence-uncommitted",
+            session_token_hash=mf_subagent_session_token_hash("session-uncommitted"),
+            status="worktree_ready",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-21T17:10:00Z",
+    )
+    issued_route = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=[changed_path],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-uncommitted-route-token"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued_route["route_token_ref"],
+        token=issued_route["route_token"],
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-uncommitted",
+        payload={"target_files": [changed_path]},
+        route_identity={
+            "route_id": issued_route["route_id"],
+            "route_context_hash": issued_route["route_context_hash"],
+            "prompt_contract_id": issued_route["prompt_contract_id"],
+            "prompt_contract_hash": issued_route["route_token"][
+                "prompt_contract_hash"
+            ],
+            "visible_injection_manifest_hash": issued_route[
+                "visible_injection_manifest_hash"
+            ],
+            "route_token_ref": issued_route["route_token_ref"],
+        },
+        now_iso="2026-06-21T17:11:00Z",
+    )
+    graph_trace_id = "gqt-runtime-uncommitted"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=parent_task_id,
+        snapshot_id="scope-uncommitted",
+        runtime_context_id=context.runtime_context_id,
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token="fence-uncommitted",
+        run_id=_mf_sub_run_id(task_id, "fence-uncommitted"),
+    )
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="read_receipt",
+        status="accepted",
+        actor="worker-uncommitted-session",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_slot_id": "worker-runtime-uncommitted",
+            "fence_token_hash": _fake_sha("fence-uncommitted"),
+            "read_receipt_hash": "sha256:read-uncommitted",
+            "route_token_ref": issued_route["route_token_ref"],
+        },
+    )
+    conn.commit()
+
+    response = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": parent_task_id,
+                "fence_token": "fence-uncommitted",
+                "session_token": "session-uncommitted",
+                "target_project_root": str(worktree),
+                "worker_session_id": "worker-uncommitted-session",
+                "filer_principal": "worker-uncommitted-session",
+                "worker_transcript_ref": "multi_agent:worker-uncommitted-session",
+                "harness_type": "codex",
+                "graph_trace_ids": [graph_trace_id],
+                "read_receipt_hash": "sha256:read-uncommitted",
+                "read_receipt_event_id": read_receipt["id"],
+                "observer_command_id": "cmd-uncommitted",
+                "changed_files": [changed_path],
+                "owned_files": [changed_path],
+                "test_results": {
+                    "status": "passed",
+                    "passed": True,
+                    "command": "node tests/reminders.test.mjs",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["finish_time_worker_self_attestation"][
+        "finish_time_self_attesting"
+    ] is True
+    assert response["finish_gate_submission"]["changed_files"] == [changed_path]
+
+
 def test_runtime_context_implementation_evidence_accepts_parent_bound_child_route_token(
     conn,
     tmp_path,
