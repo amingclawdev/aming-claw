@@ -5898,11 +5898,28 @@ def _ordered_subset(values: list[str], allowed: tuple[str, ...] | set[str]) -> l
 def mf_close_missing_evidence_groups(
     missing_event_kinds: list[str] | None,
     route_context_gate: dict[str, Any] | None,
+    ignored_required_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Group close-gate gaps into the operator action buckets shown in reminders."""
 
     close_missing = list(missing_event_kinds or [])
     route_gate = _mapping(route_context_gate)
+    ignored = [
+        _mapping(item)
+        for item in _list(ignored_required_events)
+        if isinstance(item, Mapping)
+    ]
+    hotfix_implementation_gaps = [
+        item
+        for item in ignored
+        if str(item.get("event_kind") or "").strip() == "hotfix_under_action"
+        and str(item.get("reason") or "").strip()
+        in {
+            "missing_hotfix_implementation_policy_payload",
+            "event_does_not_claim_implementation_projection",
+            "missing_hotfix_implementation_close_evidence",
+        }
+    ]
     route_missing = [
         str(item)
         for item in _list(route_gate.get("missing_requirement_ids"))
@@ -5966,6 +5983,20 @@ def mf_close_missing_evidence_groups(
             "label": "other route evidence",
             "missing": other_route,
             "next_action": "inspect route_context_gate.missing_requirement_ids",
+        }
+    if "implementation" in close_missing and hotfix_implementation_gaps:
+        groups["timeline"]["next_action"] = (
+            "append or repair a hotfix_under_action event with "
+            "implementation_close_evidence, then record verification and close_ready"
+        )
+        groups["hotfix_implementation_close_evidence"] = {
+            "label": "hotfix implementation close evidence",
+            "missing": ["implementation_close_evidence"],
+            "rejected_hotfix_events": hotfix_implementation_gaps,
+            "next_action": (
+                "record hotfix_under_action with implementation_close_evidence "
+                "including changed_files, verification_evidence_refs, and qa_lineage"
+            ),
         }
     contract_policy = _mapping(route_gate.get("contract_close_gate_policy"))
     not_applicable = _list(route_gate.get("not_applicable_requirement_ids"))
@@ -8605,6 +8636,7 @@ def mf_close_gate_verification(
     missing_evidence_groups = mf_close_missing_evidence_groups(
         missing,
         route_context_gate,
+        ignored,
     )
     groups = _mapping(missing_evidence_groups.get("groups"))
     if contract_projection_gate.get("required") and not contract_projection_gate.get("passed"):

@@ -2576,6 +2576,77 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(step_ids[0], "implementation")
         self.assertEqual(next_action["id"], "implementation")
 
+    def test_root_route_context_next_action_names_hotfix_implementation_close_evidence(self):
+        from agent.governance import server
+
+        route_gate = {
+            "missing_requirement_ids": [],
+            "ignored_route_events": [],
+        }
+        close_gate = {
+            "missing_event_kinds": ["implementation"],
+            "ignored_required_events": [
+                {
+                    "id": 5857,
+                    "event_kind": "hotfix_under_action",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "reason": "missing_hotfix_implementation_close_evidence",
+                    "implementation_close_projection": {
+                        "counts_as_implementation": False,
+                        "missing_fields": [
+                            "changed_files",
+                            "verification_evidence_refs",
+                            "qa_lineage",
+                        ],
+                    },
+                }
+            ],
+            "cross_ref_gate": {"passed": True},
+            "close_timeline_startup_gate": {},
+            "checks": {},
+        }
+
+        steps = server._observer_root_route_close_gate_steps(close_gate, route_gate)
+        step_ids = [step["id"] for step in steps]
+        next_action = server._observer_root_route_next_legal_action_from_steps(
+            steps,
+            default={"id": "close_ready", "action": "record_close_ready"},
+        )
+
+        self.assertEqual(step_ids, ["hotfix_implementation_close_evidence"])
+        self.assertEqual(next_action["id"], "hotfix_implementation_close_evidence")
+        self.assertEqual(
+            next_action["action"],
+            "record_hotfix_under_action_implementation_close_evidence",
+        )
+        self.assertIn("implementation_close_evidence", next_action["detail"])
+
+    def test_root_route_context_next_action_includes_architecture_review_gate(self):
+        from agent.governance import server
+
+        route_gate = {
+            "missing_requirement_ids": ["architecture_review_lane"],
+            "ignored_route_events": [],
+        }
+        close_gate = {
+            "missing_event_kinds": ["close_ready"],
+            "cross_ref_gate": {"passed": True},
+            "close_timeline_startup_gate": {},
+            "checks": {},
+        }
+
+        steps = server._observer_root_route_close_gate_steps(close_gate, route_gate)
+        step_ids = [step["id"] for step in steps]
+        next_action = server._observer_root_route_next_legal_action_from_steps(
+            steps,
+            default={"id": "close_ready", "action": "record_close_ready"},
+        )
+
+        self.assertEqual(step_ids, ["architecture_review_lane", "close_ready"])
+        self.assertEqual(next_action["id"], "architecture_review_lane")
+        self.assertEqual(next_action["action"], "record_architecture_review")
+
     def test_root_route_context_multi_attempts_request_lineage_bridge_not_dispatch(self):
         from agent.governance import observer_session, server
 
@@ -7249,6 +7320,15 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertFalse(blocked["passed"], blocked)
         self.assertIn("implementation", blocked["missing_event_kinds"])
         self.assertTrue(blocked["independent_qa_gate"]["passed"], blocked)
+        groups = blocked["missing_evidence_groups"]["groups"]
+        self.assertEqual(
+            groups["hotfix_implementation_close_evidence"]["missing"],
+            ["implementation_close_evidence"],
+        )
+        self.assertIn(
+            "implementation_close_evidence",
+            groups["timeline"]["next_action"],
+        )
 
     def test_observer_hotfix_under_action_rejects_generic_implementation_alias(self):
         from agent.governance import task_timeline

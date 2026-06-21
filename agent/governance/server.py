@@ -27562,6 +27562,12 @@ def _observer_root_route_close_gate_steps(
             "record_independent_verification",
             "independent verification lane evidence is missing",
         ),
+        (
+            "architecture_review_lane",
+            "architecture_review_lane",
+            "record_architecture_review",
+            "architecture/data-continuity review lane evidence is missing",
+        ),
     ]
     for missing_id, step_id, action, reason in route_step_map:
         if missing_id in missing_route:
@@ -27572,8 +27578,32 @@ def _observer_root_route_close_gate_steps(
         for item in (close_gate.get("missing_event_kinds") or [])
         if str(item)
     ]
+    ignored_hotfix_implementation_events = [
+        item
+        for item in (close_gate.get("ignored_required_events") or [])
+        if isinstance(item, Mapping)
+        and str(item.get("event_kind") or "").strip() == "hotfix_under_action"
+        and str(item.get("reason") or "").strip()
+        in {
+            "missing_hotfix_implementation_policy_payload",
+            "event_does_not_claim_implementation_projection",
+            "missing_hotfix_implementation_close_evidence",
+        }
+    ]
     for event_kind in ("implementation", "verification", "close_ready"):
         if event_kind in missing_events:
+            if event_kind == "implementation" and ignored_hotfix_implementation_events:
+                _add(
+                    "hotfix_implementation_close_evidence",
+                    "record_hotfix_under_action_implementation_close_evidence",
+                    (
+                        "hotfix_under_action exists but does not yet include "
+                        "implementation_close_evidence for changed files, "
+                        "verification refs, and QA lineage"
+                    ),
+                    rejected_hotfix_events=ignored_hotfix_implementation_events,
+                )
+                continue
             _add(
                 event_kind,
                 f"record_{event_kind}",
