@@ -9490,18 +9490,78 @@ def _runtime_context_raise_child_route_lineage_error(
 def _runtime_context_implementation_event_route_identity(
     body: Mapping[str, Any],
     *,
+    project_id: str,
     runtime_context_id: str,
     context,
     parent_route_identity: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     token = _runtime_context_child_route_token(body.get("route_token"))
     if not token:
-        return dict(parent_route_identity), {}
+        route_token_ref = str(body.get("route_token_ref") or "").strip()
+        if route_token_ref:
+            from . import observer_route_context as _orc
+            from .mf_subagent_contract import route_token_required_failure_details
+
+            try:
+                resolved = _resolve_route_token_ref_server_side(
+                    dict(body),
+                    pid=project_id,
+                    backlog_id=str(getattr(context, "backlog_id", "") or ""),
+                    task_id=str(getattr(context, "task_id", "") or ""),
+                    route_id=_route_request_identity_value(body, "route_id"),
+                    route_context_hash=_route_request_identity_value(
+                        body,
+                        "route_context_hash",
+                    ),
+                    prompt_contract_id=_route_request_identity_value(
+                        body,
+                        "prompt_contract_id",
+                    ),
+                )
+            except _orc.RouteTokenRefError as exc:
+                raise GovernanceError(
+                    "route_token_required",
+                    str(exc),
+                    422,
+                    route_token_required_failure_details(
+                        action="task_timeline_append",
+                        reason=str(exc),
+                    ),
+                ) from exc
+            if resolved:
+                return _runtime_context_implementation_resolved_ref_route_identity(
+                    resolved,
+                    route_token_ref=route_token_ref,
+                    runtime_context_id=runtime_context_id,
+                    context=context,
+                    parent_route_identity=parent_route_identity,
+                )
+        identity = dict(parent_route_identity)
+        if route_token_ref:
+            identity["route_token_ref"] = route_token_ref
+        return identity, {}
 
     child_route_identity = _runtime_context_route_identity_from_child_token(
         token,
         route_token_ref=str(body.get("route_token_ref") or "").strip(),
     )
+    return _runtime_context_validate_parent_bound_route_identity(
+        token,
+        child_route_identity=child_route_identity,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        parent_route_identity=parent_route_identity,
+    )
+
+
+def _runtime_context_validate_parent_bound_route_identity(
+    token: Mapping[str, Any],
+    *,
+    child_route_identity: Mapping[str, Any],
+    runtime_context_id: str,
+    context,
+    parent_route_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     token_parent_mismatches = _runtime_context_route_identity_mismatch_fields(
         parent_route_identity,
         child_route_identity,
@@ -9516,7 +9576,11 @@ def _runtime_context_implementation_event_route_identity(
     )
     if not parent_lineage:
         if token_matches_parent:
-            return dict(parent_route_identity), {}
+            identity = dict(parent_route_identity)
+            for key, value in child_route_identity.items():
+                if value and (key == "route_token_ref" or not identity.get(key)):
+                    identity[key] = value
+            return identity, {}
         _runtime_context_raise_child_route_lineage_error(
             code="parent_route_lineage_missing",
             runtime_context_id=runtime_context_id,
@@ -9562,6 +9626,27 @@ def _runtime_context_implementation_event_route_identity(
         "child_route_lineage": dict(child_lineage),
         "route_lineage": route_lineage,
     }
+
+
+def _runtime_context_implementation_resolved_ref_route_identity(
+    resolved: Mapping[str, Any],
+    *,
+    route_token_ref: str,
+    runtime_context_id: str,
+    context,
+    parent_route_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    child_route_identity = _runtime_context_route_identity_from_child_token(
+        resolved,
+        route_token_ref=route_token_ref,
+    )
+    return _runtime_context_validate_parent_bound_route_identity(
+        resolved,
+        child_route_identity=child_route_identity,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        parent_route_identity=parent_route_identity,
+    )
 
 
 def _runtime_context_implementation_observer_command_id(
@@ -11310,6 +11395,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     event_route_identity, route_lineage_payload = (
         _runtime_context_implementation_event_route_identity(
             body,
+            project_id=project_id,
             runtime_context_id=runtime_context_id,
             context=context,
             parent_route_identity=route_identity,

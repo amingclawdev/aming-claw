@@ -6318,13 +6318,13 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
     assert response["timeline_event"]["event_kind"] == "implementation"
     assert response["route_token_gate"]["decision"] == "route_token"
     assert response["route_token_gate"]["route_token_ref"] == child_issue["route_token_ref"]
+    child_route = child_issue["route_token"]
 
     stored = conn.execute(
         "SELECT payload_json FROM task_timeline_events WHERE id = ?",
         (response["timeline_event"]["id"],),
     ).fetchone()
     payload = json.loads(stored["payload_json"])
-    child_route = child_issue["route_token"]
     assert payload["route_id"] == child_route["route_id"]
     assert payload["route_context_hash"] == child_route["route_context_hash"]
     assert payload["prompt_contract_id"] == child_route["prompt_contract_id"]
@@ -6341,6 +6341,50 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
         parent_route_identity["route_id"]
     )
     assert payload["meta_contract_gate"]["action"] == "implementation"
+
+    ref_only_response = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": context.root_task_id,
+                    "fence_token": "fence-child-route-token",
+                    "session_token": "session-child-route-token",
+                    "target_project_root": str(target_root),
+                    "changed_files": ["agent/governance/server.py"],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "payload": {
+                        "worker_role": "mf_sub",
+                        "summary": "copy-safe child route ref path",
+                    },
+                    "route_token_ref": child_issue["route_token_ref"],
+                },
+            )
+        )
+    )
+    assert ref_only_response["ok"] is True
+    assert ref_only_response["timeline_event"]["event_kind"] == "implementation"
+    assert ref_only_response["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    assert ref_only_response["route_token_gate"]["route_token_ref"] == (
+        child_issue["route_token_ref"]
+    )
+    ref_only_stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (ref_only_response["timeline_event"]["id"],),
+    ).fetchone()
+    ref_only_payload = json.loads(ref_only_stored["payload_json"])
+    assert ref_only_payload["route_id"] == child_route["route_id"]
+    assert ref_only_payload["route_context_hash"] == child_route["route_context_hash"]
+    assert ref_only_payload["prompt_contract_id"] == child_route["prompt_contract_id"]
+    assert ref_only_payload["route_token_ref"] == child_issue["route_token_ref"]
+    assert ref_only_payload["parent_route_lineage"]["route_id"] == (
+        parent_route_identity["route_id"]
+    )
+    assert ref_only_payload["child_route_lineage"]["route_id"] == child_route["route_id"]
+    assert ref_only_payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    assert "route_token" not in ref_only_payload
 
 
 def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_lineage(
@@ -6405,12 +6449,24 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
             "selected_backlog_id": context.backlog_id,
         },
     )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=unrelated_child["route_token_ref"],
+        token=unrelated_child["route_token"],
+    )
     token_without_parent = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
         backlog_id=context.backlog_id,
         task_id=context.task_id,
         target_files=["agent/governance/server.py"],
         allowed_actions=["task_timeline_append"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=token_without_parent["route_token_ref"],
+        token=token_without_parent["route_token"],
     )
     common_body = {
         "parent_task_id": context.root_task_id,
@@ -6444,6 +6500,24 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
         "parent_route_lineage.route_id"
     )
 
+    with pytest.raises(GovernanceError) as ref_mismatch:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "route_token_ref": unrelated_child["route_token_ref"],
+                },
+            )
+        )
+    assert ref_mismatch.value.code == "parent_route_lineage_mismatch"
+    assert ref_mismatch.value.status == 422
+    assert ref_mismatch.value.details["mismatched_fields"][0]["field"] == (
+        "parent_route_lineage.route_id"
+    )
+
     with pytest.raises(GovernanceError) as missing:
         server.handle_graph_governance_runtime_context_implementation_evidence(
             _ctx_with_role(
@@ -6462,6 +6536,21 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
     assert missing.value.details["repair"]["action"] == (
         "refresh_runtime_contract_or_reissue_child_route_token"
     )
+
+    with pytest.raises(GovernanceError) as ref_missing:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "route_token_ref": token_without_parent["route_token_ref"],
+                },
+            )
+        )
+    assert ref_missing.value.code == "parent_route_lineage_missing"
+    assert ref_missing.value.status == 422
 
 
 def test_runtime_context_finish_gate_facade_preserves_contract_error_tuple(conn):
