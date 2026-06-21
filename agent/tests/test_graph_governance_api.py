@@ -4559,6 +4559,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "graph_query",
         "route_context",
         "session_token_reissue",
+        "session_token_rejoin",
     }
     read_interface_contracts = {
         "current_state": {
@@ -15058,7 +15059,13 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
         conn,
         context,
         revision_id="crev-empty-target-root",
-        payload={"target_files": ["agent/governance/server.py"]},
+        payload={
+            "contract_execution_id": "cex-empty-target-root",
+            "contract_chain_id": "cchain-empty-target-root",
+            "parent_contract_execution_id": "cex-parent-empty-target-root",
+            "successor_contract_execution_id": "cex-qa-empty-target-root",
+            "target_files": ["agent/governance/server.py"],
+        },
         route_identity={
             "route_id": "route-empty-target-root",
             "route_context_hash": "sha256:route-empty-target-root",
@@ -15099,6 +15106,32 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     assert graph_payload["target_project_root"] == str(target_root)
     assert graph_payload["project_root"] == str(target_root)
     assert graph_payload["repo_root"] == str(target_root)
+    current_envelope = current["executable_contract"]
+    assert current["runtime_context_service"]["executable_contract"] == current_envelope
+    assert current_envelope["schema_version"] == (
+        "runtime_context.executable_contract_envelope.v1"
+    )
+    assert current_envelope["advisory_only"] is True
+    assert current_envelope["access_audit"]["counts_as_context_read_receipt"] is False
+    assert current_envelope["contract_execution"]["contract_execution_id"] == (
+        "cex-empty-target-root"
+    )
+    assert current_envelope["contract_execution"]["contract_chain_id"] == (
+        "cchain-empty-target-root"
+    )
+    assert current_envelope["contract_execution"]["contract_hash"].startswith("sha256:")
+    current_receipt = current_envelope["contract_context_read_receipt"]
+    assert current_receipt["schema_version"] == "contract_context_read_receipt.v1"
+    assert current_receipt["canonical_event_kind"] == "contract_context_read_receipt"
+    assert current_receipt["legacy_event_kind"] == "mf_subagent_read_receipt"
+    assert current_receipt["receipt_required"] is True
+    assert current_receipt["receipt_status"] == "missing"
+    assert current_receipt["context_hash"] == current["runtime_context_service"][
+        "content_address"
+    ]["projection_hash"]
+    assert "next_legal_action/current-state/access_audit are advisory" in (
+        current_envelope["proof_policy"]
+    )
 
     guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
         _ctx(
@@ -15115,14 +15148,44 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     assert worker_guide["graph_query_identity"]["payload_shape"][
         "target_project_root"
     ] == str(target_root)
+    guide_envelope = guide["executable_contract"]
+    assert worker_guide["executable_contract"] == guide_envelope
+    assert guide_envelope["contract_execution"]["contract_execution_id"] == (
+        "cex-empty-target-root"
+    )
+    assert guide_envelope["contract_context_read_receipt"]["payload_skeleton"][
+        "copy_safe_body"
+    ]["contract_execution_id"] == "cex-empty-target-root"
     write_guide = worker_guide["write_guides"]["read_receipt"]
     assert write_guide["top_level_body_required"] is True
     assert "route_context_hash" in write_guide["required_fields"]
     receipt_skeleton = worker_guide["read_receipt_facade_payload_skeleton"]
     assert receipt_skeleton["top_level_body_required"] is True
     assert receipt_skeleton["body_source"] == "copy_safe_body"
+    assert receipt_skeleton["canonical_event_kind"] == "contract_context_read_receipt"
+    assert receipt_skeleton["legacy_event_kind"] == "mf_subagent_read_receipt"
+    assert receipt_skeleton["contract_context_read_receipt"]["proof_policy"]
     assert "nested_payload_only_identity" in receipt_skeleton["forbidden_shapes"]
     copy_safe_body = receipt_skeleton["copy_safe_body"]
+    assert copy_safe_body["canonical_event_kind"] == "contract_context_read_receipt"
+    assert copy_safe_body["legacy_event_kind"] == "mf_subagent_read_receipt"
+    assert copy_safe_body["actor_role"] == "mf_sub"
+    assert copy_safe_body["contract_execution_id"] == "cex-empty-target-root"
+    assert copy_safe_body["contract_chain_id"] == "cchain-empty-target-root"
+    assert copy_safe_body["parent_contract_execution_id"] == (
+        "cex-parent-empty-target-root"
+    )
+    assert copy_safe_body["successor_contract_execution_id"] == (
+        "cex-qa-empty-target-root"
+    )
+    assert copy_safe_body["contract_revision_id"] == "crev-empty-target-root"
+    assert copy_safe_body["contract_hash"].startswith("sha256:")
+    assert copy_safe_body["context_hash"] == guide_envelope[
+        "contract_context_read_receipt"
+    ]["context_hash"]
+    assert copy_safe_body["contract_context_read_receipt"]["schema_version"] == (
+        "contract_context_read_receipt.v1"
+    )
     assert copy_safe_body["runtime_context_id"] == context.runtime_context_id
     assert copy_safe_body["task_id"] == "worker-empty-target-root"
     assert copy_safe_body["parent_task_id"] == "parent-empty-target-root"

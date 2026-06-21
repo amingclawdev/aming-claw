@@ -150,6 +150,38 @@ def test_independent_verification_lane_hint_is_qa_owned_and_appendable():
     assert completed["missing_evidence"] == []
 
 
+def test_focused_verification_hint_uses_appendable_qa_event_kind():
+    contract = {
+        "contract": {
+            "contract_id": "observer_hotfix_direct_mutation.v1",
+            "contract_template_id": "observer_hotfix_direct_mutation.v1",
+            "contract_execution_id": "cex-hotfix",
+            "state": "selected",
+            "evidence_requirements": [
+                {
+                    "id": "focused_verification",
+                    "event_kind": "verification",
+                    "accepted_event_kinds": ["verification", "qa_verification"],
+                    "match_policy": "canonical_event_kind",
+                }
+            ],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    hint = projection["next_legal_action"]["timeline_append_hint"]
+    assert projection["next_legal_action"]["id"] == "focused_verification"
+    assert hint["event_kind"] == "qa_verification"
+    assert hint["actor_role"] == "qa"
+    assert hint["meta_contract_gate"]["allowed"] is True
+    assert "verification" in hint["accepted_event_kinds"]
+
+
 def test_work_mode_transition_hint_carries_route_identity_and_precheck_ref():
     route_identity = {
         "route_id": "route-1",

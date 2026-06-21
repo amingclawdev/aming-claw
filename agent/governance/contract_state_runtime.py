@@ -913,17 +913,24 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         requirement_id,
         accepted_event_kinds,
     )
-    direct_event_kind = next(
-        (
-            event_kind
-            for event_kind in accepted_event_kinds
-            if event_kind in _DIRECT_TIMELINE_APPEND_EVENT_KINDS
-        ),
-        "",
+    direct_event_kind, actor_role = _appendable_event_kind_for_requirement(
+        accepted_event_kinds,
+        requirement_id,
     )
+    if not direct_event_kind:
+        direct_event_kind = next(
+            (
+                event_kind
+                for event_kind in accepted_event_kinds
+                if event_kind in _DIRECT_TIMELINE_APPEND_EVENT_KINDS
+            ),
+            "",
+        )
+        actor_role = _actor_role_for_append_event(direct_event_kind, requirement_id)
     uses_requirement_payload_match = False
     if not direct_event_kind:
         direct_event_kind = "contract_state_changed"
+        actor_role = _actor_role_for_append_event(direct_event_kind, requirement_id)
         uses_requirement_payload_match = True
     accepted_statuses = _string_list(step.get("accepted_statuses"))
     if "passed" in accepted_statuses:
@@ -937,7 +944,6 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         "requirement_id": requirement_id,
         "requirement_ids": [requirement_id] if requirement_id else [],
     }
-    actor_role = _actor_role_for_append_event(direct_event_kind, requirement_id)
     strict_identity = _strict_requirement_identity_hint(step)
     if strict_identity:
         for canonical, value in strict_identity["expected_identity"].items():
@@ -974,6 +980,19 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         hint["expected_identity"] = dict(strict_identity["expected_identity"])
         hint["required_payload_fields"] = strict_identity["required_payload_fields"]
     return hint
+
+
+def _appendable_event_kind_for_requirement(
+    accepted_event_kinds: list[str],
+    requirement_id: str,
+) -> tuple[str, str]:
+    for event_kind in accepted_event_kinds:
+        if event_kind not in _DIRECT_TIMELINE_APPEND_EVENT_KINDS:
+            continue
+        actor_role = _actor_role_for_append_event(event_kind, requirement_id)
+        if _meta_contract_append_gate(event_kind, actor_role).get("allowed") is True:
+            return event_kind, actor_role
+    return "", ""
 
 
 def _actor_role_for_append_event(event_kind: str, requirement_id: str = "") -> str:
