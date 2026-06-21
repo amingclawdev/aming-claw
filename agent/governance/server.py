@@ -27728,8 +27728,11 @@ def _observer_root_route_close_action_card(
     task_id: str,
     target_files: list[str],
     events: list[dict[str, Any]],
+    backlog_status: str = "",
 ) -> dict[str, Any]:
     passed = bool(close_gate.get("passed"))
+    normalized_backlog_status = str(backlog_status or "").strip().upper()
+    backlog_is_terminal = normalized_backlog_status in _BACKLOG_CLOSED_STATUSES
     current_ref = str(route_token_ref_projection.get("route_token_ref") or "").strip()
     current_allowed_actions = [
         str(item or "").strip()
@@ -27811,6 +27814,29 @@ def _observer_root_route_close_action_card(
             "route-token issue requires target_files from the backlog row, "
             "contract scope, or owned-file fence"
         )
+    if backlog_is_terminal:
+        card.update(
+            {
+                "action": "done",
+                "allowed_action": "",
+                "protected_action": False,
+                "status": "done",
+                "terminal": True,
+                "terminal_status": normalized_backlog_status,
+                "classification": (
+                    "already_fixed"
+                    if normalized_backlog_status == "FIXED"
+                    else "already_terminal"
+                ),
+                "route_token_refresh_required": False,
+                "detail": (
+                    f"backlog row is already {normalized_backlog_status}; "
+                    "no backlog_close action is required"
+                ),
+            }
+        )
+        card.pop("issue_route_token_request", None)
+        return card
     if not passed:
         card.update(
             {
@@ -27857,6 +27883,25 @@ def _observer_root_route_close_action_card(
 def _observer_root_route_close_next_legal_action(
     close_action_card: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if close_action_card.get("terminal"):
+        action_id = "done"
+        next_action = {
+            "id": action_id,
+            "action": action_id,
+            "status": str(close_action_card.get("status") or "done"),
+            "detail": str(close_action_card.get("detail") or ""),
+            "source": "close_gate_projection",
+            "precedence": "backlog_terminal_status",
+            "terminal_status": str(close_action_card.get("terminal_status") or ""),
+            "action_card": dict(close_action_card),
+        }
+        scope = close_action_card.get("required_scope")
+        if isinstance(scope, Mapping):
+            for field in ("project_id", "backlog_id", "task_id"):
+                value = str(scope.get(field) or "").strip()
+                if value:
+                    next_action[field] = value
+        return {key: value for key, value in next_action.items() if value}
     if not close_action_card.get("close_gate_passed"):
         return {}
     action_id = str(close_action_card.get("next_action") or "").strip()
@@ -28326,6 +28371,7 @@ def _observer_root_route_context_state(
         route_token_ref_projection,
         project_id=project_id,
         backlog_id=backlog_id,
+        backlog_status=str(_row_get(row, "status", "") if row is not None else ""),
         task_id=str(task_id or "").strip(),
         target_files=row_target_files or contract_target_files,
         events=events,
