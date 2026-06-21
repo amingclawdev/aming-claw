@@ -1047,10 +1047,10 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert [step["id"] for step in bridge["steps"]] == [
         "query_runtime_contract",
         "record_read_receipt",
+        "record_startup",
         "worker_graph_query",
         "implementation_and_tests",
         "transcript_self_attestation",
-        "record_startup",
     ]
     contract_step = bridge["steps"][0]
     assert contract_step["entrypoint"]["path"] == (
@@ -1068,14 +1068,20 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     ]
     assert read_receipt_step["hash_bridge"]["startup_field"] == "read_receipt_hash"
     assert "observer_command_id" in read_receipt_step["required_payload_fields"]
-    graph_query_step = bridge["steps"][2]
+    startup_step = bridge["steps"][2]
+    assert "worker_transcript_ref or worker_transcript_path" in startup_step[
+        "required_fields"
+    ]
+    assert "graph_trace_ids" not in startup_step["required_fields"]
+    assert "close_satisfying=false" in startup_step["close_satisfying_rule"]
+    graph_query_step = bridge["steps"][3]
     assert graph_query_step["entrypoint"]["path"] == (
         "/api/graph-governance/{project_id}/query"
     )
     assert graph_query_step["entrypoint"]["query_source"] == "mf_subagent"
     assert graph_query_step["entrypoint"]["query_purpose"] == "subagent_context_build"
     assert "runtime_context_id" in graph_query_step["entrypoint"]["required_body_fields"]
-    implementation_step = bridge["steps"][3]
+    implementation_step = bridge["steps"][4]
     assert implementation_step["owned_files"] == [
         "agent/governance/parallel_branch_runtime.py"
     ]
@@ -1085,10 +1091,6 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "finish_gate",
         "verification_or_test_results",
     ]
-    startup_step = bridge["steps"][-1]
-    assert "worker_transcript_path" in startup_step["required_fields"]
-    assert "graph_trace_ids" in startup_step["required_fields"]
-    assert "close_satisfying=false" in startup_step["close_satisfying_rule"]
     assert read_action["worker_next_moves"][0]["id"] == "query_runtime_contract"
     assert read_action["worker_constraints"]["scope"]["owned_files"] == [
         "agent/governance/parallel_branch_runtime.py"

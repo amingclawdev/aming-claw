@@ -8629,6 +8629,264 @@ def test_parallel_branch_startup_accepts_codex_cli_host_startup_id_for_observer_
     assert started["startup_gate"]["host_startup_id"].startswith("codex-cli-thread:")
 
 
+def test_parallel_branch_startup_accepts_service_dispatch_bound_multi_agent_id(
+    conn, tmp_path
+):
+    worktree = tmp_path / "worker-service-dispatch-startup"
+    worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="service-dispatch-mf-sub-task",
+        root_task_id="service-dispatch-parent",
+        stage_task_id="service-dispatch-mf-sub-task",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        branch_ref="refs/heads/codex/service-dispatch-mf-sub-task",
+        status="worktree_ready",
+        worker_id="service-dispatch-worker-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        worker_slot_id="service-dispatch-worker-slot",
+        fence_token="fence-service-dispatch-mf-sub",
+        session_token_hash=mf_subagent_session_token_hash(
+            "service-dispatch-session-token"
+        ),
+        worktree_path=str(worktree),
+        base_commit="base-service-dispatch",
+        head_commit="base-service-dispatch",
+        target_head_commit="target-service-dispatch",
+        merge_queue_id="mergeq-api-service-dispatch",
+    )
+    upsert_branch_context(
+        conn,
+        runtime_context,
+        now_iso="2026-06-21T15:05:00Z",
+    )
+    route_identity = {
+        "route_id": "route-service-dispatch",
+        "route_context_hash": "sha256:route-service-dispatch",
+        "prompt_contract_id": "rprompt-service-dispatch",
+        "prompt_contract_hash": "sha256:prompt-service-dispatch",
+        "route_token_ref": "rtok-service-dispatch",
+        "visible_injection_manifest_hash": "sha256:visible-service-dispatch",
+    }
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        payload={"target_files": ["agent/governance/parallel_branch_runtime.py"]},
+        route_identity=route_identity,
+        now_iso="2026-06-21T15:05:10Z",
+    )
+    dispatch_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="service-dispatch-parent",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        event_type="observer.subagent.service_dispatch",
+        event_kind="observer_subagent_service_dispatch",
+        phase="dispatch",
+        status="accepted",
+        actor="observer",
+        payload={
+            "schema_version": "observer_subagent_service_dispatch.v1",
+            "observer_command_id": "cmd-service-dispatch",
+            **route_identity,
+            "workers": [
+                {
+                    "runtime_context_id": runtime_context_id_for_branch_context(
+                        runtime_context
+                    ),
+                    "task_id": "service-dispatch-mf-sub-task",
+                    "worker_id": "service-dispatch-worker-slot",
+                    "worker_slot_id": "service-dispatch-worker-slot",
+                    "agent_id": "019ee-service-dispatch-worker",
+                    "actual_host_worker_id": "019ee-service-dispatch-worker",
+                    "transcript_ref": "multi_agent:019ee-service-dispatch-worker",
+                    "session_token_ref": runtime_context_session_token_ref(
+                        runtime_context
+                    ),
+                }
+            ],
+        },
+    )
+    conn.commit()
+
+    started = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "service-dispatch-mf-sub-task",
+                "parent_task_id": "service-dispatch-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "service-dispatch-worker-slot",
+                "worker_slot_id": "service-dispatch-worker-slot",
+                "agent_id": "019ee-service-dispatch-worker",
+                "actual_host_worker_id": "019ee-service-dispatch-worker",
+                "worker_session_id": "019ee-service-dispatch-worker",
+                "filer_principal": "019ee-service-dispatch-worker",
+                "worker_transcript_ref": (
+                    "multi_agent:019ee-service-dispatch-worker"
+                ),
+                "harness_type": "codex",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "fence_token": "fence-service-dispatch-mf-sub",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/service-dispatch-mf-sub-task",
+                "head_commit": "head-service-dispatch",
+                "base_commit": "base-service-dispatch",
+                "target_head_commit": "target-service-dispatch",
+                "merge_queue_id": "mergeq-api-service-dispatch",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                **route_identity,
+                "observer_command_id": "cmd-service-dispatch",
+                "read_receipt_hash": "sha256:read-service-dispatch",
+                "read_receipt_event_id": "2874",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    gate = started["startup_gate"]
+    assert gate["allocation_owner"] == "observer-allocation-owner"
+    assert gate["agent_id"] == "019ee-service-dispatch-worker"
+    assert gate["actual_host_worker_id"] == "019ee-service-dispatch-worker"
+    assert gate["agent_id_match_mode"] == "observer_subagent_service_dispatch"
+    assert gate["host_adapter_startup_token_accepted"] is False
+    assert gate["session_token_evidence_type"] == "server_verified_ref"
+    assert gate["server_issued_session_token_verified"] is True
+    assert gate["service_dispatch_worker_binding_present"] is True
+    assert gate["service_dispatch_worker_binding"]["event_ref"] == (
+        f"timeline:{dispatch_event['id']}"
+    )
+    assert gate["identity_join"]["service_dispatch_event_ref"] == (
+        f"timeline:{dispatch_event['id']}"
+    )
+
+
+def test_parallel_branch_startup_rejects_service_dispatch_missing_route_identity(
+    conn, tmp_path
+):
+    worktree = tmp_path / "worker-service-dispatch-missing-route"
+    worktree.mkdir()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="service-dispatch-missing-route-task",
+        root_task_id="service-dispatch-missing-route-parent",
+        stage_task_id="service-dispatch-missing-route-task",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        branch_ref="refs/heads/codex/service-dispatch-missing-route-task",
+        status="worktree_ready",
+        worker_id="service-dispatch-missing-route-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        worker_slot_id="service-dispatch-missing-route-slot",
+        fence_token="fence-service-dispatch-missing-route",
+        session_token_hash=mf_subagent_session_token_hash(
+            "service-dispatch-missing-route-token"
+        ),
+        worktree_path=str(worktree),
+        base_commit="base-service-dispatch-missing-route",
+        target_head_commit="target-service-dispatch-missing-route",
+        merge_queue_id="mergeq-api-service-dispatch-missing-route",
+    )
+    upsert_branch_context(conn, runtime_context)
+    route_identity = {
+        "route_id": "route-service-dispatch-missing-route",
+        "route_context_hash": "sha256:route-service-dispatch-missing-route",
+        "prompt_contract_id": "rprompt-service-dispatch-missing-route",
+        "prompt_contract_hash": "sha256:prompt-service-dispatch-missing-route",
+        "route_token_ref": "rtok-service-dispatch-missing-route",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-service-dispatch-missing-route"
+        ),
+    }
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="service-dispatch-missing-route-parent",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        event_type="observer.subagent.service_dispatch",
+        event_kind="observer_subagent_service_dispatch",
+        phase="dispatch",
+        status="accepted",
+        actor="observer",
+        payload={
+            "schema_version": "observer_subagent_service_dispatch.v1",
+            "observer_command_id": "cmd-service-dispatch-missing-route",
+            "workers": [
+                {
+                    "runtime_context_id": runtime_context_id_for_branch_context(
+                        runtime_context
+                    ),
+                    "task_id": "service-dispatch-missing-route-task",
+                    "worker_slot_id": "service-dispatch-missing-route-slot",
+                    "agent_id": "019ee-service-dispatch-missing-route-worker",
+                    "actual_host_worker_id": (
+                        "019ee-service-dispatch-missing-route-worker"
+                    ),
+                    "transcript_ref": (
+                        "multi_agent:019ee-service-dispatch-missing-route-worker"
+                    ),
+                }
+            ],
+        },
+    )
+    conn.commit()
+
+    blocked = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "service-dispatch-missing-route-task",
+                "parent_task_id": "service-dispatch-missing-route-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "service-dispatch-missing-route-slot",
+                "worker_slot_id": "service-dispatch-missing-route-slot",
+                "agent_id": "019ee-service-dispatch-missing-route-worker",
+                "actual_host_worker_id": (
+                    "019ee-service-dispatch-missing-route-worker"
+                ),
+                "worker_session_id": "019ee-service-dispatch-missing-route-worker",
+                "worker_transcript_ref": (
+                    "multi_agent:019ee-service-dispatch-missing-route-worker"
+                ),
+                "harness_type": "codex",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "fence_token": "fence-service-dispatch-missing-route",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": "refs/heads/codex/service-dispatch-missing-route-task",
+                "head_commit": "head-service-dispatch-missing-route",
+                "base_commit": "base-service-dispatch-missing-route",
+                "target_head_commit": "target-service-dispatch-missing-route",
+                "merge_queue_id": "mergeq-api-service-dispatch-missing-route",
+                "owned_files": ["agent/governance/parallel_branch_runtime.py"],
+                **route_identity,
+                "observer_command_id": "cmd-service-dispatch-missing-route",
+                "read_receipt_hash": "sha256:read-service-dispatch-missing-route",
+                "read_receipt_event_id": "2875",
+            },
+        )
+    )
+
+    assert blocked["ok"] is False
+    assert blocked["blocker_id"] == "agent_id_mismatch"
+
+
 def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
     conn, tmp_path
 ):

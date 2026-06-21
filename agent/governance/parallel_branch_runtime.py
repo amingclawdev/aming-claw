@@ -4760,8 +4760,8 @@ def _runtime_context_read_receipt_hash_action(
             },
             "must_precede": [
                 "record_read_receipt",
-                "worker_graph_query",
                 "record_startup",
+                "worker_graph_query",
                 "implementation",
             ],
         },
@@ -4786,7 +4786,24 @@ def _runtime_context_read_receipt_hash_action(
                     "accepted launch_text_hash as the startup read_receipt_hash"
                 ),
             },
-            "must_precede": ["worker_graph_query", "record_startup", "implementation"],
+            "must_precede": ["record_startup", "worker_graph_query", "implementation"],
+        },
+        {
+            "id": "record_startup",
+            "status": "required",
+            "close_satisfying_rule": (
+                "read receipt plus server-verified same-owner or "
+                "service-dispatch-bound startup remains close_satisfying=false "
+                "until worker transcript/self-attestation passes"
+            ),
+            "required_fields": [
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+                "worker_transcript_ref or worker_transcript_path",
+                "worker_session_id",
+                "harness_type",
+            ],
         },
         {
             "id": "worker_graph_query",
@@ -4863,23 +4880,6 @@ def _runtime_context_read_receipt_hash_action(
                 "timeline read receipt",
                 "owned file diff",
                 "DB-verified mf_subagent graph traces",
-            ],
-        },
-        {
-            "id": "record_startup",
-            "status": "required",
-            "close_satisfying_rule": (
-                "read receipt plus server-verified same-owner startup remains "
-                "close_satisfying=false until worker transcript/self-attestation passes"
-            ),
-            "required_fields": [
-                "observer_command_id",
-                "read_receipt_hash",
-                "read_receipt_event_id",
-                "worker_transcript_path",
-                "worker_session_id",
-                "harness_type",
-                "graph_trace_ids",
             ],
         },
     ]
@@ -8490,6 +8490,170 @@ def _startup_registered_host_adapter_identity(
     return {}
 
 
+def _startup_service_dispatch_worker_binding(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    context: BranchTaskRuntimeContext,
+    payload: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a real spawned worker id from observer service-dispatch evidence.
+
+    Branch runtime allocation often happens before the host returns the concrete
+    multi-agent/CLI worker id.  This binding lets startup join that real worker
+    to the preallocated runtime context, but only when an accepted observer
+    service-dispatch event names the same runtime context, task, worker slot,
+    command lineage, and route identity.
+    """
+
+    try:
+        from . import task_timeline
+
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=context.backlog_id,
+            event_kind="observer_subagent_service_dispatch",
+            limit=200,
+        )
+    except Exception:
+        events = []
+    if not events:
+        return {}
+
+    expected_runtime_context_id = runtime_context_id_for_branch_context(context)
+    expected_task_id = str(context.task_id or "")
+    expected_worker_slot_id = str(context.worker_slot_id or context.worker_id or "")
+    expected_observer_command_id = str(payload.get("observer_command_id") or "").strip()
+    candidate_ids = _runtime_context_dedupe(
+        [
+            str(payload.get("agent_id") or "").strip(),
+            str(payload.get("actual_host_worker_id") or "").strip(),
+            str(payload.get("host_worker_id") or "").strip(),
+            str(payload.get("worker_session_id") or "").strip(),
+            str(payload.get("worker_transcript_ref") or "").strip().split(":", 1)[-1],
+            str(payload.get("transcript_ref") or "").strip().split(":", 1)[-1],
+        ]
+    )
+
+    route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    )
+
+    def _accepted(event: Mapping[str, Any]) -> bool:
+        status = str(event.get("status") or "").strip().lower()
+        return status in {"accepted", "ok", "passed", "succeeded"}
+
+    def _route_matches(
+        source: Mapping[str, Any],
+        *,
+        require_expected_fields: bool = False,
+    ) -> bool:
+        for field in route_fields:
+            expected = str(route_identity.get(field) or "").strip()
+            actual = str(source.get(field) or "").strip()
+            if expected:
+                if require_expected_fields and not actual:
+                    return False
+                if actual and actual != expected:
+                    return False
+        return True
+
+    for event in reversed(events):
+        if not _accepted(event):
+            continue
+        event_payload = (
+            event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        )
+        if not _route_matches(event_payload, require_expected_fields=True):
+            continue
+        event_command_id = str(event_payload.get("observer_command_id") or "").strip()
+        if (
+            expected_observer_command_id
+            and event_command_id
+            and event_command_id != expected_observer_command_id
+        ):
+            continue
+        workers = event_payload.get("workers")
+        if not isinstance(workers, list):
+            workers = event_payload.get("dispatches")
+        if not isinstance(workers, list):
+            continue
+        for worker in workers:
+            if not isinstance(worker, Mapping):
+                continue
+            if str(worker.get("runtime_context_id") or "").strip() != expected_runtime_context_id:
+                continue
+            if str(worker.get("task_id") or "").strip() != expected_task_id:
+                continue
+            worker_slot_id = str(
+                worker.get("worker_slot_id") or worker.get("worker_id") or ""
+            ).strip()
+            if expected_worker_slot_id and worker_slot_id != expected_worker_slot_id:
+                continue
+            if not _route_matches(worker):
+                continue
+            worker_command_id = str(worker.get("observer_command_id") or "").strip()
+            if (
+                expected_observer_command_id
+                and worker_command_id
+                and worker_command_id != expected_observer_command_id
+            ):
+                continue
+            transcript_ref = str(
+                worker.get("transcript_ref")
+                or worker.get("worker_transcript_ref")
+                or ""
+            ).strip()
+            worker_ids = _runtime_context_dedupe(
+                [
+                    str(worker.get("agent_id") or "").strip(),
+                    str(worker.get("actual_host_worker_id") or "").strip(),
+                    str(worker.get("worker_session_id") or "").strip(),
+                    transcript_ref.split(":", 1)[-1] if transcript_ref else "",
+                ]
+            )
+            if candidate_ids and not set(candidate_ids).intersection(worker_ids):
+                continue
+            if not worker_ids:
+                continue
+            return {
+                "schema_version": "mf_subagent_service_dispatch_worker_binding.v1",
+                "source": "observer_subagent_service_dispatch",
+                "event_id": str(event.get("id") or ""),
+                "event_ref": f"timeline:{event.get('id') or ''}",
+                "runtime_context_id": expected_runtime_context_id,
+                "task_id": expected_task_id,
+                "worker_slot_id": worker_slot_id,
+                "agent_id": worker_ids[0],
+                "actual_host_worker_id": str(
+                    worker.get("actual_host_worker_id")
+                    or worker.get("agent_id")
+                    or worker_ids[0]
+                    or ""
+                ).strip(),
+                "worker_session_id": str(
+                    worker.get("worker_session_id") or worker_ids[0] or ""
+                ).strip(),
+                "transcript_ref": transcript_ref,
+                "monitor_ref": str(worker.get("monitor_ref") or "").strip(),
+                "dispatch_command_ref": str(
+                    event_payload.get("dispatch_command_ref")
+                    or worker.get("dispatch_command_ref")
+                    or ""
+                ).strip(),
+                "observer_command_id": event_command_id or expected_observer_command_id,
+                "session_token_ref": str(worker.get("session_token_ref") or "").strip(),
+            }
+    return {}
+
+
 def build_registered_host_adapter_spawn_identity(
     *,
     project_id: str,
@@ -9752,6 +9916,31 @@ def record_mf_subagent_startup(
         or payload.get("on_behalf_of")
         or ""
     ).strip()
+    route_identity = _startup_route_identity(payload)
+    service_dispatch_worker_binding = _startup_service_dispatch_worker_binding(
+        conn,
+        project_id=project_id,
+        context=context,
+        payload=payload,
+        route_identity=route_identity,
+    )
+    if service_dispatch_worker_binding:
+        if not actual_host_worker_id:
+            actual_host_worker_id = str(
+                service_dispatch_worker_binding.get("actual_host_worker_id")
+                or service_dispatch_worker_binding.get("agent_id")
+                or ""
+            ).strip()
+        if not worker_session_id:
+            worker_session_id = str(
+                service_dispatch_worker_binding.get("worker_session_id")
+                or service_dispatch_worker_binding.get("agent_id")
+                or ""
+            ).strip()
+        if not worker_transcript_ref:
+            worker_transcript_ref = str(
+                service_dispatch_worker_binding.get("transcript_ref") or ""
+            ).strip()
     governance_project_id = str(
         payload.get("governance_project_id")
         or payload.get("backlog_project_id")
@@ -9881,6 +10070,8 @@ def record_mf_subagent_startup(
     agent_id_match_mode = "actual_host_worker_bound"
     if allocation_owner and agent_id == allocation_owner:
         agent_id_match_mode = "same_as_allocation_owner"
+    elif service_dispatch_worker_binding:
+        agent_id_match_mode = "observer_subagent_service_dispatch"
     elif host_adapter_startup:
         agent_id_match_mode = "host_adapter_startup_token_surrogate"
     elif allocation_owner:
@@ -10004,7 +10195,6 @@ def record_mf_subagent_startup(
             },
         ))
 
-    route_identity = _startup_route_identity(payload)
     latest_revision = get_latest_branch_contract_revision(
         conn,
         project_id,
@@ -10033,18 +10223,25 @@ def record_mf_subagent_startup(
             },
         ))
 
-    if agent_id_match_mode == "same_as_allocation_owner":
+    server_verified_identity_modes = {
+        "same_as_allocation_owner",
+        "observer_subagent_service_dispatch",
+    }
+    if agent_id_match_mode in server_verified_identity_modes:
         if not context.session_token_hash:
             return _blocked(_startup_blocker(
                 blocker_id="session_token_not_server_issued",
                 message=(
-                    "same-owner mf_subagent startup requires a server-issued "
+                    "real mf_subagent startup requires a server-issued "
                     "scoped session_token recorded at allocation time"
                 ),
                 context=context,
                 details={
                     "agent_id": agent_id,
                     "allocation_owner": allocation_owner,
+                    "service_dispatch_worker_binding_present": bool(
+                        service_dispatch_worker_binding
+                    ),
                     "session_token_evidence_type": token_evidence[
                         "session_token_evidence_type"
                     ],
@@ -10057,13 +10254,16 @@ def record_mf_subagent_startup(
             return _blocked(_startup_blocker(
                 blocker_id="session_token_not_server_verified",
                 message=(
-                    "same-owner mf_subagent startup session token identity must "
+                    "real mf_subagent startup session token identity must "
                     "match the server-issued token hash/ref for this task and fence"
                 ),
                 context=context,
                 details={
                     "agent_id": agent_id,
                     "allocation_owner": allocation_owner,
+                    "service_dispatch_worker_binding_present": bool(
+                        service_dispatch_worker_binding
+                    ),
                     "session_token_evidence_type": token_evidence[
                         "session_token_evidence_type"
                     ],
@@ -10111,6 +10311,7 @@ def record_mf_subagent_startup(
         "host_adapter_startup_token_accepted": host_adapter_startup,
         "graph_trace_db_evidence": graph_trace_db_evidence,
         "attestation_phase": "startup",
+        "service_dispatch_worker_binding": service_dispatch_worker_binding,
     }
     worker_self_attestation = dict(
         verify_worker_transcript(worker_self_attestation_payload)
@@ -10213,6 +10414,10 @@ def record_mf_subagent_startup(
         "agent_id": agent_id,
         "expected_agent_id": allocation_owner,
         "agent_id_match_mode": agent_id_match_mode,
+        "service_dispatch_worker_binding": service_dispatch_worker_binding,
+        "service_dispatch_worker_binding_present": bool(
+            service_dispatch_worker_binding
+        ),
         "host_adapter_startup_token_accepted": host_adapter_startup,
         "host_adapter_startup_surrogate_not_close_satisfying": (
             surrogate_startup_not_close_satisfying
@@ -10243,7 +10448,9 @@ def record_mf_subagent_startup(
         "session_token_evidence_type": token_evidence["session_token_evidence_type"],
         "session_token_present": token_evidence["session_token_present"],
         "session_token_persisted": False,
-        "server_issued_session_token_required": agent_id_match_mode == "same_as_allocation_owner",
+        "server_issued_session_token_required": (
+            agent_id_match_mode in server_verified_identity_modes
+        ),
         "server_issued_session_token_verified": (
             token_evidence["session_token_evidence_type"]
             in {"server_verified", "server_verified_ref"}
@@ -10277,6 +10484,12 @@ def record_mf_subagent_startup(
             if latest_revision is not None
             else "",
             "agent_id_match_mode": agent_id_match_mode,
+            "service_dispatch_worker_binding_present": bool(
+                service_dispatch_worker_binding
+            ),
+            "service_dispatch_event_ref": str(
+                service_dispatch_worker_binding.get("event_ref") or ""
+            ),
         },
     }
     if launch_text_hash:
