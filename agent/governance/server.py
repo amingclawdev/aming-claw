@@ -5509,6 +5509,11 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     worker_role = str(body.get("worker_role") or "").strip().lower().replace("-", "_")
     fence_token = str(body.get("fence_token") or "").strip()
     session_token = str(body.get("session_token") or "").strip()
+    session_token_ref = str(
+        body.get("session_token_ref")
+        or body.get("worker_session_token_ref")
+        or ""
+    ).strip()
     target_project_id = str(
         body.get("target_project_id")
         or body.get("graph_project_id")
@@ -5564,6 +5569,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             target_project_id=target_project_id,
             target_project_root=target_project_root,
             session_token=session_token,
+            session_token_ref=session_token_ref,
             route_identity=route_identity,
         )
     except BranchRuntimeFenceError as exc:
@@ -5589,6 +5595,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                 parent_task_id=parent_task_id,
                 fence_token=fence_token,
                 session_token=session_token,
+                session_token_ref=session_token_ref,
                 target_project_root=target_project_root,
                 route_identity=route_identity,
                 reason=reason,
@@ -5616,6 +5623,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         parent_task_id=parent_task_id,
         fence_token=fence_token,
         session_token=session_token,
+        session_token_ref=session_token_ref,
         target_project_root=target_project_root,
         route_identity=route_identity,
         reason="runtime_context_sequence_check",
@@ -5646,6 +5654,8 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
     body["runtime_context_id"] = runtime_context_id_for_branch_context(context)
     body["worker_role"] = "mf_sub"
     body["fence_token"] = fence_token
+    if session_token_ref and not body.get("session_token_ref"):
+        body["session_token_ref"] = session_token_ref
     body["governance_project_id"] = context.governance_project_id or context.project_id
     body["target_project_id"] = context.target_project_id or ctx.get_project_id()
     target_root = _runtime_context_effective_target_project_root(context)
@@ -7554,6 +7564,11 @@ def _runtime_context_worker_guide_response(
     project_id = str(current_state_response.get("project_id") or "")
     task_id = str(current_state_response.get("task_id") or task.get("task_id") or "")
     parent_task_id = str(graph_identity.get("parent_task_id") or task.get("parent_task_id") or "")
+    session_token_ref_value = str(worker_view.get("session_token_ref") or "").strip()
+    session_token_ref_placeholder = (
+        session_token_ref_value
+        or "<copy session_token_ref from worker_guide.session_token_ref>"
+    )
     worker_id = str(
         graph_identity.get("worker_id")
         or task.get("worker_id")
@@ -7594,7 +7609,7 @@ def _runtime_context_worker_guide_response(
     )
     def _auth_guide(location: str) -> dict[str, Any]:
         return {
-            "primary": "runtime_context_session_token",
+            "primary": "runtime_context_session_token_or_ref",
             "runtime_context_session_token": {
                 "accepted_location": location,
                 "required_companion_fields": [
@@ -7607,6 +7622,17 @@ def _runtime_context_worker_guide_response(
                     "Validated against runtime_context_id, fence_token, "
                     "parent_task_id, session_token, and target_project_root."
                 ),
+            },
+            "runtime_context_session_token_ref": {
+                "accepted_location": location.replace("session_token", "session_token_ref"),
+                "copy_safe": True,
+                "required_companion_fields": [
+                    "runtime_context_id",
+                    "parent_task_id",
+                    "fence_token",
+                    "target_project_root",
+                ],
+                "raw_session_token_exposed": False,
             },
             "x_gov_token": {
                 "header": "X-Gov-Token",
@@ -7632,7 +7658,7 @@ def _runtime_context_worker_guide_response(
             "required_query_fields_for_mf_sub": [
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
             ],
             "auth": _auth_guide("query.session_token"),
         },
@@ -7647,7 +7673,7 @@ def _runtime_context_worker_guide_response(
             "required_query_fields_for_mf_sub": [
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
             ],
             "auth": _auth_guide("query.session_token"),
         },
@@ -7661,13 +7687,13 @@ def _runtime_context_worker_guide_response(
                 "query_purpose",
                 "runtime_context_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             ],
             "required_identity_fields": [
                 "runtime_context_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             ],
             "server_resolved_identity_fields": [
@@ -7724,7 +7750,7 @@ def _runtime_context_worker_guide_response(
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             ],
             "ttl_policy": {
@@ -7758,6 +7784,7 @@ def _runtime_context_worker_guide_response(
         "parent_task_id": parent_task_id,
         "fence_token": "<same fence_token from the worker launch envelope>",
         "session_token": "<current runtime_context_session_token>",
+        "session_token_ref": session_token_ref_placeholder,
         "target_project_root": target_project_root,
         "checkpoint_id": "<finish-gate-checkpoint-id>",
         "head_commit": "<worker-worktree-head-commit>",
@@ -7776,6 +7803,7 @@ def _runtime_context_worker_guide_response(
             "parent_task_id": parent_task_id,
             "fence_token": "<same fence_token from the worker launch envelope>",
             "session_token": "<current runtime_context_session_token>",
+            "session_token_ref": session_token_ref_placeholder,
             "target_project_root": target_project_root,
             "checkpoint_id": "<finish-gate-checkpoint-id>",
             "head_commit": "<worker-worktree-head-commit>",
@@ -7823,7 +7851,7 @@ def _runtime_context_worker_guide_response(
                 "worker_id",
                 "worker_slot_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "read_receipt_hash",
                 *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
@@ -7862,7 +7890,7 @@ def _runtime_context_worker_guide_response(
                 "parent_task_id",
                 "worker_role",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "worker_session_id",
                 "worker_transcript_ref or worker_transcript_path",
@@ -7890,7 +7918,7 @@ def _runtime_context_worker_guide_response(
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "checkpoint_id",
                 "evidence_refs",
@@ -7918,7 +7946,7 @@ def _runtime_context_worker_guide_response(
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "worker_session_id",
                 "filer_principal",
@@ -7967,7 +7995,7 @@ def _runtime_context_worker_guide_response(
                 "checkpoint_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "head_commit",
                 "changed_files",
@@ -8000,7 +8028,7 @@ def _runtime_context_worker_guide_response(
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "changed_files",
                 "tests",
@@ -8062,6 +8090,7 @@ def _runtime_context_worker_guide_response(
             or worker_view.get("fence_token_hash")
             or ""
         ),
+        session_token_ref=str(worker_view.get("session_token_ref") or ""),
         launch_text_hash=str(worker_view.get("launch_text_hash") or ""),
         read_receipt_event_ref=str(worker_view.get("read_receipt_event_ref") or ""),
     )
@@ -8079,9 +8108,16 @@ def _runtime_context_worker_guide_response(
         "corrected_request_shapes": corrected_request_shapes,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
+        "session_token_ref": str(worker_view.get("session_token_ref") or ""),
+        "session_token_ref_present": bool(worker_view.get("session_token_ref")),
+        "raw_session_token_exposed": False,
         "actionable_payloads": actionable_payloads,
         "read_receipt_facade_payload_skeleton": actionable_payloads.get(
             "read_receipt_facade_payload_skeleton",
+            {},
+        ),
+        "startup_facade_payload_skeleton": actionable_payloads.get(
+            "startup_facade_payload_skeleton",
             {},
         ),
         "role_scope": current_state_response.get("role_scope"),
@@ -8090,6 +8126,9 @@ def _runtime_context_worker_guide_response(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
+            "session_token_ref": str(worker_view.get("session_token_ref") or ""),
+            "session_token_ref_present": bool(worker_view.get("session_token_ref")),
+            "raw_session_token_exposed": False,
             "target_project_root": target_project_root,
             "project_root": project_root,
             "repo_root": repo_root,
@@ -8115,6 +8154,10 @@ def _runtime_context_worker_guide_response(
                 "read_receipt_facade_payload_skeleton",
                 {},
             ),
+            "startup_facade_payload_skeleton": actionable_payloads.get(
+                "startup_facade_payload_skeleton",
+                {},
+            ),
             "graph_query_identity": {
                 "runtime_context_id": runtime_context_id,
                 "task_id": graph_identity.get("task_id") or task_id,
@@ -8132,6 +8175,7 @@ def _runtime_context_worker_guide_response(
                 ),
                 "target_project_root": target_project_root,
                 "worktree_path": worktree_path,
+                "session_token_ref": str(worker_view.get("session_token_ref") or ""),
                 "fence_token_hash": graph_identity.get("fence_token_hash") or "",
                 "fence_token_redacted": True,
                 "project_root": project_root,
@@ -8401,6 +8445,7 @@ def _runtime_context_worker_recovery_payloads(
     target_project_root: str,
     route_identity: Mapping[str, Any] | None = None,
     fence_token_hash: str = "",
+    session_token_ref: str = "",
     launch_text_hash: str = "",
     read_receipt_event_ref: str = "",
 ) -> dict[str, Any]:
@@ -8414,10 +8459,15 @@ def _runtime_context_worker_recovery_payloads(
     required_route_identity_fields = list(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
     session_token_env = "AMING_WORKER_SESSION_TOKEN"
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
-    session_token_ref = f"env:{session_token_env}"
+    context_session_token_ref = str(session_token_ref or "").strip()
+    session_token_ref = context_session_token_ref or f"env:{session_token_env}"
     fence_token_ref = f"env:{fence_token_env}"
     session_token_placeholder = (
         f"<read from env:{session_token_env} at submission time>"
+    )
+    session_token_ref_placeholder = (
+        context_session_token_ref
+        or "<copy session_token_ref from worker_guide.session_token_ref>"
     )
     fence_token_placeholder = f"<read from env:{fence_token_env} at submission time>"
     read_receipt_path = (
@@ -8441,6 +8491,8 @@ def _runtime_context_worker_recovery_payloads(
         "read_receipt_hash": "<worker-computed-read-receipt-hash>",
         "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
         "session_token_env": session_token_env,
+        "session_token_ref": session_token_ref_placeholder,
+        "session_token_ref_present": bool(context_session_token_ref),
         "fence_token_env": fence_token_env,
         "fence_token_hash": fence_token_hash,
         "fence_token_redacted": bool(fence_token_hash),
@@ -8457,6 +8509,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
         "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
         "fence_token": fence_token_placeholder,
         "session_token_env": session_token_env,
         "fence_token_env": fence_token_env,
@@ -8480,6 +8533,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_slot_id": "copy_safe_body.worker_slot_id",
         "target_project_root": "copy_safe_body.target_project_root",
         "session_token": "copy_safe_body.session_token",
+        "session_token_ref": "copy_safe_body.session_token_ref",
         "fence_token": "copy_safe_body.fence_token",
         "route_identity": {
             field: f"copy_safe_body.{field}"
@@ -8518,6 +8572,7 @@ def _runtime_context_worker_recovery_payloads(
         "observer_command_id": "<claimed execute_backlog_row command id>",
         "target_project_root": target_project_root,
         "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
         "fence_token": fence_token_placeholder,
         "session_token_env": session_token_env,
         "fence_token_env": fence_token_env,
@@ -8548,6 +8603,8 @@ def _runtime_context_worker_recovery_payloads(
             "worker_slot_id": worker_slot_id,
             "target_project_root": target_project_root,
             "session_token_env": session_token_env,
+            "session_token_ref": session_token_ref_placeholder,
+            "session_token_ref_present": bool(context_session_token_ref),
             "fence_token_env": fence_token_env,
             "fence_token_hash": fence_token_hash,
             "fence_token_redacted": bool(fence_token_hash),
@@ -8570,6 +8627,7 @@ def _runtime_context_worker_recovery_payloads(
         "route_identity": present_route_identity,
         "route_token_ref": safe_route_identity.get("route_token_ref", ""),
         "session_token_ref": session_token_ref,
+        "session_token_ref_available": bool(context_session_token_ref),
         "fence_token_ref": fence_token_ref,
         "fence_token_hash": fence_token_hash,
         "raw_session_token_exposed": False,
@@ -8605,7 +8663,7 @@ def _runtime_context_worker_recovery_payloads(
                 "worker_role",
                 "worker_id",
                 "worker_slot_id",
-                "session_token",
+                "session_token or session_token_ref",
                 "fence_token",
                 "target_project_root",
                 "read_receipt_hash or launch_text_hash",
@@ -8616,6 +8674,7 @@ def _runtime_context_worker_recovery_payloads(
             "field_pointers": read_receipt_field_pointers,
             "auth_fields": {
                 "session_token": session_token_placeholder,
+                "session_token_ref": session_token_ref_placeholder,
                 "session_token_env": session_token_env,
                 "fence_token": fence_token_placeholder,
                 "fence_token_env": fence_token_env,
@@ -8633,7 +8692,7 @@ def _runtime_context_worker_recovery_payloads(
             "required_fields": [
                 "runtime_context_id",
                 "parent_task_id",
-                "session_token",
+                "session_token or session_token_ref",
                 "fence_token",
                 "target_project_root",
                 *startup_identity_required_fields,
@@ -8647,6 +8706,7 @@ def _runtime_context_worker_recovery_payloads(
             ],
             "auth_fields": {
                 "session_token": session_token_placeholder,
+                "session_token_ref": session_token_ref_placeholder,
                 "session_token_env": session_token_env,
                 "fence_token": fence_token_placeholder,
                 "fence_token_env": fence_token_env,
@@ -8667,6 +8727,7 @@ def _runtime_context_worker_recovery_details(
     parent_task_id: str = "",
     fence_token: str = "",
     session_token: str = "",
+    session_token_ref: str = "",
     target_project_root: str = "",
     route_identity: Mapping[str, Any] | None = None,
     reason: str = "",
@@ -8678,6 +8739,7 @@ def _runtime_context_worker_recovery_details(
         mf_subagent_session_token_hash,
         runtime_context_id_for_branch_context,
         runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref,
     )
 
     requested_runtime_context_id = str(runtime_context_id or "").strip()
@@ -8724,6 +8786,7 @@ def _runtime_context_worker_recovery_details(
             "worker_role": "mf_sub",
             "target_project_root": requested_target_root,
             "session_token_present": bool(session_token),
+            "session_token_ref_present": bool(session_token_ref),
             "fence_token_present": bool(fence_token),
         },
         "expected": {},
@@ -8748,7 +8811,9 @@ def _runtime_context_worker_recovery_details(
         },
         "session_token": {
             "presented": bool(session_token),
+            "ref_presented": bool(session_token_ref),
             "matches_recorded_hash": None,
+            "ref_matches_recorded_hash": None,
             "raw_session_token_exposed": False,
         },
     }
@@ -8761,10 +8826,18 @@ def _runtime_context_worker_recovery_details(
         supplied_session_hash = (
             mf_subagent_session_token_hash(session_token) if session_token else ""
         )
+        supplied_session_ref_matches = runtime_context_session_token_ref(context) == str(
+            session_token_ref or ""
+        ).strip()
         session_matches = bool(
             getattr(context, "session_token_hash", "")
-            and supplied_session_hash
-            and supplied_session_hash == getattr(context, "session_token_hash", "")
+            and (
+                (
+                    supplied_session_hash
+                    and supplied_session_hash == getattr(context, "session_token_hash", "")
+                )
+                or supplied_session_ref_matches
+            )
         )
         fence_token_hash = ""
         try:
@@ -8886,6 +8959,7 @@ def _runtime_context_worker_recovery_details(
         diagnostics["session_token"].update(
             {
                 "matches_recorded_hash": session_matches,
+                "ref_matches_recorded_hash": bool(supplied_session_ref_matches),
                 "lease": lease_view,
                 "lease_status": lease_view.get("status"),
                 "lease_expired": lease_view.get("expired"),
@@ -8946,6 +9020,7 @@ def _runtime_context_worker_recovery_details(
             target_project_root=expected_target_root,
             route_identity=expected_route_identity or supplied_route_identity,
             fence_token_hash=fence_token_hash,
+            session_token_ref=runtime_context_session_token_ref(context),
             read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
         )
     recovery_actions = [
@@ -9070,12 +9145,16 @@ def _runtime_context_validate_mf_sub_lookup(
     if not fence_token:
         raise ValidationError("fence_token is required for mf_sub runtime context write")
     session_token = _runtime_context_request_value(ctx, "session_token")
+    session_token_ref = (
+        _runtime_context_request_value(ctx, "session_token_ref")
+        or _runtime_context_request_value(ctx, "worker_session_token_ref")
+    )
     target_project_root = (
         _runtime_context_request_value(ctx, "target_project_root")
         or _runtime_context_request_value(ctx, "target_graph_root")
     )
     try:
-        if require_session_token and not session_token:
+        if require_session_token and not (session_token or session_token_ref):
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
         if require_target_project_root and not target_project_root:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
@@ -9098,6 +9177,7 @@ def _runtime_context_validate_mf_sub_lookup(
             ),
             target_project_root=target_project_root,
             session_token=session_token,
+            session_token_ref=session_token_ref,
             allowed_statuses=(
                 {
                     *ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
@@ -9141,6 +9221,7 @@ def _runtime_context_validate_mf_sub_lookup(
                 parent_task_id=_runtime_context_request_value(ctx, "parent_task_id"),
                 fence_token=fence_token,
                 session_token=session_token,
+                session_token_ref=session_token_ref,
                 target_project_root=target_project_root,
                 reason=reason,
             )
@@ -9188,7 +9269,11 @@ def _runtime_context_mf_sub_read_context(
         return context, "mf_sub", session
     if (
         _runtime_context_anonymous_token_free_fallback(ctx, session)
-        and _runtime_context_request_value(ctx, "session_token")
+        and (
+            _runtime_context_request_value(ctx, "session_token")
+            or _runtime_context_request_value(ctx, "session_token_ref")
+            or _runtime_context_request_value(ctx, "worker_session_token_ref")
+        )
     ):
         context = _runtime_context_validate_mf_sub_lookup(
             ctx,
@@ -10184,6 +10269,11 @@ def handle_graph_governance_parallel_branch_runtime_contract(ctx: RequestContext
                         or ""
                     ),
                     session_token=str(ctx.query.get("session_token") or ""),
+                    session_token_ref=str(
+                        ctx.query.get("session_token_ref")
+                        or ctx.query.get("worker_session_token_ref")
+                        or ""
+                    ),
                 )
             except BranchRuntimeFenceError as exc:
                 raise GovernanceError(
@@ -10443,6 +10533,10 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
 
     raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
     raw_session_token = _runtime_context_request_value(ctx, "session_token")
+    session_token_ref = (
+        _runtime_context_request_value(ctx, "session_token_ref")
+        or _runtime_context_request_value(ctx, "worker_session_token_ref")
+    )
     fence_token_hash = runtime_context_secret_hash(
         raw_fence_token or getattr(context, "fence_token", "")
     )
@@ -10481,6 +10575,11 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "fence_token_redacted": bool(fence_token_hash),
         "fence_token_env": str(body.get("fence_token_env") or "AMING_WORKER_FENCE_TOKEN"),
         "session_token_env": str(body.get("session_token_env") or "AMING_WORKER_SESSION_TOKEN"),
+        "session_token_ref": session_token_ref,
+        "session_token_ref_present": bool(session_token_ref),
+        "session_token_evidence_type": (
+            "server_verified_ref" if session_token_ref else "server_verified"
+        ),
         "raw_fence_token_persisted": False,
         "raw_session_token_persisted": False,
         "worker_role": "mf_sub",
@@ -10577,6 +10676,10 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
         "worker_role": "mf_sub",
         "fence_token": _runtime_context_request_value(ctx, "fence_token"),
         "session_token": _runtime_context_request_value(ctx, "session_token"),
+        "session_token_ref": (
+            _runtime_context_request_value(ctx, "session_token_ref")
+            or _runtime_context_request_value(ctx, "worker_session_token_ref")
+        ),
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
         "agent_id": body.get("agent_id") or context.agent_id,

@@ -426,6 +426,63 @@ def runtime_context_secret_hash(value: str) -> str:
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def mf_subagent_session_token_ref(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    fence_token_hash: str,
+    session_token_hash: str,
+    worker_slot_id: str = "",
+) -> str:
+    """Return a copy-safe bearer ref for a stored mf_sub session token hash."""
+
+    session_hash = str(session_token_hash or "").strip()
+    runtime_id = str(runtime_context_id or "").strip()
+    task = str(task_id or "").strip()
+    fence_hash = str(fence_token_hash or "").strip()
+    if not session_hash or not runtime_id or not task or not fence_hash:
+        return ""
+    seed = "|".join(
+        str(value or "").strip()
+        for value in (
+            "mf_subagent_session_token_ref.v1",
+            project_id,
+            runtime_id,
+            task,
+            fence_hash,
+            session_hash,
+            worker_slot_id,
+        )
+    )
+    return "wstok-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:40]
+
+
+def runtime_context_session_token_ref(
+    context: "BranchTaskRuntimeContext",
+    *,
+    session_token_hash: str = "",
+) -> str:
+    token_hash = str(session_token_hash or context.session_token_hash or "").strip()
+    return mf_subagent_session_token_ref(
+        project_id=context.project_id,
+        runtime_context_id=runtime_context_id_for_branch_context(context),
+        task_id=context.task_id,
+        fence_token_hash=runtime_context_secret_hash(context.fence_token),
+        session_token_hash=token_hash,
+        worker_slot_id=context.worker_slot_id or context.worker_id,
+    )
+
+
+def runtime_context_session_token_ref_matches(
+    context: "BranchTaskRuntimeContext",
+    presented_ref: str,
+) -> bool:
+    expected = runtime_context_session_token_ref(context)
+    candidate = str(presented_ref or "").strip()
+    return bool(expected and candidate and secrets.compare_digest(expected, candidate))
+
+
 def issue_mf_subagent_session_token(
     context: "BranchTaskRuntimeContext",
 ) -> dict[str, Any]:
@@ -438,13 +495,23 @@ def issue_mf_subagent_session_token(
             str(context.fence_token or "").encode("utf-8")
         ).hexdigest()[:16]
     runtime_context_id = runtime_context_id_for_branch_context(context)
+    token_ref = mf_subagent_session_token_ref(
+        project_id=context.project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        fence_token_hash=runtime_context_secret_hash(context.fence_token),
+        session_token_hash=token_hash,
+        worker_slot_id=context.worker_slot_id or context.worker_id,
+    )
     return {
         "schema_version": "mf_subagent_same_owner_session_token.v1",
         "issued": True,
         "token_type": "same_owner_scoped",
         "session_token": token,
+        "session_token_ref": token_ref,
         "session_token_hash": token_hash,
         "session_token_persisted": False,
+        "session_token_ref_persisted": False,
         "scope": {
             "project_id": context.project_id,
             "task_id": context.task_id,
@@ -456,6 +523,7 @@ def issue_mf_subagent_session_token(
             "backlog_id": context.backlog_id,
         },
         "delivery": "worker_host_envelope",
+        "copy_safe_delivery": "runtime_context_session_token_ref",
         "raw_token_persistence": "not_persisted",
     }
 
@@ -522,6 +590,8 @@ def runtime_context_session_token_lease_view(
             "/api/graph-governance/{project_id}/runtime-contexts/"
             "{runtime_context_id}/session-token/reissue"
         ),
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "session_token_ref_available": bool(runtime_context_session_token_ref(context)),
         "raw_session_token_exposed": False,
         "raw_session_token_persisted": False,
         "now": _runtime_context_iso(now_dt),
@@ -2599,6 +2669,95 @@ def _runtime_context_event_status_ok(event: Mapping[str, Any]) -> bool:
     return status in _RUNTIME_CONTEXT_FULFILLING_STATUSES
 
 
+def _runtime_context_event_terminal_dispatch_blocker(event: Mapping[str, Any]) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    if any(bool(value) for value in _runtime_context_deep_values(event, "terminal_dispatch_blocker")):
+        return True
+    if any(bool(value) for value in _runtime_context_deep_values(event, "dispatch_blocker")):
+        status = _runtime_context_text(
+            event.get("status") or _runtime_context_deep_text(event, "status")
+        ).lower()
+        return status in _RUNTIME_CONTEXT_BLOCKING_STATUSES
+    return False
+
+
+def _runtime_context_terminal_blocker_matches_lineage(
+    event: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+) -> bool:
+    expected = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+    }
+    for key, expected_value in expected.items():
+        if not expected_value:
+            continue
+        values = [
+            _runtime_context_text(value)
+            for value in _runtime_context_deep_values(event, key)
+        ]
+        if expected_value in values:
+            return True
+    return False
+
+
+def _runtime_context_terminal_dispatch_blockers(
+    events: Sequence[Mapping[str, Any]] | None,
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    resolved_refs: set[str] = set()
+    for event in events or ():
+        if not isinstance(event, Mapping):
+            continue
+        for ref in _runtime_context_lane_resolved_refs(event):
+            if ref:
+                resolved_refs.add(ref)
+    for event in events or ():
+        if not isinstance(event, Mapping):
+            continue
+        if not _runtime_context_event_terminal_dispatch_blocker(event):
+            continue
+        if not _runtime_context_terminal_blocker_matches_lineage(
+            event,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=backlog_id,
+        ):
+            continue
+        event_ref = _runtime_context_event_ref(event)
+        if event_ref and _runtime_context_lane_normalized_ref(event_ref) in resolved_refs:
+            continue
+        payload = _runtime_context_mapping(event.get("payload"))
+        blocker_id = _runtime_context_deep_text(event, "blocker_id")
+        blockers.append(
+            {
+                "event_ref": event_ref,
+                "event_kind": _runtime_context_event_kind_token(event),
+                "status": _runtime_context_lane_event_status(event) or "blocked",
+                "blocker_id": blocker_id or "terminal_dispatch_blocker",
+                "message": _runtime_context_deep_text(event, "message")
+                or _runtime_context_deep_text(event, "reason"),
+                "terminal_dispatch_blocker": True,
+                "dispatch_blocker": True,
+                "payload": public_contract_revision_payload(payload),
+            }
+        )
+    return blockers
+
+
 def _runtime_context_event_kind_token(event: Mapping[str, Any]) -> str:
     return _runtime_context_lane_clause_id(
         event.get("event_kind") or event.get("event_type") or event.get("phase")
@@ -3118,6 +3277,7 @@ def _runtime_context_current_values(
         worker_self_attestation.get("attestation_phase")
     ).lower() != "startup"
     fence_token_hash = runtime_context_secret_hash(context.fence_token)
+    session_token_ref = runtime_context_session_token_ref(context)
     target_project_root = runtime_context_effective_target_project_root(context)
     target_project_root_source = ""
     if _runtime_context_text(context.target_project_root):
@@ -3160,6 +3320,9 @@ def _runtime_context_current_values(
         "merge_preview_id": context.merge_preview_id,
         "lease_id": context.lease_id,
         "lease_expires_at": context.lease_expires_at,
+        "session_token_ref": session_token_ref,
+        "session_token_ref_present": bool(session_token_ref),
+        "raw_session_token_exposed": False,
         "session_token_lease": runtime_context_session_token_lease_view(
             context,
             now_iso=generated_at,
@@ -3189,6 +3352,8 @@ def _runtime_context_current_values(
             "runtime_context_id": runtime_context_id,
             "fence_token_hash": fence_token_hash,
             "fence_token_redacted": bool(context.fence_token),
+            "session_token_ref": session_token_ref,
+            "session_token_ref_present": bool(session_token_ref),
             "governance_project_id": context.governance_project_id
             or context.project_id,
             "target_project_id": context.target_project_id or context.project_id,
@@ -3213,6 +3378,7 @@ def _runtime_context_current_values(
                 "task_id": context.task_id,
                 "parent_task_id": parent_task_id,
                 "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+                "session_token_ref": session_token_ref,
                 "target_project_root": target_project_root,
                 "project_root": target_project_root,
                 "repo_root": target_project_root,
@@ -3234,6 +3400,7 @@ def _runtime_context_current_values(
                         route_identity.get("visible_injection_manifest_hash")
                     ),
                 },
+                "raw_session_token_exposed": False,
                 "raw_session_token_persisted": False,
                 "raw_fence_token_echoed": False,
             },
@@ -4019,6 +4186,13 @@ def build_runtime_context_current_view(
         fence_token=context.fence_token,
         route_identity=route,
     )
+    terminal_dispatch_blockers = _runtime_context_terminal_dispatch_blockers(
+        timeline_events,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=parent_task_id,
+        backlog_id=context.backlog_id,
+    )
     for key, value in _runtime_context_mapping(derived.get("route_identity")).items():
         if value and not route.get(key):
             route[key] = value
@@ -4108,6 +4282,13 @@ def build_runtime_context_current_view(
         close_evidence=close,
         generated_at=generated_at,
     )
+    current_values["terminal_dispatch_blockers"] = terminal_dispatch_blockers
+    current_values["terminal_dispatch_blocker_count"] = len(terminal_dispatch_blockers)
+    current_values["terminal_dispatch_blocker_ref"] = (
+        terminal_dispatch_blockers[0].get("event_ref", "")
+        if terminal_dispatch_blockers
+        else ""
+    )
     current_values["merge_queue_projection"] = public_contract_revision_payload(
         revision_payload.get("merge_queue_projection")
     )
@@ -4195,6 +4376,7 @@ def build_runtime_context_current_view(
             lane_id=context.task_id,
             generated_at=generated_at,
         ),
+        "terminal_dispatch_blockers": terminal_dispatch_blockers,
         "startup_gate": startup,
         "finish_gate": finish,
         "close_evidence": close,
@@ -4230,6 +4412,23 @@ def build_runtime_context_close_gate_view(
         _runtime_context_mapping(gate_inputs.get("gates")).get("close")
     )
     close_missing = list(close_gate.get("missing") or [])
+    terminal_dispatch_blockers = list(
+        current_view.get("terminal_dispatch_blockers")
+        or values.get("terminal_dispatch_blockers")
+        or []
+    )
+    if terminal_dispatch_blockers:
+        close_missing.append(
+            {
+                "gate": "terminal_dispatch",
+                "field": "terminal_dispatch_blocker",
+                "expected_source": "task_timeline.record_blocker",
+                "producer": "observer",
+                "consumer": "runtime_context.close_gate",
+                "evidence_ref": terminal_dispatch_blockers[0].get("event_ref", ""),
+                "message": "Terminal dispatch blocker must be resolved or audit-archived before close.",
+            }
+        )
     checklist_fields = (
         ("observer_command", "observer_command_id"),
         ("startup_evidence", "startup_event_ref"),
@@ -4278,8 +4477,13 @@ def build_runtime_context_close_gate_view(
         "graph_trace_ids": list(values.get("graph_trace_ids") or []),
         "checklist": checklist,
         "missing": close_missing,
-        "ready": not close_missing,
-        "status": "ready" if not close_missing else "missing_required_fields",
+        "terminal_dispatch_blockers": terminal_dispatch_blockers,
+        "ready": not close_missing and not terminal_dispatch_blockers,
+        "status": (
+            "terminal_dispatch_blocked"
+            if terminal_dispatch_blockers
+            else ("ready" if not close_missing else "missing_required_fields")
+        ),
         "evidence_refs": {
             "timeline": current_view.get("timeline_refs", {}),
             "graph_trace": current_view.get("graph_trace_refs", {}),
@@ -4310,6 +4514,7 @@ def build_runtime_context_close_gate_view(
                     values.get("route_action_precheck_event_ref")
                 ),
             },
+            "terminal_dispatch_blockers": terminal_dispatch_blockers,
         },
     }
 
@@ -5084,6 +5289,19 @@ def _runtime_context_close_precheck_gap_projection(
         if next_action and next_action not in next_actions:
             next_actions.append(next_action)
 
+    terminal_dispatch_blockers = list(
+        values.get("terminal_dispatch_blockers")
+        or close_gate_view.get("terminal_dispatch_blockers")
+        or []
+    )
+    if terminal_dispatch_blockers:
+        _add_gap(
+            code="terminal_dispatch_blocker",
+            message="Terminal dispatch blocker is recorded for this runtime context lineage.",
+            next_action="audit_close_or_resolve_terminal_dispatch_blocker",
+            field="terminal_dispatch_blocker",
+        )
+
     for code, (next_action, message) in gap_specs.items():
         if close_precheck.get(code) is True:
             _add_gap(
@@ -5213,7 +5431,9 @@ def _runtime_context_close_precheck_gap_projection(
             ),
             "missing_close_fields": missing_close_fields,
             "handoff_terminal_status": (
-                "review_ready" if close_gate_view.get("ready") else "waiting_merge_gap"
+                "terminal_dispatch_blocked"
+                if terminal_dispatch_blockers
+                else ("review_ready" if close_gate_view.get("ready") else "waiting_merge_gap")
             ),
         },
     }
@@ -5227,6 +5447,10 @@ def _runtime_context_next_legal_action(
     close_gate_view: Mapping[str, Any],
     lane_plan: Mapping[str, Any],
 ) -> str:
+    if values.get("terminal_dispatch_blockers") or close_gate_view.get(
+        "terminal_dispatch_blockers"
+    ):
+        return "audit_close_or_resolve_terminal_dispatch_blocker"
     if route_token_action.get("status") in {"missing", "stale"}:
         return "refresh_route_token_ref"
     if read_receipt_hash_action.get("status") == "missing":
@@ -5333,6 +5557,25 @@ def _runtime_context_next_required_evidence(
                 "close_satisfying_required": close_satisfying_required,
                 "requires": list(requires),
             }
+        )
+
+    if values.get("terminal_dispatch_blockers") or close_gate_view.get(
+        "terminal_dispatch_blockers"
+    ):
+        _add(
+            item_id="terminal_dispatch_blocker",
+            field="terminal_dispatch_blocker",
+            gate="terminal_dispatch",
+            next_action="audit_close_or_resolve_terminal_dispatch_blocker",
+            producer="task_timeline.record_blocker",
+            consumer="runtime_context_close_gate",
+            expected_source="task_timeline.record_blocker.terminal_dispatch_blocker",
+            evidence_ref=_runtime_context_text(
+                values.get("terminal_dispatch_blocker_ref")
+            ),
+            status="blocked",
+            worker_owned=False,
+            close_satisfying_required=True,
         )
 
     if route_token_action.get("status") in {"missing", "stale"}:
@@ -6421,6 +6664,9 @@ def build_runtime_context_worker_view(
             "visible_injection_manifest_hash",
             "",
         ),
+        "session_token_ref": values.get("session_token_ref", ""),
+        "session_token_ref_present": bool(values.get("session_token_ref")),
+        "raw_session_token_exposed": False,
         "target_files": list(values.get("target_files") or []),
         "owned_files": list(values.get("owned_files") or values.get("target_files") or []),
         "task": {
@@ -6445,6 +6691,8 @@ def build_runtime_context_worker_view(
                 "fence_token_present",
                 "fence_token_hash",
                 "fence_token_redacted",
+                "session_token_ref",
+                "session_token_ref_present",
             )
         },
         "branch": {
@@ -6491,6 +6739,11 @@ def build_runtime_context_worker_view(
         )
         or runtime_context_content_hash(capability_boundary),
         "lane_plan": dict(_runtime_context_mapping(current_view.get("lane_plan"))),
+        "terminal_dispatch_blockers": list(
+            current_view.get("terminal_dispatch_blockers")
+            or values.get("terminal_dispatch_blockers")
+            or []
+        ),
         "worker_next_moves": list(action_plan.get("worker_next_moves") or []),
         "next_required_evidence": list(
             action_plan.get("next_required_evidence") or []
@@ -6525,8 +6778,10 @@ def build_runtime_context_worker_view(
                 "route_identity",
                 "work",
                 "lane_plan",
+                "terminal_dispatch_blockers",
                 "graph_query_identity",
                 "session_token_lease",
+                "session_token_ref",
                 "worker_execution_safety",
                 "capability_boundary",
                 "next_required_evidence",
@@ -7813,6 +8068,7 @@ def validate_mf_subagent_graph_query_identity(
     target_project_id: str = "",
     target_project_root: str = "",
     session_token: str = "",
+    session_token_ref: str = "",
     route_identity: Mapping[str, Any] | None = None,
 ) -> BranchTaskRuntimeContext:
     """Validate the runtime/fence identity an mf_sub worker presents for graph reads."""
@@ -7861,7 +8117,11 @@ def validate_mf_subagent_graph_query_identity(
     if context.session_token_hash:
         supplied_token_hash = mf_subagent_session_token_hash(session_token)
         token_matches_context = bool(
-            supplied_token_hash and supplied_token_hash == context.session_token_hash
+            (
+                supplied_token_hash
+                and supplied_token_hash == context.session_token_hash
+            )
+            or runtime_context_session_token_ref_matches(context, session_token_ref)
         )
         if not token_matches_context:
             latest_revision = get_latest_branch_contract_revision(
@@ -8386,6 +8646,7 @@ def _startup_token_evidence(
     payload: Mapping[str, Any],
     *,
     stored_token_hash: str = "",
+    expected_session_token_ref: str = "",
 ) -> dict[str, Any]:
     """Compute session-token evidence for a startup.
 
@@ -8402,8 +8663,13 @@ def _startup_token_evidence(
       server already holds a DIFFERENT hash for this lane — the presented token
       does not match.  The startup is treated as unverified and the finish gate
       MUST classify it as a surrogate.  Existing refusal paths are not weakened.
-    - ``'surrogate'``: no session_token was presented; a surrogate string was
-      supplied instead.  Always classified as surrogate in the finish gate.
+    - ``'server_verified_ref'``: the worker presented the copy-safe
+      runtime_context session_token_ref and the server verified it against the
+      stored token hash/lineage.  This is equivalent to ``server_verified`` for
+      close gates while avoiding raw token persistence.
+    - ``'surrogate'``: no session_token/session_token_ref was presented; a
+      surrogate string was supplied instead.  Always classified as surrogate in
+      the finish gate.
     - ``''`` (empty): no token and no surrogate.
 
     Backward compatibility: existing recorded startup events with
@@ -8412,6 +8678,13 @@ def _startup_token_evidence(
     startups processed after this fix lands.
     """
     session_token = str(payload.get("session_token") or "").strip()
+    if session_token.startswith("<") and session_token.endswith(">"):
+        session_token = ""
+    session_token_ref = str(
+        payload.get("session_token_ref")
+        or payload.get("worker_session_token_ref")
+        or ""
+    ).strip()
     surrogate = str(
         payload.get("session_token_surrogate")
         or payload.get("session_surrogate")
@@ -8432,14 +8705,39 @@ def _startup_token_evidence(
             evidence_type = "hash"
         return {
             "session_token_hash": computed_hash,
+            "session_token_ref": "",
+            "session_token_ref_present": False,
             "session_token_present": True,
             "session_token_persisted": False,
             "session_token_surrogate": surrogate,
             "session_token_evidence_type": evidence_type,
         }
+    if session_token_ref:
+        expected_ref = str(expected_session_token_ref or "").strip()
+        if expected_ref and secrets.compare_digest(session_token_ref, expected_ref):
+            return {
+                "session_token_hash": str(stored_token_hash or "").strip(),
+                "session_token_ref": session_token_ref,
+                "session_token_ref_present": True,
+                "session_token_present": False,
+                "session_token_persisted": False,
+                "session_token_surrogate": surrogate,
+                "session_token_evidence_type": "server_verified_ref",
+            }
+        return {
+            "session_token_hash": "",
+            "session_token_ref": session_token_ref,
+            "session_token_ref_present": True,
+            "session_token_present": False,
+            "session_token_persisted": False,
+            "session_token_surrogate": surrogate,
+            "session_token_evidence_type": "claimed_unverified_ref",
+        }
     if surrogate:
         return {
             "session_token_hash": "",
+            "session_token_ref": "",
+            "session_token_ref_present": False,
             "session_token_present": False,
             "session_token_persisted": False,
             "session_token_surrogate": surrogate,
@@ -8447,6 +8745,8 @@ def _startup_token_evidence(
         }
     return {
         "session_token_hash": "",
+        "session_token_ref": "",
+        "session_token_ref_present": False,
         "session_token_present": False,
         "session_token_persisted": False,
         "session_token_surrogate": "",
@@ -9413,6 +9713,7 @@ def record_mf_subagent_startup(
     token_evidence = _startup_token_evidence(
         payload_for_token_evidence,
         stored_token_hash=context.session_token_hash if context is not None else "",
+        expected_session_token_ref=runtime_context_session_token_ref(context),
     )
     host_session_id = str(
         payload.get("host_session_id")
@@ -9749,12 +10050,15 @@ def record_mf_subagent_startup(
                     ],
                 },
             ))
-        if token_evidence["session_token_evidence_type"] != "server_verified":
+        if token_evidence["session_token_evidence_type"] not in {
+            "server_verified",
+            "server_verified_ref",
+        }:
             return _blocked(_startup_blocker(
                 blocker_id="session_token_not_server_verified",
                 message=(
-                    "same-owner mf_subagent startup session_token must match "
-                    "the server-issued token hash for this task and fence"
+                    "same-owner mf_subagent startup session token identity must "
+                    "match the server-issued token hash/ref for this task and fence"
                 ),
                 context=context,
                 details={
@@ -9813,7 +10117,8 @@ def record_mf_subagent_startup(
     )
     surrogate_startup_not_close_satisfying = bool(
         host_adapter_startup
-        or token_evidence["session_token_evidence_type"] == "surrogate"
+        or token_evidence["session_token_evidence_type"]
+        in {"surrogate", "claimed_unverified_ref"}
     )
     if surrogate_startup_not_close_satisfying:
         blockers = _runtime_context_dedupe(
@@ -9843,7 +10148,11 @@ def record_mf_subagent_startup(
     # the CASE WHEN guard in upsert_branch_context.
     _persist_token_hash = (
         token_evidence["session_token_hash"]
-        if token_evidence["session_token_evidence_type"] in ("hash", "server_verified")
+        if token_evidence["session_token_evidence_type"] in (
+            "hash",
+            "server_verified",
+            "server_verified_ref",
+        )
         else ""
     )
     saved = upsert_branch_context(
@@ -9928,13 +10237,16 @@ def record_mf_subagent_startup(
         "route_token_ref": route_token_ref,
         "visible_injection_manifest_hash": visible_manifest,
         "session_token_hash": token_evidence["session_token_hash"],
+        "session_token_ref": token_evidence["session_token_ref"],
+        "session_token_ref_present": token_evidence["session_token_ref_present"],
         "session_token_surrogate": token_evidence["session_token_surrogate"],
         "session_token_evidence_type": token_evidence["session_token_evidence_type"],
         "session_token_present": token_evidence["session_token_present"],
         "session_token_persisted": False,
         "server_issued_session_token_required": agent_id_match_mode == "same_as_allocation_owner",
         "server_issued_session_token_verified": (
-            token_evidence["session_token_evidence_type"] == "server_verified"
+            token_evidence["session_token_evidence_type"]
+            in {"server_verified", "server_verified_ref"}
         ),
         "startup_source": startup_source,
         "startup_timing": "actual_worker_started",
@@ -10024,6 +10336,7 @@ def validate_mf_subagent_runtime_context_lookup(
     target_project_id: str = "",
     target_project_root: str = "",
     session_token: str = "",
+    session_token_ref: str = "",
     allowed_statuses: Sequence[str] | None = None,
     allow_worktree_target_root_alias: bool = False,
 ) -> BranchTaskRuntimeContext:
@@ -10055,7 +10368,11 @@ def validate_mf_subagent_runtime_context_lookup(
     if context.session_token_hash:
         supplied_token_hash = mf_subagent_session_token_hash(session_token)
         token_matches_context = bool(
-            supplied_token_hash and supplied_token_hash == context.session_token_hash
+            (
+                supplied_token_hash
+                and supplied_token_hash == context.session_token_hash
+            )
+            or runtime_context_session_token_ref_matches(context, session_token_ref)
         )
         if not token_matches_context:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")

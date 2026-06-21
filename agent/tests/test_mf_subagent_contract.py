@@ -64,6 +64,8 @@ from agent.governance.mf_subagent_contract import (
 from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
     branch_runtime_context_id,
+    mf_subagent_session_token_hash,
+    mf_subagent_session_token_ref,
     _startup_token_evidence,
 )
 
@@ -420,6 +422,7 @@ def test_runtime_context_projection_wrapper_returns_valid_worker_view() -> None:
         "timeline_refs": {
             "startup_event_ref": "timeline:startup",
             "read_receipt_event_ref": "timeline:read-receipt",
+            "route_action_precheck_event_ref": "timeline:route-action-precheck",
             "finish_event_ref": "timeline:finish",
             "verification_event_refs": ["timeline:verification"],
         },
@@ -5829,6 +5832,43 @@ def test_startup_token_evidence_matching_stored_hash_returns_server_verified() -
     assert evidence["session_token_evidence_type"] == "server_verified"
     assert evidence["session_token_present"] is True
     assert evidence["session_token_hash"] == stored
+
+
+def test_startup_token_evidence_matching_session_token_ref_returns_server_verified_ref() -> None:
+    """F1: copy-safe session_token_ref can verify the stored server-issued hash."""
+    stored = mf_subagent_session_token_hash("ref-token")
+    token_ref = mf_subagent_session_token_ref(
+        project_id="p",
+        runtime_context_id="mfrctx-ref",
+        task_id="task-ref",
+        fence_token_hash="sha256:fence-ref",
+        session_token_hash=stored,
+        worker_slot_id="slot-ref",
+    )
+
+    evidence = _startup_token_evidence(
+        {"session_token_ref": token_ref},
+        stored_token_hash=stored,
+        expected_session_token_ref=token_ref,
+    )
+
+    assert evidence["session_token_evidence_type"] == "server_verified_ref"
+    assert evidence["session_token_hash"] == stored
+    assert evidence["session_token_present"] is False
+    assert evidence["session_token_ref_present"] is True
+
+
+def test_startup_token_evidence_mismatched_session_token_ref_is_unverified() -> None:
+    stored = mf_subagent_session_token_hash("ref-token")
+    evidence = _startup_token_evidence(
+        {"session_token_ref": "wstok-wrong"},
+        stored_token_hash=stored,
+        expected_session_token_ref="wstok-expected",
+    )
+
+    assert evidence["session_token_evidence_type"] == "claimed_unverified_ref"
+    assert evidence["session_token_hash"] == ""
+    assert evidence["session_token_ref_present"] is True
 
 
 def test_startup_token_evidence_mismatched_stored_hash_returns_claimed_unverified() -> None:

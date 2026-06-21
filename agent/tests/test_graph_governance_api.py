@@ -54,6 +54,7 @@ from agent.governance.parallel_branch_runtime import (
     get_latest_branch_contract_revision,
     mf_subagent_session_token_hash,
     runtime_context_id_for_branch_context,
+    runtime_context_session_token_ref,
     upsert_batch_merge_runtime,
     upsert_branch_context,
     upsert_merge_queue_items,
@@ -4563,7 +4564,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
             "required_query_fields_for_mf_sub": {
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
             },
             "auth_session_token_location": "query.session_token",
         },
@@ -4577,7 +4578,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
             "required_query_fields_for_mf_sub": {
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
             },
             "auth_session_token_location": "query.session_token",
         },
@@ -4591,13 +4592,13 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "query_purpose",
                 "runtime_context_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             },
             "required_identity_fields": {
                 "runtime_context_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             },
             "server_resolved_identity_fields": {
@@ -4646,10 +4647,17 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         assert interface["path"] == expected["path"]
         assert interface["facade_status"] == expected["facade_status"]
         auth = interface["auth"]
-        assert auth["primary"] == "runtime_context_session_token"
+        assert auth["primary"] == "runtime_context_session_token_or_ref"
         assert auth["runtime_context_session_token"]["accepted_location"] == (
             expected["auth_session_token_location"]
         )
+        assert auth["runtime_context_session_token_ref"]["accepted_location"] == (
+            expected["auth_session_token_location"].replace(
+                "session_token",
+                "session_token_ref",
+            )
+        )
+        assert auth["runtime_context_session_token_ref"]["copy_safe"] is True
         assert auth["x_gov_token"]["header"] == "X-Gov-Token"
         assert auth["x_gov_token"]["role_required"] == "mf_sub"
         for field_name, expected_value in expected.items():
@@ -4700,7 +4708,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "read_receipt_hash",
             },
@@ -4721,7 +4729,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "parent_task_id",
                 "worker_role",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             },
         },
@@ -4740,7 +4748,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "checkpoint_id",
                 "evidence_refs",
@@ -4759,7 +4767,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "worker_session_id",
                 "filer_principal",
@@ -4786,7 +4794,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "checkpoint_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
             },
         },
@@ -4803,7 +4811,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
                 "task_id",
                 "parent_task_id",
                 "fence_token",
-                "session_token",
+                "session_token or session_token_ref",
                 "target_project_root",
                 "changed_files",
                 "tests",
@@ -4836,10 +4844,14 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         assert guide["planned_path"] == expected["planned_path"]
         assert expected["required_fields"].issubset(set(guide["required_fields"]))
         auth = guide["auth"]
-        assert auth["primary"] == "runtime_context_session_token"
+        assert auth["primary"] == "runtime_context_session_token_or_ref"
         assert auth["runtime_context_session_token"]["accepted_location"] == (
             "body.session_token"
         )
+        assert auth["runtime_context_session_token_ref"]["accepted_location"] == (
+            "body.session_token_ref"
+        )
+        assert auth["runtime_context_session_token_ref"]["copy_safe"] is True
         assert auth["x_gov_token"]["header"] == "X-Gov-Token"
         assert auth["x_gov_token"]["role_required"] == "mf_sub"
 
@@ -14240,6 +14252,169 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     assert persisted_payload["fence_token_hash"] == _fake_sha(
         "fence-copy-safe-receipt"
     )
+
+
+def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "session-ref-worker-root"
+    target_root.mkdir()
+    route_identity = {
+        "route_id": "route-session-ref",
+        "route_context_hash": "sha256:route-session-ref",
+        "prompt_contract_id": "rprompt-session-ref",
+        "prompt_contract_hash": "sha256:prompt-session-ref",
+        "route_token_ref": "rtok-session-ref",
+        "visible_injection_manifest_hash": "sha256:visible-session-ref",
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-session-ref",
+            root_task_id="parent-session-ref",
+            backlog_id="AC-SESSION-REF",
+            stage_task_id="worker-session-ref",
+            worker_id="worker-session-ref",
+            worker_slot_id="slot-session-ref",
+            agent_id="agent-session-ref",
+            allocation_owner="agent-session-ref",
+            branch_ref="refs/heads/codex/worker-session-ref",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-session-ref",
+            session_token_hash=mf_subagent_session_token_hash("raw-session-ref"),
+            lease_id="lease-session-ref",
+            lease_expires_at="2999-01-01T00:00:00Z",
+            base_commit="base-session-ref",
+            target_head_commit="target-session-ref",
+            merge_queue_id="mq-session-ref",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-session-ref",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+
+    session_ref = runtime_context_session_token_ref(context)
+    query = {
+        "parent_task_id": "parent-session-ref",
+        "fence_token": "fence-session-ref",
+        "session_token_ref": session_ref,
+        "target_project_root": str(target_root),
+        "view": "all",
+    }
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            query=query,
+        )
+    )
+    worker_guide = guide["worker_guide"]
+    assert worker_guide["session_token_ref"] == session_ref
+    receipt_body = dict(
+        worker_guide["read_receipt_facade_payload_skeleton"]["copy_safe_body"]
+    )
+    receipt_body["session_token"] = ""
+    receipt_body["session_token_ref"] = session_ref
+    receipt_body["fence_token"] = "fence-session-ref"
+    receipt_body["read_receipt_hash"] = "sha256:session-ref-receipt"
+    receipt_body["launch_text_hash"] = "sha256:session-ref-launch"
+
+    receipt_response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body=receipt_body,
+        )
+    )
+    assert receipt_response["ok"] is True
+    read_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-session-ref",
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert len(read_events) == 1
+    assert read_events[0]["payload"]["session_token_ref"] == session_ref
+
+    startup_body = dict(worker_guide["startup_facade_payload_skeleton"]["body"])
+    startup_body.update(
+        {
+            "session_token": "",
+            "session_token_ref": session_ref,
+            "fence_token": "fence-session-ref",
+            "agent_id": "agent-session-ref",
+            "actual_host_worker_id": "agent-session-ref",
+            "worker_session_id": "agent-session-ref",
+            "worker_transcript_ref": "multi_agent:agent-session-ref",
+            "harness_type": "codex",
+            "filer_principal": "agent-session-ref",
+            "observer_command_id": "cmd-session-ref",
+            "actual_cwd": str(target_root),
+            "actual_git_root": str(target_root),
+            "branch": "refs/heads/codex/worker-session-ref",
+            "head_commit": "head-session-ref",
+            "base_commit": "base-session-ref",
+            "target_head_commit": "target-session-ref",
+            "merge_queue_id": "mq-session-ref",
+            "owned_files": ["agent/governance/server.py"],
+            "read_receipt_hash": "sha256:session-ref-receipt",
+            "read_receipt_event_id": str(read_events[0]["id"]),
+            **route_identity,
+        }
+    )
+    startup_response = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body=startup_body,
+        )
+    )
+    assert startup_response["ok"] is True
+    startup_gate = startup_response["gate"]
+    assert startup_gate["session_token_evidence_type"] == "server_verified_ref"
+    assert startup_gate["server_issued_session_token_verified"] is True
+
+    graph_body = {
+        "tool": "find_node_by_path",
+        "args": {"path": "agent/governance/server.py"},
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": "worker-session-ref",
+        "parent_task_id": "parent-session-ref",
+        "worker_role": "mf_sub",
+        "fence_token": "fence-session-ref",
+        "session_token_ref": session_ref,
+        "target_project_root": str(target_root),
+        **route_identity,
+    }
+    session = server._require_graph_query_capability(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=graph_body,
+        ),
+        conn,
+        graph_body,
+        "graph-governance.query",
+    )
+    assert session["role"] == "mf_sub"
+    assert graph_body["task_id"] == "worker-session-ref"
+    assert graph_body["session_token_ref"] == session_ref
 
 
 def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(

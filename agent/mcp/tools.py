@@ -104,6 +104,7 @@ _RUNTIME_CONTEXT_QUERY_FIELDS = (
     "view",
     "graph_trace_id",
     "session_token",
+    "session_token_ref",
     "target_project_root",
 )
 
@@ -143,6 +144,10 @@ def _runtime_context_schema_properties() -> dict[str, Any]:
         "session_token": {
             "type": "string",
             "description": "Scoped worker session token issued at allocation.",
+        },
+        "session_token_ref": {
+            "type": "string",
+            "description": "Copy-safe scoped worker session token reference from runtime_context_worker_guide.",
         },
         "target_project_root": {
             "type": "string",
@@ -1041,6 +1046,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Required for server-tokenized mf_subagent lanes: the scoped worker session_token issued at allocation.",
                 },
+                "session_token_ref": {
+                    "type": "string",
+                    "description": "Copy-safe scoped worker session token reference from runtime_context_worker_guide; accepted instead of raw session_token for mf_subagent lanes.",
+                },
                 "route_id": {
                     "type": "string",
                     "description": "Safe route identity field from runtime_context_worker_guide/current-state.",
@@ -1175,6 +1184,10 @@ TOOLS: list[dict] = [
                 "session_token": {
                     "type": "string",
                     "description": "One-time worker session token. The server persists only a hash.",
+                },
+                "session_token_ref": {
+                    "type": "string",
+                    "description": "Copy-safe worker session token reference accepted instead of the raw session_token.",
                 },
                 "session_token_surrogate": {
                     "type": "string",

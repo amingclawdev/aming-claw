@@ -1057,7 +1057,10 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "/api/graph-governance/{project_id}/runtime-contexts/"
         "{runtime_context_id}/runtime-contract"
     )
-    assert "session_token" in contract_step["entrypoint"]["required_query_fields"]
+    assert any(
+        "session_token" in field
+        for field in contract_step["entrypoint"]["required_query_fields"]
+    )
     read_receipt_step = bridge["steps"][1]
     assert read_receipt_step["hash_bridge"]["accepted_inputs"] == [
         "read_receipt_hash",
@@ -1112,6 +1115,58 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert present_action["next_action"] == "none"
     assert present_action["read_receipt_event_ref"] == "timeline:read-runtime-context"
     assert present_action["ordered_worker_startup_bridge"]["status"] == "ready"
+
+
+def test_runtime_context_projection_surfaces_terminal_dispatch_blocker() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_events=[
+            {
+                "id": "26",
+                "project_id": PROJECT_ID,
+                "backlog_id": "BUG-RUNTIME-CONTEXT",
+                "task_id": "BUG-RUNTIME-CONTEXT",
+                "event_kind": "record_blocker",
+                "event_type": "record_blocker",
+                "status": "blocked",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "backlog_id": "BUG-RUNTIME-CONTEXT",
+                    "terminal_dispatch_blocker": True,
+                    "dispatch_blocker": True,
+                    "blocker_id": "worker_session_token_not_injected",
+                    "message": "Worker launch missed session token injection.",
+                },
+            }
+        ],
+        generated_at=NOW,
+    ).to_dict()
+
+    close_gate = projection["views"]["close_gate_view"]
+    action_plan = projection["views"]["action_plan"]
+    worker_view = projection["views"]["worker_view"]
+
+    assert close_gate["status"] == "terminal_dispatch_blocked"
+    assert close_gate["ready"] is False
+    assert close_gate["terminal_dispatch_blockers"][0]["event_ref"] == "timeline:26"
+    assert action_plan["next_legal_action"] == (
+        "audit_close_or_resolve_terminal_dispatch_blocker"
+    )
+    assert {
+        gap["code"] for gap in action_plan["close_precheck_gap_projection"]["gaps"]
+    } >= {"terminal_dispatch_blocker"}
+    assert worker_view["terminal_dispatch_blockers"][0]["blocker_id"] == (
+        "worker_session_token_not_injected"
+    )
 
 
 def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_startup_cwd_verified() -> None:
