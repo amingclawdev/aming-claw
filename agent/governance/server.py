@@ -8955,6 +8955,10 @@ def _runtime_context_worker_guide_response(
             "startup_facade_payload_skeleton",
             {},
         ),
+        "implementation_evidence_facade_payload_skeleton": actionable_payloads.get(
+            "implementation_evidence_facade_payload_skeleton",
+            {},
+        ),
         "role_scope": current_state_response.get("role_scope"),
         "worker_guide": {
             "schema_version": "runtime_context.worker_guide.v1",
@@ -8992,6 +8996,10 @@ def _runtime_context_worker_guide_response(
             "executable_contract": executable_contract,
             "startup_facade_payload_skeleton": actionable_payloads.get(
                 "startup_facade_payload_skeleton",
+                {},
+            ),
+            "implementation_evidence_facade_payload_skeleton": actionable_payloads.get(
+                "implementation_evidence_facade_payload_skeleton",
                 {},
             ),
             "graph_query_identity": {
@@ -9329,6 +9337,10 @@ def _runtime_context_worker_recovery_payloads(
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/startup"
     )
+    implementation_evidence_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/implementation-evidence"
+    )
     canonical_context_receipt_template = {
         "schema_version": "contract_context_read_receipt.v1",
         "event_kind": "contract_context_read_receipt",
@@ -9528,6 +9540,61 @@ def _runtime_context_worker_recovery_payloads(
             **safe_route_identity,
         }
     }
+    implementation_evidence_payload = {
+        "schema_version": "runtime_context.implementation_evidence.payload.v1",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        **safe_route_identity,
+    }
+    implementation_evidence_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "changed_files": ["<worker-owned changed file>"],
+        "tests": [{"command": "<worker test command>", "status": "passed"}],
+        "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+        "payload": implementation_evidence_payload,
+        **safe_route_identity,
+    }
+    implementation_evidence_field_pointers = {
+        "top_level_post_json": (
+            "implementation_evidence_facade_payload_skeleton.copy_safe_body"
+        ),
+        "do_not_post_alone": [
+            "implementation_evidence_facade_payload_skeleton.payload",
+            (
+                "implementation_evidence_facade_payload_skeleton."
+                "copy_safe_body.payload"
+            ),
+        ],
+        "runtime_context_id": "copy_safe_body.runtime_context_id",
+        "task_id": "copy_safe_body.task_id",
+        "parent_task_id": "copy_safe_body.parent_task_id",
+        "target_project_root": "copy_safe_body.target_project_root",
+        "session_token": "copy_safe_body.session_token",
+        "session_token_ref": "copy_safe_body.session_token_ref",
+        "fence_token": "copy_safe_body.fence_token",
+        "changed_files": "copy_safe_body.changed_files",
+        "tests": "copy_safe_body.tests",
+        "route_token_ref": "copy_safe_body.route_token_ref",
+    }
     return {
         "schema_version": "runtime_context.worker_recovery_payloads.v1",
         "project_id": project_id,
@@ -9561,6 +9628,15 @@ def _runtime_context_worker_recovery_payloads(
                 "tool": "record_mf_subagent_startup",
                 "facade": "runtime_context.startup",
                 "legacy_tool": "parallel_branch_startup",
+            },
+            "runtime_context_implementation_evidence": {
+                "method": "POST",
+                "path": implementation_evidence_path,
+                "tool": "runtime_context_implementation_evidence",
+                "facade": "runtime_context.implementation_evidence",
+                "body_source": (
+                    "implementation_evidence_facade_payload_skeleton.copy_safe_body"
+                ),
             },
         },
         "read_receipt_facade_payload_skeleton": {
@@ -9654,6 +9730,52 @@ def _runtime_context_worker_recovery_payloads(
             },
             "body": startup_body,
             "payload": startup_payload,
+        },
+        "implementation_evidence_facade_payload_skeleton": {
+            "method": "POST",
+            "path": implementation_evidence_path,
+            "facade": "runtime_context.implementation_evidence",
+            "top_level_body_required": True,
+            "body_is_top_level_post_json": True,
+            "body_source": "copy_safe_body",
+            "required_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "session_token or session_token_ref",
+                "fence_token",
+                "target_project_root",
+                "changed_files",
+                "tests",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+            ],
+            "forbidden_shapes": [
+                "nested_payload_only_identity",
+                "payload_posted_without_top_level_identity",
+                "worktree_path_as_target_project_root_for_write_facades",
+                "stale_child_route_token_with_parent_route_ref",
+            ],
+            "field_pointers": implementation_evidence_field_pointers,
+            "auth_fields": {
+                "session_token": session_token_placeholder,
+                "session_token_ref": session_token_ref_placeholder,
+                "session_token_env": session_token_env,
+                "fence_token": fence_token_placeholder,
+                "fence_token_env": fence_token_env,
+            },
+            "body": implementation_evidence_body,
+            "copy_safe_body": dict(implementation_evidence_body),
+            "retry_payload": dict(implementation_evidence_body),
+            "payload": implementation_evidence_payload,
+            "route_token_policy": {
+                "prefer_route_token_ref": True,
+                "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
+                "parent_route_token_ref": safe_route_identity.get(
+                    "route_token_ref",
+                    "",
+                ),
+            },
         },
     }
 
@@ -9983,8 +10105,15 @@ def _runtime_context_worker_recovery_details(
                 },
             }
         elif identity_failure:
-            next_legal_action = "verify_runtime_context_identity"
-            recovery_action_id = "retry_with_matching_runtime_context_identity"
+            if target_root_projection.get("request_role") in {
+                "assigned_worktree_path_alias",
+                "mismatched_or_unknown",
+            }:
+                next_legal_action = "retry_with_target_project_root"
+                recovery_action_id = "copy_projected_target_project_root"
+            else:
+                next_legal_action = "verify_runtime_context_identity"
+                recovery_action_id = "retry_with_matching_runtime_context_identity"
         elif not timeline_refs.get("read_receipt_event_ref"):
             next_legal_action = "submit_mf_subagent_read_receipt"
             recovery_action_id = "post_runtime_context_read_receipt"
@@ -10048,6 +10177,17 @@ def _runtime_context_worker_recovery_details(
     )
     if not isinstance(read_receipt_field_pointers, Mapping):
         read_receipt_field_pointers = {}
+    implementation_skeleton = actionable_payloads.get(
+        "implementation_evidence_facade_payload_skeleton",
+        {},
+    )
+    implementation_copy_safe_body = (
+        implementation_skeleton.get("copy_safe_body")
+        if isinstance(implementation_skeleton, Mapping)
+        else {}
+    )
+    if not isinstance(implementation_copy_safe_body, Mapping):
+        implementation_copy_safe_body = {}
 
     return {
         "recoverable": recoverable,
@@ -10063,6 +10203,10 @@ def _runtime_context_worker_recovery_details(
         "startup_facade_payload_skeleton": actionable_payloads.get(
             "startup_facade_payload_skeleton",
             {},
+        ),
+        "implementation_evidence_facade_payload_skeleton": implementation_skeleton,
+        "retry_implementation_evidence_top_level_body": dict(
+            implementation_copy_safe_body
         ),
         "corrected_request_shapes": target_root_projection.get(
             "corrected_request_shapes",
@@ -10447,6 +10591,30 @@ def _runtime_context_raise_child_route_lineage_error(
     child_route_identity: Mapping[str, Any],
     mismatched_fields: list[dict[str, str]] | None = None,
 ) -> None:
+    parent_route_summary = _route_identity_public_summary(parent_route_identity)
+    child_route_summary = _route_identity_public_summary(child_route_identity)
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    from .parallel_branch_runtime import runtime_context_session_token_ref
+
+    retry_parent_ref_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": getattr(context, "task_id", ""),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_role": "mf_sub",
+        "target_project_root": target_project_root,
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "fence_token": "<read from env:AMING_WORKER_FENCE_TOKEN at submission time>",
+        "changed_files": ["<worker-owned changed file>"],
+        "tests": [{"command": "<worker test command>", "status": "passed"}],
+        "payload": {
+            "worker_role": "mf_sub",
+            "summary": "<worker-authored implementation summary>",
+        },
+    }
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        value = str(parent_route_identity.get(field) or "").strip()
+        if value:
+            retry_parent_ref_body[field] = value
     raise GovernanceError(
         code,
         "runtime-context implementation evidence child route token is not bound to the latest runtime contract route",
@@ -10468,15 +10636,18 @@ def _runtime_context_raise_child_route_lineage_error(
                 ),
                 "required_payload": {
                     "route_token": {
-                        "parent_route_lineage": _route_identity_public_summary(
-                            parent_route_identity
-                        ),
+                        "parent_route_lineage": parent_route_summary,
                         "child_route_lineage": "<child route identity>",
-                    }
+                    },
+                    "parent_route_token_ref_body": retry_parent_ref_body,
                 },
+                "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
             },
-            "parent_route_identity": _route_identity_public_summary(parent_route_identity),
-            "child_route_identity": _route_identity_public_summary(child_route_identity),
+            "retry_implementation_evidence_parent_route_ref_body": (
+                retry_parent_ref_body
+            ),
+            "parent_route_identity": parent_route_summary,
+            "child_route_identity": child_route_summary,
             "mismatched_fields": mismatched_fields or [],
         },
     )

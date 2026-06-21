@@ -6805,6 +6805,267 @@ def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_re
     assert "route_token" not in payload
 
 
+def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_root(
+    conn,
+    tmp_path,
+):
+    from agent.governance import observer_route_context
+
+    canonical_root = tmp_path / "runtime-impl-canonical-root"
+    worktree = tmp_path / "runtime-impl-worker-worktree"
+    canonical_root.mkdir()
+    worktree.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(canonical_root),
+            task_id="runtime-impl-canonical-root-task",
+            root_task_id="runtime-impl-canonical-root-parent",
+            backlog_id="AC-RUNTIME-IMPL-CANONICAL-ROOT",
+            stage_task_id="runtime-impl-canonical-root-task",
+            worker_id="worker-impl-canonical-root",
+            worker_slot_id="slot-impl-canonical-root",
+            branch_ref="refs/heads/codex/runtime-impl-canonical-root-task",
+            worktree_path=str(worktree),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-impl-canonical-root",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-impl-canonical-root"
+            ),
+        ),
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-runtime-impl-canonical-root"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_route_identity = {
+        "route_id": parent_issue["route_id"],
+        "route_context_hash": parent_issue["route_context_hash"],
+        "prompt_contract_id": parent_issue["prompt_contract_id"],
+        "prompt_contract_hash": parent_issue["route_token"]["prompt_contract_hash"],
+        "route_token_ref": parent_issue["route_token_ref"],
+        "visible_injection_manifest_hash": parent_issue[
+            "visible_injection_manifest_hash"
+        ],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-impl-canonical-root",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=parent_route_identity,
+    )
+    conn.commit()
+
+    wrong_root_body = {
+        "parent_task_id": context.root_task_id,
+        "fence_token": "fence-impl-canonical-root",
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": str(worktree),
+        "changed_files": ["agent/governance/server.py"],
+        "tests": [{"command": "pytest -q", "status": "passed"}],
+        "payload": {"worker_role": "mf_sub", "summary": "wrong root first"},
+        "route_token_ref": parent_issue["route_token_ref"],
+        "route_id": parent_issue["route_id"],
+        "route_context_hash": parent_issue["route_context_hash"],
+        "prompt_contract_id": parent_issue["prompt_contract_id"],
+    }
+    with pytest.raises(GovernanceError) as denied:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body=wrong_root_body,
+            )
+        )
+
+    assert denied.value.code == "fence_invalidated_or_unknown"
+    assert denied.value.details["next_legal_action"] == "retry_with_target_project_root"
+    skeleton = denied.value.details["implementation_evidence_facade_payload_skeleton"]
+    retry_body = dict(skeleton["copy_safe_body"])
+    assert retry_body["target_project_root"] == str(canonical_root)
+    assert retry_body["route_token_ref"] == parent_issue["route_token_ref"]
+    assert skeleton["route_token_policy"]["prefer_route_token_ref"] is True
+
+    retry_body.update(
+        {
+            "fence_token": "fence-impl-canonical-root",
+            "changed_files": ["agent/governance/server.py"],
+            "tests": [{"command": "pytest -q", "status": "passed"}],
+            "payload": {
+                "worker_role": "mf_sub",
+                "summary": "canonical retry body succeeds",
+            },
+        }
+    )
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body=retry_body,
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["timeline_event"]["event_kind"] == "implementation"
+    assert response["route_token_gate"]["decision"] == "route_token_ref_resolved"
+
+
+def test_runtime_context_parent_route_lineage_error_retry_body_succeeds(
+    conn,
+    tmp_path,
+):
+    from agent.governance import observer_route_context
+
+    target_root = tmp_path / "runtime-parent-lineage-retry"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="runtime-parent-lineage-retry-task",
+            root_task_id="runtime-parent-lineage-retry-parent",
+            backlog_id="AC-RUNTIME-PARENT-LINEAGE-RETRY",
+            stage_task_id="runtime-parent-lineage-retry-task",
+            worker_id="worker-parent-lineage-retry",
+            worker_slot_id="slot-parent-lineage-retry",
+            branch_ref="refs/heads/codex/runtime-parent-lineage-retry-task",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-parent-lineage-retry",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-parent-lineage-retry"
+            ),
+        ),
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-runtime-parent-lineage-retry-parent"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_route_identity = {
+        "route_id": parent_issue["route_id"],
+        "route_context_hash": parent_issue["route_context_hash"],
+        "prompt_contract_id": parent_issue["prompt_contract_id"],
+        "prompt_contract_hash": parent_issue["route_token"]["prompt_contract_hash"],
+        "route_token_ref": parent_issue["route_token_ref"],
+        "visible_injection_manifest_hash": parent_issue[
+            "visible_injection_manifest_hash"
+        ],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-parent-lineage-retry",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=parent_route_identity,
+    )
+    unrelated_parent = {
+        **parent_route_identity,
+        "route_id": "route-runtime-parent-lineage-retry-stale",
+        "route_context_hash": "sha256:route-runtime-parent-lineage-retry-stale",
+    }
+    stale_child = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        parent_route_identity={
+            **unrelated_parent,
+            "selected_project": PID,
+            "selected_backlog_id": context.backlog_id,
+        },
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=stale_child["route_token_ref"],
+        token=stale_child["route_token"],
+    )
+    conn.commit()
+    common_body = {
+        "parent_task_id": context.root_task_id,
+        "fence_token": "fence-parent-lineage-retry",
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": str(target_root),
+        "changed_files": ["agent/governance/server.py"],
+        "tests": [{"command": "pytest -q", "status": "passed"}],
+        "payload": {"worker_role": "mf_sub"},
+    }
+
+    with pytest.raises(GovernanceError) as mismatch:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "route_token": stale_child["route_token"],
+                    "route_token_ref": stale_child["route_token_ref"],
+                },
+            )
+        )
+
+    assert mismatch.value.code == "parent_route_lineage_mismatch"
+    retry_body = dict(
+        mismatch.value.details["retry_implementation_evidence_parent_route_ref_body"]
+    )
+    assert retry_body["route_token_ref"] == parent_issue["route_token_ref"]
+    assert "route_token" not in retry_body
+    retry_body.update(
+        {
+            "fence_token": "fence-parent-lineage-retry",
+            "changed_files": ["agent/governance/server.py"],
+            "tests": [{"command": "pytest -q", "status": "passed"}],
+            "payload": {
+                "worker_role": "mf_sub",
+                "summary": "parent route ref retry succeeds",
+            },
+        }
+    )
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body=retry_body,
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["timeline_event"]["event_kind"] == "implementation"
+    assert response["route_token_gate"]["decision"] == "route_token_ref_resolved"
+
+
 def test_runtime_context_service_refs_accept_legacy_implementation_evidence_kind(
     conn,
 ):
@@ -15242,6 +15503,7 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
         assert denied.value.details["fail_closed"] is True
         assert denied.value.details["next_legal_action"] in {
             "record_mf_subagent_startup",
+            "retry_with_target_project_root",
             "verify_runtime_context_identity",
         }
         diagnostics = denied.value.details["diagnostics"]
@@ -15631,6 +15893,18 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     assert worker_guide["corrected_request_shapes"]["write_facade_body"][
         "target_project_root"
     ] == str(canonical_root)
+    implementation_skeleton = worker_guide[
+        "implementation_evidence_facade_payload_skeleton"
+    ]
+    assert implementation_skeleton["copy_safe_body"]["target_project_root"] == (
+        str(canonical_root)
+    )
+    assert implementation_skeleton["copy_safe_body"]["route_token_ref"] == (
+        route_identity["route_token_ref"]
+    )
+    assert implementation_skeleton["route_token_policy"][
+        "omit_stale_child_route_token_when_using_parent_route_token_ref"
+    ] is True
 
     strict_body = {
         "parent_task_id": "parent-worktree-alias",
