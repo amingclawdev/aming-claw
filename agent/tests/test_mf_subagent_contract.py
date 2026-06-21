@@ -777,27 +777,27 @@ def test_meta_contract_allows_observer_work_mode_transition_with_bound_precheck_
     assert gate["observer_worker_transport"] is False
 
 
-def test_meta_contract_rejects_observer_work_mode_transition_without_bound_precheck_ref() -> None:
-    with pytest.raises(
-        MfSubagentContractError,
-        match="route_action_precheck_ref",
-    ):
-        validate_meta_contract_timeline_event(
-            {
-                "event_type": "observer.work_mode_transition",
-                "event_kind": "observer_work_mode_transition",
-                "actor": "observer",
-                "phase": "routing",
-                "status": "accepted",
-                "payload": {
-                    "route_identity": {
-                        "route_id": "route-1",
-                        "route_context_hash": "sha256:ctx",
-                        "prompt_contract_id": "rprompt-1",
-                    },
+def test_meta_contract_allows_observer_work_mode_transition_before_precheck_ref() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "observer.work_mode_transition",
+            "event_kind": "observer_work_mode_transition",
+            "actor": "observer",
+            "phase": "routing",
+            "status": "accepted",
+            "payload": {
+                "route_identity": {
+                    "route_id": "route-1",
+                    "route_context_hash": "sha256:ctx",
+                    "prompt_contract_id": "rprompt-1",
                 },
-            }
-        )
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == OBSERVER_COORDINATOR_ROLE
+    assert gate["action"] == "observer_work_mode_transition"
 
 
 @pytest.mark.parametrize(

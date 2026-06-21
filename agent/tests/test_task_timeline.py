@@ -1789,6 +1789,41 @@ class TestTaskTimeline(unittest.TestCase):
         ).fetchone()["c"]
         self.assertEqual(count, 1)
 
+    def test_timeline_append_accepts_observer_work_mode_transition_before_precheck(self):
+        from agent.governance import server
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": "BUG-WORK-MODE-TRANSITION-BEFORE-PRECHECK",
+                    "event_type": "observer.work_mode_transition",
+                    "event_kind": "observer_work_mode_transition",
+                    "phase": "dispatch",
+                    "actor": "observer",
+                    "status": "accepted",
+                    "payload": {
+                        "from_work_mode": "observer_look_before_act",
+                        "to_work_mode": "observer_execution_supervisor",
+                        "route_identity": {
+                            "route_id": "route-1",
+                            "route_context_hash": "sha256:ctx",
+                            "prompt_contract_id": "rprompt-1",
+                        },
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        gate = result["payload"]["meta_contract_gate"]
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["action"], "observer_work_mode_transition")
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ?",
+            ("BUG-WORK-MODE-TRANSITION-BEFORE-PRECHECK",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 1)
+
     def test_root_route_context_projects_execution_supervisor_after_transition_precheck(self):
         from agent.governance import observer_session, server, task_timeline
 

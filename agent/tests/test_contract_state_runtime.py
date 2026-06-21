@@ -200,6 +200,58 @@ def test_work_mode_transition_hint_carries_route_identity_and_precheck_ref():
     assert hint["meta_contract_gate"]["allowed"] is True
 
 
+def test_work_mode_transition_hint_is_writable_before_route_action_precheck():
+    route_identity = {
+        "route_id": "route-1",
+        "route_context_hash": "sha256:ctx",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt",
+        "visible_injection_manifest_hash": "sha256:visible",
+        "route_token_ref": "rtok-1",
+    }
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_revision_id": "rev-work-mode-before-precheck",
+            "state": "selected",
+            "required_evidence": [
+                "route_context",
+                "observer_work_mode_transition",
+                "route_action_precheck",
+            ],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(
+                1,
+                "route_context",
+                payload={
+                    "route_identity": route_identity,
+                    **route_identity,
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": "AC-CONTRACT-RUNTIME",
+            "task_id": "observer-task-1",
+        },
+    )
+
+    hint = projection["next_legal_action"]["timeline_append_hint"]
+    assert projection["next_legal_action"]["id"] == "observer_work_mode_transition"
+    assert hint["event_kind"] == "observer_work_mode_transition"
+    assert hint["route_identity"] == route_identity
+    assert hint["payload"]["route_identity"] == route_identity
+    assert hint["payload"]["task_id"] == "observer-task-1"
+    assert "route_action_precheck_ref" not in hint["payload"]
+    assert hint["meta_contract_gate"]["allowed"] is True
+
+
 def test_projection_computes_completed_missing_and_next_action():
     contract = {
         "contract": {

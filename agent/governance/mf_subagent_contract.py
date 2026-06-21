@@ -580,14 +580,6 @@ _META_WORK_MODE_TRANSITION_ROUTE_IDENTITY_KEYS = (
     "route_context_hash",
     "prompt_contract_id",
 )
-_META_WORK_MODE_TRANSITION_PRECHECK_REF_KEYS = (
-    "route_action_precheck_event_id",
-    "route_action_precheck_event_ref",
-    "route_action_precheck_ref",
-    "route_action_precheck_timeline_id",
-    "bound_route_action_precheck_event_id",
-    "bound_route_action_precheck_ref",
-)
 _META_OBSERVER_ROLE_TOKENS = {"observer", "coordinator"}
 _META_JUDGE_ROLE_TOKENS = {"judger", "judge"}
 _META_QA_ROLE_TOKENS = {"qa", "verifier", "reviewer"}
@@ -5770,40 +5762,6 @@ def _meta_work_mode_transition_missing_evidence(
     for key in _META_WORK_MODE_TRANSITION_ROUTE_IDENTITY_KEYS:
         if not any(_string(container.get(key)) for container in containers):
             missing.append(key)
-
-    has_precheck_ref = any(
-        _string(container.get(key))
-        for container in containers
-        for key in _META_WORK_MODE_TRANSITION_PRECHECK_REF_KEYS
-    )
-    if not has_precheck_ref:
-        for container in containers:
-            for key in (
-                "action_precheck",
-                "bound_route_action_precheck",
-                "route_action_precheck",
-            ):
-                child = container.get(key)
-                if _string(child):
-                    has_precheck_ref = True
-                    break
-                if isinstance(child, Mapping) and any(
-                    _string(child.get(ref_key))
-                    for ref_key in (
-                        "event_id",
-                        "event_ref",
-                        "id",
-                        "ref",
-                        "source_event_id",
-                        "timeline_id",
-                    )
-                ):
-                    has_precheck_ref = True
-                    break
-            if has_precheck_ref:
-                break
-    if not has_precheck_ref:
-        missing.append("route_action_precheck_ref")
     return missing
 
 
