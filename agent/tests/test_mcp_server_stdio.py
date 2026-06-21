@@ -178,6 +178,23 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
     }.issubset(properties)
 
 
+def test_mcp_stdio_parallel_branch_allocate_schema_exposes_route_token_ref():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    properties = tools["parallel_branch_allocate"]["inputSchema"]["properties"]
+    assert "route_token_ref" in properties
+    assert properties["route_token_ref"]["type"] == "string"
+    assert (
+        properties["route_token_ref"]["description"]
+        == "Opaque server-registered route token reference accepted by protected HTTP facades."
+    )
+
+
 def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},

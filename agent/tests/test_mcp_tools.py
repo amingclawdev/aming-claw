@@ -1063,9 +1063,15 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "merge_queue_id",
         "fence_token",
         "create_worktree",
+        "route_token_ref",
     ):
         assert key in allocate_props
 
+    assert allocate_props["route_token_ref"]["type"] == "string"
+    assert (
+        allocate_props["route_token_ref"]["description"]
+        == "Opaque server-registered route token reference accepted by protected HTTP facades."
+    )
     assert startup["inputSchema"]["required"] == ["project_id", "task_id"]
     for key in (
         "parent_task_id",
@@ -1185,6 +1191,7 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
             "fence_token": "fence-1",
             "create_worktree": False,
             "route_token": route_token,
+            "route_token_ref": "rtok-allocate",
         },
     )
     dispatcher.dispatch(
@@ -1277,6 +1284,7 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
                 "fence_token": "fence-1",
                 "create_worktree": False,
                 "route_token": route_token,
+                "route_token_ref": "rtok-allocate",
             },
         ),
         (

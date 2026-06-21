@@ -1127,6 +1127,7 @@ TOOLS: list[dict] = [
                 "create_worktree": {"type": "boolean"},
                 "now_iso": {"type": "string"},
                 "route_token": {"type": "object", "description": "Route-token evidence required when governance protects this mutation."},
+                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit waiver for protected route-token gates."},
                 "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
             },
