@@ -4213,7 +4213,10 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     capability_boundary = observer_views["capability_boundary"]
     assert control_plane["schema_version"] == "runtime_context.control_plane.v1"
     assert control_plane["next_legal_action"] == (
-        "record_finish_time_worker_attestation"
+        "record_implementation_evidence"
+    )
+    assert control_plane["next_required_evidence"][0]["id"] == (
+        "implementation_evidence"
     )
     gate_projection = observer_views["gate_projection"]
     assert gate_projection["schema_version"] == "runtime_context.gate_projection.v1"
@@ -4459,15 +4462,19 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     next_required = worker_view["next_required_evidence"]
     assert worker_view["action_plan"]["next_required_evidence"] == next_required
     assert worker_view["control_plane"]["next_required_evidence"] == next_required
-    assert [item["id"] for item in next_required[:2]] == [
+    assert [item["id"] for item in next_required[:3]] == [
+        "implementation_evidence",
         "finish_time_worker_attestation",
         "finish_gate",
     ]
-    assert next_required[0]["next_action"] == "record_finish_time_worker_attestation"
-    assert next_required[0]["next_after_success"] == "record_finish_gate"
-    assert next_required[1]["waits_for"] == "finish_time_worker_attestation"
-    assert "finish_time_worker_attestation" in next_required[1]["requires"]
-    assert next_required[1]["runtime_context_id"] == context.runtime_context_id
+    assert next_required[0]["next_action"] == "record_implementation_evidence"
+    assert next_required[1]["next_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert "implementation_evidence" in next_required[1]["requires"]
+    assert next_required[2]["waits_for"] == "finish_time_worker_attestation"
+    assert "implementation_evidence" in next_required[2]["requires"]
+    assert next_required[2]["runtime_context_id"] == context.runtime_context_id
     assert "current_values" not in worker_view
     assert "fence-current" not in json.dumps(worker_result, sort_keys=True)
     assert "runtime-current-session" not in json.dumps(worker_result, sort_keys=True)
@@ -5524,6 +5531,28 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert checkpoint["context"]["checkpoint_id"] == "ckpt-runtime-facade"
     assert checkpoint["context"]["replay_source"] == "checkpoint"
 
+    implementation = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                **common_body,
+                "changed_files": [changed_path],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "summary": "worker appended implementation evidence before finish attestation",
+                },
+            },
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["action"] == "implementation_evidence"
+    assert implementation["timeline_event"]["event_kind"] == "implementation"
+
     finish_attestation_body = {
         **common_body,
         "worker_session_id": "worker-session-facade",
@@ -6001,6 +6030,13 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         route_identity=unresolved_route_identity,
         now_iso="2026-06-15T11:03:00Z",
     )
+    implementation_count_before_unresolved = conn.execute(
+        """
+        SELECT COUNT(*) FROM task_timeline_events
+        WHERE task_id = ? AND event_kind = 'implementation'
+        """,
+        (context.task_id,),
+    ).fetchone()[0]
     with pytest.raises(GovernanceError) as unresolved_ref_exc:
         server.handle_graph_governance_runtime_context_implementation_evidence(
             _ctx_with_role(
@@ -6028,7 +6064,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         """,
         (context.task_id,),
     ).fetchone()[0]
-    assert implementation_count_after_unresolved == 0
+    assert implementation_count_after_unresolved == implementation_count_before_unresolved
 
     append_branch_contract_revision(
         conn,

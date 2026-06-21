@@ -1581,6 +1581,7 @@ def test_runtime_context_close_gate_blocks_handoff_when_route_action_precheck_mi
         timeline_refs = {
             "startup_event_ref": "timeline:startup-runtime-context",
             "read_receipt_event_ref": "timeline:read-runtime-context",
+            "implementation_event_refs": ["timeline:implementation-runtime-context"],
             "finish_event_ref": "timeline:finish-runtime-context",
             "verification_event_refs": ["timeline:verify-runtime-context"],
         }
@@ -2065,6 +2066,7 @@ def test_runtime_context_action_plan_translates_close_blockers_for_operator() ->
         timeline_refs={
             "startup_event_ref": "timeline:startup-runtime-context",
             "read_receipt_event_ref": "timeline:read-runtime-context",
+            "implementation_event_refs": ["timeline:implementation-runtime-context"],
         },
         target_files=["agent/governance/parallel_branch_runtime.py"],
         graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
@@ -2136,9 +2138,10 @@ def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish
     assert [
         "mf_subagent_startup_identity",
         "worker_graph_trace",
+        "implementation_evidence",
         "finish_time_worker_attestation",
     ] == [
-        item["id"] for item in next_required[:3]
+        item["id"] for item in next_required[:4]
     ]
     assert by_id["mf_subagent_startup_identity"]["next_action"] == (
         "record_mf_subagent_startup"
@@ -2147,9 +2150,18 @@ def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish
     assert by_id["worker_graph_trace"]["next_action"] == "run_worker_graph_query"
     assert by_id["worker_graph_trace"]["producer"] == "graph_query_trace"
     assert by_id["worker_graph_trace"]["worker_owned"] is True
+    assert by_id["implementation_evidence"]["next_action"] == (
+        "record_implementation_evidence"
+    )
+    assert by_id["implementation_evidence"]["requires"] == ["worker_graph_trace"]
+    assert by_id["implementation_evidence"]["worker_owned"] is True
     assert by_id["finish_time_worker_attestation"]["next_action"] == (
         "record_finish_time_worker_attestation"
     )
+    assert by_id["finish_time_worker_attestation"]["requires"] == [
+        "worker_graph_trace",
+        "implementation_evidence",
+    ]
     assert by_id["finish_time_worker_attestation"]["expected_source"] == (
         "worker_transcript_verify.finish_time_worker_self_attestation"
     )
@@ -2157,6 +2169,7 @@ def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish
     assert by_id["finish_gate"]["next_action"] == "record_finish_gate"
     assert by_id["finish_gate"]["requires"] == [
         "worker_graph_trace",
+        "implementation_evidence",
         "finish_time_worker_attestation",
     ]
     assert by_id["finish_gate"]["runtime_context_id"] == projection["runtime_context_id"]
@@ -2227,6 +2240,8 @@ def test_runtime_context_current_values_prefer_finish_time_worker_attestation() 
     assert current_values["worker_self_attesting"] is True
     assert current_values["worker_self_attestation"]["attestation_phase"] == "finish"
     assert current_values["worker_self_attestation"]["finish_time_self_attesting"] is True
+    assert current_values["implementation_event_refs"] == []
+    assert "implementation_evidence" in next_required_ids
     assert "finish_time_worker_attestation" not in next_required_ids
 
 
@@ -2311,9 +2326,11 @@ def test_runtime_context_current_values_read_worker_progress_finish_time_attesta
     assert current_values["test_results"]["passed"] is True
     assert current_values["finish_gate_ref"] == ""
     assert current_values["checkpoint_id"] == ""
+    assert current_values["implementation_event_refs"] == []
     assert ("finish", "worker_self_attesting") not in gate_missing
     assert ("close", "worker_self_attesting") not in gate_missing
     assert "worker_self_attesting" not in close_missing
+    assert "implementation_evidence" in next_required_ids
     assert "finish_time_worker_attestation" not in next_required_ids
     assert "finish_gate" in next_required_ids
 
@@ -2525,6 +2542,7 @@ def test_runtime_context_worker_guide_repairs_next_action_after_finish_attestati
         timeline_refs={
             "startup_event_ref": "timeline:startup-runtime-context",
             "read_receipt_event_ref": "timeline:read-runtime-context",
+            "implementation_event_refs": ["timeline:implementation-runtime-context"],
         },
         startup_gate={
             "runtime_context_id": branch_runtime_context_id(
@@ -2721,6 +2739,7 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
             "startup_event_ref": "timeline:startup",
             "read_receipt_event_ref": "timeline:read-receipt",
             "route_action_precheck_event_ref": "timeline:route-precheck",
+            "implementation_event_refs": ["timeline:implementation"],
             "finish_event_ref": "timeline:finish",
             "verification_event_refs": ["timeline:verification"],
         },

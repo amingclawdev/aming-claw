@@ -3419,6 +3419,9 @@ def _runtime_context_current_values(
             or close_evidence.get("event_id")
             or close_evidence.get("source_ref")
         ),
+        "implementation_event_refs": list(
+            timeline_refs.get("implementation_event_refs") or []
+        ),
         "verification_event_refs": verification_event_refs,
         "startup_gate_ref": _runtime_context_text(
             startup_gate.get("event_id")
@@ -5483,8 +5486,11 @@ def _runtime_context_next_legal_action(
         for item in close_gate_view.get("missing") or []
         if isinstance(item, Mapping)
     }
+    if not _runtime_context_string_list(values.get("graph_trace_ids")):
+        return "run_worker_graph_query"
+    if not _runtime_context_string_list(values.get("implementation_event_refs")):
+        return "record_implementation_evidence"
     for field, action in (
-        ("graph_trace_ids", "run_worker_graph_query"),
         ("worker_self_attesting", "record_finish_time_worker_attestation"),
         ("finish_gate_ref", "record_finish_gate"),
         ("checkpoint_id", "record_checkpoint"),
@@ -5653,7 +5659,10 @@ def _runtime_context_next_required_evidence(
                 close_satisfying_required=True,
                 requires=[],
             )
-    if "graph_trace_ids" in missing_fields:
+    if (
+        "graph_trace_ids" in missing_fields
+        or not _runtime_context_string_list(values.get("graph_trace_ids"))
+    ):
         _add(
             item_id="worker_graph_trace",
             field="graph_trace_ids",
@@ -5665,8 +5674,26 @@ def _runtime_context_next_required_evidence(
             evidence_ref="graph_trace",
             close_satisfying_required=True,
         )
-    if "worker_self_attesting" in missing_fields:
+    if not _runtime_context_string_list(values.get("implementation_event_refs")):
         requires = ["worker_graph_trace"] if "worker_graph_trace" in seen else []
+        _add(
+            item_id="implementation_evidence",
+            field="implementation_event_refs",
+            gate="finish",
+            next_action="record_implementation_evidence",
+            producer="mf_subagent_worker",
+            consumer="mf_subagent_contract.validate_mf_subagent_finish_gate",
+            expected_source="task_timeline.implementation",
+            evidence_ref="timeline",
+            close_satisfying_required=True,
+            requires=requires,
+        )
+    if "worker_self_attesting" in missing_fields:
+        requires = [
+            evidence_id
+            for evidence_id in ("worker_graph_trace", "implementation_evidence")
+            if evidence_id in seen
+        ]
         _add(
             item_id="finish_time_worker_attestation",
             field="worker_self_attesting",
@@ -5682,7 +5709,11 @@ def _runtime_context_next_required_evidence(
     if "finish_gate_ref" in missing_fields:
         requires = [
             evidence_id
-            for evidence_id in ("worker_graph_trace", "finish_time_worker_attestation")
+            for evidence_id in (
+                "worker_graph_trace",
+                "implementation_evidence",
+                "finish_time_worker_attestation",
+            )
             if evidence_id in seen
         ]
         _add(
