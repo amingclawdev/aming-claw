@@ -7960,6 +7960,71 @@ def test_parallel_branch_merge_queue_requires_route_token_or_waiver(conn):
         )
 
 
+def test_parallel_branch_merge_queue_accepts_root_route_token_ref_for_child_lane(conn):
+    root_task_id = "root-route-merge-task"
+    child_task_id = f"{root_task_id}-focus-ui"
+    queue_id = "mergeq-api-root-route-ref"
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=root_task_id,
+        task_id=root_task_id,
+        target_files=["src/app.js"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["timeline:route-action-precheck"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-root-route-ref",
+            backlog_id=root_task_id,
+            root_task_id=root_task_id,
+            task_id=child_task_id,
+            branch_ref="refs/heads/codex/root-route-child",
+            status="validated",
+            fence_token="fence-root-route-child",
+            base_commit="base-root-route",
+            head_commit="head-root-route",
+            target_head_commit="target-root-route",
+        ),
+        now_iso="2026-06-21T20:00:00Z",
+    )
+    conn.commit()
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": child_task_id,
+                "merge_queue_id": queue_id,
+                "queue_index": 1,
+                "fence_token": "fence-root-route-child",
+                "route_token_ref": issued["route_token_ref"],
+                "now_iso": "2026-06-21T20:01:00Z",
+            },
+        )
+    )
+
+    gate = queued["route_token_gate"]
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["task_id"] == child_task_id
+    assert gate["action"] == "merge_queue"
+    assert gate["protected_action"] == "merge_queue"
+    assert gate["authorized_action"] == "close_or_merge_after_evidence"
+    assert gate["parent_task_scope_accepted"] is True
+    assert gate["parent_task_id"] == root_task_id
+    assert gate["child_task_id"] == child_task_id
+    assert gate["route_token_ref"] == issued["route_token_ref"]
+
+
 def test_parallel_branch_checkpoint_refreshes_worktree_head_before_merge_queue(conn, tmp_path):
     repo = _git_repo(tmp_path)
     base = subprocess.run(

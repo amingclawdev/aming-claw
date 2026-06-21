@@ -13428,6 +13428,85 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
         conn.close()
 
 
+_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION = "close_or_merge_after_evidence"
+_PARALLEL_BRANCH_PARENT_ROUTE_ACTIONS = {
+    "merge_queue",
+    "merge_execute",
+    "merge_result",
+}
+
+
+def _body_has_route_token_reference(body: Mapping[str, Any] | None) -> bool:
+    payload = body or {}
+    return bool(payload.get("route_token") or str(payload.get("route_token_ref") or "").strip())
+
+
+def _require_parallel_branch_merge_route_gate(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    action: str,
+    task_id: str,
+) -> dict:
+    """Authorize a child-lane merge action against its root route contract.
+
+    Existing mf_parallel route contracts mint the observer merge authority at the
+    root task/backlog scope and name it ``close_or_merge_after_evidence``.  The
+    concrete merge endpoints run against child lane task ids (``merge_queue``,
+    ``merge_execute`` and ``merge_result``).  Try the concrete action first, then
+    fall back to the parent/root route scope when the request supplies a route
+    token/ref and the branch context binds the child lane to that root.
+    """
+
+    concrete_action = str(action or "").strip()
+    lane_task_id = str(task_id or "").strip()
+    try:
+        return _require_route_token_mutation_gate(
+            ctx,
+            action=concrete_action,
+            task_id=lane_task_id,
+        )
+    except GovernanceError as exc:
+        if (
+            exc.code != "route_token_required"
+            or concrete_action not in _PARALLEL_BRANCH_PARENT_ROUTE_ACTIONS
+            or not _body_has_route_token_reference(ctx.body)
+            or _body_has_route_waiver(ctx.body)
+        ):
+            raise
+
+        from .parallel_branch_runtime import get_branch_context
+
+        context = get_branch_context(conn, project_id, lane_task_id)
+        root_task_id = str(
+            getattr(context, "root_task_id", "")
+            or getattr(context, "chain_id", "")
+            or getattr(context, "backlog_id", "")
+            or ""
+        ).strip() if context is not None else ""
+        backlog_id = str(getattr(context, "backlog_id", "") or root_task_id).strip() if context is not None else ""
+        if not root_task_id or root_task_id == lane_task_id:
+            raise
+
+        gate = _require_route_token_mutation_gate(
+            ctx,
+            action=_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION,
+            backlog_id=backlog_id,
+            task_id=root_task_id,
+        )
+        gate = dict(gate)
+        gate["action"] = concrete_action
+        gate["protected_action"] = concrete_action
+        gate["authorized_action"] = _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION
+        gate["parent_task_scope_accepted"] = True
+        gate["parent_task_id"] = root_task_id
+        gate["child_task_id"] = lane_task_id
+        gate["backlog_id"] = backlog_id
+        gate["fallback_reason"] = str(exc.message or exc)
+        return gate
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
 def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     """Enter one branch runtime context into the durable merge queue."""
@@ -13449,8 +13528,10 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.merge-queue")
-        route_gate = _require_route_token_mutation_gate(
+        route_gate = _require_parallel_branch_merge_route_gate(
             ctx,
+            conn,
+            project_id=project_id,
             action="merge_queue",
             task_id=task_id,
         )
@@ -13685,8 +13766,10 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
             conn,
             "graph-governance.parallel-branches.merge-result",
         )
-        route_gate = _require_route_token_mutation_gate(
+        route_gate = _require_parallel_branch_merge_route_gate(
             ctx,
+            conn,
+            project_id=project_id,
             action="merge_result",
             task_id=str(ctx.body.get("task_id") or ""),
         )
@@ -13780,8 +13863,10 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
         route_gate = {}
         dry_run = _query_bool(ctx.body, "dry_run", True)
         if not dry_run:
-            route_gate = _require_route_token_mutation_gate(
+            route_gate = _require_parallel_branch_merge_route_gate(
                 ctx,
+                conn,
+                project_id=project_id,
                 action="merge_execute",
                 task_id=str(ctx.body.get("task_id") or ""),
             )
