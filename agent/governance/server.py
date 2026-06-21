@@ -6856,6 +6856,8 @@ def _runtime_context_service_timeline_refs(
     backlog_id: str,
     timeline_events: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    from .parallel_branch_runtime import public_contract_revision_payload
+
     events = timeline_events
     if events is None:
         events = _runtime_context_service_timeline_events(
@@ -6912,6 +6914,27 @@ def _runtime_context_service_timeline_refs(
         if is_startup:
             refs["startup_event_ref"] = ref
             startup_event = dict(event)
+            startup_payload = public_contract_revision_payload(payload)
+            startup_hint = refs.setdefault("startup_hint", {})
+            if isinstance(startup_hint, dict):
+                startup_hint["event_ref"] = ref
+                for key in (
+                    "worker_session_id",
+                    "filer_principal",
+                    "worker_transcript_ref",
+                    "worker_transcript_path",
+                    "harness_type",
+                    "actual_cwd",
+                    "actual_git_root",
+                    "head_commit",
+                    "read_receipt_hash",
+                    "read_receipt_event_id",
+                ):
+                    value = _runtime_context_non_placeholder_text(
+                        _timeline_first_deep_text(startup_payload, key)
+                    )
+                    if value:
+                        startup_hint[key] = value
         elif (
             not refs.get("startup_event_ref")
             and "startup" in haystack
@@ -6921,6 +6944,11 @@ def _runtime_context_service_timeline_refs(
             startup_event = dict(event)
         if not refs.get("read_receipt_event_ref") and is_read_receipt:
             refs["read_receipt_event_ref"] = ref
+            read_receipt_hash = _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(payload, "read_receipt_hash")
+            )
+            if read_receipt_hash:
+                refs["read_receipt_hash"] = read_receipt_hash
         is_finish_gate = event_kind_normalized in {
             "finish_gate",
             "mf_subagent_finish_gate",
@@ -6963,6 +6991,45 @@ def _runtime_context_service_timeline_refs(
             close_event = dict(event)
         if is_implementation:
             refs["implementation_event_refs"].append(ref)
+            implementation_payload = public_contract_revision_payload(payload)
+            refs["latest_implementation_event_ref"] = ref
+            refs["latest_implementation_payload"] = implementation_payload
+            observer_command_id = _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(
+                    implementation_payload,
+                    "observer_command_id",
+                )
+            )
+            if observer_command_id:
+                refs["observer_command_id"] = observer_command_id
+            implementation_tests = (
+                implementation_payload.get("test_results")
+                if isinstance(implementation_payload.get("test_results"), Mapping)
+                else {}
+            )
+            if not implementation_tests:
+                implementation_tests = _runtime_context_test_results_from_tests(
+                    implementation_payload.get("tests")
+                )
+            if implementation_tests:
+                refs["test_results"] = public_contract_revision_payload(
+                    implementation_tests
+                )
+            for key in ("head_commit", "commit_sha", "read_receipt_hash"):
+                value = _runtime_context_non_placeholder_text(
+                    _timeline_first_deep_text(implementation_payload, key)
+                    or str(event.get(key) or "")
+                )
+                if value:
+                    refs[key] = value
+            changed_files = _runtime_context_service_query_values(
+                implementation_payload,
+                "changed_files",
+                "owned_files",
+                "worker_changed_files",
+            )
+            if changed_files:
+                refs["changed_files"] = changed_files
         is_verification = (
             event_kind_normalized in {"verification", "qa_verification"}
             or phase_normalized == "verification"
@@ -6983,6 +7050,42 @@ def _runtime_context_service_timeline_refs(
         refs["graph_trace_ids"] = _runtime_context_service_dedupe(
             timeline_graph_trace_ids
         )
+    startup_hint = (
+        refs.get("startup_hint") if isinstance(refs.get("startup_hint"), Mapping) else {}
+    )
+    finish_hint: dict[str, Any] = {
+        "schema_version": "runtime_context.finish_time_worker_attestation.hint.v1",
+        "source": "task_timeline",
+        "implementation_event_ref": str(
+            refs.get("latest_implementation_event_ref") or ""
+        ),
+        "startup_event_ref": str(refs.get("startup_event_ref") or ""),
+        "read_receipt_event_ref": str(refs.get("read_receipt_event_ref") or ""),
+        "observer_command_id": str(refs.get("observer_command_id") or ""),
+        "read_receipt_hash": str(refs.get("read_receipt_hash") or ""),
+        "test_results": dict(refs.get("test_results") or {}),
+        "graph_trace_ids": list(refs.get("graph_trace_ids") or []),
+        "changed_files": list(refs.get("changed_files") or []),
+        "head_commit": str(refs.get("head_commit") or refs.get("commit_sha") or ""),
+    }
+    for key in (
+        "worker_session_id",
+        "filer_principal",
+        "worker_transcript_ref",
+        "worker_transcript_path",
+        "harness_type",
+        "actual_cwd",
+        "actual_git_root",
+    ):
+        value = str(startup_hint.get(key) or "").strip()
+        if value:
+            finish_hint[key] = value
+    read_receipt_event_id = _runtime_context_timeline_event_id(
+        finish_hint["read_receipt_event_ref"]
+    )
+    if read_receipt_event_id:
+        finish_hint["read_receipt_event_id"] = read_receipt_event_id
+    refs["finish_time_worker_attestation_hint"] = finish_hint
     return (
         refs,
         _runtime_context_event_payload(startup_event),
@@ -7017,6 +7120,39 @@ def _runtime_context_service_timeline_events(
             limit=1000,
         )
     return [dict(event) for event in events]
+
+
+def _runtime_context_non_placeholder_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.startswith("<"):
+        return ""
+    return text
+
+
+def _runtime_context_test_results_from_tests(value: Any) -> dict[str, Any]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        return {}
+    commands: list[dict[str, Any]] = []
+    all_passed = True
+    pass_statuses = {"pass", "passed", "ok", "succeeded", "success", "clean"}
+    for item in value:
+        if isinstance(item, Mapping):
+            command = dict(item)
+            status = str(command.get("status") or "").strip().lower()
+            passed = bool(command.get("passed")) or status in pass_statuses
+            if not passed:
+                all_passed = False
+            commands.append(command)
+        elif str(item or "").strip():
+            commands.append({"command": str(item).strip(), "status": "unknown"})
+            all_passed = False
+    if not commands:
+        return {}
+    return {
+        "status": "passed" if all_passed else "failed",
+        "passed": all_passed,
+        "commands": commands,
+    }
 
 
 def _runtime_context_service_graph_trace_refs(
@@ -7529,6 +7665,26 @@ def _runtime_context_worker_guide_response(
     )
     task = dict(worker_view.get("task") or {})
     route_identity = dict(worker_view.get("route_identity") or {})
+    source_refs = (
+        current_state_response.get("source_refs")
+        if isinstance(current_state_response.get("source_refs"), Mapping)
+        else {}
+    )
+    timeline_refs = (
+        source_refs.get("timeline")
+        if isinstance(source_refs.get("timeline"), Mapping)
+        else {}
+    )
+    graph_trace_refs = (
+        source_refs.get("graph_trace")
+        if isinstance(source_refs.get("graph_trace"), Mapping)
+        else {}
+    )
+    finish_attestation_hint = (
+        timeline_refs.get("finish_time_worker_attestation_hint")
+        if isinstance(timeline_refs.get("finish_time_worker_attestation_hint"), Mapping)
+        else {}
+    )
     target_project_root = str(
         graph_identity.get("target_project_root")
         or task.get("target_project_root")
@@ -7778,6 +7934,185 @@ def _runtime_context_worker_guide_response(
         "/api/graph-governance/{project_id}/runtime-contexts/"
         "{runtime_context_id}/finish-gate"
     )
+    finish_attestation_path = (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-time-worker-attestation"
+    )
+    finish_attestation_concrete_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/finish-time-worker-attestation"
+    )
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    session_token_placeholder = (
+        f"<read from env:{session_token_env} at submission time>"
+    )
+    fence_token_placeholder = (
+        f"<read from env:{fence_token_env} at submission time>"
+    )
+    hinted_test_results = (
+        dict(finish_attestation_hint.get("test_results"))
+        if isinstance(finish_attestation_hint.get("test_results"), Mapping)
+        else {}
+    )
+    hinted_graph_trace_ids = [
+        str(item)
+        for item in (
+            finish_attestation_hint.get("graph_trace_ids")
+            or graph_trace_refs.get("verified_trace_ids")
+            or graph_trace_refs.get("trace_ids")
+            or []
+        )
+        if str(item or "").strip()
+    ]
+    hinted_changed_files = [
+        str(item)
+        for item in finish_attestation_hint.get("changed_files") or []
+        if str(item or "").strip()
+    ]
+    hinted_worker_session_id = str(
+        finish_attestation_hint.get("worker_session_id") or ""
+    ).strip()
+    hinted_filer_principal = str(
+        finish_attestation_hint.get("filer_principal")
+        or hinted_worker_session_id
+        or ""
+    ).strip()
+    hinted_read_receipt_event_id = str(
+        finish_attestation_hint.get("read_receipt_event_id")
+        or _runtime_context_timeline_event_id(
+            finish_attestation_hint.get("read_receipt_event_ref") or ""
+        )
+        or ""
+    ).strip()
+    hinted_read_receipt_hash = str(
+        finish_attestation_hint.get("read_receipt_hash")
+        or timeline_refs.get("read_receipt_hash")
+        or ""
+    ).strip()
+    hinted_observer_command_id = str(
+        finish_attestation_hint.get("observer_command_id")
+        or timeline_refs.get("observer_command_id")
+        or ""
+    ).strip()
+    finish_attestation_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "worker_session_id": (
+            hinted_worker_session_id or "<actual worker-owned session id>"
+        ),
+        "filer_principal": (
+            hinted_filer_principal or "<same value as worker_session_id>"
+        ),
+        "worker_transcript_ref": str(
+            finish_attestation_hint.get("worker_transcript_ref")
+            or "<host transcript ref, e.g. codex:<session-id>>"
+        ),
+        "harness_type": str(finish_attestation_hint.get("harness_type") or "codex"),
+        "graph_trace_ids": hinted_graph_trace_ids
+        or ["<worker-owned-graph-query-trace-id>"],
+        "read_receipt_event_id": (
+            hinted_read_receipt_event_id or "<accepted-read-receipt-event-id>"
+        ),
+        "read_receipt_hash": (
+            hinted_read_receipt_hash or "<accepted-read-receipt-hash>"
+        ),
+        "observer_command_id": (
+            hinted_observer_command_id
+            or "<claimed execute_backlog_row command id>"
+        ),
+        "head_commit": str(
+            finish_attestation_hint.get("head_commit")
+            or "<worker-worktree-head-commit>"
+        ),
+        "changed_files": hinted_changed_files or ["<owned-file>"],
+        "owned_files": hinted_changed_files or ["<owned-file>"],
+        "actual_cwd": str(
+            finish_attestation_hint.get("actual_cwd") or target_project_root
+        ),
+        "actual_git_root": str(
+            finish_attestation_hint.get("actual_git_root") or target_project_root
+        ),
+        "test_results": hinted_test_results
+        or {"status": "passed", "passed": True},
+        **{
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(route_identity.get(field) or "").strip()
+        },
+    }
+    if finish_attestation_hint.get("worker_transcript_path"):
+        finish_attestation_body["worker_transcript_path"] = str(
+            finish_attestation_hint.get("worker_transcript_path") or ""
+        )
+    finish_attestation_missing = [
+        field
+        for field, value in {
+            "observer_command_id": hinted_observer_command_id,
+            "test_results": hinted_test_results,
+            "graph_trace_ids": hinted_graph_trace_ids,
+            "read_receipt_event_id": hinted_read_receipt_event_id,
+            "read_receipt_hash": hinted_read_receipt_hash,
+            "worker_session_id": hinted_worker_session_id,
+            "filer_principal": hinted_filer_principal,
+        }.items()
+        if not value
+    ]
+    finish_attestation_submission = {
+        "schema_version": (
+            "runtime_context.finish_time_worker_attestation_submission.v1"
+        ),
+        "action": "record_finish_time_worker_attestation",
+        "name": "record_finish_time_worker_attestation",
+        "next_legal_action": "record_finish_time_worker_attestation",
+        "method": "POST",
+        "endpoint": "runtime_context.finish_time_worker_attestation",
+        "path": finish_attestation_path,
+        "concrete_path": finish_attestation_concrete_path,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "body": finish_attestation_body,
+        "copy_safe_body": dict(finish_attestation_body),
+        "missing_required_fields": finish_attestation_missing,
+        "source_refs": {
+            "implementation_event_ref": str(
+                finish_attestation_hint.get("implementation_event_ref") or ""
+            ),
+            "startup_event_ref": str(
+                finish_attestation_hint.get("startup_event_ref") or ""
+            ),
+            "read_receipt_event_ref": str(
+                finish_attestation_hint.get("read_receipt_event_ref") or ""
+            ),
+            "graph_trace_ids": hinted_graph_trace_ids,
+        },
+        "reminders": {
+            "sequence": (
+                "Refresh current-state/worker-guide, then POST this body only "
+                "from the mf_sub worker session."
+            ),
+            "observer_must_not_author": True,
+            "raw_tokens_exposed": False,
+            "test_results_source": (
+                "worker implementation/startup timeline evidence when present"
+            ),
+        },
+        "privacy_boundary": {
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        },
+    }
     finish_gate_submission_template = {
         "schema_version": "runtime_context.finish_gate_submission.template.v1",
         "action": "record_finish_gate",
@@ -7983,6 +8318,12 @@ def _runtime_context_worker_guide_response(
                 "graph_trace_db_evidence",
                 "read_receipt_lineage",
             ],
+            "finish_time_worker_attestation_submission": (
+                finish_attestation_submission
+            ),
+            "submission": finish_attestation_submission,
+            "body": finish_attestation_submission["body"],
+            "copy_safe_body": finish_attestation_submission["copy_safe_body"],
             "finish_gate_submission": {
                 **finish_gate_submission_template,
                 "finish_time_worker_self_attestation": (
@@ -8117,6 +8458,12 @@ def _runtime_context_worker_guide_response(
         session_token_ref=str(worker_view.get("session_token_ref") or ""),
         launch_text_hash=str(worker_view.get("launch_text_hash") or ""),
         read_receipt_event_ref=str(worker_view.get("read_receipt_event_ref") or ""),
+    )
+    actionable_payloads["finish_time_worker_attestation_submission"] = (
+        finish_attestation_submission
+    )
+    actionable_payloads["finish_time_worker_attestation_body"] = dict(
+        finish_attestation_submission["body"]
     )
     return {
         "ok": True,

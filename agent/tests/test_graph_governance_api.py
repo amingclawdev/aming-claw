@@ -5549,8 +5549,14 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                 **common_body,
                 "changed_files": [changed_path],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {
+                    "status": "passed",
+                    "passed": True,
+                    "command": "pytest -q",
+                },
                 "payload": {
                     "summary": "worker appended implementation evidence before finish attestation",
+                    "graph_trace_ids": [graph_trace_id],
                 },
             },
         )
@@ -5570,6 +5576,65 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             },
         },
         now_iso="2026-06-15T11:02:00Z",
+    )
+
+    pre_attestation_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                query={**common_body, "view": "current"},
+            )
+        )
+    )
+    assert pre_attestation_guide["worker_guide"]["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    finish_attestation_submission = pre_attestation_guide["worker_guide"][
+        "write_guides"
+    ]["finish_time_worker_attestation"][
+        "finish_time_worker_attestation_submission"
+    ]
+    assert finish_attestation_submission["action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert finish_attestation_submission["missing_required_fields"] == []
+    assert finish_attestation_submission["body"]["observer_command_id"] == (
+        "cmd-facade"
+    )
+    assert finish_attestation_submission["body"]["test_results"] == {
+        "status": "passed",
+        "passed": True,
+        "command": "pytest -q",
+    }
+    assert finish_attestation_submission["body"]["graph_trace_ids"] == [
+        graph_trace_id
+    ]
+    assert finish_attestation_submission["body"]["read_receipt_event_id"] == str(
+        read_receipt["timeline_event"]["id"]
+    )
+    assert finish_attestation_submission["body"]["read_receipt_hash"] == (
+        "sha256:read-facade"
+    )
+    assert finish_attestation_submission["body"]["worker_session_id"] == (
+        "worker-session-facade"
+    )
+    assert finish_attestation_submission["body"]["filer_principal"] == (
+        "worker-session-facade"
+    )
+    assert pre_attestation_guide["actionable_payloads"][
+        "finish_time_worker_attestation_body"
+    ]["observer_command_id"] == "cmd-facade"
+    assert "fence-facade" not in json.dumps(
+        finish_attestation_submission,
+        sort_keys=True,
+    )
+    assert "facade-session" not in json.dumps(
+        finish_attestation_submission,
+        sort_keys=True,
     )
 
     finish_attestation_body = {
