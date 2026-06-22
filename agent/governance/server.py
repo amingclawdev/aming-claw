@@ -7494,6 +7494,9 @@ def _runtime_context_collect_worker_scope_files(
                 "contract_executions",
                 "execution_plan",
                 "worker_dispatch",
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_dispatch_gate",
+                "dispatch_evidence",
             ):
                 child = source.get(key)
                 if isinstance(child, (Mapping, list)):
@@ -7507,6 +7510,40 @@ def _runtime_context_collect_worker_scope_files(
     for source in [payload, contract, receipt, *(sources or ())]:
         visit_lanes(source)
     return _runtime_context_public_file_values(values)
+
+
+def _runtime_context_timeline_worker_scope_sources(
+    timeline_events: Sequence[Any],
+    *,
+    task_id: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
+) -> list[Any]:
+    sources: list[Any] = []
+
+    def source_matches(source: Any) -> bool:
+        if isinstance(source, Mapping):
+            return _runtime_context_lane_identity_matches(
+                source,
+                task_id=task_id,
+                worker_id=worker_id,
+                worker_slot_id=worker_slot_id,
+            )
+        if isinstance(source, list):
+            return any(source_matches(item) for item in source)
+        return False
+
+    for event in timeline_events or []:
+        if not isinstance(event, Mapping):
+            continue
+        event_sources: list[Any] = [event]
+        for key in ("payload", "verification", "artifact_refs"):
+            value = event.get(key)
+            if isinstance(value, (Mapping, list)):
+                event_sources.append(value)
+        if any(source_matches(source) for source in event_sources):
+            sources.extend(event_sources)
+    return sources
 
 
 def _runtime_context_worker_scope_projection(owned_files: Sequence[str]) -> dict[str, Any]:
@@ -7795,6 +7832,22 @@ def _runtime_context_projection_response(
             ctx.query,
             full_worker_view_for_scope,
             worker_view_for_summary,
+            *_runtime_context_timeline_worker_scope_sources(
+                timeline_events,
+                task_id=str(getattr(context, "task_id", "") or ""),
+                worker_id=str(
+                    worker_view_for_summary.get("worker_id")
+                    or worker_view_for_summary.get("agent_id")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+                worker_slot_id=str(
+                    worker_view_for_summary.get("worker_slot_id")
+                    or getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+            ),
             {
                 "owned_files": getattr(context, "owned_files", []),
                 "target_files": getattr(context, "target_files", []),
@@ -29788,12 +29841,163 @@ def _observer_root_route_lineage_bridge_action(
     }
 
 
+def _observer_root_route_public_event_ref(event: Mapping[str, Any]) -> str:
+    event_id = _observer_root_route_event_id(event)
+    return f"timeline:{event_id}" if event_id else ""
+
+
+def _observer_root_route_deep_strings(value: Any, key: str) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        direct = value.get(key)
+        if isinstance(direct, list):
+            values.extend(str(item).strip() for item in direct if str(item or "").strip())
+        elif str(direct or "").strip():
+            values.append(str(direct).strip())
+        for child in value.values():
+            if isinstance(child, (Mapping, list)):
+                values.extend(_observer_root_route_deep_strings(child, key))
+    elif isinstance(value, list):
+        for child in value:
+            if isinstance(child, (Mapping, list)):
+                values.extend(_observer_root_route_deep_strings(child, key))
+    return _runtime_context_service_dedupe(values)
+
+
+def _observer_root_route_event_task_id(event: Mapping[str, Any]) -> str:
+    for key in ("task_id", "worker_id", "worker_slot_id", "runtime_context_id"):
+        token = str(event.get(key) or "").strip()
+        if token:
+            return token
+    for source_key in ("payload", "verification", "artifact_refs"):
+        source = event.get(source_key)
+        if isinstance(source, Mapping):
+            for key in ("task_id", "worker_id", "worker_slot_id", "runtime_context_id"):
+                token = _timeline_first_deep_text(source, key)
+                if token:
+                    return token
+    return ""
+
+
+def _observer_root_route_event_markers(event: Mapping[str, Any]) -> set[str]:
+    markers = {
+        _observer_root_route_normalize_action(event.get(key))
+        for key in ("event_kind", "event_type", "phase", "status", "decision")
+    }
+    for source_key in ("payload", "verification", "artifact_refs"):
+        source = event.get(source_key)
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("action", "kind", "status", "decision", "phase", "event_kind"):
+            marker = _observer_root_route_normalize_action(source.get(key))
+            if marker:
+                markers.add(marker)
+    return {marker for marker in markers if marker}
+
+
+def _observer_root_route_changed_files(event: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in (
+        "changed_files",
+        "owned_changed_files",
+        "worker_changed_files",
+        "modified_files",
+        "touched_files",
+    ):
+        values.extend(_observer_root_route_deep_strings(event, key))
+    return [
+        value
+        for value in _runtime_context_service_dedupe(values)
+        if not value.startswith("<")
+    ]
+
+
+def _observer_root_route_event_claims_no_implementation(event: Mapping[str, Any]) -> bool:
+    truthy_keys = {
+        "implementation_recorded",
+        "implementation_present",
+        "has_implementation",
+        "has_diff",
+        "diff_present",
+    }
+    falsy_keys = {
+        "zero_diff",
+        "no_diff",
+        "implementation_absent",
+        "no_implementation",
+    }
+    for source in (
+        event,
+        event.get("payload") if isinstance(event.get("payload"), Mapping) else {},
+        event.get("verification") if isinstance(event.get("verification"), Mapping) else {},
+        event.get("artifact_refs") if isinstance(event.get("artifact_refs"), Mapping) else {},
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for key in truthy_keys:
+            value = source.get(key)
+            if isinstance(value, bool) and value:
+                return False
+            if isinstance(value, str) and value.strip().lower() in {"true", "yes", "1"}:
+                return False
+        for key in falsy_keys:
+            value = source.get(key)
+            if isinstance(value, bool) and value:
+                return True
+            if isinstance(value, str) and value.strip().lower() in {"true", "yes", "1"}:
+                return True
+    return False
+
+
+def _observer_root_route_no_progress_failed_attempt(
+    events: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    if not events:
+        return {}
+
+    implementation_task_ids: set[str] = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        markers = _observer_root_route_event_markers(event)
+        if not markers.intersection({"implementation", "hotfix_under_action"}):
+            continue
+        if _observer_root_route_changed_files(event):
+            task_id = _observer_root_route_event_task_id(event)
+            if task_id:
+                implementation_task_ids.add(task_id)
+
+    for event in reversed([event for event in events if isinstance(event, Mapping)]):
+        markers = _observer_root_route_event_markers(event)
+        if "no_progress_timeout" not in markers:
+            continue
+        task_id = _observer_root_route_event_task_id(event)
+        if task_id and task_id in implementation_task_ids:
+            continue
+        if _observer_root_route_changed_files(event):
+            continue
+        if not _observer_root_route_event_claims_no_implementation(event):
+            continue
+        event_ref = _observer_root_route_public_event_ref(event)
+        return {
+            "task_id": task_id,
+            "event_ref": event_ref,
+            "event_kind": str(event.get("event_kind") or ""),
+            "phase": str(event.get("phase") or ""),
+            "status": str(event.get("status") or event.get("decision") or ""),
+            "zero_diff": True,
+            "implementation_recorded": False,
+        }
+    return {}
+
+
 def _observer_root_route_close_gate_steps(
     close_gate: Mapping[str, Any],
     route_context_gate: Mapping[str, Any],
     *,
     backlog_id: str = "",
     contract: Mapping[str, Any] | None = None,
+    events: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
 
@@ -29880,18 +30084,45 @@ def _observer_root_route_close_gate_steps(
 
     close_startup_gate = close_gate.get("close_timeline_startup_gate") or {}
     checks = close_gate.get("checks") or {}
-    if (
-        isinstance(close_startup_gate, Mapping)
-        and close_startup_gate.get("demoted_startup_events")
-    ) or (
+    no_progress_failed_attempt = _observer_root_route_no_progress_failed_attempt(events)
+    startup_close_satisfying = (
         isinstance(checks, Mapping)
-        and checks.get("mf_subagent_startup_close_satisfying") is False
-    ):
+        and checks.get("mf_subagent_startup_close_satisfying") is True
+    ) or (
+        isinstance(close_startup_gate, Mapping)
+        and close_startup_gate.get("passed") is True
+        and bool(close_startup_gate.get("accepted_startup_events"))
+    )
+
+    def _add_no_progress_replacement_dispatch() -> None:
         _add(
-            "real_mf_subagent_startup",
-            "record_server_verified_worker_startup_with_transcript",
-            "DB-backed startup exists but is not close-satisfying real worker evidence",
+            "dispatch_bounded_worker",
+            "dispatch_bounded_worker",
+            (
+                "latest bounded worker lane ended with no_progress_timeout, "
+                "zero diff, and no implementation evidence"
+            ),
+            failed_attempt=no_progress_failed_attempt,
+            replacement_required=True,
         )
+
+    if not startup_close_satisfying and (
+        (
+            isinstance(close_startup_gate, Mapping)
+            and close_startup_gate.get("demoted_startup_events")
+        ) or (
+            isinstance(checks, Mapping)
+            and checks.get("mf_subagent_startup_close_satisfying") is False
+        )
+    ):
+        if no_progress_failed_attempt:
+            _add_no_progress_replacement_dispatch()
+        else:
+            _add(
+                "real_mf_subagent_startup",
+                "record_server_verified_worker_startup_with_transcript",
+                "DB-backed startup exists but is not close-satisfying real worker evidence",
+            )
 
     route_step_map = [
         (
@@ -29954,6 +30185,9 @@ def _observer_root_route_close_gate_steps(
     ]
     for event_kind in ("implementation", "verification", "close_ready"):
         if event_kind in missing_events:
+            if event_kind == "implementation" and no_progress_failed_attempt:
+                _add_no_progress_replacement_dispatch()
+                continue
             if event_kind == "implementation" and ignored_hotfix_implementation_events:
                 _add(
                     "hotfix_implementation_close_evidence",
@@ -30652,6 +30886,7 @@ def _observer_root_route_context_state(
         route_context_gate,
         backlog_id=backlog_id,
         contract=contract,
+        events=events,
     )
     lineage_bridge_action = next(
         (
@@ -30701,6 +30936,37 @@ def _observer_root_route_context_state(
             for step in (contract_next_action.get("ordered_missing_steps") or [])
             if isinstance(step, dict) and str(step.get("id") or "").strip()
         ]
+    no_progress_replacement_step = next(
+        (
+            step
+            for step in close_gate_steps
+            if step.get("replacement_required")
+            and str(step.get("id") or "") == "dispatch_bounded_worker"
+        ),
+        {},
+    )
+    if no_progress_replacement_step and any(
+        str(step.get("id") or "") == "implementation"
+        for step in contract_action_steps
+    ):
+        contract_action_steps = [
+            dict(no_progress_replacement_step),
+            *[
+                step
+                for step in contract_action_steps
+                if str(step.get("id") or "") != "implementation"
+            ],
+        ]
+        contract_ordered_steps = contract_action_steps
+        contract_next_action = {
+            "id": "dispatch_bounded_worker",
+            "action": "dispatch_bounded_worker",
+            "detail": str(no_progress_replacement_step.get("reason") or ""),
+            "source": "close_gate_projection",
+            "precedence": "terminal_no_progress_timeout_replacement",
+            "replacement_required": True,
+            "failed_attempt": no_progress_replacement_step.get("failed_attempt") or {},
+        }
     active_contract_execution = (
         contract_state.get("active_contract_execution")
         if isinstance(contract_state.get("active_contract_execution"), dict)

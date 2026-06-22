@@ -21469,6 +21469,52 @@ def test_observer_root_route_context_resolves_route_token_ref_identity(conn):
     assert result["canonical_route_identity_source"]["missing_fields"] == []
 
 
+def test_observer_root_route_runtime_worker_scope_uses_dispatch_timeline_payload():
+    task_id = "mfsub-runtime-scope-d"
+    worker_slot_id = "worker-runtime-scope-d"
+    owned_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    timeline_sources = server._runtime_context_timeline_worker_scope_sources(
+        [
+            {
+                "event_kind": "bounded_implementation_worker_dispatch",
+                "task_id": "mfsub-runtime-scope-c",
+                "payload": {
+                    "bounded_implementation_worker_dispatch": {
+                        "task_id": "mfsub-runtime-scope-c",
+                        "worker_slot_id": "worker-runtime-scope-c",
+                        "owned_files": ["agent/other_lane.py"],
+                    }
+                },
+            },
+            {
+                "event_kind": "bounded_implementation_worker_dispatch",
+                "task_id": task_id,
+                "payload": {
+                    "bounded_implementation_worker_dispatch": {
+                        "task_id": task_id,
+                        "worker_slot_id": worker_slot_id,
+                        "owned_files": owned_files,
+                        "target_files": owned_files,
+                    }
+                },
+            },
+        ],
+        task_id=task_id,
+        worker_slot_id=worker_slot_id,
+    )
+
+    projected_files = server._runtime_context_collect_worker_scope_files(
+        task_id=task_id,
+        worker_slot_id=worker_slot_id,
+        sources=timeline_sources,
+    )
+
+    assert projected_files == owned_files
+
+
 def test_task_timeline_record_event_centrally_rejects_meta_contract_bypass(conn):
     backlog_id = "AC-META-CONTRACT-CENTRAL-REJECT"
     _insert_simple_mf_close_backlog(conn, backlog_id)

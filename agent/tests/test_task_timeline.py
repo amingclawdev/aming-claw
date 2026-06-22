@@ -2813,6 +2813,235 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(next_action["id"], "architecture_review_lane")
         self.assertEqual(next_action["action"], "record_architecture_review")
 
+    def test_root_route_context_demoted_stale_startup_does_not_force_repair_when_current_startup_close_satisfying(self):
+        from agent.governance import server
+
+        route_gate = {
+            "missing_requirement_ids": ["independent_verification_lane"],
+            "ignored_route_events": [],
+        }
+        close_gate = {
+            "missing_event_kinds": ["verification"],
+            "cross_ref_gate": {"passed": True},
+            "finish_gate_projection": {
+                "passed": True,
+                "projected_event_kinds": ["close_ready", "implementation"],
+            },
+            "worker_graph_trace_gate": {"passed": True},
+            "close_timeline_startup_gate": {
+                "schema_version": "mf_close_timeline_startup_gate.v1",
+                "passed": True,
+                "status": "passed",
+                "accepted_startup_events": [
+                    {
+                        "id": "6091",
+                        "event_kind": "mf_subagent_finish_gate",
+                        "projection": "finish_gate_startup_projection",
+                        "status": "passed",
+                    }
+                ],
+                "demoted_startup_events": [
+                    {
+                        "id": "6087",
+                        "event_kind": "mf_subagent_startup",
+                        "phase": "startup_gate",
+                        "status": "passed",
+                        "reason": "worker_self_attestation_not_close_satisfying",
+                    }
+                ],
+                "demoted_startup_event_indexes": [0],
+            },
+            "checks": {
+                "has_implementation": True,
+                "has_finish_gate_projection": True,
+                "has_worker_graph_trace": True,
+                "mf_subagent_startup_close_satisfying": True,
+            },
+        }
+        events = [
+            {
+                "id": 6088,
+                "event_kind": "no_progress_timeout",
+                "phase": "implementation_wait",
+                "status": "accepted",
+                "task_id": "old-worker-lane",
+                "payload": {
+                    "task_id": "old-worker-lane",
+                    "zero_diff": True,
+                    "implementation_recorded": False,
+                    "changed_files": [],
+                },
+            },
+            {
+                "id": 6089,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "passed",
+                "task_id": "replacement-worker-lane",
+                "payload": {
+                    "task_id": "replacement-worker-lane",
+                    "changed_files": ["agent/governance/server.py"],
+                },
+            },
+            {
+                "id": 6091,
+                "event_kind": "mf_subagent_finish_gate",
+                "phase": "finish_gate",
+                "status": "passed",
+                "task_id": "replacement-worker-lane",
+                "payload": {
+                    "mf_subagent_finish_gate": {
+                        "task_id": "replacement-worker-lane",
+                        "changed_files": ["agent/governance/server.py"],
+                    }
+                },
+            },
+        ]
+
+        steps = server._observer_root_route_close_gate_steps(
+            close_gate,
+            route_gate,
+            events=events,
+        )
+        step_ids = [step["id"] for step in steps]
+        next_action = server._observer_root_route_next_legal_action_from_steps(
+            steps,
+            default={"id": "close_ready", "action": "record_close_ready"},
+        )
+
+        self.assertEqual(step_ids, ["independent_verification_lane", "verification"])
+        self.assertEqual(next_action["id"], "independent_verification_lane")
+        self.assertEqual(next_action["action"], "record_independent_verification")
+        self.assertNotIn("real_mf_subagent_startup", step_ids)
+        self.assertNotIn("dispatch_bounded_worker", step_ids)
+        self.assertNotIn(
+            "record_server_verified_worker_startup_with_transcript",
+            json.dumps(next_action, sort_keys=True),
+        )
+
+    def test_root_route_context_no_progress_timeout_dispatches_replacement_not_startup_repair(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-NO-PROGRESS-REPLACEMENT"
+        task_id = f"{bug_id}-D"
+        runtime_context_id = "mfrctx-no-progress-d"
+        worker_slot_id = "worker-no-progress-d"
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+                "governance_policy": {
+                    "requirements": {
+                        "close_timeline": True,
+                        "independent_qa": False,
+                        "worker_graph_trace": False,
+                    }
+                },
+            },
+        )
+        identity = {
+            **ROUTE_IDENTITY,
+            "route_id": "route-no-progress-replacement",
+            "visible_injection_manifest_hash": _fake_sha("no-progress-visible"),
+        }
+        precheck_ref = ""
+        for event in _route_context_consumption_events(identity=identity):
+            event = _add_attempt_lineage(
+                event,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=bug_id,
+                worker_slot_id=worker_slot_id,
+            )
+            if event["event_kind"] == "mf_subagent_startup":
+                startup_gate = event["payload"]["mf_subagent_startup_gate"]
+                startup_gate.update({
+                    "close_satisfying": False,
+                    "task_id": task_id,
+                    "runtime_context_id": runtime_context_id,
+                    "worker_slot_id": worker_slot_id,
+                    "filer_principal": "mf_sub",
+                })
+                for key in (
+                    "worker_self_attestation",
+                    "worker_session_id",
+                    "worker_transcript_ref",
+                    "harness_type",
+                ):
+                    startup_gate.pop(key, None)
+            recorded = self._record_root_context_event(
+                bug_id,
+                event,
+                task_id=task_id,
+            )
+            if event.get("event_kind") == "route_action_precheck":
+                precheck_ref = f"timeline:{recorded['id']}"
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "phase": "routing",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "from_work_mode": "observer_look_before_act",
+                    "to_work_mode": "observer_execution_supervisor",
+                    "route_identity": identity,
+                    "route_action_precheck_event_id": precheck_ref,
+                    **identity,
+                },
+            },
+            task_id=task_id,
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "observer_command.no_progress_timeout",
+                "event_kind": "no_progress_timeout",
+                "phase": "implementation_wait",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    **identity,
+                    "task_id": task_id,
+                    "parent_task_id": bug_id,
+                    "runtime_context_id": runtime_context_id,
+                    "worker_slot_id": worker_slot_id,
+                    "terminal": True,
+                    "zero_diff": True,
+                    "implementation_recorded": False,
+                    "changed_files": [],
+                    "owned_changed_files": [],
+                    "worker_changed_files": [],
+                },
+            },
+            task_id=task_id,
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            work_mode=observer_session.normalize_work_mode(None),
+        )
+
+        ordered_steps = result["work_mode_projection"]["ordered_missing_steps"]
+        step_ids = [step["id"] for step in ordered_steps]
+        self.assertEqual(result["next_legal_action"]["id"], "dispatch_bounded_worker")
+        self.assertEqual(
+            result["next_legal_action"]["action"],
+            "dispatch_bounded_worker",
+        )
+        self.assertNotIn("real_mf_subagent_startup", step_ids)
+        self.assertNotIn(
+            "record_server_verified_worker_startup_with_transcript",
+            json.dumps(result, sort_keys=True),
+        )
+        self.assertTrue(ordered_steps[0]["replacement_required"])
+        self.assertEqual(ordered_steps[0]["failed_attempt"]["task_id"], task_id)
+
     def test_root_route_context_multi_attempts_request_lineage_bridge_not_dispatch(self):
         from agent.governance import observer_session, server
 
