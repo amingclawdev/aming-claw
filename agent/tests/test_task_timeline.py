@@ -2302,6 +2302,7 @@ class TestTaskTimeline(unittest.TestCase):
         from agent.governance import observer_session, server
 
         bug_id = "BUG-ROOT-CONTEXT-CLOSE-ACTION-CARD"
+        close_commit = "b52fd9aa00000000000000000000000000000000"
         issued = self._issue_route_token(
             bug_id,
             allowed_actions=["task_timeline_append"],
@@ -2388,7 +2389,11 @@ class TestTaskTimeline(unittest.TestCase):
                 "phase": "implementation",
                 "actor": "mf_sub",
                 "status": "passed",
-                "payload": {**identity, "changed_files": ["agent/governance/server.py"]},
+                "payload": {
+                    **identity,
+                    "changed_files": ["agent/governance/server.py"],
+                    "commit_sha": close_commit,
+                },
             },
         )
         self._record_root_context_event(
@@ -2399,7 +2404,11 @@ class TestTaskTimeline(unittest.TestCase):
                 "phase": "verification",
                 "actor": "qa",
                 "status": "passed",
-                "verification": {**identity, "tests_run": ["pytest focused"]},
+                "verification": {
+                    **identity,
+                    "tests_run": ["pytest focused"],
+                    "commit_sha": close_commit,
+                },
             },
         )
         self._record_root_context_event(
@@ -2410,7 +2419,7 @@ class TestTaskTimeline(unittest.TestCase):
                 "phase": "close",
                 "actor": "observer",
                 "status": "passed",
-                "payload": identity,
+                "payload": {**identity, "commit_sha": close_commit},
             },
         )
 
@@ -2421,6 +2430,7 @@ class TestTaskTimeline(unittest.TestCase):
             task_id=bug_id,
             route_token_ref=issued["route_token_ref"],
             work_mode=observer_session.normalize_work_mode(None),
+            close_planning_body={"close_commit": close_commit},
         )
 
         self.assertTrue(result["close_gate_projection"]["can_close"])
@@ -2465,6 +2475,7 @@ class TestTaskTimeline(unittest.TestCase):
         from agent.governance import observer_session, server
 
         bug_id = "BUG-ROOT-CONTEXT-CLOSE-ACTION-READY"
+        close_commit = "b52fd9ab00000000000000000000000000000000"
         issued = self._issue_route_token(
             bug_id,
             allowed_actions=["backlog_close"],
@@ -2536,7 +2547,11 @@ class TestTaskTimeline(unittest.TestCase):
                 "phase": "implementation",
                 "actor": "mf_sub",
                 "status": "passed",
-                "payload": {**identity, "changed_files": ["agent/governance/server.py"]},
+                "payload": {
+                    **identity,
+                    "changed_files": ["agent/governance/server.py"],
+                    "commit_sha": close_commit,
+                },
             },
         )
         self._record_root_context_event(
@@ -2547,7 +2562,11 @@ class TestTaskTimeline(unittest.TestCase):
                 "phase": "verification",
                 "actor": "qa",
                 "status": "passed",
-                "verification": {**identity, "tests_run": ["pytest focused"]},
+                "verification": {
+                    **identity,
+                    "tests_run": ["pytest focused"],
+                    "commit_sha": close_commit,
+                },
             },
         )
         self._record_root_context_event(
@@ -2558,7 +2577,7 @@ class TestTaskTimeline(unittest.TestCase):
                 "phase": "close",
                 "actor": "observer",
                 "status": "passed",
-                "payload": identity,
+                "payload": {**identity, "commit_sha": close_commit},
             },
         )
 
@@ -2569,6 +2588,7 @@ class TestTaskTimeline(unittest.TestCase):
             task_id=bug_id,
             route_token_ref=issued["route_token_ref"],
             work_mode=observer_session.normalize_work_mode(None),
+            close_planning_body={"close_commit": close_commit},
         )
 
         action_card = result["close_gate_projection"]["action_card"]
@@ -2578,6 +2598,261 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertFalse(action_card["route_token_refresh_required"])
         self.assertEqual(result["next_legal_action"]["id"], "backlog_close")
         self.assertEqual(result["next_legal_action"]["route_token_ref"], issued["route_token_ref"])
+
+    def test_observer_root_route_context_requires_close_commit_before_close_actions(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-CLOSE-COMMIT-REQUIRED"
+        issued = self._issue_route_token(
+            bug_id,
+            allowed_actions=["backlog_close"],
+        )
+        token = issued["route_token"]
+        identity = {
+            "route_id": token["route_id"],
+            "route_context_hash": token["route_context_hash"],
+            "prompt_contract_id": token["prompt_contract_id"],
+            "prompt_contract_hash": token["prompt_contract_hash"],
+            "visible_injection_manifest_hash": token["visible_injection_manifest_hash"],
+        }
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+                "target_files": ["agent/governance/server.py"],
+                "governance_policy": {
+                    "requirements": {
+                        "close_timeline": True,
+                        "independent_qa": False,
+                        "worker_graph_trace": False,
+                    }
+                },
+                "route_topology_policy": {
+                    "selected_topology": "observer_led_parallel_lanes",
+                    "recommended_topology": "mf_parallel.v1",
+                },
+            },
+        )
+        precheck_ref = ""
+        for event in _route_context_consumption_events(identity=identity):
+            if event["event_kind"] == "mf_subagent_startup":
+                self._make_startup_close_satisfying(event)
+            recorded = self._record_root_context_event(bug_id, event)
+            if event.get("event_kind") == "route_action_precheck":
+                precheck_ref = f"timeline:{recorded['id']}"
+        self._record_root_context_event(
+            bug_id,
+            _mf_subagent_read_receipt_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            _route_context_qa_verification_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "phase": "routing",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "from_work_mode": "observer_look_before_act",
+                    "to_work_mode": "observer_execution_supervisor",
+                    "route_identity": identity,
+                    "route_action_precheck_event_id": precheck_ref,
+                    **identity,
+                },
+            },
+        )
+        for event_kind, phase, target in (
+            ("implementation", "implementation", "payload"),
+            ("verification", "verification", "verification"),
+            ("close_ready", "close", "payload"),
+        ):
+            self._record_root_context_event(
+                bug_id,
+                {
+                    "event_type": f"mf.{event_kind}",
+                    "event_kind": event_kind,
+                    "phase": phase,
+                    "actor": (
+                        "mf_sub"
+                        if event_kind == "implementation"
+                        else "observer" if event_kind == "close_ready" else "qa"
+                    ),
+                    "status": "passed",
+                    target: {
+                        **identity,
+                        "changed_files": ["agent/governance/server.py"],
+                        "tests_run": ["pytest focused"],
+                    },
+                },
+            )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            task_id=bug_id,
+            route_token_ref=issued["route_token_ref"],
+            work_mode=observer_session.normalize_work_mode(None),
+        )
+
+        self.assertFalse(result["close_gate_projection"]["can_close"])
+        action_card = result["close_gate_projection"]["action_card"]
+        self.assertEqual(action_card["status"], "close_commit_required")
+        self.assertEqual(
+            action_card["next_action"],
+            "provide_close_commit_for_close_planning",
+        )
+        self.assertNotEqual(action_card.get("allowed_action"), "backlog_close")
+        self.assertNotIn("issue_route_token_request", action_card)
+        self.assertEqual(
+            result["next_legal_action"]["id"],
+            "provide_close_commit_for_close_planning",
+        )
+        self.assertNotEqual(
+            result["next_legal_action"].get("allowed_action"),
+            "backlog_close",
+        )
+
+    def test_observer_root_route_context_close_commit_gap_blocks_backlog_close(self):
+        from agent.governance import observer_session, server
+
+        bug_id = "BUG-ROOT-CONTEXT-CLOSE-COMMIT-GAP"
+        evidence_commit = "de32274600000000000000000000000000000000"
+        intended_commit = "a643d3ff00000000000000000000000000000000"
+        issued = self._issue_route_token(
+            bug_id,
+            allowed_actions=["backlog_close"],
+        )
+        token = issued["route_token"]
+        identity = {
+            "route_id": token["route_id"],
+            "route_context_hash": token["route_context_hash"],
+            "prompt_contract_id": token["prompt_contract_id"],
+            "prompt_contract_hash": token["prompt_contract_hash"],
+            "visible_injection_manifest_hash": token["visible_injection_manifest_hash"],
+        }
+        self._insert_router_backlog(
+            bug_id,
+            contract={
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": bug_id,
+                "target_files": ["agent/governance/server.py"],
+                "governance_policy": {
+                    "requirements": {
+                        "close_timeline": True,
+                        "independent_qa": False,
+                        "worker_graph_trace": False,
+                    }
+                },
+                "route_topology_policy": {
+                    "selected_topology": "observer_led_parallel_lanes",
+                    "recommended_topology": "mf_parallel.v1",
+                },
+            },
+        )
+        precheck_ref = ""
+        for event in _route_context_consumption_events(identity=identity):
+            if event["event_kind"] == "mf_subagent_startup":
+                self._make_startup_close_satisfying(event)
+            recorded = self._record_root_context_event(bug_id, event)
+            if event.get("event_kind") == "route_action_precheck":
+                precheck_ref = f"timeline:{recorded['id']}"
+        self._record_root_context_event(
+            bug_id,
+            _mf_subagent_read_receipt_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            _route_context_qa_verification_event(identity=identity),
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "observer.work_mode_transition",
+                "event_kind": "observer_work_mode_transition",
+                "phase": "routing",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "from_work_mode": "observer_look_before_act",
+                    "to_work_mode": "observer_execution_supervisor",
+                    "route_identity": identity,
+                    "route_action_precheck_event_id": precheck_ref,
+                    **identity,
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "mf_sub",
+                "status": "passed",
+                "payload": {
+                    **identity,
+                    "changed_files": ["agent/governance/server.py"],
+                    "commit_sha": evidence_commit,
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.verification",
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "qa",
+                "status": "passed",
+                "verification": {
+                    **identity,
+                    "tests_run": ["pytest focused"],
+                    "commit_sha": evidence_commit,
+                },
+            },
+        )
+        self._record_root_context_event(
+            bug_id,
+            {
+                "event_type": "mf.close_ready",
+                "event_kind": "close_ready",
+                "phase": "close",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {**identity, "commit_sha": evidence_commit},
+            },
+        )
+
+        result = server._observer_root_route_context_state(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            task_id=bug_id,
+            route_token_ref=issued["route_token_ref"],
+            work_mode=observer_session.normalize_work_mode(None),
+            close_planning_body={"close_commit": intended_commit},
+        )
+
+        self.assertFalse(result["close_gate_projection"]["can_close"])
+        commit_gate = result["close_gate_projection"]["close_commit_evidence_gate"]
+        self.assertFalse(commit_gate["passed"])
+        self.assertEqual(commit_gate["close_commit"], intended_commit)
+        self.assertEqual(commit_gate["latest_evidence_commit"], evidence_commit)
+        action_card = result["close_gate_projection"]["action_card"]
+        self.assertEqual(action_card["next_action"], "record_close_ready_for_close_commit")
+        self.assertEqual(action_card["close_commit"], intended_commit)
+        self.assertEqual(result["next_legal_action"]["id"], "close_commit_evidence")
+        self.assertEqual(
+            result["next_legal_action"]["action"],
+            "record_close_ready_for_close_commit",
+        )
+        self.assertNotEqual(result["next_legal_action"].get("id"), "backlog_close")
 
     def test_root_route_context_close_action_card_reports_done_for_fixed_row(self):
         from agent.governance import observer_session, server
@@ -2812,6 +3087,52 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(step_ids, ["architecture_review_lane", "close_ready"])
         self.assertEqual(next_action["id"], "architecture_review_lane")
         self.assertEqual(next_action["action"], "record_architecture_review")
+
+    def test_observer_root_route_close_commit_gap_names_commit_specific_action(self):
+        from agent.governance import server
+
+        close_commit = "a643d3ff00000000000000000000000000000000"
+        evidence_commit = "de32274600000000000000000000000000000000"
+        route_gate = {
+            "missing_requirement_ids": [],
+            "ignored_route_events": [],
+        }
+        close_gate = {
+            "missing_event_kinds": [],
+            "cross_ref_gate": {"passed": True},
+            "close_timeline_startup_gate": {},
+            "checks": {},
+            "close_commit_evidence_gate": {
+                "passed": False,
+                "close_commit": close_commit,
+                "close_commit_source": "request.close_commit",
+                "latest_evidence_commit": evidence_commit,
+                "evidence_commits": [evidence_commit],
+                "missing_requirement_ids": [
+                    "matching_close_commit_timeline_evidence"
+                ],
+                "next_action": (
+                    "record close-satisfying implementation, verification, "
+                    f"finish-gate, or close_ready evidence for close commit {close_commit} "
+                    "before retrying backlog_close"
+                ),
+            },
+        }
+
+        steps = server._observer_root_route_close_gate_steps(close_gate, route_gate)
+        next_action = server._observer_root_route_next_legal_action_from_steps(
+            steps,
+            default={"id": "backlog_close", "action": "backlog_close"},
+        )
+
+        self.assertEqual([step["id"] for step in steps], ["close_commit_evidence"])
+        self.assertEqual(next_action["id"], "close_commit_evidence")
+        self.assertEqual(next_action["action"], "record_close_ready_for_close_commit")
+        self.assertEqual(next_action["ordered_missing_steps"][0]["close_commit"], close_commit)
+        self.assertEqual(
+            next_action["ordered_missing_steps"][0]["latest_evidence_commit"],
+            evidence_commit,
+        )
 
     def test_root_route_context_demoted_stale_startup_does_not_force_repair_when_current_startup_close_satisfying(self):
         from agent.governance import server

@@ -30166,6 +30166,32 @@ def _observer_root_route_close_gate_steps(
         if missing_id in missing_route:
             _add(step_id, action, reason)
 
+    close_commit_evidence_gate = close_gate.get("close_commit_evidence_gate") or {}
+    if (
+        isinstance(close_commit_evidence_gate, Mapping)
+        and not close_commit_evidence_gate.get("passed")
+    ):
+        close_commit = str(close_commit_evidence_gate.get("close_commit") or "").strip()
+        if close_commit:
+            _add(
+                "close_commit_evidence",
+                "record_close_ready_for_close_commit",
+                (
+                    "close-satisfying timeline evidence for the intended close "
+                    f"commit {close_commit} is missing"
+                ),
+                close_commit=close_commit,
+                close_commit_source=close_commit_evidence_gate.get("close_commit_source"),
+                latest_evidence_commit=close_commit_evidence_gate.get(
+                    "latest_evidence_commit"
+                ),
+                evidence_commits=close_commit_evidence_gate.get("evidence_commits"),
+                missing_requirement_ids=close_commit_evidence_gate.get(
+                    "missing_requirement_ids"
+                ),
+                next_action=close_commit_evidence_gate.get("next_action"),
+            )
+
     missing_events = [
         str(item)
         for item in (close_gate.get("missing_event_kinds") or [])
@@ -30266,6 +30292,32 @@ def _observer_root_route_contract_state_action_has_priority(
 
 def _observer_root_route_normalize_action(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _observer_root_route_close_planning_body(source: Any) -> dict[str, Any]:
+    """Return body fields that affect close planning without exposing secrets."""
+
+    if not isinstance(source, Mapping):
+        return {}
+    nested_context = source.get("close_context")
+    close_context = nested_context if isinstance(nested_context, Mapping) else {}
+    keys = (
+        "close_commit",
+        "close_commit_sha",
+        "requested_close_commit",
+        "requested_commit",
+        "commit",
+        "commit_sha",
+        "implementation_commit",
+        "target_head_commit",
+        "head_commit",
+    )
+    for container in (source, close_context):
+        for key in keys:
+            value = str(container.get(key) or "").strip()
+            if value:
+                return {"close_commit": value}
+    return {}
 
 
 def _observer_root_route_close_evidence_refs(
@@ -30472,13 +30524,82 @@ def _observer_root_route_close_action_card(
         )
         card.pop("issue_route_token_request", None)
         return card
-    if not passed:
+    close_commit_evidence_gate = close_gate.get("close_commit_evidence_gate") or {}
+    close_commit_missing_for_planning = (
+        isinstance(close_commit_evidence_gate, Mapping)
+        and close_commit_evidence_gate.get("status") == "not_applicable"
+        and close_commit_evidence_gate.get("reason") == "close_commit_not_supplied"
+    )
+    if close_commit_missing_for_planning:
         card.update(
             {
-                "next_action": "satisfy_close_gate_before_backlog_close",
-                "detail": "close gate is not yet passed; follow missing close evidence first",
+                "action": "provide_close_commit_for_close_planning",
+                "allowed_action": "",
+                "protected_action": False,
+                "status": "close_commit_required",
+                "close_commit_required": True,
+                "route_token_refresh_required": False,
+                "next_action": "provide_close_commit_for_close_planning",
+                "detail": (
+                    "observer-root-route close planning requires the intended "
+                    "close commit before advertising backlog_close; rerun "
+                    "observer-root-route-context or backlog_close planning with "
+                    "close_commit, commit, commit_sha, target_head_commit, or "
+                    "head_commit"
+                ),
+                "accepted_commit_fields": [
+                    "close_commit",
+                    "commit",
+                    "commit_sha",
+                    "target_head_commit",
+                    "head_commit",
+                ],
+                "close_commit_evidence_gate": dict(close_commit_evidence_gate),
+            }
+        )
+        for field in (
+            "protected_entrypoint",
+            "route_token_issue_entrypoint",
+            "issue_route_token_request",
+        ):
+            card.pop(field, None)
+        return card
+    if not passed:
+        close_commit = (
+            str(close_commit_evidence_gate.get("close_commit") or "").strip()
+            if isinstance(close_commit_evidence_gate, Mapping)
+            else ""
+        )
+        next_action = "satisfy_close_gate_before_backlog_close"
+        detail = "close gate is not yet passed; follow missing close evidence first"
+        close_commit_fields: dict[str, Any] = {}
+        if close_commit:
+            next_action = "record_close_ready_for_close_commit"
+            detail = (
+                "close gate is not yet passed; record close-satisfying timeline "
+                f"evidence for close commit {close_commit} before backlog_close"
+            )
+            close_commit_fields = {
+                "close_commit": close_commit,
+                "close_commit_source": close_commit_evidence_gate.get(
+                    "close_commit_source"
+                ),
+                "latest_evidence_commit": close_commit_evidence_gate.get(
+                    "latest_evidence_commit"
+                ),
+                "close_commit_evidence_gate": dict(close_commit_evidence_gate),
+            }
+        card.update(
+            {
+                "next_action": next_action,
+                "detail": detail,
                 "missing_event_kinds": close_gate.get("missing_event_kinds") or [],
                 "missing_evidence_groups": close_gate.get("missing_evidence_groups") or {},
+                **{
+                    key: value
+                    for key, value in close_commit_fields.items()
+                    if value not in ("", [], {})
+                },
             }
         )
         return card
@@ -30548,10 +30669,12 @@ def _observer_root_route_close_next_legal_action(
         "detail": str(close_action_card.get("detail") or ""),
         "source": "close_gate_projection",
         "precedence": "close_gate_passed",
-        "allowed_action": "backlog_close",
-        "protected_action": True,
         "action_card": dict(close_action_card),
     }
+    allowed_action = str(close_action_card.get("allowed_action") or "").strip()
+    if allowed_action:
+        next_action["allowed_action"] = allowed_action
+    next_action["protected_action"] = bool(close_action_card.get("protected_action"))
     scope = close_action_card.get("required_scope")
     if isinstance(scope, Mapping):
         for field in ("project_id", "backlog_id", "task_id"):
@@ -30743,6 +30866,7 @@ def _observer_root_route_context_state(
     route_token_ref: Any = "",
     task_id: Any = "",
     materialize_requested_work_mode: bool = False,
+    close_planning_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the aming-owned observer root route context for a backlog row.
 
@@ -30764,7 +30888,11 @@ def _observer_root_route_context_state(
         contract = backlog_runtime.parse_json_object(
             _row_get(row, "chain_trigger_json", "{}")
         )
-        contract = _mf_close_contract_with_route_context(contract, row, {})
+        contract = _mf_close_contract_with_route_context(
+            contract,
+            row,
+            _observer_root_route_close_planning_body(close_planning_body),
+        )
     events = task_timeline.list_events(
         conn, project_id, backlog_id=backlog_id, limit=1000
     )
@@ -31089,11 +31217,14 @@ def _observer_root_route_context_state(
     context["close_gate_projection"] = {
         "schema_version": "observer_root_route_close_gate_projection.v1",
         "passed": bool(close_gate.get("passed")),
-        "can_close": bool(close_gate.get("passed")),
+        "can_close": bool(close_gate.get("passed"))
+        and not bool(close_action_card.get("close_commit_required")),
         "status": str(close_gate.get("status") or ""),
         "missing_event_kinds": close_gate.get("missing_event_kinds") or [],
         "checks": close_gate.get("checks") or {},
         "missing_evidence_groups": close_gate.get("missing_evidence_groups") or {},
+        "close_commit_evidence_gate": close_gate.get("close_commit_evidence_gate")
+        or {},
         "action_card": close_action_card,
         "close_action_card": close_action_card,
         "lineage_bridge_action": lineage_bridge_action,
@@ -31125,6 +31256,7 @@ def handle_observer_root_route_context_get(ctx: RequestContext):
             work_mode=work_mode,
             route_token_ref=ctx.query.get("route_token_ref"),
             task_id=ctx.query.get("task_id"),
+            close_planning_body=ctx.query,
         )
 
 
@@ -31159,6 +31291,7 @@ def handle_observer_root_route_context_post(ctx: RequestContext):
             route_token_ref=body.get("route_token_ref"),
             task_id=body.get("task_id"),
             materialize_requested_work_mode=True,
+            close_planning_body=body,
         )
 
 
