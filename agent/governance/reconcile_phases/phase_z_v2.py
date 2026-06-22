@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,69 @@ _IMPORT_RESOLUTION_SUFFIXES: Tuple[str, ...] = (
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".rb", ".rake",
 )
+
+
+def _new_phase_trace(run_id: str) -> Dict[str, Any]:
+    return {
+        "schema_version": "phase_z_v2.full_rebuild_phase_trace.v1",
+        "run_id": run_id,
+        "steps": [],
+        "total_elapsed_ms": 0,
+    }
+
+
+def _record_phase_step(
+    phase_trace: Dict[str, Any],
+    name: str,
+    started: float,
+    *,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
+    step = {
+        "name": name,
+        "elapsed_ms": elapsed_ms,
+        "metrics": metrics or {},
+    }
+    steps = phase_trace.setdefault("steps", [])
+    if isinstance(steps, list):
+        steps.append(step)
+        phase_trace["step_count"] = len(steps)
+        phase_trace["total_elapsed_ms"] = sum(
+            int(item.get("elapsed_ms") or 0)
+            for item in steps
+            if isinstance(item, dict)
+        )
+
+
+def _phase_timing_summary(phase_trace: Dict[str, Any]) -> Dict[str, Any]:
+    steps = [
+        {
+            "name": str(item.get("name") or ""),
+            "elapsed_ms": int(item.get("elapsed_ms") or 0),
+        }
+        for item in (phase_trace.get("steps") or [])
+        if isinstance(item, dict)
+    ]
+    return {
+        "schema_version": "phase_z_v2.full_rebuild_phase_timing.v1",
+        "run_id": str(phase_trace.get("run_id") or ""),
+        "step_count": len(steps),
+        "total_elapsed_ms": sum(int(item.get("elapsed_ms") or 0) for item in steps),
+        "steps": steps,
+    }
+
+
+def _module_source_kind_counts(modules: Mapping[str, "ModuleInfo"]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for module in modules.values():
+        key = str(getattr(module, "source_kind", "") or "")
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _module_function_count(modules: Mapping[str, "ModuleInfo"]) -> int:
+    return sum(len(getattr(module, "functions", []) or []) for module in modules.values())
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +388,101 @@ def _call_target_name(node: ast.Call) -> Optional[str]:
     return None
 
 
+def _python_symbol_call_names(node: ast.AST) -> List[str]:
+    calls: Set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            name = _call_target_name(child)
+            if name:
+                calls.add(name)
+    return sorted(calls)
+
+
+def _python_decorator_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _python_decorator_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    if isinstance(node, ast.Call):
+        return _python_decorator_name(node.func)
+    return ""
+
+
+def _python_assigned_names(node: ast.AST) -> List[str]:
+    targets: List[ast.AST] = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    names: List[str] = []
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names.extend(elt.id for elt in target.elts if isinstance(elt, ast.Name))
+    return sorted(set(names))
+
+
+def _python_source_span_hash(lines: List[str], node: ast.AST) -> str:
+    start = int(getattr(node, "lineno", 0) or 0)
+    end = int(getattr(node, "end_lineno", start) or start)
+    if start <= 0:
+        return ""
+    end = max(start, end)
+    snippet = "\n".join(lines[start - 1 : min(len(lines), end)])
+    return f"sha256:{hashlib.sha256(snippet.encode('utf-8')).hexdigest()}"
+
+
+def _python_symbol_records_from_tree(
+    tree: ast.AST,
+    *,
+    module_name: str,
+    source: str,
+) -> List[Dict[str, Any]]:
+    lines = source.splitlines()
+    symbols: List[Dict[str, Any]] = []
+    body = getattr(tree, "body", [])
+    for node in (body if isinstance(body, list) else []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append({
+                "name": node.name,
+                "kind": "function",
+                "module": module_name,
+                "lineno": int(getattr(node, "lineno", 1) or 1),
+                "end_lineno": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
+                "source_hash": _python_source_span_hash(lines, node),
+                "decorators": [
+                    name for name in (_python_decorator_name(item) for item in node.decorator_list) if name
+                ],
+                "calls": _python_symbol_call_names(node),
+            })
+        elif isinstance(node, ast.ClassDef):
+            symbols.append({
+                "name": node.name,
+                "kind": "class",
+                "module": module_name,
+                "lineno": int(getattr(node, "lineno", 1) or 1),
+                "end_lineno": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
+                "decorators": [
+                    name for name in (_python_decorator_name(item) for item in node.decorator_list) if name
+                ],
+                "calls": _python_symbol_call_names(node),
+            })
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for name in _python_assigned_names(node):
+                if not name.isupper():
+                    continue
+                symbols.append({
+                    "name": name,
+                    "kind": "constant",
+                    "module": module_name,
+                    "lineno": int(getattr(node, "lineno", 1) or 1),
+                    "end_lineno": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
+                })
+    return symbols
+
+
 def _path_to_module(path: str, root: str) -> str:
     """Convert a file path to a dotted module name relative to root's parent."""
     rel = os.path.relpath(path, os.path.dirname(root) if not os.path.isdir(root) else os.path.dirname(root))
@@ -363,6 +522,7 @@ def _parse_python_module(fpath: str, mod_name: str, source: str) -> Optional[Mod
         source=source,
         language="python",
         source_kind="python_ast",
+        adapter_symbols=_python_symbol_records_from_tree(tree, module_name=mod_name, source=source),
     )
 
 
@@ -1475,6 +1635,7 @@ def write_dry_run_artifact(
     typed_relations: Optional[List[Dict[str, Any]]] = None,
     architecture_graph: Optional[Dict[str, Any]] = None,
     module_dependency_edges: Optional[List[Dict[str, Any]]] = None,
+    phase_trace: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Write docs/dev/scratch/graph-v2-{date}.json with diff-vs-current report.
 
@@ -1498,6 +1659,8 @@ def write_dry_run_artifact(
         "typed_relations": typed_relations or [],
         "architecture_graph": architecture_graph or {},
         "module_dependency_edges": module_dependency_edges or [],
+        "phase_trace": phase_trace or {},
+        "phase_timing": _phase_timing_summary(phase_trace or {}),
     }
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -4793,6 +4956,7 @@ def build_graph_v2_from_symbols(
     run_id: Optional[str] = None,
     extra_exclude_roots: Optional[List[str]] = None,
     extra_ignore_globs: Optional[List[str]] = None,
+    include_parsed_modules: bool = False,
 ) -> Dict[str, Any]:
     """Orchestrate the full symbol-level topology pipeline.
 
@@ -4812,7 +4976,23 @@ def build_graph_v2_from_symbols(
         extra_exclude_roots=extra_exclude_roots,
         extra_ignore_globs=extra_ignore_globs,
     )
+    run_id = run_id or datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")
+    phase_trace = _new_phase_trace(run_id)
+
+    started = time.perf_counter()
     modules = parse_production_modules(project_root, profile=profile)
+    _record_phase_step(
+        phase_trace,
+        "production_module_parsing",
+        started,
+        metrics={
+            "module_count": len(modules),
+            "function_count": _module_function_count(modules),
+            "source_kind_counts": _module_source_kind_counts(modules),
+        },
+    )
+
+    started = time.perf_counter()
     call_graph = build_call_graph(modules)
     graph_enrich_config_rules = _load_graph_enrich_config_rules(project_root)
     sccs = tarjan_scc(call_graph.edges)
@@ -4822,15 +5002,45 @@ def build_graph_v2_from_symbols(
 
     # R10: Cycle abort threshold
     if len(real_cycles) > CYCLE_ABORT_THRESHOLD:
+        _record_phase_step(
+            phase_trace,
+            "call_graph_scc",
+            started,
+            metrics={
+                "function_count": len(call_graph.all_functions),
+                "edge_count": sum(len(targets) for targets in call_graph.edges.values()),
+                "weak_edge_count": len(call_graph.weak_edges),
+                "scc_count": len(sccs),
+                "real_cycle_count": len(real_cycles),
+                "cycle_abort_threshold": CYCLE_ABORT_THRESHOLD,
+                "aborted": True,
+            },
+        )
         return {
             "status": "aborted",
             "abort_reason": f"Too many cycles: {len(real_cycles)} exceeds threshold {CYCLE_ABORT_THRESHOLD}",
+            "phase_trace": phase_trace,
+            "phase_timing": _phase_timing_summary(phase_trace),
         }
 
     for scc in real_cycles:
         handle_cycle(scc, call_graph.all_functions, call_graph.edges)
+    _record_phase_step(
+        phase_trace,
+        "call_graph_scc",
+        started,
+        metrics={
+            "function_count": len(call_graph.all_functions),
+            "edge_count": sum(len(targets) for targets in call_graph.edges.values()),
+            "weak_edge_count": len(call_graph.weak_edges),
+            "scc_count": len(sccs),
+            "real_cycle_count": len(real_cycles),
+            "cycle_abort_threshold": CYCLE_ABORT_THRESHOLD,
+        },
+    )
 
     # Step 2a: DFS coloring from entries
+    started = time.perf_counter()
     entry_qnames = identify_entries(modules)
     _color_sets, color_count_map = dfs_color_from_entries(
         call_graph.edges, entry_qnames
@@ -4851,7 +5061,20 @@ def build_graph_v2_from_symbols(
         )
 
     nodes = aggregate_functions_into_nodes(modules, layer_scores)
+    _record_phase_step(
+        phase_trace,
+        "dfs_coloring",
+        started,
+        metrics={
+            "entry_count": len(entry_qnames),
+            "colored_function_count": len(color_count_map),
+            "max_color_count": max_color_count,
+            "layer_score_count": len(layer_scores),
+            "node_count": len(nodes),
+        },
+    )
 
+    started = time.perf_counter()
     test_consumer_fanin = build_test_consumer_fanin_index(
         project_root,
         modules,
@@ -4895,7 +5118,6 @@ def build_graph_v2_from_symbols(
         feature_clusters.extend(_fallback_feature_clusters(all_fallback_nodes))
         feature_clusters.sort(key=lambda c: c.get("cluster_fingerprint", ""))
 
-    run_id = run_id or datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")
     try:
         from agent.governance.reconcile_file_inventory import (
             build_file_inventory,
@@ -4918,7 +5140,21 @@ def build_graph_v2_from_symbols(
             "pending_decision_count": 0,
             "pending_decision_sample": [],
         }
+    _record_phase_step(
+        phase_trace,
+        "inventory_index_work",
+        started,
+        metrics={
+            "node_count": len(nodes),
+            "feature_cluster_count": len(feature_clusters),
+            "adapter_fallback_node_count": len(adapter_fallback_nodes),
+            "filetree_fallback_node_count": len(fallback_nodes),
+            "file_inventory_count": len(file_inventory),
+            "file_inventory_summary": file_inventory_summary,
+        },
+    )
 
+    started = time.perf_counter()
     typed_relations = extract_typed_relations(
         project_root,
         modules,
@@ -4937,15 +5173,45 @@ def build_graph_v2_from_symbols(
         TypedRelation(**rel) if isinstance(rel, dict) else rel
         for rel in typed_relations
     ])]
+    _record_phase_step(
+        phase_trace,
+        "typed_relation_extraction",
+        started,
+        metrics={
+            "typed_relation_count": len(typed_relations),
+        },
+    )
+
+    started = time.perf_counter()
     function_call_facts = build_function_call_facts(
         modules,
         call_graph,
         graph_enrich_config_rules=graph_enrich_config_rules,
     )
     enrich_nodes_with_function_call_facts(nodes, function_call_facts)
+    _record_phase_step(
+        phase_trace,
+        "function_call_facts",
+        started,
+        metrics={
+            "function_call_fact_count": len(function_call_facts),
+        },
+    )
+
+    started = time.perf_counter()
     enrich_nodes_with_architecture_signals(nodes, typed_relations)
     architecture_graph = build_architecture_graph(nodes, typed_relations)
     module_dependency_edges = build_module_dependency_edges(modules, call_graph)
+    _record_phase_step(
+        phase_trace,
+        "module_dependency_edges",
+        started,
+        metrics={
+            "module_dependency_edge_count": len(module_dependency_edges),
+            "architecture_node_count": len((architecture_graph or {}).get("nodes") or []),
+            "architecture_link_count": len((architecture_graph or {}).get("links") or []),
+        },
+    )
 
     # Step 4: Diff against existing
     diff_report = diff_against_existing_graph(project_root, nodes)
@@ -4963,8 +5229,9 @@ def build_graph_v2_from_symbols(
             typed_relations=typed_relations,
             architecture_graph=architecture_graph,
             module_dependency_edges=module_dependency_edges,
+            phase_trace=phase_trace,
         )
-        return {
+        result = {
             "status": "ok",
             "run_id": run_id,
             "report_path": report_path,
@@ -4978,7 +5245,12 @@ def build_graph_v2_from_symbols(
             "file_inventory": file_inventory,
             "file_inventory_summary": file_inventory_summary,
             "diff_report": diff_report,
+            "phase_trace": phase_trace,
+            "phase_timing": _phase_timing_summary(phase_trace),
         }
+        if include_parsed_modules:
+            result["_parsed_modules"] = modules
+        return result
     else:
         # R5: Write graph.v2.json
         graph_path = write_graph_v2_json(project_root, nodes)
@@ -5000,7 +5272,7 @@ def build_graph_v2_from_symbols(
         except Exception:
             pass  # Best-effort baseline creation
 
-        return {
+        result = {
             "status": "ok",
             "run_id": run_id,
             "graph_path": graph_path,
@@ -5014,4 +5286,9 @@ def build_graph_v2_from_symbols(
             "file_inventory": file_inventory,
             "file_inventory_summary": file_inventory_summary,
             "diff_report": diff_report,
+            "phase_trace": phase_trace,
+            "phase_timing": _phase_timing_summary(phase_trace),
         }
+        if include_parsed_modules:
+            result["_parsed_modules"] = modules
+        return result

@@ -86,6 +86,22 @@ class TestBuildGraphV2FromSymbols:
         assert result["status"] == "ok"
         assert "report_path" in result
         assert result["node_count"] >= 0
+        timing = result["phase_timing"]
+        assert timing["schema_version"] == "phase_z_v2.full_rebuild_phase_timing.v1"
+        assert [step["name"] for step in timing["steps"]] == [
+            "production_module_parsing",
+            "call_graph_scc",
+            "dfs_coloring",
+            "inventory_index_work",
+            "typed_relation_extraction",
+            "function_call_facts",
+            "module_dependency_edges",
+        ]
+        assert timing["step_count"] == 7
+        assert all(step["elapsed_ms"] >= 0 for step in timing["steps"])
+        trace_steps = {step["name"]: step for step in result["phase_trace"]["steps"]}
+        assert trace_steps["production_module_parsing"]["metrics"]["module_count"] >= 1
+        assert "file_inventory_count" in trace_steps["inventory_index_work"]["metrics"]
 
     def test_ac2_dry_run_writes_scratch_artifact(self):
         """AC2: dry_run=True writes docs/dev/scratch/graph-v2-{date}.json."""

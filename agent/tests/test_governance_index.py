@@ -14,6 +14,8 @@ from agent.governance.governance_index import (
     merge_feature_hashes_into_graph_nodes,
     persist_governance_index,
 )
+from agent.governance.project_profile import discover_project_profile
+from agent.governance.reconcile_phases.phase_z_v2 import parse_production_modules
 
 
 PID = "governance-index-test"
@@ -279,6 +281,39 @@ def test_build_governance_index_can_use_candidate_graph_before_activation(conn, 
     assert rows["tests/test_service.py"]["attached_node_ids"] == ["L7.candidate"]
     assert rows["tests/test_service.py"]["attachment_role"] == "test"
     assert index["feature_index"]["features"][0]["node_id"] == "L7.candidate"
+
+
+def test_build_governance_index_reuses_parsed_modules_for_symbol_index(conn, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_project(project)
+    _activate_graph(conn)
+    profile = discover_project_profile(str(project))
+    parsed_modules = parse_production_modules(str(project), profile=profile)
+    assert parsed_modules
+
+    def _unexpected_parse(*_args, **_kwargs):
+        raise AssertionError("build_governance_index should pass parsed modules to symbol index")
+
+    monkeypatch.setattr(
+        "agent.governance.external_project_governance.parse_production_modules",
+        _unexpected_parse,
+    )
+    index = build_governance_index(
+        conn,
+        PID,
+        project,
+        run_id="index-reuse-test",
+        commit_sha="abc1234",
+        profile=profile,
+        parsed_modules=parsed_modules,
+    )
+
+    assert index["symbol_index"]["parse_reuse"]["parsed_modules_reused"] is True
+    assert any(
+        item["id"] == "src.demo_app.service::STATUS_READY" and item["kind"] == "constant"
+        for item in index["symbol_index"]["symbols"]
+    )
 
 
 def test_build_governance_index_attaches_orphan_doc_from_governance_hint(conn, tmp_path):

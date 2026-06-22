@@ -13,7 +13,7 @@ import re
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from agent.governance import graph_events
 from agent.governance.graph_snapshot_store import (
@@ -2307,7 +2307,9 @@ def run_state_only_full_reconcile(
         run_id=rid,
         extra_exclude_roots=list(graph_exclude_paths or []),
         extra_ignore_globs=list(graph_ignore_globs or []),
+        include_parsed_modules=True,
     )
+    parsed_modules = phase_result.pop("_parsed_modules", None)
     trace.step(
         "build-graph-v2",
         input_payload={
@@ -2472,6 +2474,7 @@ def run_state_only_full_reconcile(
         snapshot_id=sid,
         snapshot_kind=snapshot_kind,
         file_inventory=file_inventory,
+        parsed_modules=parsed_modules if isinstance(parsed_modules, Mapping) else None,
     )
     hash_metadata_merge = merge_feature_hashes_into_graph_nodes(candidate_graph, governance_index)
     enriched_inventory = governance_index.get("file_inventory")

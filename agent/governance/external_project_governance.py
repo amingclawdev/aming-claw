@@ -7,12 +7,14 @@ materializes scan artifacts there without mutating the canonical graph.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
 import re
 import subprocess
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,17 +228,41 @@ def build_symbol_index(
     project_root: str | Path,
     file_inventory: list[dict[str, Any]],
     profile: ProjectProfile | None = None,
+    parsed_modules: Mapping[str, Any] | None = None,
+    prebuilt_symbol_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the MVP symbol/location index for prompt context and drift checks."""
+    if isinstance(prebuilt_symbol_index, dict) and prebuilt_symbol_index:
+        reused = copy.deepcopy(prebuilt_symbol_index)
+        parse_reuse = dict(reused.get("parse_reuse") or {})
+        production_module_count = parse_reuse.get("production_module_count")
+        covered_production_file_count = parse_reuse.get("covered_production_file_count")
+        parse_reuse.update({
+            "schema_version": "symbol_index.parse_reuse.v1",
+            "parsed_modules_reused": False,
+            "prebuilt_symbol_index_reused": True,
+            "production_module_count": production_module_count if type(production_module_count) is int else 0,
+            "covered_production_file_count": (
+                covered_production_file_count
+                if type(covered_production_file_count) is int
+                else 0
+            ),
+        })
+        reused["parse_reuse"] = parse_reuse
+        return reused
     root = Path(project_root).resolve()
     profile = profile or discover_project_profile(str(root))
     symbols: list[dict[str, Any]] = []
     covered_files: set[str] = set()
     seen_symbol_ids: set[str] = set()
-    try:
-        modules = parse_production_modules(str(root), profile=profile)
-    except Exception:
-        modules = {}
+    reused_parsed_modules = parsed_modules is not None
+    if parsed_modules is None:
+        try:
+            modules = parse_production_modules(str(root), profile=profile)
+        except Exception:
+            modules = {}
+    else:
+        modules = dict(parsed_modules)
     for module_name, module in sorted(modules.items()):
         rel = _relpath(root, module.path)
         covered_files.add(rel)
@@ -256,10 +282,22 @@ def build_symbol_index(
             }
             symbols.append(symbol)
             seen_symbol_ids.add(str(symbol["id"]))
+        for symbol in _symbol_index_entries_from_module_symbols(
+            module_name=module_name,
+            module=module,
+            rel_path=rel,
+        ):
+            symbol_id = str(symbol.get("id") or "")
+            if not symbol_id or symbol_id in seen_symbol_ids:
+                continue
+            symbols.append(symbol)
+            seen_symbol_ids.add(symbol_id)
 
     for row in sorted(file_inventory, key=lambda r: str(r.get("path") or "")):
         rel = str(row.get("path") or "").replace("\\", "/").strip("/")
         if not rel.endswith(".py"):
+            continue
+        if rel in covered_files and row.get("file_kind") == "source":
             continue
         if row.get("file_kind") not in {"source", "test"} and row.get("language") != "python":
             continue
@@ -293,7 +331,63 @@ def build_symbol_index(
         "schema_version": 1,
         "symbol_count": len(symbols) + len(file_symbols),
         "symbols": symbols + file_symbols,
+        "parse_reuse": {
+            "schema_version": "symbol_index.parse_reuse.v1",
+            "parsed_modules_reused": reused_parsed_modules,
+            "prebuilt_symbol_index_reused": False,
+            "production_module_count": len(modules),
+            "covered_production_file_count": len(covered_files),
+        },
     }
+
+
+def _symbol_index_entries_from_module_symbols(
+    *,
+    module_name: str,
+    module: Any,
+    rel_path: str,
+) -> list[dict[str, Any]]:
+    """Convert cached parser symbol records into symbol-index entries."""
+    entries: list[dict[str, Any]] = []
+    language = str(getattr(module, "language", "") or "")
+    raw_symbols = getattr(module, "adapter_symbols", None) or []
+    for raw in raw_symbols if isinstance(raw_symbols, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        kind = str(raw.get("kind") or "symbol").strip() or "symbol"
+        line_start = int(raw.get("lineno") or raw.get("line_start") or 1)
+        line_end = int(raw.get("end_lineno") or raw.get("line_end") or line_start)
+        entry = {
+            "id": f"{module_name}::{name}",
+            "kind": kind,
+            "language": language,
+            "module": module_name,
+            "path": rel_path,
+            "line_start": line_start,
+            "line_end": max(line_start, line_end),
+        }
+        source_hash = str(raw.get("source_hash") or "")
+        if source_hash:
+            entry["source_hash"] = source_hash
+        decorators = [str(item) for item in (raw.get("decorators") or []) if str(item)]
+        calls = [str(item) for item in (raw.get("calls") or []) if str(item)]
+        if kind in {"function", "test_function", "class"} or decorators:
+            entry["decorators"] = decorators
+        if kind in {"function", "test_function", "class"} or calls:
+            entry["calls"] = calls
+        entries.append(entry)
+    return sorted(
+        entries,
+        key=lambda item: (
+            str(item.get("path") or ""),
+            int(item.get("line_start") or 0),
+            str(item.get("kind") or ""),
+            str(item.get("id") or ""),
+        ),
+    )
 
 
 def build_doc_index(
@@ -618,7 +712,9 @@ def scan_external_project(
         dry_run=True,
         scratch_dir=str(session_dir),
         run_id=sid,
+        include_parsed_modules=True,
     )
+    parsed_modules = phase_result.pop("_parsed_modules", None)
     candidate_graph = build_rebase_candidate_graph(
         str(root),
         phase_result,
@@ -655,6 +751,7 @@ def scan_external_project(
         project_root=root,
         file_inventory=file_inventory,
         profile=profile,
+        parsed_modules=parsed_modules if isinstance(parsed_modules, Mapping) else None,
     )
     doc_index = build_doc_index(project_root=root, file_inventory=file_inventory)
     coverage_state["symbol_count"] = symbol_index.get("symbol_count", 0)
@@ -697,6 +794,8 @@ def scan_external_project(
         "coverage_state_cache_path": str(coverage_cache_path),
         "feature_index_path": str(feature_index_path),
         "phase_report_path": str(phase_result.get("report_path") or ""),
+        "phase_timing": phase_result.get("phase_timing") or {},
+        "phase_trace": phase_result.get("phase_trace") or {},
         "candidate_node_count": coverage_state.get("candidate_node_count", 0),
         "source_leaf_count": coverage_state.get("source_leaf_count", 0),
         "symbol_count": symbol_index.get("symbol_count", 0),

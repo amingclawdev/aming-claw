@@ -17,6 +17,7 @@ from agent.governance.external_project_governance import (
     COVERAGE_STATE_FILE,
     FEATURE_INDEX_FILE,
     GOVERNANCE_DIR,
+    build_symbol_index,
     scan_external_project,
 )
 from agent.governance.project_service import (
@@ -25,6 +26,7 @@ from agent.governance.project_service import (
 )
 from agent.governance.project_profile import discover_project_profile
 from agent.governance.reconcile_file_inventory import build_file_inventory
+from agent.governance.reconcile_phases.phase_z_v2 import parse_production_modules
 from agent.governance.server import handle_version_check
 from agent.mcp.tools import ToolDispatcher
 
@@ -153,6 +155,53 @@ def test_profile_excludes_project_local_aming_claw_workspace(tmp_path):
 
     assert GOVERNANCE_DIR in profile.exclude_roots
     assert ".aming-claw/sessions/old/generated.py" not in paths
+
+
+def test_build_symbol_index_reuses_parsed_modules_without_reparse(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / "src" / "demo_app").mkdir(parents=True)
+    (project / "tests").mkdir()
+    (project / "src" / "demo_app" / "service.py").write_text(
+        "def calculate_total(items):\n"
+        "    return sum(items)\n\n"
+        "class TotalPolicy:\n"
+        "    pass\n\n"
+        "STATUS_READY = 'ready'\n",
+        encoding="utf-8",
+    )
+    (project / "tests" / "test_service.py").write_text(
+        "def test_calculate_total():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    profile = discover_project_profile(str(project))
+    file_inventory = build_file_inventory(
+        project_root=str(project),
+        run_id="symbol-reuse-test",
+        profile=profile,
+    )
+    parsed_modules = parse_production_modules(str(project), profile=profile)
+    assert parsed_modules
+
+    def _unexpected_parse(*_args, **_kwargs):
+        raise AssertionError("build_symbol_index should reuse parsed modules")
+
+    monkeypatch.setattr(
+        "agent.governance.external_project_governance.parse_production_modules",
+        _unexpected_parse,
+    )
+    symbol_index = build_symbol_index(
+        project_root=project,
+        file_inventory=file_inventory,
+        profile=profile,
+        parsed_modules=parsed_modules,
+    )
+
+    assert symbol_index["parse_reuse"]["parsed_modules_reused"] is True
+    symbol_ids = {item["id"] for item in symbol_index["symbols"]}
+    assert "src.demo_app.service::calculate_total" in symbol_ids
+    assert "src.demo_app.service::TotalPolicy" in symbol_ids
+    assert "src.demo_app.service::STATUS_READY" in symbol_ids
 
 
 def test_bootstrap_rejects_self_plugin_artifacts_in_external_target(tmp_path):
@@ -385,6 +434,7 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
     feature_index_path = gov_root / FEATURE_INDEX_FILE
 
     assert result["status"] == "ok"
+    assert result["phase_timing"]["schema_version"] == "phase_z_v2.full_rebuild_phase_timing.v1"
     assert (gov_root / "project.yaml").exists()
     assert candidate_path.exists()
     assert symbol_index_path.exists()
@@ -409,6 +459,8 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
     assert "web/widget.js" in primary_paths
 
     symbol_index = json.loads(symbol_index_path.read_text(encoding="utf-8"))
+    assert symbol_index["parse_reuse"]["parsed_modules_reused"] is True
+    assert symbol_index["parse_reuse"]["prebuilt_symbol_index_reused"] is False
     symbol_ids = {item["id"] for item in symbol_index["symbols"]}
     assert any(symbol_id.endswith("::calculate_total") for symbol_id in symbol_ids)
     assert any(item["id"] == "file::web/widget.js" for item in symbol_index["symbols"])

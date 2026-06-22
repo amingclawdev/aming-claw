@@ -12,6 +12,7 @@ import hashlib
 import sqlite3
 import subprocess
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -570,6 +571,8 @@ def build_governance_index(
     snapshot_id: str = "",
     snapshot_kind: str = "",
     file_inventory: list[dict[str, Any]] | None = None,
+    parsed_modules: Mapping[str, Any] | None = None,
+    prebuilt_symbol_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a governance index without mutating project source files."""
     ensure_graph_snapshot_schema(conn)
@@ -630,6 +633,8 @@ def build_governance_index(
         project_root=root,
         file_inventory=file_inventory,
         profile=profile,
+        parsed_modules=parsed_modules,
+        prebuilt_symbol_index=prebuilt_symbol_index,
     )
     doc_index = build_doc_index(project_root=root, file_inventory=file_inventory)
     doc_asset_state = build_doc_asset_state(

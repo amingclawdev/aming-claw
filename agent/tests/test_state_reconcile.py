@@ -244,6 +244,61 @@ def _write_project(root: Path) -> list[Path]:
     return files
 
 
+def test_state_only_full_reconcile_reuses_phase_parsed_modules_for_governance_index(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    _write_project(project)
+    captured: dict[str, object] = {}
+    real_build_governance_index = state_reconcile.build_governance_index
+
+    def _unexpected_external_parse(*_args, **_kwargs):
+        raise AssertionError("state reconcile should pass Phase Z parsed modules to governance index")
+
+    def _capture_build_governance_index(*args, **kwargs):
+        parsed_modules = kwargs.get("parsed_modules")
+        captured["parsed_modules_present"] = parsed_modules is not None
+        captured["parsed_module_count"] = len(parsed_modules or {})
+        return real_build_governance_index(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "agent.governance.external_project_governance.parse_production_modules",
+        _unexpected_external_parse,
+    )
+    monkeypatch.setattr(
+        state_reconcile,
+        "build_governance_index",
+        _capture_build_governance_index,
+    )
+
+    result = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-reconcile-parse-reuse",
+        commit_sha="abc1234",
+        snapshot_id="full-parse-reuse",
+        created_by="test",
+        semantic_enrich=False,
+    )
+
+    assert result["ok"] is True
+    assert captured["parsed_modules_present"] is True
+    assert captured["parsed_module_count"] > 0
+    trace_dir = Path(result["trace"]["steps"][0]["input"]["path"]).parents[2]
+    build_graph_output = (
+        trace_dir / "steps" / "002-build-graph-v2" / "output.json"
+    ).read_text(encoding="utf-8")
+    assert "_parsed_modules" not in build_graph_output
+    snapshot_row = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, "full-parse-reuse"),
+    ).fetchone()
+    assert "_parsed_modules" not in snapshot_row["notes"]
+
+
 def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mutation(conn, tmp_path):
     project = tmp_path / "project"
     files = _write_project(project)
