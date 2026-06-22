@@ -330,6 +330,7 @@ function installCodexPlugin() {
       "plugin",
       "install",
       INSTALL_SOURCE,
+      ...(REPO_REF ? ["--ref", REPO_REF] : []),
       "--install-root",
       INSTALL_ROOT,
       "--python",
