@@ -15657,7 +15657,7 @@ def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
     assert wrong_token.value.code == "fence_invalidated_or_unknown"
 
 
-def test_runtime_context_worker_guide_missing_auth_points_to_rejoin(
+def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before_lineage(
     conn,
     tmp_path,
 ):
@@ -15700,10 +15700,161 @@ def test_runtime_context_worker_guide_missing_auth_points_to_rejoin(
     assert blocked.value.code == "fence_invalidated_or_unknown"
     details = blocked.value.details
     assert details["diagnostics"]["reason"] == "worker_auth_material_missing"
-    assert details["next_legal_action"] == "request_runtime_context_rejoin_host_envelope"
-    submission = details["actionable_payloads"]["session_token_rejoin_submission"]
-    assert submission["action"] == "request_runtime_context_rejoin_host_envelope"
+    assert details["next_legal_action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    submission = details["actionable_payloads"][
+        "session_token_initial_join_submission"
+    ]
+    assert submission["action"] == "request_runtime_context_initial_join_host_envelope"
+    assert submission["missing_lineage"] == [
+        "mf_subagent_read_receipt",
+        "mf_subagent_startup",
+    ]
     assert submission["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
+
+
+def test_runtime_context_session_token_initial_join_audits_host_envelope_before_lineage(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-initial-join"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-initial-join",
+            root_task_id="parent-runtime-initial-join",
+            backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
+            stage_task_id="worker-runtime-initial-join",
+            worker_id="worker-runtime-initial-join",
+            worker_slot_id="slot-runtime-initial-join",
+            branch_ref="refs/heads/codex/worker-runtime-initial-join",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-initial-join",
+        ),
+    )
+    route_identity = {
+        "route_id": "route-runtime-initial-join",
+        "route_context_hash": "sha256:route-runtime-initial-join",
+        "prompt_contract_id": "prompt-runtime-initial-join",
+        "prompt_contract_hash": "sha256:prompt-runtime-initial-join",
+        "route_token_ref": "rtok-runtime-initial-join",
+        "visible_injection_manifest_hash": "sha256:visible-runtime-initial-join",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-initial-join",
+        route_identity=route_identity,
+        payload={"route_identity": route_identity},
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as wrong_route:
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-initial-join",
+                    "parent_task_id": "parent-runtime-initial-join",
+                    "target_project_root": str(target_root),
+                    "route_context_hash": "sha256:wrong-route",
+                    "prompt_contract_id": "prompt-runtime-initial-join",
+                    "reason": "host adapter needs first worker auth env",
+                },
+            )
+        )
+    assert wrong_route.value.code == (
+        "runtime_context_initial_join_route_identity_mismatch"
+    )
+
+    result = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": "worker-runtime-initial-join",
+                "parent_task_id": "parent-runtime-initial-join",
+                "target_project_root": str(target_root),
+                **route_identity,
+                "reason": "host adapter needs first worker auth env",
+                "ttl_seconds": 1200,
+                "now_iso": "2026-06-21T18:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_initial_join_issued"
+    assert result["session_token"]
+    assert result["fence_token"] == "fence-runtime-initial-join"
+    assert result["raw_tokens_persisted_to_timeline"] is False
+    host_envelope = result["host_envelope"]
+    assert host_envelope["env"]["AMING_WORKER_SESSION_TOKEN"] == result["session_token"]
+    assert host_envelope["env"]["AMING_WORKER_FENCE_TOKEN"] == (
+        "fence-runtime-initial-join"
+    )
+    assert result["route_identity"] == route_identity
+    assert host_envelope["route_identity"] == route_identity
+    saved = get_branch_context(conn, PID, "worker-runtime-initial-join")
+    assert saved is not None
+    assert saved.session_token_hash == mf_subagent_session_token_hash(
+        result["session_token"]
+    )
+    assert saved.last_recovery_action == "mf_subagent_initial_join_issued"
+    assert runtime_context_session_token_ref(saved) == result["session_token_ref"]
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
+        event_kind="observer_command",
+    )
+    initial_join_events = [
+        event
+        for event in events
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    ]
+    assert len(initial_join_events) == 1
+    payload = initial_join_events[0]["payload"]
+    assert payload["caller_role"] == "observer"
+    assert payload["worker_role"] == "mf_sub"
+    assert payload["missing_lineage"] == [
+        "mf_subagent_read_receipt",
+        "mf_subagent_startup",
+    ]
+    assert payload["host_envelope_returned"] is True
+    assert payload["route_identity"] == route_identity
+    serialized_event = json.dumps(initial_join_events[0], sort_keys=True)
+    assert result["session_token"] not in serialized_event
+    assert "fence-runtime-initial-join" not in serialized_event
+    assert "AMING_WORKER_SESSION_TOKEN" in serialized_event
+
+    with pytest.raises(GovernanceError) as rejoin_without_lineage:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-initial-join",
+                    "parent_task_id": "parent-runtime-initial-join",
+                    "target_project_root": str(target_root),
+                    "reason": "host worker session lost raw auth env after resume",
+                },
+            )
+        )
+    assert rejoin_without_lineage.value.code == (
+        "runtime_context_rejoin_requires_existing_worker_lineage"
+    )
 
 
 def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_only_write(
@@ -15770,6 +15921,29 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
         },
     )
     conn.commit()
+
+    with pytest.raises(GovernanceError) as guide_blocked:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                query={
+                    "parent_task_id": "parent-runtime-rejoin",
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+    assert guide_blocked.value.code == "fence_invalidated_or_unknown"
+    assert guide_blocked.value.details["next_legal_action"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    assert "session_token_rejoin_submission" in (
+        guide_blocked.value.details["actionable_payloads"]
+    )
+    assert "session_token_initial_join_submission" not in (
+        guide_blocked.value.details["actionable_payloads"]
+    )
 
     result = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(

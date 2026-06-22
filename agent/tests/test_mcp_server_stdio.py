@@ -86,6 +86,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
+        "runtime_context_session_token_initial_join",
     }.issubset(names)
 
 
@@ -115,6 +116,16 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
     assert governance_mcp_server._dispatch_tool(
         "runtime_context_finish_gate",
         {**common, "checkpoint_id": "ckpt-demo"},
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_session_token_initial_join",
+        {
+            "project_id": "demo",
+            "runtime_context_id": "mfrctx-demo",
+            "task_id": "worker-demo",
+            "reason": "host adapter needs first worker auth env",
+            "ttl_seconds": 1200,
+        },
     )["ok"] is True
 
     assert calls == [
@@ -146,6 +157,16 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
                 "session_token": "worker-session",
                 "fence_token": "fence-demo",
                 "checkpoint_id": "ckpt-demo",
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/demo/runtime-contexts/mfrctx-demo/session-token/initial-join",
+            {
+                "runtime_context_id": "mfrctx-demo",
+                "task_id": "worker-demo",
+                "reason": "host adapter needs first worker auth env",
+                "ttl_seconds": 1200,
             },
         ),
     ]
@@ -383,6 +404,55 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
             "graph_trace_id=gqt-test&session_token=session-test&"
             "target_project_root=%2Frepo%2Ffixture",
             None,
+        )
+    ]
+
+
+def test_mcp_dispatcher_runtime_context_initial_join_posts_canonical_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "status": "session_token_initial_join_issued"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "runtime_context_session_token_initial_join",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-join",
+            "task_id": "worker-join",
+            "parent_task_id": "AC-JOIN",
+            "target_project_root": "/repo/fixture",
+            "route_context_hash": "sha256:route-join",
+            "prompt_contract_id": "prompt-join",
+            "reason": "host adapter needs first worker auth env",
+            "ttl_seconds": 1200,
+        },
+    )
+
+    assert result == {"ok": True, "status": "session_token_initial_join_issued"}
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-join/session-token/initial-join",
+            {
+                "runtime_context_id": "mfrctx-join",
+                "task_id": "worker-join",
+                "parent_task_id": "AC-JOIN",
+                "target_project_root": "/repo/fixture",
+                "route_context_hash": "sha256:route-join",
+                "prompt_contract_id": "prompt-join",
+                "reason": "host adapter needs first worker auth env",
+                "ttl_seconds": 1200,
+            },
         )
     ]
 

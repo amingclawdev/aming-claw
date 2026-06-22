@@ -8809,6 +8809,42 @@ def _runtime_context_worker_guide_response(
             ),
             "auth": _auth_guide("body.session_token"),
         },
+        "session_token_initial_join": {
+            "method": "POST",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/session-token/initial-join"
+            ),
+            "facade_status": "available_for_initial_host_adapter_join",
+            "required_body_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "target_project_root",
+                "reason",
+            ],
+            "valid_when_lineage_missing": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            ],
+            "ttl_policy": {
+                "default_ttl_seconds": session_token_lease.get(
+                    "renewal_default_ttl_seconds"
+                ),
+                "max_ttl_seconds": session_token_lease.get("renewal_max_ttl_seconds"),
+                "raw_session_token_persisted": False,
+                "raw_fence_token_persisted_to_timeline": False,
+            },
+            "failure_policy": (
+                "complete worker lineage, stale contexts, closed contexts, and "
+                "scope-mismatched requests fail closed"
+            ),
+            "security_boundary": {
+                "session_token_ref_alone_authorizes_writes": False,
+                "observer_authors_worker_evidence": False,
+                "delivery": "worker_host_envelope",
+            },
+        },
         "session_token_rejoin": {
             "method": "POST",
             "path": (
@@ -9860,6 +9896,10 @@ def _runtime_context_worker_recovery_payloads(
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/startup"
     )
+    initial_join_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/session-token/initial-join"
+    )
     implementation_evidence_path = (
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/implementation-evidence"
@@ -10152,6 +10192,13 @@ def _runtime_context_worker_recovery_payloads(
                 "facade": "runtime_context.startup",
                 "legacy_tool": "parallel_branch_startup",
             },
+            "runtime_context_session_token_initial_join": {
+                "method": "POST",
+                "path": initial_join_path,
+                "tool": "runtime_context_session_token_initial_join",
+                "facade": "runtime_context.session_token_initial_join",
+                "body_source": "session_token_initial_join_submission.copy_safe_body",
+            },
             "runtime_context_implementation_evidence": {
                 "method": "POST",
                 "path": implementation_evidence_path,
@@ -10408,6 +10455,10 @@ def _runtime_context_worker_recovery_details(
         expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
         expected_target_root = _runtime_context_effective_target_project_root(context)
         expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+        safe_route_identity = {
+            field: str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
         lease_view = runtime_context_session_token_lease_view(context)
         supplied_session_hash = (
             mf_subagent_session_token_hash(session_token) if session_token else ""
@@ -10577,6 +10628,15 @@ def _runtime_context_worker_recovery_details(
             "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
             "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
         }
+        missing_worker_lineage = [
+            item
+            for item, present in (
+                ("mf_subagent_read_receipt", timeline_refs.get("read_receipt_event_ref")),
+                ("mf_subagent_startup", timeline_refs.get("startup_event_ref")),
+            )
+            if not present
+        ]
+        diagnostics["timeline"]["missing_worker_lineage"] = list(missing_worker_lineage)
         auth_material_missing = bool(
             context is not None
             and (
@@ -10587,46 +10647,99 @@ def _runtime_context_worker_recovery_details(
                 )
             )
         )
+        session_token_initial_join_submission: dict[str, Any] = {}
         session_token_rejoin_submission: dict[str, Any] = {}
         if auth_material_missing:
             diagnostics["reason"] = "worker_auth_material_missing"
-            next_legal_action = "request_runtime_context_rejoin_host_envelope"
-            recovery_action_id = "request_runtime_context_rejoin_host_envelope"
-            session_token_rejoin_submission = {
-                "schema_version": "runtime_context.session_token_rejoin_submission.v1",
-                "action": "request_runtime_context_rejoin_host_envelope",
-                "method": "POST",
-                "path": (
-                    "/api/graph-governance/{project_id}/runtime-contexts/"
-                    "{runtime_context_id}/session-token/rejoin"
-                ),
-                "body": {
-                    "runtime_context_id": expected_runtime_context_id,
-                    "task_id": str(getattr(context, "task_id", "") or ""),
-                    "parent_task_id": expected_parent_task_id,
-                    "target_project_root": expected_target_root,
-                    "reason": "<operator reason: host worker session lost raw auth env>",
-                    "ttl_seconds": 3600,
-                },
-                "copy_safe_body": {
-                    "runtime_context_id": expected_runtime_context_id,
-                    "task_id": str(getattr(context, "task_id", "") or ""),
-                    "parent_task_id": expected_parent_task_id,
-                    "target_project_root": expected_target_root,
-                    "reason": "<operator reason: host worker session lost raw auth env>",
-                    "ttl_seconds": 3600,
-                },
-                "required_existing_lineage": [
-                    "mf_subagent_read_receipt",
-                    "mf_subagent_startup",
-                ],
-                "security_boundary": {
-                    "session_token_ref_alone_authorizes_writes": False,
-                    "raw_tokens_persisted_to_timeline": False,
-                    "observer_authors_worker_evidence": False,
-                    "delivery": "worker_host_envelope",
-                },
-            }
+            if missing_worker_lineage:
+                next_legal_action = "request_runtime_context_initial_join_host_envelope"
+                recovery_action_id = "request_runtime_context_initial_join_host_envelope"
+                session_token_initial_join_submission = {
+                    "schema_version": (
+                        "runtime_context.session_token_initial_join_submission.v1"
+                    ),
+                    "action": "request_runtime_context_initial_join_host_envelope",
+                    "method": "POST",
+                    "path": (
+                        "/api/graph-governance/{project_id}/runtime-contexts/"
+                        "{runtime_context_id}/session-token/initial-join"
+                    ),
+                    "body": {
+                        "runtime_context_id": expected_runtime_context_id,
+                        "task_id": str(getattr(context, "task_id", "") or ""),
+                        "parent_task_id": expected_parent_task_id,
+                        "target_project_root": expected_target_root,
+                        **safe_route_identity,
+                        "reason": (
+                            "<operator reason: host adapter needs first worker auth env>"
+                        ),
+                        "ttl_seconds": 3600,
+                    },
+                    "copy_safe_body": {
+                        "runtime_context_id": expected_runtime_context_id,
+                        "task_id": str(getattr(context, "task_id", "") or ""),
+                        "parent_task_id": expected_parent_task_id,
+                        "target_project_root": expected_target_root,
+                        **safe_route_identity,
+                        "reason": (
+                            "<operator reason: host adapter needs first worker auth env>"
+                        ),
+                        "ttl_seconds": 3600,
+                    },
+                    "required_route_identity_fields": list(
+                        _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                    ),
+                    "missing_lineage": list(missing_worker_lineage),
+                    "required_before_worker_evidence": [
+                        "inject host_envelope env into the real mf_sub worker",
+                        "worker submits read receipt",
+                        "worker records startup",
+                    ],
+                    "security_boundary": {
+                        "session_token_ref_alone_authorizes_writes": False,
+                        "raw_tokens_persisted_to_timeline": False,
+                        "observer_authors_worker_evidence": False,
+                        "delivery": "worker_host_envelope",
+                    },
+                }
+            else:
+                next_legal_action = "request_runtime_context_rejoin_host_envelope"
+                recovery_action_id = "request_runtime_context_rejoin_host_envelope"
+                session_token_rejoin_submission = {
+                    "schema_version": "runtime_context.session_token_rejoin_submission.v1",
+                    "action": "request_runtime_context_rejoin_host_envelope",
+                    "method": "POST",
+                    "path": (
+                        "/api/graph-governance/{project_id}/runtime-contexts/"
+                        "{runtime_context_id}/session-token/rejoin"
+                    ),
+                    "body": {
+                        "runtime_context_id": expected_runtime_context_id,
+                        "task_id": str(getattr(context, "task_id", "") or ""),
+                        "parent_task_id": expected_parent_task_id,
+                        "target_project_root": expected_target_root,
+                        "reason": "<operator reason: host worker session lost raw auth env>",
+                        "ttl_seconds": 3600,
+                    },
+                    "copy_safe_body": {
+                        "runtime_context_id": expected_runtime_context_id,
+                        "task_id": str(getattr(context, "task_id", "") or ""),
+                        "parent_task_id": expected_parent_task_id,
+                        "target_project_root": expected_target_root,
+                        "reason": "<operator reason: host worker session lost raw auth env>",
+                        "ttl_seconds": 3600,
+                    },
+                    "required_existing_lineage": [
+                        "mf_subagent_read_receipt",
+                        "mf_subagent_startup",
+                    ],
+                    "security_boundary": {
+                        "session_token_ref_alone_authorizes_writes": False,
+                        "raw_tokens_persisted_to_timeline": False,
+                        "observer_authors_worker_evidence": False,
+                        "delivery": "worker_host_envelope",
+                    },
+                }
         elif identity_failure:
             if target_root_projection.get("request_role") in {
                 "assigned_worktree_path_alias",
@@ -10666,6 +10779,10 @@ def _runtime_context_worker_recovery_details(
             session_token_ref=runtime_context_session_token_ref(context),
             read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
         )
+        if session_token_initial_join_submission:
+            actionable_payloads["session_token_initial_join_submission"] = (
+                session_token_initial_join_submission
+            )
         if session_token_rejoin_submission:
             actionable_payloads["session_token_rejoin_submission"] = (
                 session_token_rejoin_submission
@@ -12382,6 +12499,209 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
         conn.commit()
         result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"
         result["audit_event_id"] = audit_event.get("id", "")
+        return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/initial-join")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/initial-join")
+def handle_graph_governance_runtime_context_session_token_initial_join(ctx: RequestContext):
+    """Issue the first audited worker host envelope before worker lineage exists."""
+    project_id = ctx.get_project_id()
+    runtime_context_id = str(
+        ctx.path_params.get("runtime_context_id")
+        or _runtime_context_request_value(ctx, "runtime_context_id")
+        or ""
+    ).strip()
+    if not runtime_context_id:
+        raise ValidationError("runtime_context_id is required")
+    body = dict(ctx.body or {})
+    reason = str(body.get("reason") or body.get("join_reason") or "").strip()
+    if not reason:
+        raise ValidationError("reason is required for runtime-context initial join")
+
+    conn = get_connection(project_id)
+    try:
+        from .parallel_branch_runtime import (
+            BranchRuntimeFenceError,
+            get_branch_context_by_runtime_context_id,
+            initial_join_mf_subagent_runtime_session_token,
+            runtime_context_id_for_branch_context,
+        )
+        from .permissions import require_operator_capability, session_role
+        from . import task_timeline
+
+        session = _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            "graph-governance.runtime-context.session-token-initial-join",
+        )
+        require_operator_capability(
+            session,
+            "graph-governance.runtime-context.session-token-initial-join",
+        )
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        if context is None:
+            raise GovernanceError(
+                "runtime_context_not_found",
+                f"branch runtime context not found: {project_id}/{runtime_context_id}",
+                404,
+                {"runtime_context_id": runtime_context_id},
+            )
+        task_id = str(body.get("task_id") or context.task_id or "").strip()
+        parent_task_id = str(body.get("parent_task_id") or "").strip() or (
+            _runtime_context_mf_sub_parent_task_id(context)
+        )
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+        )
+        timeline_refs, _startup_gate, _finish_gate, _close_evidence = (
+            _runtime_context_service_timeline_refs(
+                conn,
+                project_id=project_id,
+                task_id=context.task_id,
+                backlog_id=context.backlog_id,
+                timeline_events=timeline_events,
+            )
+        )
+        missing_lineage = [
+            item
+            for item, present in (
+                ("mf_subagent_read_receipt", timeline_refs.get("read_receipt_event_ref")),
+                ("mf_subagent_startup", timeline_refs.get("startup_event_ref")),
+            )
+            if not present
+        ]
+        if not missing_lineage:
+            raise GovernanceError(
+                "runtime_context_initial_join_requires_missing_worker_lineage",
+                "runtime-context initial join is only valid before complete worker read receipt/startup lineage; use rejoin for recovery",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "next_legal_action": "request_runtime_context_rejoin_host_envelope",
+                    "fail_closed": True,
+                },
+            )
+        expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+        supplied_route_identity = dict(
+            _runtime_context_request_route_identity_shapes(ctx).get("supplied") or {}
+        )
+        if expected_route_identity and any(
+            str(supplied_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        ):
+            mismatches = _runtime_context_route_identity_mismatch_fields(
+                expected_route_identity,
+                supplied_route_identity,
+            )
+            if mismatches:
+                raise GovernanceError(
+                    "runtime_context_initial_join_route_identity_mismatch",
+                    "runtime-context initial join route identity does not match the active runtime contract",
+                    403,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": context.task_id,
+                        "route_identity_mismatch_fields": mismatches,
+                        "fail_closed": True,
+                    },
+                )
+        try:
+            result = initial_join_mf_subagent_runtime_session_token(
+                conn,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+                target_project_root=str(
+                    body.get("target_project_root")
+                    or body.get("project_root")
+                    or body.get("repo_root")
+                    or ""
+                ).strip(),
+                ttl_seconds=body.get("ttl_seconds"),
+                reason=reason,
+                now_iso=str(body.get("now_iso") or ""),
+            )
+        except BranchRuntimeFenceError as exc:
+            raise GovernanceError(
+                "fence_invalidated_or_unknown",
+                "runtime-context initial join requires active matching runtime identity",
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "reason": str(exc) or "fence_invalidated_or_unknown",
+                    "fail_closed": True,
+                },
+            ) from exc
+
+        safe_route_identity = {
+            field: str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(expected_route_identity.get(field) or "").strip()
+        }
+        if safe_route_identity:
+            result["route_identity"] = dict(safe_route_identity)
+            host_envelope = result.get("host_envelope")
+            if isinstance(host_envelope, dict):
+                host_envelope["route_identity"] = dict(safe_route_identity)
+                result["host_envelope"] = host_envelope
+        audit_payload = {
+            key: value
+            for key, value in result.items()
+            if key
+            not in {
+                "session_token",
+                "session_token_hash",
+                "fence_token",
+                "host_envelope",
+            }
+        }
+        audit_payload.update(
+            {
+                "action": "runtime_context_session_token_initial_join",
+                "caller_role": "observer",
+                "raw_session_token_persisted": False,
+                "raw_fence_token_persisted_to_timeline": False,
+                "host_envelope_returned": True,
+                "host_envelope_env_keys": [
+                    "AMING_WORKER_SESSION_TOKEN",
+                    "AMING_WORKER_FENCE_TOKEN",
+                ],
+                "reason": reason,
+                "operator_session_role": session_role(session),
+                "missing_lineage": missing_lineage,
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+            }
+        )
+        audit_event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+            event_type="observer.runtime_context_session_token_initial_join",
+            event_kind="observer_command",
+            phase="runtime_context_initial_join",
+            status="accepted",
+            actor=str(session.get("principal_id") or "observer"),
+            payload=audit_payload,
+        )
+        conn.commit()
+        result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"
+        result["audit_event_id"] = audit_event.get("id", "")
+        result["raw_tokens_persisted_to_timeline"] = False
         return result
     finally:
         conn.close()

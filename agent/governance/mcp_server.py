@@ -223,8 +223,10 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "route_token": {"type": "object"},
             "route_waiver": {"type": "object"},
             "reason": {"type": "string"},
+            "join_reason": {"type": "string"},
             "rejoin_reason": {"type": "string"},
             "ttl_seconds": {"type": "integer"},
+            "now_iso": {"type": "string"},
         }
     )
     return properties
@@ -536,6 +538,15 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
             "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_session_token_initial_join",
+        "description": "Observer/host-adapter facade that issues the first audited worker host envelope before mf_sub read-receipt/startup lineage exists. Does not persist raw tokens.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": ["project_id", "runtime_context_id", "task_id", "reason"],
         },
     },
     {
@@ -875,6 +886,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
+        "runtime_context_session_token_initial_join",
         "runtime_context_session_token_rejoin",
     }:
         pid = args["project_id"]
@@ -885,6 +897,9 @@ def _dispatch_tool(name: str, args: dict) -> Any:
                 "finish-time-worker-attestation"
             ),
             "runtime_context_finish_gate": "finish-gate",
+            "runtime_context_session_token_initial_join": (
+                "session-token/initial-join"
+            ),
             "runtime_context_session_token_rejoin": "session-token/rejoin",
         }
         return _http(
