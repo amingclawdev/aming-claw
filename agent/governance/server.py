@@ -30803,6 +30803,68 @@ def _observer_root_route_next_legal_action_from_steps(
     }
 
 
+def _observer_root_route_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _observer_root_route_worker_startup_handoff_step(
+    step: Mapping[str, Any],
+) -> dict[str, Any]:
+    original = dict(step)
+    step_id = str(original.get("id") or original.get("action") or "").strip()
+    if step_id not in {"mf_subagent_startup", "real_mf_subagent_startup"}:
+        return original
+    append_hint = _observer_root_route_mapping(original.get("timeline_append_hint"))
+    actor_role = str(
+        append_hint.get("actor_role")
+        or append_hint.get("lane_actor_role")
+        or original.get("actor_role")
+        or original.get("lane_actor_role")
+        or ""
+    ).strip()
+    if actor_role not in {"mf_sub", "mf_subagent", "worker"}:
+        return original
+    return {
+        "id": "worker_startup_handoff",
+        "action": "handoff_worker_startup_or_recover_dispatch",
+        "detail": (
+            "mf_subagent startup evidence is worker-owned; observer must hand "
+            "off safe startup refs, recover worker auth, or dispatch a bounded "
+            "worker instead of appending startup evidence directly"
+        ),
+        "reason": (
+            "mf_subagent startup evidence is worker-owned; observer root cannot "
+            "author mf_subagent_startup evidence"
+        ),
+        "source": original.get("source") or "contract_state",
+        "precedence": original.get("precedence") or "role_bound_worker_handoff",
+        "blocked_requirement_id": step_id,
+        "blocked_requirement_action": original.get("action"),
+        "evidence_owner_role": actor_role,
+        "worker_owned": True,
+        "observer_owned": False,
+        "safe_repair_actions": [
+            "dispatch_bounded_worker",
+            "provide_worker_startup_facade_with_safe_refs",
+            "recover_worker_auth_or_runtime_context",
+        ],
+        "forbidden_observer_actions": ["record_mf_subagent_startup"],
+        "accepted_event_kinds": original.get("accepted_event_kinds") or [],
+        "accepted_statuses": original.get("accepted_statuses") or [],
+        "worker_handoff": {
+            "target_actor_role": actor_role,
+            "requirement_id": step_id,
+            "timeline_append_hint": append_hint,
+        },
+    }
+
+
+def _observer_root_route_steps_for_observer(
+    steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [_observer_root_route_worker_startup_handoff_step(step) for step in steps]
+
+
 def _observer_root_route_contract_state_action_has_priority(
     action: Mapping[str, Any],
 ) -> bool:
@@ -31723,10 +31785,16 @@ def _observer_root_route_context_state(
         for step in (contract_state.get("ordered_next_steps") or [])
         if isinstance(step, dict) and str(step.get("id") or "").strip()
     ]
+    contract_ordered_steps = _observer_root_route_steps_for_observer(
+        contract_ordered_steps
+    )
     contract_next_action = (
         dict(contract_state.get("next_legal_action") or {})
         if isinstance(contract_state.get("next_legal_action"), dict)
         else {}
+    )
+    contract_next_action = _observer_root_route_worker_startup_handoff_step(
+        contract_next_action
     )
     contract_state_action_has_priority = (
         _observer_root_route_contract_state_action_has_priority(contract_next_action)
@@ -31738,6 +31806,9 @@ def _observer_root_route_context_state(
             for step in (contract_next_action.get("ordered_missing_steps") or [])
             if isinstance(step, dict) and str(step.get("id") or "").strip()
         ]
+        contract_action_steps = _observer_root_route_steps_for_observer(
+            contract_action_steps
+        )
     dirty_without_contract_step = _observer_root_route_dirty_without_contract_step(
         project_id=project_id,
         backlog_id=backlog_id,
@@ -31820,6 +31891,9 @@ def _observer_root_route_context_state(
             seen_step_ids.add(step_id)
             merged_steps.append(step)
         ordered_missing_steps = merged_steps
+    ordered_missing_steps = _observer_root_route_steps_for_observer(
+        ordered_missing_steps
+    )
     context["requested_work_mode"] = requested_work_mode
     context["work_mode_projection"] = {
         "schema_version": "observer_root_route_context_work_mode_projection.v1",

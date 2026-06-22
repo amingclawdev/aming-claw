@@ -21655,6 +21655,54 @@ def test_observer_root_route_context_dirty_no_contract_reports_recovery(conn):
     ]
 
 
+def test_observer_root_route_context_rewrites_worker_startup_contract_step(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-WORKER-STARTUP-HANDOFF"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "contract": {
+                        "contract_id": "mf_parallel.v1",
+                        "contract_template_id": "mf_parallel.v1",
+                        "contract_revision_id": "crev-worker-startup-root",
+                        "contract_execution_id": "cex-worker-startup-root",
+                        "contract_chain_id": "cchain-worker-startup-root",
+                        "state": "selected",
+                        "required_evidence": ["mf_subagent_startup"],
+                    }
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        caller_graph_query_schema_trace_id="gqt-20260619-abcdef1234",
+    )
+
+    action = result["next_legal_action"]
+    assert action["id"] == "worker_startup_handoff"
+    assert action["action"] == "handoff_worker_startup_or_recover_dispatch"
+    assert action["blocked_requirement_id"] == "mf_subagent_startup"
+    assert action["evidence_owner_role"] == "mf_sub"
+    assert action["observer_owned"] is False
+    assert action["worker_owned"] is True
+    assert "timeline_append_hint" not in action
+    assert "record_mf_subagent_startup" in action["forbidden_observer_actions"]
+    assert action["worker_handoff"]["timeline_append_hint"]["actor_role"] == "mf_sub"
+    assert (
+        result["contract_state"]["next_legal_action"]["id"]
+        == "mf_subagent_startup"
+    )
+
+
 def test_observer_root_route_context_prioritizes_successor_contract_state_action(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-SUCCESSOR-STATE-ACTION"
     task_id = "root-route-context-successor-state-task"
