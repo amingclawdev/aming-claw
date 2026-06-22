@@ -1424,6 +1424,27 @@ def test_observer_root_route_close_gate_steps_surface_deterministic_lineage_brid
     assert "close evidence is split" not in json.dumps(bridge_step)
 
 
+def test_observer_root_route_close_gate_steps_keep_worker_startup_worker_owned():
+    steps = server._observer_root_route_close_gate_steps(
+        {},
+        {"missing_requirement_ids": ["mf_subagent_startup"]},
+        backlog_id="AC-WORKER-STARTUP-HANDOFF",
+    )
+
+    assert len(steps) == 1
+    step = steps[0]
+    assert step["id"] == "worker_startup_handoff"
+    assert step["action"] == "handoff_worker_startup_or_recover_dispatch"
+    assert step["blocked_requirement_id"] == "mf_subagent_startup"
+    assert step["evidence_owner_role"] == "mf_sub"
+    assert step["worker_owned"] is True
+    assert step["observer_owned"] is False
+    assert "record_mf_subagent_startup" in step["forbidden_observer_actions"]
+    assert "provide_worker_startup_facade_with_safe_refs" in step[
+        "safe_repair_actions"
+    ]
+
+
 def test_graph_governance_asset_drift_state_and_proposal_api_are_auditable(conn):
     code, recorded = server.handle_graph_governance_asset_drift_state_record(
         _ctx(

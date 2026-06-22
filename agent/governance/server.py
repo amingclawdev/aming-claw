@@ -30694,7 +30694,29 @@ def _observer_root_route_close_gate_steps(
     ]
     for missing_id, step_id, action, reason in route_step_map:
         if missing_id in missing_route:
-            _add(step_id, action, reason)
+            if missing_id == "mf_subagent_startup":
+                _add(
+                    "worker_startup_handoff",
+                    "handoff_worker_startup_or_recover_dispatch",
+                    (
+                        "mf_subagent startup evidence is worker-owned; observer "
+                        "must hand off safe startup refs, recover worker auth, or "
+                        "dispatch a bounded worker instead of appending startup "
+                        "evidence directly"
+                    ),
+                    blocked_requirement_id="mf_subagent_startup",
+                    evidence_owner_role="mf_sub",
+                    worker_owned=True,
+                    observer_owned=False,
+                    safe_repair_actions=[
+                        "dispatch_bounded_worker",
+                        "provide_worker_startup_facade_with_safe_refs",
+                        "recover_worker_auth_or_runtime_context",
+                    ],
+                    forbidden_observer_actions=["record_mf_subagent_startup"],
+                )
+            else:
+                _add(step_id, action, reason)
 
     close_commit_evidence_gate = close_gate.get("close_commit_evidence_gate") or {}
     if (
