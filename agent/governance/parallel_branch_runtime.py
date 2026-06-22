@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     governance_project_id TEXT NOT NULL DEFAULT '',
     target_project_id TEXT NOT NULL DEFAULT '',
     target_project_root TEXT NOT NULL DEFAULT '',
+    target_files_json TEXT NOT NULL DEFAULT '[]',
+    owned_files_json  TEXT NOT NULL DEFAULT '[]',
     attempt           INTEGER NOT NULL DEFAULT 1,
     lease_id          TEXT NOT NULL DEFAULT '',
     lease_expires_at  TEXT NOT NULL DEFAULT '',
@@ -695,6 +697,8 @@ class BranchTaskRuntimeContext:
     governance_project_id: str = ""
     target_project_id: str = ""
     target_project_root: str = ""
+    target_files: tuple[str, ...] = ()
+    owned_files: tuple[str, ...] = ()
     attempt: int = 1
     lease_id: str = ""
     lease_expires_at: str = ""
@@ -1183,6 +1187,8 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
         "governance_project_id",
         "target_project_id",
         "target_project_root",
+        "target_files_json",
+        "owned_files_json",
         "merge_queue_id",
         "merge_preview_id",
         "session_token_hash",
@@ -1932,6 +1938,12 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
             row["target_project_root"] if "target_project_root" in row_keys else ""
         )
         or "",
+        target_files=_parse_json_array(
+            row["target_files_json"] if "target_files_json" in row_keys else "[]"
+        ),
+        owned_files=_parse_json_array(
+            row["owned_files_json"] if "owned_files_json" in row_keys else "[]"
+        ),
         attempt=int(row["attempt"] or 1),
         lease_id=row["lease_id"] or "",
         lease_expires_at=row["lease_expires_at"] or "",
@@ -1972,6 +1984,8 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     payload["worker_slot_id"] = context.worker_slot_id or context.worker_id
     payload["governance_project_id"] = context.governance_project_id or context.project_id
     payload["target_project_id"] = context.target_project_id or context.project_id
+    payload["target_files"] = list(context.target_files)
+    payload["owned_files"] = list(context.owned_files)
     return payload
 
 
@@ -4261,15 +4275,20 @@ def build_runtime_context_current_view(
         "owned_files",
         "write_scope",
     )
+    runtime_target_file_values = _runtime_context_string_list(context.target_files)
+    runtime_owned_file_values = _runtime_context_string_list(context.owned_files)
     target_file_values = _runtime_context_dedupe(
         list(target_files or ())
         or revision_target_file_values
+        or runtime_target_file_values
         or revision_owned_file_values
+        or runtime_owned_file_values
         or startup_target_file_values
         or startup_owned_file_values
     )
     owned_file_values = _runtime_context_dedupe(
         revision_owned_file_values
+        or runtime_owned_file_values
         or startup_owned_file_values
         or target_file_values
     )
@@ -7086,9 +7105,10 @@ def upsert_branch_context(
             stage_task_id, stage_type, retry_round, agent_id, worker_id,
             allocation_owner, worker_slot_id, actual_host_worker_id,
             host_startup_id, host_session_id, governance_project_id,
-            target_project_id, target_project_root, attempt, lease_id,
-            lease_expires_at, fence_token, branch_ref, ref_name, worktree_id,
-            worktree_path, base_commit, head_commit, target_head_commit,
+            target_project_id, target_project_root, target_files_json,
+            owned_files_json, attempt, lease_id, lease_expires_at, fence_token,
+            branch_ref, ref_name, worktree_id, worktree_path,
+            base_commit, head_commit, target_head_commit,
             session_token_hash,
             snapshot_id, projection_id, merge_queue_id, merge_preview_id,
             rollback_epoch, replay_epoch, status, depends_on_json,
@@ -7096,7 +7116,7 @@ def upsert_branch_context(
             created_at, updated_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
             runtime_context_id = excluded.runtime_context_id,
@@ -7117,6 +7137,8 @@ def upsert_branch_context(
             governance_project_id = excluded.governance_project_id,
             target_project_id = excluded.target_project_id,
             target_project_root = excluded.target_project_root,
+            target_files_json = excluded.target_files_json,
+            owned_files_json = excluded.owned_files_json,
             attempt = excluded.attempt,
             lease_id = excluded.lease_id,
             lease_expires_at = excluded.lease_expires_at,
@@ -7166,6 +7188,8 @@ def upsert_branch_context(
             context.governance_project_id or context.project_id,
             context.target_project_id or context.project_id,
             context.target_project_root,
+            _json_array(context.target_files),
+            _json_array(context.owned_files),
             context.attempt,
             context.lease_id,
             context.lease_expires_at,
@@ -9985,6 +10009,7 @@ def record_mf_subagent_startup(
     prompt_contract_hash = str(payload.get("prompt_contract_hash") or "").strip()
     route_token_ref = str(payload.get("route_token_ref") or "").strip()
     visible_manifest = str(payload.get("visible_injection_manifest_hash") or "").strip()
+    target_files = _startup_string_list(payload.get("target_files"))
     owned_files = _startup_string_list(payload.get("owned_files"))
     supplied_runtime_context_id = str(payload.get("runtime_context_id") or "").strip()
     expected_runtime_context_id = runtime_context_id_for_branch_context(context)
@@ -10549,6 +10574,8 @@ def record_mf_subagent_startup(
             governance_project_id=governance_project_id,
             target_project_id=target_project_id,
             target_project_root=target_project_root,
+            target_files=target_files or context.target_files,
+            owned_files=owned_files or context.owned_files,
             head_commit=head_commit,
             session_token_hash=_persist_token_hash,
             last_recovery_action="mf_subagent_startup_recorded",
@@ -10614,6 +10641,7 @@ def record_mf_subagent_startup(
         "target_head_commit": saved.target_head_commit,
         "head_commit": saved.head_commit,
         "merge_queue_id": saved.merge_queue_id,
+        "target_files": list(saved.target_files),
         "owned_files": list(owned_files),
         "route_id": route_id,
         "route_context_hash": route_context_hash,
@@ -10995,6 +11023,8 @@ def plan_branch_runtime_context(
     governance_project_id: str = "",
     target_project_id: str = "",
     target_project_root: str = "",
+    target_files: Sequence[str] | None = None,
+    owned_files: Sequence[str] | None = None,
     attempt: int = 1,
     branch_prefix: str = "codex",
     worktree_root: str = ".worktrees",
@@ -11038,6 +11068,8 @@ def plan_branch_runtime_context(
         governance_project_id=governance_project_id or project_id,
         target_project_id=target_project_id or project_id,
         target_project_root=target_project_root,
+        target_files=tuple(_runtime_context_string_list(target_files)),
+        owned_files=tuple(_runtime_context_string_list(owned_files)),
         attempt=attempt_num,
         branch_ref=branch_ref,
         ref_name=ref_name,

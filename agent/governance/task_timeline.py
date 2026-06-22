@@ -7402,6 +7402,16 @@ def _cross_ref_row_anchor(
         trusted_value = str(trusted.get(field) or "").strip()
         if trusted_value:
             anchor[field] = trusted_value
+    trusted_task = (
+        str(
+            trusted.get("task_id")
+            or trusted.get("root_task_id")
+            or trusted.get("parent_task_id")
+            or ""
+        ).strip()
+    )
+    if trusted_task:
+        anchor["task_id"] = trusted_task
     canonical_route_scope = _cross_ref_canonical_route_scope(rows, route_context_gate)
     for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
         if canonical_route_scope.get(field):
@@ -7423,13 +7433,6 @@ def _cross_ref_row_anchor(
             and _normalize_token(event.get("event_kind")) == "close_ready"
         ):
             anchor["task_id"] = _first_deep_text(event, "task_id")
-    if not anchor["task_id"]:
-        for raw in rows:
-            event = _mapping(raw)
-            if is_protected_close_evidence(event):
-                anchor["task_id"] = _first_deep_text(event, "task_id")
-                if anchor["task_id"]:
-                    break
     return anchor
 
 
@@ -7894,6 +7897,10 @@ def mf_close_cross_ref_gate_verification(
     for field in ("backlog_id", "project_id"):
         if not trusted_anchor.get(field) and expected.get(field):
             trusted_anchor[field] = str(expected.get(field) or "").strip()
+    for field in ("task_id", "root_task_id", "parent_task_id"):
+        value = str((row_identity or {}).get(field) or "").strip()
+        if value:
+            trusted_anchor[field] = value
     anchor = _cross_ref_row_anchor(
         rows,
         trusted_anchor,
@@ -7999,6 +8006,7 @@ def mf_close_cross_ref_gate_verification(
                 "event_ref_identity": identity,
                 "lane_identity": lane,
                 "event_route_scope": _cross_ref_public_route_scope(event),
+                "merge_queue_id": _first_deep_text(event, "merge_queue_id"),
                 "command_scope": {
                     key: value
                     for key, value in {
@@ -8903,6 +8911,7 @@ def compact_gate_summary(
                     "rejected_event_ids",
                     "relevant_event_ids",
                     "recommended_legal_action",
+                    "next_action",
                     "suggested_event_kind",
                     "append_payload_hint",
                     "repair_view_hint",
@@ -9342,6 +9351,35 @@ def _cross_ref_append_payload_skeleton(
     route_token_lineage = _mapping(first.get("route_token_child_lineage"))
     expected_task = str(_mapping(mismatches.get("task_id")).get("expected") or "").strip()
     actual_task = str(_mapping(mismatches.get("task_id")).get("actual") or "").strip()
+    parent_row_id = str(
+        row_anchor.get("task_id")
+        or row_identity.get("parent_row_id")
+        or row_identity.get("root_task_id")
+        or row_identity.get("parent_task_id")
+        or row_identity.get("backlog_id")
+        or row_anchor.get("backlog_id")
+        or ""
+    ).strip()
+    child_task_ids = _unique_compact_values(
+        [
+            str(_mapping(item.get("lane_identity")).get("task_id") or "").strip()
+            for item in rejected
+        ]
+        + [actual_task]
+    )
+    child_task_ids = [
+        task_id
+        for task_id in child_task_ids
+        if task_id and task_id != parent_row_id
+    ]
+    merge_queue_id = next(
+        (
+            str(item.get("merge_queue_id") or "").strip()
+            for item in rejected
+            if str(item.get("merge_queue_id") or "").strip()
+        ),
+        "",
+    )
 
     bridged_identities: list[dict[str, Any]] = []
     base_identity = {
@@ -9361,9 +9399,14 @@ def _cross_ref_append_payload_skeleton(
 
     payload: dict[str, Any] = {
         "bridge_reason": "repair_cross_ref_gate",
+        "next_action": "record_cross_ref_lineage_bridge",
+        "parent_row_id": parent_row_id,
+        "child_task_ids": child_task_ids,
         "rejected_event_ids": _event_ids_from_items(rejected),
         "bridged_identities": bridged_identities,
     }
+    if merge_queue_id:
+        payload["merge_queue_id"] = merge_queue_id
     if row_identity.get("backlog_id"):
         payload["backlog_id"] = row_identity["backlog_id"]
     for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
@@ -9769,6 +9812,10 @@ def _compact_append_payload_hint(skeleton: dict[str, Any]) -> dict[str, Any]:
     }
     for field in (
         "bridge_reason",
+        "next_action",
+        "parent_row_id",
+        "child_task_ids",
+        "merge_queue_id",
         "rejected_event_ids",
         "backlog_id",
         "observer_command_id",
@@ -9799,6 +9846,7 @@ def _compact_gate_repair_projection(repair: dict[str, Any]) -> dict[str, Any]:
         "rejected_event_ids",
         "relevant_event_ids",
         "recommended_legal_action",
+        "next_action",
         "suggested_event_kind",
         "advisory_only",
     ):
@@ -10015,6 +10063,7 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             "rejected_event_ids": rejected_event_ids,
             "relevant_event_ids": relevant_event_ids,
             "recommended_legal_action": recommended_action,
+            "next_action": "record_cross_ref_lineage_bridge",
             "suggested_event_kind": suggested_event_kind,
             "append_payload_skeleton": append_payload_skeleton,
             "advisory_only": True,

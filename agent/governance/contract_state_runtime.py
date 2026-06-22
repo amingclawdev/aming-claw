@@ -368,6 +368,19 @@ _QA_REQUIREMENT_EVENT_KIND_ALIASES = {
     ),
 }
 
+_WORKER_REQUIREMENT_EVENT_KIND_ALIASES = {
+    "bounded_implementation_worker_dispatch": (
+        "mf_subagent_dispatch",
+        "dispatch_bounded_worker",
+        "bounded_implementation_worker_dispatch",
+    ),
+    "bounded_implementation_subagent.dispatch": (
+        "mf_subagent_dispatch",
+        "dispatch_bounded_worker",
+        "bounded_implementation_worker_dispatch",
+    ),
+}
+
 _WORKER_TIMELINE_EVENT_KINDS = {
     "graph_trace",
     "implementation",
@@ -901,7 +914,7 @@ def _normalize_requirement(
         or step.get("event_kinds")
         or step.get("event_kind")
     )
-    step["accepted_event_kinds"] = _qa_requirement_event_kinds(
+    step["accepted_event_kinds"] = _requirement_event_kinds(
         requirement_id,
         step["accepted_event_kinds"],
     )
@@ -933,6 +946,22 @@ def _qa_requirement_event_kinds(
     return accepted_event_kinds
 
 
+def _requirement_event_kinds(
+    requirement_id: str,
+    accepted_event_kinds: list[str],
+) -> list[str]:
+    aliases = list(_WORKER_REQUIREMENT_EVENT_KIND_ALIASES.get(requirement_id) or ())
+    if aliases:
+        if not accepted_event_kinds:
+            return aliases
+        if accepted_event_kinds == [requirement_id] or not any(
+            event_kind in _DIRECT_TIMELINE_APPEND_EVENT_KINDS
+            for event_kind in accepted_event_kinds
+        ):
+            return _dedupe_nonempty([*aliases, *accepted_event_kinds])
+    return _qa_requirement_event_kinds(requirement_id, accepted_event_kinds)
+
+
 def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
     requirement_id = str(step.get("id") or "").strip()
     accepted_event_kinds = _string_list(
@@ -940,7 +969,7 @@ def _timeline_append_hint(step: Mapping[str, Any]) -> dict[str, Any]:
         or step.get("event_kinds")
         or step.get("event_kind")
     )
-    accepted_event_kinds = _qa_requirement_event_kinds(
+    accepted_event_kinds = _requirement_event_kinds(
         requirement_id,
         accepted_event_kinds,
     )
@@ -1535,6 +1564,16 @@ def _enrich_next_action_append_hint(
 
 def _next_action_requirement_metadata(step: Mapping[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
+    requirement_id = str(step.get("id") or "").strip()
+    hint = _mapping(step.get("timeline_append_hint"))
+    append_event_kind = str(hint.get("event_kind") or "").strip()
+    if (
+        requirement_id in _WORKER_REQUIREMENT_EVENT_KIND_ALIASES
+        and append_event_kind == "dispatch_bounded_worker"
+    ):
+        metadata["id"] = append_event_kind
+        metadata["action"] = append_event_kind
+        metadata["requirement_id"] = requirement_id
     for key in (
         "accepted_event_kinds",
         "accepted_statuses",
@@ -1830,6 +1869,80 @@ def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int
             if _payload_declares_requirement(child, requirement_id, depth=depth + 1):
                 return True
     return False
+
+
+def _event_deep_text(event: Mapping[str, Any], field_names: set[str]) -> str:
+    for field_name in field_names:
+        token = str(event.get(field_name) or "").strip()
+        if token:
+            return token
+    for payload in _event_payloads(event):
+        token = _payload_field_value(payload, field_names)
+        if token:
+            return token
+    return ""
+
+
+def _multiple_attempt_lineage_bridge_step(
+    events: list[dict[str, Any]],
+    *,
+    backlog_id: str,
+) -> dict[str, Any] | None:
+    """Project explicit bridge repair before generic implementation work.
+
+    Root rows can have several bounded worker attempts that share the same
+    backlog/merge lane. When no accepted lineage bridge exists yet, the next
+    action should document that sibling relationship before asking for another
+    implementation event.
+    """
+
+    accepted_bridge_kinds = {
+        "cross_ref_lineage_bridge",
+        "lineage_bridge",
+        "mf_cross_ref_lineage_bridge",
+    }
+    for event in events:
+        event_kind = str(event.get("event_kind") or "").strip()
+        status = str(event.get("status") or "").strip().lower()
+        if event_kind in accepted_bridge_kinds and status in CONTRACT_PASS_STATUSES:
+            return None
+
+    attempt_task_ids: set[str] = set()
+    for event in events:
+        event_kind = str(event.get("event_kind") or "").strip()
+        status = str(event.get("status") or "").strip().lower()
+        if status and status not in CONTRACT_PASS_STATUSES:
+            continue
+        task_id = _event_deep_text(event, {"task_id"})
+        parent_task_id = _event_deep_text(event, {"parent_task_id", "root_task_id"})
+        runtime_context_id = _event_deep_text(event, {"runtime_context_id"})
+        if not runtime_context_id and event_kind not in {
+            "mf_subagent_dispatch",
+            "mf_subagent_startup",
+            "route_context",
+            "route_action_precheck",
+        }:
+            continue
+        if not task_id or task_id == backlog_id:
+            continue
+        if backlog_id and parent_task_id != backlog_id:
+            continue
+        attempt_task_ids.add(task_id)
+
+    if len(attempt_task_ids) <= 1:
+        return None
+    return {
+        "id": "cross_ref_lineage_bridge",
+        "action": "record_cross_ref_lineage_bridge",
+        "source": "contract_state",
+        "precedence": "attempt_lineage_bridge_required",
+        "order": 250,
+        "reason": (
+            "multiple worker attempt lineages exist for this root row without "
+            "an accepted bridge"
+        ),
+        "attempt_task_ids": sorted(attempt_task_ids),
+    }
 
 
 def _requirement_requires_event_kind_match(requirement: Mapping[str, Any]) -> bool:
@@ -2701,6 +2814,14 @@ def build_contract_state_projection(
         missing_steps,
         key=lambda step: int(step.get("order") or 0),
     )
+    attempt_bridge_step = _multiple_attempt_lineage_bridge_step(
+        rows,
+        backlog_id=backlog_id,
+    )
+    if attempt_bridge_step and not any(
+        step.get("id") == attempt_bridge_step["id"] for step in ordered_next_steps
+    ):
+        ordered_next_steps = [attempt_bridge_step, *ordered_next_steps]
     requirement_contract_active = bool(has_explicit_contract and requirement_steps)
     next_legal_action: dict[str, Any] | None = None
     if requirement_contract_active and ordered_next_steps:
@@ -3515,7 +3636,11 @@ def build_contract_state_projection(
     if next_legal_action and active_execution:
         root_next_legal_action = {
             **next_legal_action,
-            "requirement_id": next_legal_action.get("id") or "",
+            "requirement_id": (
+                next_legal_action.get("requirement_id")
+                or next_legal_action.get("id")
+                or ""
+            ),
             "contract_chain_id": contract_chain_id,
             "contract_execution_id": active_execution.get("contract_execution_id") or "",
             "backlog_id": backlog_id,

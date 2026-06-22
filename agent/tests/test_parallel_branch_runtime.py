@@ -1166,6 +1166,83 @@ def test_runtime_context_worker_guide_carries_nested_dispatch_owned_files() -> N
     assert worker_view["capability_boundary"]["owned_files"] == owned_files
 
 
+def test_runtime_context_worker_guide_carries_branch_runtime_owned_files() -> None:
+    owned_files = (
+        "agent/governance/task_timeline.py",
+        "agent/governance/parallel_branch_runtime.py",
+    )
+    target_files = ("agent/governance",)
+    context = _runtime_projection_context(
+        target_files=target_files,
+        owned_files=owned_files,
+    )
+
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    current = projection["views"]["current"]
+    gate_inputs = projection["views"]["gate_inputs"]
+    worker_view = projection["views"]["worker_view"]
+    read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
+    implementation_step = read_action["ordered_worker_startup_bridge"]["steps"][4]
+
+    assert current["work"]["target_files"] == list(target_files)
+    assert current["work"]["owned_files"] == list(owned_files)
+    assert current["current_values"]["target_files"] == list(target_files)
+    assert current["current_values"]["owned_files"] == list(owned_files)
+    assert gate_inputs["target_files"] == list(target_files)
+    assert gate_inputs["owned_files"] == list(owned_files)
+    assert worker_view["target_files"] == list(target_files)
+    assert worker_view["owned_files"] == list(owned_files)
+    assert worker_view["capability_boundary"]["owned_files"] == list(owned_files)
+    assert implementation_step["owned_files"] == list(owned_files)
+    assert read_action["worker_constraints"]["scope"]["owned_files"] == list(owned_files)
+
+
+def test_branch_runtime_persists_owned_files_for_later_worker_guide() -> None:
+    conn = _runtime_conn()
+    context = _runtime_projection_context(
+        target_files=("agent/governance",),
+        owned_files=(
+            "agent/governance/task_timeline.py",
+            "agent/governance/parallel_branch_runtime.py",
+        ),
+    )
+
+    saved = upsert_branch_context(conn, context, now_iso=NOW)
+    reloaded = get_branch_context(conn, PROJECT_ID, context.task_id)
+
+    assert saved.target_files == ("agent/governance",)
+    assert saved.owned_files == (
+        "agent/governance/task_timeline.py",
+        "agent/governance/parallel_branch_runtime.py",
+    )
+    assert reloaded is not None
+    assert reloaded.target_files == saved.target_files
+    assert reloaded.owned_files == saved.owned_files
+    projection = build_runtime_context_projection(
+        reloaded,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+    assert projection["views"]["worker_view"]["owned_files"] == list(saved.owned_files)
+
+
 def test_runtime_context_projection_surfaces_terminal_dispatch_blocker() -> None:
     context = _runtime_projection_context()
     runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)

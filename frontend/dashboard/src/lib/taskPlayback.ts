@@ -477,6 +477,107 @@ function parseJsonRecord(value: unknown): Record<string, unknown> {
   }
 }
 
+interface LineageBridgeActionRecord {
+  action: string;
+  parent_row_id: string;
+  child_task_ids: string[];
+  merge_queue_id: string;
+  source: TaskPlaybackStructuredFact["source"];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const text = safeText(value);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    result.push(text);
+  }
+  return result;
+}
+
+function lineageBridgeActionsFromEvent(event: TaskTimelineEvent): LineageBridgeActionRecord[] {
+  const roots: Array<{ source: TaskPlaybackStructuredFact["source"]; value: unknown }> = [
+    { source: "payload", value: event.payload },
+    { source: "verification", value: event.verification },
+    { source: "artifact_refs", value: event.artifact_refs },
+  ];
+  const actions: LineageBridgeActionRecord[] = [];
+  const seen = new Set<string>();
+  const visit = (value: unknown, source: TaskPlaybackStructuredFact["source"], depth: number): void => {
+    if (depth > 5 || value == null) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, source, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    const text = stringsFromUnknown(record.action ?? record.next_legal_action ?? record.event_kind ?? record.id).join(" ").toLowerCase();
+    const childTaskIds = uniqueStrings([
+      ...stringsFromUnknown(record.child_task_ids),
+      ...stringsFromUnknown(record.attempt_task_ids),
+      ...stringsFromUnknown(record.task_ids),
+    ]);
+    const bridgeShaped = /(^|[\s._-])(lineage_bridge|cross_ref_lineage_bridge|record_cross_ref_lineage_bridge)([\s._-]|$)/.test(text)
+      || childTaskIds.length > 0
+      || Array.isArray(record.bridged_identities);
+    if (bridgeShaped) {
+      const bridgedIdentities = Array.isArray(record.bridged_identities) ? record.bridged_identities : [];
+      for (const identity of bridgedIdentities) {
+        const identityRecord = asRecord(identity);
+        childTaskIds.push(...stringsFromUnknown(identityRecord.task_id));
+      }
+      const action = firstStringField(record, ["action", "next_legal_action", "event_kind"]) || "record_cross_ref_lineage_bridge";
+      const normalizedChildTaskIds = uniqueStrings(childTaskIds).filter((item) => item !== "[private detail redacted]");
+      const parentRowId = firstStringField(record, ["parent_row_id", "parent_backlog_id", "backlog_id", "bug_id"]);
+      const mergeQueueId = firstStringField(record, ["merge_queue_id"]);
+      if (action === "record_cross_ref_lineage_bridge" || normalizedChildTaskIds.length > 0 || text.includes("lineage_bridge")) {
+        const key = `${action}|${parentRowId}|${normalizedChildTaskIds.join(",")}|${mergeQueueId}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          actions.push({
+            action,
+            parent_row_id: parentRowId,
+            child_task_ids: normalizedChildTaskIds,
+            merge_queue_id: mergeQueueId,
+            source,
+          });
+        }
+      }
+    }
+    for (const key of ["lineage_bridge_action", "bridge_action", "next_legal_action", "deterministic_actions", "repair_summary"]) {
+      if (key in record) visit(record[key], source, depth + 1);
+    }
+  };
+  for (const root of roots) visit(root.value, root.source, 0);
+  return actions;
+}
+
+function formatLineageBridgeAction(action: LineageBridgeActionRecord): string {
+  const details = [
+    action.parent_row_id ? `parent row ${action.parent_row_id}` : "",
+    action.child_task_ids.length > 0 ? `child tasks ${formatCompactList(action.child_task_ids)}` : "",
+    action.merge_queue_id ? `merge queue ${action.merge_queue_id}` : "",
+  ].filter(Boolean);
+  return `${action.action || "record_cross_ref_lineage_bridge"}${details.length > 0 ? ` (${details.join("; ")})` : ""}`;
+}
+
+function pushLineageBridgeFacts(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent): void {
+  const bridgeAction = lineageBridgeActionsFromEvent(event)[0];
+  if (!bridgeAction) return;
+  pushFact(facts, "lineage_bridge_action", "lineage bridge action", bridgeAction.action, bridgeAction.source);
+  if (bridgeAction.parent_row_id) {
+    pushFact(facts, "lineage_bridge_parent_row", "lineage bridge parent row", bridgeAction.parent_row_id, bridgeAction.source);
+  }
+  if (bridgeAction.child_task_ids.length > 0) {
+    pushFact(facts, "lineage_bridge_child_tasks", "lineage bridge child tasks", formatCompactList(bridgeAction.child_task_ids), bridgeAction.source);
+  }
+  if (bridgeAction.merge_queue_id) {
+    pushFact(facts, "merge_queue_id", "merge queue id", bridgeAction.merge_queue_id, bridgeAction.source);
+  }
+}
+
 function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSemanticProjection): TaskPlaybackStructuredFact[] {
   const facts: TaskPlaybackStructuredFact[] = [];
   pushFact(facts, "actor", "actor", semantic.actor_label || stringFrom(event.actor), "semantic");
@@ -624,6 +725,7 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "artifact_refs.target_files",
     "artifact_refs.owned_files",
   ]);
+  pushLineageBridgeFacts(facts, event);
   pushCountFact(facts, event, "acceptance_criteria_count", "acceptance-criteria count", "acceptance criterion", "acceptance criteria", [
     "payload.acceptance_criteria",
     "payload.prompt_contract.acceptance_criteria",
@@ -1145,7 +1247,8 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "artifact_refs.outcome.remaining_open",
     "artifact_refs.remaining_scope.remaining_open",
   ]);
-  const nextAction = firstPublicValueAtPaths(event, [
+  const bridgeAction = lineageBridgeActionsFromEvent(event)[0];
+  const nextAction = bridgeAction ? null : firstPublicValueAtPaths(event, [
     "payload.next_legal_action.description",
     "payload.next_legal_action.action",
     "payload.remaining_scope.next_legal_action.description",
@@ -1170,7 +1273,9 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "artifact_refs.remaining_scope.next_legal_action.action",
     "artifact_refs.next_legal_action",
   ]);
-  if (nextAction) {
+  if (bridgeAction) {
+    pushFact(diagnosis, "next_legal_action", "next legal action", formatLineageBridgeAction(bridgeAction), bridgeAction.source);
+  } else if (nextAction) {
     pushFact(diagnosis, "next_legal_action", "next legal action", nextAction.value, nextAction.source);
   } else if (diagnosis.length > 0 || ["blocked", "failed", "missing"].includes(status)) {
     pushFact(diagnosis, "next_legal_action", "next legal action", inferredNextLegalAction(diagnosis, status), "semantic");
@@ -2060,6 +2165,18 @@ function eventSummaryFromEvent(
   }
   const blocker = factValue(diagnosis, "blocker_ids") || factValue(diagnosis, "missing_event_kinds") || factValue(diagnosis, "missing_required_evidence");
   const nextAction = factValue(diagnosis, "next_legal_action");
+  const bridgeAction = factValue(facts, "lineage_bridge_action");
+  if (bridgeAction) {
+    const parent = factValue(facts, "lineage_bridge_parent_row");
+    const children = factValue(facts, "lineage_bridge_child_tasks");
+    const mergeQueue = factValue(facts, "merge_queue_id");
+    const details = [
+      parent ? `parent row ${parent}` : "",
+      children ? `child tasks ${children}` : "",
+      mergeQueue ? `merge queue ${mergeQueue}` : "",
+    ].filter(Boolean);
+    return `Observer recorded ${bridgeAction}${details.length > 0 ? ` for ${details.join("; ")}` : ""}.`;
+  }
   if (hasOutcomeAuditFacts(event, decision, closedRows, implementedAndMerged, remainingAcceptance, remainingOpen)) {
     const completed = [
       closedRows ? `closed rows: ${closedRows}` : "",
@@ -2460,7 +2577,7 @@ function evidenceFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSeman
 
 function artifactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSemanticProjection): TaskPlaybackArtifactRef[] {
   const containers = [event.payload, event.verification, event.artifact_refs].map(asRecord);
-  const files = collectPublicStrings(containers, ["changed_files", "target_files", "modified_files", "updated_files", "files"]);
+  const files = collectPublicStrings(containers, ["changed_files", "target_files", "owned_files", "modified_files", "updated_files", "files"]);
   const tests = collectPublicStrings(containers, ["tests_run", "test_commands", "tests_written", "test_files", "commands"]);
   const screenshots = collectPublicStrings(containers, ["screenshot", "screenshots", "browser_screenshot", "browser_screenshots"]);
   const graph = collectPublicStrings(containers, ["graph_trace_ids", "graph_query_trace_ids", "trace_ids"]);

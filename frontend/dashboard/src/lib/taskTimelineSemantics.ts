@@ -335,6 +335,9 @@ const HEADLINE_REGISTRY: Record<string, { role: string; action: string }> = {
   route_context:                          { role: "Route service",            action: "prepared public task scope for the next lane" },
   route_identity_cleanup:                 { role: "Observer",                 action: "cleaned up stale route identity entries" },
   route_identity_supersede:               { role: "Observer",                 action: "superseded a stale route identity with a fresh one" },
+  lineage_bridge:                         { role: "Observer",                 action: "recorded sibling task lineage bridge coordination" },
+  cross_ref_lineage_bridge:               { role: "Observer",                 action: "recorded sibling task lineage bridge coordination" },
+  record_cross_ref_lineage_bridge:        { role: "Observer",                 action: "prepared sibling task lineage bridge coordination" },
   dispatch:                               { role: "Observer",                 action: "dispatched a governed worker or action" },
   planning:                               { role: "Observer",                 action: "recorded planning or scenario specification" },
   scenario_spec:                          { role: "Observer",                 action: "recorded a scenario specification" },
@@ -528,7 +531,7 @@ function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[
     }
   }
 
-  // --- bridged_identities[].task_id from cross_ref_lineage_bridge ---
+  // --- bridged_identities[].task_id / bridge child_task_ids from cross_ref_lineage_bridge ---
   // Use the original (non-unwrapped) raw payload for array fields to avoid
   // double-extraction when the envelope merged an array into the flat record.
   const rawPayload = asRecord(event.payload);
@@ -545,6 +548,17 @@ function buildRelations(event: TaskTimelineEvent): TaskTimelineSemanticRelation[
           relations.push({ kind: "backlog_row", label: "bridged task", value: safe, summary: "Task id from cross-ref lineage bridge" });
         }
       }
+    }
+  }
+  const bridgeChildTaskIds = [
+    ...stringsFromBridgeAction(rawPayload),
+    ...stringsFromBridgeAction(rawVerification),
+    ...stringsFromBridgeAction(rawArtifactRefs),
+  ];
+  for (const taskIdVal of bridgeChildTaskIds.slice(0, 8)) {
+    const safe = sanitizePublicTimelineText(taskIdVal);
+    if (safe && safe !== "[private detail redacted]") {
+      relations.push({ kind: "backlog_row", label: "bridged task", value: safe, summary: "Child task id from cross-ref lineage bridge action" });
     }
   }
 
@@ -693,7 +707,57 @@ function statusLabelFor(event: TaskTimelineEvent, status: TaskTimelineSemanticSt
   return CATALOG.status_labels?.[status] ?? status;
 }
 
+function isLineageBridgeEvent(event: TaskTimelineEvent): boolean {
+  const raw = [
+    event.event_kind,
+    event.event_type,
+    event.phase,
+    event.actor,
+    valueAtPath(event as unknown as Record<string, unknown>, "payload.action"),
+    valueAtPath(event as unknown as Record<string, unknown>, "payload.next_legal_action"),
+    valueAtPath(event as unknown as Record<string, unknown>, "payload.next_legal_action.action"),
+    valueAtPath(event as unknown as Record<string, unknown>, "payload.lineage_bridge_action.action"),
+    valueAtPath(event as unknown as Record<string, unknown>, "verification.action"),
+    valueAtPath(event as unknown as Record<string, unknown>, "verification.lineage_bridge_action.action"),
+  ].flatMap(stringsFromUnknown).join(" ").toLowerCase();
+  return /(^|[\s._-])(lineage_bridge|cross_ref_lineage_bridge|record_cross_ref_lineage_bridge)([\s._-]|$)/.test(raw);
+}
+
+function stringsFromBridgeAction(source: Record<string, unknown>): string[] {
+  const values: string[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || value == null) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    const actionText = stringsFromUnknown(record.action ?? record.next_legal_action ?? record.event_kind).join(" ").toLowerCase();
+    const bridgeShaped = /(^|[\s._-])(lineage_bridge|cross_ref_lineage_bridge|record_cross_ref_lineage_bridge)([\s._-]|$)/.test(actionText)
+      || Array.isArray(record.child_task_ids)
+      || Array.isArray(record.bridged_identities);
+    if (bridgeShaped) {
+      values.push(...stringsFromUnknown(record.child_task_ids));
+      values.push(...stringsFromUnknown(record.attempt_task_ids));
+      const identities = record.bridged_identities;
+      if (Array.isArray(identities)) {
+        for (const identity of identities) {
+          const identityRecord = asRecord(identity);
+          values.push(...stringsFromUnknown(identityRecord.task_id));
+        }
+      }
+    }
+    for (const key of ["lineage_bridge_action", "bridge_action", "next_legal_action", "deterministic_actions", "repair_summary"]) {
+      if (key in record) visit(record[key], depth + 1);
+    }
+  };
+  visit(source, 0);
+  return values;
+}
+
 function laneIdForEvent(event: TaskTimelineEvent): TaskTimelineSemanticLane {
+  if (isLineageBridgeEvent(event)) return "observer";
   const raw = [
     valueAtPath(event as unknown as Record<string, unknown>, "payload.lane"),
     valueAtPath(event as unknown as Record<string, unknown>, "payload.worker_lane"),
@@ -746,6 +810,7 @@ export function semanticLaneLabel(raw: string): string | null {
 }
 
 function actorForEvent(event: TaskTimelineEvent, lane: TaskTimelineSemanticLane): string {
+  if (isLineageBridgeEvent(event)) return "Observer";
   if (lane === "worker") return "Bounded worker";
   if (lane === "gate") return "Aming Claw gate";
   if (lane === "verification") return "Verification";

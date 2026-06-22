@@ -2834,6 +2834,28 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
         conn.close()
 
 
+_OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS = {
+    "submit_mf_subagent_read_receipt",
+    "record_mf_subagent_startup",
+    "record_implementation_evidence",
+    "record_finish_time_worker_attestation",
+    "record_finish_gate",
+    "runtime_context_implementation_evidence",
+}
+
+
+def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
+    if not isinstance(allowed_actions, list):
+        return allowed_actions
+    normalized = {str(item or "").strip() for item in allowed_actions}
+    if (
+        normalized.intersection(_OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS)
+        and "task_timeline_append" not in normalized
+    ):
+        return [*allowed_actions, "task_timeline_append"]
+    return allowed_actions
+
+
 @route("POST", "/api/projects/{project_id}/observer/route-context/issue")
 def handle_observer_route_context_issue(ctx: RequestContext):
     """Mint an Aming-owned, write-authorizing observer route token.
@@ -2882,6 +2904,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     allowed_actions = body.get("allowed_actions")
     if allowed_actions is not None and not isinstance(allowed_actions, list):
         return 400, {"ok": False, "error": "allowed_actions must be a list"}
+    allowed_actions = _observer_route_context_issue_allowed_actions(allowed_actions)
     evidence_refs = body.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return 400, {"ok": False, "error": "evidence_refs must be a list"}
@@ -7378,6 +7401,210 @@ def _runtime_context_service_dedupe(values: list[str]) -> list[str]:
     return result
 
 
+def _runtime_context_public_file_values(values: Sequence[Any]) -> list[str]:
+    public_values: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text.startswith("<"):
+            continue
+        public_values.append(text)
+    return _runtime_context_service_dedupe(public_values)
+
+
+def _runtime_context_lane_identity_matches(
+    lane: Mapping[str, Any],
+    *,
+    task_id: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
+) -> bool:
+    wanted = {
+        str(item or "").strip()
+        for item in (task_id, worker_id, worker_slot_id)
+        if str(item or "").strip()
+    }
+    if not wanted:
+        return False
+    candidate_values = {
+        str(lane.get(key) or "").strip()
+        for key in (
+            "task_id",
+            "worker_id",
+            "agent_id",
+            "worker_slot_id",
+            "worker_lane",
+            "lane_id",
+            "slot_id",
+            "id",
+        )
+    }
+    return bool(wanted.intersection(candidate_values))
+
+
+def _runtime_context_collect_worker_scope_files(
+    *,
+    task_id: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
+    latest_revision_payload: Mapping[str, Any] | None = None,
+    sources: Sequence[Any] = (),
+) -> list[str]:
+    values: list[str] = []
+
+    def add_direct(source: Any) -> None:
+        if not isinstance(source, Mapping):
+            return
+        values.extend(
+            _runtime_context_service_query_values(
+                source,
+                "owned_files",
+                "target_files",
+                "acknowledged_owned_files",
+                "assigned_files",
+            )
+        )
+        scope = source.get("scope")
+        if isinstance(scope, Mapping):
+            add_direct(scope)
+        worker_constraints = source.get("worker_constraints")
+        if isinstance(worker_constraints, Mapping):
+            add_direct(worker_constraints)
+
+    def visit_lanes(source: Any, *, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(source, Mapping):
+            add_direct(source)
+            lanes = source.get("worker_lanes") or source.get("lanes") or []
+            if isinstance(lanes, list):
+                for lane in lanes:
+                    if isinstance(lane, Mapping) and _runtime_context_lane_identity_matches(
+                        lane,
+                        task_id=task_id,
+                        worker_id=worker_id,
+                        worker_slot_id=worker_slot_id,
+                    ):
+                        add_direct(lane)
+            for key in (
+                "contract",
+                "payload",
+                "prompt_contract",
+                "chain_trigger",
+                "contract_chain",
+                "contract_executions",
+                "execution_plan",
+                "worker_dispatch",
+            ):
+                child = source.get(key)
+                if isinstance(child, (Mapping, list)):
+                    visit_lanes(child, depth=depth + 1)
+        elif isinstance(source, list):
+            for item in source:
+                if isinstance(item, (Mapping, list)):
+                    visit_lanes(item, depth=depth + 1)
+
+    payload, contract, receipt = _runtime_context_revision_payload(latest_revision_payload)
+    for source in [payload, contract, receipt, *(sources or ())]:
+        visit_lanes(source)
+    return _runtime_context_public_file_values(values)
+
+
+def _runtime_context_worker_scope_projection(owned_files: Sequence[str]) -> dict[str, Any]:
+    files = _runtime_context_public_file_values(list(owned_files))
+    return {
+        "schema_version": "runtime_context.worker_scope.v1",
+        "owned_files": files,
+        "target_files": files,
+    }
+
+
+def _runtime_context_patch_scope_record(
+    record: dict[str, Any],
+    owned_files: Sequence[str],
+) -> None:
+    files = _runtime_context_public_file_values(list(owned_files))
+    if not files:
+        return
+    if not record.get("owned_files"):
+        record["owned_files"] = list(files)
+    if not record.get("target_files"):
+        record["target_files"] = list(files)
+    scope = record.get("scope")
+    if not isinstance(scope, dict):
+        scope = {}
+        record["scope"] = scope
+    if not scope.get("owned_files"):
+        scope["owned_files"] = list(files)
+    if not scope.get("target_files"):
+        scope["target_files"] = list(files)
+
+
+def _runtime_context_patch_worker_scope(
+    container: Any,
+    owned_files: Sequence[str],
+) -> None:
+    files = _runtime_context_public_file_values(list(owned_files))
+    if not files or not isinstance(container, dict):
+        return
+    _runtime_context_patch_scope_record(container, files)
+    for key in (
+        "task",
+        "action_plan",
+        "control_plane",
+        "capability_boundary",
+        "graph_query_identity",
+        "worker_execution_safety",
+    ):
+        child = container.get(key)
+        if isinstance(child, dict):
+            _runtime_context_patch_scope_record(child, files)
+    read_receipt_action = (
+        container.get("read_receipt_hash_action")
+        if isinstance(container.get("read_receipt_hash_action"), dict)
+        else None
+    )
+    if read_receipt_action is not None:
+        _runtime_context_patch_worker_scope(read_receipt_action, files)
+    worker_constraints = (
+        container.get("worker_constraints")
+        if isinstance(container.get("worker_constraints"), dict)
+        else None
+    )
+    if worker_constraints is not None:
+        _runtime_context_patch_worker_scope(worker_constraints, files)
+
+
+def _runtime_context_patch_actionable_payload_worker_scope(
+    actionables: dict[str, Any],
+    owned_files: Sequence[str],
+) -> None:
+    files = _runtime_context_public_file_values(list(owned_files))
+    if not files:
+        return
+    actionables["owned_files"] = list(files)
+    actionables["target_files"] = list(files)
+    for key in (
+        "read_receipt_facade_payload_skeleton",
+        "startup_facade_payload_skeleton",
+        "implementation_evidence_facade_payload_skeleton",
+        "finish_time_worker_attestation_submission",
+        "finish_time_worker_attestation_body",
+    ):
+        value = actionables.get(key)
+        if not isinstance(value, dict):
+            continue
+        _runtime_context_patch_scope_record(value, files)
+        for child_key in (
+            "copy_safe_body",
+            "body",
+            "payload",
+            "contract_context_read_receipt",
+        ):
+            child = value.get(child_key)
+            if isinstance(child, dict):
+                _runtime_context_patch_scope_record(child, files)
+
+
 def _runtime_context_service_graph_trace_values_from_event(
     event: Mapping[str, Any],
 ) -> list[str]:
@@ -7507,6 +7734,7 @@ def _runtime_context_projection_response(
         fence_token=str(getattr(context, "fence_token", "") or ""),
     ).to_dict()
     views = projection.get("views") if isinstance(projection.get("views"), dict) else {}
+    full_worker_view_for_scope = dict(views.get("worker_view") or {})
     requested_view = str(ctx.query.get("view") or "auto").strip().lower()
     if role == "mf_sub":
         exposed_views = {"worker_view": dict(views.get("worker_view") or {})}
@@ -7548,6 +7776,35 @@ def _runtime_context_projection_response(
         if isinstance(exposed_views.get("worker_view"), Mapping)
         else {}
     )
+    worker_scope_files = _runtime_context_collect_worker_scope_files(
+        task_id=str(getattr(context, "task_id", "") or ""),
+        worker_id=str(
+            worker_view_for_summary.get("worker_id")
+            or worker_view_for_summary.get("agent_id")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        worker_slot_id=str(
+            worker_view_for_summary.get("worker_slot_id")
+            or getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        latest_revision_payload=latest_revision_payload,
+        sources=[
+            ctx.query,
+            full_worker_view_for_scope,
+            worker_view_for_summary,
+            {
+                "owned_files": getattr(context, "owned_files", []),
+                "target_files": getattr(context, "target_files", []),
+            },
+        ],
+    )
+    if worker_scope_files and isinstance(worker_view_for_summary, dict):
+        _runtime_context_patch_worker_scope(worker_view_for_summary, worker_scope_files)
+        if "worker_view" in exposed_views:
+            exposed_views["worker_view"] = worker_view_for_summary
     branch_view_for_summary = (
         worker_view_for_summary.get("branch")
         if isinstance(worker_view_for_summary.get("branch"), Mapping)
@@ -7597,6 +7854,9 @@ def _runtime_context_projection_response(
         "worktree_path": worktree_path,
         "target_project_root_projection": target_root_projection,
         "corrected_request_shapes": target_root_projection["corrected_request_shapes"],
+        "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
+        "owned_files": list(worker_scope_files),
+        "target_files": list(worker_scope_files),
         "runtime_context_id": runtime_context_id,
         "task_id": getattr(context, "task_id", ""),
         "role_scope": role_scope,
@@ -7609,6 +7869,7 @@ def _runtime_context_projection_response(
             "views": exposed_views,
             "source_policy": projection.get("source_policy") or {},
             "content_address": scoped_content_address,
+            "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
         },
         "access_audit": {
             "schema_version": audit["schema_version"],
@@ -7680,6 +7941,10 @@ def _runtime_context_projection_response(
         contract_revision_id=contract_identity["contract_revision_id"],
         contract_hash=contract_identity["contract_hash"],
         context_hash=str(scoped_content_address.get("projection_hash") or ""),
+    )
+    _runtime_context_patch_actionable_payload_worker_scope(
+        current_actionable_payloads,
+        worker_scope_files,
     )
     executable_contract = _runtime_context_executable_contract_envelope(
         response,
@@ -7863,6 +8128,28 @@ def _runtime_context_executable_contract_envelope(
         or worker_id
         or ""
     )
+    worker_scope_files = _runtime_context_collect_worker_scope_files(
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        latest_revision_payload=latest_revision_payload,
+        sources=[
+            current_state_response,
+            worker_view,
+            action_plan,
+            control_plane,
+            task,
+            graph_identity,
+            branch_view,
+            actionable_payloads if isinstance(actionable_payloads, Mapping) else {},
+        ],
+    )
+    if worker_scope_files:
+        _runtime_context_patch_worker_scope(worker_view, worker_scope_files)
+        _runtime_context_patch_worker_scope(action_plan, worker_scope_files)
+        _runtime_context_patch_worker_scope(control_plane, worker_scope_files)
+        _runtime_context_patch_worker_scope(task, worker_scope_files)
+        _runtime_context_patch_worker_scope(graph_identity, worker_scope_files)
     fence_token_hash = str(
         graph_identity.get("fence_token_hash")
         or worker_view.get("fence_token_hash")
@@ -7923,6 +8210,9 @@ def _runtime_context_executable_contract_envelope(
                 "canonical_visible_contract_text_hash"
             ),
         },
+        "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
+        "owned_files": list(worker_scope_files),
+        "target_files": list(worker_scope_files),
         "route_identity": present_route_identity,
         "runtime_identity": {
             "runtime_context_id": runtime_context_id,
@@ -7940,6 +8230,8 @@ def _runtime_context_executable_contract_envelope(
             ),
             "fence_token_hash": fence_token_hash,
             "fence_token_redacted": True,
+            "owned_files": list(worker_scope_files),
+            "target_files": list(worker_scope_files),
         },
         "contract_context_read_receipt": {
             "schema_version": "contract_context_read_receipt.v1",
@@ -7968,6 +8260,9 @@ def _runtime_context_executable_contract_envelope(
             "successor_contract_execution_id": contract_identity[
                 "successor_contract_execution_id"
             ],
+            "acknowledged_owned_files": list(worker_scope_files),
+            "owned_files": list(worker_scope_files),
+            "target_files": list(worker_scope_files),
             "route_token_ref": safe_route_identity.get("route_token_ref", ""),
             "endpoint": {
                 "facade": "runtime_context.read_receipts",
@@ -8250,6 +8545,33 @@ def _runtime_context_worker_guide_response(
         or worker_view.get("worker_slot_id")
         or worker_id
     )
+    worker_scope_files = _runtime_context_collect_worker_scope_files(
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        sources=[
+            current_state_response,
+            worker_view,
+            action_plan,
+            control_plane,
+            capability_boundary,
+            worker_execution_safety,
+            graph_identity,
+            branch_view,
+            task,
+        ],
+    )
+    if worker_scope_files:
+        for scope_container in (
+            worker_view,
+            action_plan,
+            control_plane,
+            capability_boundary,
+            worker_execution_safety,
+            graph_identity,
+            task,
+        ):
+            _runtime_context_patch_worker_scope(scope_container, worker_scope_files)
     target_root_projection = dict(
         current_state_response.get("target_project_root_projection") or {}
     )
@@ -8511,6 +8833,7 @@ def _runtime_context_worker_guide_response(
         for item in finish_attestation_hint.get("changed_files") or []
         if str(item or "").strip()
     ]
+    attestation_owned_files = hinted_changed_files or list(worker_scope_files)
     hinted_worker_session_id = str(
         finish_attestation_hint.get("worker_session_id") or ""
     ).strip()
@@ -8574,8 +8897,8 @@ def _runtime_context_worker_guide_response(
             finish_attestation_hint.get("head_commit")
             or "<worker-worktree-head-commit>"
         ),
-        "changed_files": hinted_changed_files or ["<owned-file>"],
-        "owned_files": hinted_changed_files or ["<owned-file>"],
+        "changed_files": attestation_owned_files or ["<owned-file>"],
+        "owned_files": attestation_owned_files or ["<owned-file>"],
         "actual_cwd": str(
             finish_attestation_hint.get("actual_cwd") or target_project_root
         ),
@@ -8686,7 +9009,8 @@ def _runtime_context_worker_guide_response(
         "target_project_root": target_project_root,
         "checkpoint_id": "<finish-gate-checkpoint-id>",
         "head_commit": "<worker-worktree-head-commit>",
-        "changed_files": ["<owned-file>"],
+        "changed_files": list(worker_scope_files) or ["<owned-file>"],
+        "owned_files": list(worker_scope_files) or ["<owned-file>"],
         "test_results": {"status": "passed", "passed": True},
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
         "read_receipt_event_id": "<accepted-read-receipt-event-id>",
@@ -8705,7 +9029,8 @@ def _runtime_context_worker_guide_response(
             "target_project_root": target_project_root,
             "checkpoint_id": "<finish-gate-checkpoint-id>",
             "head_commit": "<worker-worktree-head-commit>",
-            "changed_files": ["<owned-file>"],
+            "changed_files": list(worker_scope_files) or ["<owned-file>"],
+            "owned_files": list(worker_scope_files) or ["<owned-file>"],
             "status": "review_ready",
             "test_results": {"status": "passed", "passed": True},
             "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
@@ -9054,6 +9379,10 @@ def _runtime_context_worker_guide_response(
     actionable_payloads["finish_time_worker_attestation_body"] = dict(
         finish_attestation_submission["body"]
     )
+    _runtime_context_patch_actionable_payload_worker_scope(
+        actionable_payloads,
+        worker_scope_files,
+    )
     executable_contract = _runtime_context_executable_contract_envelope(
         current_state_response,
         actionable_payloads=actionable_payloads,
@@ -9070,6 +9399,9 @@ def _runtime_context_worker_guide_response(
         "worktree_path": worktree_path,
         "target_project_root_projection": target_root_projection,
         "corrected_request_shapes": corrected_request_shapes,
+        "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
+        "owned_files": list(worker_scope_files),
+        "target_files": list(worker_scope_files),
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "session_token_ref": str(worker_view.get("session_token_ref") or ""),
@@ -9105,6 +9437,9 @@ def _runtime_context_worker_guide_response(
             "worktree_path": worktree_path,
             "target_project_root_projection": target_root_projection,
             "corrected_request_shapes": corrected_request_shapes,
+            "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
+            "owned_files": list(worker_scope_files),
+            "target_files": list(worker_scope_files),
             "next_legal_action": next_legal_action,
             "next_required_evidence": next_required_evidence,
             "missing_evidence": list(
@@ -9151,6 +9486,9 @@ def _runtime_context_worker_guide_response(
                 ),
                 "target_project_root": target_project_root,
                 "worktree_path": worktree_path,
+                "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
+                "owned_files": list(worker_scope_files),
+                "target_files": list(worker_scope_files),
                 "session_token_ref": str(worker_view.get("session_token_ref") or ""),
                 "fence_token_hash": graph_identity.get("fence_token_hash") or "",
                 "fence_token_redacted": True,
@@ -10644,6 +10982,31 @@ def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
     return dict(route_identity)
 
 
+def _runtime_context_latest_parent_route_identity(
+    revision_payload: Mapping[str, Any],
+    fallback_route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidates = (
+        revision_payload.get("parent_route_identity"),
+        (revision_payload.get("payload") or {}).get("parent_route_identity")
+        if isinstance(revision_payload.get("payload"), Mapping)
+        else {},
+        (revision_payload.get("route_gate") or {}).get("parent_route_identity")
+        if isinstance(revision_payload.get("route_gate"), Mapping)
+        else {},
+    )
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            identity = {
+                field: str(candidate.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if str(candidate.get(field) or "").strip()
+            }
+            if identity:
+                return identity
+    return dict(fallback_route_identity)
+
+
 def _runtime_context_child_route_token(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -10922,6 +11285,34 @@ def _runtime_context_validate_parent_bound_route_identity(
         if isinstance(token.get("parent_route_lineage"), Mapping)
         else {}
     )
+
+    def lineage_payload(parent_lineage_value: Mapping[str, Any]) -> dict[str, Any]:
+        child_lineage = (
+            dict(token.get("child_route_lineage"))
+            if isinstance(token.get("child_route_lineage"), Mapping)
+            else _route_identity_public_summary(child_route_identity)
+        )
+        if (
+            child_route_identity.get("route_token_ref")
+            and not child_lineage.get("route_token_ref")
+        ):
+            child_lineage["route_token_ref"] = child_route_identity["route_token_ref"]
+        route_lineage = (
+            dict(token.get("route_lineage"))
+            if isinstance(token.get("route_lineage"), Mapping)
+            else {
+                "schema_version": "runtime_context.implementation_route_lineage.v1",
+                "status": "parent_bound",
+                "parent_route_lineage": dict(parent_lineage_value),
+                "child_route_lineage": dict(child_lineage),
+            }
+        )
+        return {
+            "parent_route_lineage": dict(parent_lineage_value),
+            "child_route_lineage": dict(child_lineage),
+            "route_lineage": route_lineage,
+        }
+
     if not parent_lineage:
         if token_matches_parent:
             identity = dict(parent_route_identity)
@@ -10952,28 +11343,7 @@ def _runtime_context_validate_parent_bound_route_identity(
             mismatched_fields=mismatches,
         )
 
-    child_lineage = (
-        dict(token.get("child_route_lineage"))
-        if isinstance(token.get("child_route_lineage"), Mapping)
-        else _route_identity_public_summary(child_route_identity)
-    )
-    if child_route_identity.get("route_token_ref") and not child_lineage.get("route_token_ref"):
-        child_lineage["route_token_ref"] = child_route_identity["route_token_ref"]
-    route_lineage = (
-        dict(token.get("route_lineage"))
-        if isinstance(token.get("route_lineage"), Mapping)
-        else {
-            "schema_version": "runtime_context.implementation_route_lineage.v1",
-            "status": "parent_bound",
-            "parent_route_lineage": dict(parent_lineage),
-            "child_route_lineage": dict(child_lineage),
-        }
-    )
-    return child_route_identity, {
-        "parent_route_lineage": dict(parent_lineage),
-        "child_route_lineage": dict(child_lineage),
-        "route_lineage": route_lineage,
-    }
+    return child_route_identity, lineage_payload(parent_lineage)
 
 
 def _runtime_context_implementation_resolved_ref_route_identity(
@@ -12380,13 +12750,18 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             allow_validated=True,
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
+        revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
+        parent_route_identity = _runtime_context_latest_parent_route_identity(
+            revision_payload,
+            route_identity,
+        )
         event_route_identity, route_lineage_payload = (
             _runtime_context_implementation_event_route_identity(
                 body,
                 project_id=project_id,
                 runtime_context_id=runtime_context_id,
                 context=context,
-                parent_route_identity=route_identity,
+                parent_route_identity=parent_route_identity,
             )
         )
         parent_task_id = (
@@ -12908,6 +13283,10 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
         revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
+        parent_route_identity = _runtime_context_latest_parent_route_identity(
+            revision_payload,
+            route_identity,
+        )
         from . import task_timeline
 
         timeline_events = task_timeline.list_events(
@@ -12924,7 +13303,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             project_id=project_id,
             runtime_context_id=runtime_context_id,
             context=context,
-            parent_route_identity=route_identity,
+            parent_route_identity=parent_route_identity,
         )
     )
 
@@ -29277,9 +29656,118 @@ def _observer_root_route_canonical_identity_projection(
     }
 
 
+def _observer_root_route_worker_lane_task_ids(source: Any) -> list[str]:
+    task_ids: list[str] = []
+
+    def visit(value: Any, *, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, Mapping):
+            lanes = value.get("worker_lanes") or value.get("lanes") or []
+            if isinstance(lanes, list):
+                for lane in lanes:
+                    if isinstance(lane, Mapping):
+                        task_id = str(lane.get("task_id") or "").strip()
+                        if task_id:
+                            task_ids.append(task_id)
+            for key in (
+                "contract",
+                "payload",
+                "chain_trigger",
+                "contract_chain",
+                "contract_executions",
+                "execution_plan",
+            ):
+                child = value.get(key)
+                if isinstance(child, (Mapping, list)):
+                    visit(child, depth=depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, (Mapping, list)):
+                    visit(item, depth=depth + 1)
+
+    visit(source)
+    return _runtime_context_service_dedupe(task_ids)
+
+
+def _observer_root_route_lineage_bridge_action(
+    close_gate: Mapping[str, Any],
+    route_context_gate: Mapping[str, Any],
+    *,
+    backlog_id: str = "",
+    contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    cross_ref_gate = (
+        close_gate.get("cross_ref_gate")
+        if isinstance(close_gate.get("cross_ref_gate"), Mapping)
+        else {}
+    )
+    child_task_ids: list[str] = []
+    for item in route_context_gate.get("attempt_lineage_candidates") or []:
+        if not isinstance(item, Mapping):
+            continue
+        lineage = item.get("lineage") if isinstance(item.get("lineage"), Mapping) else {}
+        task_id = str(lineage.get("task_id") or item.get("task_id") or "").strip()
+        if task_id:
+            child_task_ids.append(task_id)
+    for item in cross_ref_gate.get("rejected_cross_ref_evidence") or []:
+        if not isinstance(item, Mapping):
+            continue
+        lineage = item.get("lineage") if isinstance(item.get("lineage"), Mapping) else {}
+        task_id = str(lineage.get("task_id") or item.get("task_id") or "").strip()
+        if task_id:
+            child_task_ids.append(task_id)
+    child_task_ids.extend(_observer_root_route_worker_lane_task_ids(contract or {}))
+    child_task_ids = _runtime_context_service_dedupe(child_task_ids)
+
+    merge_queue_id = _runtime_context_public_text(
+        close_gate.get("merge_queue_id"),
+        route_context_gate.get("merge_queue_id"),
+        (contract or {}).get("merge_queue_id") if isinstance(contract, Mapping) else "",
+    )
+    if not merge_queue_id and isinstance(contract, Mapping):
+        merge_queue_candidates: list[str] = []
+
+        def visit_merge(value: Any, *, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(value, Mapping):
+                candidate = str(value.get("merge_queue_id") or "").strip()
+                if candidate:
+                    merge_queue_candidates.append(candidate)
+                for child in value.values():
+                    if isinstance(child, (Mapping, list)):
+                        visit_merge(child, depth=depth + 1)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, (Mapping, list)):
+                        visit_merge(item, depth=depth + 1)
+
+        visit_merge(contract)
+        merge_queue_id = _runtime_context_public_text(*merge_queue_candidates)
+
+    parent_row_id = str(backlog_id or "").strip()
+    return {
+        "schema_version": "observer_root_route.cross_ref_lineage_bridge_action.v1",
+        "id": "cross_ref_lineage_bridge",
+        "event_kind": "cross_ref_lineage_bridge",
+        "action": "record_cross_ref_lineage_bridge",
+        "next_legal_action": "record_cross_ref_lineage_bridge",
+        "parent_row_id": parent_row_id,
+        "parent_backlog_id": parent_row_id,
+        "child_task_ids": child_task_ids,
+        "merge_queue_id": merge_queue_id,
+        "status": "required",
+        "raw_token_exposed": False,
+    }
+
+
 def _observer_root_route_close_gate_steps(
     close_gate: Mapping[str, Any],
     route_context_gate: Mapping[str, Any],
+    *,
+    backlog_id: str = "",
+    contract: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
 
@@ -29322,13 +29810,23 @@ def _observer_root_route_close_gate_steps(
         )
 
     cross_ref_gate = close_gate.get("cross_ref_gate") or {}
+    bridge_action = _observer_root_route_lineage_bridge_action(
+        close_gate,
+        route_context_gate,
+        backlog_id=backlog_id,
+        contract=contract,
+    )
     if isinstance(cross_ref_gate, Mapping) and not cross_ref_gate.get("passed"):
         rejected = cross_ref_gate.get("rejected_cross_ref_evidence") or []
         if rejected:
             _add(
                 "cross_ref_lineage_bridge",
                 "record_cross_ref_lineage_bridge",
-                "close evidence is split across task attempts or route scopes",
+                "cross-ref lineage bridge required for sibling task attempts",
+                parent_row_id=bridge_action.get("parent_row_id"),
+                child_task_ids=bridge_action.get("child_task_ids"),
+                merge_queue_id=bridge_action.get("merge_queue_id"),
+                bridge_action=bridge_action,
                 rejected_cross_ref_evidence=rejected,
             )
     attempt_task_ids = {
@@ -29346,7 +29844,11 @@ def _observer_root_route_close_gate_steps(
         _add(
             "cross_ref_lineage_bridge",
             "record_cross_ref_lineage_bridge",
-            "multiple worker attempt lineages exist for this root row without an accepted bridge",
+            "cross-ref lineage bridge required for sibling task attempts",
+            parent_row_id=bridge_action.get("parent_row_id"),
+            child_task_ids=bridge_action.get("child_task_ids"),
+            merge_queue_id=bridge_action.get("merge_queue_id"),
+            bridge_action=bridge_action,
             attempt_task_ids=sorted(attempt_task_ids),
         )
 
@@ -30122,6 +30624,16 @@ def _observer_root_route_context_state(
     close_gate_steps = _observer_root_route_close_gate_steps(
         close_gate,
         route_context_gate,
+        backlog_id=backlog_id,
+        contract=contract,
+    )
+    lineage_bridge_action = next(
+        (
+            step.get("bridge_action")
+            for step in close_gate_steps
+            if isinstance(step.get("bridge_action"), Mapping)
+        ),
+        {},
     )
     supervisor_transition_prerequisites_satisfied = bool(
         transition_gate.get("allowed") and canonical_identity_complete
@@ -30292,6 +30804,7 @@ def _observer_root_route_context_state(
         "missing_evidence_groups": close_gate.get("missing_evidence_groups") or {},
         "action_card": close_action_card,
         "close_action_card": close_action_card,
+        "lineage_bridge_action": lineage_bridge_action,
     }
     context["backlog_row_present"] = bool(row)
     return context
@@ -31002,6 +31515,216 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
     )
 
 
+def _observer_runtime_text_prepare_worker_route_identity(
+    conn,
+    project_id: str,
+    body: Mapping[str, Any],
+    resolved_context: Mapping[str, Any],
+    owned_files: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the body shape workers should use for append-scoped evidence."""
+
+    from . import observer_route_context
+
+    def _first_text(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _route_identity_from(source: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            field: _first_text(source.get(field))
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+
+    effective_body = dict(body)
+    supplied_identity = _route_identity_from(body)
+    parent_route_identity = (
+        dict(body.get("parent_route_identity"))
+        if isinstance(body.get("parent_route_identity"), Mapping)
+        else {}
+    )
+    if not parent_route_identity:
+        parent_route_identity = {
+            field: value for field, value in supplied_identity.items() if value
+        }
+    else:
+        for field, value in supplied_identity.items():
+            if value and not parent_route_identity.get(field):
+                parent_route_identity[field] = value
+
+    route_token_ref = supplied_identity.get("route_token_ref", "")
+    backlog_id = _first_text(body.get("backlog_id"), resolved_context.get("backlog_id"))
+    task_id = _first_text(
+        body.get("task_id"),
+        resolved_context.get("task_id"),
+        resolved_context.get("stage_task_id"),
+    )
+    observer_command_id = _first_text(
+        body.get("observer_command_id"),
+        resolved_context.get("observer_command_id"),
+    )
+    runtime_context_id = _first_text(
+        body.get("runtime_context_id"),
+        resolved_context.get("runtime_context_id"),
+    )
+    proof = {
+        "schema_version": "observer_runtime_text.worker_route_identity.v1",
+        "source": "observer_runtime_text_prepare",
+        "status": "unchanged",
+        "route_token_ref": route_token_ref,
+        "append_scoped": False,
+        "raw_route_token_persisted": False,
+    }
+
+    if not route_token_ref or not backlog_id or not task_id or not owned_files:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "missing_route_scope_for_append_child_ref",
+                "missing_fields": [
+                    field
+                    for field, value in (
+                        ("route_token_ref", route_token_ref),
+                        ("backlog_id", backlog_id),
+                        ("task_id", task_id),
+                        ("owned_files", owned_files),
+                    )
+                    if not value
+                ],
+            }
+        )
+        return effective_body, proof
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        resolved = None
+        proof["resolution_error"] = str(exc)
+
+    normalized_actions = {
+        str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+        for action in ((resolved or {}).get("allowed_actions") or [])
+    }
+    if resolved and "task_timeline_append" in normalized_actions:
+        proof.update(
+            {
+                "status": "resolved_append_scoped_ref",
+                "append_scoped": True,
+                "route_token_ref": route_token_ref,
+            }
+        )
+        return effective_body, proof
+
+    required_parent_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    )
+    missing_parent = [
+        field for field in required_parent_fields if not parent_route_identity.get(field)
+    ]
+    if missing_parent:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "missing_parent_route_identity_for_append_child_ref",
+                "missing_fields": missing_parent,
+            }
+        )
+        return effective_body, proof
+
+    parent_route_identity = {
+        **parent_route_identity,
+        "selected_project": project_id,
+        "selected_backlog_id": backlog_id,
+    }
+    evidence_refs = [
+        ref
+        for ref in (
+            f"observer_command:{observer_command_id}" if observer_command_id else "",
+            f"runtime_context:{runtime_context_id}" if runtime_context_id else "",
+            "observer_runtime_text_prepare",
+        )
+        if ref
+    ]
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=owned_files,
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=evidence_refs,
+        parent_route_identity=parent_route_identity,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=str(issued.get("route_token_ref") or ""),
+        token=issued.get("route_token") if isinstance(issued.get("route_token"), Mapping) else {},
+    )
+    parent_lineage = (
+        issued.get("parent_route_lineage")
+        if isinstance(issued.get("parent_route_lineage"), Mapping)
+        else {}
+    )
+    child_lineage = (
+        issued.get("child_route_lineage")
+        if isinstance(issued.get("child_route_lineage"), Mapping)
+        else {}
+    )
+    if parent_lineage and child_lineage:
+        observer_route_context.persist_route_token_ref_lineage(
+            conn,
+            project_id=project_id,
+            route_token_ref=str(issued.get("route_token_ref") or ""),
+            parent_route_lineage=parent_lineage,
+            child_route_lineage=child_lineage,
+            route_lineage=issued.get("route_lineage")
+            if isinstance(issued.get("route_lineage"), Mapping)
+            else {},
+        )
+
+    child_identity = {
+        "route_id": str(issued.get("route_id") or ""),
+        "route_context_hash": str(issued.get("route_context_hash") or ""),
+        "prompt_contract_id": str(issued.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(
+            (issued.get("route_token") or {}).get("prompt_contract_hash")
+            if isinstance(issued.get("route_token"), Mapping)
+            else ""
+        ),
+        "visible_injection_manifest_hash": str(
+            issued.get("visible_injection_manifest_hash") or ""
+        ),
+        "route_token_ref": str(issued.get("route_token_ref") or ""),
+    }
+    for field, value in child_identity.items():
+        effective_body[field] = value
+    effective_body["parent_route_identity"] = parent_route_identity
+    proof.update(
+        {
+            "status": "issued_append_scoped_child_ref",
+            "append_scoped": True,
+            "route_token_ref": child_identity["route_token_ref"],
+            "parent_route_token_ref": parent_route_identity.get("route_token_ref", ""),
+            "child_route_identity": child_identity,
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+        }
+    )
+    return effective_body, proof
+
+
 def _bounded_worker_dispatch_recovery_payload(
     *,
     project_id: str,
@@ -31548,6 +32271,11 @@ def _observer_runtime_text_contract_revision_payload(
         "target_files",
     )
     route_identity = _parallel_branch_runtime_contract_route_identity(prepared, body)
+    parent_route_identity = (
+        dict(body.get("parent_route_identity"))
+        if isinstance(body.get("parent_route_identity"), Mapping)
+        else {}
+    )
     persistent_evidence = (
         prepared.get("persistent_evidence")
         if isinstance(prepared.get("persistent_evidence"), Mapping)
@@ -31755,6 +32483,7 @@ def _observer_runtime_text_contract_revision_payload(
             prepared.get("merge_queue_id") or body.get("merge_queue_id") or ""
         ),
         "route_identity": dict(route_identity) if isinstance(route_identity, Mapping) else {},
+        "parent_route_identity": parent_route_identity,
         "target_files": owned_files,
         "owned_files": owned_files,
         "acceptance_criteria": _runtime_context_service_query_values(
@@ -31892,6 +32621,19 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "owned_files",
         "target_files",
     )
+    conn = get_connection(project_id)
+    try:
+        body, worker_route_identity_evidence = (
+            _observer_runtime_text_prepare_worker_route_identity(
+                conn,
+                project_id,
+                body,
+                resolved_context,
+                owned_files,
+            )
+        )
+    finally:
+        conn.close()
     request = ObserverRuntimeTextPrepareRequest(
         project_id=project_id,
         backlog_id=str(body.get("backlog_id") or resolved_context.get("backlog_id") or ""),
@@ -32001,6 +32743,17 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         ),
     )
     prepared = build_observer_runtime_text_context(request)
+    if worker_route_identity_evidence:
+        prepared["worker_route_identity_evidence"] = dict(
+            worker_route_identity_evidence
+        )
+        child_identity = worker_route_identity_evidence.get("child_route_identity")
+        if isinstance(child_identity, Mapping):
+            prepared["worker_route_identity"] = dict(child_identity)
+        prepared["persistent_evidence"] = {
+            **dict(prepared.get("persistent_evidence") or {}),
+            "worker_route_identity": dict(worker_route_identity_evidence),
+        }
     revision = _persist_observer_runtime_text_contract_revision(
         project_id,
         body,
@@ -34697,9 +35450,15 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         from . import task_timeline
 
         events = task_timeline.list_events(conn, pid, backlog_id=bug_id, limit=limit)
+        contract: dict[str, Any] = {}
+        route_context_gate: dict[str, Any] = {}
         if applicable["is_mf"]:
             contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
             contract = _mf_close_contract_with_route_context(contract, row, ctx.query)
+            route_context_gate = task_timeline.mf_route_context_gate_verification(
+                events,
+                contract=contract,
+            )
             verification = _mf_close_gate_verification(
                 events,
                 contract=contract,
@@ -34792,10 +35551,37 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             )
             result["gate_summary"] = compact_summary
         elif view == "repair":
-            result["repair_summary"] = task_timeline.repair_gate_summary(
+            repair_summary = task_timeline.repair_gate_summary(
                 {**verification, "project_id": pid, "bug_id": bug_id, "applicable": applicable["is_mf"]},
                 request_id=ctx.request_id,
             )
+            bridge_action = _observer_root_route_lineage_bridge_action(
+                verification,
+                route_context_gate,
+                backlog_id=bug_id,
+                contract=contract,
+            )
+            if (
+                bridge_action.get("child_task_ids")
+                and not verification.get("passed")
+                and isinstance(verification.get("cross_ref_gate"), Mapping)
+                and not (verification.get("cross_ref_gate") or {}).get("passed")
+            ):
+                repair_summary = dict(repair_summary)
+                repair_summary["lineage_bridge_action"] = bridge_action
+                deterministic_actions = [
+                    item
+                    for item in repair_summary.get("deterministic_actions") or []
+                    if not (
+                        isinstance(item, Mapping)
+                        and item.get("action") == "record_cross_ref_lineage_bridge"
+                    )
+                ]
+                repair_summary["deterministic_actions"] = [
+                    bridge_action,
+                    *deterministic_actions,
+                ]
+            result["repair_summary"] = repair_summary
         else:
             result["timeline_gate"] = verification
         # Criterion 2: surface FIXED + can_close=false + no-waiver as a

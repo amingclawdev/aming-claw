@@ -11964,6 +11964,111 @@ def test_cross_ref_same_backlog_siblings_do_not_block_canonical_registry_child_l
     assert "project_id" in rejected[0]["mismatches"]
 
 
+def test_cross_ref_does_not_promote_first_child_lane_to_row_anchor():
+    from agent.governance import task_timeline
+
+    row_identity = {"backlog_id": "AC-SIBLING", "project_id": "aming-claw"}
+    worker_a = {
+        "id": 71,
+        "event_kind": "implementation",
+        "status": "accepted",
+        "backlog_id": "AC-SIBLING",
+        "project_id": "aming-claw",
+        "task_id": "worker-a",
+        "payload": {"scope": "agent/governance"},
+    }
+    worker_b = {
+        "id": 72,
+        "event_kind": "implementation",
+        "status": "accepted",
+        "backlog_id": "AC-SIBLING",
+        "project_id": "aming-claw",
+        "task_id": "worker-b",
+        "payload": {"scope": "agent/governance"},
+    }
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [worker_a, worker_b],
+        row_identity,
+    )
+
+    assert gate["passed"] is True
+    assert gate["row_anchor"]["backlog_id"] == "AC-SIBLING"
+    assert gate["row_anchor"]["task_id"] == ""
+    assert gate["rejected_cross_ref_evidence"] == []
+
+
+def test_cross_ref_repair_projects_parent_row_child_tasks_and_merge_queue():
+    from agent.governance import task_timeline
+
+    row_identity = {
+        "backlog_id": "AC-SIBLING",
+        "project_id": "aming-claw",
+        "scope": "agent/governance/root",
+    }
+    worker_a = {
+        "id": 81,
+        "event_kind": "implementation",
+        "status": "accepted",
+        "backlog_id": "AC-SIBLING",
+        "project_id": "aming-claw",
+        "task_id": "worker-a",
+        "payload": {
+            "scope": "agent/governance/runtime",
+            "merge_queue_id": "mq-sibling",
+        },
+    }
+    worker_b = {
+        "id": 82,
+        "event_kind": "verification",
+        "status": "accepted",
+        "backlog_id": "AC-SIBLING",
+        "project_id": "aming-claw",
+        "task_id": "worker-b",
+        "payload": {
+            "scope": "agent/governance/dashboard",
+            "merge_queue_id": "mq-sibling",
+        },
+    }
+    cross_ref_gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [worker_a, worker_b],
+        row_identity,
+    )
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "missing_event_kinds": [],
+        "event_count": 2,
+        "cross_ref_gate": cross_ref_gate,
+    }
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+    cross_ref = next(
+        item for item in repair["failed_gate_repairs"]
+        if item["gate"] == "cross_ref_gate"
+    )
+
+    assert cross_ref["next_action"] == "record_cross_ref_lineage_bridge"
+    skeleton = cross_ref["append_payload_skeleton"]
+    payload = skeleton["payload"]
+    assert payload["next_action"] == "record_cross_ref_lineage_bridge"
+    assert payload["parent_row_id"] == "AC-SIBLING"
+    assert payload["child_task_ids"] == ["worker-a", "worker-b"]
+    assert payload["merge_queue_id"] == "mq-sibling"
+    compact = task_timeline.compact_gate_summary(full_gate)
+    compact_cross_ref = next(
+        item for item in compact["failed_gates"]
+        if item["gate"] == "cross_ref_gate"
+    )
+    assert compact_cross_ref["next_action"] == "record_cross_ref_lineage_bridge"
+    assert compact_cross_ref["append_payload_hint"]["parent_row_id"] == "AC-SIBLING"
+    assert compact_cross_ref["append_payload_hint"]["child_task_ids"] == [
+        "worker-a",
+        "worker-b",
+    ]
+    assert compact_cross_ref["append_payload_hint"]["merge_queue_id"] == "mq-sibling"
+
+
 def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     from agent.governance import task_timeline
 

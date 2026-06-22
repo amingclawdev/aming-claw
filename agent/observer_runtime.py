@@ -204,6 +204,7 @@ WORKER_LAUNCH_PACK_ALLOWED_ACTIONS = (
     "patch_owned_files",
     "run_focused_tests",
     "record_implementation_evidence",
+    "task_timeline_append",
     "record_finish_time_worker_attestation",
     "record_finish_gate",
     "report_review_ready",
@@ -2556,6 +2557,7 @@ def _runtime_text_parent_route_lineage(
         "allowed_actions": [
             "prepare_runtime_text",
             "dispatch_bounded_worker",
+            "task_timeline_append",
             "run_tests",
             "git_diff",
             "report_review_ready",

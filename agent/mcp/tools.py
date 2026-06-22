@@ -489,6 +489,11 @@ TOOLS: list[dict] = [
                 "main_worktree": {"type": "string"},
                 "workspace_root": {"type": "string"},
                 "owned_files": {"type": "array", "items": {"type": "string"}},
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Alias for dispatch-visible owned_files/target_files scope.",
+                },
                 "observer_command_id": {
                     "type": "string",
                     "description": (
@@ -1150,7 +1155,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_worker_guide",
-        "description": "Read the Runtime Context Service worker guide, including read/write guide intent for a bounded worker.",
+        "description": "Read the Runtime Context Service worker guide, including next_legal_action, next_required_evidence, owned_files/target_files scope, and read/write guide intent for a bounded worker.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_schema_properties(),

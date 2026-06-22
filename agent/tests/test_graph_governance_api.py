@@ -37,6 +37,7 @@ from agent.governance.mf_subagent_contract import (
 )
 from agent.observer_runtime import (
     ObserverRuntimeTextPrepareRequest,
+    WORKER_LAUNCH_PACK_ALLOWED_ACTIONS,
     build_observer_runtime_text_context,
 )
 from agent.governance.parallel_branch_runtime import (
@@ -66,6 +67,42 @@ PID = "graph-api-test"
 
 def _fake_sha(label: str) -> str:
     return "sha256:" + hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _persist_append_route_token_ref(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+    task_id: str,
+    route_id: str,
+    route_context_hash: str,
+    prompt_contract_id: str,
+    prompt_contract_hash: str,
+    visible_injection_manifest_hash: str,
+    route_token_ref: str,
+) -> None:
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            "route_id": route_id,
+            "route_context_hash": route_context_hash,
+            "prompt_contract_id": prompt_contract_id,
+            "prompt_contract_hash": prompt_contract_hash,
+            "visible_injection_manifest_hash": visible_injection_manifest_hash,
+            "route_token_ref": route_token_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["test:append-route-token-ref"],
+        },
+    )
 
 
 class _NoCloseConn:
@@ -1348,6 +1385,43 @@ def test_backlog_list_compact_hides_completed_command_with_stale_projection_for_
     assert "observer_command_projection" not in bug
 
 
+def test_observer_root_route_close_gate_steps_surface_deterministic_lineage_bridge_action():
+    steps = server._observer_root_route_close_gate_steps(
+        {
+            "cross_ref_gate": {
+                "passed": False,
+                "rejected_cross_ref_evidence": [
+                    {"lineage": {"task_id": "worker-child-a"}}
+                ],
+            }
+        },
+        {
+            "attempt_lineage_candidates": [
+                {"lineage": {"task_id": "worker-child-b"}}
+            ]
+        },
+        backlog_id="AC-PARENT-ROW",
+        contract={
+            "merge_queue_id": "mq-parent-row",
+            "worker_lanes": [{"task_id": "worker-child-c"}],
+        },
+    )
+
+    bridge_step = next(step for step in steps if step["id"] == "cross_ref_lineage_bridge")
+    bridge_action = bridge_step["bridge_action"]
+    assert bridge_step["action"] == "record_cross_ref_lineage_bridge"
+    assert bridge_action["action"] == "record_cross_ref_lineage_bridge"
+    assert bridge_action["parent_row_id"] == "AC-PARENT-ROW"
+    assert bridge_action["child_task_ids"] == [
+        "worker-child-b",
+        "worker-child-a",
+        "worker-child-c",
+    ]
+    assert bridge_action["merge_queue_id"] == "mq-parent-row"
+    assert bridge_action["raw_token_exposed"] is False
+    assert "close evidence is split" not in json.dumps(bridge_step)
+
+
 def test_graph_governance_asset_drift_state_and_proposal_api_are_auditable(conn):
     code, recorded = server.handle_graph_governance_asset_drift_state_record(
         _ctx(
@@ -2225,6 +2299,17 @@ def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(con
     )
     main = tmp_path / "main"
     main.mkdir()
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id="AC-RUNTIME-TEXT",
+        task_id="runtime-text-task",
+        route_id="route-api",
+        route_context_hash="sha256:route-api",
+        prompt_contract_id="rprompt-api",
+        prompt_contract_hash="sha256:prompt-api",
+        visible_injection_manifest_hash="sha256:visible-api",
+        route_token_ref="rtok-api",
+    )
 
     prepared = server.handle_observer_runtime_text_prepare(
         _ctx(
@@ -2538,6 +2623,17 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     )
     assert status_code == 201
     context = allocated["context"]
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id="AC-RUNTIME-TEXT",
+        task_id=context["task_id"],
+        route_id="route-api",
+        route_context_hash="sha256:route-api",
+        prompt_contract_id="rprompt-api",
+        prompt_contract_hash="sha256:prompt-api",
+        visible_injection_manifest_hash="sha256:visible-api",
+        route_token_ref="rtok-api",
+    )
 
     prepared = server.handle_observer_runtime_text_prepare(
         _ctx(
@@ -3134,6 +3230,170 @@ def test_observer_runtime_text_prepare_prefers_registered_parent_lineage_without
     assert dispatch_payload["route_action_scope_lineage"]["child_route_identity"][
         "route_context_hash"
     ] == child_identity["route_context_hash"]
+
+
+def test_observer_runtime_text_prepare_mints_append_scoped_worker_route_ref(
+    conn,
+    tmp_path,
+):
+    bug_id = "AC-RUNTIME-TEXT-APPEND-CHILD"
+    task_id = "runtime-text-append-child-task"
+    runtime_context_id = "mfrctx-runtime-text-append-child"
+    session_token = "session-runtime-text-append-child"
+    worktree = tmp_path / "append-child-worker"
+    worktree.mkdir()
+    main = tmp_path / "append-child-main"
+    main.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(worktree),
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=bug_id,
+            root_task_id=bug_id,
+            stage_task_id=task_id,
+            stage_type="mf_sub",
+            worker_id="worker-append-child",
+            worker_slot_id="slot-append-child",
+            attempt=1,
+            fence_token="fence-runtime-text-append-child",
+            session_token_hash=mf_subagent_session_token_hash(session_token),
+            branch_ref="refs/heads/codex/runtime-text-append-child",
+            worktree_id="wt-runtime-text-append-child",
+            worktree_path=str(worktree),
+            base_commit="base-append-child",
+            target_head_commit="target-append-child",
+            merge_queue_id="mq-runtime-text-append-child",
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=bug_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["dispatch_bounded_lane"],
+        evidence_refs=["timeline:runtime-text-parent-dispatch"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_route_identity = {
+        "route_id": parent_issue["route_id"],
+        "route_context_hash": parent_issue["route_context_hash"],
+        "prompt_contract_id": parent_issue["prompt_contract_id"],
+        "prompt_contract_hash": parent_issue["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": parent_issue[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": parent_issue["route_token_ref"],
+    }
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": bug_id,
+                "observer_command_id": "cmd-runtime-text-append-child",
+                "task_id": task_id,
+                "parent_task_id": bug_id,
+                "runtime_context_id": runtime_context_id,
+                "fence_token": "fence-runtime-text-append-child",
+                "worktree_path": str(worktree),
+                "branch_ref": "refs/heads/codex/runtime-text-append-child",
+                "base_commit": "base-append-child",
+                "target_head_commit": "target-append-child",
+                "merge_queue_id": "mq-runtime-text-append-child",
+                **parent_route_identity,
+                "parent_route_identity": parent_route_identity,
+                "main_worktree": str(main),
+                "owned_files": ["agent/governance/server.py"],
+                "graph_trace_ids": ["gqt-runtime-text-append-child"],
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    child_ref = prepared["route_identity"]["route_token_ref"]
+    assert child_ref
+    assert child_ref != parent_issue["route_token_ref"]
+    assert prepared["route_identity"]["route_id"] != parent_route_identity["route_id"]
+    worker_route_identity = prepared["persistent_evidence"]["worker_route_identity"]
+    assert worker_route_identity["status"] == "issued_append_scoped_child_ref"
+    assert worker_route_identity["parent_route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+    assert worker_route_identity["child_route_identity"]["route_token_ref"] == child_ref
+    revision = prepared["runtime_contract_revision"]
+    assert revision["route_identity"]["route_token_ref"] == child_ref
+    assert revision["payload"]["route_identity"]["route_token_ref"] == child_ref
+
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=bug_id,
+        task_id=task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["route_token_ref"] == child_ref
+    assert dispatch_payload["route_token_registry_proof"]["accepted"] is True
+    assert dispatch_payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    assert dispatch_payload["parent_route_lineage"]["route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+    assert dispatch_payload["child_route_lineage"]["route_token_ref"] == child_ref
+    assert dispatch_payload["child_route_lineage"]["parent_route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": context.root_task_id,
+                "fence_token": "fence-runtime-text-append-child",
+                "session_token": session_token,
+                "target_project_root": str(worktree),
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "summary": "ref-only child route from runtime-text prepare",
+                },
+                "route_token_ref": child_ref,
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["timeline_event"]["event_kind"] == "implementation"
+    assert response["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    assert response["route_token_gate"]["route_token_ref"] == child_ref
+    stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (response["timeline_event"]["id"],),
+    ).fetchone()
+    payload = json.loads(stored["payload_json"])
+    assert payload["route_token_ref"] == child_ref
+    assert payload["parent_route_lineage"]["route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+    assert payload["child_route_lineage"]["route_token_ref"] == child_ref
+    assert "route_token" not in payload
 
 
 def test_timeline_precheck_enrichment_rejects_event_local_lineage_without_registry_binding(
