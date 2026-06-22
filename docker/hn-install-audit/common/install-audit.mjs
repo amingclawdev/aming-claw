@@ -140,6 +140,21 @@ function projectSlug(value) {
     || "project";
 }
 
+function pluginInstallSlug(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/\/+$/g, "");
+  const tail = (cleaned.split(/[\\/]/).pop() || "aming-claw").replace(/\.git$/i, "");
+  return tail
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    || "aming-claw";
+}
+
+function installedCodexPluginRoot() {
+  return join(INSTALL_ROOT, pluginInstallSlug(INSTALL_SOURCE));
+}
+
 function pluginVersion() {
   try {
     const raw = readFileSync(join(SRC_ROOT, ".codex-plugin", "plugin.json"), "utf8");
@@ -1323,7 +1338,9 @@ function buildReport({
     ? "AI_PROMPT_MODE=skip; deterministic install checks ran, but the one-click AI install and HN demo prompts were not executed."
     : loginRequired
       ? "Claude CLI is installed but not authenticated in the mounted auth home. Run `claude /login` or `claude auth login` with the same auth home, then rerun with --claude-auth-home <dir>."
-    : "";
+      : "";
+  const installedPluginRoot = HOST === "codex" ? installedCodexPluginRoot() : claudeCacheRoot();
+  const installedPluginCommit = hostInstall.ok ? String(gitHead(installedPluginRoot) || "").trim() : "";
   const combinedFeatureSmokes = [
     ...(featureSmokes || []),
     ...(liveObserverRoute?.requested ? [liveObserverRoute] : []),
@@ -1369,6 +1386,8 @@ function buildReport({
     source_mode: SOURCE_MODE,
     install_source: INSTALL_SOURCE,
     plugin_root: SRC_ROOT,
+    installed_plugin_root: installedPluginRoot,
+    installed_plugin_commit: installedPluginCommit,
     cache_path: HOST === "codex" ? codexCacheRoot() : claudeCacheRoot(),
     fresh_session_id: `${HOST}-docker-${RUN_ID}`,
     skills_seen: skills,
