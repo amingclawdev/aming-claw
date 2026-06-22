@@ -249,6 +249,23 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
 _QA_EVIDENCE_CONTRACT_TEMPLATE_ID = "qa_evidence_gate_review.v1"
 _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID = "audit_close_with_qa_acceptance.v1"
 
+_CONTRACT_FIRST_CANDIDATE_TEMPLATES = [
+    "onboard_contract.v1",
+    "observer_hotfix_direct_mutation.v1",
+    "mf_parallel.v1",
+    _QA_EVIDENCE_CONTRACT_TEMPLATE_ID,
+    _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID,
+]
+
+_CONTRACT_FIRST_SUPPORTED_ROLES = [
+    "onboard",
+    "observer_hotfix",
+    "parallel_worker",
+    "qa",
+    "merge",
+    "audit_close",
+]
+
 _META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
     "observer": {
         "route_context",
@@ -481,6 +498,15 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, list | tuple | set):
         return _dedupe_nonempty([str(item or "").strip() for item in value])
     return []
+
+
+def _event_kind(event: Mapping[str, Any]) -> str:
+    return str(
+        event.get("event_kind")
+        or event.get("kind")
+        or event.get("event_type")
+        or ""
+    ).strip()
 
 
 def _json_mapping(value: Any) -> dict[str, Any]:
@@ -1374,6 +1400,82 @@ def _default_timeline_append_hint_for_action(
     action: Mapping[str, Any],
 ) -> dict[str, Any]:
     action_id = str(action.get("id") or action.get("action") or "").strip()
+    if action_id == "select_or_enter_contract":
+        event_kind = "contract_binding"
+        actor_role = _actor_role_for_append_event(event_kind, action_id)
+        candidate_templates = _string_list(action.get("candidate_contract_templates"))
+        if not candidate_templates:
+            candidate_templates = list(_CONTRACT_FIRST_CANDIDATE_TEMPLATES)
+        supported_roles = _string_list(action.get("supported_contract_roles"))
+        if not supported_roles:
+            supported_roles = list(_CONTRACT_FIRST_SUPPORTED_ROLES)
+        return {
+            "schema_version": "contract_state_timeline_append_hint.v1",
+            "event_kind": event_kind,
+            "event_type": "contract.selected",
+            "status": "passed",
+            "payload": {
+                "schema_version": "contract_first_selection_hint.v1",
+                "requirement_id": "select_or_enter_contract",
+                "requirement_ids": ["select_or_enter_contract"],
+                "selection_required_before_mutation": True,
+                "candidate_contract_templates": candidate_templates,
+                "supported_contract_roles": supported_roles,
+                "entrypoints": {
+                    "onboard_or_parallel_or_qa": (
+                        "append contract_binding / contract_revision_created evidence"
+                    ),
+                    "observer_hotfix": (
+                        "POST /api/projects/{project_id}/hotfix/enter before mutation"
+                    ),
+                    "audit_close": (
+                        "select audit_close_with_qa_acceptance.v1 only for "
+                        "recovery closure"
+                    ),
+                },
+            },
+            "actor_role": actor_role,
+            "lane_actor_role": actor_role,
+            "meta_contract_gate": _meta_contract_append_gate(event_kind, actor_role),
+            "satisfies_by": "event_kind",
+            "accepted_event_kinds": [
+                "contract_binding",
+                "contract_revision_created",
+                "contract_bound",
+                "hotfix_entered",
+            ],
+            "accepted_statuses": sorted(CONTRACT_PASS_STATUSES),
+        }
+    if action_id == "hotfix_post_action_summary":
+        event_kind = "hotfix_under_action"
+        actor_role = _actor_role_for_append_event(event_kind, action_id)
+        return {
+            "schema_version": "contract_state_timeline_append_hint.v1",
+            "event_kind": event_kind,
+            "event_type": "hotfix.under_action",
+            "status": "accepted",
+            "payload": {
+                "schema_version": "observer_hotfix_action_summary.v1",
+                "requirement_id": "hotfix_post_action_summary",
+                "requirement_ids": ["hotfix_post_action_summary"],
+                "pre_reason_event_id": str(action.get("pre_reason_event_id") or ""),
+                "what_changed": "<summary of the tiny deterministic mutation>",
+                "changed_files": [],
+                "verification_evidence_refs": [],
+                "deviations_from_plan": [],
+                "remaining_close_gate_evidence": [
+                    "independent_verification",
+                    "verification",
+                    "close_ready",
+                ],
+            },
+            "actor_role": actor_role,
+            "lane_actor_role": actor_role,
+            "meta_contract_gate": _meta_contract_append_gate(event_kind, actor_role),
+            "satisfies_by": "event_kind",
+            "accepted_event_kinds": [event_kind],
+            "accepted_statuses": sorted(CONTRACT_PASS_STATUSES),
+        }
     if action_id == "close_ready":
         event_kind = "close_ready"
         actor_role = _actor_role_for_append_event(event_kind, action_id)
@@ -1580,6 +1682,10 @@ def _next_action_requirement_metadata(step: Mapping[str, Any]) -> dict[str, Any]
         "accepted_statuses",
         "timeline_append_hint",
         "prerequisite_ids",
+        "candidate_contract_templates",
+        "supported_contract_roles",
+        "entrypoints",
+        "pre_reason_event_id",
     ):
         value = step.get(key)
         if value not in (None, "", [], {}):
@@ -1618,6 +1724,12 @@ def _next_action_summary(action: Mapping[str, Any] | None) -> dict[str, Any]:
         "route_token_request_hint",
         "close_ready_evidence_refs",
         "terminal_semantics",
+        "candidate_contract_templates",
+        "supported_contract_roles",
+        "entrypoints",
+        "recovery_state",
+        "dirty_files",
+        "dirty_target_files",
     ):
         value = action.get(key)
         if value in (None, "", [], {}):
@@ -1658,7 +1770,7 @@ def _runtime_next_legal_operation(action: Mapping[str, Any] | None) -> dict[str,
     operation = str(action.get("action") or action_id or "").strip()
     hint = _mapping(action.get("timeline_append_hint"))
     role_policy = _mapping(hint.get("role_bound_prefill_policy"))
-    return {
+    result = {
         "schema_version": "contract_state.next_legal_operation.v1",
         "id": action_id,
         "operation": operation,
@@ -1677,6 +1789,24 @@ def _runtime_next_legal_operation(action: Mapping[str, Any] | None) -> dict[str,
         "close_gate_role": "final_verifier",
         "prefill_state": role_policy,
     }
+    for key in (
+        "candidate_contract_templates",
+        "supported_contract_roles",
+        "entrypoints",
+        "recovery_state",
+        "dirty_files",
+        "dirty_target_files",
+    ):
+        value = action.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, Mapping):
+            result[key] = dict(value)
+        elif isinstance(value, list):
+            result[key] = list(value)
+        else:
+            result[key] = value
+    return result
 
 
 def _runtime_contract_hints(
@@ -2686,6 +2816,91 @@ def _contract_requirements_state(
     }
 
 
+def _latest_passing_event_with_kind(
+    events: list[dict[str, Any]],
+    event_kind: str,
+) -> dict[str, Any]:
+    matches = [
+        event
+        for event in events
+        if _event_kind(event) == event_kind
+        and str(event.get("status") or "").strip() in CONTRACT_PASS_STATUSES
+    ]
+    if not matches:
+        return {}
+    return max(matches, key=_event_numeric_id)
+
+
+def _contract_first_selection_step(
+    *,
+    backlog_id: str,
+    project_id: str,
+) -> dict[str, Any]:
+    return {
+        "id": "select_or_enter_contract",
+        "action": "select_or_enter_contract",
+        "detail": (
+            "select or enter an onboard, hotfix, parallel-worker, QA, merge, "
+            "or audit-close contract before mutating governed files"
+        ),
+        "source": "contract_state",
+        "precedence": "contract_first_pre_mutation",
+        "order": 1,
+        "backlog_id": backlog_id,
+        "project_id": project_id,
+        "accepted_event_kinds": [
+            "contract_binding",
+            "contract_revision_created",
+            "contract_bound",
+            "hotfix_entered",
+        ],
+        "accepted_statuses": sorted(CONTRACT_PASS_STATUSES),
+        "candidate_contract_templates": list(_CONTRACT_FIRST_CANDIDATE_TEMPLATES),
+        "supported_contract_roles": list(_CONTRACT_FIRST_SUPPORTED_ROLES),
+        "entrypoints": {
+            "onboard_contract.v1": (
+                "append contract_binding / contract_revision_created evidence"
+            ),
+            "observer_hotfix_direct_mutation.v1": (
+                "POST /api/projects/{project_id}/hotfix/enter"
+            ),
+            "mf_parallel.v1": "instantiate and bind a role-scoped parallel contract",
+            _QA_EVIDENCE_CONTRACT_TEMPLATE_ID: (
+                "create a QA-owned successor contract/evidence lane"
+            ),
+            _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID: (
+                "select only for audited recovery closure"
+            ),
+            "merge": "select a merge/close successor contract before privileged merge",
+        },
+    }
+
+
+def _legacy_hotfix_post_action_step(
+    *,
+    backlog_id: str,
+    project_id: str,
+    hotfix_event: Mapping[str, Any],
+) -> dict[str, Any]:
+    pre_reason_event_id = _event_ref_id(hotfix_event)
+    return {
+        "id": "hotfix_post_action_summary",
+        "action": "record_hotfix_under_action",
+        "detail": (
+            "record the direct observer hotfix action summary before verification "
+            "or close"
+        ),
+        "source": "contract_state",
+        "precedence": "legacy_hotfix_direct_mutation_step",
+        "order": 2,
+        "backlog_id": backlog_id,
+        "project_id": project_id,
+        "pre_reason_event_id": pre_reason_event_id,
+        "accepted_event_kinds": ["hotfix_under_action"],
+        "accepted_statuses": sorted(CONTRACT_PASS_STATUSES),
+    }
+
+
 def build_contract_state_projection(
     events: list[dict[str, Any]] | None,
     contract: Mapping[str, Any] | None = None,
@@ -2823,14 +3038,46 @@ def build_contract_state_projection(
         step.get("id") == attempt_bridge_step["id"] for step in ordered_next_steps
     ):
         ordered_next_steps = [attempt_bridge_step, *ordered_next_steps]
+    contract_first_runtime_step: dict[str, Any] = {}
+    if legacy_no_contract:
+        latest_hotfix_entered = _latest_passing_event_with_kind(
+            rows,
+            "hotfix_entered",
+        )
+        latest_hotfix_under_action = _latest_passing_event_with_kind(
+            rows,
+            "hotfix_under_action",
+        )
+        if latest_hotfix_entered and not latest_hotfix_under_action:
+            contract_first_runtime_step = _legacy_hotfix_post_action_step(
+                backlog_id=backlog_id,
+                project_id=project_id,
+                hotfix_event=latest_hotfix_entered,
+            )
+        elif not latest_hotfix_entered:
+            contract_first_runtime_step = _contract_first_selection_step(
+                backlog_id=backlog_id,
+                project_id=project_id,
+            )
+        if contract_first_runtime_step and not any(
+            step.get("id") == contract_first_runtime_step["id"]
+            for step in ordered_next_steps
+        ):
+            ordered_next_steps = [
+                contract_first_runtime_step,
+                *ordered_next_steps,
+            ]
     requirement_contract_active = bool(has_explicit_contract and requirement_steps)
     next_legal_action: dict[str, Any] | None = None
-    if requirement_contract_active and ordered_next_steps:
+    if (
+        requirement_contract_active or contract_first_runtime_step
+    ) and ordered_next_steps:
         first = ordered_next_steps[0]
         next_legal_action = {
             "id": first["id"],
             "action": first.get("action") or f"record_{first['id']}",
-            "detail": f"record contract evidence for {first['id']}",
+            "detail": first.get("detail")
+            or f"record contract evidence for {first['id']}",
             "source": first.get("source") or "contract_state",
             "precedence": first.get("precedence") or "active_contract_missing_step",
             "blocked_by": first.get("blocked_by") or [],

@@ -407,7 +407,30 @@ def test_projection_keeps_no_contract_rows_without_chain_requirement():
     assert projection["contract_chain"] == []
     assert projection["successor_contract_candidates"] == []
     assert projection["selected_successor_contract"] == {}
-    assert projection["next_legal_action"] is None
+    assert projection["next_legal_action"]["id"] == "select_or_enter_contract"
+    assert projection["next_legal_action"]["precedence"] == "contract_first_pre_mutation"
+    assert "observer_hotfix_direct_mutation.v1" in projection["next_legal_action"][
+        "candidate_contract_templates"
+    ]
+    assert "merge" in projection["next_legal_action"]["supported_contract_roles"]
+    assert projection["runtime_contract_hints"]["next_legal_operation"][
+        "id"
+    ] == "select_or_enter_contract"
+
+
+def test_no_contract_hotfix_entry_prompts_hotfix_under_action():
+    projection = build_contract_state_projection(
+        [_event(41, "hotfix_entered")],
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    action = projection["next_legal_action"]
+    assert projection["legacy_no_contract"] is True
+    assert action["id"] == "hotfix_post_action_summary"
+    assert action["action"] == "record_hotfix_under_action"
+    assert action["timeline_append_hint"]["event_kind"] == "hotfix_under_action"
+    assert action["timeline_append_hint"]["payload"]["pre_reason_event_id"] == "41"
 
 
 def test_root_terminal_contract_with_close_ready_prompts_backlog_close_route_token():

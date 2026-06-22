@@ -21579,6 +21579,61 @@ def test_observer_root_route_context_includes_contract_state_projection(conn):
     assert result["contract_state"]["legacy_no_contract"] is False
 
 
+def test_observer_root_route_context_contract_first_for_no_contract_row(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-CONTRACT-FIRST"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        caller_graph_query_schema_trace_id="gqt-20260619-abcdef1234",
+    )
+
+    assert result["contract_state"]["legacy_no_contract"] is True
+    assert (
+        result["contract_state"]["next_legal_action"]["id"]
+        == "select_or_enter_contract"
+    )
+    assert result["next_legal_action"]["id"] == "select_or_enter_contract"
+    assert result["next_legal_action"]["precedence"] == "contract_first_pre_mutation"
+    assert "observer_work_mode_transition" in result["next_legal_action"][
+        "deferred_missing_prerequisites"
+    ]
+
+
+def test_observer_root_route_context_dirty_no_contract_reports_recovery(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-DIRTY-NO-CONTRACT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ? WHERE bug_id = ?",
+        (json.dumps(["agent/governance/server.py"]), backlog_id),
+    )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        caller_graph_query_schema_trace_id="gqt-20260619-abcdef1234",
+        close_planning_body={"dirty_files": ["agent/governance/server.py"]},
+    )
+
+    assert (
+        result["next_legal_action"]["id"]
+        == "recover_dirty_without_contract_first_evidence"
+    )
+    assert result["next_legal_action"]["recovery_state"] == (
+        "dirty_without_contract_first_evidence"
+    )
+    assert result["next_legal_action"]["dirty_target_files"] == [
+        "agent/governance/server.py"
+    ]
+
+
 def test_observer_root_route_context_prioritizes_successor_contract_state_action(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-SUCCESSOR-STATE-ACTION"
     task_id = "root-route-context-successor-state-task"

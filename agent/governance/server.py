@@ -30787,6 +30787,12 @@ def _observer_root_route_contract_state_action_has_priority(
     action_id = str(action.get("id") or action.get("action") or "").strip()
     if not action_id or action_id in {"close_ready", "successor_contract_complete"}:
         return False
+    if action_id in {
+        "select_or_enter_contract",
+        "hotfix_post_action_summary",
+        "recover_dirty_without_contract_first_evidence",
+    }:
+        return True
     source = str(action.get("source") or "").strip()
     if source and source != "contract_state":
         return False
@@ -30818,6 +30824,116 @@ def _observer_root_route_contract_state_action_has_priority(
             and missing_source.endswith("_contract_state.v1")
         )
     )
+
+
+def _observer_root_route_dirty_files_from_request_or_git(
+    *,
+    project_id: str,
+    close_planning_body: Mapping[str, Any] | None,
+) -> list[str]:
+    body = close_planning_body if isinstance(close_planning_body, Mapping) else {}
+    supplied = _string_list_field(
+        body.get("dirty_files")
+        or body.get("target_dirty_files")
+        or body.get("dirty_scope_files")
+        or body.get("changed_files")
+        or ""
+    )
+    if supplied:
+        return filter_dirty_files(supplied)
+
+    self_root = Path(__file__).resolve().parents[2]
+    project_entry = project_service.get_project(project_id)
+    if project_entry and project_entry.get("workspace_path"):
+        root = Path(str(project_entry["workspace_path"])).resolve()
+    elif project_id == "aming-claw":
+        root = self_root
+    else:
+        return []
+    porcelain = _git_output(root, ["status", "--porcelain"])
+    if not porcelain:
+        return []
+    return filter_dirty_files(parse_git_porcelain_paths(porcelain))
+
+
+def _observer_root_route_has_contract_first_entry(
+    events: list[dict[str, Any]],
+) -> bool:
+    contract_entry_kinds = {
+        "contract_binding",
+        "contract_bound",
+        "contract_revision_created",
+        "contract_revision_changed",
+        "contract_state_changed",
+        "hotfix_entered",
+    }
+    for event in events:
+        event_kind = str(
+            event.get("event_kind")
+            or event.get("kind")
+            or event.get("event_type")
+            or ""
+        ).strip()
+        if event_kind not in contract_entry_kinds:
+            continue
+        status = str(event.get("status") or "").strip().lower()
+        if status in {
+            "accepted",
+            "allowed",
+            "complete",
+            "completed",
+            "ok",
+            "passed",
+            "succeeded",
+        }:
+            return True
+    return False
+
+
+def _observer_root_route_dirty_without_contract_step(
+    *,
+    project_id: str,
+    backlog_id: str,
+    row_target_files: list[str],
+    events: list[dict[str, Any]],
+    contract_state: Mapping[str, Any],
+    close_planning_body: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not bool(contract_state.get("legacy_no_contract")):
+        return {}
+    if _observer_root_route_has_contract_first_entry(events):
+        return {}
+    dirty_files = _observer_root_route_dirty_files_from_request_or_git(
+        project_id=project_id,
+        close_planning_body=close_planning_body,
+    )
+    if not dirty_files:
+        return {}
+    target_files = set(row_target_files or [])
+    dirty_target_files = sorted(
+        path for path in dirty_files if not target_files or path in target_files
+    )
+    if not dirty_target_files:
+        return {}
+    return {
+        "id": "recover_dirty_without_contract_first_evidence",
+        "action": "record_late_recovery_or_audit_close_decision",
+        "reason": (
+            "target files are already dirty but this row has no accepted contract "
+            "binding or hotfix_entered pre-mutation evidence"
+        ),
+        "detail": (
+            "record a late-recovery/audit decision before continuing; do not "
+            "pretend the clean contract-first path was followed"
+        ),
+        "source": "runtime_dirty_guard",
+        "precedence": "dirty_without_contract_first_evidence",
+        "recovery_state": "dirty_without_contract_first_evidence",
+        "dirty_files": dirty_files,
+        "dirty_target_files": dirty_target_files,
+        "backlog_id": backlog_id,
+        "project_id": project_id,
+    }
 
 
 def _observer_root_route_normalize_action(value: Any) -> str:
@@ -31444,6 +31560,12 @@ def _observer_root_route_context_state(
             "project_id": project_id,
         },
     )
+    row_target_files = (
+        _string_list_field(_row_get(row, "target_files", ""))
+        if row is not None
+        else []
+    )
+    contract_target_files = _string_list_field(contract.get("target_files"))
 
     # Graph query_schema trace id: if the caller supplied a plausible trace id
     # (a fresh session that already ran query_schema passes its own gqt-* id),
@@ -31594,6 +31716,37 @@ def _observer_root_route_context_state(
             for step in (contract_next_action.get("ordered_missing_steps") or [])
             if isinstance(step, dict) and str(step.get("id") or "").strip()
         ]
+    dirty_without_contract_step = _observer_root_route_dirty_without_contract_step(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        row_target_files=row_target_files or contract_target_files,
+        events=events,
+        contract_state=contract_state,
+        close_planning_body=close_planning_body,
+    )
+    if dirty_without_contract_step:
+        contract_action_steps = [
+            dirty_without_contract_step,
+            *[
+                step
+                for step in contract_action_steps
+                if str(step.get("id") or "") != dirty_without_contract_step["id"]
+            ],
+        ]
+        contract_ordered_steps = contract_action_steps
+        contract_next_action = {
+            "id": dirty_without_contract_step["id"],
+            "action": dirty_without_contract_step["action"],
+            "detail": dirty_without_contract_step["detail"],
+            "source": dirty_without_contract_step["source"],
+            "precedence": dirty_without_contract_step["precedence"],
+            "recovery_state": dirty_without_contract_step["recovery_state"],
+            "dirty_files": dirty_without_contract_step["dirty_files"],
+            "dirty_target_files": dirty_without_contract_step["dirty_target_files"],
+            "ordered_missing_steps_source": "runtime_dirty_guard",
+            "ordered_missing_steps": contract_action_steps,
+        }
+        contract_state_action_has_priority = True
     no_progress_replacement_step = next(
         (
             step
@@ -31631,7 +31784,7 @@ def _observer_root_route_context_state(
         else {}
     )
     contract_missing_step_active = bool(
-        active_contract_execution
+        (active_contract_execution or contract_state_action_has_priority)
         and contract_next_action
         and (contract_ordered_steps or contract_state_action_has_priority)
     )
@@ -31707,12 +31860,6 @@ def _observer_root_route_context_state(
             ordered_missing_steps,
             default=dict(context.get("next_legal_action") or {}),
         )
-    row_target_files = (
-        _string_list_field(_row_get(row, "target_files", ""))
-        if row is not None
-        else []
-    )
-    contract_target_files = _string_list_field(contract.get("target_files"))
     close_action_card = _observer_root_route_close_action_card(
         close_gate,
         route_token_ref_projection,
