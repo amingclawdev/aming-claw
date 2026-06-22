@@ -15,7 +15,7 @@ import traceback
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -16542,6 +16542,91 @@ def _graph_rule_fingerprint_status(
     return compare_rule_fingerprint(snapshot_fingerprint, current_fingerprint)
 
 
+def _direct_update_graph_activation_guidance(
+    project_id: str,
+    *,
+    target_commit_sha: str,
+    parent_commit_sha: str = "",
+    run_id: str = "",
+    actor: str = "observer",
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return machine-readable guidance for making HEAD the active graph."""
+    body: dict[str, Any] = {
+        "target_commit_sha": str(target_commit_sha or ""),
+        "activate": True,
+        "semantic_use_ai": False,
+        "enqueue_stale": False,
+        "actor": str(actor or "observer"),
+    }
+    if parent_commit_sha:
+        body["parent_commit_sha"] = str(parent_commit_sha)
+    if run_id:
+        body["run_id"] = str(run_id)
+    identity = identity if isinstance(identity, Mapping) else {}
+    for key in ("ref_name", "branch_ref", "worktree_id", "worktree_path"):
+        value = str(identity.get(key) or "").strip()
+        if value:
+            body[key] = value
+    return {
+        "schema_version": "graph_reconcile_next_action.v1",
+        "action": "materialize_and_activate_pending_scope",
+        "description": (
+            "To make the active graph reflect the target commit, call the direct "
+            "pending-scope reconcile endpoint with activate=true. Omitting "
+            "activate creates a candidate snapshot only."
+        ),
+        "endpoint": f"/api/graph-governance/{project_id}/reconcile/pending-scope",
+        "method": "POST",
+        "request": {"body": body},
+        "candidate_only_if_activate_false": True,
+    }
+
+
+def _candidate_snapshot_finalize_guidance(
+    project_id: str,
+    *,
+    snapshot_id: str,
+    target_commit_sha: str,
+    expected_old_snapshot_id: str = "",
+    actor: str = "observer",
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return guidance for activating an already materialized candidate."""
+    body: dict[str, Any] = {
+        "target_commit_sha": str(target_commit_sha or ""),
+        "covered_commit_shas": [str(target_commit_sha or "")],
+        "materialize_pending": True,
+        "actor": str(actor or "observer"),
+        "evidence": {
+            "source": "pending_scope_candidate_only_next_action",
+            "candidate_snapshot_id": str(snapshot_id or ""),
+        },
+    }
+    if expected_old_snapshot_id:
+        body["expected_old_snapshot_id"] = str(expected_old_snapshot_id)
+    identity = identity if isinstance(identity, Mapping) else {}
+    for key in ("ref_name", "branch_ref", "worktree_id", "worktree_path"):
+        value = str(identity.get(key) or "").strip()
+        if value:
+            body[key] = value
+    return {
+        "schema_version": "graph_reconcile_next_action.v1",
+        "action": "finalize_candidate_snapshot",
+        "description": (
+            "A candidate snapshot already exists because activate=true was not "
+            "requested. Finalize this snapshot instead of rerunning reconcile."
+        ),
+        "endpoint": (
+            f"/api/graph-governance/{project_id}/snapshots/"
+            f"{quote(str(snapshot_id or ''), safe='')}/finalize"
+        ),
+        "method": "POST",
+        "request": {"body": body},
+        "avoids_rebuild": True,
+    }
+
+
 def _graph_stale_scope_operation(
     project_id: str,
     *,
@@ -16654,6 +16739,16 @@ def _graph_stale_scope_operation(
     if pending_for_head:
         return None, stale_summary
     changed_hint = f"; {len(all_changed_files)} changed files since snapshot" if all_changed_files else ""
+    next_action = _direct_update_graph_activation_guidance(
+        project_id,
+        target_commit_sha=head_commit,
+        parent_commit_sha=graph_commit,
+        actor="dashboard_user",
+    )
+    stale_summary.update({
+        "recommended_action": next_action["action"],
+        "next_action": next_action,
+    })
     operation = {
         "operation_id": f"scope-reconcile:stale:{head_commit[:12]}",
         "operation_type": "scope_reconcile",
@@ -16669,11 +16764,13 @@ def _graph_stale_scope_operation(
         "lease_expires_at": "",
         "last_error": "",
         "last_result": f"active graph at {graph_commit[:12]}, HEAD at {head_commit[:12]}{changed_hint}",
-        "supported_actions": ["queue_scope_reconcile", "view_trace", "file_backlog"],
+        "supported_actions": ["materialize_and_activate_pending_scope", "queue_scope_reconcile", "view_trace", "file_backlog"],
         "active_graph_commit": graph_commit,
         "head_commit": head_commit,
         "changed_files": changed_files,
         "warnings": active_warnings,
+        "recommended_action": next_action["action"],
+        "next_action": next_action,
     }
     return operation, stale_summary
 
@@ -20243,6 +20340,42 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                     )
                     conn.commit()
             raise
+        if isinstance(result, dict) and result.get("ok", True):
+            result = dict(result)
+            activate_requested = bool(body.get("activate", False))
+            if activate_requested:
+                result.setdefault("snapshot_status", "active")
+                result.setdefault("next_action", {
+                    "schema_version": "graph_reconcile_next_action.v1",
+                    "action": "verify_graph_current",
+                    "description": (
+                        "activate=true was requested; verify graph status and "
+                        "operations queue before closing the work."
+                    ),
+                    "endpoint": f"/api/graph-governance/{project_id}/status",
+                    "method": "GET",
+                })
+            else:
+                snapshot_id = str(result.get("snapshot_id") or "")
+                result.setdefault("snapshot_status", "candidate")
+                result.setdefault("candidate_only", True)
+                if snapshot_id:
+                    active = (
+                        store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"])
+                        or store.get_active_graph_snapshot(conn, project_id)
+                        or {}
+                    )
+                    result.setdefault(
+                        "next_action",
+                        _candidate_snapshot_finalize_guidance(
+                            project_id,
+                            snapshot_id=snapshot_id,
+                            target_commit_sha=target_commit,
+                            expected_old_snapshot_id=str(active.get("snapshot_id") or ""),
+                            actor=str(body.get("actor") or "observer"),
+                            identity=identity,
+                        ),
+                    )
         conn.commit()
         return 201, result
     finally:

@@ -17254,6 +17254,77 @@ def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monk
     assert final_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
 
 
+def test_pending_scope_materialize_candidate_only_guides_finalize_without_rebuild(conn, tmp_path, monkeypatch):
+    from agent.governance import state_reconcile
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+
+    active = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-old-candidate-guide",
+        commit_sha="old",
+        snapshot_kind="scope",
+        graph_json=_graph("L7.1"),
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"])
+    conn.commit()
+
+    captured = {}
+
+    def fake_run_pending_scope(conn_arg, project_id, root, **kwargs):
+        captured["kwargs"] = kwargs
+        conn_arg.execute(
+            """
+            UPDATE pending_scope_reconcile
+            SET status = ?, snapshot_id = ?
+            WHERE project_id = ? AND commit_sha = ?
+            """,
+            (store.PENDING_STATUS_MATERIALIZED, "scope-head-candidate", project_id, "head"),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": "scope-head-candidate",
+            "covered_pending_count": 1,
+            "pending_rows_bound": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_pending_scope_reconcile_candidate", fake_run_pending_scope)
+
+    code, result = server.handle_graph_governance_pending_scope_materialize(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": "head",
+                "parent_commit_sha": "old",
+                "actor": "observer",
+                "activate": False,
+            },
+        )
+    )
+
+    assert code == 201
+    assert captured["kwargs"]["activate"] is False
+    assert result["snapshot_status"] == "candidate"
+    assert result["candidate_only"] is True
+    next_action = result["next_action"]
+    assert next_action["schema_version"] == "graph_reconcile_next_action.v1"
+    assert next_action["action"] == "finalize_candidate_snapshot"
+    assert next_action["avoids_rebuild"] is True
+    assert next_action["endpoint"].endswith(
+        "/api/graph-governance/graph-api-test/snapshots/scope-head-candidate/finalize"
+    )
+    body = next_action["request"]["body"]
+    assert body["target_commit_sha"] == "head"
+    assert body["covered_commit_shas"] == ["head"]
+    assert body["materialize_pending"] is True
+    assert body["expected_old_snapshot_id"] == "scope-old-candidate-guide"
+
+
 def test_pending_scope_materialize_infers_head_when_target_commit_missing(conn, tmp_path, monkeypatch):
     """New-user Update graph calls should not dead-end when target_commit_sha is omitted."""
     from agent.governance import batch_jobs, state_reconcile
@@ -20401,8 +20472,18 @@ def test_operations_queue_synthesizes_stale_scope_reconcile(conn, monkeypatch, t
     assert row["active_graph_commit"] == "old-commit"
     assert row["changed_files"] == changed_paths[:25]
     assert "30 changed files" in row["last_result"]
+    assert row["recommended_action"] == "materialize_and_activate_pending_scope"
+    next_action = row["next_action"]
+    assert next_action["schema_version"] == "graph_reconcile_next_action.v1"
+    assert next_action["action"] == "materialize_and_activate_pending_scope"
+    assert next_action["endpoint"] == "/api/graph-governance/graph-api-test/reconcile/pending-scope"
+    assert next_action["request"]["body"]["target_commit_sha"] == "head-commit"
+    assert next_action["request"]["body"]["parent_commit_sha"] == "old-commit"
+    assert next_action["request"]["body"]["activate"] is True
+    assert next_action["candidate_only_if_activate_false"] is True
     assert queue["summary"]["graph_stale"]["is_stale"] is True
     assert queue["summary"]["graph_stale"]["changed_file_count"] == 30
+    assert queue["summary"]["graph_stale"]["next_action"]["request"]["body"]["activate"] is True
 
 
 def test_operations_queue_surfaces_rule_fingerprint_rebuild_action(conn, monkeypatch, tmp_path):
