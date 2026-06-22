@@ -14,6 +14,7 @@ CLAUDE_AUTH_HOME="${CLAUDE_AUTH_HOME:-}"
 DOCKER_AI_E2E_CHANGED_FILES="${DOCKER_AI_E2E_CHANGED_FILES:-}"
 DOCKER_LIVE_OBSERVER_ROUTE="${DOCKER_LIVE_OBSERVER_ROUTE:-0}"
 LIVE_OBSERVER_ROUTE_REPORT_PATH="${LIVE_OBSERVER_ROUTE_REPORT_PATH:-}"
+DOCKER_AUDIT_SOURCE_MODE="${DOCKER_AUDIT_SOURCE_MODE:-git}"
 
 usage() {
   cat <<'USAGE'
@@ -29,6 +30,10 @@ Options:
   --codex-auth-home DIR         Read Codex auth from DIR instead of $HOME.
   --claude-auth-home DIR        Read Claude auth from DIR instead of $HOME.
   --changed-files LIST          Newline or comma separated changed files for lane impact planning.
+  --source-mode git|mounted-worktree
+                               Default: git. mounted-worktree copies the
+                               mounted checkout so dirty changes can be
+                               dogfooded before commit.
   --no-build                    Reuse existing Docker images.
   --help                        Show this help.
 
@@ -52,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --codex-auth-home) CODEX_AUTH_HOME="$2"; shift 2 ;;
     --claude-auth-home) CLAUDE_AUTH_HOME="$2"; shift 2 ;;
     --changed-files) DOCKER_AI_E2E_CHANGED_FILES="$2"; shift 2 ;;
+    --source-mode) DOCKER_AUDIT_SOURCE_MODE="$2"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -61,6 +67,11 @@ done
 case "$HOSTS" in
   codex|claude|both) ;;
   *) echo "--host must be codex, claude, or both" >&2; exit 2 ;;
+esac
+
+case "$DOCKER_AUDIT_SOURCE_MODE" in
+  git|mounted-worktree) ;;
+  *) echo "--source-mode must be git or mounted-worktree" >&2; exit 2 ;;
 esac
 
 if [[ -z "$OUT_DIR" ]]; then
@@ -134,6 +145,7 @@ run_host() {
     -e "DOCKER_AI_E2E_CHANGED_FILES=$DOCKER_AI_E2E_CHANGED_FILES" \
     -e "DOCKER_LIVE_OBSERVER_ROUTE=$DOCKER_LIVE_OBSERVER_ROUTE" \
     -e "LIVE_OBSERVER_ROUTE_REPORT_PATH=$LIVE_OBSERVER_ROUTE_REPORT_PATH" \
+    -e "DOCKER_AUDIT_SOURCE_MODE=$DOCKER_AUDIT_SOURCE_MODE" \
     "$image"
 }
 

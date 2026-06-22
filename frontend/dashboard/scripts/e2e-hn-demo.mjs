@@ -111,6 +111,8 @@ const SCREENSHOTS = [
   },
 ];
 
+const BACKLOG_TARGET_FILES = new Map();
+
 const C = {
   reset: "\x1b[0m",
   dim: "\x1b[2m",
@@ -309,11 +311,76 @@ async function resolveTrace(traceId) {
 }
 
 async function upsertBacklog(bugId, body) {
+  if (Array.isArray(body?.target_files) && body.target_files.length) {
+    BACKLOG_TARGET_FILES.set(bugId, body.target_files.map((item) => String(item || "")).filter(Boolean));
+  }
   return http("POST", `/api/backlog/${pid(PROJECT)}/${encodeURIComponent(bugId)}`, body);
 }
 
 async function appendTimeline(body) {
-  return http("POST", `/api/task/${pid(PROJECT)}/timeline`, body);
+  return http("POST", `/api/task/${pid(PROJECT)}/timeline`, await withTimelineRoute(body));
+}
+
+async function withTimelineRoute(body) {
+  if (body?.route_token || body?.route_token_ref || body?.route_waiver) return body;
+  const backlogId = String(body?.backlog_id || "").trim();
+  if (!backlogId) return body;
+  const targetFiles = timelineTargetFiles(body, backlogId);
+  if (!targetFiles.length) return body;
+  const taskId = String(body?.task_id || `${backlogId}-observer`).trim();
+  const issued = await issueObserverRoute(backlogId, taskId, targetFiles, timelineEvidenceRefs(body));
+  const token = issued.route_token || {};
+  return {
+    ...body,
+    task_id: taskId,
+    route_token: token,
+    route_token_ref: issued.route_token_ref || "",
+    route_id: issued.route_id || token.route_id || "",
+    route_context_hash: issued.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued.prompt_contract_id || token.prompt_contract_id || "",
+    prompt_contract_hash: token.prompt_contract_hash || "",
+    visible_injection_manifest_hash: issued.visible_injection_manifest_hash || token.visible_injection_manifest_hash || "",
+  };
+}
+
+async function issueObserverRoute(backlogId, taskId, targetFiles, evidenceRefs = []) {
+  const issued = await http("POST", `/api/projects/${pid(PROJECT)}/observer/route-context/issue`, {
+    caller_role: "observer",
+    backlog_id: backlogId,
+    task_id: taskId,
+    target_files: targetFiles,
+    allowed_actions: ["task_timeline_append"],
+    evidence_refs: evidenceRefs,
+    ttl_hours: 4,
+  });
+  assert(issued?.route_token?.route_context_hash, `route token issue failed for ${backlogId}`);
+  assert(issued?.route_token_ref, `route token ref missing for ${backlogId}`);
+  return issued;
+}
+
+function timelineTargetFiles(body, backlogId) {
+  const files = new Set(BACKLOG_TARGET_FILES.get(backlogId) || []);
+  for (const key of ["changed_files", "owned_files", "target_files"]) {
+    for (const item of asArray(body?.payload?.[key])) files.add(String(item || ""));
+    for (const item of asArray(body?.verification?.[key])) files.add(String(item || ""));
+  }
+  for (const worker of asArray(body?.payload?.workers)) {
+    for (const item of asArray(worker?.owned_files)) files.add(String(item || ""));
+  }
+  return [...files].map((item) => item.trim()).filter(Boolean);
+}
+
+function timelineEvidenceRefs(body) {
+  const refs = new Set();
+  for (const key of ["graph_query_trace_ids", "graph_trace_ids"]) {
+    for (const item of asArray(body?.payload?.[key])) refs.add(String(item || ""));
+    for (const item of asArray(body?.verification?.[key])) refs.add(String(item || ""));
+  }
+  return [...refs].map((item) => item.trim()).filter(Boolean);
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
 }
 
 async function getBacklog(query = "") {
@@ -730,7 +797,7 @@ async function runBeforeWorkCase(audit) {
     mf_id: mfId,
     actor: "observer:hn-sandbox-before",
     event_type: "before_work_dispatch_contract",
-    event_kind: "implementation",
+    event_kind: "dispatch_bounded_worker",
     phase: "dispatch",
     status: "accepted",
     payload: {
@@ -934,7 +1001,7 @@ async function runDuringWorkCase(audit) {
     mf_id: mfId,
     actor: "observer:hn-sandbox-during",
     event_type: "during_work_parallel_dispatch",
-    event_kind: "implementation",
+    event_kind: "dispatch_bounded_worker",
     phase: "dispatch",
     status: "accepted",
     payload: {
@@ -979,7 +1046,7 @@ async function runDuringWorkCase(audit) {
     task_id: replayWorker.task_id,
     actor: "observer:hn-sandbox-during",
     event_type: "during_work_worker_replay_dispatch",
-    event_kind: "implementation",
+    event_kind: "dispatch_bounded_worker",
     phase: "replay_dispatch",
     status: "accepted",
     attempt_num: replayWorker.attempt_num,
@@ -1423,8 +1490,10 @@ function writeAuditReports(audit) {
   mkdirSync(path.dirname(REPORT_PATH), { recursive: true });
   writeFileSync(REPORT_PATH, markdownReport(audit), "utf8");
   writeFileSync(JSON_REPORT_PATH, JSON.stringify(audit, null, 2), "utf8");
-  const latestMd = path.join(REPO_ROOT, "docs", "hn-demo", "audits", "latest.md");
-  const latestJson = path.join(REPO_ROOT, "docs", "hn-demo", "audits", "latest.json");
+  const latestDir = path.join(REPO_ROOT, "docs", "hn-demo", "audits");
+  mkdirSync(latestDir, { recursive: true });
+  const latestMd = path.join(latestDir, "latest.md");
+  const latestJson = path.join(latestDir, "latest.json");
   writeFileSync(latestMd, markdownReport(audit), "utf8");
   writeFileSync(latestJson, JSON.stringify(audit, null, 2), "utf8");
   ok(`wrote ${REPORT_PATH}`);

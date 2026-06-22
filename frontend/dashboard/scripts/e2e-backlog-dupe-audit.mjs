@@ -68,9 +68,55 @@ function run(command, args, cwd = REPO_ROOT) {
 }
 
 function parseFixtureOutput(stdout) {
-  const start = stdout.lastIndexOf("{");
-  assert(start >= 0, "fixture did not print JSON");
-  return JSON.parse(stdout.slice(start));
+  for (const candidate of jsonObjectCandidates(stdout).reverse()) {
+    const parsed = JSON.parse(candidate);
+    if (parsed && typeof parsed === "object" && parsed.ok === true && parsed.project_id && parsed.fixture_root) {
+      return parsed;
+    }
+  }
+  throw new Error("fixture did not print a complete JSON result");
+}
+
+function jsonObjectCandidates(text) {
+  const raw = String(text || "");
+  const candidates = [];
+  for (let start = 0; start < raw.length; start++) {
+    if (raw[start] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < raw.length; index++) {
+      const char = raw[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+      } else if (char === "{") {
+        depth++;
+      } else if (char === "}") {
+        depth--;
+        if (depth === 0) {
+          const candidate = raw.slice(start, index + 1);
+          try {
+            JSON.parse(candidate);
+            candidates.push(candidate);
+          } catch {
+            // Keep scanning; not every brace-delimited block is JSON.
+          }
+          break;
+        }
+      }
+    }
+  }
+  return candidates;
 }
 
 function runFixture() {
@@ -97,6 +143,53 @@ async function appendTimeline(body) {
   return http("POST", `/api/task/${pid(PROJECT)}/timeline`, body);
 }
 
+function taskIdFor(bugId) {
+  return `task-${clean(bugId).toLowerCase()}`;
+}
+
+async function issueObserverRoute(bugId, targetFiles, evidenceRefs = []) {
+  const issued = await http("POST", `/api/projects/${pid(PROJECT)}/observer/route-context/issue`, {
+    caller_role: "observer",
+    backlog_id: bugId,
+    task_id: taskIdFor(bugId),
+    target_files: targetFiles,
+    evidence_refs: evidenceRefs,
+    ttl_hours: 4,
+  });
+  assert(issued?.route_token?.route_context_hash, `route token issue failed for ${bugId}`);
+  assert(issued?.route_token_ref, `route token ref missing for ${bugId}`);
+  return issued;
+}
+
+function withRoute(body, issued) {
+  if (!issued?.route_token) return body;
+  const token = issued.route_token;
+  const scope = token.scope || {};
+  return {
+    ...body,
+    task_id: body.task_id || scope.task_id || issued.execute_backlog_row_payload?.task_id || "",
+    route_token: token,
+    route_token_ref: issued.route_token_ref || "",
+    route_id: issued.route_id || token.route_id || "",
+    route_context_hash: issued.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued.prompt_contract_id || token.prompt_contract_id || "",
+    prompt_contract_hash: token.prompt_contract_hash || "",
+    visible_injection_manifest_hash: issued.visible_injection_manifest_hash || token.visible_injection_manifest_hash || "",
+  };
+}
+
+function publicRouteRef(backlogId, issued) {
+  const token = issued?.route_token || {};
+  return {
+    backlog_id: backlogId,
+    task_id: token.scope?.task_id || "",
+    route_token_ref: issued?.route_token_ref || "",
+    route_id: issued?.route_id || token.route_id || "",
+    route_context_hash: issued?.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued?.prompt_contract_id || token.prompt_contract_id || "",
+  };
+}
+
 function overlapScore(existing, proposal) {
   const haystack = `${existing.title || ""} ${existing.details_md || ""} ${JSON.stringify(existing.acceptance_criteria || "")} ${JSON.stringify(existing.target_files || "")}`.toLowerCase();
   const words = proposal.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
@@ -111,7 +204,7 @@ async function runAudit() {
     project_id: PROJECT,
     backend: BACKEND,
     fixture_root: FIXTURE_ROOT,
-    evidence: { backlog_ids: [], timeline_event_ids: [], trace_ids: [] },
+    evidence: { backlog_ids: [], timeline_event_ids: [], trace_ids: [], route_token_refs: [] },
     checks: [],
     warnings: [],
   };
@@ -124,6 +217,12 @@ async function runAudit() {
   const sourceTrace = await graphQuery("find_node_by_path", { path: "src/reminders.js" });
   const storageTrace = await graphQuery("find_node_by_path", { path: "src/storage.js" });
   audit.evidence.trace_ids.push(...[sourceTrace.trace_id, storageTrace.trace_id].filter(Boolean));
+  const route = await issueObserverRoute(
+    SETUP_BUG_ID,
+    ["src/reminders.js", "src/storage.js", "tests/reminders.test.mjs"],
+    audit.evidence.trace_ids.filter(Boolean),
+  );
+  audit.evidence.route_token_refs.push(publicRouteRef(SETUP_BUG_ID, route));
 
   const proposal = "Add a reminder toggle for tasks, default off, and persist the reminder state.";
   const search = await http("GET", `/api/backlog/${pid(PROJECT)}?include_closed=true&q=${encodeURIComponent("reminder toggle default off")}`);
@@ -131,14 +230,15 @@ async function runAudit() {
   const scored = candidates.map((bug) => ({ bug_id: bug.bug_id, title: bug.title, status: bug.status, target_files: bug.target_files, acceptance_criteria: bug.acceptance_criteria, overlap: overlapScore(bug, proposal) }));
   const best = scored.find((item) => item.bug_id === SETUP_BUG_ID) || scored[0];
   assert(best && best.overlap.score > 0, "overlap probe did not find setup backlog row");
-  const overlapEvent = await appendTimeline({
+  const overlapEvent = await appendTimeline(withRoute({
     backlog_id: SETUP_BUG_ID,
     actor: "observer:backlog-dupe",
-    event_type: "overlap_detected_before_new_row",
-    event_kind: "requirement",
-    phase: "Clarifying",
+    event_type: "observer_command.overlap_detected_before_new_row",
+    event_kind: "observer_command",
+    phase: "observer_command",
     status: "accepted",
     payload: {
+      action: "overlap_detected_before_new_row",
       user_proposal: proposal,
       existing_backlog_id: SETUP_BUG_ID,
       overlap: best,
@@ -146,11 +246,11 @@ async function runAudit() {
       safe_choices: ["merge into existing row", "supersede existing row", "create separate row with explicit difference"],
       graph_query_trace_ids: audit.evidence.trace_ids.filter(Boolean),
     },
-  });
+  }, route));
   if (overlapEvent?.id) audit.evidence.timeline_event_ids.push(overlapEvent.id);
 
   const userChoice = "merge into existing row";
-  await upsertBacklog(SETUP_BUG_ID, {
+  await upsertBacklog(SETUP_BUG_ID, withRoute({
     actor: "observer:backlog-dupe",
     title: setup.title,
     status: setup.status || "OPEN",
@@ -167,16 +267,21 @@ async function runAudit() {
       "Merged user wording: Add a reminder toggle for tasks, default off, and persist the reminder state.",
     ],
     details_md: `${setup.details_md || ""}\n\nAUDIT MERGE DECISION: User chose to merge the similar proposal into this existing setup row. No duplicate backlog row should be created.`,
-  });
-  const mergeEvent = await appendTimeline({
+  }, route));
+  const mergeEvent = await appendTimeline(withRoute({
     backlog_id: SETUP_BUG_ID,
     actor: "observer:backlog-dupe",
-    event_type: "user_choice_merge_existing_row",
-    event_kind: "requirement",
-    phase: "Backlog Contracts",
+    event_type: "observer_command.user_choice_merge_existing_row",
+    event_kind: "observer_command",
+    phase: "observer_command",
     status: "accepted",
-    payload: { user_choice: userChoice, duplicate_row_created: false, existing_backlog_id: SETUP_BUG_ID },
-  });
+    payload: {
+      action: "user_choice_merge_existing_row",
+      user_choice: userChoice,
+      duplicate_row_created: false,
+      existing_backlog_id: SETUP_BUG_ID,
+    },
+  }, route));
   if (mergeEvent?.id) audit.evidence.timeline_event_ids.push(mergeEvent.id);
 
   const after = await http("GET", `/api/backlog/${pid(PROJECT)}?include_closed=true&q=${encodeURIComponent("reminder")}`);

@@ -48,6 +48,26 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function isAllowedFixtureSetupTimelineEvent(event) {
+  const eventType = String(event?.event_type || "");
+  const eventKind = String(event?.event_kind || "");
+  const phase = String(event?.phase || "");
+  const backlogId = String(event?.backlog_id || "");
+  const taskId = String(event?.task_id || "");
+  return (
+    !backlogId
+    && !taskId
+    && phase === "route_gate"
+    && eventKind === "route_token_gate"
+    && eventType === "route_token_gate.project_bootstrap"
+  );
+}
+
+function unexpectedFixtureTimelineEvents(timeline) {
+  const events = Array.isArray(timeline?.events) ? timeline.events : [];
+  return events.filter((event) => !isAllowedFixtureSetupTimelineEvent(event));
+}
+
 async function http(method, route, body) {
   const headers = { Accept: "application/json" };
   const init = { method, headers };
@@ -136,8 +156,22 @@ async function main() {
     const backlog = await http("GET", `/api/backlog/${pid(PROJECT)}`);
     const timeline = await http("GET", `/api/task/${pid(PROJECT)}/timeline`);
     assert(Number(backlog.count || backlog.bugs?.length || 0) === 0, "drift fixture must not seed backlog rows");
-    assert(Number(timeline.count || 0) === 0, "drift fixture must not seed timeline events");
-    console.log(JSON.stringify({ ok: true, project_id: PROJECT, fixture_root: FIXTURE_ROOT, baseline_commit: commit, snapshot_id: status.active_snapshot_id, doc_graph_count: Number(doc.result?.count || 0), trace_ids: [source.trace_id, doc.trace_id].filter(Boolean) }, null, 2));
+    const unexpectedTimeline = unexpectedFixtureTimelineEvents(timeline);
+    assert(unexpectedTimeline.length === 0, "drift fixture must not seed non-bootstrap timeline events");
+    console.log(JSON.stringify({
+      ok: true,
+      project_id: PROJECT,
+      fixture_root: FIXTURE_ROOT,
+      baseline_commit: commit,
+      snapshot_id: status.active_snapshot_id,
+      doc_graph_count: Number(doc.result?.count || 0),
+      trace_ids: [source.trace_id, doc.trace_id].filter(Boolean),
+      fixture_setup_timeline: {
+        total_event_count: Array.isArray(timeline.events) ? timeline.events.length : Number(timeline.count || 0),
+        allowed_bootstrap_route_gate_count: (timeline.events || []).filter(isAllowedFixtureSetupTimelineEvent).length,
+        unexpected_event_count: unexpectedTimeline.length,
+      },
+    }, null, 2));
   } catch (error) {
     console.error(error.message);
     exit(1);

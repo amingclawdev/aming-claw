@@ -84,9 +84,55 @@ function write(relativePath, content) {
 }
 
 function parseFixtureOutput(stdout) {
-  const start = stdout.lastIndexOf("{");
-  assert(start >= 0, "fixture did not print JSON");
-  return JSON.parse(stdout.slice(start));
+  for (const candidate of jsonObjectCandidates(stdout).reverse()) {
+    const parsed = JSON.parse(candidate);
+    if (parsed && typeof parsed === "object" && parsed.ok === true && parsed.project_id && parsed.fixture_root) {
+      return parsed;
+    }
+  }
+  throw new Error("fixture did not print a complete JSON result");
+}
+
+function jsonObjectCandidates(text) {
+  const raw = String(text || "");
+  const candidates = [];
+  for (let start = 0; start < raw.length; start++) {
+    if (raw[start] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < raw.length; index++) {
+      const char = raw[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+      } else if (char === "{") {
+        depth++;
+      } else if (char === "}") {
+        depth--;
+        if (depth === 0) {
+          const candidate = raw.slice(start, index + 1);
+          try {
+            JSON.parse(candidate);
+            candidates.push(candidate);
+          } catch {
+            // Keep scanning; not every brace-delimited block is JSON.
+          }
+          break;
+        }
+      }
+    }
+  }
+  return candidates;
 }
 
 function runFixture() {
@@ -111,6 +157,53 @@ async function upsertBacklog(bugId, body) {
 
 async function appendTimeline(body) {
   return http("POST", `/api/task/${pid(PROJECT)}/timeline`, body);
+}
+
+function taskIdFor(bugId) {
+  return `task-${clean(bugId).toLowerCase()}`;
+}
+
+async function issueObserverRoute(bugId, targetFiles, evidenceRefs = []) {
+  const issued = await http("POST", `/api/projects/${pid(PROJECT)}/observer/route-context/issue`, {
+    caller_role: "observer",
+    backlog_id: bugId,
+    task_id: taskIdFor(bugId),
+    target_files: targetFiles,
+    evidence_refs: evidenceRefs,
+    ttl_hours: 4,
+  });
+  assert(issued?.route_token?.route_context_hash, `route token issue failed for ${bugId}`);
+  assert(issued?.route_token_ref, `route token ref missing for ${bugId}`);
+  return issued;
+}
+
+function withRoute(body, issued) {
+  if (!issued?.route_token) return body;
+  const token = issued.route_token;
+  const scope = token.scope || {};
+  return {
+    ...body,
+    task_id: body.task_id || scope.task_id || issued.execute_backlog_row_payload?.task_id || "",
+    route_token: token,
+    route_token_ref: issued.route_token_ref || "",
+    route_id: issued.route_id || token.route_id || "",
+    route_context_hash: issued.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued.prompt_contract_id || token.prompt_contract_id || "",
+    prompt_contract_hash: token.prompt_contract_hash || "",
+    visible_injection_manifest_hash: issued.visible_injection_manifest_hash || token.visible_injection_manifest_hash || "",
+  };
+}
+
+function publicRouteRef(backlogId, issued) {
+  const token = issued?.route_token || {};
+  return {
+    backlog_id: backlogId,
+    task_id: token.scope?.task_id || "",
+    route_token_ref: issued?.route_token_ref || "",
+    route_id: issued?.route_id || token.route_id || "",
+    route_context_hash: issued?.route_context_hash || token.route_context_hash || "",
+    prompt_contract_id: issued?.prompt_contract_id || token.prompt_contract_id || "",
+  };
 }
 
 function commitAll(message, bugId) {
@@ -177,7 +270,7 @@ async function runAudit() {
     project_id: PROJECT,
     backend: BACKEND,
     fixture_root: FIXTURE_ROOT,
-    evidence: { backlog_ids: [], timeline_event_ids: [], trace_ids: [], commits: [], tests: [] },
+    evidence: { backlog_ids: [], timeline_event_ids: [], trace_ids: [], route_token_refs: [], commits: [], tests: [] },
     checks: [],
     warnings: [],
   };
@@ -186,20 +279,34 @@ async function runAudit() {
   const sourceTrace = await graphQuery("find_node_by_path", { path: "src/reminders.js" });
   const docTrace = await graphQuery("find_node_by_path", { path: "docs/reminders.md" });
   audit.evidence.trace_ids.push(...[sourceTrace.trace_id, docTrace.trace_id].filter(Boolean));
-  await upsertBacklog(bugId, {
+  const targetFiles = ["src/reminders.js", "tests/reminders.test.mjs", "docs/reminders.md"];
+  const route = await issueObserverRoute(bugId, targetFiles, audit.evidence.trace_ids.filter(Boolean));
+  audit.evidence.route_token_refs.push(publicRouteRef(bugId, route));
+  await upsertBacklog(bugId, withRoute({
     actor: "observer:drift-demo",
     title: "Add email reminder behavior and detect stale docs",
     status: "MF_IN_PROGRESS",
     priority: "P2",
     mf_type: "chain_rescue",
     force_admit: true,
-    target_files: ["src/reminders.js", "tests/reminders.test.mjs", "docs/reminders.md"],
+    target_files: targetFiles,
     test_files: ["tests/reminders.test.mjs"],
     provenance_paths: audit.evidence.trace_ids.filter(Boolean),
     acceptance_criteria: ["Email reminder behavior is implemented.", "Docs drift is checked before docs are updated.", "Docs are updated and reconciled after the drift check."],
-  });
+  }, route));
   audit.evidence.backlog_ids.push(bugId);
-  const startEvent = await appendTimeline({ backlog_id: bugId, actor: "observer:drift-demo", event_type: "implementation_started", event_kind: "implementation", phase: "implementation", status: "accepted", payload: { graph_query_trace_ids: audit.evidence.trace_ids.filter(Boolean) } });
+  const startEvent = await appendTimeline(withRoute({
+    backlog_id: bugId,
+    actor: "observer:drift-demo",
+    event_type: "observer_command.implementation_started",
+    event_kind: "observer_command",
+    phase: "observer_command",
+    status: "accepted",
+    payload: {
+      action: "implementation_started",
+      graph_query_trace_ids: audit.evidence.trace_ids.filter(Boolean),
+    },
+  }, route));
   if (startEvent?.id) audit.evidence.timeline_event_ids.push(startEvent.id);
 
   const beforeDoc = readFileSync(path.join(FIXTURE_ROOT, "docs/reminders.md"), "utf8");
@@ -219,7 +326,16 @@ async function runAudit() {
     source_now_mentions_email: readFileSync(path.join(FIXTURE_ROOT, "src/reminders.js"), "utf8").includes("email"),
   };
   let driftSignals = driftSignalFrom(statusBeforeReconcile, opsBefore, feedbackBefore);
-  const driftEvent = await appendTimeline({ backlog_id: bugId, actor: "observer:drift-demo", event_type: "docs_drift_probe_before_doc_fix", event_kind: "verification", phase: "drift_probe", status: "accepted", payload: { mismatch, drift_signals: driftSignals }, verification: { tests_run: [test.command], tests_exit_code: 0 } });
+  const driftEvent = await appendTimeline(withRoute({
+    backlog_id: bugId,
+    actor: "observer:drift-demo",
+    event_type: "observer_command.docs_drift_probe_before_doc_fix",
+    event_kind: "observer_command",
+    phase: "observer_command",
+    status: "accepted",
+    payload: { action: "docs_drift_probe_before_doc_fix", mismatch, drift_signals: driftSignals },
+    verification: { tests_run: [test.command], tests_exit_code: 0 },
+  }, route));
   if (driftEvent?.id) audit.evidence.timeline_event_ids.push(driftEvent.id);
   if (!driftSignals.length) {
     audit.warnings.push("Governance API did not expose a clear docs/reminders.md drift row before reconcile; report records source/doc mismatch and recommended action instead.");
@@ -239,9 +355,9 @@ async function runAudit() {
   audit.evidence.commits.push({ kind: "doc_fix", commit });
   const secondReconcile = await http("POST", `/api/graph-governance/${pid(PROJECT)}/reconcile/full`, { actor: "observer:drift-demo", project_root: FIXTURE_ROOT, activate: true, semantic_enrich: false, run_id: `drift-docs-${RUN_ID}` });
   const finalStatus = await http("GET", `/api/graph-governance/${pid(PROJECT)}/status`);
-  const closeEvent = await appendTimeline({ backlog_id: bugId, actor: "observer:drift-demo", event_type: "docs_drift_resolved_or_limited", event_kind: "close_ready", phase: "close_ready", status: "accepted", payload: { code_reconcile: firstReconcile, docs_reconcile: secondReconcile, final_status: finalStatus, warnings: audit.warnings } });
+  const closeEvent = await appendTimeline(withRoute({ backlog_id: bugId, actor: "observer:drift-demo", event_type: "docs_drift_resolved_or_limited", event_kind: "close_ready", phase: "close_ready", status: "accepted", payload: { code_reconcile: firstReconcile, docs_reconcile: secondReconcile, final_status: finalStatus, warnings: audit.warnings } }, route));
   if (closeEvent?.id) audit.evidence.timeline_event_ids.push(closeEvent.id);
-  await upsertBacklog(bugId, { actor: "observer:drift-demo", status: "FIXED", commit, force_admit: true });
+  await upsertBacklog(bugId, withRoute({ actor: "observer:drift-demo", status: "FIXED", commit, force_admit: true }, route));
 
   audit.evidence.mismatch = mismatch;
   audit.evidence.drift_signals = driftSignals;

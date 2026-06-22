@@ -118,6 +118,17 @@ function demoPages() {
   };
 }
 
+function dashboardLinks() {
+  return {
+    backlog: dashboardUrl("backlog"),
+    timeline: dashboardUrl("activity"),
+    prompt_queue: dashboardUrl("backlog"),
+    graph: dashboardUrl("graph"),
+    operations: dashboardUrl("operations"),
+    review: dashboardUrl("review"),
+  };
+}
+
 function runSelfTest() {
   const allowed = {
     event_type: "route_token_gate.project_bootstrap",
@@ -143,6 +154,9 @@ function runSelfTest() {
   const pages = demoPages();
   assert(pages.governance.url.includes("/dashboard?project_id="), "self-test governance page link missing dashboard");
   assert(pages.project.url.startsWith("http://127.0.0.1:"), "self-test project page link missing preview URL");
+  const staleTimelineView = ["view", "timeline"].join("=");
+  assert(dashboardLinks().timeline.includes("view=activity"), "self-test timeline link must use canonical activity view");
+  assert(!dashboardLinks().timeline.includes(staleTimelineView), "self-test timeline link must not use stale timeline view");
   console.log("VIBE QUEUE FIXTURE SELF TEST OK");
 }
 
@@ -333,14 +347,7 @@ async function main() {
         external_page: "Open Daily Planner Preview",
       },
       dashboard_url: dashboardUrl("backlog"),
-      dashboard_links: {
-        backlog: dashboardUrl("backlog"),
-        timeline: dashboardUrl("timeline"),
-        prompt_queue: dashboardUrl("backlog"),
-        graph: dashboardUrl("graph"),
-        operations: dashboardUrl("operations"),
-        review: dashboardUrl("review"),
-      },
+      dashboard_links: dashboardLinks(),
       planner_preview_url: previewUrl(),
       planner_preview_command: `python3 -m http.server ${PREVIEW_PORT} --directory ${FIXTURE_ROOT}`,
     }, null, 2));

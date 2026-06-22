@@ -45,6 +45,8 @@ const IMPACT_CHANGED_FILES = parseChangedFiles(process.env.DOCKER_AI_E2E_CHANGED
 const LIVE_OBSERVER_ROUTE_REQUESTED = /^(1|true|required|yes)$/i.test(process.env.DOCKER_LIVE_OBSERVER_ROUTE || "");
 const LIVE_OBSERVER_ROUTE_REPORT_PATH = process.env.LIVE_OBSERVER_ROUTE_REPORT_PATH
   || join(OUT_DIR, `${HOST}-live-observer-route-${RUN_ID}.json`);
+const SOURCE_MODE = process.env.DOCKER_AUDIT_SOURCE_MODE || "git"; // git | mounted-worktree
+const INSTALL_SOURCE = SOURCE_MODE === "mounted-worktree" && REPO_URL === "file:///plugin-source" ? SRC_ROOT : REPO_URL;
 
 const REQUIRED_SKILLS = [
   "aming-claw",
@@ -210,6 +212,34 @@ function copyHostAuth() {
 function gitCloneSource() {
   rmSync(SRC_ROOT, { recursive: true, force: true });
   ensureDir(dirname(SRC_ROOT));
+  if (SOURCE_MODE === "mounted-worktree" && REPO_URL === "file:///plugin-source") {
+    const commit = run("git", ["-C", "/plugin-source", "rev-parse", "HEAD"], { cwd: WORK_ROOT, timeout: 30000 });
+    cpSync("/plugin-source", SRC_ROOT, {
+      recursive: true,
+      filter: shouldCopyMountedSourcePath,
+    });
+    const snapshot = createMountedSourceGitSnapshot(commit.ok ? commit.stdout.trim() : "");
+    if (!snapshot.ok) return snapshot;
+    return {
+      ok: true,
+      status: 0,
+      signal: "",
+      command: "copy mounted /plugin-source worktree",
+      stdout: sample([
+        commit.stdout || "",
+        snapshot.stdout || "",
+      ].filter(Boolean).join("\n")),
+      stderr: sample([
+        commit.stderr || "",
+        snapshot.stderr || "",
+      ].filter(Boolean).join("\n")),
+      elapsed_ms: (commit.elapsed_ms || 0) + (snapshot.elapsed_ms || 0),
+      plugin_root: SRC_ROOT,
+      source_mode: SOURCE_MODE,
+      source_commit: commit.ok ? commit.stdout.trim() : "",
+      source_snapshot_commit: snapshot.source_snapshot_commit || "",
+    };
+  }
   const clone = run("git", ["clone", REPO_URL, SRC_ROOT], { cwd: WORK_ROOT, timeout: 300000 });
   if (!clone.ok) return clone;
   if (REPO_REF) {
@@ -217,6 +247,62 @@ function gitCloneSource() {
     if (!checkout.ok) return checkout;
   }
   return { ...clone, plugin_root: SRC_ROOT };
+}
+
+function shouldCopyMountedSourcePath(source) {
+  const rel = source.replace(/^\/plugin-source\/?/, "");
+  if (!rel) return true;
+  const parts = rel.split("/");
+  const excluded = new Set([
+    ".git",
+    ".worktrees",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+  ]);
+  if (parts.some((part) => excluded.has(part))) return false;
+  if (parts[0] === "docs" && parts[1] === "hn-demo" && parts[2] === "audits") return false;
+  if (parts[0] === ".aming-claw" && parts[1] === "e2e-artifacts") return false;
+  return true;
+}
+
+function createMountedSourceGitSnapshot(sourceCommit) {
+  const steps = [
+    run("git", ["init"], { cwd: SRC_ROOT, timeout: 30000 }),
+    run("git", ["config", "user.email", "install-audit@example.invalid"], { cwd: SRC_ROOT, timeout: 30000 }),
+    run("git", ["config", "user.name", "Install Audit"], { cwd: SRC_ROOT, timeout: 30000 }),
+    run("git", ["add", "."], { cwd: SRC_ROOT, timeout: 120000 }),
+    run("git", [
+      "commit",
+      "-m",
+      [
+        "mounted worktree source snapshot",
+        "",
+        `Source-Head: ${sourceCommit || "unknown"}`,
+        "Source-Mode: mounted-worktree",
+      ].join("\n"),
+    ], { cwd: SRC_ROOT, timeout: 120000 }),
+  ];
+  const failed = steps.find((step) => !step.ok);
+  const snapshotHead = failed ? { ok: false, stdout: "", stderr: "" } : run("git", ["rev-parse", "HEAD"], { cwd: SRC_ROOT, timeout: 30000 });
+  return {
+    ok: !failed && snapshotHead.ok,
+    status: failed?.status ?? snapshotHead.status ?? 0,
+    signal: failed?.signal || snapshotHead.signal || "",
+    command: "create mounted-worktree git snapshot",
+    stdout: sample(steps.map((step) => step.stdout).filter(Boolean).join("\n")),
+    stderr: sample(steps.map((step) => step.stderr).filter(Boolean).join("\n") || snapshotHead.stderr || ""),
+    elapsed_ms: steps.reduce((total, step) => total + (step.elapsed_ms || 0), 0) + (snapshotHead.elapsed_ms || 0),
+    plugin_root: SRC_ROOT,
+    source_mode: SOURCE_MODE,
+    source_commit: sourceCommit,
+    source_snapshot_commit: snapshotHead.ok ? snapshotHead.stdout.trim() : "",
+  };
 }
 
 function installRuntime() {
@@ -243,7 +329,7 @@ function installCodexPlugin() {
       "agent.cli",
       "plugin",
       "install",
-      REPO_URL,
+      INSTALL_SOURCE,
       "--install-root",
       INSTALL_ROOT,
       "--python",
@@ -821,10 +907,19 @@ function runEverydayDemos() {
     },
   ];
   return demos.map((demo) => {
-    const fixture = runEverydayDemoScript(demo.fixture, demo.name);
-    const audit = fixture.ok
-      ? runEverydayDemoScript(demo.audit, demo.name)
-      : { ok: false, command: demo.audit, stdout: "", stderr: "fixture failed", elapsed_ms: 0 };
+    const audit = runEverydayDemoScript(demo.audit, demo.name);
+    const fixture = {
+      ok: audit.ok,
+      status: audit.status,
+      signal: audit.signal || "",
+      command: `${demo.audit} (embedded fixture setup)`,
+      stdout: audit.stdout,
+      stderr: audit.stderr,
+      elapsed_ms: audit.elapsed_ms,
+      embedded_in_audit: true,
+      skipped_standalone_fixture: true,
+      skip_reason: "audit script creates or resets its own fixture; pre-running the same fixture re-enters protected project_bootstrap",
+    };
     return { name: demo.name, fixture, audit };
   });
 }
@@ -833,7 +928,7 @@ function buildInstallPrompt() {
   return `You are running a clean Docker install audit for Aming Claw on host lane ${HOST}.
 
 Phase 1: perform the README/launcher one-click install path for this plugin.
-- Install from: ${REPO_URL}
+- Install from: ${INSTALL_SOURCE}
 - Use the local Docker HOME, not host plugin state.
 - Reuse auth only from the mounted read-only host auth files. Do not print token contents.
 - Verify skills, MCP tools, and MCP resources after install.
@@ -1185,7 +1280,7 @@ function buildReport({
   tools,
   resources,
 }) {
-  const sourceCommit = clone.ok ? gitHead(SRC_ROOT) : "";
+  const sourceCommit = clone.ok ? String(clone.source_commit || gitHead(SRC_ROOT) || "").trim() : "";
   const blockers = [];
   if (!version.ok) blockers.push(`${HOST} CLI version check failed`);
   if (!authCopied.length) blockers.push("host auth files were not found in mounted auth volume");
@@ -1270,6 +1365,8 @@ function buildReport({
     install_prompt_sha256: sha256(installPrompt),
     demo_prompt_sha256: sha256(demoPrompt),
     install_command: hostInstall.command || "",
+    source_mode: SOURCE_MODE,
+    install_source: INSTALL_SOURCE,
     plugin_root: SRC_ROOT,
     cache_path: HOST === "codex" ? codexCacheRoot() : claudeCacheRoot(),
     fresh_session_id: `${HOST}-docker-${RUN_ID}`,
@@ -1378,7 +1475,8 @@ async function main() {
   writeJson(REPORT_PATH, report);
   const validation = run("node", ["/opt/hn-install-audit/validate-report.mjs", REPORT_PATH], { cwd: WORK_ROOT });
   console.log(JSON.stringify({ report: REPORT_PATH, validation, status: report.status }, null, 2));
-  if (!validation.ok || report.status !== "PASS") process.exit(1);
+  const acceptedStatus = report.status === "PASS" || (AI_PROMPT_MODE === "skip" && report.status === "SKIPPED");
+  if (!validation.ok || !acceptedStatus) process.exit(1);
 }
 
 main().catch((error) => {
