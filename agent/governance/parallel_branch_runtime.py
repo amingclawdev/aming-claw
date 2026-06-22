@@ -5553,7 +5553,7 @@ def _runtime_context_next_legal_action(
         ("worker_self_attesting", "record_finish_time_worker_attestation"),
         ("finish_gate_ref", "record_finish_gate"),
         ("checkpoint_id", "record_checkpoint"),
-        ("verification_event_refs", "record_independent_verification"),
+        ("verification_event_refs", "handoff_to_independent_qa"),
         ("route_action_precheck_event_ref", "record_route_action_precheck"),
         ("close_ready_event_ref", "record_close_ready"),
     ):
@@ -5800,8 +5800,8 @@ def _runtime_context_next_required_evidence(
         (
             "verification_event_refs",
             "independent_verification",
-            "record_independent_verification",
-            "verification_runner",
+            "handoff_to_independent_qa",
+            "independent_qa",
             "task_timeline.verification",
         ),
         (
@@ -5829,7 +5829,12 @@ def _runtime_context_next_required_evidence(
                 consumer="close_gate",
                 expected_source=expected_source,
                 evidence_ref="timeline",
-                worker_owned=item_id not in {"close_ready", "route_action_precheck"},
+                worker_owned=item_id
+                not in {
+                    "close_ready",
+                    "independent_verification",
+                    "route_action_precheck",
+                },
                 requires=["finish_gate"] if "finish_gate" in seen else [],
             )
     if lane_plan.get("blocking_events"):

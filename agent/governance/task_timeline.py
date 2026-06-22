@@ -10941,6 +10941,62 @@ def synthetic_failure_envelope(
     }
 
 
+_EVENT_KIND_QUERY_ALIASES: dict[str, dict[str, set[str]]] = {
+    "mf_subagent_startup": {
+        "event_kind": {
+            "mf_subagent_startup",
+            "mf_subagent_startup_gate",
+            "worker_startup",
+        },
+    },
+    "finish_time_worker_attestation": {
+        "event_kind": {
+            "finish_time_worker_attestation",
+            "mf_subagent_finish_time_worker_attestation",
+        },
+        "event_type": {"mf_subagent.finish_time_worker_attestation"},
+        "phase": {"finish_time_worker_attestation"},
+    },
+    "mf_subagent_finish_time_worker_attestation": {
+        "event_kind": {
+            "finish_time_worker_attestation",
+            "mf_subagent_finish_time_worker_attestation",
+        },
+        "event_type": {"mf_subagent.finish_time_worker_attestation"},
+        "phase": {"finish_time_worker_attestation"},
+    },
+}
+
+
+def _timeline_event_kind_query_parts(
+    event_kind: str,
+) -> tuple[str, list[Any]] | None:
+    normalized = str(event_kind or "").strip()
+    if not normalized:
+        return None
+    aliases = _EVENT_KIND_QUERY_ALIASES.get(
+        normalized.lower().replace("-", "_"),
+        {},
+    )
+    if not aliases:
+        return "event_kind = ?", [normalized]
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column in ("event_kind", "event_type", "phase"):
+        column_aliases = set(aliases.get(column, set()))
+        if column == "event_kind":
+            column_aliases.add(normalized)
+        values = sorted(column_aliases)
+        if not values:
+            continue
+        placeholders = ", ".join("?" for _ in values)
+        clauses.append(f"{column} IN ({placeholders})")
+        params.extend(values)
+    if not clauses:
+        return "event_kind = ?", [normalized]
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 def list_events(
     conn: sqlite3.Connection,
     project_id: str,
@@ -10973,8 +11029,11 @@ def list_events(
         clauses.append("phase = ?")
         params.append(phase)
     if event_kind:
-        clauses.append("event_kind = ?")
-        params.append(event_kind)
+        event_kind_query = _timeline_event_kind_query_parts(event_kind)
+        if event_kind_query is not None:
+            clause, query_params = event_kind_query
+            clauses.append(clause)
+            params.extend(query_params)
     if scenario_id:
         clauses.append("scenario_id = ?")
         params.append(scenario_id)

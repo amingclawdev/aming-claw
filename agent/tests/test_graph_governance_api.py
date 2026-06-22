@@ -48,8 +48,10 @@ from agent.governance.parallel_branch_runtime import (
     BatchMergeRuntime,
     MergeQueueItem,
     STATE_MERGE_FAILED,
+    STATE_VALIDATED,
     STATE_WORKTREE_READY,
     append_branch_contract_revision,
+    build_runtime_context_action_plan_view,
     build_runtime_context_lane_plan_view,
     get_branch_context,
     get_latest_branch_contract_revision,
@@ -7597,6 +7599,268 @@ def test_runtime_context_finish_gate_facade_preserves_contract_error_tuple(conn)
     )
     assert response["context"]["runtime_context_id"] == runtime_context_id
     assert response["context"]["fence_token_redacted"] is True
+
+
+def test_runtime_context_finish_attestation_lookup_accepts_passed_shape_drift(conn):
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-attestation-shape-task",
+            root_task_id="runtime-attestation-shape-parent",
+            backlog_id="AC-RUNTIME-ATTESTATION-SHAPE",
+            worker_id="worker-runtime-attestation-shape",
+            worker_slot_id="worker-runtime-attestation-shape",
+            agent_id="worker-runtime-attestation-shape",
+            governance_project_id=PID,
+            target_project_id=PID,
+            branch_ref="refs/heads/codex/runtime-attestation-shape",
+            worktree_path="/tmp/runtime-attestation-shape",
+            base_commit="base-runtime-attestation-shape",
+            head_commit="head-runtime-attestation-shape",
+            target_head_commit="head-runtime-attestation-shape",
+            merge_queue_id="mq-runtime-attestation-shape",
+            fence_token="fence-runtime-attestation-shape",
+            status=STATE_WORKTREE_READY,
+        ),
+        now_iso="2026-06-22T06:30:00Z",
+    )
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="passed",
+        actor="worker-runtime-attestation-shape",
+        payload={
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": "runtime-attestation-shape-parent",
+            "worker_session_id": "worker-runtime-attestation-shape",
+            "filer_principal": "worker-runtime-attestation-shape",
+            "head_commit": "head-runtime-attestation-shape",
+            "changed_files": ["src/app.js", "tests/today-focus.test.mjs"],
+            "test_results": {
+                "status": "passed",
+                "commands": [
+                    "node tests/today-focus.test.mjs",
+                    "npm test",
+                ],
+            },
+            "read_receipt_hash": "sha256:runtime-attestation-shape-read",
+            "read_receipt_event_id": "42",
+            "finish_time_worker_self_attestation": {
+                "schema_version": "worker_transcript_self_attestation.v1",
+                "attestation_phase": "finish",
+                "status": "passed",
+                "ok": True,
+                "worker_self_attesting": True,
+                "self_attesting": True,
+                "finish_time_self_attesting": True,
+                "finish_time_blockers": [],
+                "worker_session_id": "worker-runtime-attestation-shape",
+                "filer_principal": "worker-runtime-attestation-shape",
+                "worker_transcript_path": "/tmp/runtime-attestation-shape.jsonl",
+                "harness_type": "codex",
+                "blockers": [],
+            },
+        },
+        commit_sha="head-runtime-attestation-shape",
+    )
+
+    attestation = server._runtime_context_latest_finish_attestation(
+        conn,
+        project_id=PID,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        parent_task_id="runtime-attestation-shape-parent",
+        head_commit="head-runtime-attestation-shape",
+        changed_files=["tests/today-focus.test.mjs", "src/app.js"],
+        test_results={
+            "status": "passed",
+            "passed": True,
+            "commands": [
+                "npm test",
+                "node tests/today-focus.test.mjs",
+            ],
+        },
+        worker_session_id="worker-runtime-attestation-shape",
+        read_receipt_event_id="timeline:42",
+        read_receipt_hash="sha256:runtime-attestation-shape-read",
+    )
+
+    assert attestation["harness_type"] == "codex"
+    assert attestation["finish_time_self_attesting"] is True
+
+
+def test_timeline_list_events_accepts_contract_event_kind_aliases(conn):
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="timeline-alias-task",
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="passed",
+        payload={"action": "record_finish_time_worker_attestation"},
+    )
+    refusal = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="timeline-alias-task",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup_refusal",
+        phase="startup_gate",
+        status="blocked",
+        payload={},
+    )
+    startup = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="timeline-alias-task",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        payload={"mf_subagent_startup_gate": {"status": "passed"}},
+    )
+
+    finish_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="timeline-alias-task",
+        event_kind="finish_time_worker_attestation",
+    )
+    startup_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="timeline-alias-task",
+        event_kind="mf_subagent_startup",
+    )
+
+    assert [event["phase"] for event in finish_events] == [
+        "finish_time_worker_attestation"
+    ]
+    assert [event["id"] for event in startup_events] == [startup["id"]]
+    assert refusal["id"] not in {event["id"] for event in startup_events}
+
+
+def test_runtime_context_current_state_allows_validated_worker_read(conn):
+    target_root = "/tmp/runtime-validated-current-state"
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-validated-current-state-task",
+            root_task_id="runtime-validated-current-state-parent",
+            backlog_id="AC-RUNTIME-VALIDATED-CURRENT-STATE",
+            worker_id="worker-runtime-validated-current-state",
+            worker_slot_id="worker-runtime-validated-current-state",
+            agent_id="worker-runtime-validated-current-state",
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=target_root,
+            branch_ref="refs/heads/codex/runtime-validated-current-state",
+            worktree_path=target_root,
+            base_commit="base-runtime-validated-current-state",
+            head_commit="head-runtime-validated-current-state",
+            target_head_commit="head-runtime-validated-current-state",
+            merge_queue_id="mq-runtime-validated-current-state",
+            fence_token="fence-runtime-validated-current-state",
+            session_token_hash=mf_subagent_session_token_hash(
+                "runtime-validated-current-state-session"
+            ),
+            status=STATE_VALIDATED,
+            checkpoint_id="ckpt-runtime-validated-current-state",
+        ),
+        now_iso="2026-06-22T06:45:00Z",
+    )
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+
+    response = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "runtime-validated-current-state-parent",
+                "fence_token": "fence-runtime-validated-current-state",
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "target_project_root": target_root,
+                "view": "all",
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    worker_view = response["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["task"]["task_id"] == "runtime-validated-current-state-task"
+    assert worker_view["branch"]["head_commit"] == (
+        "head-runtime-validated-current-state"
+    )
+    assert worker_view["action_plan"]["schema_version"].startswith(
+        "runtime_context.action_plan"
+    )
+    assert worker_view["raw_session_token_exposed"] is False
+
+
+def test_runtime_context_action_plan_hands_off_independent_qa_after_finish():
+    action_plan = build_runtime_context_action_plan_view(
+        {
+            "runtime_context_id": "mfrctx-qa-handoff",
+            "current_values": {
+                "runtime_context_id": "mfrctx-qa-handoff",
+                "task_id": "task-qa-handoff",
+                "parent_task_id": "parent-qa-handoff",
+                "read_receipt_event_ref": "timeline:1",
+                "startup_event_ref": "timeline:2",
+                "startup_runtime_context_id": "mfrctx-qa-handoff",
+                "startup_fence_token_present": True,
+                "startup_worker_session_id": "worker-qa-handoff",
+                "startup_worker_transcript_ref": "multi_agent:worker-qa-handoff",
+                "startup_harness_type": "codex",
+                "startup_route_id": "route-qa-handoff",
+                "startup_route_context_hash": "sha256:route-qa-handoff",
+                "startup_prompt_contract_id": "prompt-qa-handoff",
+                "startup_prompt_contract_hash": "sha256:prompt-qa-handoff",
+                "startup_route_token_ref": "rtok-qa-handoff",
+                "startup_read_receipt_hash": "sha256:read-qa-handoff",
+                "startup_read_receipt_event_id": "1",
+                "route_id": "route-qa-handoff",
+                "route_context_hash": "sha256:route-qa-handoff",
+                "prompt_contract_id": "prompt-qa-handoff",
+                "prompt_contract_hash": "sha256:prompt-qa-handoff",
+                "route_token_ref": "rtok-qa-handoff",
+                "visible_injection_manifest_hash": "sha256:visible-qa-handoff",
+                "graph_trace_ids": ["gqt-qa-handoff"],
+                "implementation_event_refs": ["timeline:3"],
+                "worker_self_attesting": True,
+                "finish_gate_ref": "timeline:4",
+                "checkpoint_id": "ckpt-qa-handoff",
+            },
+            "lane_plan": {},
+        },
+        gate_inputs_view={},
+        close_gate_view={
+            "missing": [{"field": "verification_event_refs"}],
+            "ready": False,
+        },
+    )
+
+    assert action_plan["next_legal_action"] == "handoff_to_independent_qa"
+    assert action_plan["next_required_evidence"][0]["id"] == (
+        "independent_verification"
+    )
+    assert action_plan["next_required_evidence"][0]["producer"] == "independent_qa"
+    assert action_plan["next_required_evidence"][0]["worker_owned"] is False
 
 
 def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_events(conn):

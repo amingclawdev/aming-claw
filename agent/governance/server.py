@@ -10873,6 +10873,7 @@ def _runtime_context_mf_sub_read_context(
             conn,
             project_id=project_id,
             runtime_context_id=runtime_context_id,
+            allow_validated=True,
             allow_worktree_target_root_alias=True,
         )
         return context, "mf_sub", session
@@ -10890,6 +10891,7 @@ def _runtime_context_mf_sub_read_context(
             project_id=project_id,
             runtime_context_id=runtime_context_id,
             require_session_token=True,
+            allow_validated=True,
             allow_worktree_target_root_alias=True,
         )
         session = _runtime_context_scoped_mf_sub_session(
@@ -11793,6 +11795,27 @@ def _runtime_context_test_results_passed(value: Any) -> bool:
     }
 
 
+def _runtime_context_test_results_compatible(
+    candidate: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    if dict(candidate) == dict(expected):
+        return True
+    if not _runtime_context_test_results_passed(candidate):
+        return False
+    if not _runtime_context_test_results_passed(expected):
+        return False
+    candidate_commands = set(
+        _runtime_context_service_query_values(candidate, "command", "commands")
+    )
+    expected_commands = set(
+        _runtime_context_service_query_values(expected, "command", "commands")
+    )
+    if candidate_commands and expected_commands:
+        return candidate_commands == expected_commands
+    return True
+
+
 def _runtime_context_finish_gate_submission_payload(
     *,
     project_id: str,
@@ -11984,7 +12007,10 @@ def _runtime_context_latest_finish_attestation(
                 if isinstance(payload.get("test_results"), Mapping)
                 else {}
             )
-            if dict(candidate_tests) != expected_tests:
+            if not _runtime_context_test_results_compatible(
+                candidate_tests,
+                expected_tests,
+            ):
                 continue
         attestation = payload.get("finish_time_worker_self_attestation")
         attestation_payload = attestation if isinstance(attestation, Mapping) else {}
