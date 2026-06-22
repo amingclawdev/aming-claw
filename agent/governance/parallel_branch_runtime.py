@@ -2281,13 +2281,36 @@ def _runtime_context_public_qa_findings(value: Any) -> list[Any]:
     return sanitized if isinstance(sanitized, list) else []
 
 
+def _runtime_context_public_timeline_ref_value(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        refs = [
+            ref
+            for item in value
+            if (ref := _runtime_context_public_timeline_ref_value(item))
+        ]
+        return refs
+    text = _runtime_context_text(value).strip()
+    if not text:
+        return None
+    if text.startswith("timeline:"):
+        event_id = text.removeprefix("timeline:").strip()
+    else:
+        event_id = text
+    if not event_id.isdigit():
+        return None
+    return f"timeline:{event_id}"
+
+
 def _runtime_context_public_reviewed_events(value: Any) -> dict[str, Any]:
     reviewed_events = _runtime_context_mapping(value)
     safe: dict[str, Any] = {}
     for key in _RUNTIME_CONTEXT_REVIEWED_EVENT_REF_KEYS:
         event_ref = reviewed_events.get(key)
-        if event_ref:
-            safe[key] = _sanitize_public_contract_revision_value(event_ref)
+        if not event_ref:
+            continue
+        public_ref = _runtime_context_public_timeline_ref_value(event_ref)
+        if public_ref:
+            safe[key] = public_ref
     return safe
 
 

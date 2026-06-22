@@ -1329,6 +1329,11 @@ def test_runtime_context_failed_independent_qa_prioritizes_revision_over_startup
                     ],
                     "reviewed_events": {
                         "implementation_event_ref": "timeline:6160",
+                        "verification_event_ref": "raw-route-token-secret",
+                        "verification_event_refs": [
+                            "timeline:6164",
+                            "raw-session-token-secret",
+                        ],
                         "worker_verification_event_ref": "timeline:6162",
                         "review_ready_event_ref": "timeline:6163",
                         "raw_route_token": "secret-route-token",
@@ -1362,10 +1367,14 @@ def test_runtime_context_failed_independent_qa_prioritizes_revision_over_startup
         == "state_reconcile did not reuse parsed modules"
     )
     assert revision["reviewed_events"]["implementation_event_ref"] == "timeline:6160"
+    assert revision["reviewed_events"]["verification_event_refs"] == ["timeline:6164"]
+    assert "verification_event_ref" not in revision["reviewed_events"]
     assert "raw_route_token" not in revision["reviewed_events"]
     assert "session_token" not in revision["reviewed_events"]
     assert "secret-route-token" not in json.dumps(action_plan)
     assert "secret-session-token" not in json.dumps(action_plan)
+    assert "raw-route-token-secret" not in json.dumps(action_plan)
+    assert "raw-session-token-secret" not in json.dumps(action_plan)
     assert revision["allowed_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert first_required["id"] == "failed_qa_revision"
     assert first_required["is_next"] is True
