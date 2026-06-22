@@ -228,6 +228,7 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "merge",
     "merge_preview",
     "merge_queue_entry",
+    "mf_subagent_startup",
     "no_progress_timeout",
     "observer_command",
     "observer_visual_smoke",

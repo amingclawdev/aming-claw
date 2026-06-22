@@ -553,6 +553,57 @@ def test_runtime_hints_carry_role_bound_worker_prefill_boundary():
     ] == "mf_sub"
 
 
+def test_mf_subagent_startup_next_action_hint_is_worker_owned():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_revision_id": "rev-worker-startup",
+            "contract_execution_id": "cex-worker-startup",
+            "contract_chain_id": "cchain-worker-startup",
+            "state": "selected",
+            "required_evidence": ["mf_subagent_startup"],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": "AC-CONTRACT-RUNTIME",
+            "task_id": "worker-task-1",
+        },
+    )
+
+    action = projection["next_legal_action"]
+    hint = action["timeline_append_hint"]
+    prefill = hint["role_bound_prefill_policy"]
+
+    assert action["id"] == "mf_subagent_startup"
+    assert hint["event_kind"] == "mf_subagent_startup"
+    assert hint["satisfies_by"] == "event_kind"
+    assert hint["actor_role"] == "mf_sub"
+    assert hint["meta_contract_gate"]["allowed"] is True
+    assert prefill["execution_owner_role"] == "mf_sub"
+    assert prefill["observer_owned"] is False
+    assert prefill["observer_prefill_allowed"] is True
+    assert prefill["actor_must_supply_evidence"] is True
+    assert "route_identity" in prefill["observer_prefill_fields"]
+    assert "contract_execution_id" in prefill["observer_prefill_fields"]
+    for field in (
+        "status",
+        "evidence_refs",
+        "verification",
+        "result",
+        "changed_files",
+        "tests",
+        "graph_trace_ids",
+    ):
+        assert field not in prefill["observer_prefill_fields"]
+        assert field in prefill["actor_owned_execution_fields"]
+
+
 def test_projection_falls_back_to_event_project_id_for_active_execution():
     contract = {
         "contract": {
