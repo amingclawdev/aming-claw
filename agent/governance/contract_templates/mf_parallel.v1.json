@@ -332,6 +332,59 @@
       },
       "description": "Worker and observer lanes query the shared runtime/contract view by task/fence identity instead of treating generated runtime text as the source of truth. Observer changes must append contract revisions; workers poll this service for current bounded execution state."
     },
+    "parent_child_prefill_policy": {
+      "schema_version": "mf_parallel.parent_child_prefill_policy.v1",
+      "parent_orchestration": {
+        "owner": "observer_coordinator",
+        "responsibilities": [
+          "split parallel work into child contracts before dispatch",
+          "allocate/register each child branch runtime context",
+          "prefill each child contract with route identity, parent lineage, owned_files, tests, evidence ids, and dispatch readiness",
+          "refresh missing or stale child prefill before spawn_agent"
+        ]
+      },
+      "child_prefill": {
+        "owner": "mf_sub",
+        "required_before_implementation": [
+          "runtime_context_id",
+          "task_id",
+          "parent_task_id",
+          "worker_role",
+          "branch_ref",
+          "worktree_path",
+          "target_project_root",
+          "base_commit",
+          "target_head_commit",
+          "merge_queue_id",
+          "fence_token",
+          "route_context_hash",
+          "prompt_contract_id",
+          "prompt_contract_hash",
+          "route_token_ref",
+          "owned_files",
+          "test_commands",
+          "required_evidence"
+        ],
+        "child_ownership": "The child worker may modify only owned_files in its assigned worktree and must report missing/stale prefill as a blocker instead of widening scope."
+      },
+      "dispatch_readiness": {
+        "ready_when": [
+          "branch runtime registration is current",
+          "child route identity and parent lineage are present",
+          "owned_files are non-empty and projected into worker_constraints.scope.owned_files",
+          "runtime worker guide implementation_and_tests step lists the same owned_files",
+          "worker graph query identity is mf_subagent-scoped"
+        ],
+        "blocked_when": [
+          "child prefill is missing",
+          "child prefill is stale relative to parent route identity",
+          "owned_files are empty or differ between dispatch payload and runtime guide",
+          "worktree_path is used as target_project_root for write facades instead of the canonical target_project_root"
+        ],
+        "next_action_on_block": "refresh_child_contract_prefill_before_dispatch"
+      },
+      "parallelization_guidance": "Prefer splitting parent work into explicit child contracts with owned_files fences before dispatching parallel mf_sub workers."
+    },
     "service_dispatch": {
       "schema_version": "observer_subagent_service_dispatch.v1",
       "required_for": [

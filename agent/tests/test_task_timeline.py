@@ -4180,6 +4180,18 @@ class TestTaskTimeline(unittest.TestCase):
             raised.exception.details["legal_next_action"],
             "record_or_reuse_an_accepted_route_owned_source_event_for_the_claimed_route_identity",
         )
+        self.assertEqual(
+            raised.exception.details["accepted_timeline_evidence_shapes"][0],
+            {"timeline_evidence": {"event_id": "6040"}},
+        )
+        self.assertEqual(
+            raised.exception.details["accepted_timeline_evidence_shapes"][1],
+            {"timeline_evidence_refs": ["timeline:6036", "timeline:6040"]},
+        )
+        self.assertIn(
+            "timeline_evidence",
+            raised.exception.details["route_waiver_shape_hint"],
+        )
         count = self.conn.execute(
             "SELECT COUNT(*) AS c FROM task_timeline_events WHERE backlog_id = ? AND event_kind = 'implementation'",
             (bug_id,),

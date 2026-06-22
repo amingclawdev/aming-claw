@@ -14998,6 +14998,19 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert graph_payload["project_root"] == str(target_root)
     assert graph_payload["repo_root"] == str(target_root)
     assert graph_payload["route_identity"]["route_token_ref"] == "rtok-runtime-lease"
+    current_qa_guide = current["executable_contract"][
+        "independent_verification_runtime"
+    ]
+    assert current_qa_guide["role"] == "qa"
+    assert current_qa_guide["raw_route_token_required"] is False
+    assert current_qa_guide["read_current_state"]["tool"] == "runtime_context_current"
+    assert current_qa_guide["read_worker_guide"]["tool"] == (
+        "runtime_context_worker_guide"
+    )
+    assert current_qa_guide["graph_query"]["query_source"] == "qa"
+    assert current_qa_guide["graph_query"]["query_purpose"] == (
+        "independent_verification"
+    )
 
     guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
         _ctx_with_role(
@@ -15010,6 +15023,21 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert guide["worker_guide"]["session_token_lease"]["lease_id"] == (
         "lease-runtime-current"
     )
+    qa_guide = guide["worker_guide"]["independent_verification_runtime"]
+    assert qa_guide["observer_or_hotfix_actor_must_not_author_evidence"] is True
+    assert qa_guide["append_evidence"]["accepted_authorization_forms"] == [
+        "route_token_ref",
+        "accepted_route_owned_source_event_lineage",
+    ]
+    assert qa_guide["append_evidence"]["route_token_ref_body"]["route_token_ref"] == (
+        "rtok-runtime-lease"
+    )
+    assert qa_guide["append_evidence"]["route_token_ref_body"]["backlog_id"] == (
+        "AC-RUNTIME-LEASE-CURRENT"
+    )
+    assert qa_guide["append_evidence"]["source_event_lineage_body"]["verification"][
+        "source_event_lineage"
+    ]["accepted_source_event_refs"] == ["timeline:<accepted-source-event-id>"]
     assert "target_project_root" in guide["worker_guide"]["read_endpoints"]["graph_query"][
         "required_body_fields"
     ]

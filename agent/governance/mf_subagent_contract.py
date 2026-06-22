@@ -914,6 +914,7 @@ def build_observer_owned_agent_task_contract(
     blocked_actions: Sequence[str] | None = None,
     required_evidence: Sequence[str] | None = None,
     target_files: Sequence[str] | None = None,
+    owned_files: Sequence[str] | None = None,
     target_fences: Sequence[str] | None = None,
     lease_deadline: str = "",
     lifecycle_state: str = "",
@@ -930,6 +931,10 @@ def build_observer_owned_agent_task_contract(
         for item in (required_evidence or _DEFAULT_RUNTIME_CONTRACT_EVIDENCE)
         if _string(item)
     ]
+    target_file_values = [item for item in (target_files or []) if _string(item)]
+    owned_file_values = [item for item in (owned_files or []) if _string(item)]
+    if not owned_file_values:
+        owned_file_values = list(target_file_values)
     core = {
         "schema_version": AGENT_TASK_CONTRACT_SCHEMA_VERSION,
         "source_of_truth": "Contract/Revision/Event",
@@ -951,7 +956,8 @@ def build_observer_owned_agent_task_contract(
         "allowed_actions": list(allowed_actions or MF_SUB_ALLOWED_CAPABILITIES),
         "blocked_actions": list(blocked_actions or MF_SUB_FORBIDDEN_ACTIONS),
         "required_evidence": evidence,
-        "target_files": [item for item in (target_files or []) if _string(item)],
+        "target_files": target_file_values,
+        "owned_files": owned_file_values,
         "target_fences": [item for item in (target_fences or []) if _string(item)]
         or [context.fence_token],
         "lease": {
@@ -1046,6 +1052,19 @@ def build_mf_subagent_runtime_contract_view(
     )
     observer_command_id = _string(latest_revision_payload.get("observer_command_id"))
     route_identity_safe = _safe_route_identity(route_identity)
+    latest_target_files = _string_list_from_mapping(
+        latest_revision_payload,
+        "target_files",
+    )
+    latest_owned_files = _string_list_from_mapping(
+        latest_revision_payload,
+        "owned_files",
+        "write_scope",
+    )
+    if not latest_target_files:
+        latest_target_files = list(latest_owned_files)
+    if not latest_owned_files:
+        latest_owned_files = list(latest_target_files)
     agent_task_contract = build_observer_owned_agent_task_contract(
         context,
         requester=_string(latest_revision_payload.get("requester")),
@@ -1074,11 +1093,8 @@ def build_mf_subagent_runtime_contract_view(
         )
         or MF_SUB_FORBIDDEN_ACTIONS,
         required_evidence=evidence_ids,
-        target_files=_string_list_from_mapping(
-            latest_revision_payload,
-            "target_files",
-            "owned_files",
-        ),
+        target_files=latest_target_files,
+        owned_files=latest_owned_files,
         target_fences=[context.fence_token],
         lease_deadline=context.lease_expires_at,
         lifecycle_state=context.status,
@@ -1330,7 +1346,11 @@ def build_mf_subagent_runtime_contract_view(
             "",
         ),
         "target_files": list(agent_task_contract.get("target_files") or []),
-        "owned_files": list(agent_task_contract.get("target_files") or []),
+        "owned_files": list(
+            agent_task_contract.get("owned_files")
+            or agent_task_contract.get("target_files")
+            or []
+        ),
         "verification_route_policy": verification_route_policy_from_contract(
             {
                 **latest_revision_payload,
@@ -6627,6 +6647,7 @@ def build_mf_subagent_input(
         contract_version="mf_parallel.v1",
         required_evidence=_DEFAULT_RUNTIME_CONTRACT_EVIDENCE,
         target_files=target_files,
+        owned_files=target_files,
         target_fences=[context.fence_token],
         lifecycle_state=context.status,
     )
@@ -6702,6 +6723,7 @@ def build_mf_subagent_input(
                 acceptance_criteria, field_name="acceptance_criteria"
             ),
             "target_files": _string_list(target_files, field_name="target_files"),
+            "owned_files": list(agent_task_contract.get("owned_files") or []),
             "test_commands": _string_list(test_commands, field_name="test_commands"),
             "operator_notes": operator_notes,
         },
@@ -6716,6 +6738,7 @@ def build_mf_subagent_input(
             {
                 "route_identity": child_route_prompt_contract,
                 "target_files": list(agent_task_contract["target_files"]),
+                "owned_files": list(agent_task_contract.get("owned_files") or []),
             }
         ),
         "capabilities": {

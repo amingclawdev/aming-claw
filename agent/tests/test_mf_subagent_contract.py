@@ -2877,9 +2877,11 @@ def test_build_input_carries_branch_runtime_identity() -> None:
 
 
 def test_build_input_carries_parent_and_child_route_lineage() -> None:
+    owned_files = ["agent/governance/mf_subagent_contract.py"]
     payload = build_mf_subagent_input(
         _context(),
         prompt="Implement the isolated change.",
+        target_files=owned_files,
         route_context_hash="sha256:child-route-context",
         prompt_contract_id="rprompt-child",
         prompt_contract_hash="sha256:child-prompt",
@@ -2897,6 +2899,8 @@ def test_build_input_carries_parent_and_child_route_lineage() -> None:
         "sha256:parent-route-context"
     )
     assert payload["route_lineage"]["child_prompt_contract_id"] == "rprompt-child"
+    assert payload["work"]["owned_files"] == owned_files
+    assert payload["agent_task_contract"]["owned_files"] == owned_files
 
 
 @pytest.mark.parametrize("field", ["backlog_id", "worktree_path", "fence_token", "merge_queue_id"])

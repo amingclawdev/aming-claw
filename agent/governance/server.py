@@ -8018,6 +8018,125 @@ def _runtime_context_executable_contract_envelope(
             "projection_hash": access_audit.get("projection_hash", ""),
             "counts_as_context_read_receipt": False,
         },
+        "independent_verification_runtime": _runtime_context_qa_verification_guide(
+            project_id=str(current_state_response.get("project_id") or ""),
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            backlog_id=str(
+                task.get("backlog_id") or worker_view.get("backlog_id") or ""
+            ),
+            parent_task_id=parent_task_id,
+            target_project_root=str(
+                current_state_response.get("target_project_root")
+                or task.get("target_project_root")
+                or branch_view.get("worktree_path")
+                or ""
+            ),
+            route_identity=present_route_identity,
+        ),
+    }
+
+
+def _runtime_context_qa_verification_guide(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    backlog_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
+    safe_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(route_identity.get(field) or "").strip()
+    }
+    base_append_body = {
+        "backlog_id": backlog_id or parent_task_id,
+        "task_id": task_id,
+        "event_type": "independent_verification.completed",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "<independent-qa-reviewer-id>",
+        "status": "passed",
+        "payload": {
+            "reviewer_role": "independent_qa",
+            "requirement_id": "independent_verification_lane",
+        },
+        "verification": {
+            "requirement_id": "independent_verification_lane",
+            "route_identity": dict(safe_route_identity),
+        },
+    }
+    route_ref_body = dict(base_append_body)
+    if route_token_ref:
+        route_ref_body["route_token_ref"] = route_token_ref
+    source_lineage_body = dict(base_append_body)
+    source_lineage_body["verification"] = {
+        **dict(base_append_body["verification"]),
+        "source_event_lineage": {
+            "accepted_source_event_refs": ["timeline:<accepted-source-event-id>"],
+            "route_owned_source_event_required": True,
+        },
+    }
+    return {
+        "schema_version": "runtime_context.qa_independent_verification_guide.v1",
+        "role": "qa",
+        "purpose": "independent_verification",
+        "observer_or_hotfix_actor_must_not_author_evidence": True,
+        "raw_route_token_required": False,
+        "read_current_state": {
+            "tool": "runtime_context_current",
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/current-state"
+            ),
+            "query": {
+                "project_id": project_id,
+                "runtime_context_id": runtime_context_id,
+                "parent_task_id": parent_task_id,
+                "target_project_root": target_project_root,
+            },
+        },
+        "read_worker_guide": {
+            "tool": "runtime_context_worker_guide",
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/worker-guide"
+            ),
+            "query": {
+                "project_id": project_id,
+                "runtime_context_id": runtime_context_id,
+                "parent_task_id": parent_task_id,
+                "target_project_root": target_project_root,
+            },
+        },
+        "graph_query": {
+            "tool": "graph_query",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "route_identity": dict(safe_route_identity),
+            "target_project_root": target_project_root,
+        },
+        "append_evidence": {
+            "tool": "task_timeline_append",
+            "event_kind": "independent_verification",
+            "accepted_authorization_forms": [
+                "route_token_ref",
+                "accepted_route_owned_source_event_lineage",
+            ],
+            "route_token_ref_body": route_ref_body,
+            "source_event_lineage_body": source_lineage_body,
+            "forbidden_authors": [
+                "observer",
+                "hotfix_implementation_actor",
+                "mf_sub_worker_under_review",
+            ],
+        },
     }
 
 
@@ -8492,6 +8611,17 @@ def _runtime_context_worker_guide_response(
         }.items()
         if not value
     ]
+    qa_verification_guide = _runtime_context_qa_verification_guide(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        backlog_id=str(
+            task.get("backlog_id") or worker_view.get("backlog_id") or ""
+        ),
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        route_identity=route_identity,
+    )
     finish_attestation_submission = {
         "schema_version": (
             "runtime_context.finish_time_worker_attestation_submission.v1"
@@ -8959,6 +9089,7 @@ def _runtime_context_worker_guide_response(
             "implementation_evidence_facade_payload_skeleton",
             {},
         ),
+        "independent_verification_runtime": qa_verification_guide,
         "role_scope": current_state_response.get("role_scope"),
         "worker_guide": {
             "schema_version": "runtime_context.worker_guide.v1",
@@ -9002,6 +9133,7 @@ def _runtime_context_worker_guide_response(
                 "implementation_evidence_facade_payload_skeleton",
                 {},
             ),
+            "independent_verification_runtime": qa_verification_guide,
             "graph_query_identity": {
                 "runtime_context_id": runtime_context_id,
                 "task_id": graph_identity.get("task_id") or task_id,
@@ -26921,11 +27053,14 @@ def _require_route_token_mutation_gate(
             server_binding=server_binding,
         )
     except MfSubagentContractError as exc:
+        details = route_token_required_failure_details(action=action, reason=str(exc))
+        if "route_waiver requires timeline evidence" in str(exc):
+            details.update(_route_waiver_timeline_evidence_diagnostic())
         raise GovernanceError(
             "route_token_required",
             str(exc),
             422,
-            route_token_required_failure_details(action=action, reason=str(exc)),
+            details,
         ) from exc
 
     if resolved_from_ref:
@@ -28039,6 +28174,7 @@ def _timeline_route_waiver_block_for_high_risk(
             },
             "route_waiver_recording_allowed": True,
             "waiver_evidence_only": True,
+            **_route_waiver_timeline_evidence_diagnostic(),
             "source_event_lineage_required": source_lineage_required,
             "route_owned_source_event_gate": (
                 source_gate.get("source_event_gate", {}) if source_gate else {}
@@ -28072,6 +28208,27 @@ def _timeline_route_waiver_block_for_high_risk(
             "present_requirement_ids": present_requirement_ids,
         },
     )
+
+
+def _route_waiver_timeline_evidence_diagnostic() -> dict[str, Any]:
+    return {
+        "timeline_evidence_required": True,
+        "accepted_timeline_evidence_shapes": [
+            {"timeline_evidence": {"event_id": "6040"}},
+            {"timeline_evidence_refs": ["timeline:6036", "timeline:6040"]},
+        ],
+        "route_waiver_shape_hint": {
+            "allowed_action": "task_timeline_append",
+            "manual_fix": True,
+            "reason": "<operator reason, at least 20 characters>",
+            "timeline_evidence": {"event_id": "<accepted route/source event id>"},
+        },
+        "timeline_evidence_note": (
+            "Put timeline_evidence or timeline_evidence_refs inside route_waiver; "
+            "route_waiver evidence remains a waiver and does not itself satisfy "
+            "implementation, QA, or close-ready evidence."
+        ),
+    }
 
 
 def _backlog_upsert_requires_route_gate(body: dict | None, existing_row: Any | None) -> bool:

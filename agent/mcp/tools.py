@@ -1216,6 +1216,21 @@ TOOLS: list[dict] = [
                 "attempt": {"type": "integer"},
                 "branch_prefix": {"type": "string"},
                 "worktree_root": {"type": "string"},
+                "worktree_path": {
+                    "type": "string",
+                    "description": (
+                        "Final absolute worker worktree path; use when the path "
+                        "is already fully allocated."
+                    ),
+                },
+                "worker_worktree_path": {
+                    "type": "string",
+                    "description": "Alias for worktree_path.",
+                },
+                "assigned_worktree": {
+                    "type": "string",
+                    "description": "Alias for worktree_path.",
+                },
                 "ref_name": {"type": "string"},
                 "target_branch": {"type": "string"},
                 "base_commit": {"type": "string"},

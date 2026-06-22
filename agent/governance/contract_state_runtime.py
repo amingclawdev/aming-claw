@@ -1035,6 +1035,56 @@ def _actor_role_for_append_event(event_kind: str, requirement_id: str = "") -> s
     return "observer"
 
 
+def _role_bound_prefill_policy(
+    *,
+    actor_role: str,
+    event_kind: str,
+    requirement_id: str,
+    lane_role: str = "",
+) -> dict[str, Any]:
+    owner = _normalized_writer_role(actor_role) or "observer"
+    observer_owned = owner == "observer"
+    base_fields = [
+        "schema_version",
+        "requirement_id",
+        "requirement_ids",
+        "contract_execution_id",
+        "active_contract_execution_id",
+        "parent_contract_execution_id_expected",
+        "task_id",
+        "route_identity",
+    ]
+    route_fields = list(_ROUTE_BINDING_FIELD_NAMES)
+    actor_execution_fields = [
+        "status",
+        "evidence_refs",
+        "verification",
+        "result",
+        "changed_files",
+        "tests",
+        "graph_trace_ids",
+    ]
+    return {
+        "schema_version": "contract_state.role_bound_prefill_policy.v1",
+        "requirement_id": requirement_id,
+        "event_kind": event_kind,
+        "lane_role": lane_role,
+        "execution_owner_role": owner,
+        "observer_owned": observer_owned,
+        "observer_prefill_allowed": True,
+        "observer_prefill_fields": (
+            [*base_fields, *route_fields] if not observer_owned else ["*"]
+        ),
+        "actor_must_supply_evidence": not observer_owned,
+        "actor_owned_execution_fields": [] if observer_owned else actor_execution_fields,
+        "boundary": (
+            "observer_may_prefill_and_execute"
+            if observer_owned
+            else "observer_prefills_identity_only_actor_records_execution_evidence"
+        ),
+    }
+
+
 def _meta_contract_append_gate(event_kind: str, actor_role: str) -> dict[str, Any]:
     role = str(actor_role or "").strip() or "observer"
     allowed_actions = set(_META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE.get(role) or set())
@@ -1435,6 +1485,14 @@ def _enrich_next_action_append_hint(
             "route_identity_required": bool(route_identity),
             "route_identity": route_identity,
             "meta_contract_gate": _meta_contract_append_gate(event_kind, actor_role),
+            "role_bound_prefill_policy": _role_bound_prefill_policy(
+                actor_role=actor_role,
+                event_kind=event_kind,
+                requirement_id=str(
+                    enriched.get("requirement_id") or enriched.get("id") or ""
+                ),
+                lane_role=lane_role,
+            ),
         }
     )
     candidate_template_ids = _action_candidate_template_ids(enriched)
@@ -1544,6 +1602,152 @@ def _next_action_summary(action: Mapping[str, Any] | None) -> dict[str, Any]:
             if isinstance(step, Mapping) and str(step.get("id") or "").strip()
         ]
     return summary
+
+
+def _runtime_next_legal_operation(action: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(action, Mapping) or not action:
+        return {
+            "schema_version": "contract_state.next_legal_operation.v1",
+            "id": "",
+            "operation": "",
+            "source": "contract_state",
+            "status": "none",
+            "close_gate_is_navigation_source": False,
+        }
+    action_id = str(action.get("id") or "").strip()
+    operation = str(action.get("action") or action_id or "").strip()
+    hint = _mapping(action.get("timeline_append_hint"))
+    role_policy = _mapping(hint.get("role_bound_prefill_policy"))
+    return {
+        "schema_version": "contract_state.next_legal_operation.v1",
+        "id": action_id,
+        "operation": operation,
+        "requirement_id": str(action.get("requirement_id") or action_id).strip(),
+        "source": str(action.get("source") or "contract_state").strip(),
+        "precedence": str(action.get("precedence") or "").strip(),
+        "actor_role": str(hint.get("actor_role") or "").strip(),
+        "execution_owner_role": str(
+            role_policy.get("execution_owner_role") or hint.get("actor_role") or ""
+        ).strip(),
+        "contract_execution_id": str(action.get("contract_execution_id") or "").strip(),
+        "contract_chain_id": str(action.get("contract_chain_id") or "").strip(),
+        "backlog_id": str(action.get("backlog_id") or "").strip(),
+        "route_token_ref_present": bool(str(action.get("route_token_ref") or "").strip()),
+        "close_gate_is_navigation_source": False,
+        "close_gate_role": "final_verifier",
+        "prefill_state": role_policy,
+    }
+
+
+def _runtime_contract_hints(
+    *,
+    root: Mapping[str, Any],
+    active_execution: Mapping[str, Any],
+    active_lane_contract: Mapping[str, Any],
+    next_legal_action: Mapping[str, Any] | None,
+    lane_contract_executions: list[dict[str, Any]],
+    route_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    next_operation = _runtime_next_legal_operation(next_legal_action)
+    template_hints = _mapping(root.get("runtime_contract_hints"))
+    active = dict(active_execution) if isinstance(active_execution, Mapping) else {}
+    lane = dict(active_lane_contract) if isinstance(active_lane_contract, Mapping) else {}
+    return {
+        "schema_version": "contract_state.runtime_contract_hints.v1",
+        "template_hints": template_hints,
+        "active_contract_id": str(active.get("contract_id") or "").strip(),
+        "active_contract_template_id": str(
+            active.get("contract_template_id") or ""
+        ).strip(),
+        "active_contract_execution_id": str(
+            active.get("contract_execution_id") or ""
+        ).strip(),
+        "active_contract_chain_id": str(active.get("contract_chain_id") or "").strip(),
+        "active_lane_role": str(lane.get("role") or "root").strip(),
+        "active_lane_execution_id": str(lane.get("contract_execution_id") or "").strip(),
+        "route_identity": _public_route_identity(route_binding),
+        "next_legal_operation": next_operation,
+        "prefill_state": next_operation.get("prefill_state") or {},
+        "role_boundaries": [
+            {
+                "role": str(item.get("role") or "").strip(),
+                "contract_execution_id": str(
+                    item.get("contract_execution_id") or ""
+                ).strip(),
+                "contract_template_id": str(
+                    item.get("contract_template_id") or ""
+                ).strip(),
+                "next_legal_action": _next_action_summary(
+                    _mapping(item.get("next_legal_action"))
+                ),
+            }
+            for item in lane_contract_executions
+        ],
+        "close_gate_policy": {
+            "schema_version": "contract_state.close_gate_runtime_policy.v1",
+            "role": "final_verifier",
+            "drives_next_legal_operation": False,
+            "navigation_source": "contract_state.next_legal_operation",
+            "finalizes_after": [
+                "implementation_evidence",
+                "verification_evidence",
+                "close_ready",
+            ],
+        },
+    }
+
+
+def _executable_contract_envelope(
+    *,
+    active_execution: Mapping[str, Any],
+    active_lane_contract: Mapping[str, Any],
+    next_legal_action: Mapping[str, Any] | None,
+    runtime_hints: Mapping[str, Any],
+) -> dict[str, Any]:
+    active = dict(active_execution) if isinstance(active_execution, Mapping) else {}
+    lane = dict(active_lane_contract) if isinstance(active_lane_contract, Mapping) else {}
+    next_operation = _mapping(runtime_hints.get("next_legal_operation"))
+    return {
+        "schema_version": "runtime_context.executable_contract_envelope.v1",
+        "advisory_only": True,
+        "proof_policy": (
+            "runtime next_legal_operation/current-state/access_audit are advisory; "
+            "actor-authored timeline or runtime-context facade evidence remains "
+            "required for contract proof"
+        ),
+        "active_contract_id": str(active.get("contract_id") or "").strip(),
+        "active_contract_template_id": str(
+            active.get("contract_template_id") or ""
+        ).strip(),
+        "contract_execution": {
+            "schema_version": "runtime_context.contract_execution_identity.v1",
+            "contract_execution_id": str(
+                active.get("contract_execution_id") or ""
+            ).strip(),
+            "contract_chain_id": str(active.get("contract_chain_id") or "").strip(),
+            "parent_contract_execution_id": str(
+                active.get("parent_contract_execution_id") or ""
+            ).strip(),
+            "successor_contract_execution_id": str(
+                lane.get("contract_execution_id") or ""
+            ).strip()
+            if str(lane.get("role") or "") != "root"
+            else "",
+            "contract_revision_id": str(
+                active.get("contract_revision_id") or ""
+            ).strip(),
+            "contract_hash": str(active.get("contract_hash") or "").strip(),
+            "contract_hash_source": (
+                "branch_contract_revision.payload."
+                "revision_receipt.canonical_visible_contract_text_hash"
+            ),
+        },
+        "role": str(lane.get("role") or "root").strip(),
+        "prefill_state": _mapping(runtime_hints.get("prefill_state")),
+        "next_legal_operation": next_operation,
+        "next_legal_action": next_operation.get("operation") or "",
+        "close_gate_policy": _mapping(runtime_hints.get("close_gate_policy")),
+    }
 
 
 def _requirement_steps(
@@ -3867,6 +4071,20 @@ def build_contract_state_projection(
     active_lane_contract = (
         lane_contract_executions[-1] if lane_contract_executions else {}
     )
+    runtime_contract_hints = _runtime_contract_hints(
+        root=root,
+        active_execution=active_execution,
+        active_lane_contract=active_lane_contract,
+        next_legal_action=next_legal_action,
+        lane_contract_executions=lane_contract_executions,
+        route_binding=route_binding,
+    )
+    executable_contract = _executable_contract_envelope(
+        active_execution=active_execution,
+        active_lane_contract=active_lane_contract,
+        next_legal_action=next_legal_action,
+        runtime_hints=runtime_contract_hints,
+    )
 
     return {
         "schema_version": schema_version,
@@ -3893,6 +4111,8 @@ def build_contract_state_projection(
         "contract_lane_executions": lane_contract_executions,
         "contract_execution_index": contract_execution_index,
         "active_lane_contract": active_lane_contract,
+        "runtime_contract_hints": runtime_contract_hints,
+        "executable_contract": executable_contract,
         "completed_contract_executions": completed_contract_executions,
         "required_evidence": [step["id"] for step in requirement_steps],
         "conditional_required_evidence": conditional_groups,

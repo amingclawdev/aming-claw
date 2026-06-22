@@ -137,6 +137,12 @@ def test_independent_verification_lane_hint_is_qa_owned_and_appendable():
     assert hint["payload"]["requirement_id"] == "independent_verification_lane"
     assert hint["payload"]["requirement_ids"] == ["independent_verification_lane"]
     assert "qa_review" in hint["accepted_event_kinds"]
+    prefill = hint["role_bound_prefill_policy"]
+    assert prefill["execution_owner_role"] == "qa"
+    assert prefill["observer_owned"] is False
+    assert prefill["actor_must_supply_evidence"] is True
+    assert "contract_execution_id" in prefill["observer_prefill_fields"]
+    assert "verification" in prefill["actor_owned_execution_fields"]
 
     completed = build_contract_state_projection(
         [_event(12, "qa_review")],
@@ -487,6 +493,64 @@ def test_projection_exposes_active_contract_execution_handle():
         "contract_execution_id"
     ]
     assert projection["contract_chain"][0]["role"] == "root"
+    executable = projection["executable_contract"]
+    assert executable["active_contract_id"] == "onboard_contract.v1"
+    assert executable["contract_execution"]["contract_execution_id"] == active[
+        "contract_execution_id"
+    ]
+    assert executable["contract_execution"]["contract_chain_id"] == active[
+        "contract_chain_id"
+    ]
+    assert executable["next_legal_operation"]["id"] == "route_context"
+    assert executable["next_legal_operation"]["close_gate_is_navigation_source"] is False
+    hints = projection["runtime_contract_hints"]
+    assert hints["active_contract_execution_id"] == active["contract_execution_id"]
+    assert hints["active_contract_chain_id"] == active["contract_chain_id"]
+    assert hints["close_gate_policy"]["role"] == "final_verifier"
+    assert hints["close_gate_policy"]["drives_next_legal_operation"] is False
+
+
+def test_runtime_hints_carry_role_bound_worker_prefill_boundary():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_revision_id": "rev-worker-prefill",
+            "contract_execution_id": "cex-worker-prefill",
+            "contract_chain_id": "cchain-worker-prefill",
+            "state": "selected",
+            "required_evidence": [
+                {
+                    "id": "implementation",
+                    "accepted_event_kinds": ["implementation"],
+                }
+            ],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": "AC-CONTRACT-RUNTIME",
+            "task_id": "worker-task-1",
+        },
+    )
+
+    action = projection["next_legal_action"]
+    hint = action["timeline_append_hint"]
+    prefill = hint["role_bound_prefill_policy"]
+    assert action["contract_execution_id"] == "cex-worker-prefill"
+    assert hint["actor_role"] == "mf_sub"
+    assert prefill["execution_owner_role"] == "mf_sub"
+    assert prefill["observer_owned"] is False
+    assert prefill["actor_must_supply_evidence"] is True
+    assert "route_identity" in prefill["observer_prefill_fields"]
+    assert "changed_files" in prefill["actor_owned_execution_fields"]
+    assert projection["runtime_contract_hints"]["next_legal_operation"][
+        "execution_owner_role"
+    ] == "mf_sub"
 
 
 def test_projection_falls_back_to_event_project_id_for_active_execution():

@@ -2496,6 +2496,21 @@ def _runtime_context_revision_string_list(
     return []
 
 
+def _runtime_context_revision_scope_string_list(
+    payload: Mapping[str, Any],
+    *keys: str,
+) -> list[str]:
+    values = _runtime_context_revision_string_list(payload, *keys)
+    if values:
+        return values
+    for key in keys:
+        for candidate in _runtime_context_deep_values(payload, key):
+            values = _runtime_context_string_list(candidate)
+            if values:
+                return values
+    return []
+
+
 def _runtime_context_timeline_refs(
     timeline_refs: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -3166,6 +3181,7 @@ def _runtime_context_current_values(
     timeline_refs: Mapping[str, Any],
     graph_trace_refs: Mapping[str, Any],
     target_files: Sequence[str],
+    owned_files: Sequence[str],
     acceptance_criteria: Sequence[str],
     startup_gate: Mapping[str, Any],
     finish_gate: Mapping[str, Any],
@@ -3350,7 +3366,7 @@ def _runtime_context_current_values(
             route_identity.get("visible_injection_manifest_hash")
         ),
         "target_files": list(target_files),
-        "owned_files": list(target_files),
+        "owned_files": list(owned_files),
         "acceptance_criteria": list(acceptance_criteria),
         "graph_query_identity": {
             "query_source": "mf_subagent",
@@ -4151,7 +4167,9 @@ def build_runtime_context_gate_inputs_view(
             "",
         ),
         "target_files": list(values.get("target_files") or []),
-        "owned_files": list(values.get("target_files") or []),
+        "owned_files": list(
+            values.get("owned_files") or values.get("target_files") or []
+        ),
         "generated_at": current_view.get("generated_at", ""),
         "evidence_refs": evidence_refs,
         "gates": gates,
@@ -4225,21 +4243,35 @@ def build_runtime_context_current_view(
     if not graph_trace.get("source_details"):
         graph_trace["source_details"] = derived_graph_trace.get("source_details", {})
     startup = _runtime_context_startup_gate_payload(startup_gate or {})
-    startup_target_file_values = _runtime_context_revision_string_list(
+    startup_target_file_values = _runtime_context_revision_scope_string_list(
         startup,
         "target_files",
+    )
+    startup_owned_file_values = _runtime_context_revision_scope_string_list(
+        startup,
+        "owned_files",
+        "write_scope",
+    )
+    revision_target_file_values = _runtime_context_revision_scope_string_list(
+        revision_payload,
+        "target_files",
+    )
+    revision_owned_file_values = _runtime_context_revision_scope_string_list(
+        revision_payload,
         "owned_files",
         "write_scope",
     )
     target_file_values = _runtime_context_dedupe(
         list(target_files or ())
-        or _runtime_context_revision_string_list(
-            revision_payload,
-            "target_files",
-            "owned_files",
-            "write_scope",
-        )
+        or revision_target_file_values
+        or revision_owned_file_values
         or startup_target_file_values
+        or startup_owned_file_values
+    )
+    owned_file_values = _runtime_context_dedupe(
+        revision_owned_file_values
+        or startup_owned_file_values
+        or target_file_values
     )
     acceptance_values = _runtime_context_dedupe(
         list(acceptance_criteria or ())
@@ -4287,6 +4319,7 @@ def build_runtime_context_current_view(
         timeline_refs=timeline,
         graph_trace_refs=graph_trace,
         target_files=target_file_values,
+        owned_files=owned_file_values,
         acceptance_criteria=acceptance_values,
         startup_gate=startup,
         finish_gate=finish,
@@ -4375,6 +4408,7 @@ def build_runtime_context_current_view(
         "route_identity": route,
         "work": {
             "target_files": target_file_values,
+            "owned_files": owned_file_values,
             "acceptance_criteria": acceptance_values,
             "required_evidence": required_evidence_values,
         },

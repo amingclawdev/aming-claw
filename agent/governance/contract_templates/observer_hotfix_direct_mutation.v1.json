@@ -208,6 +208,53 @@
       }
     ]
   },
+  "runtime_contract_hints": {
+    "schema_version": "contract_template.runtime_hints.v1",
+    "active_contract_identity_fields": [
+      "contract_id",
+      "contract_template_id",
+      "contract_execution_id",
+      "contract_chain_id",
+      "parent_contract_execution_id",
+      "contract_revision_id",
+      "route_token_ref"
+    ],
+    "next_legal_operation_source": "hotfix_contract_evidence_requirements_then_successor_policy",
+    "role_bound_prefill_policy": {
+      "schema_version": "contract_template.role_bound_prefill_policy.v1",
+      "observer_owned_requirements": [
+        "hotfix_pre_reason",
+        "hotfix_post_action_summary",
+        "close_ready",
+        "successor_contract_selection"
+      ],
+      "observer_prefills_non_observer_contracts": [
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "contract_execution_id",
+        "contract_chain_id",
+        "parent_contract_execution_id",
+        "route_identity",
+        "route_token_ref"
+      ],
+      "non_observer_execution_evidence_owned_by": {
+        "qa": [
+          "focused_verification",
+          "qa_review",
+          "qa_verification",
+          "independent_verification"
+        ]
+      },
+      "worker_evidence_substitution_allowed": false
+    },
+    "close_gate_policy": {
+      "schema_version": "contract_template.close_gate_runtime_policy.v1",
+      "role": "final_verifier",
+      "drives_next_legal_operation": false,
+      "next_action_source": "hotfix_contract_state_not_generic_close_gate_gap_list"
+    }
+  },
   "evidence_requirements": [
     {
       "id": "hotfix_pre_reason",

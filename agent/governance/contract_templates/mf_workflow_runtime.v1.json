@@ -80,11 +80,51 @@
     ],
     "worker_prompt_fields": [
       "target_files",
+      "owned_files",
       "test_files",
       "acceptance_criteria",
       "route_identity",
       "evidence_required"
     ],
+    "parent_child_runtime_contract": {
+      "schema_version": "mf_workflow_runtime.parent_child_runtime_contract.v1",
+      "parent_orchestration_required": true,
+      "child_prefill_required_before_dispatch": true,
+      "prefer_parallel_child_contracts": true,
+      "parent_responsibilities": [
+        "derive child contracts from the parent route and backlog scope",
+        "prefill each child with parent_route_lineage and child route_prompt_contract",
+        "bind owned_files, test_commands, branch runtime identity, and merge_queue_id before dispatch",
+        "refresh missing or stale child prefill before worker startup"
+      ],
+      "child_responsibilities": [
+        "read runtime_context_worker_guide/current-state before implementation",
+        "verify worker_constraints.scope.owned_files matches the dispatch payload",
+        "modify only owned_files in the assigned worktree",
+        "stop with blocked/review_ready if child prefill or ownership is missing or stale"
+      ],
+      "dispatch_readiness_fields": [
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "branch_ref",
+        "worktree_path",
+        "target_project_root",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "fence_token",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "owned_files",
+        "test_commands"
+      ],
+      "blocked_next_action": "refresh_child_contract_prefill_before_dispatch",
+      "missing_or_stale_prefill_message": "Child worker contract prefill is missing or stale; parent orchestration must refresh child route identity, owned_files, and dispatch readiness before implementation."
+    },
     "blocked_roles": [
       "observer",
       "judger"
