@@ -2256,6 +2256,41 @@ def _runtime_context_lane_resolved_refs(event: Mapping[str, Any]) -> list[str]:
     return _runtime_context_dedupe([ref for ref in refs if ref])
 
 
+_RUNTIME_CONTEXT_REVIEWED_EVENT_REF_KEYS = {
+    "implementation_event_ref",
+    "implementation_event_refs",
+    "review_ready_event_ref",
+    "review_ready_event_refs",
+    "worker_verification_event_ref",
+    "worker_verification_event_refs",
+    "verification_event_ref",
+    "verification_event_refs",
+    "qa_event_ref",
+    "qa_event_refs",
+    "finish_gate_event_ref",
+    "finish_gate_event_refs",
+    "previous_failed_qa_ref",
+    "previous_failed_qa_event_ref",
+}
+
+
+def _runtime_context_public_qa_findings(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    sanitized = _sanitize_public_contract_revision_value(value[:5])
+    return sanitized if isinstance(sanitized, list) else []
+
+
+def _runtime_context_public_reviewed_events(value: Any) -> dict[str, Any]:
+    reviewed_events = _runtime_context_mapping(value)
+    safe: dict[str, Any] = {}
+    for key in _RUNTIME_CONTEXT_REVIEWED_EVENT_REF_KEYS:
+        event_ref = reviewed_events.get(key)
+        if event_ref:
+            safe[key] = _sanitize_public_contract_revision_value(event_ref)
+    return safe
+
+
 def _runtime_context_lane_blocking_event_details(
     event: Mapping[str, Any],
     merged: Mapping[str, Any],
@@ -2282,9 +2317,12 @@ def _runtime_context_lane_blocking_event_details(
     if acceptance_failed:
         details["acceptance_failed"] = acceptance_failed
     findings = merged.get("findings")
-    if isinstance(findings, list) and findings:
-        details["findings"] = public_contract_revision_payload(findings[:5])
-    reviewed_events = _runtime_context_mapping(merged.get("reviewed_events"))
+    public_findings = _runtime_context_public_qa_findings(findings)
+    if public_findings:
+        details["findings"] = public_findings
+    reviewed_events = _runtime_context_public_reviewed_events(
+        merged.get("reviewed_events")
+    )
     if reviewed_events:
         details["reviewed_events"] = reviewed_events
     safe_artifacts = {
@@ -5773,8 +5811,12 @@ def _runtime_context_failed_qa_revision_projection(
             "failed_qa_event_kind": event_kind,
             "failed_qa_status": status,
             "failed_acceptance_items": list(event.get("acceptance_failed") or []),
-            "findings": public_contract_revision_payload(event.get("findings") or []),
-            "reviewed_events": dict(event.get("reviewed_events") or {}),
+            "findings": _runtime_context_public_qa_findings(
+                event.get("findings") or []
+            ),
+            "reviewed_events": _runtime_context_public_reviewed_events(
+                event.get("reviewed_events") or {}
+            ),
             "allowed_files": owned_files,
             "required_revision_cycle": [
                 "revise_implementation_in_owned_scope",
