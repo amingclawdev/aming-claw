@@ -87,6 +87,7 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_content_hash,
     runtime_context_filter_content_address,
     runtime_context_session_token_lease_view,
+    runtime_context_secret_hash,
     runtime_tasks_from_contexts,
     upsert_branch_context,
     validate_mf_subagent_graph_query_identity,
@@ -1293,6 +1294,54 @@ def test_runtime_context_projection_surfaces_terminal_dispatch_blocker() -> None
     assert worker_view["terminal_dispatch_blockers"][0]["blocker_id"] == (
         "worker_session_token_not_injected"
     )
+
+
+def test_runtime_context_close_gate_marks_startup_refusal_blocked_not_present() -> None:
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={"startup_event_ref": "timeline:6196"},
+        startup_gate={
+            "id": 6196,
+            "event_kind": "mf_subagent_startup_refusal",
+            "status": "blocked",
+            "payload": {
+                "mf_subagent_startup_refusal": {
+                    "schema_version": "mf_subagent_startup_refusal.v1",
+                    "status": "blocked",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "reason": "session_token_ref missing",
+                    "missing_fields": ["session_token_ref"],
+                }
+            },
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    close_gate = projection["views"]["close_gate_view"]
+    startup_item = next(
+        item for item in close_gate["checklist"] if item["id"] == "startup_evidence"
+    )
+
+    assert startup_item["value"] == "timeline:6196"
+    assert startup_item["status"] == "blocked"
+    assert startup_item["valid"] is False
+    assert startup_item["blockers"] == ["session_token_ref"]
+    assert any(
+        item.get("field") == "startup_event_ref"
+        and item.get("status") == "blocked"
+        for item in close_gate["missing"]
+    )
+    assert close_gate["ready"] is False
 
 
 def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_startup_cwd_verified() -> None:
@@ -3751,6 +3800,11 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert gate["observer_allocation_owner"] == "agent-startup"
     assert gate["session_token_hash"].startswith("sha256:")
     assert gate["session_token_persisted"] is False
+    assert "fence_token" not in gate
+    assert gate["fence_token_present"] is True
+    assert gate["fence_token_hash"] == runtime_context_secret_hash("fence-startup")
+    assert gate["fence_token_redacted"] is True
+    assert gate["raw_fence_token_exposed"] is False
     assert gate["runtime_context_id"] == branch_runtime_context_id(PROJECT_ID, "mf-sub-startup")
     assert gate["observer_command_id"] == "cmd-startup"
     assert gate["route_id"] == "route-startup"
@@ -3768,6 +3822,10 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert gate["identity_join"]["route_identity_matches_latest_contract"] is True
     assert gate["identity_join"]["read_receipt_lineage_present"] is True
     assert "secret-worker-session-token" not in str(result)
+    assert "fence-startup" not in json.dumps(
+        result["timeline_event"]["payload"]["mf_subagent_startup_gate"],
+        sort_keys=True,
+    )
     assert result["timeline_event"]["event_kind"] == "mf_subagent_startup"
     assert result["timeline_event"]["actor"] == "codex-session-startup"
     assert result["timeline_event"]["payload"]["mf_subagent_startup_gate"] == gate

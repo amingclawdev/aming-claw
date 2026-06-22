@@ -2073,17 +2073,30 @@ def _runtime_context_startup_gate_payload(value: Mapping[str, Any] | None) -> di
     event_payload = payload.get("payload")
     if isinstance(event_payload, Mapping):
         event_payload = public_contract_revision_payload(event_payload)
-        nested = event_payload.get("mf_subagent_startup_gate")
-        if isinstance(nested, Mapping):
+        for nested_key in (
+            "mf_subagent_startup_gate",
+            "mf_subagent_startup_refusal",
+        ):
+            nested = event_payload.get(nested_key)
+            if not isinstance(nested, Mapping):
+                continue
+            nested_payload = public_contract_revision_payload(nested)
             return {
                 **payload,
                 **event_payload,
-                **public_contract_revision_payload(nested),
+                nested_key: nested_payload,
+                **nested_payload,
             }
         return {**payload, **event_payload}
-    nested = payload.get("mf_subagent_startup_gate")
-    if isinstance(nested, Mapping):
-        return {**payload, **public_contract_revision_payload(nested)}
+    for nested_key in (
+        "mf_subagent_startup_gate",
+        "mf_subagent_startup_refusal",
+    ):
+        nested = payload.get(nested_key)
+        if not isinstance(nested, Mapping):
+            continue
+        nested_payload = public_contract_revision_payload(nested)
+        return {**payload, nested_key: nested_payload, **nested_payload}
     return payload
 
 
@@ -3131,6 +3144,61 @@ def _runtime_context_value_present(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, dict)):
         return bool(value)
     return True
+
+
+def _runtime_context_startup_gate_blocker(
+    startup_gate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    gate = _runtime_context_mapping(startup_gate)
+    if not gate:
+        return {}
+    refusal = _runtime_context_mapping(gate.get("mf_subagent_startup_refusal"))
+    status = _runtime_context_text(gate.get("status") or refusal.get("status")).lower()
+    schema_version = _runtime_context_text(
+        gate.get("schema_version") or refusal.get("schema_version")
+    ).lower()
+    gate_kind = _runtime_context_text(gate.get("gate_kind") or refusal.get("gate_kind")).lower()
+    blocked_statuses = {
+        "blocked",
+        "denied",
+        "failed",
+        "invalid",
+        "refused",
+        "rejected",
+    }
+    is_refusal = (
+        "refusal" in schema_version
+        or "refusal" in gate_kind
+        or bool(refusal)
+    )
+    explicit_rejection = gate.get("allowed") is False or gate.get("ok") is False
+    if not (is_refusal or status in blocked_statuses or explicit_rejection):
+        return {}
+    blockers = (
+        _runtime_context_string_list(gate.get("blockers"))
+        or _runtime_context_string_list(gate.get("missing_fields"))
+        or _runtime_context_string_list(gate.get("reasons"))
+        or _runtime_context_string_list(refusal.get("blockers"))
+        or _runtime_context_string_list(refusal.get("missing_fields"))
+        or _runtime_context_string_list(refusal.get("reasons"))
+    )
+    reason = _runtime_context_text(
+        gate.get("message")
+        or gate.get("reason")
+        or refusal.get("message")
+        or refusal.get("reason")
+        or (blockers[0] if blockers else "")
+    )
+    return {
+        "status": "blocked" if status == "blocked" or is_refusal else "invalid",
+        "reason": reason or "Startup evidence ref points to a blocked or invalid startup event.",
+        "blockers": blockers,
+        "schema_version": schema_version,
+        "gate_kind": gate_kind,
+        "evidence_ref": _runtime_context_text(
+            gate.get("event_id") or gate.get("source_ref") or refusal.get("event_id")
+        ),
+    }
 
 
 def _runtime_context_nested_finish_gate_payload(
@@ -4510,18 +4578,55 @@ def build_runtime_context_close_gate_view(
         ("merge_queue", "merge_queue_id"),
     )
     checklist = []
-    for item_id, field_name in checklist_fields:
-        value = values.get(field_name)
-        checklist.append(
+    startup_blocker = _runtime_context_startup_gate_blocker(
+        _runtime_context_mapping(current_view.get("startup_gate"))
+    )
+    if startup_blocker and not any(
+        item.get("field") in {"startup_event_ref", "startup_gate_ref"}
+        for item in close_missing
+        if isinstance(item, Mapping)
+    ):
+        close_missing.append(
             {
-                "id": item_id,
-                "field": field_name,
-                "status": "present"
-                if _runtime_context_value_present(value)
-                else "missing",
-                "value": value,
+                "gate": "startup",
+                "field": "startup_event_ref",
+                "status": startup_blocker["status"],
+                "expected_source": "task_timeline.mf_subagent_startup",
+                "producer": "mf_sub",
+                "consumer": "runtime_context.close_gate",
+                "evidence_ref": (
+                    startup_blocker.get("evidence_ref")
+                    or values.get("startup_event_ref")
+                    or values.get("startup_gate_ref")
+                ),
+                "message": startup_blocker["reason"],
+                "blockers": list(startup_blocker.get("blockers") or []),
             }
         )
+    for item_id, field_name in checklist_fields:
+        value = values.get(field_name)
+        status = "present" if _runtime_context_value_present(value) else "missing"
+        item = {
+            "id": item_id,
+            "field": field_name,
+            "status": status,
+            "value": value,
+        }
+        if item_id == "startup_evidence" and startup_blocker:
+            item.update(
+                {
+                    "status": startup_blocker["status"],
+                    "valid": False,
+                    "message": startup_blocker["reason"],
+                    "blockers": list(startup_blocker.get("blockers") or []),
+                    "evidence_ref": (
+                        startup_blocker.get("evidence_ref")
+                        or value
+                        or values.get("startup_gate_ref")
+                    ),
+                }
+            )
+        checklist.append(item)
     return {
         "schema_version": RUNTIME_CONTEXT_CLOSE_GATE_VIEW_SCHEMA_VERSION,
         "runtime_context_id": current_view.get("runtime_context_id", ""),
@@ -9481,7 +9586,10 @@ def _startup_graph_trace_db_evidence(
             "task_id": task_id,
             "parent_task_id": parent_task_id,
             "runtime_context_id": runtime_context_id,
-            "fence_token": fence_token,
+            "fence_token_present": bool(str(fence_token or "").strip()),
+            "fence_token_hash": runtime_context_secret_hash(fence_token),
+            "fence_token_redacted": bool(str(fence_token or "").strip()),
+            "raw_fence_token_exposed": False,
         }
     try:
         from . import graph_query_trace
@@ -9534,11 +9642,29 @@ def _startup_graph_trace_db_evidence(
             "runtime_context_id": runtime_context_id,
             "fence_token": fence_token,
         }
-        trace_mismatches = [
-            {"trace_id": trace_id, "field": field, "expected": value, "actual": fields[field]}
-            for field, value in expected.items()
-            if value and fields[field] != value
-        ]
+        trace_mismatches = []
+        for field, value in expected.items():
+            if not value or fields[field] == value:
+                continue
+            if field == "fence_token":
+                trace_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "fence_token_hash",
+                        "expected": runtime_context_secret_hash(value),
+                        "actual": runtime_context_secret_hash(fields[field]),
+                        "raw_fence_token_exposed": False,
+                    }
+                )
+                continue
+            trace_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": field,
+                    "expected": value,
+                    "actual": fields[field],
+                }
+            )
         if fields["query_purpose"] not in {
             "subagent_context_build",
             "subagent_gate_validation",
@@ -9571,7 +9697,10 @@ def _startup_graph_trace_db_evidence(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "runtime_context_id": runtime_context_id,
-        "fence_token": fence_token,
+        "fence_token_present": bool(str(fence_token or "").strip()),
+        "fence_token_hash": runtime_context_secret_hash(fence_token),
+        "fence_token_redacted": bool(str(fence_token or "").strip()),
+        "raw_fence_token_exposed": False,
     }
 
 
@@ -9646,7 +9775,10 @@ def _startup_blocker(
             "agent_id": context.agent_id,
             "allocation_owner": context.allocation_owner or context.agent_id,
             "observer_allocation_owner": context.allocation_owner or context.agent_id,
-            "fence_token": context.fence_token,
+            "fence_token_present": bool(context.fence_token),
+            "fence_token_hash": runtime_context_secret_hash(context.fence_token),
+            "fence_token_redacted": bool(context.fence_token),
+            "raw_fence_token_exposed": False,
             "branch": context.branch_ref,
             "worktree": context.worktree_path,
             "base_commit": context.base_commit,
@@ -10670,6 +10802,16 @@ def record_mf_subagent_startup(
                 "host_adapter_startup_surrogate_not_close_satisfying": True,
             }
         )
+    worker_self_attestation = dict(
+        redact_runtime_context_payload(
+            worker_self_attestation,
+            raw_secrets=(
+                fence_token,
+                str(payload.get("session_token") or ""),
+                str(payload.get("worker_session_token") or ""),
+            ),
+        )
+    )
     worker_self_attesting = bool(worker_self_attestation.get("worker_self_attesting"))
     finish_time_self_attesting = bool(
         worker_self_attestation.get("finish_time_self_attesting")
@@ -10756,7 +10898,10 @@ def record_mf_subagent_startup(
         "host_adapter_startup_surrogate_not_close_satisfying": (
             surrogate_startup_not_close_satisfying
         ),
-        "fence_token": saved.fence_token,
+        "fence_token_present": bool(saved.fence_token),
+        "fence_token_hash": runtime_context_secret_hash(saved.fence_token),
+        "fence_token_redacted": bool(saved.fence_token),
+        "raw_fence_token_exposed": False,
         "branch": saved.branch_ref,
         "branch_ref": saved.branch_ref,
         "worktree": saved.worktree_path,
