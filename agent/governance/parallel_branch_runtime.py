@@ -401,6 +401,12 @@ _RUNTIME_CONTEXT_BLOCKING_STATUSES = {
     "invalid",
     "rejected",
 }
+_RUNTIME_CONTEXT_QA_EVENT_KINDS = {
+    "independent_verification",
+    "qa_review",
+    "qa_verification",
+    "verification",
+}
 BATCH_CLEANUP_ALLOWED_STATES = {
     BATCH_STATE_ACCEPTED,
     BATCH_STATE_ABANDONED,
@@ -2223,6 +2229,13 @@ def _runtime_context_lane_normalized_ref(value: Any) -> str:
     return ref
 
 
+def _runtime_context_lane_timeline_ref(value: Any) -> str:
+    ref = _runtime_context_text(value)
+    if not ref:
+        return ""
+    return ref if ref.startswith("timeline:") else f"timeline:{ref}"
+
+
 def _runtime_context_lane_resolved_refs(event: Mapping[str, Any]) -> list[str]:
     merged = _runtime_context_lane_event_mapping(event)
     refs: list[str] = []
@@ -2233,12 +2246,63 @@ def _runtime_context_lane_resolved_refs(event: Mapping[str, Any]) -> list[str]:
         "resolves_event_id",
         "resolved_event_id",
         "blocked_event_id",
+        "previous_failed_qa_ref",
+        "previous_failed_qa_event_ref",
     ):
         refs.extend(
             _runtime_context_lane_normalized_ref(item)
             for item in _runtime_context_string_list(merged.get(key))
         )
     return _runtime_context_dedupe([ref for ref in refs if ref])
+
+
+def _runtime_context_lane_blocking_event_details(
+    event: Mapping[str, Any],
+    merged: Mapping[str, Any],
+) -> dict[str, Any]:
+    verification = _runtime_context_mapping(event.get("verification"))
+    artifact_refs = _runtime_context_mapping(event.get("artifact_refs"))
+    details: dict[str, Any] = {}
+    for key, source in (
+        ("summary", merged),
+        ("verdict", merged),
+        ("runtime_context_id", merged),
+        ("route_token_ref", merged),
+        ("commit_sha", event),
+    ):
+        value = _runtime_context_text(source.get(key))
+        if value:
+            details[key] = value
+    acceptance_failed = _runtime_context_string_list(
+        merged.get("acceptance_failed")
+        or verification.get("acceptance_failed")
+        or merged.get("failed_acceptance_items")
+        or verification.get("failed_acceptance_items")
+    )
+    if acceptance_failed:
+        details["acceptance_failed"] = acceptance_failed
+    findings = merged.get("findings")
+    if isinstance(findings, list) and findings:
+        details["findings"] = public_contract_revision_payload(findings[:5])
+    reviewed_events = _runtime_context_mapping(merged.get("reviewed_events"))
+    if reviewed_events:
+        details["reviewed_events"] = reviewed_events
+    safe_artifacts = {
+        key: value
+        for key, value in artifact_refs.items()
+        if key
+        in {
+            "implementation_event_ref",
+            "review_ready_event_ref",
+            "worker_verification_event_ref",
+            "previous_failed_qa_ref",
+            "graph_trace_id",
+            "worktree_head",
+        }
+    }
+    if safe_artifacts:
+        details["artifact_refs"] = public_contract_revision_payload(safe_artifacts)
+    return details
 
 
 def _runtime_context_finish_gate_lane_projection(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -2378,7 +2442,11 @@ def build_runtime_context_lane_plan_view(
             if clause in clause_by_id
         ]
         if status in _RUNTIME_CONTEXT_BLOCKING_STATUSES:
-            blocking_events.append(event_view | {"clauses": clauses})
+            blocking_events.append(
+                event_view
+                | {"clauses": clauses}
+                | _runtime_context_lane_blocking_event_details(event, merged)
+            )
             continue
         if status not in _RUNTIME_CONTEXT_FULFILLING_STATUSES:
             continue
@@ -5615,11 +5683,17 @@ def _runtime_context_next_legal_action(
     values: Mapping[str, Any],
     close_gate_view: Mapping[str, Any],
     lane_plan: Mapping[str, Any],
+    failed_qa_revision_projection: Mapping[str, Any] | None = None,
 ) -> str:
     if values.get("terminal_dispatch_blockers") or close_gate_view.get(
         "terminal_dispatch_blockers"
     ):
         return "audit_close_or_resolve_terminal_dispatch_blocker"
+    if (
+        isinstance(failed_qa_revision_projection, Mapping)
+        and failed_qa_revision_projection.get("status") == "revision_required"
+    ):
+        return "revise_after_failed_independent_qa"
     if route_token_action.get("status") in {"missing", "stale"}:
         return "refresh_route_token_ref"
     if read_receipt_hash_action.get("status") == "missing":
@@ -5669,6 +5743,89 @@ def _runtime_context_next_legal_action(
     if close_gate_view.get("ready"):
         return "handoff_review_ready"
     return "record_missing_evidence"
+
+
+def _runtime_context_failed_qa_revision_projection(
+    *,
+    lane_plan: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    owned_files = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("owned_files"))
+        or _runtime_context_string_list(values.get("target_files"))
+        or _runtime_context_string_list(values.get("changed_files"))
+    )
+    for event in lane_plan.get("blocking_events") or []:
+        if not isinstance(event, Mapping):
+            continue
+        event_kind = _runtime_context_lane_clause_id(event.get("event_kind"))
+        status = _runtime_context_lane_clause_id(event.get("status"))
+        if event_kind not in _RUNTIME_CONTEXT_QA_EVENT_KINDS:
+            continue
+        if status not in _RUNTIME_CONTEXT_BLOCKING_STATUSES:
+            continue
+        failed_ref = _runtime_context_lane_timeline_ref(event.get("event_ref"))
+        return {
+            "schema_version": "runtime_context.failed_qa_revision_projection.v1",
+            "status": "revision_required",
+            "next_legal_action": "revise_after_failed_independent_qa",
+            "failed_qa_event_ref": failed_ref,
+            "failed_qa_event_kind": event_kind,
+            "failed_qa_status": status,
+            "failed_acceptance_items": list(event.get("acceptance_failed") or []),
+            "findings": public_contract_revision_payload(event.get("findings") or []),
+            "reviewed_events": dict(event.get("reviewed_events") or {}),
+            "allowed_files": owned_files,
+            "required_revision_cycle": [
+                "revise_implementation_in_owned_scope",
+                "record_implementation_evidence",
+                "record_worker_verification",
+                "record_review_ready",
+                "request_independent_qa_again",
+            ],
+            "blocked_generic_actions": [
+                "record_mf_subagent_startup",
+                "record_close_ready",
+                "handoff_review_ready",
+                "backlog_close",
+            ],
+            "raw_route_token_exposed": False,
+        }
+    return {
+        "schema_version": "runtime_context.failed_qa_revision_projection.v1",
+        "status": "not_required",
+    }
+
+
+def _runtime_context_failed_qa_revision_required_item(
+    projection: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "runtime_context.next_required_evidence.item.v1",
+        "id": "failed_qa_revision",
+        "status": "blocked",
+        "field": "failed_qa_event_ref",
+        "gate": "independent_qa",
+        "next_action": "revise_after_failed_independent_qa",
+        "producer": "mf_subagent_worker",
+        "consumer": "independent_qa",
+        "expected_source": "task_timeline.independent_verification.failed",
+        "evidence_ref": _runtime_context_text(projection.get("failed_qa_event_ref")),
+        "runtime_context_id": _runtime_context_text(values.get("runtime_context_id")),
+        "task_id": _runtime_context_text(values.get("task_id")),
+        "parent_task_id": _runtime_context_text(values.get("parent_task_id")),
+        "worker_owned": True,
+        "close_satisfying_required": True,
+        "requires": [],
+        "failed_acceptance_items": list(
+            projection.get("failed_acceptance_items") or []
+        ),
+        "allowed_files": list(projection.get("allowed_files") or []),
+        "required_revision_cycle": list(
+            projection.get("required_revision_cycle") or []
+        ),
+    }
 
 
 def _runtime_context_next_required_evidence(
@@ -6029,12 +6186,17 @@ def build_runtime_context_action_plan_view(
         values=values,
         close_gate_view=close_gate,
     )
+    failed_qa_revision_projection = _runtime_context_failed_qa_revision_projection(
+        lane_plan=lane_plan,
+        values=values,
+    )
     next_legal_action = _runtime_context_next_legal_action(
         route_token_action=route_token_action,
         read_receipt_hash_action=read_receipt_hash_action,
         values=values,
         close_gate_view=close_gate,
         lane_plan=lane_plan,
+        failed_qa_revision_projection=failed_qa_revision_projection,
     )
     missing_evidence = _runtime_context_missing_evidence(
         gate_inputs_view=gate_inputs,
@@ -6047,6 +6209,21 @@ def build_runtime_context_action_plan_view(
         close_gate_view=close_gate,
         lane_plan=lane_plan,
     )
+    if failed_qa_revision_projection.get("status") == "revision_required":
+        next_required_evidence = [
+            _runtime_context_failed_qa_revision_required_item(
+                failed_qa_revision_projection,
+                values,
+            ),
+            *[
+                item
+                for item in next_required_evidence
+                if _runtime_context_text(item.get("id")) != "failed_qa_revision"
+            ],
+        ]
+        for index, item in enumerate(next_required_evidence):
+            item["sequence_index"] = index
+            item["is_next"] = index == 0
     worker_next_moves = [
         {
             "id": item.get("id", ""),
@@ -6059,6 +6236,17 @@ def build_runtime_context_action_plan_view(
         if isinstance(item, Mapping)
     ]
     blocking_reasons: list[dict[str, Any]] = []
+    if failed_qa_revision_projection.get("status") == "revision_required":
+        blocking_reasons.append(
+            {
+                "code": "failed_independent_qa",
+                "message": "independent QA failed; revise implementation before generic close/startup actions",
+                "next_action": "revise_after_failed_independent_qa",
+                "event_ref": failed_qa_revision_projection.get(
+                    "failed_qa_event_ref", ""
+                ),
+            }
+        )
     if route_token_action.get("status") in {"missing", "stale"}:
         blocking_reasons.append(
             {
@@ -6118,6 +6306,7 @@ def build_runtime_context_action_plan_view(
         "audit_archive_action": audit_archive_action,
         "merge_dependency_projection": merge_dependency_projection,
         "close_precheck_gap_projection": close_precheck_gap_projection,
+        "failed_qa_revision_projection": failed_qa_revision_projection,
         "done_state_projection": close_precheck_gap_projection.get(
             "done_state_projection",
             {},

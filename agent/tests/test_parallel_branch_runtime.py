@@ -1296,6 +1296,120 @@ def test_runtime_context_projection_surfaces_terminal_dispatch_blocker() -> None
     )
 
 
+def test_runtime_context_failed_independent_qa_prioritizes_revision_over_startup_gap() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        timeline_events=[
+            {
+                "id": 6165,
+                "event_kind": "independent_verification",
+                "task_id": context.task_id,
+                "status": "failed",
+                "payload": {
+                    "runtime_context_id": branch_runtime_context_id(
+                        PROJECT_ID,
+                        context.task_id,
+                    ),
+                    "summary": "Acceptance item 2 failed.",
+                    "findings": [
+                        {
+                            "acceptance_item": 2,
+                            "severity": "blocking",
+                            "title": "state_reconcile did not reuse parsed modules",
+                        }
+                    ],
+                    "reviewed_events": {
+                        "implementation_event_ref": "timeline:6160",
+                        "worker_verification_event_ref": "timeline:6162",
+                        "review_ready_event_ref": "timeline:6163",
+                    },
+                },
+                "verification": {
+                    "acceptance_failed": [2],
+                    "result": "failed",
+                },
+                "artifact_refs": {
+                    "implementation_event_ref": "timeline:6160",
+                    "worker_verification_event_ref": "timeline:6162",
+                    "review_ready_event_ref": "timeline:6163",
+                },
+            }
+        ],
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+    revision = action_plan["failed_qa_revision_projection"]
+    first_required = action_plan["next_required_evidence"][0]
+
+    assert action_plan["next_legal_action"] == "revise_after_failed_independent_qa"
+    assert revision["status"] == "revision_required"
+    assert revision["failed_qa_event_ref"] == "timeline:6165"
+    assert revision["failed_acceptance_items"] == ["2"]
+    assert revision["reviewed_events"]["implementation_event_ref"] == "timeline:6160"
+    assert revision["allowed_files"] == ["agent/governance/parallel_branch_runtime.py"]
+    assert first_required["id"] == "failed_qa_revision"
+    assert first_required["is_next"] is True
+    assert first_required["next_action"] == "revise_after_failed_independent_qa"
+    assert {
+        item["code"] for item in action_plan["blocking_reasons"]
+    } >= {"failed_independent_qa", "startup_missing"}
+
+
+def test_runtime_context_passed_qa_with_previous_failed_ref_clears_revision_blocker() -> None:
+    context = _runtime_projection_context()
+    failed = {
+        "id": 6165,
+        "event_kind": "independent_verification",
+        "task_id": context.task_id,
+        "status": "failed",
+        "payload": {"summary": "Acceptance item 2 failed."},
+        "verification": {"acceptance_failed": [2], "result": "failed"},
+    }
+    passed = {
+        "id": 6180,
+        "event_kind": "independent_verification",
+        "task_id": context.task_id,
+        "status": "passed",
+        "payload": {
+            "previous_failed_qa_ref": "timeline:6165",
+            "summary": "Revised worker patch fixes prior blocker.",
+        },
+        "verification": {"acceptance_failed": [], "result": "passed"},
+    }
+
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_events=[failed, passed],
+        generated_at=NOW,
+    ).to_dict()
+
+    action_plan = projection["views"]["action_plan"]
+
+    assert action_plan["failed_qa_revision_projection"]["status"] == "not_required"
+    assert action_plan["next_legal_action"] != "revise_after_failed_independent_qa"
+    assert all(
+        item["id"] != "failed_qa_revision"
+        for item in action_plan["next_required_evidence"]
+    )
+
+
 def test_runtime_context_close_gate_marks_startup_refusal_blocked_not_present() -> None:
     context = _runtime_projection_context()
     runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
