@@ -4821,6 +4821,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "graph_query",
         "route_context",
         "session_token_reissue",
+        "session_token_initial_join",
         "session_token_rejoin",
     }
     read_interface_contracts = {
@@ -15535,6 +15536,21 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert current_qa_guide["graph_query"]["query_purpose"] == (
         "independent_verification"
     )
+    current_prefill = current_qa_guide["observer_prefill_route_token"]
+    assert current_prefill["status"] == "ready"
+    assert current_prefill["observer_action"] == "observer_route_context_issue"
+    assert current_prefill["issue_route_token_request"]["caller_role"] == "observer"
+    assert current_prefill["issue_route_token_request"]["allowed_actions"] == [
+        "task_timeline_append"
+    ]
+    assert current_prefill["issue_route_token_request"]["parent_route_token_ref"] == (
+        "rtok-runtime-lease"
+    )
+    assert current_prefill["issue_route_token_request"]["parent_route_identity"][
+        "selected_backlog_id"
+    ] == "AC-RUNTIME-LEASE-CURRENT"
+    assert current_prefill["handoff_to_qa"]["raw_route_token_exposed"] is False
+    assert current_prefill["handoff_to_qa"]["qa_must_author_evidence"] is True
 
     guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
         _ctx_with_role(
@@ -15549,10 +15565,21 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     )
     qa_guide = guide["worker_guide"]["independent_verification_runtime"]
     assert qa_guide["observer_or_hotfix_actor_must_not_author_evidence"] is True
+    assert qa_guide["observer_prefill_route_token"]["status"] == "ready"
+    assert qa_guide["observer_prefill_route_token"]["issue_route_token_request"][
+        "target_files"
+    ] == ["agent/governance/server.py"]
+    assert qa_guide["append_evidence"]["preferred_authorization_form"] == (
+        "qa_child_route_token_ref"
+    )
     assert qa_guide["append_evidence"]["accepted_authorization_forms"] == [
+        "qa_child_route_token_ref",
         "route_token_ref",
         "accepted_route_owned_source_event_lineage",
     ]
+    assert qa_guide["append_evidence"]["qa_child_route_token_ref_body"][
+        "route_token_ref"
+    ] == "<qa_child_route_token_ref>"
     assert qa_guide["append_evidence"]["route_token_ref_body"]["route_token_ref"] == (
         "rtok-runtime-lease"
     )

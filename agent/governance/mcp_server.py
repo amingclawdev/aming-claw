@@ -665,9 +665,11 @@ TOOLS: list[dict] = [
         "description": (
             "Mint an Aming-owned, write-authorizing observer route token "
             "(decision route_token) without any external route provider. "
-            "Authorizes observer orchestration/close actions but blocks direct "
-            "file edits. Also returns a consumable route_token_ref + "
-            "merge_queue_id and an execute_backlog_row_payload."
+            "Authorizes observer orchestration/close actions and observer-prefilled "
+            "child action-scope refs for QA-owned timeline evidence, but blocks "
+            "direct file edits. Also returns a consumable route_token_ref + "
+            "merge_queue_id and an execute_backlog_row_payload; handoffs should pass "
+            "the ref, not the raw token."
         ),
         "inputSchema": {
             "type": "object",

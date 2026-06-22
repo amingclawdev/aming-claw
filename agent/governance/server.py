@@ -8380,6 +8380,7 @@ def _runtime_context_executable_contract_envelope(
                 or branch_view.get("worktree_path")
                 or ""
             ),
+            target_files=worker_scope_files,
             route_identity=present_route_identity,
         ),
     }
@@ -8394,13 +8395,46 @@ def _runtime_context_qa_verification_guide(
     parent_task_id: str,
     target_project_root: str,
     route_identity: Mapping[str, Any],
+    target_files: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
+    qa_target_files = [
+        str(item).strip()
+        for item in (target_files or [])
+        if str(item or "").strip()
+    ]
     safe_route_identity = {
         field: str(route_identity.get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         if str(route_identity.get(field) or "").strip()
     }
+    parent_route_identity = dict(safe_route_identity)
+    if project_id:
+        parent_route_identity["selected_project"] = project_id
+    if backlog_id or parent_task_id:
+        parent_route_identity["selected_backlog_id"] = backlog_id or parent_task_id
+    issue_qa_route_token_request = {
+        "caller_role": "observer",
+        "backlog_id": backlog_id or parent_task_id,
+        "task_id": task_id,
+        "target_files": (
+            qa_target_files
+            if qa_target_files
+            else ["<target-file-from-contract-scope>"]
+        ),
+        "allowed_actions": ["task_timeline_append"],
+        "evidence_refs": [
+            ref
+            for ref in (
+                f"runtime_context:{runtime_context_id}" if runtime_context_id else "",
+                f"backlog:{backlog_id or parent_task_id}" if (backlog_id or parent_task_id) else "",
+            )
+            if ref
+        ],
+        "parent_route_identity": parent_route_identity,
+    }
+    if route_token_ref:
+        issue_qa_route_token_request["parent_route_token_ref"] = route_token_ref
     base_append_body = {
         "backlog_id": backlog_id or parent_task_id,
         "task_id": task_id,
@@ -8421,6 +8455,18 @@ def _runtime_context_qa_verification_guide(
     route_ref_body = dict(base_append_body)
     if route_token_ref:
         route_ref_body["route_token_ref"] = route_token_ref
+    qa_child_route_ref_body = {
+        **base_append_body,
+        "route_token_ref": "<qa_child_route_token_ref>",
+        "payload": {
+            **dict(base_append_body["payload"]),
+            "route_token_ownership": "qa_child_action_scope",
+        },
+        "verification": {
+            "requirement_id": "independent_verification_lane",
+            "route_identity": "<server-derived-from-qa_child_route_token_ref>",
+        },
+    }
     source_lineage_body = dict(base_append_body)
     source_lineage_body["verification"] = {
         **dict(base_append_body["verification"]),
@@ -8435,6 +8481,33 @@ def _runtime_context_qa_verification_guide(
         "purpose": "independent_verification",
         "observer_or_hotfix_actor_must_not_author_evidence": True,
         "raw_route_token_required": False,
+        "observer_prefill_route_token": {
+            "schema_version": "runtime_context.qa_route_token_prefill.v1",
+            "role": "observer",
+            "purpose": "mint_qa_child_route_token_before_handoff",
+            "status": (
+                "ready"
+                if route_token_ref and qa_target_files
+                else "blocked_missing_route_or_target_files"
+            ),
+            "observer_action": "observer_route_context_issue",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "allowed_actions": ["task_timeline_append"],
+            "parent_route_token_ref_present": bool(route_token_ref),
+            "target_files_present": bool(qa_target_files),
+            "issue_route_token_request": issue_qa_route_token_request,
+            "handoff_to_qa": {
+                "provide_only": [
+                    "route_token_ref",
+                    "route_lineage",
+                    "append_evidence.qa_child_route_token_ref_body",
+                ],
+                "raw_route_token_exposed": False,
+                "qa_must_author_evidence": True,
+                "observer_must_not_submit_qa_evidence": True,
+            },
+        },
         "read_current_state": {
             "tool": "runtime_context_current",
             "method": "GET",
@@ -8473,10 +8546,13 @@ def _runtime_context_qa_verification_guide(
         "append_evidence": {
             "tool": "task_timeline_append",
             "event_kind": "independent_verification",
+            "preferred_authorization_form": "qa_child_route_token_ref",
             "accepted_authorization_forms": [
+                "qa_child_route_token_ref",
                 "route_token_ref",
                 "accepted_route_owned_source_event_lineage",
             ],
+            "qa_child_route_token_ref_body": qa_child_route_ref_body,
             "route_token_ref_body": route_ref_body,
             "source_event_lineage_body": source_lineage_body,
             "forbidden_authors": [
@@ -9032,6 +9108,7 @@ def _runtime_context_worker_guide_response(
         ),
         parent_task_id=parent_task_id,
         target_project_root=target_project_root,
+        target_files=worker_scope_files,
         route_identity=route_identity,
     )
     finish_attestation_submission = {
