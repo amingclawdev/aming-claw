@@ -4941,11 +4941,17 @@ def mf_close_commit_evidence_gate_verification(
     )
     latest_evidence_event = evidence_events[-1] if evidence_events else {}
     latest_evidence_commit = str(latest_evidence_event.get("commit_sha") or "")
-
-    passed = bool(
-        latest_evidence_commit
-        and _commit_values_match(close_commit, latest_evidence_commit)
+    matching_evidence_events = [
+        item
+        for item in evidence_events
+        if _commit_values_match(close_commit, str(item.get("commit_sha") or ""))
+    ]
+    matching_evidence_event = (
+        matching_evidence_events[-1] if matching_evidence_events else {}
     )
+    matching_evidence_commit = str(matching_evidence_event.get("commit_sha") or "")
+
+    passed = bool(matching_evidence_commit)
     if passed:
         return {
             "schema_version": MF_CLOSE_COMMIT_EVIDENCE_GATE_SCHEMA_VERSION,
@@ -4954,6 +4960,8 @@ def mf_close_commit_evidence_gate_verification(
             "close_commit": close_commit,
             "close_commit_source": close_commit_source,
             "close_commit_event": close_commit_event,
+            "matching_evidence_commit": matching_evidence_commit,
+            "matching_evidence_event": matching_evidence_event,
             "latest_evidence_commit": latest_evidence_commit,
             "latest_evidence_event": latest_evidence_event,
             "evidence_commits": evidence_commits,
@@ -4976,6 +4984,8 @@ def mf_close_commit_evidence_gate_verification(
         "close_commit_source": close_commit_source,
         "close_commit_event": close_commit_event,
         "evidence_commits": evidence_commits,
+        "matching_evidence_commit": matching_evidence_commit,
+        "matching_evidence_event": matching_evidence_event,
         "latest_evidence_commit": latest_evidence_commit,
         "latest_evidence_event": latest_evidence_event,
         "evidence_events": evidence_events,

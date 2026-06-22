@@ -13429,16 +13429,7 @@ def test_close_gate_blocks_when_close_commit_lacks_timeline_evidence():
     contract = {"close_context": {"close_commit": close_commit}}
 
     gate = task_timeline.mf_close_gate_verification(
-        [
-            {
-                "id": 0,
-                "event_kind": "implementation",
-                "phase": "implementation",
-                "status": "accepted",
-                "commit_sha": close_commit,
-            },
-            *_close_commit_events(evidence_commit),
-        ],
+        _close_commit_events(evidence_commit),
         contract=contract,
     )
 
@@ -13491,6 +13482,46 @@ def test_close_gate_allows_matching_close_commit_evidence():
 
     assert gate["close_commit_evidence_gate"]["passed"] is True, gate
     assert gate["passed"] is True, gate
+
+
+def test_close_gate_allows_matching_close_commit_before_later_finish_projection():
+    from agent.governance import task_timeline
+
+    close_commit = "1976569a790caf9bae780c3184f12a416707ebdb"
+    worker_commit = "4a9c0865b00b1e5f6d34cbb4dc13e6a1f1f5a123"
+    contract = {"close_context": {"close_commit": close_commit}}
+    finish_gate = json.loads(json.dumps(_daily_planner_finish_gate_event()))
+    finish_gate["id"] = 4
+    finish_gate["commit_sha"] = worker_commit
+    finish_payload = finish_gate["payload"]["finish_gate"]
+    finish_payload["commit_sha"] = worker_commit
+    finish_payload["head_commit"] = worker_commit
+    finish_payload["receipt_gate"] = {
+        "status": "passed",
+        "read_receipt_present": True,
+        "read_receipt_event_id_present": True,
+        "startup_present": True,
+        "observer_command_id_present": True,
+    }
+    finish_payload["startup_worker_identity_gate"] = {"passed": True}
+    finish_payload["worker_self_attestation_gate"] = {"passed": True}
+    finish_payload["test_results"] = {"status": "passed"}
+    finish_payload["startup_evidence"]["head_commit"] = worker_commit
+    finish_payload["startup_evidence"]["base_commit"] = close_commit
+    finish_payload["startup_evidence"]["target_head_commit"] = close_commit
+
+    gate = task_timeline.mf_close_gate_verification(
+        [*_close_commit_events(close_commit), finish_gate],
+        contract=contract,
+    )
+
+    commit_gate = gate["close_commit_evidence_gate"]
+    assert commit_gate["passed"] is True, gate
+    assert commit_gate["close_commit"] == close_commit
+    assert commit_gate["matching_evidence_commit"] == close_commit
+    assert commit_gate["matching_evidence_event"]["id"] == 3
+    assert commit_gate["latest_evidence_commit"] == worker_commit
+    assert commit_gate["latest_evidence_event"]["id"] == 4
 
 
 def test_close_gate_preserves_legacy_rows_without_supplied_close_commit():
