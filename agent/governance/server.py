@@ -31179,6 +31179,39 @@ def _observer_root_route_next_legal_action_from_steps(
     }
 
 
+def _observer_root_route_priority_close_gate_step(
+    close_gate_steps: list[dict[str, Any]],
+    close_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    for step in close_gate_steps:
+        if (
+            str(step.get("id") or "") == "dispatch_bounded_worker"
+            and bool(step.get("replacement_required"))
+        ):
+            return dict(step)
+
+    close_commit_evidence_gate = close_gate.get("close_commit_evidence_gate")
+    if (
+        isinstance(close_commit_evidence_gate, Mapping)
+        and not bool(close_commit_evidence_gate.get("passed"))
+        and str(close_commit_evidence_gate.get("close_commit") or "").strip()
+    ):
+        for step in close_gate_steps:
+            if str(step.get("id") or "") == "close_commit_evidence":
+                return dict(step)
+
+    missing_events = [
+        str(item)
+        for item in (close_gate.get("missing_event_kinds") or [])
+        if str(item or "").strip()
+    ]
+    if missing_events == ["close_ready"]:
+        for step in close_gate_steps:
+            if str(step.get("id") or "") == "close_ready":
+                return dict(step)
+    return {}
+
+
 def _observer_root_route_mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -32453,12 +32486,33 @@ def _observer_root_route_context_state(
             contract_next_action
         )
     )
+    priority_close_gate_step = {}
+    close_gate_specific_step_has_priority = False
+    if (
+        effective_work_mode == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
+        and supervisor_transition_prerequisites_satisfied
+    ):
+        priority_close_gate_step = _observer_root_route_priority_close_gate_step(
+            close_gate_steps,
+            close_gate,
+        )
+    if priority_close_gate_step:
+        close_gate_specific_step_has_priority = True
+        priority_step_id = str(priority_close_gate_step.get("id") or "")
+        ordered_missing_steps = [
+            priority_close_gate_step,
+            *[
+                step
+                for step in ordered_missing_steps
+                if str(step.get("id") or "") != priority_step_id
+            ],
+        ]
     if contract_missing_step_active:
         merged_steps: list[dict[str, Any]] = []
         seen_step_ids: set[str] = set()
         step_sources = (
             [*ordered_missing_steps, *contract_action_steps]
-            if contract_action_waits_for_work_mode
+            if contract_action_waits_for_work_mode or close_gate_specific_step_has_priority
             else [*contract_action_steps, *ordered_missing_steps]
         )
         for step in step_sources:
@@ -32501,7 +32555,24 @@ def _observer_root_route_context_state(
         "raw_route_token_persisted": False,
     }
     context["work_mode_transition_gate"] = transition_gate
-    if contract_missing_step_active and contract_action_waits_for_work_mode:
+    if close_gate_specific_step_has_priority:
+        if contract_missing_step_active:
+            context["contract_state_next_action_deferred_by_close_gate"] = dict(
+                contract_next_action
+            )
+        next_action = _observer_root_route_next_legal_action_from_steps(
+            ordered_missing_steps,
+            default=dict(context.get("next_legal_action") or {}),
+        )
+        next_action["source"] = "close_gate_projection"
+        next_action["precedence"] = "close_gate_specific_action_over_contract_state"
+        if contract_missing_step_active:
+            next_action["contract_state_next_action_deferred"] = True
+            next_action["deferred_contract_state_next_action"] = dict(
+                contract_next_action
+            )
+        context["next_legal_action"] = next_action
+    elif contract_missing_step_active and contract_action_waits_for_work_mode:
         context["contract_state_next_action"] = contract_next_action
         context["contract_state_next_action_deferred_by_work_mode_gate"] = (
             contract_next_action
@@ -37406,8 +37477,16 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 backlog_id=bug_id,
                 contract=contract,
             )
+            bridge_action_is_next = any(
+                isinstance(item, Mapping)
+                and item.get("gate") == "cross_ref_gate"
+                and item.get("next_action") == "record_cross_ref_lineage_bridge"
+                and not bool(item.get("normal_close_blocked"))
+                for item in repair_summary.get("failed_gate_repairs") or []
+            )
             if (
-                bridge_action.get("child_task_ids")
+                bridge_action_is_next
+                and bridge_action.get("child_task_ids")
                 and not verification.get("passed")
                 and isinstance(verification.get("cross_ref_gate"), Mapping)
                 and not (verification.get("cross_ref_gate") or {}).get("passed")

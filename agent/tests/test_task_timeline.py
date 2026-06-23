@@ -12873,8 +12873,16 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert "route-token child lineage" in cross_ref["diagnosis"]
     assert "registry-proof" in cross_ref["reasons"][0]
     assert "registry-backed active token proof" in cross_ref["recommended_legal_action"]
+    assert cross_ref["next_action"] == "record_close_gate_blocker"
+    assert cross_ref["suggested_event_kind"] == "record_blocker"
+    assert cross_ref["normal_close_blocked"] is True
     skeleton = cross_ref["append_payload_skeleton"]
-    bridge_scope = skeleton["payload"]["bridge_scope"]
+    assert skeleton["event_kind"] == "record_blocker"
+    assert skeleton["payload"]["next_action"] == "record_close_gate_blocker"
+    assert skeleton["payload"]["advisory_bridge_close_satisfying"] is False
+    assert "route_token_registry_proof" in skeleton["payload"]["missing_lineage_fields"]
+    bridge_skeleton = cross_ref["advisory_lineage_bridge_skeleton"]
+    bridge_scope = bridge_skeleton["payload"]["bridge_scope"]
     assert bridge_scope["manual_bridge_advisory_only"] is True
     assert bridge_scope["close_satisfying_worker_evidence_required"] is True
     assert bridge_scope["canonical_parent_route_scope"]["route_id"] == (
@@ -12895,8 +12903,12 @@ def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     assert compact_cross_ref["rejected_event_ids"] == [22]
     assert "route-token child lineage" in compact_cross_ref["diagnosis"]
     assert "append_payload_skeleton" not in compact_cross_ref
-    assert compact_cross_ref["append_payload_hint"]["event_kind"] == "cross_ref_lineage_bridge"
+    assert compact_cross_ref["next_action"] == "record_close_gate_blocker"
+    assert compact_cross_ref["suggested_event_kind"] == "record_blocker"
+    assert compact_cross_ref["normal_close_blocked"] is True
+    assert compact_cross_ref["append_payload_hint"]["event_kind"] == "record_blocker"
     assert compact_cross_ref["append_payload_hint"]["rejected_event_ids"] == [22]
+    assert compact_cross_ref["append_payload_hint"]["advisory_bridge_close_satisfying"] is False
     assert compact_cross_ref["repair_view_hint"]
 
     route_blocked = {

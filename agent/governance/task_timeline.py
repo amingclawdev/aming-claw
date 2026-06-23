@@ -8928,6 +8928,9 @@ def compact_gate_summary(
                     "recommended_legal_action",
                     "next_action",
                     "suggested_event_kind",
+                    "normal_close_blocked",
+                    "advisory_lineage_bridge_event_kind",
+                    "advisory_lineage_bridge_close_satisfying",
                     "append_payload_hint",
                     "repair_view_hint",
                     "advisory_only",
@@ -9348,6 +9351,12 @@ def _cross_ref_repair_diagnosis(
         ["Protected close evidence does not match the row identity and lacks accepted bridge evidence."],
         "lineage_bridge",
     )
+
+
+def _cross_ref_has_route_token_child_lineage(
+    rejected: list[dict[str, Any]],
+) -> bool:
+    return any(_mapping(item.get("route_token_child_lineage")) for item in rejected)
 
 
 def _cross_ref_append_payload_skeleton(
@@ -9834,6 +9843,11 @@ def _compact_append_payload_hint(skeleton: dict[str, Any]) -> dict[str, Any]:
         "rejected_event_ids",
         "backlog_id",
         "observer_command_id",
+        "blocked_gate",
+        "diagnosis",
+        "missing_lineage_fields",
+        "advisory_bridge_event_kind",
+        "advisory_bridge_close_satisfying",
     ):
         value = payload.get(field)
         if value not in ("", [], {}, None):
@@ -9863,6 +9877,9 @@ def _compact_gate_repair_projection(repair: dict[str, Any]) -> dict[str, Any]:
         "recommended_legal_action",
         "next_action",
         "suggested_event_kind",
+        "normal_close_blocked",
+        "advisory_lineage_bridge_event_kind",
+        "advisory_lineage_bridge_close_satisfying",
         "advisory_only",
     ):
         value = repair.get(field)
@@ -10052,6 +10069,73 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
         diagnosis, reasons, suggested_event_kind = _cross_ref_repair_diagnosis(rejected)
         rejected_event_ids = _event_ids_from_items(rejected)
         relevant_event_ids = list(rejected_event_ids)
+        append_payload_skeleton = _cross_ref_append_payload_skeleton(
+            gate,
+            rejected,
+            suggested_event_kind,
+        )
+        route_token_child_lineage = _cross_ref_has_route_token_child_lineage(rejected)
+        if route_token_child_lineage:
+            recommended_action = (
+                "Normal close is blocked by route-token child lineage evidence that "
+                "is not registry-proven under the canonical parent route. Do not "
+                "record cross_ref_lineage_bridge as a normal-close substitute: it "
+                "can only document lineage and remains advisory-only. If the lane "
+                "can still legally act, re-record the rejected worker evidence "
+                "through the canonical runtime-context facade with route_token_ref, "
+                "parent_task_id/root backlog, runtime_context_id, worker_slot_id, "
+                "observer command scope, canonical parent route scope, and "
+                "registry-backed active token proof. If it cannot be legally "
+                "repaired without reconstructing historical facts, record a "
+                "close-gate blocker or follow-up backlog row, then require an "
+                "explicit audit-archive recovery decision with independent QA."
+            )
+            blocker_payload_skeleton = _repair_append_skeleton(
+                "record_blocker",
+                phase="close_gate",
+                payload={
+                    "schema_version": "close_gate_blocker.v1",
+                    "can_close": False,
+                    "close_attempted": False,
+                    "blocked_gate": "cross_ref_gate",
+                    "diagnosis": diagnosis,
+                    "rejected_event_ids": rejected_event_ids,
+                    "missing_lineage_fields": _unique_compact_values(
+                        [
+                            str(field)
+                            for item in rejected
+                            for field in _list(
+                                _mapping(item.get("route_token_child_lineage")).get(
+                                    "missing_fields"
+                                )
+                            )
+                            if str(field or "").strip()
+                        ]
+                    ),
+                    "advisory_bridge_event_kind": suggested_event_kind,
+                    "advisory_bridge_close_satisfying": False,
+                    "next_action": "record_close_gate_blocker",
+                },
+            )
+            return {
+                "gate": gate_key,
+                "failed_gate_name": gate_key,
+                "status": str(gate.get("status") or "failed"),
+                "missing_requirement_ids": missing,
+                "diagnosis": diagnosis,
+                "reasons": reasons,
+                "rejected_event_ids": rejected_event_ids,
+                "relevant_event_ids": relevant_event_ids,
+                "recommended_legal_action": recommended_action,
+                "next_action": "record_close_gate_blocker",
+                "suggested_event_kind": "record_blocker",
+                "append_payload_skeleton": blocker_payload_skeleton,
+                "advisory_lineage_bridge_skeleton": append_payload_skeleton,
+                "advisory_lineage_bridge_event_kind": suggested_event_kind,
+                "advisory_lineage_bridge_close_satisfying": False,
+                "normal_close_blocked": True,
+                "advisory_only": True,
+            }
         recommended_action = (
             "Prefer route-token canonical child lineage: re-record rejected worker "
             "evidence with route_token_ref, parent_task_id/root backlog, runtime_context_id, "
@@ -10062,11 +10146,6 @@ def _gate_repair_summary(gate_key: str, gate: dict[str, Any]) -> dict[str, Any]:
             "before using a manual lineage bridge. "
             "A cross-ref bridge skeleton is advisory and is not close-satisfying "
             "worker evidence by itself."
-        )
-        append_payload_skeleton = _cross_ref_append_payload_skeleton(
-            gate,
-            rejected,
-            suggested_event_kind,
         )
         return {
             "gate": gate_key,
