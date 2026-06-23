@@ -323,6 +323,13 @@ observer in any mode. The root route context exposes the canonical identity
 `allowed_actions`/`blocked_actions`, `required_evidence`, and
 `next_legal_action`; the dashboard evidence modal renders these real fields.
 
+The current runtime projection is the authority for this execution. Treat SOP
+text, `docs/dev/` notes, old context documents, remembered timelines, and source
+searches as explanatory background only. If `next_legal_action`,
+`runtime_context_worker_guide`, or `runtime_context_current` is missing,
+contradictory, or too stale to act on, record a blocker and stop rather than
+inventing or reconstructing the flow.
+
 ## observer_repair_run_route_evidence: Two Legal Modes
 
 `observer_repair_run_route_evidence` (record=true) accepts exactly two calling patterns:

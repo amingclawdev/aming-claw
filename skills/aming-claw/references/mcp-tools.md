@@ -214,6 +214,8 @@ of reconstructing lane state from prompt text.
 - `runtime_context_current`: read the same role-filtered worker view before
   each evidence write. Use it to refresh `next_legal_action`,
   `next_required_evidence`, route identity, owned files, and close-gap state.
+  This live view, not historical docs or source search, is authoritative for the
+  current execution step.
 - Read endpoints are available at
   `/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/current-state`
   and
@@ -234,6 +236,8 @@ of reconstructing lane state from prompt text.
   `route_id`, `route_context_hash`, `prompt_contract_id`,
   `prompt_contract_hash`, `visible_injection_manifest_hash`, and
   `route_token_ref`.
+  Reading onboarding or context docs does not satisfy route-context evidence;
+  use the role-specific runtime facade and record the required timeline row.
 - Required worker evidence is ordered: read receipt, real startup, graph query
   traces, implementation evidence with changed owned files and tests, finish
   time worker attestation, finish gate, and checkpoint or review-ready handoff.

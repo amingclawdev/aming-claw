@@ -1,6 +1,6 @@
 ---
 name: aming-claw-backlog-dupe-demo
-description: Public demo for Backlog Duplicate: a new requirement overlaps existing backlog work, and the observer asks whether to merge, supersede, or keep it separate. Use when a user asks to run, preview, or collect duplicate backlog evidence with the current Claude Code or Codex observer session.
+description: "Public demo for Backlog Duplicate: a new requirement overlaps existing backlog work, and the observer asks whether to merge, supersede, or keep it separate. Use when a user asks to run, preview, or collect duplicate backlog evidence with the current Claude Code or Codex observer session."
 ---
 
 ## REQUIRED FIRST READ

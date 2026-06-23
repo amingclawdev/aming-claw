@@ -1,6 +1,6 @@
 ---
 name: aming-claw-drift-demo
-description: Public demo for Docs Drift: a feature changes but documentation is stale, and the drift state is surfaced before a second doc fix. Use when a user asks to run, preview, or collect evidence for docs drift with the current Claude Code or Codex observer session.
+description: "Public demo for Docs Drift: a feature changes but documentation is stale, and the drift state is surfaced before a second doc fix. Use when a user asks to run, preview, or collect evidence for docs drift with the current Claude Code or Codex observer session."
 ---
 
 ## REQUIRED FIRST READ

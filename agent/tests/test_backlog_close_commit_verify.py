@@ -172,6 +172,30 @@ def test_close_with_real_commit(_mock_subprocess, _mock_db, _mock_audit):
 
 
 @patch("agent.governance.server.subprocess.run")
+def test_close_verifies_commit_in_registered_project_root(
+    _mock_subprocess,
+    _mock_db,
+    _mock_audit,
+    tmp_path,
+):
+    """Commit verification runs in the registered project repo, not server cwd."""
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    ctx = _make_ctx(commit="abc123")
+
+    with patch(
+        "agent.governance.server.project_service.resolve_project_root",
+        return_value=tmp_path,
+    ) as resolve_project_root:
+        result = handle_backlog_close(ctx)
+
+    assert result["ok"] is True
+    resolve_project_root.assert_called_once_with("test-proj", fallback_self=True)
+    assert _mock_subprocess.call_args.kwargs["cwd"] == tmp_path
+
+
+@patch("agent.governance.server.subprocess.run")
 def test_backlog_close_without_route_token_or_waiver_is_blocked(_mock_subprocess, _mock_db, _mock_audit):
     """Protected backlog_close rejects callers that provide no route gate evidence."""
     from agent.governance.errors import GovernanceError

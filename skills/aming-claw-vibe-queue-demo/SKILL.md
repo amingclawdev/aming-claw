@@ -1,6 +1,6 @@
 ---
 name: aming-claw-vibe-queue-demo
-description: Public demo for Vibe Queue: keep talking while agents work. Use when a user asks to run, preview, or collect evidence for a mid-implementation requirement being handled by the current Claude Code or Codex observer session.
+description: "Public demo for Vibe Queue: keep talking while agents work. Use when a user asks to run, preview, or collect evidence for a mid-implementation requirement being handled by the current Claude Code or Codex observer session."
 ---
 
 ## REQUIRED FIRST READ

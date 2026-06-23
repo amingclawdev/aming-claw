@@ -368,6 +368,10 @@ and close-gate gap list. The normal sequence is guide -> worker-authored read
 receipt -> real pre-implementation startup -> worker-scoped graph query ->
 owned-scope implementation and implementation evidence -> finish attestation
 and finish gate -> `review_ready` or `waiting_merge`.
+The guide/current-state response is authoritative for the current execution.
+Historical docs, source grep, and remembered timelines are background only; if
+the runtime guide is missing, stale, or contradictory, record a blocker instead
+of reconstructing the next step from old context.
 Do not let the observer author worker implementation evidence, fill in worker
 evidence after the fact, or reconstruct historical evidence as the normal close
 path. QA/audit bypass is a separate audited recovery path, not the happy path.

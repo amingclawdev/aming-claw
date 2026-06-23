@@ -77,6 +77,15 @@ bind the route/contract identity, record timeline evidence for the intended
 action, then mutate only the allowed files. A hotfix changes the allowed route,
 not the requirement to leave contract and timeline evidence.
 
+During governed execution, the live runtime is the authority for what is legal
+next. Use `observer-root-route-context`, `runtime_context_worker_guide`,
+`runtime_context_current`, and the contract-state `next_legal_action` before
+acting. Historical docs, `docs/dev/` drafts, previous timeline examples, and
+source-code searches are orientation only; they do not authorize a step. If the
+runtime guidance is missing, stale, contradictory, or too vague to act on, file
+that as blocker evidence and stop instead of reconstructing the flow from old
+context prose.
+
 If `aming-claw://current-context` is missing, stop normal governed work. Reload
 or open a new Codex/Claude host session from a root whose MCP config actually
 points at the plugin checkout. That can be the plugin/workspace root with the
@@ -270,6 +279,11 @@ Context worker guide as the concentrated entrypoint before acting: use MCP
 The guide is the worker-facing map for safe route context, graph-query
 identity, read/write evidence facades, startup, implementation evidence,
 finish-time attestation, finish gate, and close-gate gaps.
+
+Route context is not satisfied by reading this onboarding document or by
+searching source files. Workers and observers must consume the runtime-projected
+route context and record the required evidence through the current facade for
+their role.
 
 The normal worker order is:
 

@@ -364,8 +364,24 @@ class TestClaudePluginPackaging:
         manifest_text = (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         assert "C:\\Users\\" not in manifest_text
         assert "/home/" not in manifest_text
+        assert "/Users/" not in manifest_text
         assert "web3ToolBoxDev" not in manifest_text
         assert "aming_claw.git" not in manifest_text
+
+    def test_everyday_demo_skill_frontmatter_is_yaml_parseable(self):
+        import yaml
+
+        for rel in (
+            "skills/aming-claw-drift-demo/SKILL.md",
+            "skills/aming-claw-backlog-dupe-demo/SKILL.md",
+            "skills/aming-claw-vibe-queue-demo/SKILL.md",
+        ):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            assert text.startswith("---\n"), rel
+            frontmatter = text.split("---", 2)[1]
+            parsed = yaml.safe_load(frontmatter)
+            assert parsed["name"], rel
+            assert parsed["description"], rel
 
     def test_claude_local_marketplace_points_to_root_plugin(self):
         marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"

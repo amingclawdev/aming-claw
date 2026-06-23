@@ -56,6 +56,13 @@ created again. The JSON report includes `docker_debug.container_name`,
 `docker_debug.prompt_timeout_ms`, and a `docker_debug.reuse_command` hint when
 the container name is known.
 
+For Claude diagnosis where OAuth/device login must happen inside the container
+home, keep the named Claude container as the auth store. Do not run
+`--replace-container`, `docker rm`, Docker prune, or an unnamed `--rm` lane
+after login unless you intentionally want to discard that Claude auth state.
+Reuse the same container name for the prompt rerun and keep logs/report files as
+evidence.
+
 Kept containers are a debugging shortcut only. Final public proof should run
 from the pushed git ref in a fresh container, without `--keep-container` or
 `--reuse-container`:
@@ -87,6 +94,13 @@ against GitHub instead:
 PLUGIN_REPO_URL=https://github.com/amingclawdev/aming-claw \
 docker/hn-install-audit/run-install-audit.sh --host both
 ```
+
+Do not treat a host-installed Codex or Claude plugin cache as container proof.
+Those cache/config files may legitimately contain host-local absolute paths
+such as `/Users/...` or `/home/...`. A Docker validation lane must reinstall or
+refresh the plugin runtime from the container-visible source/ref; copied host
+caches are debug-only evidence and should be filed as friction if they affect
+MCP startup.
 
 ## Lanes
 
@@ -210,4 +224,6 @@ node docker/hn-install-audit/validate-report.mjs --self-test
 
 Interactive OAuth/device-code login is intentionally kept outside the automated
 run. Log in once into a dedicated auth home, then pass that directory with
-`--claude-auth-home` for repeatable release checks.
+`--claude-auth-home` for repeatable release checks. If that auth cannot be
+mounted on the host, use a named kept Claude container and treat the container
+home as debug-only auth state until the validation is complete.

@@ -38313,19 +38313,35 @@ def handle_backlog_close(ctx: RequestContext):
                 422,
             )
 
-        # Verify commit SHA exists in git log (best-effort)
+        # Verify commit SHA exists in the target project git log (best-effort).
+        commit_verification_root = project_service.resolve_project_root(
+            pid,
+            fallback_self=True,
+        )
         commit_sha = body.get("commit", "")
         if commit_sha:
             try:
                 result = subprocess.run(
                     ["git", "rev-parse", "--verify", commit_sha],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=commit_verification_root,
                 )
                 if result.returncode != 0:
                     raise GovernanceError(
                         "commit_not_found",
                         f"Commit {commit_sha} does not resolve to a real commit",
                         422,
+                        {
+                            "commit": commit_sha,
+                            "project_id": pid,
+                            "commit_verification_root": (
+                                str(commit_verification_root)
+                                if commit_verification_root
+                                else ""
+                            ),
+                        },
                     )
             except subprocess.TimeoutExpired:
                 log.warning("git rev-parse timed out for commit %s; allowing close", commit_sha)
@@ -38403,7 +38419,15 @@ def handle_backlog_close(ctx: RequestContext):
             bug_id,
             "manual_fix" if prior_status == "MF_IN_PROGRESS" else "fixed",
             project_id=pid,
-            result={"commit": body.get("commit", ""), "route_token_gate": route_gate},
+            result={
+                "commit": body.get("commit", ""),
+                "route_token_gate": route_gate,
+                "commit_verification_root": (
+                    str(commit_verification_root)
+                    if commit_verification_root
+                    else ""
+                ),
+            },
             runtime_state="fixed",
         )
         _publish_current_task_changed(
