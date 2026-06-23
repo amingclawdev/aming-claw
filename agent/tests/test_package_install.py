@@ -416,3 +416,10 @@ class TestClaudePluginPackaging:
         # locate the agent package in the plugin install dir, not the caller's
         # CWD which is unpredictable after install.
         assert aming.get("cwd") == "${CLAUDE_PLUGIN_ROOT}"
+
+    def test_claude_plugin_does_not_install_client_hook(self):
+        """Claude CLI dogfood relies on server-side gates, not the client hook."""
+        manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+
+        assert "hooks" not in manifest
+        assert "onboarding_guard.py" not in json.dumps(manifest)

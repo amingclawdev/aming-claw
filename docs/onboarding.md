@@ -10,13 +10,13 @@ The single user-invocable onboarding entry is
 the CLI. The launcher skill is the compact state machine; this document remains
 the full schema and first-run route-gate source.
 
-The packaged Claude and Codex plugin manifests also install a client-side
-`PreToolUse` hard guard that runs `python agent/hooks/onboarding_guard.py`
-before protected governance or dispatch actions. This is a client hard rail, not
-a replacement for the server-side route/identity gate. It cannot intercept
-direct `curl` or other HTTP calls to governance made outside the CLI hook path;
-the client hook and server gate are layered controls, and neither one is
-sufficient by itself.
+The packaged Codex plugin manifest also installs a client-side `PreToolUse`
+hard guard that runs `python agent/hooks/onboarding_guard.py` before protected
+governance or dispatch actions. Claude Code relies on the server-side
+route/identity gate instead, so non-interactive demo prompts can progress after
+runtime route/context evidence is recorded. Client hooks cannot intercept direct
+`curl` or other HTTP calls to governance made outside the CLI hook path; the
+server gate remains the authoritative control.
 
 ## 1. Start Aming Claw
 

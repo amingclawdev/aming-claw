@@ -38,17 +38,5 @@
         "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}"
       }
     }
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python agent/hooks/onboarding_guard.py"
-          }
-        ]
-      }
-    ]
   }
 }
