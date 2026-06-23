@@ -572,6 +572,22 @@ def _event_ref_id(event: Mapping[str, Any]) -> str:
     return str(event.get("id") or event.get("event_id") or "").strip()
 
 
+def _event_id_at_or_after(event: Mapping[str, Any], start_event_id: int) -> bool:
+    if start_event_id <= 0:
+        return True
+    event_id = _event_numeric_id(event)
+    return bool(event_id and event_id >= start_event_id)
+
+
+def _source_event_numeric_id(value: Mapping[str, Any]) -> int:
+    for key in ("source_event_id", "id", "event_id"):
+        try:
+            return int(value.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def _payload_field_value(value: Any, field_names: set[str], *, depth: int = 0) -> str:
     if depth > 6:
         return ""
@@ -2539,6 +2555,34 @@ def _event_mentions_contract_execution(
     return False
 
 
+def _contract_execution_scoped_events(
+    events: list[dict[str, Any]],
+    *,
+    contract_execution_id: str = "",
+    start_event_id: int = 0,
+) -> list[dict[str, Any]]:
+    """Return events that belong to the active contract execution view.
+
+    Contract-state navigation is execution-scoped. When a contract is selected
+    in the middle of a long row, old sibling attempts must not satisfy or block
+    the newly active contract just because they share the backlog id. Events
+    that explicitly name the contract execution are accepted even if their
+    numeric id is older; otherwise events must be at or after the binding event.
+    """
+
+    execution_id = str(contract_execution_id or "").strip()
+    if not execution_id and start_event_id <= 0:
+        return list(events)
+    scoped: list[dict[str, Any]] = []
+    for event in events:
+        if execution_id and _event_mentions_contract_execution(event, execution_id):
+            scoped.append(event)
+            continue
+        if _event_id_at_or_after(event, start_event_id):
+            scoped.append(event)
+    return scoped
+
+
 def _qa_followup_needed_from_completed_evidence(
     events: list[dict[str, Any]],
     *,
@@ -2817,6 +2861,55 @@ def _successor_contract_root(
     return root
 
 
+_ROOT_TEMPLATE_OVERRIDE_KEYS = {
+    "required_evidence",
+    "evidence_requirements",
+    "conditional_required_evidence",
+    "successor_contract_policy",
+    "successor_contract_candidates",
+}
+
+
+def _root_contract_with_bound_template(
+    root: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    contract_templates: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    template_id = str(
+        binding.get("contract_template_id")
+        or binding.get("contract_template")
+        or binding.get("template_id")
+        or root.get("contract_template_id")
+        or root.get("contract_template")
+        or root.get("template_id")
+        or ""
+    ).strip()
+    template = contract_templates.get(template_id) or {}
+    binding_event_id = _source_event_numeric_id(binding)
+    use_bound_template = bool(template_id and template and binding_event_id)
+    merged = dict(template) if use_bound_template else dict(root)
+    if template and not merged.get("required_evidence") and not merged.get("evidence_requirements"):
+        for key in _ROOT_TEMPLATE_OVERRIDE_KEYS:
+            if key in template and key not in merged:
+                merged[key] = template[key]
+    if not use_bound_template:
+        return merged
+    for key, value in root.items():
+        if key in _ROOT_TEMPLATE_OVERRIDE_KEYS:
+            continue
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    for field in _CONTRACT_BINDING_FIELD_NAMES:
+        value = binding.get(field)
+        if value not in (None, "", [], {}):
+            merged[field] = value
+    merged["contract_template_id"] = template_id
+    merged.setdefault("template_id", template_id)
+    merged.setdefault("contract_id", str(binding.get("contract_id") or template_id))
+    return merged
+
+
 def _successor_active_execution(
     successor: Mapping[str, Any],
     *,
@@ -2860,6 +2953,7 @@ def _contract_requirements_state(
     backlog_row: Mapping[str, Any],
     default_required_evidence: list[str],
     contract_execution_id: str = "",
+    scope_start_event_id: int = 0,
     missing_precedence: str = "active_contract_missing_step",
 ) -> dict[str, Any]:
     requirement_steps, conditional_groups = _requirement_steps(
@@ -2902,9 +2996,18 @@ def _contract_requirements_state(
         scoped_steps.append(step)
 
     completed_sources: dict[str, dict[str, Any]] = {}
+    scoped_events = _contract_execution_scoped_events(
+        events,
+        contract_execution_id=contract_execution_id,
+        start_event_id=scope_start_event_id,
+    )
+    if handoff_event is not None and all(
+        _event_ref_id(event) != _event_ref_id(handoff_event) for event in scoped_events
+    ):
+        scoped_events = [handoff_event, *scoped_events]
     for requirement in scoped_steps:
         requirement_id = str(requirement.get("id") or "")
-        for event in events:
+        for event in scoped_events:
             matched, source = _event_satisfies_requirement(event, requirement)
             if matched and source:
                 completed_sources[requirement_id] = source
@@ -3072,6 +3175,12 @@ def build_contract_state_projection(
             if backlog_id:
                 break
     binding = _latest_contract_binding(rows, root)
+    template_catalog = _contract_template_map(contract_templates)
+    root = _root_contract_with_bound_template(
+        root,
+        binding,
+        contract_templates=template_catalog,
+    )
     template_id = str(
         binding.get("contract_template_id")
         or binding.get("contract_template")
@@ -3096,6 +3205,27 @@ def build_contract_state_projection(
         or binding.get("runtime_contract_revision_id")
         or ""
     ).strip() or _latest_contract_revision_id(rows, root)
+    binding_source_event_id = _source_event_numeric_id(binding)
+    active_contract_execution_id = str(
+        binding.get("contract_execution_id")
+        or root.get("contract_execution_id")
+        or ""
+    ).strip()
+    if not active_contract_execution_id and (
+        contract_id or template_id or current_revision_id
+    ):
+        active_contract_execution_id = _execution_id(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_id=contract_id,
+            template_id=template_id,
+            revision_id=current_revision_id,
+        )
+    active_rows = _contract_execution_scoped_events(
+        rows,
+        contract_execution_id=active_contract_execution_id,
+        start_event_id=binding_source_event_id,
+    )
     default_required = default_required_evidence or []
     requirements_explicit = bool(
         root.get("required_evidence")
@@ -3108,7 +3238,7 @@ def build_contract_state_projection(
         default_required_evidence=default_required,
     )
     has_explicit_contract = bool(
-        root
+        (root or binding)
         and (
             contract_id
             or template_id
@@ -3138,7 +3268,7 @@ def build_contract_state_projection(
     completed_sources: dict[str, dict[str, Any]] = {}
     for requirement in requirement_steps:
         requirement_id = str(requirement.get("id") or "")
-        for event in rows:
+        for event in active_rows:
             matched, source = _event_satisfies_requirement(event, requirement)
             if matched and source:
                 completed_sources[requirement_id] = source
@@ -3166,7 +3296,7 @@ def build_contract_state_projection(
         key=lambda step: int(step.get("order") or 0),
     )
     attempt_bridge_step = _multiple_attempt_lineage_bridge_step(
-        rows,
+        active_rows,
         backlog_id=backlog_id,
     )
     if attempt_bridge_step and not any(
@@ -3223,37 +3353,36 @@ def build_contract_state_projection(
             **_next_action_requirement_metadata(first),
         }
 
-    route_binding = _latest_route_binding(rows, root)
+    route_binding = _latest_route_binding(
+        active_rows if binding_source_event_id else rows,
+        root,
+    )
     route_identity_hash = _route_identity_hash(route_binding)
     projection_watermark = projection.get("projection_watermark", 0)
     if not projection_watermark:
         projection_watermark = max((_event_numeric_id(event) for event in rows), default=0) or len(rows)
     active_execution: dict[str, Any] = {}
     if has_explicit_contract:
-        active_contract_execution_id = str(
-            binding.get("contract_execution_id")
-            or root.get("contract_execution_id")
-            or ""
-        ).strip()
         active_execution = {
             "schema_version": "active_contract_execution.v1",
             "project_id": project_id,
             "backlog_id": backlog_id,
-            "contract_execution_id": active_contract_execution_id
-            or _execution_id(
-                project_id=project_id,
-                backlog_id=backlog_id,
-                contract_id=contract_id,
-                template_id=template_id,
-                revision_id=current_revision_id,
-            ),
+            "contract_execution_id": active_contract_execution_id,
             "contract_id": contract_id,
             "contract_template_id": template_id,
-            "contract_instance_id": str(binding.get("contract_instance_id") or root.get("contract_instance_id") or ""),
+            "contract_instance_id": str(
+                binding.get("contract_instance_id")
+                or root.get("contract_instance_id")
+                or ""
+            ),
             "contract_revision_id": current_revision_id,
             "state": state,
             "projection_watermark": projection_watermark,
-            "observer_session_id": str(binding.get("observer_session_id") or root.get("observer_session_id") or ""),
+            "observer_session_id": str(
+                binding.get("observer_session_id")
+                or root.get("observer_session_id")
+                or ""
+            ),
             "route_identity_hash": route_identity_hash,
             "route_token_ref": str(route_binding.get("route_token_ref") or ""),
             "prompt_contract_id": str(route_binding.get("prompt_contract_id") or ""),
@@ -3289,7 +3418,7 @@ def build_contract_state_projection(
     )
     successor_policy = _successor_policy_summary(root)
     successor_bindings = _successor_contract_bindings(
-        rows,
+        active_rows,
         project_id=project_id,
         backlog_id=backlog_id,
         contract_chain_id=contract_chain_id,
@@ -3314,7 +3443,6 @@ def build_contract_state_projection(
         for successor in successor_bindings:
             contract_chain.append({"role": "successor", **successor})
 
-    template_catalog = _contract_template_map(contract_templates)
     selected_successor_contract_state: dict[str, Any] = {}
     selected_successor_contract_candidates: list[dict[str, Any]] = []
     selected_successor_bindings: list[dict[str, Any]] = []
@@ -3367,6 +3495,7 @@ def build_contract_state_projection(
             },
             default_required_evidence=[],
             contract_execution_id=successor_execution_id,
+            scope_start_event_id=_source_event_numeric_id(selected_successor),
             missing_precedence="successor_contract_missing_step",
         )
         selected_successor_contract_candidates = _successor_candidates(
@@ -3376,7 +3505,7 @@ def build_contract_state_projection(
             contract_complete=bool(successor_requirement_state["contract_complete"]),
         )
         selected_successor_bindings = _successor_contract_bindings(
-            rows,
+            active_rows,
             project_id=project_id,
             backlog_id=str(
                 selected_successor.get("successor_backlog_id") or backlog_id
@@ -3443,10 +3572,13 @@ def build_contract_state_projection(
                 },
                 default_required_evidence=[],
                 contract_execution_id=nested_execution_id,
+                scope_start_event_id=_source_event_numeric_id(
+                    nested_selected_successor
+                ),
                 missing_precedence="nested_successor_contract_missing_step",
             )
             deep_successor_bindings = _successor_contract_bindings(
-                rows,
+                active_rows,
                 project_id=project_id,
                 backlog_id=str(
                     nested_selected_successor.get("successor_backlog_id")
@@ -3520,6 +3652,9 @@ def build_contract_state_projection(
                     },
                     default_required_evidence=[],
                     contract_execution_id=deep_execution_id,
+                    scope_start_event_id=_source_event_numeric_id(
+                        deep_selected_successor
+                    ),
                     missing_precedence="deep_successor_contract_missing_step",
                 )
                 deep_successor_contract_state = {

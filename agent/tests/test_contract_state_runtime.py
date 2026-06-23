@@ -543,6 +543,81 @@ def test_projection_exposes_active_contract_execution_handle():
     assert hints["close_gate_policy"]["drives_next_legal_operation"] is False
 
 
+def test_active_contract_binding_scopes_navigation_to_binding_watermark():
+    onboard_template = {
+        "template_id": "onboard_contract.v1",
+        "required_evidence": [
+            {
+                "id": "route_context",
+                "accepted_event_kinds": ["route_context"],
+            },
+            {
+                "id": "route_action_precheck",
+                "accepted_event_kinds": ["route_action_precheck"],
+                "prerequisite_ids": ["route_context"],
+            },
+        ],
+    }
+    events = [
+        _event(
+            1,
+            "mf_subagent_dispatch",
+            payload={
+                "task_id": "old-worker-a",
+                "route_identity": {
+                    "route_context_hash": "sha256:old",
+                    "prompt_contract_id": "rprompt-old",
+                    "route_token_ref": "rtok-old",
+                },
+            },
+        ),
+        _event(2, "implementation", payload={"task_id": "old-worker-b"}),
+        _event(3, "verification", payload={"task_id": "old-worker-c"}),
+        _event(
+            10,
+            "contract_binding",
+            payload={
+                "contract_binding": {
+                    "contract_id": "onboard_contract.v1",
+                    "contract_template_id": "onboard_contract.v1",
+                    "contract_execution_id": "cex-fresh-onboard",
+                    "contract_revision_id": "rev-fresh-onboard",
+                    "state": "selected",
+                },
+                "route_identity": {
+                    "route_id": "route-fresh",
+                    "route_context_hash": "sha256:fresh",
+                    "prompt_contract_id": "rprompt-fresh",
+                    "prompt_contract_hash": "sha256:prompt-fresh",
+                    "visible_injection_manifest_hash": "sha256:manifest-fresh",
+                },
+            },
+        ),
+    ]
+
+    projection = build_contract_state_projection(
+        events,
+        contract={"schema_version": "legacy_bootstrap.v1"},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        contract_templates={"onboard_contract.v1": onboard_template},
+    )
+
+    assert projection["legacy_no_contract"] is False
+    assert projection["contract_template_id"] == "onboard_contract.v1"
+    assert projection["active_contract_execution"]["contract_execution_id"] == (
+        "cex-fresh-onboard"
+    )
+    assert projection["completed_evidence"] == []
+    assert projection["next_legal_action"]["id"] == "route_context"
+    assert "cross_ref_lineage_bridge" not in {
+        step["id"] for step in projection["ordered_next_steps"]
+    }
+    route_identity = projection["runtime_contract_hints"]["route_identity"]
+    assert route_identity["route_context_hash"] == "sha256:fresh"
+    assert route_identity["prompt_contract_id"] == "rprompt-fresh"
+    assert "route_token_ref" not in route_identity
+
+
 def test_runtime_hints_carry_role_bound_worker_prefill_boundary():
     contract = {
         "contract": {
