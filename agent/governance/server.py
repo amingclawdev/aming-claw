@@ -36691,7 +36691,12 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         applicable = _mf_close_timeline_applicability(row)
         from . import task_timeline
 
-        events = task_timeline.list_events(conn, pid, backlog_id=bug_id, limit=limit)
+        events = task_timeline.list_backlog_gate_events(
+            conn,
+            pid,
+            backlog_id=bug_id,
+            limit=limit,
+        )
         contract: dict[str, Any] = {}
         route_context_gate: dict[str, Any] = {}
         if applicable["is_mf"]:

@@ -23565,6 +23565,52 @@ def test_worker_transcript_timeline_gate_allows_same_owner_passed_attestation(co
     assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is True
 
 
+def test_timeline_gate_counts_child_lane_startup_linked_by_parent_task_id(conn):
+    backlog_id = "AC-CLOSE-TIMELINE-CHILD-STARTUP"
+    task_id = "close-child-startup-task"
+    _insert_close_timeline_backlog(conn, backlog_id=backlog_id, suffix="child-startup")
+    recorded = _record_close_timeline(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        suffix="child-startup",
+        same_owner_startup=True,
+    )
+
+    startup_event_id = recorded["startup_event"]["id"]
+    row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (startup_event_id,),
+    ).fetchone()
+    payload = json.loads(row["payload_json"])
+    payload["parent_task_id"] = backlog_id
+    payload["mf_subagent_startup_gate"]["parent_task_id"] = backlog_id
+    conn.execute(
+        "UPDATE task_timeline_events SET backlog_id = '', payload_json = ? WHERE id = ?",
+        (json.dumps(payload), startup_event_id),
+    )
+    conn.commit()
+
+    parent_only_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    )
+    assert all(event["id"] != startup_event_id for event in parent_only_events)
+
+    result = server.handle_backlog_timeline_gate(
+        _ctx({"project_id": PID, "bug_id": backlog_id})
+    )
+
+    assert result["can_close"] is True
+    assert result["event_count"] == len(parent_only_events) + 1
+    gate = result["timeline_gate"]
+    assert gate["route_context_gate"]["checks"]["mf_subagent_startup_present"] is True
+    startup_gate = gate["close_timeline_startup_gate"]
+    assert startup_gate["passed"] is True
+    assert startup_gate["accepted_startup_events"][0]["id"] == str(startup_event_id)
+
+
 def test_worker_transcript_timeline_gate_blocks_same_owner_failed_attestation(conn):
     backlog_id = "AC-CLOSE-TIMELINE-WORKER-TRANSCRIPT-BLOCKED"
     task_id = "close-worker-transcript-blocked-task"

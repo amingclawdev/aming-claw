@@ -11070,6 +11070,51 @@ def list_events(
     return [_row_to_dict(row) for row in rows]
 
 
+def list_backlog_gate_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    backlog_id: str,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    """Return parent backlog events plus child-lane events linked by contract lineage.
+
+    Worker lanes can write their own child task id while leaving top-level
+    ``backlog_id`` empty.  Close/runtime gates are evaluated for the parent
+    backlog row, so they must consume server-accepted child evidence that
+    carries an explicit ``parent_task_id`` link without rewriting that evidence
+    as parent-authored.
+    """
+
+    parent_backlog_id = str(backlog_id or "").strip()
+    if not parent_backlog_id:
+        return list_events(conn, project_id, limit=limit)
+
+    parent_events = list_events(
+        conn,
+        project_id,
+        backlog_id=parent_backlog_id,
+        limit=limit,
+    )
+    merged: dict[int, dict[str, Any]] = {}
+    for event in parent_events:
+        event_id = int(event.get("id") or 0)
+        if event_id:
+            merged[event_id] = event
+
+    # The project-scoped scan is bounded by the same public limit and only
+    # admits events with a first-class parent_task_id lineage to this backlog.
+    for event in list_events(conn, project_id, limit=limit):
+        event_id = int(event.get("id") or 0)
+        if not event_id or event_id in merged:
+            continue
+        if _first_deep_text(event, "parent_task_id") != parent_backlog_id:
+            continue
+        merged[event_id] = event
+
+    return [merged[event_id] for event_id in sorted(merged)]
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     for key in ("payload_json", "verification_json", "artifact_refs_json"):
