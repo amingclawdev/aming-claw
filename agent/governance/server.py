@@ -2629,6 +2629,50 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
             }
         if not external_route_identity and action_precheck:
             external_route_identity = dict(action_precheck)
+        if isinstance(external_route_identity, Mapping):
+            lineage_sources: list[Mapping[str, Any]] = [
+                source
+                for source in (body, route_context_seed, action_precheck)
+                if isinstance(source, Mapping)
+            ]
+            for source in list(lineage_sources):
+                for nested_key in (
+                    "route_identity",
+                    "route_context",
+                    "route",
+                    "contract_binding",
+                    "active_contract_execution",
+                    "contract_execution",
+                    "selected_successor_contract",
+                    "successor_contract",
+                    "next_legal_action",
+                    "route_action_gate",
+                ):
+                    nested = source.get(nested_key)
+                    if isinstance(nested, Mapping):
+                        lineage_sources.append(nested)
+            lineage: dict[str, str] = {}
+            for field in (
+                "route_token_ref",
+                "contract_execution_id",
+                "active_contract_execution_id",
+                "parent_contract_execution_id",
+                "successor_contract_execution_id",
+            ):
+                for source in lineage_sources:
+                    token = str(source.get(field) or "").strip()
+                    if token:
+                        lineage[field] = token
+                        break
+            if lineage:
+                external_route_identity = {
+                    **dict(external_route_identity),
+                    **{
+                        field: value
+                        for field, value in lineage.items()
+                        if not str(external_route_identity.get(field) or "").strip()
+                    },
+                }
         force_supersede = bool(body.get("force_supersede") or False)
         force_reason = str(body.get("force_reason") or "").strip()
         materialization = observer_repair_run.build_route_service_materialization(

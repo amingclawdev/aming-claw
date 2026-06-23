@@ -38,6 +38,13 @@ WORKER_DISPATCH_ROUTE_ACTIONS = {
     "dispatch_worker",
     "dispatch_bounded_lanes_after_route_token",
 }
+PUBLIC_ROUTE_LINEAGE_FIELDS = (
+    "route_token_ref",
+    "contract_execution_id",
+    "active_contract_execution_id",
+    "parent_contract_execution_id",
+    "successor_contract_execution_id",
+)
 
 CHECKPOINTS = [
     "diagnosed",
@@ -579,6 +586,51 @@ def _service_route_identity(route: Mapping[str, Any], bundle: Mapping[str, Any])
     }
 
 
+def _public_route_lineage_containers(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = [payload]
+    for key in (
+        "route_identity",
+        "route_context",
+        "route",
+        "contract_binding",
+        "active_contract_execution",
+        "contract_execution",
+        "selected_successor_contract",
+        "successor_contract",
+        "next_legal_action",
+        "route_action_gate",
+    ):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    return containers
+
+
+def _public_route_lineage_from_public(value: Any) -> dict[str, str]:
+    payload = _object(value)
+    if not payload:
+        return {}
+    lineage: dict[str, str] = {}
+    for field in PUBLIC_ROUTE_LINEAGE_FIELDS:
+        for container in _public_route_lineage_containers(payload):
+            token = _string(container.get(field))
+            if token:
+                lineage[field] = token
+                break
+    return lineage
+
+
+def _merge_public_route_lineage(
+    primary: Mapping[str, Any],
+    fallback: Mapping[str, Any],
+) -> dict[str, str]:
+    merged = {key: _string(value) for key, value in primary.items() if _string(value)}
+    for field in PUBLIC_ROUTE_LINEAGE_FIELDS:
+        if not merged.get(field) and _string(fallback.get(field)):
+            merged[field] = _string(fallback.get(field))
+    return merged
+
+
 def _route_identity_from_public(value: Any) -> dict[str, str]:
     payload = _object(value)
     route = _object(payload.get("route"))
@@ -626,6 +678,7 @@ def _route_identity_from_public(value: Any) -> dict[str, str]:
     }
     if not visible_manifest_hash and isinstance(visible_manifest, Mapping) and visible_manifest:
         identity["visible_injection_manifest"] = "present"
+    identity.update(_public_route_lineage_from_public(payload))
     return {key: value for key, value in identity.items() if value}
 
 
@@ -696,6 +749,7 @@ def _external_route_action_precheck(
     identity = _route_identity_from_public(route_identity)
     packet = _object(action_precheck)
     packet_identity = _route_identity_from_public(packet)
+    identity = _merge_public_route_lineage(identity, packet_identity)
     selected_action = _string(action_precheck_id) or DEFAULT_ROUTE_ACTION_PRECHECK_ID
     required_missing = [
         field
@@ -792,6 +846,9 @@ def _external_route_action_precheck(
     }
     if identity.get("prompt_contract_hash"):
         payload["prompt_contract_hash"] = identity["prompt_contract_hash"]
+    for field in PUBLIC_ROUTE_LINEAGE_FIELDS:
+        if identity.get(field):
+            payload[field] = identity[field]
 
     try:
         from agent.governance.mf_subagent_contract import validate_route_action_gate
@@ -835,11 +892,17 @@ def _external_route_action_precheck(
         "external_route_identity_validated": True,
         "private_provider_body_excluded": True,
     }
+    for field in PUBLIC_ROUTE_LINEAGE_FIELDS:
+        if identity.get(field):
+            source_event["verification"][field] = identity[field]
     source_event["artifact_refs"] = {
         **_object(source_event.get("artifact_refs")),
         "external_precheck_id": selected_action,
         "private_provider_body_excluded": True,
     }
+    for field in PUBLIC_ROUTE_LINEAGE_FIELDS:
+        if identity.get(field):
+            source_event["artifact_refs"][field] = identity[field]
     authorizes_dispatch = (
         bool(route_action_gate.get("allowed"))
         and action in WORKER_DISPATCH_ROUTE_ACTIONS
@@ -984,6 +1047,11 @@ def _route_action_precheck_payload(
         "test_files": _string_list_field(prompt_contract.get("test_files")),
         "version_check": dict(version_check) if isinstance(version_check, Mapping) else {},
         "graph_status": dict(graph_status) if isinstance(graph_status, Mapping) else {},
+        **{
+            field: _string(route_identity.get(field))
+            for field in PUBLIC_ROUTE_LINEAGE_FIELDS
+            if _string(route_identity.get(field))
+        },
     }
 
 
@@ -1025,6 +1093,11 @@ def _route_service_source_event(
             ),
             "counts_as_close_evidence": False,
             "source_event_only": True,
+            **{
+                field: _string(route_identity.get(field))
+                for field in PUBLIC_ROUTE_LINEAGE_FIELDS
+                if _string(route_identity.get(field))
+            },
         },
         "artifact_refs": {
             "observer_repair_run_id": repair_run_id,
@@ -1035,6 +1108,11 @@ def _route_service_source_event(
             "route_context_hash": _string(route_identity.get("route_context_hash")),
             "prompt_contract_id": _string(route_identity.get("prompt_contract_id")),
             "prompt_contract_hash": _string(route_identity.get("prompt_contract_hash")),
+            **{
+                field: _string(route_identity.get(field))
+                for field in PUBLIC_ROUTE_LINEAGE_FIELDS
+                if _string(route_identity.get(field))
+            },
         },
     }
 

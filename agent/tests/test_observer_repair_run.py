@@ -433,6 +433,52 @@ def test_external_route_action_precheck_materializes_public_source_event():
     assert "do-not-leak-hidden-context" not in materialized_json
 
 
+def test_external_route_action_precheck_preserves_contract_lineage():
+    row = _single_route_row()
+    identity = {
+        **_external_route_identity(),
+        "route_token_ref": "rtok-successor-lineage",
+        "contract_execution_id": "cex-successor-route-precheck",
+        "parent_contract_execution_id": "cex-onboard-root",
+    }
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"]],
+        backlog_rows=[row],
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+    )
+
+    materialization = observer_repair_run.build_route_service_materialization(
+        plan,
+        action_precheck_id="external-dispatch-precheck",
+        external_route_identity=identity,
+        action_precheck={
+            **_external_route_identity(),
+            "caller_role": "observer",
+            "action": "dispatch_bounded_worker",
+            "allowed": True,
+        },
+        graph_status={"current_state": {"graph_stale": {"is_stale": False}}},
+        version_check={"ok": True, "dirty": False, "dirty_files": []},
+        actor="observer-test",
+    )
+
+    assert materialization["ok"] is True
+    route_precheck = materialization["route_action_precheck"]
+    assert route_precheck["route_identity"]["route_token_ref"] == "rtok-successor-lineage"
+    assert (
+        route_precheck["route_identity"]["contract_execution_id"]
+        == "cex-successor-route-precheck"
+    )
+    source = materialization["source_events"][0]
+    assert source["payload"]["route_token_ref"] == "rtok-successor-lineage"
+    assert source["payload"]["route_action_gate"]["route_token_ref"] == "rtok-successor-lineage"
+    assert source["payload"]["contract_execution_id"] == "cex-successor-route-precheck"
+    assert source["verification"]["contract_execution_id"] == "cex-successor-route-precheck"
+    assert source["artifact_refs"]["parent_contract_execution_id"] == "cex-onboard-root"
+
+
 def test_command_route_identity_consumption_reports_supplied_identity():
     row = _single_route_row()
     identity = _command_route_identity()
@@ -1029,6 +1075,64 @@ class TestServerPathGuardWiring(unittest.TestCase):
             )
         )
         self.assertTrue(result["recorded"], result)
+
+    def test_server_route_evidence_merges_top_level_contract_lineage(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-SERVER-TOP-LEVEL-LINEAGE-20260623"
+        _insert_backlog_row(self.conn, bug_id)
+        identity = {
+            "route_context_hash": "sha256:server-lineage-context",
+            "prompt_contract_id": "rprompt-server-lineage",
+            "prompt_contract_hash": "sha256:server-lineage-prompt",
+            "visible_injection_manifest_hash": "sha256:server-lineage-manifest",
+        }
+
+        result = server.handle_observer_repair_run_route_evidence(
+            _server_ctx(
+                body={
+                    "root_backlog_ids": [bug_id],
+                    "actor": "observer-test",
+                    "record": True,
+                    "action_precheck_id": "external-dispatch-precheck",
+                    "route_identity": identity,
+                    "route_token_ref": "rtok-server-top-level-lineage",
+                    "contract_execution_id": "cex-server-top-level-lineage",
+                    "parent_contract_execution_id": "cex-server-parent",
+                    "action_precheck": {
+                        **identity,
+                        "caller_role": "observer",
+                        "action": "dispatch_bounded_worker",
+                        "allowed": True,
+                    },
+                    "version_check": {"ok": True, "dirty": False, "dirty_files": []},
+                }
+            )
+        )
+
+        self.assertTrue(result["recorded"], result)
+        events = task_timeline.list_events(
+            self.conn,
+            "proj",
+            backlog_id=bug_id,
+            event_kind="route_action_precheck",
+            limit=20,
+        )
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["payload"]["route_token_ref"], "rtok-server-top-level-lineage")
+        self.assertEqual(
+            event["payload"]["route_action_gate"]["route_token_ref"],
+            "rtok-server-top-level-lineage",
+        )
+        self.assertEqual(
+            event["payload"]["contract_execution_id"],
+            "cex-server-top-level-lineage",
+        )
+        self.assertEqual(
+            event["verification"]["parent_contract_execution_id"],
+            "cex-server-parent",
+        )
 
     def test_server_guard_invoked_refuses_supersession_of_live_identity(self):
         """AC2: supersession of identity with accepted startup lineage is refused without force."""

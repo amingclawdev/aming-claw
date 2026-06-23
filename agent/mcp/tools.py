@@ -917,7 +917,7 @@ TOOLS: list[dict] = [
                 },
                 "route_identity": {
                     "type": "object",
-                    "description": "Claimed public-safe command route identity to consume: route_id, route_context_hash, prompt_contract_id, prompt_contract_hash, and visible_injection_manifest_hash.",
+                    "description": "Claimed public-safe command route identity to consume: route_id, route_context_hash, prompt_contract_id, prompt_contract_hash, visible_injection_manifest_hash, route_token_ref, and contract_execution_id lineage.",
                 },
                 "external_route_identity": {
                     "type": "object",
@@ -954,6 +954,26 @@ TOOLS: list[dict] = [
                 "action_precheck_id": {
                     "type": "string",
                     "description": "Route action precheck to record; defaults to observer_dispatch_bounded_worker.",
+                },
+                "route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque route token reference to preserve on route_action_precheck source evidence; raw route tokens are not required.",
+                },
+                "contract_execution_id": {
+                    "type": "string",
+                    "description": "Active contract execution id that the route_action_precheck evidence satisfies.",
+                },
+                "active_contract_execution_id": {
+                    "type": "string",
+                    "description": "Alias/companion for contract_execution_id when supplied by runtime current-state.",
+                },
+                "parent_contract_execution_id": {
+                    "type": "string",
+                    "description": "Parent contract execution id for successor contract lineage.",
+                },
+                "successor_contract_execution_id": {
+                    "type": "string",
+                    "description": "Successor contract execution id when the precheck is satisfying a selected follow-up contract.",
                 },
                 "record": {
                     "type": "boolean",
