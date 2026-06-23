@@ -38672,7 +38672,6 @@ def _enrich_timeline_events_with_route_token_lineage(
         missing_identity = [
             field
             for field, value in (
-                ("route_id", route_id),
                 ("route_context_hash", route_context_hash),
                 ("prompt_contract_id", prompt_contract_id),
             )
@@ -38732,6 +38731,24 @@ def _enrich_timeline_events_with_route_token_lineage(
                 **event_ref,
                 "route_token_ref": route_token_ref,
                 "reason": "route_token_ref_unknown",
+            })
+            enriched_rows.append(event)
+            continue
+        resolved_route_id = str(resolved.get("route_id") or "").strip()
+        if not route_id and not resolved_route_id:
+            payload["route_action_scope_lineage_resolution"] = {
+                "schema_version": "server_route_lineage_resolution.v1",
+                "status": "failed",
+                "reason": "missing_child_route_identity",
+                "missing_fields": ["route_id"],
+                "route_token_ref": route_token_ref,
+            }
+            event["payload"] = payload
+            failed_events.append({
+                **event_ref,
+                "route_token_ref": route_token_ref,
+                "reason": "missing_child_route_identity",
+                "missing_fields": ["route_id"],
             })
             enriched_rows.append(event)
             continue

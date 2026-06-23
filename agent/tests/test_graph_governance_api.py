@@ -22816,7 +22816,12 @@ def test_timeline_precheck_enriches_ref_only_registry_child_lineage(conn, tmp_pa
         "independent_verification",
         task=backlog_id,
         payload={
-            **parent_public,
+            **{
+                key: value
+                for key, value in child_identity.items()
+                if key != "route_id"
+            },
+            "route_token_ref": child_issue["route_token_ref"],
             "reviewer_role": "independent_qa",
             "contract_evidence": [
                 {
@@ -22851,8 +22856,13 @@ def test_timeline_precheck_enriches_ref_only_registry_child_lineage(conn, tmp_pa
     enrichment = gate["server_route_lineage_enrichment"]
     assert enrichment["enriched_event_count"] >= 2
     assert enrichment["failed_event_count"] == 0
+    assert any(
+        event["event_kind"] == "independent_verification"
+        for event in enrichment["enriched_events"]
+    )
     route_gate = gate["route_context_gate"]
     assert route_gate["passed"] is True
+    assert route_gate["checks"]["independent_verification_lane_present"] is True
     assert route_gate["accepted_startup_lineages"][0]["acceptance_source"] == (
         "registry_backed_runtime_context_lineage"
     )
