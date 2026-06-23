@@ -31384,10 +31384,19 @@ def _observer_root_route_close_action_card(
             if str(item.get("ref") or "").strip()
         ],
     }
-    if current_ref:
+    parent_identity = (
+        route_token_ref_projection.get("identity")
+        if isinstance(route_token_ref_projection.get("identity"), Mapping)
+        else {}
+    )
+    parent_identity_complete = all(
+        str(parent_identity.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+    )
+    if current_ref and parent_identity_complete:
         issue_body["parent_route_token_ref"] = current_ref
     for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
-        value = str(route_token_ref_projection.get("identity", {}).get(field) or "").strip()
+        value = str(parent_identity.get(field) or "").strip()
         if value:
             issue_body[f"parent_{field}"] = value
 
@@ -31419,6 +31428,13 @@ def _observer_root_route_close_action_card(
         "raw_route_token_exposed": False,
         "raw_secret_exposed": False,
     }
+    if current_ref and not parent_identity_complete:
+        card["current_route_token_ref_parent_omitted"] = True
+        card["current_route_token_ref_parent_omitted_reason"] = (
+            "current route_token_ref is not resolvable as the parent close "
+            "route identity; mint the close-scoped token from close-gate "
+            "evidence without attaching that unresolved parent ref"
+        )
     if not target_files:
         card["target_files_required"] = True
         card["target_files_hint"] = (
@@ -31613,6 +31629,20 @@ def _observer_root_route_close_next_legal_action(
     if route_token_ref:
         next_action["route_token_ref"] = route_token_ref
     return next_action
+
+
+def _observer_root_route_close_action_drives_next_step(
+    close_action_card: Mapping[str, Any],
+    close_next_legal_action: Mapping[str, Any],
+) -> bool:
+    if not close_next_legal_action:
+        return False
+    if close_action_card.get("terminal"):
+        return True
+    if not close_action_card.get("close_gate_passed"):
+        return False
+    status = str(close_action_card.get("status") or "").strip()
+    return status in {"close_commit_required", "ready", "refresh_required"}
 
 
 def _observer_root_route_identity_from_route_token_ref(
@@ -32163,7 +32193,24 @@ def _observer_root_route_context_state(
     close_next_legal_action = _observer_root_route_close_next_legal_action(
         close_action_card
     )
-    if close_next_legal_action and not contract_missing_step_active:
+    close_action_drives_next_step = _observer_root_route_close_action_drives_next_step(
+        close_action_card,
+        close_next_legal_action,
+    )
+    if close_next_legal_action and (
+        close_action_drives_next_step or not contract_missing_step_active
+    ):
+        if close_action_drives_next_step and contract_missing_step_active:
+            deferred_contract_action = dict(context.get("next_legal_action") or {})
+            context["contract_state_next_action_deferred_by_close_gate"] = (
+                deferred_contract_action
+            )
+            close_next_legal_action = {
+                **close_next_legal_action,
+                "precedence": "close_gate_passed_over_contract_state",
+                "contract_state_next_action_deferred": True,
+                "deferred_contract_state_next_action": deferred_contract_action,
+            }
         context["next_legal_action"] = close_next_legal_action
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),

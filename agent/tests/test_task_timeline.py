@@ -277,6 +277,70 @@ def _route_context_qa_verification_event(identity=None):
     }
 
 
+def test_contract_state_projection_accepts_independent_qa_verification_requirement_ids():
+    from agent.governance import task_timeline
+
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": "BUG-CONTRACT-QA-VERIFICATION",
+        "required_evidence": ["independent_verification_lane"],
+    }
+    event = {
+        "id": 25,
+        "event_type": "independent_qa.verification",
+        "event_kind": "verification",
+        "phase": "independent_verification",
+        "actor": "codex-qa-verifier",
+        "status": "passed",
+        "payload": {
+            "requirement_ids": ["verification", "independent_verification_lane"]
+        },
+        "verification": {
+            "requirement_ids": ["verification", "independent_verification_lane"]
+        },
+    }
+
+    projection = task_timeline.contract_state_projection(
+        [event],
+        contract=contract,
+        backlog_row={"project_id": "proj", "bug_id": "BUG-CONTRACT-QA-VERIFICATION"},
+    )
+
+    assert projection["missing_evidence"] == []
+    assert projection["completed_evidence"][0]["id"] == "independent_verification_lane"
+    assert projection["completed_evidence"][0]["event_kind"] == "verification"
+
+
+def test_contract_state_projection_does_not_treat_plain_verification_as_independent_qa():
+    from agent.governance import task_timeline
+
+    contract = {
+        "template_id": "mf_parallel.v1",
+        "contract_instance_id": "BUG-CONTRACT-PLAIN-VERIFICATION",
+        "required_evidence": ["independent_verification_lane"],
+    }
+    event = {
+        "id": 26,
+        "event_type": "mf.verification",
+        "event_kind": "verification",
+        "phase": "verification",
+        "actor": "worker",
+        "status": "passed",
+        "verification": {
+            "requirement_ids": ["verification", "independent_verification_lane"]
+        },
+    }
+
+    projection = task_timeline.contract_state_projection(
+        [event],
+        contract=contract,
+        backlog_row={"project_id": "proj", "bug_id": "BUG-CONTRACT-PLAIN-VERIFICATION"},
+    )
+
+    assert projection["completed_evidence"] == []
+    assert projection["missing_evidence"][0] == "independent_verification_lane"
+
+
 def _observer_hotfix_contract_events():
     return [
         {
@@ -2470,6 +2534,64 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertFalse(action_card["raw_route_token_exposed"])
         self.assertNotIn('"route_token":', json.dumps(result, sort_keys=True))
         self.assertNotIn("session_token", json.dumps(result, sort_keys=True))
+
+    def test_close_action_drives_next_step_after_close_gate_passes(self):
+        from agent.governance import server
+
+        self.assertTrue(
+            server._observer_root_route_close_action_drives_next_step(
+                {"close_gate_passed": True, "status": "refresh_required"},
+                {"id": "issue_close_scoped_route_token_ref"},
+            )
+        )
+        self.assertTrue(
+            server._observer_root_route_close_action_drives_next_step(
+                {"close_gate_passed": True, "status": "close_commit_required"},
+                {"id": "provide_close_commit_for_close_planning"},
+            )
+        )
+        self.assertFalse(
+            server._observer_root_route_close_action_drives_next_step(
+                {"close_gate_passed": False, "status": "blocked"},
+                {"id": "satisfy_close_gate_before_backlog_close"},
+            )
+        )
+
+    def test_close_action_card_omits_unresolved_parent_route_token_ref(self):
+        from agent.governance import server
+
+        card = server._observer_root_route_close_action_card(
+            {"passed": True, "checks": {}},
+            {
+                "route_token_ref": "rtok-worker-child",
+                "resolved": False,
+                "allowed_actions": ["task_timeline_append"],
+                "identity": {},
+            },
+            project_id="proj",
+            backlog_id="BUG-CLOSE-UNRESOLVED-PARENT",
+            task_id="BUG-CLOSE-UNRESOLVED-PARENT",
+            target_files=["agent/governance/server.py"],
+            events=[
+                {
+                    "id": 25,
+                    "event_kind": "qa_review",
+                    "phase": "verification",
+                    "status": "passed",
+                }
+            ],
+        )
+
+        self.assertEqual(card["status"], "refresh_required")
+        self.assertTrue(card["current_route_token_ref_parent_omitted"])
+        self.assertNotIn(
+            "parent_route_token_ref",
+            card["issue_route_token_request"],
+        )
+        self.assertEqual(
+            card["issue_route_token_request"]["allowed_actions"],
+            ["backlog_close"],
+        )
 
     def test_root_route_context_close_action_card_uses_close_token_ref_when_ready(self):
         from agent.governance import observer_session, server

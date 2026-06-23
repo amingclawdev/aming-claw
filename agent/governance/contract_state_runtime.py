@@ -2002,6 +2002,40 @@ def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int
     return False
 
 
+def _qa_verification_event_satisfies_requirement(
+    event: Mapping[str, Any],
+    requirement_id: str,
+) -> bool:
+    if requirement_id not in _QA_REQUIREMENT_EVENT_KIND_ALIASES:
+        return False
+    event_kind = str(event.get("event_kind") or "").strip()
+    if event_kind != "verification":
+        return False
+    phase = str(event.get("phase") or "").strip().lower().replace("-", "_").replace(".", "_")
+    event_type = (
+        str(event.get("event_type") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(".", "_")
+    )
+    marker = f"{phase} {event_type}"
+    if not any(
+        token in marker
+        for token in (
+            "independent_verification",
+            "independent_qa",
+            "qa_verification",
+            "qa_review",
+        )
+    ):
+        return False
+    return any(
+        _payload_declares_requirement(payload, requirement_id)
+        for payload in _event_payloads(event)
+    )
+
+
 def _event_deep_text(event: Mapping[str, Any], field_names: set[str]) -> str:
     for field_name in field_names:
         token = str(event.get(field_name) or "").strip()
@@ -2115,11 +2149,14 @@ def _event_satisfies_requirement(
     event_kind = str(event.get("event_kind") or "").strip()
     accepted_kinds = set(_string_list(requirement.get("accepted_event_kinds")))
     matched = event_kind in accepted_kinds
-    if not matched and not _requirement_requires_event_kind_match(requirement):
-        matched = any(
-            _payload_declares_requirement(payload, requirement_id)
-            for payload in _event_payloads(event)
-        )
+    if not matched:
+        if _qa_verification_event_satisfies_requirement(event, requirement_id):
+            matched = True
+        elif not _requirement_requires_event_kind_match(requirement):
+            matched = any(
+                _payload_declares_requirement(payload, requirement_id)
+                for payload in _event_payloads(event)
+            )
     if not matched:
         return False, None
     required_execution_id = str(
