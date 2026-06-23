@@ -9,6 +9,7 @@ from .execution_state import build_execution_state
 from .guide_compiler import compile_runtime_guide
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
+from .runtime import ContractRuntime, InMemoryContractExecutionStore
 from .schema import (
     CONTRACT_DEFINITION_SCHEMA_VERSION,
     ContractDefinitionError,
@@ -25,6 +26,8 @@ __all__ = [
     "ContractDefinitionError",
     "ContractDefinitionRegistry",
     "ContractLifecycleError",
+    "ContractRuntime",
+    "InMemoryContractExecutionStore",
     "WriteGateDecision",
     "build_execution_state",
     "compile_runtime_guide",
