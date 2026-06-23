@@ -229,7 +229,8 @@ def _without_private_fields(definition: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in definition.items()
-        if not str(key).startswith("_") and key != "definition_hash"
+        if not str(key).startswith("_")
+        and key not in {"definition_hash", "read_model"}
     }
 
 

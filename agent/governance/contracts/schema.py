@@ -54,9 +54,10 @@ def normalize_definition(
     }
     if isinstance(payload.get("metadata"), Mapping):
         normalized["metadata"] = dict(payload["metadata"])
+    normalized["definition_hash"] = definition_hash(normalized)
+    normalized["read_model"] = _build_read_model(normalized)
     if source_path:
         normalized["_source_path"] = source_path
-    normalized["definition_hash"] = definition_hash(normalized)
     return normalized
 
 
@@ -254,6 +255,66 @@ def _normalize_instruction_layer(value: Any) -> dict[str, Any]:
             }
         )
     return {"inline": inline, "refs": normalized_refs}
+
+
+def _build_read_model(definition: Mapping[str, Any]) -> dict[str, Any]:
+    rule_lines: list[dict[str, Any]] = []
+    required_evidence: list[dict[str, Any]] = []
+    writer_roles: list[str] = []
+    seen_writer_roles: set[str] = set()
+    for stage, line in iter_stage_lines(definition):
+        entry = {
+            "stage_id": str(stage.get("stage_id") or ""),
+            "stage_description": str(stage.get("description") or ""),
+            "line_id": str(line.get("line_id") or ""),
+            "owner_role": str(line.get("owner_role") or ""),
+            "allowed_writer_roles": list(line.get("allowed_writer_roles") or []),
+            "evidence_kind": str(line.get("evidence_kind") or ""),
+            "required": bool(line.get("required", True)),
+            "description": str(line.get("description") or ""),
+        }
+        if line.get("requires"):
+            entry["requires"] = list(line.get("requires") or [])
+        rule_lines.append(entry)
+        for role in entry["allowed_writer_roles"]:
+            if role not in seen_writer_roles:
+                seen_writer_roles.add(role)
+                writer_roles.append(role)
+        if entry["required"]:
+            required_evidence.append(
+                {
+                    "stage_id": entry["stage_id"],
+                    "line_id": entry["line_id"],
+                    "owner_role": entry["owner_role"],
+                    "allowed_writer_roles": list(entry["allowed_writer_roles"]),
+                    "evidence_kind": entry["evidence_kind"],
+                    "required": True,
+                }
+            )
+    return {
+        "schema_version": "contract_definition_read_model.v1",
+        "contract_id": definition.get("contract_id", ""),
+        "version": definition.get("version", ""),
+        "revision": definition.get("revision", ""),
+        "role": definition.get("role", ""),
+        "contract_type": definition.get("contract_type", ""),
+        "status": definition.get("status", ""),
+        "definition_hash": definition.get("definition_hash", ""),
+        "compat_aliases": list(definition.get("compat_aliases") or []),
+        "successors": [dict(item) for item in definition.get("successors") or []],
+        "instruction_layer": {
+            "inline": list(
+                (definition.get("instruction_layer") or {}).get("inline") or []
+            ),
+            "refs": [
+                dict(ref)
+                for ref in (definition.get("instruction_layer") or {}).get("refs") or []
+            ],
+        },
+        "rule_lines": rule_lines,
+        "required_evidence": required_evidence,
+        "allowed_writer_roles": writer_roles,
+    }
 
 
 def _safe_instruction_path(path_text: str) -> str:

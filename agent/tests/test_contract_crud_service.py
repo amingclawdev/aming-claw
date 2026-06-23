@@ -69,7 +69,54 @@ def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
     validated = service.validate(_definition())
     assert validated["ok"] is True
     assert validated["operation"] == "validate"
-    assert validated["data"]["definition"]["definition_hash"].startswith("sha256:")
+    definition = validated["data"]["definition"]
+    assert definition["definition_hash"].startswith("sha256:")
+    read_model = definition["read_model"]
+    assert read_model["role"] == "observer"
+    assert read_model["contract_type"] == "implementation"
+    assert read_model["compat_aliases"] == ["observer_hotfix_direct_mutation.v1"]
+    assert read_model["successors"] == [{"contract_id": "qa_onboard", "version": "v1"}]
+    assert read_model["allowed_writer_roles"] == ["observer", "qa"]
+    assert read_model["rule_lines"] == [
+        {
+            "stage_id": "pre_mutation",
+            "stage_description": "",
+            "line_id": "reason",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "contract_state_changed",
+            "required": True,
+            "description": "",
+        },
+        {
+            "stage_id": "qa",
+            "stage_description": "",
+            "line_id": "independent_qa",
+            "owner_role": "qa",
+            "allowed_writer_roles": ["qa"],
+            "evidence_kind": "qa_verification",
+            "required": True,
+            "description": "",
+        },
+    ]
+    assert read_model["required_evidence"] == [
+        {
+            "stage_id": "pre_mutation",
+            "line_id": "reason",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "contract_state_changed",
+            "required": True,
+        },
+        {
+            "stage_id": "qa",
+            "line_id": "independent_qa",
+            "owner_role": "qa",
+            "allowed_writer_roles": ["qa"],
+            "evidence_kind": "qa_verification",
+            "required": True,
+        },
+    ]
 
     created = service.create(_definition())
     assert created["ok"] is True
@@ -220,32 +267,88 @@ def test_default_crud_service_uses_source_definition_root_without_legacy_cutover
     source_path = Path(dogfood["_source_path"])
     assert source_path.parent.name == "contract_definitions"
     assert dogfood["definition_hash"].startswith("sha256:")
+    assert dogfood["role"] == "observer"
+    assert dogfood["compat_aliases"] == [
+        "contract_crud_runtime_integration.v1",
+        "contract_crud_runtime_min_path.v1",
+    ]
+    read_model = dogfood["read_model"]
+    assert read_model["definition_hash"] == dogfood["definition_hash"]
+    assert read_model["successors"] == [
+        {
+            "contract_id": "contract_runtime_route_context_integration",
+            "reason": (
+                "Wire the source-backed contract read model into route-context "
+                "runtime after the min path is accepted."
+            ),
+            "version": "v1",
+        }
+    ]
+    assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
+    assert [
+        (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
+        for line in read_model["rule_lines"]
+    ] == [
+        (
+            "context",
+            "read_contract_definition_source",
+            "observer",
+            "route_context",
+        ),
+        ("startup", "worker_startup", "mf_sub", "mf_subagent_startup"),
+        ("implementation", "crud_runtime_proof", "mf_sub", "implementation"),
+        (
+            "verification",
+            "qa_contract_runtime_min_path",
+            "qa",
+            "independent_verification",
+        ),
+    ]
+    assert [
+        item["evidence_kind"] for item in read_model["required_evidence"]
+    ] == [
+        "route_context",
+        "mf_subagent_startup",
+        "implementation",
+        "independent_verification",
+    ]
 
     payload = json.loads(source_path.read_text(encoding="utf-8"))
+    assert "read_model" not in payload
     validated = service.validate(payload)
     assert validated["ok"] is True
     assert (
         validated["data"]["definition"]["definition_hash"]
         == dogfood["definition_hash"]
     )
+    assert (
+        service.read("contract_crud_runtime_min_path.v1")["data"]["definition"][
+            "contract_id"
+        ]
+        == "contract_crud_runtime_integration"
+    )
 
     runtime = ContractRuntime(service.registry)
     record = runtime.start_execution(
         "contract_crud_runtime_integration",
         project_id="aming-claw",
-        backlog_id="AC-CONTRACT-CRUD-RUNTIME-INTEGRATION-20260623",
+        backlog_id="AC-CONTRACT-SYSTEM-CRUD-REGISTRY-MIN-PATH-20260623",
         contract_execution_id="cex-contract-crud-runtime-integration-test",
-        actor_role="mf_sub",
+        actor_role="observer",
         route_token_ref="rtok-test",
     )
     assert record["runtime_guide"]["next_legal_action"] == {
         "stage_id": "context",
-        "line_id": "read_runtime_context",
-        "owner_role": "mf_sub",
-        "allowed_writer_roles": ["mf_sub"],
-        "evidence_kind": "mf_subagent_read_receipt",
+        "line_id": "read_contract_definition_source",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "route_context",
         "required": True,
     }
+    assert (
+        "Observer records route/source context"
+        in record["runtime_guide"]["instructions"]["inline"][2]
+    )
 
     legacy_template = get_contract_template("mf_workflow_runtime.v1")
     assert legacy_template["schema_version"] != "contract_definition.v1"

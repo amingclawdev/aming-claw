@@ -97,8 +97,15 @@ def test_minimal_contract_runtime_drives_next_action_and_role_gate(tmp_path):
     )
 
     guide = record["runtime_guide"]
-    assert guide["next_legal_action"]["stage_id"] == "bootstrap"
-    assert guide["next_legal_action"]["line_id"] == "read_context"
+    assert guide["next_legal_action"] == {
+        "stage_id": "bootstrap",
+        "line_id": "read_context",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "contract_state_changed",
+        "required": True,
+    }
+    assert guide["instructions"]["inline"] == ["Runtime guide is authoritative."]
     assert guide["instructions"]["refs"][0]["content"] == "Follow the compiled runtime guide.\n"
 
     result = runtime.submit_line_write(

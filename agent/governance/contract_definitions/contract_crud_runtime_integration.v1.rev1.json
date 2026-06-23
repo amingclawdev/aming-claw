@@ -1,35 +1,56 @@
 {
+  "compat_aliases": [
+    "contract_crud_runtime_integration.v1",
+    "contract_crud_runtime_min_path.v1"
+  ],
   "contract_id": "contract_crud_runtime_integration",
   "contract_type": "implementation",
   "instruction_layer": {
     "inline": [
       "Use ContractCrudService against this source-controlled contract_definition.v1 root.",
-      "Keep legacy contract_templates resolved by the legacy template registry."
+      "Keep legacy contract_templates resolved by the legacy template registry.",
+      "Observer records route/source context, mf_sub records bounded implementation, and QA records independent verification."
     ],
     "refs": []
   },
   "metadata": {
-    "backlog_id": "AC-CONTRACT-CRUD-RUNTIME-INTEGRATION-20260623",
+    "backlog_id": "AC-CONTRACT-SYSTEM-CRUD-REGISTRY-MIN-PATH-20260623",
     "dogfood": true,
     "legacy_template_cutover": false
   },
   "revision": "rev1",
-  "role": "mf_sub",
+  "role": "observer",
   "rule_layer": {
     "stages": [
       {
-        "description": "Worker proves runtime context and source-root read path.",
+        "description": "Observer proves route context and source-root read path.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read the source-controlled contract definition and preserve legacy template registry boundaries.",
+            "evidence_kind": "route_context",
+            "line_id": "read_contract_definition_source",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "context"
+      },
+      {
+        "description": "Worker proves bounded runtime startup before implementation.",
         "lines": [
           {
             "allowed_writer_roles": [
               "mf_sub"
             ],
-            "evidence_kind": "mf_subagent_read_receipt",
-            "line_id": "read_runtime_context",
+            "description": "Record worker startup/read-receipt lineage before changing contract CRUD/runtime files.",
+            "evidence_kind": "mf_subagent_startup",
+            "line_id": "worker_startup",
             "owner_role": "mf_sub"
           }
         ],
-        "stage_id": "context"
+        "stage_id": "startup"
       },
       {
         "description": "Worker changes only the fenced CRUD/runtime proof files.",
@@ -46,15 +67,15 @@
         "stage_id": "implementation"
       },
       {
-        "description": "Worker runs focused CRUD, registry, instruction, and runtime tests.",
+        "description": "QA verifies the source-backed CRUD/registry/runtime path independently.",
         "lines": [
           {
             "allowed_writer_roles": [
-              "mf_sub"
+              "qa"
             ],
-            "evidence_kind": "verification",
-            "line_id": "focused_tests",
-            "owner_role": "mf_sub"
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_contract_runtime_min_path",
+            "owner_role": "qa"
           }
         ],
         "stage_id": "verification"
@@ -63,5 +84,12 @@
   },
   "schema_version": "contract_definition.v1",
   "status": "active",
+  "successors": [
+    {
+      "contract_id": "contract_runtime_route_context_integration",
+      "reason": "Wire the source-backed contract read model into route-context runtime after the min path is accepted.",
+      "version": "v1"
+    }
+  ],
   "version": "v1"
 }
