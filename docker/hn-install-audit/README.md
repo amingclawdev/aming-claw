@@ -24,6 +24,50 @@ docker/hn-install-audit/run-install-audit.sh \
   --ai-prompt-mode required
 ```
 
+For live Codex/Claude prompt diagnosis, keep a named container so the same
+authenticated runtime can be inspected or restarted without rebuilding the
+image and auth mount every time:
+
+```bash
+RUN_ID=codex-live-debug-$(date -u +%Y%m%dT%H%M%SZ)
+PLUGIN_REPO_URL=https://github.com/amingclawdev/aming-claw.git \
+docker/hn-install-audit/run-install-audit.sh \
+  --host codex \
+  --run-id "$RUN_ID" \
+  --ref codex/runtime-startup-next-move \
+  --ai-prompt-mode required \
+  --prompt-timeout-ms 300000 \
+  --keep-container \
+  --container-name "aming-claw-codex-live-$RUN_ID"
+```
+
+Rerun the preserved container during diagnosis:
+
+```bash
+docker/hn-install-audit/run-install-audit.sh \
+  --host codex \
+  --run-id "$RUN_ID" \
+  --reuse-container \
+  --container-name "aming-claw-codex-live-$RUN_ID"
+```
+
+Use `--replace-container` when the named container should be discarded and
+created again. The JSON report includes `docker_debug.container_name`,
+`docker_debug.prompt_timeout_ms`, and a `docker_debug.reuse_command` hint when
+the container name is known.
+
+Kept containers are a debugging shortcut only. Final public proof should run
+from the pushed git ref in a fresh container, without `--keep-container` or
+`--reuse-container`:
+
+```bash
+PLUGIN_REPO_URL=https://github.com/amingclawdev/aming-claw.git \
+docker/hn-install-audit/run-install-audit.sh \
+  --host codex \
+  --ref codex/runtime-startup-next-move \
+  --ai-prompt-mode required
+```
+
 When testing a Claude login captured in a dedicated container-auth home, pass it
 explicitly instead of overriding `HOME`:
 

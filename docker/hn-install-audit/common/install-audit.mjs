@@ -47,6 +47,8 @@ const LIVE_OBSERVER_ROUTE_REPORT_PATH = process.env.LIVE_OBSERVER_ROUTE_REPORT_P
   || join(OUT_DIR, `${HOST}-live-observer-route-${RUN_ID}.json`);
 const SOURCE_MODE = process.env.DOCKER_AUDIT_SOURCE_MODE || "git"; // git | mounted-worktree
 const INSTALL_SOURCE = SOURCE_MODE === "mounted-worktree" && REPO_URL === "file:///plugin-source" ? SRC_ROOT : REPO_URL;
+const DOCKER_KEEP_CONTAINER = /^(1|true|yes)$/i.test(process.env.DOCKER_KEEP_CONTAINER || "");
+const DOCKER_CONTAINER_NAME = process.env.DOCKER_CONTAINER_NAME || "";
 
 const REQUIRED_SKILLS = [
   "aming-claw",
@@ -1345,6 +1347,7 @@ function buildReport({
     ...(featureSmokes || []),
     ...(liveObserverRoute?.requested ? [liveObserverRoute] : []),
   ];
+  const reuseCommand = DOCKER_CONTAINER_NAME ? `docker start -ai ${DOCKER_CONTAINER_NAME}` : "";
   const stateManager = buildInstallAuditStateManagerReport({
     host: HOST,
     status,
@@ -1380,6 +1383,13 @@ function buildReport({
     auth_mode: AUTH_MODE,
     run_id: RUN_ID,
     image_digest: process.env.IMAGE_DIGEST || "unknown-local-build",
+    docker_debug: {
+      container_name: DOCKER_CONTAINER_NAME,
+      keep_container: DOCKER_KEEP_CONTAINER,
+      prompt_timeout_ms: PROMPT_TIMEOUT_MS,
+      reuse_command: reuseCommand,
+      final_proof_requires_fresh_container: true,
+    },
     install_prompt_sha256: sha256(installPrompt),
     demo_prompt_sha256: sha256(demoPrompt),
     install_command: hostInstall.command || "",

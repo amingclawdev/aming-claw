@@ -70,6 +70,13 @@ Governance health, `/api/health`, and a working `/dashboard` prove the service
 can answer HTTP. They do not prove the AI host loaded `.mcp.json`, exposed the
 Aming Claw MCP server, or has route/current-context visibility.
 
+Every source-controlled mutation must be contract-bound before it happens. This
+applies to hotfix, parallel MF, Docker dogfood, fixture, docs, dashboard,
+runtime, config, and test changes alike: update or create the backlog row,
+bind the route/contract identity, record timeline evidence for the intended
+action, then mutate only the allowed files. A hotfix changes the allowed route,
+not the requirement to leave contract and timeline evidence.
+
 If `aming-claw://current-context` is missing, stop normal governed work. Reload
 or open a new Codex/Claude host session from a root whose MCP config actually
 points at the plugin checkout. That can be the plugin/workspace root with the
@@ -82,7 +89,34 @@ repo-local config, installed plugin cache, and any parent bridge. HTTP/CLI
 fallback is only for an explicit system-recovery hotfix or diagnosis, not
 ordinary governed implementation.
 
-## 3. Register A Target Project
+## 3. Docker Live-Lane Dogfood Loop
+
+Use the Docker install audit harness when validating that a new Codex or Claude
+host can install the plugin, load the Aming Claw MCP server, and run the demo
+prompt in a clean container runtime. The loop is contract-first even when the
+container itself is only a fixture:
+
+1. In the host observer session, read `aming-claw://current-context`,
+   `aming-claw://skill`, `aming-claw://graph-first`, and `aming-claw://mf-sop`.
+2. Bind the work to a backlog row and route context before changing docs,
+   runner scripts, runtime code, or demo fixtures.
+3. Run a minimal CLI/auth smoke in Docker before a required live prompt when
+   login state is uncertain.
+4. For diagnosis, run the Codex lane with `--keep-container`,
+   `--container-name`, and `--prompt-timeout-ms`; preserve the report and
+   container logs as blocker evidence instead of rerunning from scratch.
+5. When the Docker lane exposes a blocker, file it on the host backlog/timeline,
+   repair the host checkout under the row's contract, commit and push, then
+   update or rerun the Docker checkout/ref.
+6. Final proof must be a fresh container from the pushed ref, without
+   `--keep-container` or `--reuse-container`.
+
+The runner documentation lives in
+[docker/hn-install-audit/README.md](../docker/hn-install-audit/README.md).
+Debug containers reduce repeated auth/runtime setup, but they are not release
+proof by themselves.
+
+## 4. Register A Target Project
 
 Project registration is explicit. Do not silently register a workspace just
 because `/api/projects` is empty.
@@ -186,7 +220,7 @@ project id. For a dirty first-run target that is not yet registered, this event
 lives in the requested project's governance timeline DB even though the project
 registry row is not created.
 
-## 4. Project Config In V1
+## 5. Project Config In V1
 
 V1 stores most user project metadata in the Aming Claw project registry. It
 should not default to creating or mutating `.aming-claw.yaml` in the target
@@ -200,7 +234,7 @@ For source-controlled projects that want a config file, see
 - `testing.e2e` suite metadata.
 - `ai.routing`, especially the `semantic` provider/model.
 
-## 5. First Useful Actions
+## 6. First Useful Actions
 
 After graph build:
 
@@ -276,7 +310,7 @@ follow-up so auditability can be materialized.
 Chain trailers are MF audit anchors on commits; they do not mean auto-chain
 execution is active.
 
-## 6. AI Enrich
+## 7. AI Enrich
 
 Configure the project's `semantic` provider/model in AI config before live
 semantic jobs. OpenAI routes use Codex CLI (`codex`); Anthropic routes use
@@ -299,7 +333,7 @@ Recommended flow:
 `ai_complete` means a proposal exists. It is not trusted project memory until
 reviewed and accepted.
 
-## 7. Governance Hint
+## 8. Governance Hint
 
 Governance Hint is the V1-safe graph correction path for orphan doc/test/config
 files that already appear in snapshot file inventory.
@@ -313,7 +347,7 @@ It writes a source-controlled hint into the file, then requires:
 It does not create nodes, rewrite ownership, move hierarchy edges, or edit
 dependency/function-call relations.
 
-## 8. What Is Not The V1 Default
+## 9. What Is Not The V1 Default
 
 - Auto-chain PM -> Dev -> Test -> QA -> Merge is experimental in V1 and is
   not the V1 default implementation route.

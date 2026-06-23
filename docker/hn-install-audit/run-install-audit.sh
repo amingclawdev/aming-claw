@@ -15,6 +15,11 @@ DOCKER_AI_E2E_CHANGED_FILES="${DOCKER_AI_E2E_CHANGED_FILES:-}"
 DOCKER_LIVE_OBSERVER_ROUTE="${DOCKER_LIVE_OBSERVER_ROUTE:-0}"
 LIVE_OBSERVER_ROUTE_REPORT_PATH="${LIVE_OBSERVER_ROUTE_REPORT_PATH:-}"
 DOCKER_AUDIT_SOURCE_MODE="${DOCKER_AUDIT_SOURCE_MODE:-git}"
+AI_PROMPT_TIMEOUT_MS="${AI_PROMPT_TIMEOUT_MS:-}"
+DOCKER_KEEP_CONTAINER="${DOCKER_KEEP_CONTAINER:-0}"
+DOCKER_REUSE_CONTAINER="${DOCKER_REUSE_CONTAINER:-0}"
+DOCKER_REPLACE_CONTAINER="${DOCKER_REPLACE_CONTAINER:-0}"
+DOCKER_CONTAINER_NAME="${DOCKER_CONTAINER_NAME:-}"
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +39,15 @@ Options:
                                Default: git. mounted-worktree copies the
                                mounted checkout so dirty changes can be
                                dogfooded before commit.
+  --prompt-timeout-ms MS        Timeout for each AI prompt subprocess inside
+                               the container. Default: harness internal value.
+  --keep-container             Keep the named container after exit for
+                               docker exec/logs based diagnosis.
+  --reuse-container            Re-run an existing named container instead of
+                               creating a new one.
+  --replace-container          Remove an existing named container before run.
+  --container-name NAME        Container name. With --host both, the host name
+                               is appended to avoid collisions.
   --no-build                    Reuse existing Docker images.
   --help                        Show this help.
 
@@ -58,6 +72,11 @@ while [[ $# -gt 0 ]]; do
     --claude-auth-home) CLAUDE_AUTH_HOME="$2"; shift 2 ;;
     --changed-files) DOCKER_AI_E2E_CHANGED_FILES="$2"; shift 2 ;;
     --source-mode) DOCKER_AUDIT_SOURCE_MODE="$2"; shift 2 ;;
+    --prompt-timeout-ms) AI_PROMPT_TIMEOUT_MS="$2"; shift 2 ;;
+    --keep-container) DOCKER_KEEP_CONTAINER=1; shift ;;
+    --reuse-container) DOCKER_REUSE_CONTAINER=1; shift ;;
+    --replace-container) DOCKER_REPLACE_CONTAINER=1; shift ;;
+    --container-name) DOCKER_CONTAINER_NAME="$2"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -84,6 +103,24 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUT_DIR"
+
+container_name_for() {
+  local host="$1"
+  if [[ -n "$DOCKER_CONTAINER_NAME" ]]; then
+    if [[ "$HOSTS" == "both" ]]; then
+      printf '%s-%s\n' "$DOCKER_CONTAINER_NAME" "$host"
+    else
+      printf '%s\n' "$DOCKER_CONTAINER_NAME"
+    fi
+  else
+    printf 'aming-claw-install-audit-%s-%s\n' "$host" "$RUN_ID"
+  fi
+}
+
+container_exists() {
+  local name="$1"
+  docker ps -a --format '{{.Names}}' | grep -Fxq "$name"
+}
 
 build_image() {
   local host="$1"
@@ -122,14 +159,45 @@ auth_mounts() {
 run_host() {
   local host="$1"
   local image="aming-claw-install-audit-$host"
+  local container_name
+  container_name="$(container_name_for "$host")"
+
+  if [[ "$DOCKER_REUSE_CONTAINER" == "1" ]]; then
+    if ! container_exists "$container_name"; then
+      echo "container '$container_name' does not exist; run once with --keep-container first" >&2
+      return 2
+    fi
+    echo "Reusing container: $container_name" >&2
+    docker start -ai "$container_name"
+    return $?
+  fi
+
   build_image "$host" || return $?
+
+  if container_exists "$container_name"; then
+    if [[ "$DOCKER_REPLACE_CONTAINER" == "1" ]]; then
+      docker rm -f "$container_name" >/dev/null
+    elif [[ "$DOCKER_KEEP_CONTAINER" == "1" || -n "$DOCKER_CONTAINER_NAME" ]]; then
+      echo "container '$container_name' already exists; use --reuse-container or --replace-container" >&2
+      return 2
+    fi
+  fi
 
   local mounts=()
   while IFS= read -r item; do
     [[ -n "$item" ]] && mounts+=("$item")
   done < <(auth_mounts "$host")
 
-  docker run --rm \
+  local run_identity=()
+  if [[ "$DOCKER_KEEP_CONTAINER" == "1" || -n "$DOCKER_CONTAINER_NAME" ]]; then
+    run_identity+=(--name "$container_name")
+  fi
+  if [[ "$DOCKER_KEEP_CONTAINER" != "1" ]]; then
+    run_identity+=(--rm)
+  fi
+
+  docker run \
+    "${run_identity[@]}" \
     "${mounts[@]}" \
     -v "$ROOT:/plugin-source:ro" \
     -v "$OUT_DIR:/audit-output" \
@@ -146,6 +214,9 @@ run_host() {
     -e "DOCKER_LIVE_OBSERVER_ROUTE=$DOCKER_LIVE_OBSERVER_ROUTE" \
     -e "LIVE_OBSERVER_ROUTE_REPORT_PATH=$LIVE_OBSERVER_ROUTE_REPORT_PATH" \
     -e "DOCKER_AUDIT_SOURCE_MODE=$DOCKER_AUDIT_SOURCE_MODE" \
+    -e "AI_PROMPT_TIMEOUT_MS=$AI_PROMPT_TIMEOUT_MS" \
+    -e "DOCKER_KEEP_CONTAINER=$DOCKER_KEEP_CONTAINER" \
+    -e "DOCKER_CONTAINER_NAME=$container_name" \
     "$image"
 }
 
