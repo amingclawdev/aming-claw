@@ -31286,6 +31286,24 @@ def _observer_root_route_contract_state_action_has_priority(
     )
 
 
+def _observer_root_route_contract_action_requires_execution_supervisor(
+    action: Mapping[str, Any],
+) -> bool:
+    action_id = str(action.get("id") or action.get("action") or "").strip()
+    if action_id in {
+        "bounded_implementation_worker_dispatch",
+        "dispatch_bounded_worker",
+        "implementation",
+        "record_implementation",
+    }:
+        return True
+    action_name = str(action.get("action") or "").strip()
+    return action_name in {
+        "dispatch_bounded_worker",
+        "record_implementation",
+    }
+
+
 def _observer_root_route_dirty_files_from_request_or_git(
     *,
     project_id: str,
@@ -32287,10 +32305,26 @@ def _observer_root_route_context_state(
         and contract_next_action
         and (contract_ordered_steps or contract_state_action_has_priority)
     )
+    contract_action_waits_for_work_mode = bool(
+        contract_missing_step_active
+        and not supervisor_transition_prerequisites_satisfied
+        and any(
+            str(step.get("id") or "") == "observer_work_mode_transition"
+            for step in ordered_missing_steps
+        )
+        and _observer_root_route_contract_action_requires_execution_supervisor(
+            contract_next_action
+        )
+    )
     if contract_missing_step_active:
         merged_steps: list[dict[str, Any]] = []
         seen_step_ids: set[str] = set()
-        for step in [*contract_action_steps, *ordered_missing_steps]:
+        step_sources = (
+            [*ordered_missing_steps, *contract_action_steps]
+            if contract_action_waits_for_work_mode
+            else [*contract_action_steps, *ordered_missing_steps]
+        )
+        for step in step_sources:
             step_id = str(step.get("id") or "").strip()
             if not step_id or step_id in seen_step_ids:
                 continue
@@ -32330,7 +32364,20 @@ def _observer_root_route_context_state(
         "raw_route_token_persisted": False,
     }
     context["work_mode_transition_gate"] = transition_gate
-    if contract_missing_step_active:
+    if contract_missing_step_active and contract_action_waits_for_work_mode:
+        context["contract_state_next_action"] = contract_next_action
+        context["contract_state_next_action_deferred_by_work_mode_gate"] = (
+            contract_next_action
+        )
+        next_action = _observer_root_route_next_legal_action_from_steps(
+            ordered_missing_steps,
+            default=dict(context.get("next_legal_action") or {}),
+        )
+        next_action["precedence"] = "work_mode_transition_gate_before_contract_state"
+        next_action["contract_state_next_action_deferred"] = True
+        next_action["deferred_contract_state_next_action"] = contract_next_action
+        context["next_legal_action"] = next_action
+    elif contract_missing_step_active:
         contract_missing_prerequisites = [step["id"] for step in contract_action_steps]
         if not contract_missing_prerequisites and contract_next_action.get("id"):
             contract_missing_prerequisites = [str(contract_next_action["id"])]

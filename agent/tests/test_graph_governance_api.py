@@ -21699,6 +21699,96 @@ def test_observer_root_route_context_contract_first_for_no_contract_row(conn):
     ]
 
 
+def test_observer_root_route_context_work_mode_gate_precedes_dispatch_action(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-WORK-MODE-BEFORE-DISPATCH"
+    task_id = "root-route-context-work-mode-before-dispatch-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "contract": {
+                        "contract_id": "onboard_contract.v1",
+                        "contract_template_id": "onboard_contract.v1",
+                        "contract_revision_id": "crev-work-mode-before-dispatch",
+                        "contract_execution_id": "cex-work-mode-before-dispatch",
+                        "contract_chain_id": "cchain-work-mode-before-dispatch",
+                        "state": "selected",
+                        "required_evidence": [
+                            "route_context",
+                            "route_action_precheck",
+                            "bounded_implementation_worker_dispatch",
+                        ],
+                    }
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    route_identity = {
+        "route_id": "route-work-mode-before-dispatch",
+        "route_context_hash": _fake_sha("work-mode-before-dispatch-route"),
+        "prompt_contract_id": "rprompt-work-mode-before-dispatch",
+        "prompt_contract_hash": _fake_sha("work-mode-before-dispatch-prompt"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "work-mode-before-dispatch-visible"
+        ),
+    }
+    for event_kind in ("route_context", "route_action_precheck"):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_type=event_kind,
+            event_kind=event_kind,
+            phase=event_kind,
+            actor="observer",
+            status="passed",
+            payload={
+                **route_identity,
+                "route_context": {
+                    **route_identity,
+                    "caller_role": "observer",
+                    "allowed_actions": ["dispatch_worker"],
+                },
+                "route_action_precheck": {
+                    "action": "dispatch_bounded_worker",
+                    "allowed": True,
+                    "route_identity": route_identity,
+                },
+            },
+        )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        caller_graph_query_schema_trace_id="gqt-20260623-abcdef1234",
+    )
+
+    assert result["work_mode"] == observer_session.WORK_MODE_LOOK_BEFORE_ACT
+    assert result["work_mode_transition_gate"]["allowed"] is False
+    assert result["work_mode_transition_gate"]["missing"] == [
+        "work_mode_transition_event"
+    ]
+    assert result["contract_state"]["next_legal_action"]["id"] == (
+        "dispatch_bounded_worker"
+    )
+    assert result["next_legal_action"]["id"] == "observer_work_mode_transition"
+    assert result["next_legal_action"]["action"] == "record_work_mode_transition"
+    assert result["next_legal_action"]["precedence"] == (
+        "work_mode_transition_gate_before_contract_state"
+    )
+    assert result["next_legal_action"]["deferred_contract_state_next_action"][
+        "id"
+    ] == "dispatch_bounded_worker"
+
+
 def test_observer_root_route_context_dirty_no_contract_reports_recovery(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-DIRTY-NO-CONTRACT"
     _insert_simple_mf_close_backlog(conn, backlog_id)
