@@ -5163,6 +5163,7 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "/api/graph-governance/{project_id}/runtime-contexts/"
         "{runtime_context_id}/finish-gate"
     )
+    assert finish_time_submission["body_source"] == "copy_safe_body"
     assert finish_time_submission["runtime_context_id"] == context.runtime_context_id
     assert finish_time_submission["task_id"] == "runtime-current-task"
     assert finish_time_submission["parent_task_id"] == "runtime-current-parent"
@@ -5172,6 +5173,14 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert finish_time_submission["body"]["finish_time_worker_self_attestation"] == (
         "<returned finish_time_worker_self_attestation>"
     )
+    assert finish_time_submission["copy_safe_body"]["status"] == "review_ready"
+    assert finish_time_submission["copy_safe_body"]["test_results"] == {
+        "status": "passed",
+        "passed": True,
+    }
+    assert finish_time_submission["copy_safe_body"][
+        "finish_time_worker_self_attestation"
+    ] == "<returned finish_time_worker_self_attestation>"
     finish_time_guidance = write_guides["finish_time_worker_attestation"][
         "transcript_guidance"
     ]
@@ -5184,6 +5193,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert write_guides["finish_gate"]["finish_gate_submission"]["action"] == (
         "record_finish_gate"
     )
+    assert write_guides["finish_gate"]["body_source"] == "copy_safe_body"
+    assert write_guides["finish_gate"]["copy_safe_body"]["status"] == "review_ready"
+    assert write_guides["finish_gate"]["copy_safe_body"]["test_results"] == {
+        "status": "passed",
+        "passed": True,
+    }
 
     assert worker_guide["graph_query_identity"]["fence_token_hash"] == fence_hash
     assert worker_guide["graph_query_identity"]["fence_token_redacted"] is True

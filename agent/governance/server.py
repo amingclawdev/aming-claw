@@ -9221,6 +9221,7 @@ def _runtime_context_worker_guide_response(
         "head_commit": "<worker-worktree-head-commit>",
         "changed_files": list(worker_scope_files) or ["<owned-file>"],
         "owned_files": list(worker_scope_files) or ["<owned-file>"],
+        "status": "review_ready",
         "test_results": {"status": "passed", "passed": True},
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
         "read_receipt_event_id": "<accepted-read-receipt-event-id>",
@@ -9260,6 +9261,17 @@ def _runtime_context_worker_guide_response(
             "raw_finish_time_attestation_alone_close_satisfying": False,
         },
     }
+    finish_gate_submission_template["copy_safe_body"] = dict(
+        finish_gate_submission_template["body"]
+    )
+    finish_gate_submission_template["post_body"] = dict(
+        finish_gate_submission_template["copy_safe_body"]
+    )
+    finish_gate_submission_template["body_source"] = "copy_safe_body"
+    finish_gate_submission_template["copy_rule"] = (
+        "POST exactly copy_safe_body/body to runtime_context.finish_gate; "
+        "do not post the wrapper object itself."
+    )
     write_guides = {
         "read_receipt": {
             "legacy_bridge": {
@@ -9426,6 +9438,19 @@ def _runtime_context_worker_guide_response(
                         "<returned finish_time_worker_self_attestation>"
                     ),
                 },
+                "copy_safe_body": {
+                    **finish_gate_submission_template["copy_safe_body"],
+                    "finish_time_worker_self_attestation": (
+                        "<returned finish_time_worker_self_attestation>"
+                    ),
+                },
+                "post_body": {
+                    **finish_gate_submission_template["copy_safe_body"],
+                    "finish_time_worker_self_attestation": (
+                        "<returned finish_time_worker_self_attestation>"
+                    ),
+                },
+                "body_source": "copy_safe_body",
             },
             "auth": _auth_guide("body.session_token"),
         },
@@ -9460,6 +9485,10 @@ def _runtime_context_worker_guide_response(
                 "finish_time_worker_self_attestation",
             ],
             "finish_gate_submission": finish_gate_submission_template,
+            "submission": finish_gate_submission_template,
+            "body": finish_gate_submission_template["body"],
+            "copy_safe_body": finish_gate_submission_template["copy_safe_body"],
+            "body_source": "copy_safe_body",
             "auth": _auth_guide("body.session_token"),
         },
         "implementation_evidence": {
