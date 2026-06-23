@@ -71,6 +71,35 @@ const REQUIRED_RESOURCES = [
   "aming-claw://mf-sop",
 ];
 
+const MOUNTED_SOURCE_EXCLUDED_DIRS = [
+  ".aming-claw",
+  ".cache",
+  ".claude",
+  ".codex",
+  ".git",
+  ".hypothesis",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".tmp",
+  ".venv",
+  ".worktrees",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "htmlcov",
+  "logs",
+  "node_modules",
+  "reports",
+  "shared-volume",
+  "tmp",
+];
+
+const MOUNTED_SOURCE_EXCLUDED_PREFIXES = [
+  "docs/hn-demo/audits",
+];
+
 const FEATURE_SMOKE_NAMES = [
   "observer_command_pending",
   "live_observer_route",
@@ -116,6 +145,14 @@ function sanitizeEvidence(value) {
   }
   if (typeof value === "string") return redact(value);
   return value;
+}
+
+function logStage(stage, details = {}) {
+  console.error(JSON.stringify(sanitizeEvidence({
+    event: "install_audit_stage",
+    stage,
+    ...details,
+  })));
 }
 
 function sortedValue(value) {
@@ -251,10 +288,22 @@ function gitCloneSource() {
   rmSync(SRC_ROOT, { recursive: true, force: true });
   ensureDir(dirname(SRC_ROOT));
   if (SOURCE_MODE === "mounted-worktree" && REPO_URL === "file:///plugin-source") {
+    const copyStartedAt = Date.now();
+    logStage("mounted_source_copy_start", {
+      source: "/plugin-source",
+      target: SRC_ROOT,
+      excluded_dirs: MOUNTED_SOURCE_EXCLUDED_DIRS,
+      excluded_prefixes: MOUNTED_SOURCE_EXCLUDED_PREFIXES,
+    });
     const commit = run("git", ["-C", "/plugin-source", "rev-parse", "HEAD"], { cwd: WORK_ROOT, timeout: 30000 });
     cpSync("/plugin-source", SRC_ROOT, {
       recursive: true,
       filter: shouldCopyMountedSourcePath,
+    });
+    const copyElapsedMs = Date.now() - copyStartedAt;
+    logStage("mounted_source_copy_done", {
+      target: SRC_ROOT,
+      elapsed_ms: copyElapsedMs,
     });
     const snapshot = createMountedSourceGitSnapshot(commit.ok ? commit.stdout.trim() : "");
     if (!snapshot.ok) return snapshot;
@@ -271,11 +320,12 @@ function gitCloneSource() {
         commit.stderr || "",
         snapshot.stderr || "",
       ].filter(Boolean).join("\n")),
-      elapsed_ms: (commit.elapsed_ms || 0) + (snapshot.elapsed_ms || 0),
+      elapsed_ms: copyElapsedMs + (commit.elapsed_ms || 0) + (snapshot.elapsed_ms || 0),
       plugin_root: SRC_ROOT,
       source_mode: SOURCE_MODE,
       source_commit: commit.ok ? commit.stdout.trim() : "",
       source_snapshot_commit: snapshot.source_snapshot_commit || "",
+      source_copy_policy: mountedSourceCopyPolicy(),
     };
   }
   const clone = run("git", ["clone", REPO_URL, SRC_ROOT], { cwd: WORK_ROOT, timeout: 300000 });
@@ -291,22 +341,48 @@ function shouldCopyMountedSourcePath(source) {
   const rel = source.replace(/^\/plugin-source\/?/, "");
   if (!rel) return true;
   const parts = rel.split("/");
-  const excluded = new Set([
-    ".git",
-    ".worktrees",
-    ".venv",
-    ".mypy_cache",
-    ".pytest_cache",
-    "__pycache__",
-    "node_modules",
-    "dist",
-    "build",
-    "coverage",
-  ]);
+  const excluded = new Set(MOUNTED_SOURCE_EXCLUDED_DIRS);
   if (parts.some((part) => excluded.has(part))) return false;
-  if (parts[0] === "docs" && parts[1] === "hn-demo" && parts[2] === "audits") return false;
-  if (parts[0] === ".aming-claw" && parts[1] === "e2e-artifacts") return false;
+  if (MOUNTED_SOURCE_EXCLUDED_PREFIXES.some((prefix) => rel === prefix || rel.startsWith(`${prefix}/`))) return false;
   return true;
+}
+
+function mountedSourceCopyPolicy() {
+  return {
+    schema_version: "mounted_source_copy_policy.v1",
+    source_mode: "mounted-worktree",
+    excluded_dirs: MOUNTED_SOURCE_EXCLUDED_DIRS,
+    excluded_prefixes: MOUNTED_SOURCE_EXCLUDED_PREFIXES,
+  };
+}
+
+function runMountedSourceFilterSelfTest() {
+  const cases = [
+    ["/plugin-source", true],
+    ["/plugin-source/agent/governance/server.py", true],
+    ["/plugin-source/agent/governance/dashboard_dist/index.html", true],
+    ["/plugin-source/docs/dev/article.md", true],
+    ["/plugin-source/skills/aming-claw/SKILL.md", true],
+    ["/plugin-source/.git/config", false],
+    ["/plugin-source/.codex/config.toml", false],
+    ["/plugin-source/.claude/settings.json", false],
+    ["/plugin-source/.aming-claw/cache/runtime.db", false],
+    ["/plugin-source/shared-volume/codex-tasks/payload.json", false],
+    ["/plugin-source/reports/install-audit.json", false],
+    ["/plugin-source/frontend/dashboard/node_modules/vite/index.js", false],
+    ["/plugin-source/frontend/dashboard/dist/index.html", false],
+    ["/plugin-source/docs/hn-demo/audits/run.json", false],
+    ["/plugin-source/agent/__pycache__/server.cpython-311.pyc", false],
+  ];
+  const failures = cases
+    .map(([path, expected]) => ({ path, expected, actual: shouldCopyMountedSourcePath(path) }))
+    .filter((item) => item.actual !== item.expected);
+  return {
+    ok: failures.length === 0,
+    assertions: cases.length,
+    failures,
+    policy: mountedSourceCopyPolicy(),
+  };
 }
 
 function createMountedSourceGitSnapshot(sourceCommit) {
@@ -1546,6 +1622,16 @@ async function main() {
   console.log(JSON.stringify({ report: REPORT_PATH, validation, status: report.status }, null, 2));
   const acceptedStatus = report.status === "PASS" || (AI_PROMPT_MODE === "skip" && report.status === "SKIPPED");
   if (!validation.ok || !acceptedStatus) process.exit(1);
+}
+
+if (process.argv.includes("--self-test")) {
+  const filter = runMountedSourceFilterSelfTest();
+  console.log(JSON.stringify({
+    ok: filter.ok,
+    mounted_source_filter: filter,
+  }, null, 2));
+  if (!filter.ok) process.exit(1);
+  process.exit(0);
 }
 
 main().catch((error) => {

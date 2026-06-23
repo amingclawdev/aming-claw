@@ -56,6 +56,14 @@ created again. The JSON report includes `docker_debug.container_name`,
 `docker_debug.prompt_timeout_ms`, and a `docker_debug.reuse_command` hint when
 the container name is known.
 
+When `--source-mode mounted-worktree` is used, the harness copies only
+audit-relevant source inputs from the mounted checkout. It intentionally
+excludes local/runtime-heavy directories such as `.git`, `.codex`, `.claude`,
+`.aming-claw`, `shared-volume`, `reports`, `node_modules`, `dist`, `build`,
+and `coverage`. This keeps Docker proof from inheriting host caches or private
+runtime state while still allowing a local branch to be dogfooded before it is
+pushed.
+
 For Claude diagnosis where OAuth/device login must happen inside the container
 home, keep the named Claude container as the auth store. Do not run
 `--replace-container`, `docker rm`, Docker prune, or an unnamed `--rm` lane
@@ -71,6 +79,11 @@ docker/hn-install-audit/run-install-audit.sh \
   --keep-container \
   --container-name aming-claw-claude-container-auth
 ```
+
+On first login, Claude Code may print an auto-update warning such as
+`no write permission to npm prefix`. Treat that as environment diagnostic
+evidence, not as proof of failed auth; verify auth with a real `claude -p`
+prompt and keep the warning in the audit notes when it affects repeatability.
 
 Kept containers are a debugging shortcut only. Final public proof should run
 from the pushed git ref in a fresh container, without `--keep-container` or

@@ -40,7 +40,10 @@ Options:
   --source-mode git|mounted-worktree
                                Default: git. mounted-worktree copies the
                                mounted checkout so dirty changes can be
-                               dogfooded before commit.
+                               dogfooded before commit, excluding local
+                               runtime state/caches such as .git, .codex,
+                               .claude, .aming-claw, shared-volume, reports,
+                               node_modules, dist, build, and coverage.
   --prompt-timeout-ms MS        Timeout for each AI prompt subprocess inside
                                the container. Default: harness internal value.
   --keep-container             Keep the named container after exit for
