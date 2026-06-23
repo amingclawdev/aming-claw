@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from agent.governance.contracts import ContractCrudService, ContractDefinitionRegistry
+from agent.governance.contract_template_registry import (
+    get_contract_template,
+    list_contract_templates,
+)
+from agent.governance.contracts import (
+    ContractCrudService,
+    ContractDefinitionRegistry,
+    ContractRuntime,
+)
 
 
 def _definition(**overrides):
@@ -122,6 +131,14 @@ def test_crud_service_preserves_registry_lifecycle_rules(tmp_path: Path):
     active_only = service.list(include_deprecated=False)
     assert [item["revision"] for item in active_only["data"]["definitions"]] == ["rev2"]
 
+    hash_mismatch = service.update(
+        _definition(revision="rev2"),
+        expected_previous_hash="sha256:" + "0" * 64,
+    )
+    assert hash_mismatch["ok"] is False
+    assert hash_mismatch["error"]["type"] == "ContractLifecycleError"
+    assert "expected_previous_hash mismatch" in hash_mismatch["error"]["message"]
+
     blocked_delete = service.hard_delete(
         "observer_hotfix",
         version="v1",
@@ -133,13 +150,14 @@ def test_crud_service_preserves_registry_lifecycle_rules(tmp_path: Path):
     assert "hard delete" in blocked_delete["error"]["message"]
 
     draft = service.create(_definition(revision="rev3", status="draft"))
-    deleted = service.hard_delete(
+    deleted = service.delete(
         "observer_hotfix",
         version="v1",
         revision="rev3",
         references=["draft-ref-ok"],
     )
     assert deleted["ok"] is True
+    assert deleted["operation"] == "delete"
     assert deleted["data"]["deleted"] == {
         "contract_id": "observer_hotfix",
         "version": "v1",
@@ -186,3 +204,51 @@ def test_crud_service_accepts_registry_injection(tmp_path: Path):
 
     with pytest.raises(ValueError, match="either root or registry"):
         ContractCrudService(tmp_path, registry=registry)
+
+
+def test_default_crud_service_uses_source_definition_root_without_legacy_cutover():
+    service = ContractCrudService()
+
+    listed = service.list(include_deprecated=False)
+    assert listed["ok"] is True
+    definitions = listed["data"]["definitions"]
+    dogfood = next(
+        item
+        for item in definitions
+        if item["contract_id"] == "contract_crud_runtime_integration"
+    )
+    source_path = Path(dogfood["_source_path"])
+    assert source_path.parent.name == "contract_definitions"
+    assert dogfood["definition_hash"].startswith("sha256:")
+
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    validated = service.validate(payload)
+    assert validated["ok"] is True
+    assert (
+        validated["data"]["definition"]["definition_hash"]
+        == dogfood["definition_hash"]
+    )
+
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "contract_crud_runtime_integration",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-CRUD-RUNTIME-INTEGRATION-20260623",
+        contract_execution_id="cex-contract-crud-runtime-integration-test",
+        actor_role="mf_sub",
+        route_token_ref="rtok-test",
+    )
+    assert record["runtime_guide"]["next_legal_action"] == {
+        "stage_id": "context",
+        "line_id": "read_runtime_context",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "evidence_kind": "mf_subagent_read_receipt",
+        "required": True,
+    }
+
+    legacy_template = get_contract_template("mf_workflow_runtime.v1")
+    assert legacy_template["schema_version"] != "contract_definition.v1"
+    legacy_ids = {template["template_id"] for template in list_contract_templates()}
+    assert "mf_workflow_runtime.v1" in legacy_ids
+    assert "contract_crud_runtime_integration" not in legacy_ids

@@ -175,7 +175,39 @@ class ContractCrudService:
         revision: str | None = None,
         references: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        operation = "hard_delete"
+        return self._delete(
+            "hard_delete",
+            contract_id,
+            version=version,
+            revision=revision,
+            references=references,
+        )
+
+    def delete(
+        self,
+        contract_id: str,
+        *,
+        version: str | None = None,
+        revision: str | None = None,
+        references: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._delete(
+            "delete",
+            contract_id,
+            version=version,
+            revision=revision,
+            references=references,
+        )
+
+    def _delete(
+        self,
+        operation: str,
+        contract_id: str,
+        *,
+        version: str | None = None,
+        revision: str | None = None,
+        references: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         try:
             definition = self.registry.get(
                 contract_id,
