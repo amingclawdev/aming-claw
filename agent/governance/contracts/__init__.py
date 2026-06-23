@@ -6,6 +6,7 @@ depending on the legacy route-context runtime.
 """
 
 from .execution_state import build_execution_state
+from .crud import ContractCrudResult, ContractCrudService
 from .guide_compiler import compile_runtime_guide
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
@@ -23,6 +24,8 @@ from .write_gate import WriteGateDecision, validate_contract_write
 
 __all__ = [
     "CONTRACT_DEFINITION_SCHEMA_VERSION",
+    "ContractCrudResult",
+    "ContractCrudService",
     "ContractDefinitionError",
     "ContractDefinitionRegistry",
     "ContractLifecycleError",
