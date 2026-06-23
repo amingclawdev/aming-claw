@@ -637,6 +637,96 @@ def test_mf_subagent_startup_next_action_hint_is_worker_owned():
         assert field in prefill["actor_owned_execution_fields"]
 
 
+def test_mf_subagent_startup_missing_runtime_identity_does_not_complete_requirement():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_revision_id": "rev-worker-startup-invalid",
+            "contract_execution_id": "cex-worker-startup-invalid",
+            "contract_chain_id": "cchain-worker-startup-invalid",
+            "state": "selected",
+            "required_evidence": ["mf_subagent_startup"],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(
+                41,
+                "mf_subagent_startup",
+                status="ok",
+                payload={
+                    "contract_execution_id": "cex-worker-startup-invalid",
+                    "actual_cwd": "/tmp/worker",
+                    "actual_git_root": "/tmp/worker",
+                    "known_missing_startup_fields": [
+                        "runtime_context_id",
+                        "fence_token",
+                        "session_token_ref",
+                    ],
+                    "route_identity": {
+                        "route_id": "route-startup",
+                        "route_context_hash": "sha256:ctx",
+                        "prompt_contract_id": "prompt-startup",
+                        "prompt_contract_hash": "sha256:prompt",
+                        "visible_injection_manifest_hash": "sha256:visible",
+                    },
+                },
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["completed_evidence"] == []
+    assert projection["missing_evidence"] == ["mf_subagent_startup"]
+    assert projection["next_legal_action"]["id"] == "mf_subagent_startup"
+
+
+def test_mf_subagent_startup_with_actual_identity_completes_requirement():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_revision_id": "rev-worker-startup-valid",
+            "contract_execution_id": "cex-worker-startup-valid",
+            "contract_chain_id": "cchain-worker-startup-valid",
+            "state": "selected",
+            "required_evidence": ["mf_subagent_startup"],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(
+                42,
+                "mf_subagent_startup",
+                status="passed",
+                payload={
+                    "contract_execution_id": "cex-worker-startup-valid",
+                    "actual_cwd": "/tmp/worker",
+                    "actual_git_root": "/tmp/worker",
+                    "branch": "refs/heads/codex/worker",
+                    "head_commit": "abc123",
+                    "fence_token": "fence-123",
+                    "close_satisfying": True,
+                    "runtime_context_id": "mfrctx-worker",
+                    "task_id": "worker-task",
+                    "parent_task_id": "AC-CONTRACT-RUNTIME",
+                    "worker_slot_id": "worker-a",
+                },
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["missing_evidence"] == []
+    assert projection["completed_evidence"][0]["id"] == "mf_subagent_startup"
+    assert projection["contract_complete"] is True
+
+
 def test_projection_falls_back_to_event_project_id_for_active_execution():
     contract = {
         "contract": {

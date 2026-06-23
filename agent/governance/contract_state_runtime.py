@@ -2060,6 +2060,87 @@ def _event_deep_text(event: Mapping[str, Any], field_names: set[str]) -> str:
     return ""
 
 
+def _event_deep_value(value: Any, field_names: set[str], *, depth: int = 0) -> Any:
+    if depth > 6:
+        return None
+    if isinstance(value, Mapping):
+        for field_name in field_names:
+            if field_name in value and value.get(field_name) not in (None, "", [], {}):
+                return value.get(field_name)
+        for child in value.values():
+            found = _event_deep_value(child, field_names, depth=depth + 1)
+            if found not in (None, "", [], {}):
+                return found
+    elif isinstance(value, list | tuple | set):
+        for child in value:
+            found = _event_deep_value(child, field_names, depth=depth + 1)
+            if found not in (None, "", [], {}):
+                return found
+    return None
+
+
+def _worker_startup_fence_evidence_present(event: Mapping[str, Any]) -> bool:
+    if _event_deep_text(
+        event,
+        {
+            "fence_token",
+            "worker_fence_token",
+            "route_fence_token",
+            "actual_fence_token",
+            "reported_fence_token",
+            "fence_token_hash",
+        },
+    ):
+        return True
+    for field_name in (
+        "fence_token_present",
+        "actual_fence_token_present",
+        "fence_token_matches",
+    ):
+        value = _event_deep_value(event, {field_name})
+        if value is not None and _policy_truthy(value):
+            return True
+    return False
+
+
+def _worker_startup_actual_identity_present(event: Mapping[str, Any]) -> bool:
+    actual_runtime = _mapping(_event_deep_value(event, {"actual_runtime"}))
+    actual_cwd = _event_deep_text(event, {"actual_cwd"}) or str(
+        actual_runtime.get("cwd") or ""
+    ).strip()
+    actual_git_root = _event_deep_text(event, {"actual_git_root"}) or str(
+        actual_runtime.get("git_root") or ""
+    ).strip()
+    branch = (
+        _event_deep_text(event, {"branch", "branch_ref"})
+        or str(
+            actual_runtime.get("branch") or actual_runtime.get("branch_ref") or ""
+        ).strip()
+    )
+    head_commit = (
+        _event_deep_text(event, {"head_commit", "branch_head"})
+        or str(
+            actual_runtime.get("head_commit") or actual_runtime.get("branch_head") or ""
+        ).strip()
+    )
+    return bool(
+        (actual_cwd or actual_git_root)
+        and branch
+        and head_commit
+        and _worker_startup_fence_evidence_present(event)
+    )
+
+
+def _worker_startup_satisfies_requirement(event: Mapping[str, Any]) -> bool:
+    known_missing = _event_deep_value(event, {"known_missing_startup_fields"})
+    if known_missing not in (None, "", [], {}):
+        return False
+    close_satisfying = _event_deep_value(event, {"close_satisfying"})
+    if close_satisfying is not None and not _policy_truthy(close_satisfying):
+        return False
+    return _worker_startup_actual_identity_present(event)
+
+
 def _multiple_attempt_lineage_bridge_step(
     events: list[dict[str, Any]],
     *,
@@ -2170,6 +2251,11 @@ def _event_satisfies_requirement(
                 for payload in _event_payloads(event)
             )
     if not matched:
+        return False, None
+    if (
+        requirement_id == "mf_subagent_startup"
+        and not _worker_startup_satisfies_requirement(event)
+    ):
         return False, None
     required_execution_id = str(
         requirement.get("contract_execution_id")
