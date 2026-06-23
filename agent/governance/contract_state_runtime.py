@@ -3202,7 +3202,9 @@ def build_contract_state_projection(
                 contract_first_runtime_step,
                 *ordered_next_steps,
             ]
-    requirement_contract_active = bool(has_explicit_contract and requirement_steps)
+    requirement_contract_active = bool(
+        requirement_steps and (has_explicit_contract or binding)
+    )
     next_legal_action: dict[str, Any] | None = None
     if (
         requirement_contract_active or contract_first_runtime_step
@@ -4016,7 +4018,7 @@ def build_contract_state_projection(
             }
 
     root_next_legal_action: dict[str, Any] | None = None
-    if next_legal_action and active_execution:
+    if next_legal_action:
         root_next_legal_action = {
             **next_legal_action,
             "requirement_id": (

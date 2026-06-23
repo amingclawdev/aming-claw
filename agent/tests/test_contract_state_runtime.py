@@ -811,6 +811,46 @@ def test_default_mf_parallel_requirements_still_drive_next_action_order():
     )
 
 
+def test_bound_root_default_requirements_drive_next_action_without_active_execution():
+    projection = build_contract_state_projection(
+        [
+            _event(
+                80,
+                "contract_state_changed",
+                payload={"contract_binding": {"state": "bound"}},
+            )
+        ],
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        default_required_evidence=[
+            "mf_subagent_startup",
+            "implementation",
+            "verification",
+            "close_ready",
+        ],
+    )
+
+    assert projection["state"] == "bound"
+    assert projection["legacy_no_contract"] is False
+    assert projection["active_contract_execution"] == {}
+    assert projection["missing_evidence"] == [
+        "mf_subagent_startup",
+        "implementation",
+        "verification",
+        "close_ready",
+    ]
+    action = projection["next_legal_action"]
+    assert action["id"] == "mf_subagent_startup"
+    assert action["backlog_id"] == "AC-CONTRACT-RUNTIME"
+    assert action["contract_execution_id"] == ""
+    assert projection["runtime_contract_hints"]["next_legal_operation"]["id"] == (
+        "mf_subagent_startup"
+    )
+    assert projection["executable_contract"]["next_legal_operation"]["id"] == (
+        "mf_subagent_startup"
+    )
+
+
 def test_onboard_complete_exposes_successor_candidates_as_next_action():
     contract = {
         "contract": {
