@@ -31845,6 +31845,143 @@ def _observer_root_route_close_action_drives_next_step(
     return status in {"close_commit_required", "ready", "refresh_required"}
 
 
+def _timeline_gate_backlog_close_route_token_request_hint(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    row: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    query: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the protected backlog_close authorization step for repair view."""
+
+    if not bool(verification.get("passed") or verification.get("can_close")):
+        return {}
+    task_id = str(
+        query.get("task_id")
+        or _row_get(row, "current_task_id", "")
+        or _row_get(row, "root_task_id", "")
+        or backlog_id
+    ).strip()
+    row_target_files = _string_list_field(_row_get(row, "target_files", ""))
+    contract_target_files = _string_list_field(contract.get("target_files"))
+    route_token_ref_projection = _observer_root_route_identity_from_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=query.get("route_token_ref", ""),
+    )
+    action_card = _observer_root_route_close_action_card(
+        verification,
+        route_token_ref_projection,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        backlog_status=str(_row_get(row, "status", "")),
+        task_id=task_id,
+        target_files=row_target_files or contract_target_files,
+        events=events,
+    )
+    if action_card.get("terminal"):
+        return {
+            "schema_version": "mf_timeline_precheck_backlog_close_route_token_hint.v1",
+            "action": str(action_card.get("action") or "done"),
+            "status": str(action_card.get("status") or "done"),
+            "close_evidence_ready": True,
+            "backlog_close_authorized": False,
+            "authorization_required": False,
+            "terminal": True,
+            "terminal_status": str(action_card.get("terminal_status") or ""),
+            "detail": str(action_card.get("detail") or ""),
+            "raw_route_token_exposed": False,
+            "raw_secret_exposed": False,
+        }
+
+    issue_request = (
+        dict(action_card.get("issue_route_token_request") or {})
+        if isinstance(action_card.get("issue_route_token_request"), Mapping)
+        else {}
+    )
+    target_files = (
+        issue_request.get("target_files") or row_target_files or contract_target_files
+    )
+    evidence_refs = action_card.get("evidence_refs") or _observer_root_route_close_evidence_refs(
+        events
+    )
+    if not issue_request:
+        issue_request = {
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "target_files": target_files,
+            "allowed_actions": ["backlog_close"],
+            "evidence_refs": [
+                str(item.get("ref") or "").strip()
+                for item in evidence_refs
+                if isinstance(item, Mapping) and str(item.get("ref") or "").strip()
+            ],
+        }
+    card_status = str(action_card.get("status") or "refresh_required")
+    authorized = card_status == "ready"
+    hint = {
+        "schema_version": "mf_timeline_precheck_backlog_close_route_token_hint.v1",
+        "action": (
+            "backlog_close"
+            if authorized
+            else "issue_close_scoped_route_token_ref"
+        ),
+        "status": "ready" if authorized else "refresh_required",
+        "close_evidence_ready": True,
+        "backlog_close_authorized": authorized,
+        "authorization_required": not authorized,
+        "evidence_vs_authorization": (
+            "can_close=true means close evidence is ready; backlog_close is a "
+            "separate protected action and requires a route token/ref whose "
+            "allowed_actions include backlog_close."
+        ),
+        "allowed_action": "backlog_close",
+        "allowed_actions": ["backlog_close"],
+        "protected_action": True,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "target_files": target_files,
+        "evidence_refs": evidence_refs,
+        "issue_route_token_request": issue_request,
+        "protected_entrypoint": action_card.get("protected_entrypoint")
+        or {
+            "method": "POST",
+            "path": "/api/backlog/{project_id}/{bug_id}/close",
+            "path_params": {"project_id": project_id, "bug_id": backlog_id},
+            "mcp_tool": "backlog_close",
+        },
+        "route_token_issue_entrypoint": action_card.get("route_token_issue_entrypoint")
+        or {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "path_params": {"project_id": project_id},
+            "mcp_tool": "observer_route_context_issue",
+        },
+        "current_route_token_ref": str(
+            action_card.get("current_route_token_ref") or ""
+        ),
+        "current_route_token_allowed_actions": action_card.get(
+            "current_route_token_allowed_actions"
+        )
+        or [],
+        "route_token_refresh_required": not authorized,
+        "raw_route_token_exposed": False,
+        "raw_secret_exposed": False,
+        "detail": str(action_card.get("detail") or ""),
+    }
+    route_token_ref = str(action_card.get("route_token_ref") or "").strip()
+    if route_token_ref:
+        hint["route_token_ref"] = route_token_ref
+    return {key: value for key, value in hint.items() if value not in ("", [], {})}
+
+
 def _observer_root_route_identity_from_route_token_ref(
     conn,
     *,
@@ -37228,6 +37365,41 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 {**verification, "project_id": pid, "bug_id": bug_id, "applicable": applicable["is_mf"]},
                 request_id=ctx.request_id,
             )
+            close_route_token_hint = (
+                _timeline_gate_backlog_close_route_token_request_hint(
+                    conn,
+                    project_id=pid,
+                    backlog_id=bug_id,
+                    row=row,
+                    contract=contract,
+                    verification=verification,
+                    events=events,
+                    query=ctx.query,
+                )
+                if can_close
+                else {}
+            )
+            if close_route_token_hint:
+                repair_summary = dict(repair_summary)
+                repair_summary["backlog_close_route_token_request_hint"] = (
+                    close_route_token_hint
+                )
+                deterministic_actions = [
+                    item
+                    for item in repair_summary.get("deterministic_actions") or []
+                    if not (
+                        isinstance(item, Mapping)
+                        and item.get("action")
+                        in {
+                            "issue_close_scoped_route_token_ref",
+                            "backlog_close",
+                        }
+                    )
+                ]
+                repair_summary["deterministic_actions"] = [
+                    close_route_token_hint,
+                    *deterministic_actions,
+                ]
             bridge_action = _observer_root_route_lineage_bridge_action(
                 verification,
                 route_context_gate,
