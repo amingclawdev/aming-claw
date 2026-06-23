@@ -7034,6 +7034,11 @@ def _runtime_context_service_timeline_refs(
         if is_finish_time_worker_attestation and not finish_attestation:
             from .parallel_branch_runtime import public_contract_revision_payload
 
+            observer_command_id = _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(payload, "observer_command_id")
+            )
+            if observer_command_id:
+                refs["observer_command_id"] = observer_command_id
             finish_attestation = {
                 "payload": public_contract_revision_payload(payload),
                 "worker_self_attestation": public_contract_revision_payload(
@@ -9190,6 +9195,20 @@ def _runtime_context_worker_guide_response(
                 "Refresh current-state/worker-guide, then POST this body only "
                 "from the mf_sub worker session."
             ),
+            "required_top_level_fields": [
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+                "worker_session_id",
+                "filer_principal",
+                "graph_trace_ids",
+                "test_results",
+            ],
+            "field_shape": (
+                "Keep these lineage fields at the POST body top level. Nested "
+                "self_attestation/artifact_refs copies are tolerated only as a "
+                "recovery source, not the preferred happy-path shape."
+            ),
             "observer_must_not_author": True,
             "raw_tokens_exposed": False,
             "test_results_source": (
@@ -9226,6 +9245,10 @@ def _runtime_context_worker_guide_response(
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
         "read_receipt_event_id": "<accepted-read-receipt-event-id>",
         "read_receipt_hash": "<accepted-read-receipt-hash>",
+        "observer_command_id": (
+            hinted_observer_command_id
+            or "<same observer_command_id used for finish-time attestation>"
+        ),
         "finish_time_worker_self_attestation": (
             "<finish_time_worker_self_attestation returned by "
             "finish-time-worker-attestation>"
@@ -9247,6 +9270,10 @@ def _runtime_context_worker_guide_response(
             "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
             "read_receipt_event_id": "<accepted-read-receipt-event-id>",
             "read_receipt_hash": "<accepted-read-receipt-hash>",
+            "observer_command_id": (
+                hinted_observer_command_id
+                or "<same observer_command_id used for finish-time attestation>"
+            ),
             "finish_time_worker_self_attestation": (
                 "<finish_time_worker_self_attestation returned by "
                 "finish-time-worker-attestation>"
@@ -9257,6 +9284,12 @@ def _runtime_context_worker_guide_response(
                 "After finish-time-worker-attestation succeeds, refresh "
                 "current-state/worker-guide and POST this finish-gate facade."
             ),
+            "required_top_level_fields": [
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+                "finish_time_worker_self_attestation",
+            ],
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
         },
@@ -9334,6 +9367,7 @@ def _runtime_context_worker_guide_response(
                 "task_id",
                 "parent_task_id",
                 "worker_role",
+                "observer_command_id",
                 "fence_token",
                 "session_token or session_token_ref",
                 "target_project_root",
@@ -9397,10 +9431,12 @@ def _runtime_context_worker_guide_response(
                 "target_project_root",
                 "worker_session_id",
                 "filer_principal",
+                "observer_command_id",
                 "worker_transcript_ref or worker_transcript_path",
                 "harness_type",
                 "graph_trace_ids",
                 "read_receipt_event_id",
+                "read_receipt_hash",
                 "test_results",
             ],
             "transcript_guidance": {
@@ -9482,6 +9518,7 @@ def _runtime_context_worker_guide_response(
                 "graph_trace_ids",
                 "read_receipt_event_id",
                 "read_receipt_hash",
+                "observer_command_id",
                 "finish_time_worker_self_attestation",
             ],
             "finish_gate_submission": finish_gate_submission_template,
@@ -9517,6 +9554,7 @@ def _runtime_context_worker_guide_response(
                 "target_project_root",
                 "changed_files",
                 "tests",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
             ],
             "server_derived_fields": [
                 "actor",
@@ -9528,6 +9566,18 @@ def _runtime_context_worker_guide_response(
                 "parent_task_id",
                 "route_identity",
             ],
+            "route_identity_policy": {
+                "top_level_route_identity_source": (
+                    "copy_safe_body route_* fields are the current worker/child "
+                    "route identity for this runtime_context_id."
+                ),
+                "do_not_replace_top_level_route_fields_with_parent_identity": True,
+                "parent_route_lineage_location": (
+                    "Only use parent_route_lineage when a server error or "
+                    "route-token binding response explicitly asks for it; keep "
+                    "parent identity out of top-level route_* fields."
+                ),
+            },
             "payload_role_fields": {
                 "worker_role": "mf_sub",
                 "role": "omit",
@@ -10491,9 +10541,21 @@ def _runtime_context_worker_recovery_payloads(
             "route_token_policy": {
                 "prefer_route_token_ref": True,
                 "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
+                "current_worker_route_identity": present_route_identity,
+                "current_worker_route_token_ref": safe_route_identity.get(
+                    "route_token_ref",
+                    "",
+                ),
+                "copy_safe_body_route_fields_are_current_worker_identity": True,
+                "do_not_replace_top_level_route_fields_with_parent_identity": True,
                 "parent_route_token_ref": safe_route_identity.get(
                     "route_token_ref",
                     "",
+                ),
+                "legacy_parent_route_token_ref_name_note": (
+                    "This legacy field may contain the current worker route ref "
+                    "when the worker route is already a parent-bound child. Use "
+                    "current_worker_route_token_ref for the happy path."
                 ),
             },
         },
@@ -12136,6 +12198,40 @@ def _runtime_context_test_results_compatible(
     return True
 
 
+def _runtime_context_finish_attestation_sources(
+    body: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    sources: list[Mapping[str, Any]] = [body]
+    for key in (
+        "finish_time_worker_self_attestation",
+        "worker_self_attestation",
+        "self_attestation",
+        "attestation",
+        "artifact_refs",
+        "payload",
+    ):
+        value = body.get(key)
+        if isinstance(value, Mapping):
+            sources.append(value)
+    return sources
+
+
+def _runtime_context_finish_attestation_text(
+    body: Mapping[str, Any],
+    *keys: str,
+) -> str:
+    for source in _runtime_context_finish_attestation_sources(body):
+        for key in keys:
+            if source is body:
+                value = source.get(key)
+            else:
+                value = _timeline_first_deep_text(source, key)
+            text = _runtime_context_non_placeholder_text(value)
+            if text:
+                return text
+    return ""
+
+
 def _runtime_context_finish_gate_submission_payload(
     *,
     project_id: str,
@@ -12150,6 +12246,7 @@ def _runtime_context_finish_gate_submission_payload(
     graph_trace_ids: Sequence[str],
     read_receipt_event_id: str,
     read_receipt_hash: str,
+    observer_command_id: str = "",
     worker_session_id: str = "",
     filer_principal: str = "",
     request_body: Mapping[str, Any] | None = None,
@@ -12206,6 +12303,8 @@ def _runtime_context_finish_gate_submission_payload(
             finish_time_worker_self_attestation
         ),
     }
+    if observer_command_id:
+        submission_body["observer_command_id"] = observer_command_id
     if worker_session_id:
         submission_body["worker_session_id"] = worker_session_id
     if filer_principal:
@@ -12242,6 +12341,7 @@ def _runtime_context_finish_gate_submission_payload(
         "finish_time_worker_self_attestation": dict(
             finish_time_worker_self_attestation
         ),
+        **({"observer_command_id": observer_command_id} if observer_command_id else {}),
         "body": submission_body,
         "reminders": {
             "fence_token": "Use the same lane fence_token from the worker launch envelope.",
@@ -13406,14 +13506,20 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             )
         )
         read_receipt_event_id = str(
-            body.get("read_receipt_event_id")
-            or body.get("read_receipt_timeline_id")
+            _runtime_context_finish_attestation_text(
+                body,
+                "read_receipt_event_id",
+                "read_receipt_timeline_id",
+            )
             or timeline_refs.get("read_receipt_event_ref")
             or ""
         ).strip()
         if read_receipt_event_id.startswith("timeline:"):
             read_receipt_event_id = read_receipt_event_id.split(":", 1)[1]
-        read_receipt_hash = str(body.get("read_receipt_hash") or "").strip()
+        read_receipt_hash = _runtime_context_finish_attestation_text(
+            body,
+            "read_receipt_hash",
+        )
         if not read_receipt_hash:
             for event in timeline_events:
                 payload = (
@@ -13465,8 +13571,21 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             graph_trace_db_evidence.get("verified_trace_ids") or []
         )
 
-        worker_session_id = str(body.get("worker_session_id") or "").strip()
-        filer_principal = str(body.get("filer_principal") or body.get("actor") or "").strip()
+        observer_command_id = (
+            _runtime_context_finish_attestation_text(body, "observer_command_id")
+            or str(timeline_refs.get("observer_command_id") or "").strip()
+        )
+        worker_session_id = _runtime_context_finish_attestation_text(
+            body,
+            "worker_session_id",
+            "session_id",
+        )
+        filer_principal = _runtime_context_finish_attestation_text(
+            body,
+            "filer_principal",
+            "actor",
+            "agent_id",
+        )
         if not worker_session_id:
             raise ValidationError("worker_session_id is required")
         if filer_principal != worker_session_id:
@@ -13508,7 +13627,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "head_commit": head_commit,
             "changed_files": changed_files,
             "owned_files": list(body.get("owned_files") or changed_files),
-            "observer_command_id": str(body.get("observer_command_id") or ""),
+            "observer_command_id": observer_command_id,
             "read_receipt_hash": read_receipt_hash,
             "read_receipt_event_id": read_receipt_event_id,
             "route_token_ref": event_route_identity.get("route_token_ref") or "",
@@ -13549,6 +13668,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 "visible_injection_manifest_hash"
             )
             or "",
+            "observer_command_id": observer_command_id,
             "head_commit": head_commit,
             "changed_files": changed_files,
             "graph_trace_ids": verified_graph_trace_ids,
@@ -13613,6 +13733,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             graph_trace_ids=verified_graph_trace_ids,
             read_receipt_event_id=read_receipt_event_id,
             read_receipt_hash=read_receipt_hash,
+            observer_command_id=observer_command_id,
             worker_session_id=worker_session_id,
             filer_principal=filer_principal,
             request_body=body,

@@ -5931,6 +5931,13 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert finish_attestation_submission["body"]["filer_principal"] == (
         "worker-session-facade"
     )
+    finish_gate_template = pre_attestation_guide["worker_guide"]["write_guides"][
+        "finish_time_worker_attestation"
+    ]["finish_gate_submission"]
+    assert finish_gate_template["body"]["observer_command_id"] == "cmd-facade"
+    assert finish_gate_template["copy_safe_body"]["observer_command_id"] == (
+        "cmd-facade"
+    )
     assert pre_attestation_guide["actionable_payloads"][
         "finish_time_worker_attestation_body"
     ]["observer_command_id"] == "cmd-facade"
@@ -5952,7 +5959,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "graph_trace_ids": [graph_trace_id],
         "read_receipt_hash": "sha256:read-facade",
         "read_receipt_event_id": read_receipt["timeline_event"]["id"],
-        "observer_command_id": "cmd-facade",
+        "artifact_refs": {"observer_command_id": "cmd-facade"},
         "head_commit": head_commit,
         "changed_files": [changed_path],
         "owned_files": [changed_path],
@@ -6145,6 +6152,12 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "attestation_phase"
     ] == "finish"
     assert finish_attestation["next_legal_action"] == "record_finish_gate"
+    stored_finish = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (finish_attestation["timeline_event"]["id"],),
+    ).fetchone()
+    stored_finish_payload = json.loads(stored_finish["payload_json"])
+    assert stored_finish_payload["observer_command_id"] == "cmd-facade"
     finish_gate_submission = finish_attestation["finish_gate_submission"]
     assert finish_gate_submission["action"] == "record_finish_gate"
     assert finish_gate_submission["name"] == "record_finish_gate"
@@ -6158,6 +6171,8 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         f"/api/graph-governance/{PID}/runtime-contexts/"
         f"{runtime_context_id}/finish-gate"
     )
+    assert finish_gate_submission["observer_command_id"] == "cmd-facade"
+    assert finish_gate_submission["body"]["observer_command_id"] == "cmd-facade"
     assert finish_gate_submission["runtime_context_id"] == runtime_context_id
     assert finish_gate_submission["task_id"] == context.task_id
     assert finish_gate_submission["parent_task_id"] == "runtime-facade-parent"
