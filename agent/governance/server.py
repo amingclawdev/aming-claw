@@ -1894,8 +1894,10 @@ def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
         "Worker and QA evidence:",
         "1. Each mf_sub worker must read runtime_context_worker_guide and follow its next legal action.",
         "2. The normal worker sequence is guide -> read receipt -> real startup -> implementation -> finish gate.",
-        "3. Run independent QA from a distinct verifier lane/session where possible.",
-        "4. Observer-authored visual smoke may be useful evidence, but do not present it as independent QA.",
+        "3. Keep startup and implementation in the same live worker session. If a startup-only worker exits, spawn a fresh implementation worker and record fresh read/startup evidence; do not use send_input on a completed startup worker as the implementation path.",
+        "4. Before worker implementation evidence, verify the live worker has the raw host envelope env values AMING_WORKER_SESSION_TOKEN and AMING_WORKER_FENCE_TOKEN. If they are missing after startup, request the runtime-context rejoin host envelope and inject it into the real mf_sub worker before protected writes.",
+        "5. Run independent QA from a distinct verifier lane/session where possible.",
+        "6. Observer-authored visual smoke may be useful evidence, but do not present it as independent QA.",
         "",
         "Demo work:",
         "Do not stop after planning. Run the full governed happy path unless a real governance gate returns a blocker.",
@@ -8019,6 +8021,15 @@ def _runtime_context_projection_response(
             or ""
         ),
         target_project_root=target_project_root,
+        agent_id=str(
+            worker_view_for_summary.get("agent_id")
+            or getattr(context, "agent_id", "")
+            or ""
+        ),
+        branch_ref=str(getattr(context, "branch_ref", "") or ""),
+        base_commit=str(getattr(context, "base_commit", "") or ""),
+        target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
+        merge_queue_id=str(getattr(context, "merge_queue_id", "") or ""),
         route_identity=route_identity if isinstance(route_identity, Mapping) else {},
         fence_token_hash=str(
             (
@@ -9637,6 +9648,37 @@ def _runtime_context_worker_guide_response(
         worker_id=worker_id,
         worker_slot_id=worker_slot_id,
         target_project_root=target_project_root,
+        agent_id=str(
+            graph_identity.get("agent_id")
+            or task.get("agent_id")
+            or worker_view.get("agent_id")
+            or branch_view.get("agent_id")
+            or ""
+        ),
+        branch_ref=str(
+            graph_identity.get("branch_ref")
+            or task.get("branch_ref")
+            or branch_view.get("branch_ref")
+            or ""
+        ),
+        base_commit=str(
+            graph_identity.get("base_commit")
+            or task.get("base_commit")
+            or branch_view.get("base_commit")
+            or ""
+        ),
+        target_head_commit=str(
+            graph_identity.get("target_head_commit")
+            or task.get("target_head_commit")
+            or branch_view.get("target_head_commit")
+            or ""
+        ),
+        merge_queue_id=str(
+            graph_identity.get("merge_queue_id")
+            or task.get("merge_queue_id")
+            or branch_view.get("merge_queue_id")
+            or ""
+        ),
         route_identity=route_identity,
         fence_token_hash=str(
             graph_identity.get("fence_token_hash")
@@ -9698,6 +9740,14 @@ def _runtime_context_worker_guide_response(
         "raw_session_token_exposed": False,
         "executable_contract": executable_contract,
         "actionable_payloads": actionable_payloads,
+        "worker_session_lifecycle_policy": actionable_payloads.get(
+            "worker_session_lifecycle_policy",
+            {},
+        ),
+        "write_authorization_policy": actionable_payloads.get(
+            "write_authorization_policy",
+            {},
+        ),
         "read_receipt_facade_payload_skeleton": actionable_payloads.get(
             "read_receipt_facade_payload_skeleton",
             {},
@@ -9744,6 +9794,14 @@ def _runtime_context_worker_guide_response(
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
             "actionable_payloads": actionable_payloads,
+            "worker_session_lifecycle_policy": actionable_payloads.get(
+                "worker_session_lifecycle_policy",
+                {},
+            ),
+            "write_authorization_policy": actionable_payloads.get(
+                "write_authorization_policy",
+                {},
+            ),
             "read_receipt_facade_payload_skeleton": actionable_payloads.get(
                 "read_receipt_facade_payload_skeleton",
                 {},
@@ -10053,6 +10111,11 @@ def _runtime_context_worker_recovery_payloads(
     worker_id: str,
     worker_slot_id: str,
     target_project_root: str,
+    agent_id: str = "",
+    branch_ref: str = "",
+    base_commit: str = "",
+    target_head_commit: str = "",
+    merge_queue_id: str = "",
     route_identity: Mapping[str, Any] | None = None,
     fence_token_hash: str = "",
     session_token_ref: str = "",
@@ -10104,6 +10167,78 @@ def _runtime_context_worker_recovery_payloads(
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/implementation-evidence"
     )
+    rejoin_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/session-token/rejoin"
+    )
+    normalized_agent_id = str(agent_id or worker_slot_id or worker_id or "").strip()
+    normalized_branch_ref = str(branch_ref or "").strip()
+    normalized_base_commit = str(base_commit or "").strip()
+    normalized_target_head_commit = str(target_head_commit or "").strip()
+    normalized_merge_queue_id = str(merge_queue_id or "").strip()
+    worker_session_lifecycle_policy = {
+        "schema_version": "runtime_context.worker_session_lifecycle_policy.v1",
+        "startup_and_implementation_same_live_session_required": True,
+        "completed_startup_only_session_reusable_for_implementation": False,
+        "send_input_to_completed_startup_session_allowed": False,
+        "if_startup_probe_exited": (
+            "spawn a fresh implementation worker, then record fresh read receipt "
+            "and startup evidence for that worker before implementation writes"
+        ),
+        "observer_must_not_backfill_worker_evidence": True,
+    }
+    write_authorization_policy = {
+        "schema_version": "runtime_context.worker_write_authorization_policy.v1",
+        "happy_path_requires_worker_host_envelope": True,
+        "raw_session_token_env": session_token_env,
+        "raw_fence_token_env": fence_token_env,
+        "session_token_ref_alone_authorizes_writes": False,
+        "session_token_ref_read_use": (
+            "copy-safe identity/reference only; use raw worker host envelope "
+            "tokens for protected write facades"
+        ),
+        "before_protected_write": [
+            "verify AMING_WORKER_SESSION_TOKEN and AMING_WORKER_FENCE_TOKEN are present in the live worker environment",
+            "if raw auth is missing before read receipt or startup, request runtime_context session-token initial-join and inject the returned host_envelope into the real mf_sub worker",
+            "if raw auth is missing after read receipt and startup, request runtime_context session-token rejoin and inject the returned host_envelope into the real mf_sub worker",
+        ],
+        "missing_auth_next_legal_action_after_startup": (
+            "request_runtime_context_rejoin_host_envelope"
+        ),
+    }
+    session_token_rejoin_submission = {
+        "schema_version": "runtime_context.session_token_rejoin_submission.v1",
+        "action": "request_runtime_context_rejoin_host_envelope",
+        "method": "POST",
+        "path": rejoin_path,
+        "body_source": "copy_safe_body",
+        "body": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "reason": "<operator reason: live worker lost raw auth env>",
+            "ttl_seconds": 3600,
+        },
+        "copy_safe_body": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "reason": "<operator reason: live worker lost raw auth env>",
+            "ttl_seconds": 3600,
+        },
+        "required_existing_lineage": [
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+        ],
+        "security_boundary": {
+            "session_token_ref_alone_authorizes_writes": False,
+            "raw_tokens_persisted_to_timeline": False,
+            "observer_authors_worker_evidence": False,
+            "delivery": "worker_host_envelope",
+        },
+    }
     canonical_context_receipt_template = {
         "schema_version": "contract_context_read_receipt.v1",
         "event_kind": "contract_context_read_receipt",
@@ -10258,6 +10393,14 @@ def _runtime_context_worker_recovery_payloads(
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
+        "agent_id": normalized_agent_id or "<assigned worker agent_id>",
+        "branch": normalized_branch_ref or "<assigned worker branch>",
+        "branch_ref": normalized_branch_ref or "<assigned worker branch>",
+        "base_commit": normalized_base_commit or "<assigned base commit>",
+        "target_head_commit": (
+            normalized_target_head_commit or "<assigned target HEAD commit>"
+        ),
+        "merge_queue_id": normalized_merge_queue_id or "<assigned merge_queue_id>",
         "observer_command_id": "<claimed execute_backlog_row command id>",
         "target_project_root": target_project_root,
         "session_token": session_token_placeholder,
@@ -10280,6 +10423,8 @@ def _runtime_context_worker_recovery_payloads(
         "read_receipt_event_id": (
             read_receipt_event_ref or "<accepted-read-receipt-event-id>"
         ),
+        "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
+        "write_authorization_policy": dict(write_authorization_policy),
         **safe_route_identity,
     }
     startup_payload = {
@@ -10290,6 +10435,12 @@ def _runtime_context_worker_recovery_payloads(
             "worker_role": "mf_sub",
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
+            "agent_id": normalized_agent_id,
+            "branch": normalized_branch_ref,
+            "branch_ref": normalized_branch_ref,
+            "base_commit": normalized_base_commit,
+            "target_head_commit": normalized_target_head_commit,
+            "merge_queue_id": normalized_merge_queue_id,
             "target_project_root": target_project_root,
             "session_token_env": session_token_env,
             "session_token_ref": session_token_ref_placeholder,
@@ -10313,6 +10464,8 @@ def _runtime_context_worker_recovery_payloads(
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+        "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
+        "write_authorization_policy": dict(write_authorization_policy),
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
         **safe_route_identity,
@@ -10333,6 +10486,8 @@ def _runtime_context_worker_recovery_payloads(
         "changed_files": ["<worker-owned changed file>"],
         "tests": [{"command": "<worker test command>", "status": "passed"}],
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+        "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
+        "write_authorization_policy": dict(write_authorization_policy),
         "payload": implementation_evidence_payload,
         **safe_route_identity,
     }
@@ -10367,6 +10522,12 @@ def _runtime_context_worker_recovery_payloads(
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
+        "agent_id": normalized_agent_id,
+        "branch": normalized_branch_ref,
+        "branch_ref": normalized_branch_ref,
+        "base_commit": normalized_base_commit,
+        "target_head_commit": normalized_target_head_commit,
+        "merge_queue_id": normalized_merge_queue_id,
         "target_project_root": target_project_root,
         "route_identity": present_route_identity,
         "route_token_ref": safe_route_identity.get("route_token_ref", ""),
@@ -10374,6 +10535,8 @@ def _runtime_context_worker_recovery_payloads(
         "session_token_ref_available": bool(context_session_token_ref),
         "fence_token_ref": fence_token_ref,
         "fence_token_hash": fence_token_hash,
+        "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
+        "write_authorization_policy": write_authorization_policy,
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
         "raw_route_token_exposed": False,
@@ -10398,6 +10561,13 @@ def _runtime_context_worker_recovery_payloads(
                 "tool": "runtime_context_session_token_initial_join",
                 "facade": "runtime_context.session_token_initial_join",
                 "body_source": "session_token_initial_join_submission.copy_safe_body",
+            },
+            "runtime_context_session_token_rejoin": {
+                "method": "POST",
+                "path": rejoin_path,
+                "tool": "runtime_context_session_token_rejoin",
+                "facade": "runtime_context.session_token_rejoin",
+                "body_source": "session_token_rejoin_submission.copy_safe_body",
             },
             "runtime_context_implementation_evidence": {
                 "method": "POST",
@@ -10499,7 +10669,11 @@ def _runtime_context_worker_recovery_payloads(
                 "fence_token_env": fence_token_env,
             },
             "body": startup_body,
+            "copy_safe_body": dict(startup_body),
+            "body_source": "copy_safe_body",
             "payload": startup_payload,
+            "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
+            "write_authorization_policy": write_authorization_policy,
         },
         "implementation_evidence_facade_payload_skeleton": {
             "method": "POST",
@@ -10538,6 +10712,8 @@ def _runtime_context_worker_recovery_payloads(
             "copy_safe_body": dict(implementation_evidence_body),
             "retry_payload": dict(implementation_evidence_body),
             "payload": implementation_evidence_payload,
+            "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
+            "write_authorization_policy": write_authorization_policy,
             "route_token_policy": {
                 "prefer_route_token_ref": True,
                 "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
@@ -10559,6 +10735,7 @@ def _runtime_context_worker_recovery_payloads(
                 ),
             },
         },
+        "session_token_rejoin_submission": session_token_rejoin_submission,
     }
 
 
@@ -10986,6 +11163,11 @@ def _runtime_context_worker_recovery_details(
                 or ""
             ),
             target_project_root=expected_target_root,
+            agent_id=str(getattr(context, "agent_id", "") or ""),
+            branch_ref=str(getattr(context, "branch_ref", "") or ""),
+            base_commit=str(getattr(context, "base_commit", "") or ""),
+            target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
+            merge_queue_id=str(getattr(context, "merge_queue_id", "") or ""),
             route_identity=expected_route_identity or supplied_route_identity,
             fence_token_hash=fence_token_hash,
             session_token_ref=runtime_context_session_token_ref(context),

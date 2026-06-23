@@ -306,6 +306,17 @@ The normal worker order is:
 6. Record finish-time worker attestation and the finish gate, then stop at
    `review_ready` or `waiting_merge`.
 
+Startup and implementation belong to the same live worker session for the
+happy path. If a startup-only probe exits, do not reuse that completed
+transcript with `send_input` as the implementation worker. Spawn a fresh
+implementation worker and record fresh read receipt plus startup evidence for
+that worker before file writes. Before any protected worker write, the worker
+must have the raw host envelope env values `AMING_WORKER_SESSION_TOKEN` and
+`AMING_WORKER_FENCE_TOKEN`; `session_token_ref` alone is copy-safe identity,
+not write authorization. If those env values are missing after read receipt
+and startup, use the runtime-context `session-token/rejoin` facade and inject
+the returned host envelope into the real `mf_sub` worker.
+
 For the `daily-planner-lite` one-prompt demo, the intended fixture path is two
 parallel backlog rows moving from open through normal close gate with no manual
 route/startup/identity repair. If a worker guide says route context, read

@@ -16501,6 +16501,50 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     )
     worker_guide = guide["worker_guide"]
     assert worker_guide["session_token_ref"] == session_ref
+    lifecycle_policy = worker_guide["worker_session_lifecycle_policy"]
+    assert lifecycle_policy[
+        "startup_and_implementation_same_live_session_required"
+    ] is True
+    assert lifecycle_policy[
+        "completed_startup_only_session_reusable_for_implementation"
+    ] is False
+    assert lifecycle_policy["send_input_to_completed_startup_session_allowed"] is False
+    write_policy = worker_guide["write_authorization_policy"]
+    assert write_policy["happy_path_requires_worker_host_envelope"] is True
+    assert write_policy["session_token_ref_alone_authorizes_writes"] is False
+    assert write_policy["missing_auth_next_legal_action_after_startup"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    rejoin_submission = worker_guide["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]
+    assert rejoin_submission["copy_safe_body"]["runtime_context_id"] == (
+        context.runtime_context_id
+    )
+    assert rejoin_submission["security_boundary"][
+        "session_token_ref_alone_authorizes_writes"
+    ] is False
+    startup_skeleton = worker_guide["startup_facade_payload_skeleton"]
+    assert startup_skeleton["body_source"] == "copy_safe_body"
+    startup_copy = startup_skeleton["copy_safe_body"]
+    assert startup_copy["agent_id"] == "agent-session-ref"
+    assert startup_copy["branch"] == "refs/heads/codex/worker-session-ref"
+    assert startup_copy["branch_ref"] == "refs/heads/codex/worker-session-ref"
+    assert startup_copy["base_commit"] == "base-session-ref"
+    assert startup_copy["target_head_commit"] == "target-session-ref"
+    assert startup_copy["merge_queue_id"] == "mq-session-ref"
+    assert startup_copy["worker_session_lifecycle_policy"][
+        "completed_startup_only_session_reusable_for_implementation"
+    ] is False
+    assert startup_copy["write_authorization_policy"][
+        "session_token_ref_alone_authorizes_writes"
+    ] is False
+    implementation_skeleton = worker_guide[
+        "implementation_evidence_facade_payload_skeleton"
+    ]
+    assert implementation_skeleton["write_authorization_policy"][
+        "missing_auth_next_legal_action_after_startup"
+    ] == "request_runtime_context_rejoin_host_envelope"
     receipt_body = dict(
         worker_guide["read_receipt_facade_payload_skeleton"]["copy_safe_body"]
     )
