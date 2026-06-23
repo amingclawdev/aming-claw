@@ -431,6 +431,16 @@ def test_no_contract_hotfix_entry_prompts_hotfix_under_action():
     assert action["action"] == "record_hotfix_under_action"
     assert action["timeline_append_hint"]["event_kind"] == "hotfix_under_action"
     assert action["timeline_append_hint"]["payload"]["pre_reason_event_id"] == "41"
+    implementation_close_evidence = action["timeline_append_hint"]["payload"][
+        "implementation_close_evidence"
+    ]
+    assert implementation_close_evidence["counts_as_implementation"] is True
+    assert implementation_close_evidence["changed_files"] == []
+    assert implementation_close_evidence["verification_evidence_refs"] == []
+    assert implementation_close_evidence["qa_lineage"]["required"] is True
+    assert implementation_close_evidence["qa_lineage"]["required_gate"] == (
+        "independent_qa_gate"
+    )
 
 
 def test_root_terminal_contract_with_close_ready_prompts_backlog_close_route_token():

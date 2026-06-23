@@ -1462,6 +1462,18 @@ def _default_timeline_append_hint_for_action(
                 "what_changed": "<summary of the tiny deterministic mutation>",
                 "changed_files": [],
                 "verification_evidence_refs": [],
+                "implementation_close_evidence": {
+                    "counts_as_implementation": True,
+                    "changed_files": [],
+                    "verification_evidence_refs": [],
+                    "qa_lineage": {
+                        "required": True,
+                        "required_gate": "independent_qa_gate",
+                        "successor_contract_execution_id": (
+                            "<qa successor contract_execution_id>"
+                        ),
+                    },
+                },
                 "deviations_from_plan": [],
                 "remaining_close_gate_evidence": [
                     "independent_verification",

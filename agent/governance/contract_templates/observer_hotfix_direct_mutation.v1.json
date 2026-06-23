@@ -73,12 +73,13 @@
         "what_changed",
         "changed_files",
         "verification_evidence_refs",
+        "implementation_close_evidence",
         "deviations_from_plan",
         "remaining_close_gate_evidence"
       ],
       "required_payload_schema_version": "observer_hotfix_action_summary.v1",
       "close_satisfying": false,
-      "description": "Append after the tiny mutation and before close. Records what actually changed and links back to the pre-mutation reason. It is audit evidence, not worker-owned implementation evidence."
+      "description": "Append after the tiny mutation and before close. Records what actually changed, links back to the pre-mutation reason, and includes implementation_close_evidence so the generic close gate can count the hotfix action as implementation without fabricated worker evidence. It is audit evidence, not worker-owned implementation evidence."
     },
     "close_gate_evidence_still_required": [
       "implementation",
@@ -274,7 +275,7 @@
       "accepted_event_kinds": [
         "hotfix_under_action"
       ],
-      "description": "Post-mutation timeline summary records what changed and points to verification evidence refs."
+      "description": "Post-mutation timeline summary records what changed, points to verification evidence refs, and carries implementation_close_evidence for contract-aware close-gate projection."
     },
     {
       "id": "focused_verification",

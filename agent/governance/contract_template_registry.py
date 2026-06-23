@@ -18,6 +18,13 @@ from agent.governance.service_registry import (
 DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent / "contract_templates"
 FORBIDDEN_ROUTE_KEYS = {"ai_provider", "model", "prompt", "llm", "ai_call"}
 NON_TEMPLATE_CONTRACT_FILES = {"meta_contract.v1.json"}
+CONTRACT_TEMPLATE_ALIASES = {
+    "hotfix.v1": "observer_hotfix_direct_mutation.v1",
+    "observer_hotfix.v1": "observer_hotfix_direct_mutation.v1",
+}
+CONTRACT_TASK_TYPE_ALIASES = {
+    "hotfix": "observer_hotfix",
+}
 
 
 class ContractTemplateError(ValueError):
@@ -376,6 +383,7 @@ def list_contract_templates(
     """List templates, optionally filtered by task type and stage."""
 
     templates = load_contract_templates(template_dir)
+    task_type = _canonical_task_type(task_type)
     return [
         template
         for template in templates
@@ -390,8 +398,9 @@ def get_contract_template(
 ) -> dict[str, Any]:
     """Return a template by exact versioned template id."""
 
+    canonical_template_id = _canonical_template_id(template_id)
     for template in load_contract_templates(template_dir):
-        if template["template_id"] == template_id:
+        if template["template_id"] == canonical_template_id:
             return template
     raise UnknownContractTemplateError(f"unknown contract template: {template_id}")
 
@@ -408,14 +417,11 @@ def resolve_contract_template(
 
     templates = list_contract_templates(template_dir=template_dir, task_type=task_type, stage=stage)
     if template_id:
+        requested_ids = _template_id_candidates(template_id, version)
         templates = [
             template
             for template in templates
-            if template["template_id"] == template_id
-            or (
-                version
-                and str(template["template_id"]) == f"{template_id}.{version}"
-            )
+            if str(template["template_id"]) in requested_ids
         ]
     if version:
         templates = [template for template in templates if template.get("version") == version]
@@ -437,6 +443,28 @@ def resolve_contract_template(
             + ", ".join(str(template["template_id"]) for template in templates)
         )
     return templates[0]
+
+
+def _canonical_template_id(template_id: str) -> str:
+    return CONTRACT_TEMPLATE_ALIASES.get(template_id, template_id)
+
+
+def _template_id_candidates(template_id: str, version: str | None) -> set[str]:
+    requested = [template_id]
+    if version:
+        requested.append(f"{template_id}.{version}")
+
+    candidates: set[str] = set()
+    for item in requested:
+        candidates.add(item)
+        candidates.add(_canonical_template_id(item))
+    return candidates
+
+
+def _canonical_task_type(task_type: str | None) -> str | None:
+    if task_type is None:
+        return None
+    return CONTRACT_TASK_TYPE_ALIASES.get(task_type, task_type)
 
 
 def _matches(template: Mapping[str, Any], *, task_type: str | None, stage: str | None) -> bool:

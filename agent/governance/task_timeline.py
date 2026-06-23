@@ -357,6 +357,11 @@ MF_ROUTE_SOURCE_PASS_STATUSES = {
     "success",
 }
 OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID = "observer_hotfix_direct_mutation.v1"
+OBSERVER_HOTFIX_ACTION_SUMMARY_SCHEMA_VERSIONS = {
+    "",
+    "observer_hotfix_action_summary.v1",
+    "observer_hotfix_post_action_summary.v1",
+}
 
 _SUCCESSOR_CONTRACT_CONTAINER_KEYS = (
     "successor_contract",
@@ -3024,7 +3029,7 @@ def _hotfix_contract_events(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if payload_schema in {"", "observer_hotfix_pre_reason.v1"}:
                 pre_events.append(event_ref)
         elif marker == "hotfix_under_action":
-            if payload_schema in {"", "observer_hotfix_action_summary.v1"}:
+            if payload_schema in OBSERVER_HOTFIX_ACTION_SUMMARY_SCHEMA_VERSIONS:
                 post_events.append(event_ref)
     return {
         "pre_events": pre_events,

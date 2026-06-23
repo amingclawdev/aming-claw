@@ -192,6 +192,7 @@ def test_observer_hotfix_direct_mutation_template_declares_pre_and_post_timeline
     assert post_event["close_satisfying"] is False
     assert "pre_reason_event_id" in post_event["required_payload_fields"]
     assert "what_changed" in post_event["required_payload_fields"]
+    assert "implementation_close_evidence" in post_event["required_payload_fields"]
     assert timeline_contract["close_gate_evidence_still_required"] == [
         "implementation",
         "verification",
@@ -253,6 +254,31 @@ def test_versioned_resolution_accepts_base_id_plus_version():
     template = resolve_contract_template(template_id="ue_audit", version="v1")
 
     assert template["template_id"] == "ue_audit.v1"
+
+
+def test_hotfix_template_aliases_resolve_to_observer_direct_mutation_template():
+    for template_id in (
+        "hotfix.v1",
+        "observer_hotfix.v1",
+        "observer_hotfix_direct_mutation.v1",
+    ):
+        template = resolve_contract_template(
+            template_id=template_id,
+            task_type="observer_hotfix",
+        )
+
+        assert template["template_id"] == "observer_hotfix_direct_mutation.v1"
+
+    template = resolve_contract_template(
+        template_id="hotfix",
+        task_type="hotfix",
+        version="v1",
+    )
+
+    assert template["template_id"] == "observer_hotfix_direct_mutation.v1"
+    assert get_contract_template("observer_hotfix.v1")["template_id"] == (
+        "observer_hotfix_direct_mutation.v1"
+    )
 
 
 def test_resolution_by_task_type_and_stage():
@@ -541,10 +567,15 @@ def test_mcp_contract_template_tools_resolve_in_process():
         "contract_template_resolve",
         {"template_id": "ue_audit", "version": "v1"},
     )
+    hotfix_alias = dispatcher.dispatch(
+        "contract_template_resolve",
+        {"template_id": "hotfix.v1", "task_type": "hotfix"},
+    )
     missing = dispatcher.dispatch("contract_template_get", {"template_id": "missing.v1"})
 
     assert listed["ok"] is True
     assert [template["template_id"] for template in listed["templates"]] == ["ue_audit.v1"]
     assert fetched["template"]["template_id"] == "ue_audit.v1"
     assert resolved["template"]["template_id"] == "ue_audit.v1"
+    assert hotfix_alias["template"]["template_id"] == "observer_hotfix_direct_mutation.v1"
     assert missing["ok"] is False

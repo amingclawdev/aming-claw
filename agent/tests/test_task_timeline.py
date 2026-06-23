@@ -401,6 +401,18 @@ def _observer_hotfix_contract_events_with_implementation_projection():
     return events
 
 
+def _observer_hotfix_contract_events_with_current_post_schema_projection():
+    events = _observer_hotfix_contract_events_with_implementation_projection()
+    events[1] = {
+        **events[1],
+        "payload": {
+            **events[1]["payload"],
+            "schema_version": "observer_hotfix_post_action_summary.v1",
+        },
+    }
+    return events
+
+
 def _observer_hotfix_contract_events_with_generic_implementation_alias():
     events = _observer_hotfix_contract_events()
     events[1] = {
@@ -8245,6 +8257,24 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertTrue(ready["passed"], ready)
         self.assertNotIn("implementation", ready["missing_event_kinds"])
         self.assertTrue(ready["independent_qa_gate"]["passed"], ready)
+
+    def test_observer_hotfix_under_action_current_post_schema_can_implement(self):
+        from agent.governance import task_timeline
+
+        contract = {"template_id": "observer_hotfix_direct_mutation.v1"}
+        events = [
+            {"event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            *_observer_hotfix_contract_events_with_current_post_schema_projection(),
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertNotIn("implementation", ready["missing_event_kinds"])
+        self.assertEqual(ready["ignored_required_events"], [])
 
     def test_observer_hotfix_successor_policy_overrides_onboard_root_template(self):
         from agent.governance import task_timeline
