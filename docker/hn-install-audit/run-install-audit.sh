@@ -32,6 +32,8 @@ Options:
   --repo-url URL                Repo URL visible inside container. Default: file:///plugin-source.
   --ref REF                     Optional git ref after clone.
   --ai-prompt-mode MODE         required|optional|skip. Default: required.
+  --auth-mode MODE              AUTH_REUSED_FROM_HOST|CONTAINER_PERSISTED_LOGIN.
+                               Default: AUTH_REUSED_FROM_HOST.
   --codex-auth-home DIR         Read Codex auth from DIR instead of $HOME.
   --claude-auth-home DIR        Read Claude auth from DIR instead of $HOME.
   --changed-files LIST          Newline or comma separated changed files for lane impact planning.
@@ -56,6 +58,9 @@ Mode B auth reuse:
   Claude lane mounts <auth-home>/.claude and <auth-home>/.claude.json read-only
   when they exist.
   Token files are never baked into images; reports label AUTH_REUSED_FROM_HOST.
+  For Claude debug lanes where auth cannot be mounted, use
+  --auth-mode CONTAINER_PERSISTED_LOGIN with --keep-container and a stable
+  --container-name, then log in inside that kept container.
 USAGE
 }
 
@@ -68,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --repo-url) PLUGIN_REPO_URL="$2"; shift 2 ;;
     --ref) PLUGIN_REF="$2"; shift 2 ;;
     --ai-prompt-mode) AI_PROMPT_MODE="$2"; shift 2 ;;
+    --auth-mode) AUTH_MODE="$2"; shift 2 ;;
     --codex-auth-home) CODEX_AUTH_HOME="$2"; shift 2 ;;
     --claude-auth-home) CLAUDE_AUTH_HOME="$2"; shift 2 ;;
     --changed-files) DOCKER_AI_E2E_CHANGED_FILES="$2"; shift 2 ;;
@@ -91,6 +97,11 @@ esac
 case "$DOCKER_AUDIT_SOURCE_MODE" in
   git|mounted-worktree) ;;
   *) echo "--source-mode must be git or mounted-worktree" >&2; exit 2 ;;
+esac
+
+case "$AUTH_MODE" in
+  AUTH_REUSED_FROM_HOST|CONTAINER_PERSISTED_LOGIN) ;;
+  *) echo "--auth-mode must be AUTH_REUSED_FROM_HOST or CONTAINER_PERSISTED_LOGIN" >&2; exit 2 ;;
 esac
 
 if [[ -z "$OUT_DIR" ]]; then
@@ -133,6 +144,10 @@ build_image() {
 auth_mounts() {
   local host="$1"
   local mounts=()
+  if [[ "$AUTH_MODE" == "CONTAINER_PERSISTED_LOGIN" ]]; then
+    printf '%s\n' "${mounts[@]}"
+    return
+  fi
   if [[ "$host" == "codex" ]]; then
     local auth_home="${CODEX_AUTH_HOME:-$HOME}"
     if [[ -d "$auth_home/.codex" ]]; then

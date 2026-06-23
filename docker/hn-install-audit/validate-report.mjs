@@ -69,6 +69,11 @@ const TOKEN_PATTERNS = [
   /"refresh_token"\s*:\s*"[^"]+"/i,
 ];
 
+const ALLOWED_AUTH_MODES = [
+  "AUTH_REUSED_FROM_HOST",
+  "CONTAINER_PERSISTED_LOGIN",
+];
+
 function usage() {
   console.error("Usage: node docker/hn-install-audit/validate-report.mjs [--require-live-observer-route] <report.json>|--self-test");
   process.exit(2);
@@ -162,8 +167,16 @@ function validate(report) {
   if (!["PASS", "FAIL", "SKIPPED", "LOGIN_REQUIRED"].includes(String(report.status || ""))) {
     errors.push("status must be PASS, FAIL, SKIPPED, or LOGIN_REQUIRED");
   }
-  if (report.auth_mode !== "AUTH_REUSED_FROM_HOST") {
-    errors.push("first Docker implementation must label auth_mode as AUTH_REUSED_FROM_HOST");
+  if (!ALLOWED_AUTH_MODES.includes(String(report.auth_mode || ""))) {
+    errors.push(`auth_mode must be one of: ${ALLOWED_AUTH_MODES.join(", ")}`);
+  }
+  if (report.auth_mode === "CONTAINER_PERSISTED_LOGIN") {
+    if (report.host !== "claude") {
+      errors.push("CONTAINER_PERSISTED_LOGIN auth_mode is only valid for Claude lanes");
+    }
+    if (!String(report.docker_debug?.container_name || "").trim()) {
+      errors.push("CONTAINER_PERSISTED_LOGIN requires docker_debug.container_name");
+    }
   }
   errors.push(...validateStateManagerReport(report.state_manager));
 

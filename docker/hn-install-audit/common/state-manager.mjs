@@ -487,6 +487,7 @@ export function buildInstallAuditStateManagerReport({
   status,
   authMode = "AUTH_REUSED_FROM_HOST",
   authCopied = [],
+  authEvidenceLabels = [],
   repoUrl = "",
   repoRef = "",
   workRoot = "",
@@ -532,7 +533,9 @@ export function buildInstallAuditStateManagerReport({
       "external-project": [],
     },
   });
-  const authEvidence = asArray(authCopied).map((item) => `[redacted:${item}]`);
+  const authEvidence = asArray(authEvidenceLabels).length
+    ? asArray(authEvidenceLabels).map(String)
+    : asArray(authCopied).map((item) => `[redacted:${item}]`);
   const observerFeature = {
     id: "observer_command_pending",
     extension_point_only: !featureSmokeResults.length,

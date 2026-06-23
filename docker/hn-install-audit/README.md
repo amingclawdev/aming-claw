@@ -61,7 +61,16 @@ home, keep the named Claude container as the auth store. Do not run
 `--replace-container`, `docker rm`, Docker prune, or an unnamed `--rm` lane
 after login unless you intentionally want to discard that Claude auth state.
 Reuse the same container name for the prompt rerun and keep logs/report files as
-evidence.
+evidence. Mark this lane explicitly:
+
+```bash
+docker/hn-install-audit/run-install-audit.sh \
+  --host claude \
+  --run-id claude-container-auth \
+  --auth-mode CONTAINER_PERSISTED_LOGIN \
+  --keep-container \
+  --container-name aming-claw-claude-container-auth
+```
 
 Kept containers are a debugging shortcut only. Final public proof should run
 from the pushed git ref in a fresh container, without `--keep-container` or
@@ -226,4 +235,6 @@ Interactive OAuth/device-code login is intentionally kept outside the automated
 run. Log in once into a dedicated auth home, then pass that directory with
 `--claude-auth-home` for repeatable release checks. If that auth cannot be
 mounted on the host, use a named kept Claude container and treat the container
-home as debug-only auth state until the validation is complete.
+home as debug-only auth state until the validation is complete; set
+`--auth-mode CONTAINER_PERSISTED_LOGIN` so the report and validator do not
+expect mounted host auth files.

@@ -23,6 +23,7 @@ const HOME = process.env.HOME || "/home/audit";
 const OUT_DIR = process.env.AUDIT_OUTPUT_DIR || "/audit-output";
 const RUN_ID = process.env.RUN_ID || new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 const AUTH_MODE = process.env.AUTH_MODE || "AUTH_REUSED_FROM_HOST";
+const AUTH_MODE_CONTAINER_PERSISTED = "CONTAINER_PERSISTED_LOGIN";
 const REPO_URL = process.env.PLUGIN_REPO_URL || "https://github.com/amingclawdev/aming-claw";
 const REPO_REF = process.env.PLUGIN_REF || "";
 const WORK_ROOT = process.env.AUDIT_WORK_ROOT || "/workspace/install-audit";
@@ -208,6 +209,7 @@ function copyIfExists(source, target) {
 
 function copyHostAuth() {
   const copied = [];
+  if (AUTH_MODE === AUTH_MODE_CONTAINER_PERSISTED) return copied;
   if (HOST === "codex") {
     const sourceRoot = "/host-auth/codex";
     for (const rel of ["auth.json", "credentials.json"]) {
@@ -224,6 +226,25 @@ function copyHostAuth() {
     copied.push(".claude.json");
   }
   return copied;
+}
+
+function containerPersistedAuthEvidence() {
+  if (AUTH_MODE !== AUTH_MODE_CONTAINER_PERSISTED) return [];
+  if (HOST !== "claude") return [];
+  const candidates = [
+    [join(CLAUDE_HOME, ".credentials.json"), ".claude/.credentials.json"],
+    [join(CLAUDE_HOME, "credentials.json"), ".claude/credentials.json"],
+    [join(CLAUDE_HOME, "auth.json"), ".claude/auth.json"],
+    [join(HOME, ".claude.json"), ".claude.json"],
+  ];
+  return candidates
+    .filter(([path]) => existsSync(path))
+    .map(([, label]) => `[redacted:container:${label}]`);
+}
+
+function authEvidenceLabels(authCopied) {
+  const copied = (authCopied || []).map((item) => `[redacted:${item}]`);
+  return copied.length ? copied : containerPersistedAuthEvidence();
 }
 
 function gitCloneSource() {
@@ -1300,8 +1321,16 @@ function buildReport({
 }) {
   const sourceCommit = clone.ok ? String(clone.source_commit || gitHead(SRC_ROOT) || "").trim() : "";
   const blockers = [];
+  const authEvidence = authEvidenceLabels(authCopied);
+  const authReady = authEvidence.length > 0;
   if (!version.ok) blockers.push(`${HOST} CLI version check failed`);
-  if (!authCopied.length) blockers.push("host auth files were not found in mounted auth volume");
+  if (!authReady) {
+    blockers.push(
+      AUTH_MODE === AUTH_MODE_CONTAINER_PERSISTED
+        ? "container-persisted Claude auth files were not found in the kept container home"
+        : "host auth files were not found in mounted auth volume",
+    );
+  }
   if (!clone.ok) blockers.push("plugin source clone failed");
   if (!runtimeInstall.ok) blockers.push("pip editable install failed");
   if (!hostInstall.ok) blockers.push(`${HOST} plugin install failed`);
@@ -1339,7 +1368,11 @@ function buildReport({
   const skipReason = aiSkipped
     ? "AI_PROMPT_MODE=skip; deterministic install checks ran, but the one-click AI install and HN demo prompts were not executed."
     : loginRequired
-      ? "Claude CLI is installed but not authenticated in the mounted auth home. Run `claude /login` or `claude auth login` with the same auth home, then rerun with --claude-auth-home <dir>."
+      ? (
+        AUTH_MODE === AUTH_MODE_CONTAINER_PERSISTED
+          ? "Claude CLI is installed but not authenticated in the kept container home. Run Claude login inside the same named container, then rerun with --auth-mode CONTAINER_PERSISTED_LOGIN and --reuse-container."
+          : "Claude CLI is installed but not authenticated in the mounted auth home. Run `claude /login` or `claude auth login` with the same auth home, then rerun with --claude-auth-home <dir>."
+      )
       : "";
   const installedPluginRoot = HOST === "codex" ? installedCodexPluginRoot() : claudeCacheRoot();
   const installedPluginCommit = hostInstall.ok ? String(gitHead(installedPluginRoot) || "").trim() : "";
@@ -1353,6 +1386,7 @@ function buildReport({
     status,
     authMode: AUTH_MODE,
     authCopied,
+    authEvidenceLabels: authEvidence,
     repoUrl: REPO_URL,
     repoRef: REPO_REF,
     workRoot: WORK_ROOT,
@@ -1416,8 +1450,12 @@ function buildReport({
     },
     everyday_demo_results: everydayDemos || [],
     limitations: [
-      "Mode B reuses host auth; this is not a fresh OAuth login.",
-      "The container is fresh for plugin/cache state, but authentication comes from read-only host files.",
+      AUTH_MODE === AUTH_MODE_CONTAINER_PERSISTED
+        ? "Claude auth is persisted inside the named kept container; this is a debug/auth-preserving lane, not fresh-container release proof."
+        : "Mode B reuses host auth; this is not a fresh OAuth login.",
+      AUTH_MODE === AUTH_MODE_CONTAINER_PERSISTED
+        ? "Do not delete or replace the named container before validation is complete, or the Claude auth state will be lost."
+        : "The container is fresh for plugin/cache state, but authentication comes from read-only host files.",
     ],
     self_rating: selfRating(status, blockers),
     why_rating: loginRequired
@@ -1430,6 +1468,7 @@ function buildReport({
     evidence_refs: {
       report_path: REPORT_PATH,
       ai_self_report_path: AI_SELF_REPORT_PATH,
+      auth_evidence: authEvidence,
       auth_files_copied: authCopied.map((item) => `[redacted:${item}]`),
       clone,
       runtimeInstall,
