@@ -17,7 +17,9 @@ from agent.governance.asset_inbox_contract import (
     build_asset_inbox_response,
     validate_asset_inbox_payload,
 )
+from agent.governance.asset_binding_proposals import precheck_asset_binding_proposal
 from agent.governance.asset_projection import upsert_doc_asset_projection, upsert_graph_asset_projection
+from agent.governance.contracts import ContractCrudService
 from agent.governance.db import _ensure_schema
 from agent.governance.reconcile_semantic_enrichment import _ensure_semantic_state_schema
 
@@ -122,6 +124,46 @@ def test_candidates_are_reviewable_but_not_trusted_bindings() -> None:
                 "review_required": True,
             }
         ]
+
+
+def test_contract_add_asset_binding_line_requires_proposal_review_or_waiver() -> None:
+    definition = ContractCrudService().read("contract_add.v1")["data"]["definition"]
+    asset_line = next(
+        line
+        for line in definition["read_model"]["rule_lines"]
+        if line["line_id"] == "worker_asset_binding_proposal_or_waiver"
+    )
+
+    assert asset_line["owner_role"] == "mf_sub"
+    assert asset_line["evidence_kind"] == "asset_binding_proposal_or_waiver"
+    assert "proposal/review/materialize" in asset_line["description"]
+    assert "waiver" in asset_line["description"]
+    assert "direct trusted graph DB" in definition["instruction_layer"]["inline"][-1]
+
+    weak_doc_materialize = precheck_asset_binding_proposal(
+        {
+            "schema_version": "asset_binding_proposal.v1",
+            "operation": "materialize_binding",
+            "asset_kind": "doc",
+            "path": "agent/governance/contract_definitions/contract_add.v1.rev1.json",
+            "target_node_id": "L7.53",
+            "target_title": "agent.governance.contracts.runtime",
+            "evidence_kind": "path_reference",
+            "source": "mf_subagent",
+        },
+        mode="server_gate",
+    )
+    assert weak_doc_materialize["ok"] is False
+    assert "weak_evidence_cannot_materialize" in weak_doc_materialize["errors"]
+    assert "doc_materialization_requires_review_or_hint" in weak_doc_materialize["errors"]
+
+    waiver_evidence = {
+        "schema_version": "asset_binding_waiver.v1",
+        "reason": "contract definition source files are not graph-mapped in the current snapshot",
+        "follow_up_required": True,
+        "direct_trusted_graph_db_write": False,
+    }
+    assert waiver_evidence["direct_trusted_graph_db_write"] is False
 
 
 def test_accepted_bindings_only_enter_impact_scope() -> None:

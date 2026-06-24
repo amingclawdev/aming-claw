@@ -519,6 +519,53 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "contract_add_start",
+        "description": "Start or enter the thin source-backed contract_add guided runtime facade.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["project_id", "backlog_id"],
+        },
+    },
+    {
+        "name": "contract_add_current",
+        "description": "Read contract_add runtime guide/current-state without exposing generic CRUD.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
+        "name": "contract_add_submit_line",
+        "description": "Submit one role-bound contract_add evidence line via ContractRuntime.submit_line_write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "stage_id": {"type": "string"},
+                "line_id": {"type": "string"},
+                "evidence_kind": {"type": "string"},
+                "payload": {"type": "object"},
+                "artifact_refs": {"type": "object"},
+                "trace_id": {"type": "string"},
+                "commit_sha": {"type": "string"},
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
         "name": "runtime_context_current",
         "description": "Read the Runtime Context Service current-state projection. mf_sub callers receive only the role-filtered worker view.",
         "inputSchema": {
@@ -908,6 +955,34 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             if key != "project_id" and value is not None
         }
         return _http("POST", f"/api/projects/{pid}/hotfix/enter", body)
+
+    if name == "contract_add_start":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        return _http("POST", f"/api/projects/{pid}/contract-add/start", body)
+
+    if name == "contract_add_current":
+        pid = args["project_id"]
+        execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        return _http("GET", f"/api/projects/{pid}/contract-add/{execution_id}/current-state")
+
+    if name == "contract_add_submit_line":
+        pid = args["project_id"]
+        execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        body = {
+            key: value
+            for key, value in args.items()
+            if key not in {"project_id", "contract_execution_id"} and value is not None
+        }
+        return _http(
+            "POST",
+            f"/api/projects/{pid}/contract-add/{execution_id}/line-writes",
+            body,
+        )
 
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
         pid = args["project_id"]

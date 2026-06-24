@@ -1,0 +1,181 @@
+{
+  "compat_aliases": [
+    "contract_add.v1",
+    "add_contract.v1"
+  ],
+  "contract_id": "contract_add",
+  "contract_type": "contract_add",
+  "instruction_layer": {
+    "inline": [
+      "The compiled ContractRuntime guide is authoritative for contract_add next legal action ordering.",
+      "Only the thin contract_add start/read/submit-line facade is agent-facing; generic CRUD remains internal.",
+      "Observer owns request, approval/adoption, and close-ready lines only.",
+      "mf_sub owns draft precheck, source write or read-only adoption proof, runtime visibility proof, and asset-binding proposal or waiver evidence.",
+      "QA owns independent verification and must not be authored by observer or mf_sub.",
+      "Asset binding evidence must be proposal/review/materialize or an explicit follow-up/waiver; direct trusted graph DB writes are not contract_add evidence."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "backlog_id": "AC-CONTRACT-ADD-PARALLEL-DOGFOOD-20260624",
+    "dogfood_contract": "mf_parallel.v1",
+    "dogfood_mode": "adopt_existing_read_only",
+    "runtime_dogfood": true
+  },
+  "revision": "rev1",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer requests a source-backed contract addition and binds route, backlog, scope, target source path, and role plan.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer-authored request with backlog id, route identity, source path, target roles, owned files, and acceptance criteria.",
+            "evidence_kind": "contract_add_request",
+            "line_id": "observer_request_contract_add",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "observer_request"
+      },
+      {
+        "description": "The bounded worker validates draft contract shape before source write or read-only adoption.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored precheck showing schema validation, role-bound lines, lifecycle decision, and duplicate/revision expectation.",
+            "evidence_kind": "contract_draft_precheck",
+            "line_id": "worker_draft_precheck",
+            "owner_role": "mf_sub",
+            "requires": [
+              "observer_request_contract_add"
+            ]
+          }
+        ],
+        "stage_id": "worker_precheck"
+      },
+      {
+        "description": "The worker either writes a new source-backed contract or proves read-only adoption of an existing source definition.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored source write proof or read-only adoption proof with alias, source path, raw sha256, definition_hash, file count, and duplicate-create rejection.",
+            "evidence_kind": "contract_source_or_adoption_proof",
+            "line_id": "worker_source_or_adoption_proof",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_draft_precheck"
+            ]
+          }
+        ],
+        "stage_id": "worker_source"
+      },
+      {
+        "description": "The worker proves the contract is visible through the runtime guide/current-state path.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored ContractRuntime visibility proof for start/read/current-state/next action ordering using submit_line_write.",
+            "evidence_kind": "contract_runtime_visibility",
+            "line_id": "worker_runtime_visibility_proof",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_source_or_adoption_proof"
+            ]
+          }
+        ],
+        "stage_id": "worker_runtime_visibility"
+      },
+      {
+        "description": "The worker records how source assets are bound or explicitly waived without direct graph DB writes.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored asset-binding proposal/review/materialize evidence, follow-up backlog evidence, or explicit waiver for unbound source assets.",
+            "evidence_kind": "asset_binding_proposal_or_waiver",
+            "line_id": "worker_asset_binding_proposal_or_waiver",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_runtime_visibility_proof"
+            ]
+          }
+        ],
+        "stage_id": "worker_asset_binding"
+      },
+      {
+        "description": "Independent QA verifies the source definition, runtime path, role gates, duplicate rejection, and asset-binding evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "QA-authored independent verification; observer and mf_sub writes are rejected for this line.",
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "requires": [
+              "worker_asset_binding_proposal_or_waiver"
+            ]
+          }
+        ],
+        "stage_id": "qa"
+      },
+      {
+        "description": "Observer accepts the verified contract addition and records close-ready handoff evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer acceptance after QA verification, including merge/reconcile/backlog close policy and any waivers or follow-ups.",
+            "evidence_kind": "contract_add_accept",
+            "line_id": "observer_accept_contract_add",
+            "owner_role": "observer",
+            "requires": [
+              "qa_independent_verification"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer close-ready evidence for the contract_add execution after acceptance.",
+            "evidence_kind": "close_ready",
+            "line_id": "observer_close_ready",
+            "owner_role": "observer",
+            "requires": [
+              "observer_accept_contract_add"
+            ]
+          }
+        ],
+        "stage_id": "observer_accept"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "successors": [
+    {
+      "contract_id": "qa_evidence_gate_review.v1",
+      "reason": "Run stricter QA evidence review if contract_add verification finds ambiguous evidence.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "observer_hotfix",
+      "reason": "Use a bounded observer hotfix only for tiny runtime/facade repairs found while executing contract_add.",
+      "version": "v1"
+    }
+  ],
+  "version": "v1"
+}

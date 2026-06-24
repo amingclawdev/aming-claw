@@ -202,6 +202,7 @@ def test_runtime_guide_and_write_gate_reject_wrong_role_or_stale_hash(tmp_path):
         "runtime_guide_hash": guide["runtime_guide_hash"],
         "stage_id": "pre_mutation",
         "line_id": "reason",
+        "evidence_kind": "contract_state_changed",
         "actor_role": "observer",
     }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -560,6 +561,194 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
         record = accepted["record"]
 
     assert record["runtime_guide"]["next_legal_action"] is None
+
+
+def test_default_registry_exposes_contract_add_definition_and_runtime_path():
+    service = ContractCrudService()
+
+    result = service.read("contract_add.v1")
+    assert result["ok"] is True
+    definition = result["data"]["definition"]
+    assert definition["contract_id"] == "contract_add"
+    assert definition["role"] == "observer"
+    assert definition["contract_type"] == "contract_add"
+    assert definition["compat_aliases"] == ["contract_add.v1", "add_contract.v1"]
+
+    read_model = definition["read_model"]
+    assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
+    assert [
+        (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
+        for line in read_model["rule_lines"]
+    ] == [
+        (
+            "observer_request",
+            "observer_request_contract_add",
+            "observer",
+            "contract_add_request",
+        ),
+        (
+            "worker_precheck",
+            "worker_draft_precheck",
+            "mf_sub",
+            "contract_draft_precheck",
+        ),
+        (
+            "worker_source",
+            "worker_source_or_adoption_proof",
+            "mf_sub",
+            "contract_source_or_adoption_proof",
+        ),
+        (
+            "worker_runtime_visibility",
+            "worker_runtime_visibility_proof",
+            "mf_sub",
+            "contract_runtime_visibility",
+        ),
+        (
+            "worker_asset_binding",
+            "worker_asset_binding_proposal_or_waiver",
+            "mf_sub",
+            "asset_binding_proposal_or_waiver",
+        ),
+        ("qa", "qa_independent_verification", "qa", "independent_verification"),
+        (
+            "observer_accept",
+            "observer_accept_contract_add",
+            "observer",
+            "contract_add_accept",
+        ),
+        ("observer_accept", "observer_close_ready", "observer", "close_ready"),
+    ]
+    assert "generic CRUD remains internal" in definition["instruction_layer"]["inline"][1]
+
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "contract_add",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-ADD-PARALLEL-DOGFOOD-20260624",
+        contract_execution_id="cex-contract-add-runtime-path-test",
+        actor_role="observer",
+        route_token_ref="rtok-contract-add-test",
+    )
+    assert record["runtime_guide"]["next_legal_action"] == {
+        "stage_id": "observer_request",
+        "line_id": "observer_request_contract_add",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "contract_add_request",
+        "required": True,
+    }
+
+    record = runtime.submit_line_write(
+        "cex-contract-add-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="observer_request",
+            line_id="observer_request_contract_add",
+        ),
+    )["record"]
+
+    rejected_observer_worker_evidence = runtime.submit_line_write(
+        "cex-contract-add-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="worker_precheck",
+            line_id="worker_draft_precheck",
+        ),
+    )
+    assert rejected_observer_worker_evidence["ok"] is False
+    assert "cannot write line" in rejected_observer_worker_evidence["decision"]["errors"][0]
+
+    for stage_id, line_id in [
+        ("worker_precheck", "worker_draft_precheck"),
+        ("worker_source", "worker_source_or_adoption_proof"),
+        ("worker_runtime_visibility", "worker_runtime_visibility_proof"),
+        ("worker_asset_binding", "worker_asset_binding_proposal_or_waiver"),
+    ]:
+        runtime.current_guide("cex-contract-add-runtime-path-test", actor_role="mf_sub")
+        record = runtime.store.get("cex-contract-add-runtime-path-test")
+        accepted = runtime.submit_line_write(
+            "cex-contract-add-runtime-path-test",
+            _runtime_write_from(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    runtime.current_guide("cex-contract-add-runtime-path-test", actor_role="observer")
+    record = runtime.store.get("cex-contract-add-runtime-path-test")
+    rejected_observer_qa_evidence = runtime.submit_line_write(
+        "cex-contract-add-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )
+    assert rejected_observer_qa_evidence["ok"] is False
+    assert "cannot write line" in rejected_observer_qa_evidence["decision"]["errors"][0]
+
+    runtime.current_guide("cex-contract-add-runtime-path-test", actor_role="qa")
+    record = runtime.store.get("cex-contract-add-runtime-path-test")
+    record = runtime.submit_line_write(
+        "cex-contract-add-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="qa",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )["record"]
+
+    for stage_id, line_id in [
+        ("observer_accept", "observer_accept_contract_add"),
+        ("observer_accept", "observer_close_ready"),
+    ]:
+        runtime.current_guide("cex-contract-add-runtime-path-test", actor_role="observer")
+        record = runtime.store.get("cex-contract-add-runtime-path-test")
+        accepted = runtime.submit_line_write(
+            "cex-contract-add-runtime-path-test",
+            _runtime_write_from(
+                record,
+                actor_role="observer",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    assert record["runtime_guide"]["next_legal_action"] is None
+
+
+def test_mf_parallel_read_only_adoption_proves_source_hash_and_duplicate_rejected():
+    service = ContractCrudService()
+    before_paths = service.registry.definition_paths()
+    before_count = len(before_paths)
+
+    adopted = service.read("mf_parallel.v1")["data"]["definition"]
+    source_path = Path(adopted["_source_path"])
+    raw_sha256 = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+    assert source_path.name == "mf_parallel.v1.rev1.json"
+    assert adopted["compat_aliases"] == ["mf_parallel.v1", "parallel_worker.v1"]
+    assert adopted["definition_hash"].startswith("sha256:")
+
+    duplicate = service.create(json.loads(source_path.read_text(encoding="utf-8")))
+
+    assert duplicate["ok"] is False
+    assert duplicate["error"]["type"] == "ContractLifecycleError"
+    assert "already exists" in duplicate["error"]["message"]
+    assert len(service.registry.definition_paths()) == before_count
+    assert source_path in before_paths
+    assert raw_sha256 == "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
 
 
 def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():

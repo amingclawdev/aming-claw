@@ -915,6 +915,89 @@ def test_mcp_parallel_branch_startup_forwards_read_receipt_bridge_fields():
     ]
 
 
+def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
+    tool_by_name = {tool["name"]: tool for tool in governance_mcp_server.TOOLS}
+
+    assert {
+        "contract_add_start",
+        "contract_add_current",
+        "contract_add_submit_line",
+    }.issubset(tool_by_name)
+    assert "contract_add_create" not in tool_by_name
+    assert "contract_definition_create" not in tool_by_name
+    assert "contract_definition_update" not in tool_by_name
+    assert tool_by_name["contract_add_submit_line"]["inputSchema"]["required"] == [
+        "project_id",
+        "contract_execution_id",
+    ]
+
+
+def test_mcp_contract_add_dispatches_to_guided_http_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "path": path}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    assert dispatcher.dispatch(
+        "contract_add_start",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-CONTRACT-ADD",
+            "route_token_ref": "rtok-contract-add",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_add_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-contract-add",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_add_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-contract-add",
+            "stage_id": "worker_precheck",
+            "line_id": "worker_draft_precheck",
+            "evidence_kind": "contract_draft_precheck",
+        },
+    )["ok"] is True
+
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-add/start",
+            {
+                "backlog_id": "AC-CONTRACT-ADD",
+                "route_token_ref": "rtok-contract-add",
+            },
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-add/cex-contract-add/current-state",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-add/cex-contract-add/line-writes",
+            {
+                "stage_id": "worker_precheck",
+                "line_id": "worker_draft_precheck",
+                "evidence_kind": "contract_draft_precheck",
+            },
+        ),
+    ]
+
+
 def test_mcp_observer_repair_run_plan_dispatches_to_read_only_endpoint():
     calls = []
 

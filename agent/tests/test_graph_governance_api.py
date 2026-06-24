@@ -16418,7 +16418,7 @@ def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_fai
                 "parent_task_id": context.root_task_id,
                 "target_project_root": str(target_root),
                 "reason": "failed independent QA requires worker revision after resume",
-                "now_iso": "2026-06-24T17:00:00Z",
+                "now_iso": "2999-01-01T00:00:00Z",
             },
         )
     )
@@ -22209,6 +22209,131 @@ def test_observer_root_route_context_source_backed_next_action_from_contract_run
     ).fetchone()
     assert row["contract_id"] == "onboard_contract"
     assert row["execution_state_revision"] == 1
+
+
+def test_contract_add_facade_starts_guided_runtime_and_rejects_forged_roles(conn):
+    backlog_id = "AC-CONTRACT-ADD-FACADE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    started = server.handle_project_contract_add_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-add",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    assert started["contract_id"] == "contract_add"
+    assert started["next_legal_action"]["id"] == "observer_request_contract_add"
+    assert started["next_legal_action"]["source"] == "contract_runtime"
+    assert started["next_legal_action"]["meta_contract_gate_decision_source"] is False
+    assert "meta_contract_gate" not in started
+    assert "legacy_meta_contract_gate" not in started
+    execution_id = started["contract_execution_id"]
+
+    forged = server.handle_project_contract_add_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "actor_role": "observer",
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_add",
+                "evidence_kind": "contract_add_request",
+            },
+        )
+    )
+    assert forged["ok"] is False
+    assert "cannot write line" in forged["decision"]["errors"][0]
+
+    accepted = server.handle_project_contract_add_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_add",
+                "evidence_kind": "contract_add_request",
+                "payload": {"source_path": "agent/governance/contract_definitions/contract_add.v1.rev1.json"},
+            },
+        )
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["actor_role"] == "observer"
+    assert accepted["next_legal_action"]["id"] == "worker_draft_precheck"
+    assert accepted["next_legal_action"]["allowed_writer_roles"] == ["mf_sub"]
+    assert accepted["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert "meta_contract_gate" not in accepted
+    assert "legacy_meta_contract_gate" not in accepted
+
+    current = server.handle_project_contract_add_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="GET",
+        )
+    )
+    assert current["actor_role"] == "mf_sub"
+    assert current["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_draft_precheck"
+    )
+
+
+def test_contract_add_facade_rejects_non_contract_add_execution_on_enter_and_read(conn):
+    backlog_id = "AC-CONTRACT-ADD-WRONG-RUNTIME"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    wrong = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-contract-add-wrong-runtime",
+    )
+    conn.commit()
+
+    with pytest.raises(
+        ValidationError,
+        match="contract_add facade can only enter/read contract_add executions",
+    ):
+        server.handle_project_contract_add_start(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": wrong["contract_execution_id"],
+                    "route_token_ref": "rtok-must-not-bind",
+                },
+            )
+        )
+
+    saved = server._contract_runtime(conn).store.get(wrong["contract_execution_id"])
+    assert saved["contract_id"] == "observer_hotfix"
+    assert saved["route_token_ref"] == ""
+
+    with pytest.raises(
+        ValidationError,
+        match="contract_add facade can only enter/read contract_add executions",
+    ):
+        server.handle_project_contract_add_current_state(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": wrong["contract_execution_id"]},
+                "observer",
+                method="GET",
+            )
+        )
 
 
 def test_observer_root_route_context_contract_first_for_no_contract_row(conn):
