@@ -2439,8 +2439,10 @@ def test_runtime_context_projects_worker_owned_next_required_evidence_for_finish
 
     assert projection["next_required_evidence"] == next_required
     assert control_plane["next_required_evidence"] == next_required
+    assert worker_view["next_legal_action"] == action_plan["next_legal_action"]
     assert worker_view["next_required_evidence"] == next_required
     assert worker_view["control_plane"]["next_required_evidence"] == next_required
+    assert worker_view["blocking_reasons"] == action_plan["blocking_reasons"]
     assert [
         "mf_subagent_startup_identity",
         "worker_graph_trace",

@@ -7200,10 +7200,12 @@ def build_runtime_context_worker_view(
             or values.get("terminal_dispatch_blockers")
             or []
         ),
+        "next_legal_action": action_plan.get("next_legal_action", ""),
         "worker_next_moves": list(action_plan.get("worker_next_moves") or []),
         "next_required_evidence": list(
             action_plan.get("next_required_evidence") or []
         ),
+        "blocking_reasons": list(action_plan.get("blocking_reasons") or []),
         "done_state_projection": dict(action_plan.get("done_state_projection") or {}),
         "gate_inputs": gate_inputs,
         "close_gate_view": close_gate,

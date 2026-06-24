@@ -774,6 +774,45 @@ def test_runtime_text_unsupported_backend_blocks_executable_launch(tmp_path):
     assert validation["next_legal_action"]["status"] == "blocked"
 
 
+def test_runtime_text_codex_app_subagent_reports_host_adapter_handoff(tmp_path):
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(tmp_path, backend_mode="codex_app_subagent")
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    executable = result["executable_worker_launch"]
+    assert executable["backend_mode"] == "codex_app_subagent"
+    assert executable["requested_backend_mode"] == "codex_app_subagent"
+    assert executable["command"] == []
+    assert executable["executable"] is False
+    assert "backend_mode.codex_cli" not in executable["missing_fields"]
+    assert "host_adapter.codex_app_subagent_secure_env" in executable["missing_fields"]
+
+    handoff = executable["host_adapter_handoff"]
+    assert handoff["status"] == "blocked_until_secure_worker_envelope"
+    assert handoff["host_adapter"] == "codex_app_subagent"
+    assert handoff["host_tool"] == "multi_agent_v1.spawn_agent"
+    assert handoff["fallback_backend"] == "codex_cli"
+    assert handoff["worker_next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert "inject_secure_worker_env" in handoff["required_host_capabilities"]
+
+    next_action = result["next_legal_action"]
+    assert next_action["status"] == "blocked"
+    assert next_action["allowed"] is False
+    assert next_action["id"] == "resolve_host_adapter_handoff"
+    assert next_action["action"] == (
+        "provide_codex_app_subagent_host_envelope_or_use_codex_cli"
+    )
+    assert next_action["host_adapter_handoff"] == handoff
+    assert "host_adapter.codex_app_subagent_secure_env" in next_action[
+        "missing_fields"
+    ]
+    validation = result["dispatch_gate_validation"]
+    assert validation["status"] == "executable_worker_launch_blocked"
+    assert validation["next_legal_action"]["id"] == "resolve_host_adapter_handoff"
+
+
 def test_runtime_text_worker_launch_pack_rejects_observer_only_next_action(tmp_path):
     result = build_observer_runtime_text_context(
         _runtime_text_request(

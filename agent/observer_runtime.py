@@ -98,13 +98,20 @@ ONE_HOP_REQUIRED_BACKENDS = {
     BACKEND_CLAUDE_CLI,
     BACKEND_DOCKER_LIVE_AI,
 }
+BACKEND_CODEX_APP_SUBAGENT = "codex_app_subagent"
 CODEX_CLI_WORKER_BACKEND_ALIASES = {
     BACKEND_CODEX_CLI,
     "codex_cli_exec",
 }
+CODEX_APP_SUBAGENT_WORKER_BACKEND_ALIASES = {
+    BACKEND_CODEX_APP_SUBAGENT,
+    "codex_app",
+    "codex_app_worker",
+    "codex_app_subagent_host_adapter",
+}
 WORKER_LAUNCH_BACKENDS = ONE_HOP_REQUIRED_BACKENDS | (
     CODEX_CLI_WORKER_BACKEND_ALIASES - {BACKEND_CODEX_CLI}
-)
+) | CODEX_APP_SUBAGENT_WORKER_BACKEND_ALIASES
 OBSERVER_POLL_TIMELINE_ROUTE_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -240,6 +247,8 @@ def _canonical_worker_launch_backend(backend_mode: str) -> str:
     normalized = str(backend_mode or "").strip()
     if normalized in CODEX_CLI_WORKER_BACKEND_ALIASES:
         return BACKEND_CODEX_CLI
+    if normalized in CODEX_APP_SUBAGENT_WORKER_BACKEND_ALIASES:
+        return BACKEND_CODEX_APP_SUBAGENT
     return normalized
 RUNTIME_TEXT_BRANCH_RUNTIME_REF_MARKERS = (
     "/parallel-branches/allocate",
@@ -5364,8 +5373,11 @@ def _runtime_text_executable_worker_launch(
     )
     command: list[str] = []
     unsupported_backend = ""
+    app_subagent_handoff_required = backend_mode == BACKEND_CODEX_APP_SUBAGENT
     if backend_mode == BACKEND_CODEX_CLI:
         command = build_codex_exec_command(cwd=worktree_path, output_path=output_path)
+    elif app_subagent_handoff_required:
+        command = []
     else:
         unsupported_backend = requested_backend_mode or "missing_backend_mode"
 
@@ -5445,12 +5457,19 @@ def _runtime_text_executable_worker_launch(
     missing_fields = _runtime_text_missing_launch_fields(payload)
     if unsupported_backend:
         missing_fields.append("backend_mode.codex_cli")
+    if app_subagent_handoff_required:
+        missing_fields.append("host_adapter.codex_app_subagent_secure_env")
     command_display = ""
     if command:
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}" for key, value in env_template.items()
         )
         command_display = f"{env_prefix} {shlex.join(command)}"
+    elif app_subagent_handoff_required:
+        command_display = (
+            "Host-managed Codex app subagent handoff; no shell command is "
+            "generated until the host can inject the worker envelope."
+        )
     public_env_template = {
         key: (
             f"<read from env:{key} at launch time>"
@@ -5731,6 +5750,38 @@ def _runtime_text_executable_worker_launch(
             ),
         },
     }
+    host_adapter_handoff = {
+        "schema_version": "observer_runtime_text.host_adapter_handoff.v1",
+        "backend_mode": BACKEND_CODEX_APP_SUBAGENT,
+        "requested_backend_mode": requested_backend_mode,
+        "status": (
+            "blocked_until_secure_worker_envelope"
+            if app_subagent_handoff_required
+            else "not_applicable"
+        ),
+        "host_adapter": "codex_app_subagent",
+        "host_tool": "multi_agent_v1.spawn_agent",
+        "command_generated": False,
+        "reason": (
+            "Codex app subagent launch needs a host-created worker session in "
+            "the assigned worktree plus a secure worker envelope for "
+            "AMING_WORKER_SESSION_TOKEN and AMING_WORKER_FENCE_TOKEN."
+        ),
+        "required_host_capabilities": [
+            "spawn_subagent_in_assigned_worktree",
+            "inject_secure_worker_env",
+            "return_host_session_id",
+            "return_worker_transcript_ref",
+        ],
+        "next_legal_action": "provide_codex_app_subagent_host_envelope_or_use_codex_cli",
+        "fallback_backend": BACKEND_CODEX_CLI,
+        "worker_next_legal_action": str(
+            worker_launch_pack.get("next_legal_action") or ""
+        ),
+        "handoff_packet_source": "response.executable_worker_launch.handoff_packet",
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+    }
     return {
         "schema_version": OBSERVER_EXECUTABLE_WORKER_LAUNCH_SCHEMA_VERSION,
         "status": "ready" if command and not missing_fields else "blocked",
@@ -5738,7 +5789,7 @@ def _runtime_text_executable_worker_launch(
         "backend_mode": backend_mode,
         "requested_backend_mode": requested_backend_mode,
         "command": command,
-        "command_display": public_command_skeleton,
+        "command_display": public_command_skeleton or command_display,
         "command_display_public_safe": True,
         "secret_launch_envelope": {
             "public_safe": False,
@@ -5777,7 +5828,8 @@ def _runtime_text_executable_worker_launch(
         "worker_launch_pack": dict(worker_launch_pack),
         "handoff_packet": handoff_packet,
         "public_safe_executable_handoff_packet": handoff_packet,
-        "shell_safe": True,
+        "host_adapter_handoff": dict(host_adapter_handoff),
+        "shell_safe": bool(command),
         "raw_launch_text_persisted": False,
         "raw_session_token_persisted": False,
         "repair": {
@@ -5786,6 +5838,7 @@ def _runtime_text_executable_worker_launch(
             "stdin_source": "response.launch_text",
             "env_policy_source": "response.executable_worker_launch.env_policy",
             "handoff_packet_source": "response.executable_worker_launch.handoff_packet",
+            "host_adapter_handoff_source": "response.executable_worker_launch.host_adapter_handoff",
             "missing_fields": missing_fields,
         },
     }
@@ -5827,6 +5880,11 @@ def _runtime_text_observer_next_legal_action(
         if isinstance(executable_worker_launch.get("startup_identity_policy"), Mapping)
         else payload.get("startup_identity_policy")
         if isinstance(payload.get("startup_identity_policy"), Mapping)
+        else {}
+    )
+    host_adapter_handoff = (
+        executable_worker_launch.get("host_adapter_handoff")
+        if isinstance(executable_worker_launch.get("host_adapter_handoff"), Mapping)
         else {}
     )
     stdin = (
@@ -5942,6 +6000,29 @@ def _runtime_text_observer_next_legal_action(
     dispatch_next = dispatch_gate_validation.get("next_legal_action")
     if isinstance(dispatch_next, Mapping) and status != "ready":
         next_action["blocked_by_next_legal_action"] = dict(dispatch_next)
+    if (
+        host_adapter_handoff
+        and str(host_adapter_handoff.get("host_adapter") or "") == "codex_app_subagent"
+        and status != "ready"
+    ):
+        next_action.update(
+            {
+                "id": "resolve_host_adapter_handoff",
+                "action": str(
+                    host_adapter_handoff.get("next_legal_action")
+                    or "provide_codex_app_subagent_host_envelope_or_use_codex_cli"
+                ),
+                "description": (
+                    "Resolve the Codex app subagent host-adapter boundary before "
+                    "worker launch; do not record worker read receipt/startup until "
+                    "a real worker session has a secure envelope."
+                ),
+                "host_adapter_handoff": dict(host_adapter_handoff),
+                "host_adapter_handoff_source": (
+                    "response.executable_worker_launch.host_adapter_handoff"
+                ),
+            }
+        )
     return next_action
 
 
