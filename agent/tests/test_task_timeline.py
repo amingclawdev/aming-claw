@@ -6277,6 +6277,83 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(ready["worker_graph_trace_gate"]["trace_ids"], ["gqt-policy-close"])
         self.assertTrue(ready["independent_qa_gate"]["passed"])
 
+    def test_independent_qa_must_follow_latest_implementation(self):
+        from agent.governance import task_timeline
+
+        contract = {"governance_policy": STRICT_GOVERNANCE_POLICY}
+        events = [
+            {
+                "id": 10,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+            },
+            {
+                "id": 11,
+                "event_kind": "qa_verification",
+                "phase": "verification",
+                "actor": "qa-lane-reviewer",
+                "status": "passed",
+            },
+            {
+                "id": 12,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+            },
+            {
+                "id": 13,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "status": "accepted",
+            },
+            {
+                "id": 14,
+                "event_kind": "graph_query_trace",
+                "phase": "implementation",
+                "actor": "worker-b",
+                "status": "passed",
+                "payload": {
+                    "query_source": "mf_subagent",
+                    "worker_role": "mf_sub",
+                    "graph_trace_ids": ["gqt-freshness"],
+                },
+            },
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertIn("verification", blocked["missing_event_kinds"])
+        self.assertFalse(blocked["independent_qa_gate"]["passed"], blocked)
+        self.assertEqual(
+            blocked["independent_qa_gate"]["latest_implementation_event_id"],
+            12,
+        )
+        self.assertEqual(
+            blocked["independent_qa_gate"]["rejected_evidence_events"][0]["reason"],
+            "qa_before_latest_implementation",
+        )
+        self.assertIn("independent_qa", blocked["missing_evidence_groups"]["groups"])
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *events,
+                {
+                    "id": 15,
+                    "event_kind": "qa_verification",
+                    "phase": "verification",
+                    "actor": "qa-lane-reviewer",
+                    "status": "passed",
+                },
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertTrue(ready["independent_qa_gate"]["passed"], ready)
+        self.assertIn("verification", ready["present_event_kinds"])
+
     def test_007a033c_observer_trace_close_gate_shape_is_process_gap(self):
         from agent.governance import task_timeline
 
@@ -7482,6 +7559,8 @@ class TestTaskTimeline(unittest.TestCase):
         )
         current_qa = _route_context_qa_verification_event()
         current_qa["id"] = 2047
+        fresh_current_qa = _route_context_qa_verification_event()
+        fresh_current_qa["id"] = 2052
         cleanup = {
             "id": 2048,
             "event_kind": "route_identity_cleanup",
@@ -7511,6 +7590,7 @@ class TestTaskTimeline(unittest.TestCase):
             current_route_events[3],
             current_qa,
             *close_events,
+            fresh_current_qa,
         ]
 
         poisoned = task_timeline.mf_close_gate_verification(events, contract=contract)

@@ -543,6 +543,101 @@ def test_legacy_direct_hotfix_followup_skips_worker_only_default_requirements():
     )
 
 
+def test_legacy_direct_hotfix_requires_qa_after_latest_implementation():
+    default_required = [
+        "route_context",
+        "route_action_precheck",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "independent_verification_lane",
+        "implementation",
+        "verification",
+        "close_ready",
+    ]
+    events = [
+        _event(1, "hotfix_entered", status="accepted"),
+        _event(
+            2,
+            "service_route",
+            status="allowed",
+            payload={
+                "service_id": "route.prompt_alert_bundle",
+                "contract_evidence": [
+                    {"requirement_id": "route_context_hash"},
+                    {"requirement_id": "prompt_contract_hash"},
+                ],
+            },
+        ),
+        _event(
+            3,
+            "service_route",
+            status="allowed",
+            payload={
+                "service_id": "route.action_precheck",
+                "contract_evidence": [
+                    {"requirement_id": "route_action_allowed"},
+                ],
+            },
+        ),
+        _event(
+            4,
+            "hotfix_under_action",
+            status="accepted",
+            payload={
+                "implementation_close_evidence": {
+                    "counts_as_implementation": True,
+                    "changed_files": ["agent/governance/contract_state_runtime.py"],
+                }
+            },
+        ),
+        _event(5, "qa_verification", status="accepted"),
+        _event(
+            6,
+            "hotfix_under_action",
+            status="accepted",
+            payload={
+                "implementation_close_evidence": {
+                    "counts_as_implementation": True,
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                }
+            },
+        ),
+    ]
+
+    stale_qa_projection = build_contract_state_projection(
+        events,
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        default_required_evidence=default_required,
+    )
+
+    assert stale_qa_projection["next_legal_action"]["id"] == "independent_verification_lane"
+    assert "verification" in stale_qa_projection["missing_evidence"]
+    completed = {
+        item["id"]: item
+        for item in stale_qa_projection["completed_evidence"]
+    }
+    assert completed["implementation"]["event_id"] == 6
+    assert "independent_verification_lane" not in completed
+    assert "verification" not in completed
+
+    fresh_qa_projection = build_contract_state_projection(
+        [*events, _event(7, "qa_verification", status="accepted")],
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        default_required_evidence=default_required,
+    )
+
+    assert fresh_qa_projection["missing_evidence"] == ["close_ready"]
+    fresh_completed = {
+        item["id"]: item
+        for item in fresh_qa_projection["completed_evidence"]
+    }
+    assert fresh_completed["independent_verification_lane"]["event_id"] == 7
+    assert fresh_completed["verification"]["event_id"] == 7
+    assert fresh_completed["verification"]["fresh_after_event_id"] == 6
+
+
 def test_route_requirements_ignore_generic_requirement_id_batches():
     contract = {
         "contract": {

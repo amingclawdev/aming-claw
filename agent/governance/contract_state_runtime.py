@@ -421,6 +421,23 @@ _LEGACY_HOTFIX_DIRECT_OBSERVER_SUPPRESSED_REQUIREMENTS = {
     "mf_subagent_startup",
 }
 
+_IMPLEMENTATION_FRESHNESS_ANCHOR_REQUIREMENT_IDS = {
+    "implementation",
+    "worker_implementation",
+}
+
+_QA_FRESHNESS_REQUIREMENT_IDS = {
+    "verification",
+    "independent_verification_lane",
+    "independent_verification",
+    "independent_verification_evidence",
+    "independent_qa",
+    "independent_qa_lane",
+    "qa_evidence_gate_review",
+    "qa_review",
+    "qa_verification",
+}
+
 _CONDITION_JSON_CONTEXT_FIELDS = (
     "chain_trigger_json",
     "target_json",
@@ -2399,6 +2416,78 @@ def _event_satisfies_requirement(
     return True, source
 
 
+def _requirement_is_implementation_freshness_anchor(
+    requirement: Mapping[str, Any],
+) -> bool:
+    requirement_id = str(requirement.get("id") or "").strip()
+    return requirement_id in _IMPLEMENTATION_FRESHNESS_ANCHOR_REQUIREMENT_IDS
+
+
+def _requirement_needs_fresh_qa(requirement: Mapping[str, Any]) -> bool:
+    requirement_id = str(requirement.get("id") or "").strip()
+    if requirement_id in _QA_FRESHNESS_REQUIREMENT_IDS:
+        return True
+    accepted_kinds = set(_string_list(requirement.get("accepted_event_kinds")))
+    return bool(accepted_kinds.intersection(_QA_TIMELINE_EVENT_KINDS))
+
+
+def _latest_implementation_freshness_anchor_event_id(
+    events: list[dict[str, Any]],
+    requirements: list[dict[str, Any]],
+) -> int:
+    latest_event_id = 0
+    implementation_requirements = [
+        requirement
+        for requirement in requirements
+        if _requirement_is_implementation_freshness_anchor(requirement)
+    ]
+    for requirement in implementation_requirements:
+        for event in events:
+            matched, _source = _event_satisfies_requirement(event, requirement)
+            if not matched:
+                continue
+            event_id = _event_numeric_id(event)
+            if event_id > latest_event_id:
+                latest_event_id = event_id
+    return latest_event_id
+
+
+def _completed_requirement_sources(
+    events: list[dict[str, Any]],
+    requirements: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    latest_implementation_event_id = _latest_implementation_freshness_anchor_event_id(
+        events,
+        requirements,
+    )
+    completed_sources: dict[str, dict[str, Any]] = {}
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id") or "")
+        best_source: dict[str, Any] | None = None
+        best_event_id = 0
+        requires_fresh_qa = _requirement_needs_fresh_qa(requirement)
+        for event in events:
+            event_id = _event_numeric_id(event)
+            if (
+                requires_fresh_qa
+                and latest_implementation_event_id
+                and event_id
+                and event_id <= latest_implementation_event_id
+            ):
+                continue
+            matched, source = _event_satisfies_requirement(event, requirement)
+            if not (matched and source):
+                continue
+            if best_source is None or event_id >= best_event_id:
+                best_source = dict(source)
+                best_event_id = event_id
+        if best_source:
+            if requires_fresh_qa and latest_implementation_event_id:
+                best_source["fresh_after_event_id"] = latest_implementation_event_id
+            completed_sources[requirement_id] = best_source
+    return completed_sources
+
+
 def _route_identity_hash(route_binding: Mapping[str, Any]) -> str:
     payload = {
         key: str(route_binding.get(key) or "")
@@ -3067,7 +3156,6 @@ def _contract_requirements_state(
             step["precedence"] = missing_precedence
         scoped_steps.append(step)
 
-    completed_sources: dict[str, dict[str, Any]] = {}
     scoped_events = _contract_execution_scoped_events(
         events,
         contract_execution_id=contract_execution_id,
@@ -3077,13 +3165,7 @@ def _contract_requirements_state(
         _event_ref_id(event) != _event_ref_id(handoff_event) for event in scoped_events
     ):
         scoped_events = [handoff_event, *scoped_events]
-    for requirement in scoped_steps:
-        requirement_id = str(requirement.get("id") or "")
-        for event in scoped_events:
-            matched, source = _event_satisfies_requirement(event, requirement)
-            if matched and source:
-                completed_sources[requirement_id] = source
-                break
+    completed_sources = _completed_requirement_sources(scoped_events, scoped_steps)
     completed_ids = set(completed_sources)
     missing_steps: list[dict[str, Any]] = []
     blocked_steps: list[dict[str, Any]] = []
@@ -3352,14 +3434,7 @@ def build_contract_state_projection(
                 not in _LEGACY_HOTFIX_DIRECT_OBSERVER_SUPPRESSED_REQUIREMENTS
             ]
 
-    completed_sources: dict[str, dict[str, Any]] = {}
-    for requirement in requirement_steps:
-        requirement_id = str(requirement.get("id") or "")
-        for event in active_rows:
-            matched, source = _event_satisfies_requirement(event, requirement)
-            if matched and source:
-                completed_sources[requirement_id] = source
-                break
+    completed_sources = _completed_requirement_sources(active_rows, requirement_steps)
     completed_ids = set(completed_sources)
     missing_steps: list[dict[str, Any]] = []
     blocked_steps: list[dict[str, Any]] = []

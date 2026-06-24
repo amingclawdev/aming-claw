@@ -1280,11 +1280,16 @@ def _independent_qa_resolved_verdict_refs(
     event: dict[str, Any],
     events_by_ref: dict[str, dict[str, Any]],
     worker_slot_ids: set[str],
+    *,
+    minimum_event_id: int = 0,
 ) -> list[str]:
     resolved: list[str] = []
     for ref in _independent_qa_verdict_refs(event):
         target = events_by_ref.get(ref)
         if not target:
+            continue
+        target_event_id = _event_numeric_id(target)
+        if minimum_event_id and target_event_id and target_event_id <= minimum_event_id:
             continue
         status = _text(target.get("status") or target.get("decision")).lower()
         if status not in MF_CLOSE_PASS_STATUSES:
@@ -1310,12 +1315,23 @@ def _independent_qa_verdict_ref_rejection_reasons(
     event: dict[str, Any],
     events_by_ref: dict[str, dict[str, Any]],
     worker_slot_ids: set[str],
+    *,
+    minimum_event_id: int = 0,
 ) -> list[dict[str, Any]]:
     rejections: list[dict[str, Any]] = []
     for ref in _independent_qa_verdict_refs(event):
         target = events_by_ref.get(ref)
         if not target:
             rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_not_found"})
+            continue
+        target_event_id = _event_numeric_id(target)
+        if minimum_event_id and target_event_id and target_event_id <= minimum_event_id:
+            rejections.append({
+                "verdict_ref": ref,
+                "reason": "qa_verdict_ref_before_latest_implementation",
+                "latest_implementation_event_id": minimum_event_id,
+                "target_event_id": target_event_id,
+            })
             continue
         status = _text(target.get("status") or target.get("decision")).lower()
         if status not in MF_CLOSE_PASS_STATUSES:
@@ -1392,6 +1408,10 @@ def _independent_qa_gate(
             and contract_close_policy.get("qa_required")
         )
     required = policy_required or topology_required or contract_policy_required
+    latest_implementation_event_id = _latest_implementation_freshness_anchor_event_id(
+        rows,
+        contract_close_policy,
+    )
 
     # Collect worker identities from startup events in this timeline so we can
     # apply the independence-by-identity test.
@@ -1460,7 +1480,26 @@ def _independent_qa_gate(
             event,
             events_by_ref,
             worker_slot_ids,
+            minimum_event_id=latest_implementation_event_id,
         )
+        event_id = _event_numeric_id(event)
+
+        if (
+            latest_implementation_event_id
+            and event_id
+            and event_id <= latest_implementation_event_id
+        ):
+            rejected_events.append({
+                "id": event.get("id"),
+                "event_kind": event.get("event_kind"),
+                "actor": event.get("actor"),
+                "status": event.get("status"),
+                "reason": "qa_before_latest_implementation",
+                "latest_implementation_event_id": latest_implementation_event_id,
+                "event_id": event_id,
+                "reviewer_identity": reviewer_identity,
+            })
+            continue
 
         # Observer-authored transport may relay facts, but it only satisfies
         # independent QA when its verdict refs resolve to legitimate same-row QA.
@@ -1499,6 +1538,7 @@ def _independent_qa_gate(
                 event,
                 events_by_ref,
                 worker_slot_ids,
+                minimum_event_id=latest_implementation_event_id,
             ):
                 rejected_events.append({
                     "id": event.get("id"),
@@ -1568,6 +1608,8 @@ def _independent_qa_gate(
         "policy_required": policy_required,
         "contract_policy_required": contract_policy_required,
         "contract_close_gate_policy": contract_close_policy,
+        "freshness_required": bool(latest_implementation_event_id),
+        "latest_implementation_event_id": latest_implementation_event_id,
         "passed": passed,
         "status": "passed" if passed else "failed",
         "missing_requirement_ids": missing_ids,
@@ -1601,6 +1643,44 @@ def _event_numeric_id(event: dict[str, Any]) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _event_is_implementation_freshness_anchor(
+    event: dict[str, Any],
+    contract_close_policy: Mapping[str, Any],
+) -> bool:
+    status = _text(event.get("status") or event.get("decision")).strip().lower()
+    if status not in MF_CLOSE_PASS_STATUSES:
+        return False
+    marker = _route_marker(event.get("event_kind") or event.get("event_type") or "")
+    phase = _route_marker(event.get("phase") or "")
+    if marker == "implementation" or (not marker and phase == "implementation"):
+        return True
+    if marker != "hotfix_under_action":
+        return False
+    hotfix_projection = _hotfix_under_action_implementation_projection(
+        event,
+        contract_close_policy,
+        row_level_verification_refs=[],
+    )
+    if hotfix_projection.get("counts_as_implementation"):
+        return True
+    payload = _mapping(event.get("payload"))
+    evidence = _mapping(payload.get("implementation_close_evidence"))
+    return _truthy(evidence.get("counts_as_implementation"))
+
+
+def _latest_implementation_freshness_anchor_event_id(
+    rows: list[dict[str, Any]],
+    contract_close_policy: Mapping[str, Any],
+) -> int:
+    event_ids = [
+        _event_numeric_id(event)
+        for event in rows
+        if isinstance(event, dict)
+        and _event_is_implementation_freshness_anchor(event, contract_close_policy)
+    ]
+    return max(event_ids, default=0)
 
 
 def _event_marker(event: dict[str, Any]) -> str:
@@ -8603,6 +8683,10 @@ def mf_close_gate_verification(
             contract,
             _route_topology_policy(contract),
         )
+        latest_implementation_event_id = _latest_implementation_freshness_anchor_event_id(
+            close_rows,
+            close_policy,
+        )
         row_level_verification_refs = _row_level_verification_refs_for_hotfix(close_rows)
         for event in close_rows:
             if not isinstance(event, dict):
@@ -8627,6 +8711,22 @@ def mf_close_gate_verification(
                 and kind in {"qa_verification", "independent_verification"}
             ):
                 key = "verification"
+            event_id = _event_numeric_id(event)
+            if (
+                key == "verification"
+                and latest_implementation_event_id
+                and event_id
+                and event_id <= latest_implementation_event_id
+            ):
+                close_ignored.append({
+                    "event_kind": kind,
+                    "phase": phase,
+                    "status": status,
+                    "id": event.get("id"),
+                    "reason": "verification_before_latest_implementation",
+                    "latest_implementation_event_id": latest_implementation_event_id,
+                })
+                continue
             if key in required_event_kinds and status in MF_CLOSE_PASS_STATUSES:
                 close_present.add(key)
             elif key in required_event_kinds:
