@@ -11694,6 +11694,27 @@ def _runtime_context_raise_child_route_lineage_error(
         value = str(parent_route_identity.get(field) or "").strip()
         if value:
             retry_parent_ref_body[field] = value
+    hotfix_exception_boundary = {
+        "schema_version": "runtime_context.hotfix_exception_boundary_guidance.v1",
+        "applies_when": (
+            "meta gate allows hotfix_under_action but implementation evidence "
+            "used a stale or unbound child route lineage"
+        ),
+        "not_a_conflict": True,
+        "hotfix_exception_action": "hotfix_under_action",
+        "ordinary_direct_mutations": ["edit_files", "apply_patch"],
+        "ordinary_direct_mutation_status": (
+            "blocked_until_route_token_child_lineage_matches_latest_parent"
+        ),
+        "exception_boundary": (
+            "hotfix_under_action is the audited hotfix exception lane under "
+            "the canonical parent route; it does not authorize ordinary "
+            "edit_files/apply_patch evidence with a stale child route token"
+        ),
+        "next_legal_action": (
+            "retry_with_parent_route_token_ref_or_reissue_child_route_token"
+        ),
+    }
     raise GovernanceError(
         code,
         "runtime-context implementation evidence child route token is not bound to the latest runtime contract route",
@@ -11711,8 +11732,12 @@ def _runtime_context_raise_child_route_lineage_error(
                 "detail": (
                     "Use a parent-bound child route token whose parent_route_lineage "
                     "matches the latest runtime contract route identity, or use the "
-                    "canonical parent route_token_ref path."
+                    "canonical parent route_token_ref path. If a meta gate also "
+                    "allows hotfix_under_action, treat that as a narrow hotfix "
+                    "exception boundary, not as permission for stale ordinary "
+                    "edit_files/apply_patch lineage."
                 ),
+                "hotfix_exception_boundary": hotfix_exception_boundary,
                 "required_payload": {
                     "route_token": {
                         "parent_route_lineage": parent_route_summary,
@@ -11725,6 +11750,7 @@ def _runtime_context_raise_child_route_lineage_error(
             "retry_implementation_evidence_parent_route_ref_body": (
                 retry_parent_ref_body
             ),
+            "hotfix_exception_boundary": hotfix_exception_boundary,
             "parent_route_identity": parent_route_summary,
             "child_route_identity": child_route_summary,
             "mismatched_fields": mismatched_fields or [],
@@ -30390,20 +30416,31 @@ def _observer_root_route_merge_identity(
         field: str(base.get(field) or "").strip()
         for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
     }
+    route_token_ref = str(base.get("route_token_ref") or "").strip()
+    if route_token_ref:
+        merged["route_token_ref"] = route_token_ref
     for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
         if not merged.get(field):
             token = str(candidate.get(field) or "").strip()
             if token:
                 merged[field] = token
+    if not merged.get("route_token_ref"):
+        route_token_ref = str(candidate.get("route_token_ref") or "").strip()
+        if route_token_ref:
+            merged["route_token_ref"] = route_token_ref
     return merged
 
 
 def _observer_root_route_direct_identity(value: Mapping[str, Any]) -> dict[str, str]:
-    return {
+    identity = {
         field: str(value.get(field) or "").strip()
         for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
         if str(value.get(field) or "").strip()
     }
+    route_token_ref = str(value.get("route_token_ref") or "").strip()
+    if route_token_ref:
+        identity["route_token_ref"] = route_token_ref
+    return identity
 
 
 def _observer_root_route_identity_candidate_mappings(
@@ -30464,6 +30501,10 @@ def _observer_root_route_merge_candidate_identity(
         token = str(candidate.get(field) or "").strip()
         if token:
             merged[field] = token
+    if not merged.get("route_token_ref"):
+        route_token_ref = str(candidate.get("route_token_ref") or "").strip()
+        if route_token_ref:
+            merged["route_token_ref"] = route_token_ref
     return merged
 
 
@@ -30495,6 +30536,10 @@ def _observer_root_route_identity_from_event(
         token = _timeline_first_deep_text(dict(event), field)
         if token:
             identity[field] = token
+    if not identity.get("route_token_ref"):
+        route_token_ref = _timeline_first_deep_text(dict(event), "route_token_ref")
+        if route_token_ref:
+            identity["route_token_ref"] = route_token_ref
     return identity
 
 
@@ -30657,6 +30702,34 @@ def _observer_root_route_canonical_identity_projection(
         "missing_fields": _observer_root_route_identity_missing_fields(base_identity),
         "candidates": candidates[:5],
     }
+
+
+def _observer_root_route_route_token_ref_from_events(
+    events: list[dict[str, Any]],
+    *,
+    canonical_identity: Mapping[str, Any],
+) -> str:
+    """Find a copy-safe route token ref carried by matching timeline evidence."""
+
+    route_token_ref = ""
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        identity = _observer_root_route_identity_from_event(event)
+        candidate_ref = str(identity.get("route_token_ref") or "").strip()
+        if not candidate_ref:
+            continue
+        has_conflict = False
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS:
+            expected = str(canonical_identity.get(field) or "").strip()
+            actual = str(identity.get(field) or "").strip()
+            if expected and actual and expected != actual:
+                has_conflict = True
+                break
+        if has_conflict:
+            continue
+        route_token_ref = candidate_ref
+    return route_token_ref
 
 
 def _observer_root_route_worker_lane_task_ids(source: Any) -> list[str]:
@@ -32406,6 +32479,12 @@ def _observer_root_route_context_state(
         contract=contract,
     )
     route_context_for_bootstrap = dict(identity_projection.get("identity") or {})
+    event_route_token_ref = _observer_root_route_route_token_ref_from_events(
+        events,
+        canonical_identity=route_context_for_bootstrap,
+    )
+    if event_route_token_ref and not route_context_for_bootstrap.get("route_token_ref"):
+        route_context_for_bootstrap["route_token_ref"] = event_route_token_ref
     route_token_ref_projection = _observer_root_route_identity_from_route_token_ref(
         conn,
         project_id=project_id,
@@ -32419,7 +32498,9 @@ def _observer_root_route_context_state(
             route_context_for_bootstrap,
             route_token_ref_identity,
         )
-    token_ref = str(route_token_ref_projection.get("route_token_ref") or "").strip()
+    token_ref = str(
+        route_token_ref_projection.get("route_token_ref") or event_route_token_ref
+    ).strip()
     if token_ref:
         route_context_for_bootstrap["route_token_ref"] = token_ref
     route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
@@ -32822,7 +32903,7 @@ def _observer_root_route_context_state(
         "lineage_bridge_action": lineage_bridge_action,
     }
     context["backlog_row_present"] = bool(row)
-    return context
+    return observer_session.sync_observer_root_route_context_projection(context)
 
 
 @route("GET", "/api/projects/{project_id}/observer-root-route-context")

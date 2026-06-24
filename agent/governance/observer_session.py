@@ -778,6 +778,133 @@ def _root_route_string_list(value: Any) -> list[str]:
     return []
 
 
+def _root_route_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _root_route_first_string(*values: Any) -> str:
+    for value in values:
+        text = _root_route_string(value)
+        if text:
+            return text
+    return ""
+
+
+def _root_route_next_action_hint(
+    next_legal_action: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    hint = next_legal_action.get("timeline_append_hint")
+    if isinstance(hint, Mapping):
+        return hint
+    worker_handoff = next_legal_action.get("worker_handoff")
+    if isinstance(worker_handoff, Mapping):
+        hint = worker_handoff.get("timeline_append_hint")
+        if isinstance(hint, Mapping):
+            return hint
+    return {}
+
+
+def _root_route_next_action_actor(
+    next_legal_action: Mapping[str, Any],
+) -> str:
+    hint = _root_route_next_action_hint(next_legal_action)
+    actor = _root_route_first_string(
+        hint.get("next_action_actor"),
+        hint.get("actor_role"),
+        hint.get("lane_actor_role"),
+        hint.get("target_actor_role"),
+        hint.get("actor"),
+        next_legal_action.get("next_action_actor"),
+        next_legal_action.get("actor_role"),
+        next_legal_action.get("lane_actor_role"),
+        next_legal_action.get("target_actor_role"),
+        next_legal_action.get("evidence_owner_role"),
+        next_legal_action.get("actor"),
+    )
+    if actor:
+        return actor
+    if bool(next_legal_action.get("worker_owned")):
+        return "mf_sub"
+    return "observer"
+
+
+def _root_route_next_action_route_token_ref(
+    context: Mapping[str, Any],
+    next_legal_action: Mapping[str, Any],
+) -> str:
+    canonical_identity = _root_route_mapping(context.get("canonical_route_identity"))
+    hint = _root_route_next_action_hint(next_legal_action)
+    close_gate_projection = _root_route_mapping(context.get("close_gate_projection"))
+    action_card = _root_route_mapping(
+        close_gate_projection.get("action_card")
+        or close_gate_projection.get("close_action_card")
+    )
+    return _root_route_first_string(
+        context.get("route_token_ref"),
+        canonical_identity.get("route_token_ref"),
+        next_legal_action.get("route_token_ref"),
+        hint.get("route_token_ref"),
+        action_card.get("route_token_ref"),
+        action_card.get("current_route_token_ref"),
+    )
+
+
+def sync_observer_root_route_context_projection(
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose stable root-level aliases for the current next action."""
+
+    next_legal_action = _root_route_mapping(context.get("next_legal_action"))
+    next_action_id = _root_route_first_string(
+        next_legal_action.get("next_legal_action_id"),
+        next_legal_action.get("id"),
+        next_legal_action.get("action"),
+    )
+    next_action_actor = _root_route_next_action_actor(next_legal_action)
+    route_token_ref = _root_route_next_action_route_token_ref(
+        context,
+        next_legal_action,
+    )
+
+    if route_token_ref:
+        context["route_token_ref"] = route_token_ref
+        canonical_identity = context.get("canonical_route_identity")
+        if isinstance(canonical_identity, dict):
+            canonical_identity["route_token_ref"] = route_token_ref
+
+    if next_action_id:
+        context["next_legal_action_id"] = next_action_id
+    context["next_action_actor"] = next_action_actor
+
+    hint = next_legal_action.get("timeline_append_hint")
+    if isinstance(hint, dict):
+        if next_action_id:
+            hint.setdefault("next_legal_action_id", next_action_id)
+        hint.setdefault("next_action_actor", next_action_actor)
+        if route_token_ref:
+            hint.setdefault("route_token_ref", route_token_ref)
+
+    projection = {
+        "schema_version": "observer_root_route_next_action_projection.v1",
+        "next_legal_action_id": next_action_id,
+        "next_action_actor": next_action_actor,
+        "route_token_ref": route_token_ref,
+        "next_legal_action_id_source": "next_legal_action.id",
+        "next_action_actor_source": "next_legal_action.timeline_append_hint",
+        "route_token_ref_canonical_field": "route_token_ref",
+        "route_token_ref_aliases": [
+            "route_token_ref",
+            "canonical_route_identity.route_token_ref",
+            "next_action_projection.route_token_ref",
+        ],
+        "timeline_append_hint_consistent": True,
+    }
+    context["next_action_projection"] = {
+        key: value for key, value in projection.items() if value not in ("", [], {})
+    }
+    return context
+
+
 def build_observer_root_route_context(
     *,
     backlog_id: str,
@@ -824,6 +951,7 @@ def build_observer_root_route_context(
     visible_injection_manifest_hash = _root_route_string(
         route.get("visible_injection_manifest_hash")
     )
+    route_token_ref = _root_route_string(route.get("route_token_ref"))
 
     # Allowed/blocked actions are derived from the work-mode gate, then unioned
     # with any explicit route-supplied allowances/blocks (route blocks always
@@ -884,6 +1012,8 @@ def build_observer_root_route_context(
         "prompt_contract_hash": prompt_contract_hash,
         "visible_injection_manifest_hash": visible_injection_manifest_hash,
     }
+    if route_token_ref:
+        canonical_route_identity["route_token_ref"] = route_token_ref
     missing_identity_fields = [
         field
         for field in ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
@@ -899,7 +1029,7 @@ def build_observer_root_route_context(
             "validation until the missing fields are pinned"
         )
 
-    return {
+    context = {
         "schema_version": ROOT_ROUTE_CONTEXT_SCHEMA_VERSION,
         "backlog_id": _root_route_string(backlog_id),
         "route_id": route_id,
@@ -907,6 +1037,7 @@ def build_observer_root_route_context(
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
         "visible_injection_manifest_hash": visible_injection_manifest_hash,
+        "route_token_ref": route_token_ref,
         "work_mode": mode,
         "default_work_mode": DEFAULT_WORK_MODE,
         "loaded_skills": _root_route_string_list(loaded_skills),
@@ -920,6 +1051,7 @@ def build_observer_root_route_context(
         "canonical_route_identity": canonical_route_identity,
         "canonical_route_identity_complete": canonical_route_identity_complete,
     }
+    return sync_observer_root_route_context_projection(context)
 
 
 SCHEMA_SQL = """

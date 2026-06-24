@@ -7531,6 +7531,19 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
     assert mismatch.value.details["mismatched_fields"][0]["field"] == (
         "parent_route_lineage.route_id"
     )
+    hotfix_boundary = mismatch.value.details["hotfix_exception_boundary"]
+    assert hotfix_boundary["not_a_conflict"] is True
+    assert hotfix_boundary["hotfix_exception_action"] == "hotfix_under_action"
+    assert hotfix_boundary["ordinary_direct_mutations"] == [
+        "edit_files",
+        "apply_patch",
+    ]
+    assert hotfix_boundary["ordinary_direct_mutation_status"] == (
+        "blocked_until_route_token_child_lineage_matches_latest_parent"
+    )
+    assert mismatch.value.details["repair"]["hotfix_exception_boundary"] == (
+        hotfix_boundary
+    )
 
     with pytest.raises(GovernanceError) as ref_mismatch:
         server.handle_graph_governance_runtime_context_implementation_evidence(
@@ -7549,6 +7562,9 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
     assert ref_mismatch.value.details["mismatched_fields"][0]["field"] == (
         "parent_route_lineage.route_id"
     )
+    assert ref_mismatch.value.details["hotfix_exception_boundary"][
+        "not_a_conflict"
+    ] is True
 
     with pytest.raises(GovernanceError) as missing:
         server.handle_graph_governance_runtime_context_implementation_evidence(
@@ -7568,6 +7584,9 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
     assert missing.value.details["repair"]["action"] == (
         "refresh_runtime_contract_or_reissue_child_route_token"
     )
+    assert missing.value.details["hotfix_exception_boundary"][
+        "exception_boundary"
+    ].startswith("hotfix_under_action is the audited hotfix exception lane")
 
     with pytest.raises(GovernanceError) as ref_missing:
         server.handle_graph_governance_runtime_context_implementation_evidence(
@@ -21899,6 +21918,24 @@ def test_observer_root_route_context_legacy_hotfix_prompts_qa_then_close_ready(c
     assert result["next_legal_action"]["deferred_missing_prerequisites"] == [
         "observer_work_mode_transition"
     ]
+    assert result["route_token_ref"] == "rtok-hotfix-qa-next"
+    assert result["canonical_route_identity"]["route_token_ref"] == (
+        "rtok-hotfix-qa-next"
+    )
+    assert result["next_legal_action_id"] == "independent_verification_lane"
+    assert result["next_action_actor"]
+    assert result["next_action_projection"]["next_legal_action_id"] == (
+        result["next_legal_action"]["id"]
+    )
+    assert result["next_action_projection"]["next_action_actor"] == (
+        result["next_action_actor"]
+    )
+    assert result["next_action_projection"]["route_token_ref"] == (
+        "rtok-hotfix-qa-next"
+    )
+    assert result["next_action_projection"]["route_token_ref_canonical_field"] == (
+        "route_token_ref"
+    )
 
     task_timeline.record_event(
         conn,
@@ -21928,6 +21965,11 @@ def test_observer_root_route_context_legacy_hotfix_prompts_qa_then_close_ready(c
 
     assert after_qa["contract_state"]["missing_evidence"] == ["close_ready"]
     assert after_qa["next_legal_action"]["id"] == "close_ready"
+    assert after_qa["next_legal_action_id"] == "close_ready"
+    assert after_qa["route_token_ref"] == "rtok-hotfix-qa-next"
+    assert after_qa["next_action_projection"]["route_token_ref"] == (
+        "rtok-hotfix-qa-next"
+    )
     assert after_qa["next_legal_action"]["precedence"] == (
         "legacy_hotfix_direct_followup"
     )
@@ -22122,6 +22164,13 @@ def test_observer_root_route_context_prioritizes_successor_contract_state_action
     assert result["work_mode"] == observer_session.WORK_MODE_EXECUTION_SUPERVISOR
     assert result["contract_state"]["next_legal_action"]["id"] == "hotfix_pre_reason"
     assert result["next_legal_action"]["id"] == "hotfix_pre_reason"
+    assert result["next_legal_action_id"] == "hotfix_pre_reason"
+    assert result["next_action_projection"]["next_legal_action_id"] == (
+        result["next_legal_action"]["id"]
+    )
+    assert result["next_action_projection"]["next_action_actor"] == (
+        result["next_action_actor"]
+    )
     assert result["next_legal_action"]["contract_execution_id"] == "cex-hotfix"
     assert result["next_legal_action"]["ordered_missing_steps_source"] == (
         "selected_successor_contract_state"
@@ -22176,6 +22225,12 @@ def test_observer_root_route_context_resolves_route_token_ref_identity(conn):
     )
     assert result["canonical_route_identity_complete"] is True
     assert result["route_token_ref_projection"]["resolved"] is True
+    assert result["next_action_projection"]["route_token_ref"] == (
+        issued["route_token_ref"]
+    )
+    assert result["next_action_projection"]["route_token_ref_canonical_field"] == (
+        "route_token_ref"
+    )
     assert (
         result["canonical_route_identity_source"]["source"]
         == "route_context_gate+observer_route_token_refs"
