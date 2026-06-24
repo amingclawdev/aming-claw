@@ -2418,6 +2418,52 @@ def _worker_startup_satisfies_requirement(event: Mapping[str, Any]) -> bool:
     return _worker_startup_actual_identity_present(event)
 
 
+def _finish_gate_satisfies_worker_requirement(event: Mapping[str, Any]) -> bool:
+    status = str(event.get("status") or event.get("decision") or "").strip().lower()
+    if status and status not in CONTRACT_PASS_STATUSES:
+        return False
+    event_kind = _event_kind(event).lower()
+    if event_kind not in {
+        "finish_gate",
+        "mf_subagent_finish_gate",
+        "mf_subagent.finish_gate",
+        "review_ready",
+    }:
+        return False
+    gate = _mapping(
+        _event_deep_value(
+            event,
+            {"mf_subagent_finish_gate", "finish_gate", "finish_gate_result"},
+        )
+    )
+    if not gate:
+        return False
+    close_ready = gate.get("close_ready")
+    if close_ready is not None and not _policy_truthy(close_ready):
+        return False
+    receipt_gate = _mapping(gate.get("receipt_gate"))
+    if receipt_gate:
+        receipt_status = str(receipt_gate.get("status") or "").strip().lower()
+        if receipt_status and receipt_status not in CONTRACT_PASS_STATUSES:
+            return False
+        if not (
+            _policy_truthy(receipt_gate.get("read_receipt_present"))
+            and _policy_truthy(receipt_gate.get("startup_present"))
+        ):
+            return False
+    startup_identity_gate = _mapping(gate.get("startup_worker_identity_gate"))
+    if startup_identity_gate and not _policy_truthy(
+        startup_identity_gate.get("passed")
+    ):
+        return False
+    worker_attestation_gate = _mapping(gate.get("worker_self_attestation_gate"))
+    if worker_attestation_gate and not _policy_truthy(
+        worker_attestation_gate.get("passed")
+    ):
+        return False
+    return True
+
+
 def _multiple_attempt_lineage_bridge_step(
     events: list[dict[str, Any]],
     *,
@@ -2526,6 +2572,13 @@ def _event_satisfies_requirement(
             matched = True
         elif _qa_verification_event_satisfies_requirement(event, requirement_id):
             matched = True
+        elif requirement_id in {
+            "mf_subagent_startup",
+            "worker_startup",
+            "mf_subagent_finish_gate",
+            "worker_finish_gate",
+        } and _finish_gate_satisfies_worker_requirement(event):
+            matched = True
         elif not _requirement_requires_event_kind_match(requirement):
             matched = any(
                 _payload_declares_requirement(payload, requirement_id)
@@ -2536,6 +2589,7 @@ def _event_satisfies_requirement(
     if (
         requirement_id == "mf_subagent_startup"
         and not _worker_startup_satisfies_requirement(event)
+        and not _finish_gate_satisfies_worker_requirement(event)
     ):
         return False, None
     required_execution_id = str(

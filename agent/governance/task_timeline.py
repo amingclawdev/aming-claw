@@ -4740,6 +4740,10 @@ def _route_event_markers(event: dict[str, Any]) -> set[str]:
         container = _mapping(event.get(key))
         for marker in container.keys():
             markers.add(str(marker).strip().lower())
+        for marker_key in ("route_id", "service_id", "event_kind", "kind"):
+            marker_value = str(container.get(marker_key) or "").strip().lower()
+            if marker_value:
+                markers.add(marker_value)
         for nested_key in (
             "route_context",
             "route_prompt_bundle",
@@ -4811,8 +4815,10 @@ def _route_event_categories(event: dict[str, Any]) -> set[str]:
             "route_action_precheck",
             "action_precheck",
             "pre_mutation",
+            "route.action_precheck",
             "route.action",
             "route.action.pre_mutation",
+            "event.route_action.pre_mutation",
             "route.action.requested",
             "route_action_allowed",
             "route_action_requested",
@@ -6572,7 +6578,7 @@ def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str
 
     event = _mapping(event)
     status = str(event.get("status") or event.get("decision") or "").strip().lower()
-    if not (bool(event.get("passed")) or status in MF_CLOSE_PASS_STATUSES):
+    if not (bool(event.get("passed")) or status in MF_ROUTE_CONTEXT_PASS_STATUSES):
         return set()
 
     ids: set[str] = set()
@@ -6593,6 +6599,8 @@ def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str
         })
     if "mf_subagent_startup" in categories:
         ids.add("mf_subagent_startup")
+    if _is_mf_subagent_read_receipt_event(event):
+        ids.update({"mf_subagent_read_receipt", "read_receipt"})
     if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in categories:
         ids.add(MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID)
     if MF_ROUTE_CONTEXT_ARCHITECTURE_REVIEW_ID in categories:
@@ -6614,6 +6622,7 @@ def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str
 
     gate = _mf_subagent_finish_gate_projection(event)
     if gate:
+        ids.add("mf_subagent_finish_gate")
         ids.update(_string_list(_mapping(gate.get("lane_ownership_projection")).get("evidence_ids")))
         ids.add(MF_BOUNDED_SUBAGENT_REVIEW_READY_ID)
         ids.update(_mf_subagent_finish_gate_projected_event_kinds(event))
@@ -6624,16 +6633,18 @@ def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str
 def _contract_evidence_ids(event: dict[str, Any]) -> set[str]:
     status = str(event.get("status") or "").strip().lower()
     event_passed = status in MF_CLOSE_PASS_STATUSES
+    canonical_event_passed = status in MF_ROUTE_CONTEXT_PASS_STATUSES
     ids: set[str] = set()
     payload = _mapping(event.get("payload"))
     verification = _mapping(event.get("verification"))
     artifact_refs = _mapping(event.get("artifact_refs"))
 
+    if canonical_event_passed:
+        ids.update(canonical_contract_evidence_ids_from_event(event))
     if event_passed:
         ids.update(_requirement_ids_from_container(payload))
         ids.update(_requirement_ids_from_container(verification))
         ids.update(_requirement_ids_from_container(artifact_refs))
-        ids.update(canonical_contract_evidence_ids_from_event(event))
 
     for container in (payload, verification, artifact_refs):
         _collect_contract_evidence_ids(

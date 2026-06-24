@@ -674,6 +674,47 @@ def _route_context_worker_startup_event(identity=None):
     }
 
 
+def _route_context_worker_finish_gate_event(identity=None, *, parent_task_id="BUG"):
+    route_identity = dict(identity or ROUTE_IDENTITY)
+    return {
+        "event_type": "mf_subagent.finish_gate",
+        "event_kind": "mf_subagent_finish_gate",
+        "phase": "finish_gate",
+        "status": "passed",
+        "task_id": f"{parent_task_id}-worker-a",
+        "payload": {
+            "mf_subagent_finish_gate": {
+                **route_identity,
+                "close_ready": True,
+                "parent_task_id": parent_task_id,
+                "task_id": f"{parent_task_id}-worker-a",
+                "runtime_context_id": "mfrctx-worker-a",
+                "worker_slot_id": "worker-a",
+                "changed_files": ["src/app.js"],
+                "head_commit": "head-test",
+                "startup_evidence": {
+                    **route_identity,
+                    "actual_cwd": "/repo/.worktrees/worker-a",
+                    "actual_git_root": "/repo/.worktrees/worker-a",
+                    "branch": "refs/heads/codex/worker-a",
+                    "head_commit": "head-test",
+                    "fence_token": "fence-test",
+                },
+                "receipt_gate": {
+                    "status": "passed",
+                    "read_receipt_present": True,
+                    "read_receipt_event_id_present": True,
+                    "startup_present": True,
+                    "observer_command_id_present": True,
+                },
+                "startup_worker_identity_gate": {"passed": True},
+                "worker_self_attestation_gate": {"passed": True},
+                "test_results": {"status": "passed"},
+            }
+        },
+    }
+
+
 def test_read_receipt_gate_reports_projection_fields_and_ordering_failure():
     from agent.governance import task_timeline
 
@@ -716,6 +757,55 @@ def test_read_receipt_gate_reports_projection_fields_and_ordering_failure():
     assert "read_receipt_hash" in fields["read_receipt"]
     assert "runtime_context_id" in fields["attempt_lineage_filter"]
     assert "read_receipt_order" in fields["ordering"]
+
+
+def test_contract_gate_counts_read_receipt_and_finish_gate_canonical_evidence():
+    from agent.governance import task_timeline
+
+    contract = {
+        "required_evidence": [
+            "route_action_precheck",
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+            "mf_subagent_finish_gate",
+        ]
+    }
+    route_action = {
+        "event_kind": "service_route",
+        "event_type": "service.route.completed",
+        "phase": "service_router",
+        "status": "allowed",
+        "payload": {
+            **ROUTE_IDENTITY,
+            "route_id": "event.route_action.pre_mutation",
+            "service_id": "route.action_precheck",
+            "status": "allowed",
+        },
+    }
+    read_receipt = _add_attempt_lineage(
+        _mf_subagent_read_receipt_event(event_id=2, identity=ROUTE_IDENTITY),
+        runtime_context_id="mfrctx-worker-a",
+        task_id="BUG-worker-a",
+        parent_task_id="BUG",
+    )
+    finish_gate = _route_context_worker_finish_gate_event(
+        ROUTE_IDENTITY,
+        parent_task_id="BUG",
+    )
+
+    gate = task_timeline.mf_contract_gate_verification(
+        [route_action, read_receipt, finish_gate],
+        contract=contract,
+    )
+
+    assert gate["passed"] is True
+    assert gate["missing_requirement_ids"] == []
+    assert set(gate["present_requirement_ids"]) >= {
+        "route_action_precheck",
+        "mf_subagent_read_receipt",
+        "mf_subagent_startup",
+        "mf_subagent_finish_gate",
+    }
 
 
 def test_route_startup_gate_reports_runtime_context_projection_evidence_fields():

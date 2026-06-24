@@ -1261,6 +1261,53 @@ def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
     )
 
 
+def test_finish_gate_completion_satisfies_worker_startup_and_finish_requirements():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_execution_id": "cex-parallel-root",
+            "state": "selected",
+            "required_evidence": [
+                "mf_subagent_startup",
+                "mf_subagent_finish_gate",
+                "independent_verification_lane",
+            ],
+        }
+    }
+    finish_gate = _event(
+        23,
+        "mf_subagent_finish_gate",
+        payload={
+            "mf_subagent_finish_gate": {
+                "close_ready": True,
+                "receipt_gate": {
+                    "status": "passed",
+                    "read_receipt_present": True,
+                    "startup_present": True,
+                },
+                "startup_worker_identity_gate": {"passed": True},
+                "worker_self_attestation_gate": {"passed": True},
+                "parent_task_id": "AC-CONTRACT-RUNTIME",
+                "task_id": "AC-CONTRACT-RUNTIME-worker-a",
+                "runtime_context_id": "mfrctx-worker-a",
+            }
+        },
+    )
+
+    projection = build_contract_state_projection(
+        [finish_gate],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    completed = {item["id"] for item in projection["completed_evidence"]}
+    assert "mf_subagent_startup" in completed
+    assert "mf_subagent_finish_gate" in completed
+    assert projection["missing_evidence"] == ["independent_verification_lane"]
+    assert projection["next_legal_action"]["id"] == "independent_verification_lane"
+
+
 def test_bound_root_default_requirements_drive_next_action_without_active_execution():
     projection = build_contract_state_projection(
         [
