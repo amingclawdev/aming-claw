@@ -3171,6 +3171,19 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(step_ids[0], "implementation")
         self.assertEqual(next_action["id"], "implementation")
 
+    def test_route_context_artifact_ref_named_cleanup_does_not_supersede_event(self):
+        from agent.governance import task_timeline
+
+        events = _route_context_consumption_events()
+        events[0]["id"] = 6499
+        events[0]["artifact_refs"] = {"route_identity_cleanup": "timeline:6498"}
+
+        gate = task_timeline.mf_route_context_gate_verification(events)
+
+        self.assertFalse(gate["route_identity_cleanup"]["applied"])
+        self.assertIn("route_context", gate["present_requirement_ids"])
+        self.assertNotIn("route_context", gate["missing_requirement_ids"])
+
     def test_root_route_context_next_action_names_hotfix_implementation_close_evidence(self):
         from agent.governance import server
 
@@ -11223,6 +11236,97 @@ class TestTaskTimeline(unittest.TestCase):
         serialized = json.dumps(result, sort_keys=True)
         self.assertNotIn('"route_token":', serialized)
         self.assertNotIn("session_token", serialized)
+
+    def test_backlog_timeline_gate_repair_view_reuses_close_ready_close_token(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-MF-REPAIR-REUSE-CLOSE-READY-TOKEN"
+        close_commit = "c10eed0000000000000000000000000000000000"
+        issued = self._issue_route_token(
+            bug_id,
+            allowed_actions=["task_timeline_append", "backlog_close"],
+        )
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": bug_id},
+                body={
+                    "title": "MF timeline repair reuses close-ready token",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                    "target_files": ["agent/governance/task_timeline.py"],
+                },
+                method="POST",
+            )
+        )
+
+        for kind, status in (
+            ("implementation", "accepted"),
+            ("verification", "passed"),
+        ):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                task_id=bug_id,
+                event_type=f"mf.{kind}",
+                phase=kind,
+                event_kind=kind,
+                status=status,
+                commit_sha=close_commit,
+            )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=bug_id,
+            task_id=bug_id,
+            event_type="mf.close_ready",
+            phase="close",
+            event_kind="close_ready",
+            status="accepted",
+            commit_sha=close_commit,
+            payload={
+                "commit_sha": close_commit,
+                "route_token_ref": issued["route_token_ref"],
+                "route_token_gate": {
+                    "schema_version": "route_token_mutation_gate.v1",
+                    "decision": "route_token_ref_resolved",
+                    "status": "accepted",
+                    "allowed": True,
+                    "action": "task_timeline_append",
+                    "route_token_ref": issued["route_token_ref"],
+                    "server_issued_binding": True,
+                    "resolved_from_ref": True,
+                    "binding_source": "observer_route_token_refs",
+                    "scope": {
+                        "project_id": "proj",
+                        "backlog_id": bug_id,
+                        "task_id": bug_id,
+                    },
+                },
+            },
+        )
+        self.conn.commit()
+
+        result = server.handle_backlog_timeline_gate(
+            _ctx(
+                {"view": "repair", "close_commit": close_commit},
+                path_params={"bug_id": bug_id},
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["can_close"], result)
+        hint = result["repair_summary"]["backlog_close_route_token_request_hint"]
+        self.assertTrue(hint["backlog_close_authorized"])
+        self.assertFalse(hint["authorization_required"])
+        self.assertEqual(hint["action"], "backlog_close")
+        self.assertEqual(hint["route_token_ref"], issued["route_token_ref"])
+        self.assertEqual(
+            result["repair_summary"]["deterministic_actions"][0],
+            hint,
+        )
+        self.assertNotIn("issue_route_token_request", hint)
 
     def test_backlog_timeline_gate_repair_view_quarantines_archive_for_empty_active_row(self):
         from agent.governance import server

@@ -31878,6 +31878,102 @@ def _observer_root_route_close_action_drives_next_step(
     return status in {"close_commit_required", "ready", "refresh_required"}
 
 
+def _observer_root_route_projection_authorizes_action(
+    projection: Mapping[str, Any],
+    action: str,
+) -> bool:
+    normalized_action = _observer_root_route_normalize_action(action)
+    allowed = {
+        _observer_root_route_normalize_action(item)
+        for item in projection.get("allowed_actions") or []
+        if str(item or "").strip()
+    }
+    return bool(projection.get("resolved") and normalized_action in allowed)
+
+
+def _observer_root_route_close_ready_token_ref_candidates(
+    event: Mapping[str, Any],
+) -> list[str]:
+    refs: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text.startswith("rtok-") and text not in refs:
+            refs.append(text)
+
+    add(event.get("route_token_ref"))
+    for container_key in ("payload", "verification"):
+        container = event.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        add(container.get("route_token_ref"))
+        gate = container.get("route_token_gate")
+        if isinstance(gate, Mapping):
+            add(gate.get("route_token_ref"))
+    gate = event.get("route_token_gate")
+    if isinstance(gate, Mapping):
+        add(gate.get("route_token_ref"))
+    return refs
+
+
+def _observer_root_route_event_order(event: Mapping[str, Any]) -> int:
+    for key in ("id", "event_id"):
+        try:
+            return int(event.get(key) or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _observer_root_route_close_ready_route_token_ref_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    for event in sorted(
+        (item for item in events if isinstance(item, Mapping)),
+        key=_observer_root_route_event_order,
+        reverse=True,
+    ):
+        event_kind = _observer_root_route_normalize_action(
+            event.get("event_kind") or event.get("event_type")
+        )
+        if event_kind != "close_ready":
+            continue
+        status = str(event.get("status") or event.get("decision") or "").strip().lower()
+        if status not in {
+            "accepted",
+            "passed",
+            "ok",
+            "succeeded",
+            "success",
+            "complete",
+            "completed",
+        }:
+            continue
+        for route_token_ref in _observer_root_route_close_ready_token_ref_candidates(event):
+            projection = _observer_root_route_identity_from_route_token_ref(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+            )
+            if _observer_root_route_projection_authorizes_action(
+                projection,
+                "backlog_close",
+            ):
+                projection["source"] = "close_ready_route_token_ref"
+                projection["source_event_ref"] = (
+                    f"timeline:{_observer_root_route_event_order(event)}"
+                )
+                return projection
+    return {}
+
+
 def _timeline_gate_backlog_close_route_token_request_hint(
     conn,
     *,
@@ -31908,6 +32004,19 @@ def _timeline_gate_backlog_close_route_token_request_hint(
         task_id=task_id,
         route_token_ref=query.get("route_token_ref", ""),
     )
+    if not _observer_root_route_projection_authorizes_action(
+        route_token_ref_projection,
+        "backlog_close",
+    ):
+        close_ready_projection = _observer_root_route_close_ready_route_token_ref_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            events=events,
+        )
+        if close_ready_projection:
+            route_token_ref_projection = close_ready_projection
     action_card = _observer_root_route_close_action_card(
         verification,
         route_token_ref_projection,
@@ -32012,6 +32121,9 @@ def _timeline_gate_backlog_close_route_token_request_hint(
     route_token_ref = str(action_card.get("route_token_ref") or "").strip()
     if route_token_ref:
         hint["route_token_ref"] = route_token_ref
+    if authorized:
+        hint.pop("issue_route_token_request", None)
+        hint.pop("route_token_issue_entrypoint", None)
     return {key: value for key, value in hint.items() if value not in ("", [], {})}
 
 

@@ -166,6 +166,7 @@ _PARENT_ROUTE_RAW_TOKEN_FIELDS: tuple[str, ...] = (
 )
 _PARENT_ROUTE_CANONICAL_EVENT_IDS: tuple[str, ...] = (
     "event.route_prompt_context.preview",
+    "event.route_action.pre_mutation",
 )
 
 
@@ -704,7 +705,8 @@ def build_parent_route_lineage(
     if not _valid_parent_route_id(_string(parent.get("route_id"))):
         raise ValueError(
             "parent_route_identity route_id must be a public canonical route id "
-            "(route-* or event.route_prompt_context.preview)"
+            "(route-*, event.route_prompt_context.preview, or "
+            "event.route_action.pre_mutation)"
         )
     if not _string(parent.get("prompt_contract_id")).startswith("rprompt-"):
         raise ValueError(

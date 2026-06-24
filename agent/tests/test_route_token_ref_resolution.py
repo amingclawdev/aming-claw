@@ -66,7 +66,7 @@ _TARGET_FILES = [
     "agent/governance/task_timeline.py",
     "agent/governance/server.py",
 ]
-_NOW = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2099, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _make_token(**overrides: Any) -> dict[str, Any]:

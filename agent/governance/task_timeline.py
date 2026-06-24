@@ -4484,8 +4484,37 @@ def _route_startup_adoption_evidence_valid(event: dict[str, Any]) -> bool:
 
 
 def _route_event_is_identity_cleanup(event: dict[str, Any]) -> bool:
-    markers = {_route_marker(marker) for marker in _route_event_markers(event)}
+    markers = {
+        _route_marker(marker)
+        for marker in _route_event_identity_cleanup_markers(event)
+    }
     return bool(markers.intersection(MF_ROUTE_IDENTITY_CLEANUP_MARKERS))
+
+
+def _route_event_identity_cleanup_markers(event: dict[str, Any]) -> set[str]:
+    markers: set[str] = set()
+    for key in ("event_kind", "event_type", "phase", "schema_version"):
+        value = str(event.get(key) or "").strip().lower()
+        if value:
+            markers.add(value)
+    for key in event.keys():
+        markers.add(str(key).strip().lower())
+    for key in ("payload", "verification"):
+        container = _mapping(event.get(key))
+        for marker in container.keys():
+            markers.add(str(marker).strip().lower())
+        for nested_key in (
+            "route_identity_cleanup",
+            "route_identity_recovery",
+            "route_identity_supersede",
+        ):
+            nested = container.get(nested_key)
+            if nested not in (None, "", [], {}):
+                markers.add(nested_key)
+                if isinstance(nested, dict):
+                    for marker in nested.keys():
+                        markers.add(str(marker).strip().lower())
+    return markers
 
 
 def _route_event_markers(event: dict[str, Any]) -> set[str]:

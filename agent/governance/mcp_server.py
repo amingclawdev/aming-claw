@@ -707,7 +707,8 @@ TOOLS: list[dict] = [
                     "description": (
                         "Optional public-only canonical parent route identity to bind "
                         "the issued worker route as a child. Accepts public fields such "
-                        "as route_id (route-* or event.route_prompt_context.preview), "
+                        "as route_id (route-*, event.route_prompt_context.preview, "
+                        "or event.route_action.pre_mutation), "
                         "route_context_hash, prompt_contract_id, prompt_contract_hash, "
                         "visible_injection_manifest_hash, selected_project, "
                         "selected_backlog_id, and opaque route_token_ref. Raw route or "
@@ -726,7 +727,11 @@ TOOLS: list[dict] = [
                 },
                 "parent_route_id": {
                     "type": "string",
-                    "description": "Explicit public parent route id (route-* or event.route_prompt_context.preview).",
+                    "description": (
+                        "Explicit public parent route id (route-*, "
+                        "event.route_prompt_context.preview, or "
+                        "event.route_action.pre_mutation)."
+                    ),
                 },
                 "parent_route_context_hash": {
                     "type": "string",

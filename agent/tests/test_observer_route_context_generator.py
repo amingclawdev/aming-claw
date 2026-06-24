@@ -640,6 +640,16 @@ def test_parent_lineage_also_accepts_generated_route_id():
     assert issued["parent_route_lineage"]["route_id"] == generated_parent["route_id"]
 
 
+def test_parent_lineage_accepts_route_action_pre_mutation_event_id():
+    route_action_parent = dict(_PARENT_ROUTE_IDENTITY)
+    route_action_parent["route_id"] = "event.route_action.pre_mutation"
+
+    issued = _issue(parent_route_identity=route_action_parent)
+
+    assert issued["parent_route_lineage"]["route_id"] == "event.route_action.pre_mutation"
+    assert issued["route_lineage"]["parent_route_id"] == "event.route_action.pre_mutation"
+
+
 def test_incomplete_or_mismatched_parent_route_identity_fails_closed():
     incomplete = {
         "route_id": _PARENT_ROUTE_IDENTITY["route_id"],
@@ -1001,6 +1011,10 @@ def test_mcp_route_context_issue_schema_exposes_parent_identity_fields():
 
     assert props["parent_route_identity"]["type"] == "object"
     assert "event.route_prompt_context.preview" in props["parent_route_id"]["description"]
+    assert (
+        "event.route_action.pre_mutation"
+        in props["parent_route_id"]["description"]
+    )
     for key in (
         "route_id",
         "route_context_hash",
