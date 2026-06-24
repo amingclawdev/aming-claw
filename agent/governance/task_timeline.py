@@ -398,6 +398,9 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
 
     if not isinstance(event, dict):
         return False
+    status = _text(event.get("status") or event.get("decision")).lower()
+    if status and status not in MF_CLOSE_PASS_STATUSES:
+        return False
     tokens = {
         _text(event.get("event_kind")).lower().replace("-", "_"),
         _text(event.get("phase")).lower().replace("-", "_"),

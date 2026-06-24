@@ -12413,6 +12413,40 @@ def test_close_gate_accepts_same_backlog_scope_evidence():
     assert gate["rejected_cross_ref_evidence"] == []
 
 
+def test_close_gate_ignores_failed_qa_as_protected_cross_ref_evidence():
+    from agent.governance import task_timeline
+
+    row_identity = {
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "task_id": "root-task",
+    }
+    failed_qa = {
+        "id": 1,
+        "event_kind": "qa_verification",
+        "phase": "verification",
+        "status": "failed",
+        "backlog_id": "AC-A",
+        "project_id": "aming-claw",
+        "task_id": "worker-task",
+        "payload": {
+            "parent_task_id": "AC-A",
+            "runtime_context_id": "mfrctx-worker",
+            "worker_slot_id": "worker-a",
+            "route_token_ref": "rtok-child",
+        },
+    }
+
+    assert task_timeline.is_protected_close_evidence(failed_qa) is False
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [failed_qa],
+        row_identity,
+    )
+
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+
+
 def test_close_gate_normalizes_structured_scope_for_same_row():
     from agent.governance import task_timeline
 
