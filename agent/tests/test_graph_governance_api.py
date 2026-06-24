@@ -16290,6 +16290,213 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     )
 
 
+def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_failed_qa(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-rejoin-failed-qa"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-rejoin-failed-qa",
+            root_task_id="parent-runtime-rejoin-failed-qa",
+            backlog_id="AC-RUNTIME-TOKEN-REJOIN-FAILED-QA",
+            stage_task_id="worker-runtime-rejoin-failed-qa",
+            worker_id="worker-runtime-rejoin-failed-qa",
+            worker_slot_id="slot-runtime-rejoin-reviewfail",
+            branch_ref="refs/heads/codex/worker-runtime-rejoin-failed-qa",
+            status=STATE_VALIDATED,
+            fence_token="fence-runtime-rejoin-failed-qa",
+            session_token_hash=mf_subagent_session_token_hash("lost-runtime-token"),
+            attempt=1,
+            retry_round=0,
+        ),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="read_receipt",
+        status="accepted",
+        actor=context.worker_slot_id,
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.root_task_id,
+            "worker_role": "mf_sub",
+            "worker_slot_id": context.worker_slot_id,
+            "read_receipt_hash": "sha256:runtime-rejoin-failed-qa-read",
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup",
+        status="accepted",
+        actor=context.worker_slot_id,
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.root_task_id,
+            "worker_role": "mf_sub",
+            "worker_session_id": context.worker_slot_id,
+            "filer_principal": context.worker_slot_id,
+            "session_token_evidence_type": "server_verified",
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="independent_verification.completed",
+        event_kind="independent_verification",
+        phase="verification",
+        status="failed",
+        actor="independent-qa",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "reviewer_role": "independent_qa",
+            "requirement_id": "independent_verification_lane",
+            "findings": [{"title": "default reminder is on"}],
+        },
+        verification={
+            "requirement_id": "independent_verification_lane",
+            "result": "failed",
+            "acceptance_failed": [2],
+        },
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": context.task_id,
+                "parent_task_id": context.root_task_id,
+                "target_project_root": str(target_root),
+                "reason": "failed independent QA requires worker revision after resume",
+                "now_iso": "2026-06-24T17:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_rejoin_issued"
+    assert result["reopen_for_revision"] is True
+    assert result["previous_status"] == STATE_VALIDATED
+    assert result["current_status"] == STATE_WORKTREE_READY
+    assert result["attempt"] == 2
+    assert result["retry_round"] == 1
+    saved = get_branch_context(conn, PID, context.task_id)
+    assert saved is not None
+    assert saved.status == STATE_WORKTREE_READY
+    assert saved.last_recovery_action == "mf_subagent_failed_qa_revision_rejoin_issued"
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            query={
+                "parent_task_id": context.root_task_id,
+                "fence_token": result["fence_token"],
+                "session_token": result["session_token"],
+                "target_project_root": str(target_root),
+                "view": "all",
+            },
+        )
+    )
+    action_plan = current["executable_contract"]
+    assert action_plan["next_legal_action"] == "revise_after_failed_independent_qa"
+    assert action_plan["next_required_evidence"][0]["id"] == "failed_qa_revision"
+
+
+def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_without_failed_qa(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-rejoin-no-failed-qa"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-rejoin-no-failed-qa",
+            root_task_id="parent-runtime-rejoin-no-failed-qa",
+            backlog_id="AC-RUNTIME-TOKEN-REJOIN-NO-FAILED-QA",
+            stage_task_id="worker-runtime-rejoin-no-failed-qa",
+            worker_id="worker-runtime-rejoin-no-failed-qa",
+            worker_slot_id="slot-runtime-rejoin-no-failed-review",
+            branch_ref="refs/heads/codex/worker-runtime-rejoin-no-failed-qa",
+            status=STATE_VALIDATED,
+            fence_token="fence-runtime-rejoin-no-failed-qa",
+            session_token_hash=mf_subagent_session_token_hash("lost-runtime-token"),
+        ),
+    )
+    for event_kind, event_type, phase in (
+        ("mf_subagent_read_receipt", "mf_subagent.read_receipt", "read_receipt"),
+        ("mf_subagent_startup", "mf_subagent.startup", "startup"),
+    ):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+            event_type=event_type,
+            event_kind=event_kind,
+            phase=phase,
+            status="accepted",
+            actor=context.worker_slot_id,
+            payload={
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": context.root_task_id,
+                "worker_role": "mf_sub",
+                "worker_slot_id": context.worker_slot_id,
+                "worker_session_id": context.worker_slot_id,
+                "read_receipt_hash": "sha256:runtime-rejoin-no-failed-qa-read",
+            },
+        )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as blocked:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "target_project_root": str(target_root),
+                    "reason": "host worker session lost raw auth env after resume",
+                },
+            )
+        )
+
+    assert blocked.value.code == "fence_invalidated_or_unknown"
+    assert blocked.value.details["context_status"] == STATE_VALIDATED
+    assert blocked.value.details["reopen_for_revision"] is False
+
+
 def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_context(
     conn,
     tmp_path,

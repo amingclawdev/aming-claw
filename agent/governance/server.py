@@ -7099,7 +7099,9 @@ def _runtime_context_service_timeline_refs(
         event_type = str(event.get("event_type") or "")
         event_kind = str(event.get("event_kind") or "")
         phase = str(event.get("phase") or "")
-        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        payload = (
+            event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        )
         event_type_normalized = event_type.strip().lower().replace("-", "_")
         event_kind_normalized = event_kind.strip().lower().replace("-", "_")
         phase_normalized = phase.strip().lower().replace("-", "_")
@@ -13323,6 +13325,83 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         conn.close()
 
 
+def _runtime_context_failed_qa_revision_rejoin_allowed(
+    *,
+    context: Any,
+    runtime_context_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> bool:
+    from .parallel_branch_runtime import FAILED_QA_REVISION_REJOIN_STATES
+
+    if getattr(context, "status", "") not in FAILED_QA_REVISION_REJOIN_STATES:
+        return False
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    runtime_id = str(runtime_context_id or "").strip()
+    blocking_statuses = {"blocked", "error", "fail", "failed", "invalid", "rejected"}
+    qa_kinds = {"independent_verification", "qa_review", "qa_verification"}
+
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        verification = (
+            event.get("verification")
+            if isinstance(event.get("verification"), Mapping)
+            else {}
+        )
+        event_task_id = str(
+            event.get("task_id")
+            or payload.get("task_id")
+            or verification.get("task_id")
+            or ""
+        ).strip()
+        if event_task_id and task_id and event_task_id != task_id:
+            continue
+        event_backlog_id = str(
+            event.get("backlog_id") or payload.get("backlog_id") or ""
+        ).strip()
+        if event_backlog_id and backlog_id and event_backlog_id != backlog_id:
+            continue
+        event_runtime_id = str(
+            payload.get("runtime_context_id")
+            or verification.get("runtime_context_id")
+            or ""
+        ).strip()
+        if event_runtime_id and runtime_id and event_runtime_id != runtime_id:
+            continue
+
+        event_kind = str(event.get("event_kind") or "").strip().lower()
+        event_type = str(event.get("event_type") or "").strip().lower()
+        status = str(
+            event.get("status")
+            or verification.get("result")
+            or payload.get("status")
+            or ""
+        ).strip().lower()
+        if status not in blocking_statuses:
+            continue
+
+        qa_marker = " ".join(
+            str(value or "").strip().lower()
+            for value in (
+                event_kind,
+                event_type,
+                payload.get("reviewer_role"),
+                payload.get("requirement_id"),
+                verification.get("requirement_id"),
+            )
+            if str(value or "").strip()
+        )
+        if (
+            event_kind in qa_kinds
+            or "independent_verification" in qa_marker
+            or "independent_qa" in qa_marker
+        ):
+            return True
+    return False
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestContext):
@@ -13411,6 +13490,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "fail_closed": True,
                 },
             )
+        reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+        )
         try:
             result = rejoin_mf_subagent_runtime_session_token(
                 conn,
@@ -13427,6 +13511,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 ttl_seconds=body.get("ttl_seconds"),
                 reason=reason,
                 now_iso=str(body.get("now_iso") or ""),
+                reopen_for_revision=reopen_for_revision,
             )
         except BranchRuntimeFenceError as exc:
             raise GovernanceError(
@@ -13437,6 +13522,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "runtime_context_id": runtime_context_id,
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
+                    "context_status": getattr(context, "status", ""),
+                    "reopen_for_revision": reopen_for_revision,
                     "reason": str(exc) or "fence_invalidated_or_unknown",
                     "fail_closed": True,
                 },
@@ -13462,6 +13549,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "operator_session_role": session_role(session),
                 "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
                 "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
+                "reopen_for_revision": reopen_for_revision,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
             }
         )

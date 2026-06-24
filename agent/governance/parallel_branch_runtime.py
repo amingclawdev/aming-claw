@@ -298,6 +298,10 @@ ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
     STATE_WORKTREE_READY,
     STATE_RUNNING,
 }
+FAILED_QA_REVISION_REJOIN_STATES = {
+    STATE_VALIDATED,
+    STATE_MERGE_READY,
+}
 MF_SUBAGENT_SESSION_REISSUE_DEFAULT_TTL_SECONDS = 3600
 MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS = 28800
 MF_SUBAGENT_SESSION_REISSUE_MIN_TTL_SECONDS = 60
@@ -7745,6 +7749,7 @@ def rejoin_mf_subagent_runtime_session_token(
     ttl_seconds: Any = None,
     reason: str = "",
     now_iso: str = "",
+    reopen_for_revision: bool = False,
 ) -> dict[str, Any]:
     """Issue a new host envelope for an existing worker context.
 
@@ -7764,7 +7769,13 @@ def rejoin_mf_subagent_runtime_session_token(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+    revision_rejoin = bool(
+        reopen_for_revision and context.status in FAILED_QA_REVISION_REJOIN_STATES
+    )
+    if (
+        context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+        and not revision_rejoin
+    ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     requested_target_root = _startup_path_text(target_project_root)
@@ -7803,7 +7814,14 @@ def rejoin_mf_subagent_runtime_session_token(
             lease_id=lease_id,
             lease_expires_at=expires_at,
             session_token_hash=new_hash,
-            last_recovery_action="mf_subagent_session_token_rejoin_issued",
+            status=STATE_WORKTREE_READY if revision_rejoin else context.status,
+            retry_round=context.retry_round + (1 if revision_rejoin else 0),
+            attempt=context.attempt + (1 if revision_rejoin else 0),
+            last_recovery_action=(
+                "mf_subagent_failed_qa_revision_rejoin_issued"
+                if revision_rejoin
+                else "mf_subagent_session_token_rejoin_issued"
+            ),
         ),
         now_iso=_runtime_context_iso(now_dt),
     )
@@ -7825,6 +7843,11 @@ def rejoin_mf_subagent_runtime_session_token(
         "worker_id": saved.worker_id,
         "worker_slot_id": saved.worker_slot_id or saved.worker_id,
         "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
+        "reopen_for_revision": revision_rejoin,
+        "previous_status": context.status,
+        "current_status": saved.status,
+        "attempt": saved.attempt,
+        "retry_round": saved.retry_round,
         "session_token": new_token,
         "session_token_hash": new_hash,
         "session_token_ref": runtime_context_session_token_ref(saved),
