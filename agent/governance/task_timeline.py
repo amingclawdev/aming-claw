@@ -8936,6 +8936,7 @@ def compact_gate_summary(
     can_close = passed
 
     missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    parent_successor_gap = _parent_successor_close_model_gap(full_result)
 
     gate_keys = [
         "contract_gate",
@@ -8971,6 +8972,10 @@ def compact_gate_summary(
                 repair = {}
             if repair:
                 repair = _gate_repair_with_cross_ref_context(key, repair, full_result)
+                repair = _repair_with_parent_successor_close_model_context(
+                    repair,
+                    parent_successor_gap,
+                )
                 compact_repair = _compact_gate_repair_projection(repair)
                 for field in (
                     "diagnosis",
@@ -8987,6 +8992,7 @@ def compact_gate_summary(
                     "append_payload_hint",
                     "repair_view_hint",
                     "advisory_only",
+                    "suppressed_by_parent_successor_close_model",
                 ):
                     value = compact_repair.get(field)
                     if value not in ("", [], {}, None):
@@ -9010,6 +9016,18 @@ def compact_gate_summary(
     }
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
+    if parent_successor_gap:
+        summary["parent_successor_close_model_gap"] = parent_successor_gap
+        repair_reasons = [
+            parent_successor_gap["repair_reason"],
+            *repair_reasons,
+        ]
+        next_legal_actions = _dedupe_nonempty(
+            [
+                parent_successor_gap["next_action"],
+                *next_legal_actions,
+            ]
+        )
     if not_applicable and not repair_reasons:
         repair_reasons = [
             {
@@ -9056,6 +9074,210 @@ MF_REPAIR_GATE_KEYS = [
     "close_commit_evidence_gate",
     "close_timeline_startup_gate",
 ]
+
+
+def _parent_successor_close_model_gap(full_result: dict[str, Any]) -> dict[str, Any]:
+    """Detect parent rows where normal close would require invented history."""
+
+    if bool(full_result.get("passed") or full_result.get("can_close")):
+        return {}
+
+    route_context_gate = _mapping(full_result.get("route_context_gate"))
+    contract_policy = _mapping(route_context_gate.get("contract_close_gate_policy"))
+    if not contract_policy:
+        contract_policy = _mapping(
+            _mapping(full_result.get("independent_qa_gate")).get(
+                "contract_close_gate_policy"
+            )
+        )
+    if not contract_policy:
+        return {}
+
+    hotfix_events = _mapping(contract_policy.get("hotfix_events"))
+    post_events = [
+        _mapping(item)
+        for item in _list(hotfix_events.get("post_events"))
+        if _mapping(item)
+    ]
+    hotfix_active = bool(
+        _truthy(contract_policy.get("hotfix_contract_active"))
+        or _truthy(hotfix_events.get("active"))
+        or post_events
+    )
+    inferred_successor_template_id = str(
+        contract_policy.get("inferred_template_id") or ""
+    ).strip()
+    if (
+        not hotfix_active
+        and inferred_successor_template_id != OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+    ):
+        return {}
+
+    parent_template_id = str(
+        contract_policy.get("explicit_template_id")
+        or contract_policy.get("selected_close_policy_lane_template_id")
+        or contract_policy.get("template_id")
+        or ""
+    ).strip()
+    if not parent_template_id:
+        parent_template_id = str(
+            _mapping(contract_policy.get("active_lane_contract")).get(
+                "contract_template_id"
+            )
+            or ""
+        ).strip()
+    if (
+        not parent_template_id
+        or parent_template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+    ):
+        return {}
+
+    missing_event_kinds = [
+        str(item)
+        for item in _list(full_result.get("missing_event_kinds"))
+        if str(item or "").strip()
+    ]
+    contract_missing = [
+        str(item)
+        for item in _list(
+            _mapping(full_result.get("contract_gate")).get("missing_requirement_ids")
+        )
+        if str(item or "").strip()
+    ]
+    route_missing = [
+        str(item)
+        for item in _list(route_context_gate.get("missing_requirement_ids"))
+        if str(item or "").strip()
+    ]
+    ignored_hotfix_events = [
+        _mapping(item)
+        for item in _list(full_result.get("ignored_required_events"))
+        if str(_mapping(item).get("event_kind") or "").strip() == "hotfix_under_action"
+        and str(_mapping(item).get("reason") or "").strip()
+        == "hotfix_contract_policy_not_active"
+    ]
+    parent_close_symptoms = bool(
+        {"implementation", "close_ready"}.intersection(missing_event_kinds)
+        or contract_missing
+        or {"bounded_implementation_worker_dispatch", "mf_subagent_startup"}.intersection(
+            route_missing
+        )
+        or ignored_hotfix_events
+    )
+    if not parent_close_symptoms:
+        return {}
+
+    qa_gate = _mapping(full_result.get("independent_qa_gate"))
+    close_commit_gate = _mapping(full_result.get("close_commit_evidence_gate"))
+    active_lane = _mapping(contract_policy.get("active_lane_contract"))
+    lane_next_action = _mapping(active_lane.get("next_legal_action"))
+    successor_template_id = (
+        inferred_successor_template_id
+        if inferred_successor_template_id == OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+        else OBSERVER_HOTFIX_DIRECT_MUTATION_TEMPLATE_ID
+    )
+    next_action = "select_successor_or_audit_close_for_parent_contract"
+    recommended_action = (
+        "Do not append generic implementation, route_context, or close_ready "
+        "skeletons to this parent contract row. Keep the parent row open or "
+        "bind/close an explicit implementation successor contract such as "
+        f"{successor_template_id}; if the historical evidence cannot be "
+        "reconstructed, use an explicit audit-close/archive recovery path with "
+        "independent QA instead of fabricating timeline evidence."
+    )
+    hotfix_refs = _dedupe_nonempty(
+        [
+            f"timeline:{event.get('id')}"
+            for event in [
+                *[
+                    _mapping(item)
+                    for item in _list(hotfix_events.get("pre_events"))
+                    if _mapping(item)
+                ],
+                *post_events,
+                *ignored_hotfix_events,
+            ]
+            if event.get("id") not in ("", None)
+        ]
+    )
+    return {
+        "schema_version": "mf_parent_successor_close_model_gap.v1",
+        "status": "blocked",
+        "active": True,
+        "code": "parent_successor_close_model_gap",
+        "diagnosis": "parent contract row is not the implementation successor",
+        "parent_contract_template_id": parent_template_id,
+        "successor_contract_template_id": successor_template_id,
+        "contract_chain_id": str(active_lane.get("contract_chain_id") or "").strip(),
+        "parent_contract_execution_id": str(
+            active_lane.get("contract_execution_id") or ""
+        ).strip(),
+        "parent_contract_next_action": str(
+            lane_next_action.get("id")
+            or lane_next_action.get("action")
+            or lane_next_action.get("operation")
+            or ""
+        ).strip(),
+        "missing_event_kinds": missing_event_kinds,
+        "contract_gate_missing_requirement_ids": contract_missing,
+        "route_context_gate_missing_requirement_ids": route_missing,
+        "hotfix_event_refs": hotfix_refs,
+        "ignored_hotfix_event_ids": _dedupe_nonempty(
+            [item.get("id") for item in ignored_hotfix_events]
+        ),
+        "independent_qa_passed": bool(qa_gate.get("passed")),
+        "close_commit_evidence_passed": bool(close_commit_gate.get("passed")),
+        "normal_close_blocked": True,
+        "suppress_normal_repair_skeletons": True,
+        "next_action": next_action,
+        "recommended_legal_action": recommended_action,
+        "repair_reason": {
+            "code": "parent_successor_close_model_gap",
+            "reason": (
+                "The active close policy lane is a parent/onboard contract while "
+                "hotfix implementation evidence appears under a successor-style "
+                "lane; normal parent close would require reconstructing historical "
+                "onboard/route-context evidence."
+            ),
+            "message": recommended_action,
+            "next_legal_action": next_action,
+        },
+        "advisory_only": True,
+    }
+
+
+def _repair_with_parent_successor_close_model_context(
+    repair: dict[str, Any],
+    parent_successor_gap: dict[str, Any],
+) -> dict[str, Any]:
+    if not parent_successor_gap:
+        return repair
+    gate = str(repair.get("gate") or repair.get("failed_gate_name") or "").strip()
+    if gate not in {
+        "contract_gate",
+        "route_context_gate",
+        "close_commit_evidence_gate",
+        "contract_projection_gate",
+    }:
+        return repair
+    contextual = dict(repair)
+    contextual["diagnosis"] = parent_successor_gap["diagnosis"]
+    contextual["recommended_legal_action"] = parent_successor_gap[
+        "recommended_legal_action"
+    ]
+    contextual["next_action"] = parent_successor_gap["next_action"]
+    contextual["normal_close_blocked"] = True
+    contextual["suppressed_by_parent_successor_close_model"] = True
+    contextual["suggested_event_kind"] = "contract_successor_selection"
+    contextual["reasons"] = _dedupe_nonempty(
+        [
+            *_list(contextual.get("reasons")),
+            parent_successor_gap["repair_reason"]["reason"],
+        ]
+    )
+    contextual.pop("append_payload_skeleton", None)
+    contextual.pop("finish_gate_facade_payload_skeleton", None)
+    return contextual
 
 
 def _unique_compact_values(values: list[Any]) -> list[Any]:
@@ -9934,6 +10156,7 @@ def _compact_gate_repair_projection(repair: dict[str, Any]) -> dict[str, Any]:
         "advisory_lineage_bridge_event_kind",
         "advisory_lineage_bridge_close_satisfying",
         "advisory_only",
+        "suppressed_by_parent_successor_close_model",
     ):
         value = repair.get(field)
         if value not in ("", [], {}, None):
@@ -10307,14 +10530,19 @@ def repair_gate_summary(
     if not_applicable:
         passed = False
     missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    parent_successor_gap = _parent_successor_close_model_gap(full_result)
     failed_gate_repairs = []
     for key in MF_REPAIR_GATE_KEYS:
         gate = _mapping(full_result.get(key))
         if not gate or bool(gate.get("passed")):
             continue
         repair = _gate_repair_summary(key, gate)
+        repair = _gate_repair_with_cross_ref_context(key, repair, full_result)
         failed_gate_repairs.append(
-            _gate_repair_with_cross_ref_context(key, repair, full_result)
+            _repair_with_parent_successor_close_model_context(
+                repair,
+                parent_successor_gap,
+            )
         )
 
     missing_event_repairs = [
@@ -10330,6 +10558,20 @@ def repair_gate_summary(
         }
         for kind in missing_event_kinds
     ]
+    if parent_successor_gap:
+        missing_event_repairs = [
+            {
+                "event_kind": item["event_kind"],
+                "recommended_legal_action": parent_successor_gap[
+                    "recommended_legal_action"
+                ],
+                "next_action": parent_successor_gap["next_action"],
+                "suppressed_by_parent_successor_close_model": True,
+                "advisory_only": True,
+                "close_satisfying_by_itself": False,
+            }
+            for item in missing_event_repairs
+        ]
     archive_recovery_decision = _audit_archive_recovery_decision(full_result)
 
     summary: dict[str, Any] = {
@@ -10351,6 +10593,22 @@ def repair_gate_summary(
     }
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
+    if parent_successor_gap:
+        summary["parent_successor_close_model_gap"] = parent_successor_gap
+        summary["normal_repair_actions"]["suppressed_by_parent_successor_close_model"] = True
+        summary["normal_repair_actions"]["suppression_reason"] = parent_successor_gap[
+            "repair_reason"
+        ]["reason"]
+        repair_reasons = [
+            parent_successor_gap["repair_reason"],
+            *repair_reasons,
+        ]
+        next_legal_actions = _dedupe_nonempty(
+            [
+                parent_successor_gap["next_action"],
+                *next_legal_actions,
+            ]
+        )
     if not_applicable and not repair_reasons:
         repair_reasons = [
             {

@@ -12987,6 +12987,117 @@ def test_cross_ref_repair_projects_parent_row_child_tasks_and_merge_queue():
     assert compact_cross_ref["append_payload_hint"]["merge_queue_id"] == "mq-sibling"
 
 
+def test_repair_summary_blocks_parent_contract_history_reconstruction():
+    from agent.governance import task_timeline
+
+    contract_policy = {
+        "schema_version": "contract_close_gate_policy_projection.v1",
+        "applied": False,
+        "template_id": "onboard_contract.v1",
+        "explicit_template_id": "onboard_contract.v1",
+        "inferred_template_id": "observer_hotfix_direct_mutation.v1",
+        "selected_close_policy_lane_template_id": "onboard_contract.v1",
+        "hotfix_contract_active": True,
+        "hotfix_contract_completed": True,
+        "hotfix_events": {
+            "pre_events": [{"id": 6510, "event_kind": "hotfix_entered"}],
+            "post_events": [{"id": 6511, "event_kind": "hotfix_under_action"}],
+        },
+        "active_lane_contract": {
+            "contract_chain_id": "cchain-parent",
+            "contract_execution_id": "cex-parent",
+            "contract_template_id": "onboard_contract.v1",
+            "next_legal_action": {"id": "graph_query_schema_trace"},
+        },
+    }
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "status": "failed",
+        "missing_event_kinds": ["close_ready", "implementation"],
+        "event_count": 8,
+        "present_event_kinds": ["verification"],
+        "ignored_required_events": [
+            {
+                "id": 6511,
+                "event_kind": "hotfix_under_action",
+                "reason": "hotfix_contract_policy_not_active",
+            }
+        ],
+        "contract_gate": {
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": [
+                "graph_query_schema_trace",
+                "observer_root_route_context_read",
+            ],
+        },
+        "route_context_gate": {
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": [
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+            ],
+            "contract_close_gate_policy": contract_policy,
+        },
+        "independent_qa_gate": {
+            "passed": True,
+            "status": "passed",
+            "evidence_events": [{"id": 6513, "event_kind": "qa_verification"}],
+        },
+        "close_commit_evidence_gate": {
+            "passed": False,
+            "status": "blocked",
+            "missing_requirement_ids": ["matching_close_commit_timeline_evidence"],
+            "close_commit": "3cadc88988177c50cb07f2852ee8e3f1b6f521be",
+        },
+    }
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+
+    gap = repair["parent_successor_close_model_gap"]
+    assert gap["status"] == "blocked"
+    assert gap["parent_contract_template_id"] == "onboard_contract.v1"
+    assert gap["successor_contract_template_id"] == (
+        "observer_hotfix_direct_mutation.v1"
+    )
+    assert repair["next_legal_actions"][0] == (
+        "select_successor_or_audit_close_for_parent_contract"
+    )
+    assert all(
+        item["suppressed_by_parent_successor_close_model"]
+        for item in repair["missing_event_repairs"]
+    )
+    assert all(
+        "append_payload_skeleton" not in item
+        for item in repair["missing_event_repairs"]
+    )
+    close_commit_repair = next(
+        item
+        for item in repair["failed_gate_repairs"]
+        if item["gate"] == "close_commit_evidence_gate"
+    )
+    assert close_commit_repair["next_action"] == (
+        "select_successor_or_audit_close_for_parent_contract"
+    )
+    assert close_commit_repair["normal_close_blocked"] is True
+    assert close_commit_repair["suppressed_by_parent_successor_close_model"] is True
+    assert "append_payload_skeleton" not in close_commit_repair
+
+    compact = task_timeline.compact_gate_summary(full_gate)
+    assert compact["parent_successor_close_model_gap"]["code"] == (
+        "parent_successor_close_model_gap"
+    )
+    compact_close_commit = next(
+        item
+        for item in compact["failed_gates"]
+        if item["gate"] == "close_commit_evidence_gate"
+    )
+    assert compact_close_commit["suppressed_by_parent_successor_close_model"] is True
+    assert "append_payload_hint" not in compact_close_commit
+
+
 def test_repair_and_compact_summaries_explain_unproven_child_route_scope():
     from agent.governance import task_timeline
 
