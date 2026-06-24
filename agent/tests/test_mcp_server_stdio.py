@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp.server import AmingClawMCP
+from agent.mcp.tools import TOOLS as runtime_mcp_tools
 from agent.mcp.tools import ToolDispatcher
 
 
@@ -89,6 +90,20 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
         "runtime_context_finish_gate",
         "runtime_context_session_token_initial_join",
     }.issubset(names)
+
+
+def test_observer_hotfix_enter_schemas_require_backlog_scope():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        hotfix_enter = next(
+            tool for tool in tools if tool["name"] == "observer_hotfix_enter"
+        )
+        schema = hotfix_enter["inputSchema"]
+        assert {"project_id", "reason"}.issubset(schema["required"])
+        assert {"backlog_id", "bug_id", "actor_role"}.issubset(
+            schema["properties"]
+        )
+        assert {"required": ["backlog_id"]} in schema["anyOf"]
+        assert {"required": ["bug_id"]} in schema["anyOf"]
 
 
 def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypatch):

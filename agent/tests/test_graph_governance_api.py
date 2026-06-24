@@ -24325,6 +24325,22 @@ def test_backlog_close_rejects_runtime_gate_projection_as_close_evidence(conn):
     assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
 
 
+def test_hotfix_enter_requires_backlog_scope_before_timeline_write(conn):
+    with pytest.raises(ValidationError, match="backlog_id or bug_id"):
+        server.handle_project_hotfix_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Human approved emergency repair without scope.",
+                },
+            )
+        )
+
+    assert task_timeline.list_events(conn, PID) == []
+
+
 def test_hotfix_enter_records_timeline_event(conn):
     result = server.handle_project_hotfix_enter(
         _ctx(

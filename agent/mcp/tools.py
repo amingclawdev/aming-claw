@@ -900,6 +900,10 @@ TOOLS: list[dict] = [
                 "route_token_ref": {"type": "string"},
             },
             "required": ["project_id", "reason"],
+            "anyOf": [
+                {"required": ["backlog_id"]},
+                {"required": ["bug_id"]},
+            ],
         },
     },
     {

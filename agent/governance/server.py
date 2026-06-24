@@ -40175,6 +40175,8 @@ def handle_project_hotfix_enter(ctx: RequestContext):
     from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    if not backlog_id:
+        raise ValidationError("hotfix entry requires backlog_id or bug_id")
     task_id = str(body.get("task_id") or "").strip()
     actor = str(body.get("actor") or "api").strip()
     body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
