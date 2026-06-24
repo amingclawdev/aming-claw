@@ -9886,6 +9886,18 @@ def _runtime_context_worker_guide_response(
         "raw_session_token_exposed": False,
         "executable_contract": executable_contract,
         "actionable_payloads": actionable_payloads,
+        "next_legal_action": next_legal_action,
+        "next_required_evidence": next_required_evidence,
+        "missing_evidence": list(
+            control_plane.get("missing_evidence")
+            or action_plan.get("missing_evidence")
+            or []
+        ),
+        "blocking_reasons": list(
+            control_plane.get("blocking_reasons")
+            or action_plan.get("blocking_reasons")
+            or []
+        ),
         "worker_session_lifecycle_policy": actionable_payloads.get(
             "worker_session_lifecycle_policy",
             {},

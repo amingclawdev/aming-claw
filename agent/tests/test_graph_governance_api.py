@@ -4995,6 +4995,15 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert worker_view["action_plan"]["next_legal_action"] == (
         worker_view["control_plane"]["next_legal_action"]
     )
+    assert worker_guide_result["next_legal_action"] == (
+        worker_view["control_plane"]["next_legal_action"]
+    )
+    assert worker_guide_result["next_required_evidence"] == (
+        worker_view["control_plane"]["next_required_evidence"]
+    )
+    assert worker_guide_result["blocking_reasons"] == (
+        worker_view["control_plane"]["blocking_reasons"]
+    )
     assert worker_guide["next_legal_action"] == (
         worker_view["control_plane"]["next_legal_action"]
     )
