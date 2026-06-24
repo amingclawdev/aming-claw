@@ -3038,16 +3038,34 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     except Exception as exc:  # pragma: no cover - defensive
         ref_persist_warning = f"route_token_ref persist failed (ref-resolution disabled): {exc}"
 
+    route_token = issued["route_token"]
+    route_identity = {
+        key: str(route_token.get(key) or "")
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if str(route_token.get(key) or "").strip()
+    }
+    route_identity["route_token_ref"] = str(issued.get("route_token_ref") or "")
+
     response: dict = {
         "ok": True,
         "project_id": project_id,
-        "route_token": issued["route_token"],
+        "route_token": route_token,
         "route_token_ref": issued["route_token_ref"],
+        "route_identity": route_identity,
+        "canonical_route_identity": dict(route_identity),
         "merge_queue_id": issued["merge_queue_id"],
         "execute_backlog_row_payload": issued["execute_backlog_row_payload"],
         "provider": issued.get("provider", {}),
         "ref_registered": not bool(ref_persist_warning),
     }
+    for key, value in route_identity.items():
+        response.setdefault(key, value)
     for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
         value = issued.get(key)
         if isinstance(value, Mapping):

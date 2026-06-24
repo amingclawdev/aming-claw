@@ -909,6 +909,18 @@ def test_endpoint_accepts_observer_caller_role():
     assert result["execute_backlog_row_payload"]["route_token_ref"] == result[
         "route_token_ref"
     ]
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert result[field] == result["route_token"][field]
+        assert result["route_identity"][field] == result["route_token"][field]
+        assert result["canonical_route_identity"][field] == result["route_token"][field]
+    assert result["route_identity"]["route_token_ref"] == result["route_token_ref"]
+    assert result["canonical_route_identity"] == result["route_identity"]
 
 
 def test_endpoint_accepts_parent_route_identity_and_returns_lineage():

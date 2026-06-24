@@ -336,6 +336,91 @@ def test_projection_computes_completed_missing_and_next_action():
     ]
 
 
+def test_close_gate_projection_events_complete_hotfix_contract_state():
+    contract = {
+        "contract": {
+            "contract_id": "observer_hotfix_direct_mutation.v1",
+            "contract_template_id": "observer_hotfix_direct_mutation.v1",
+            "contract_revision_id": "rev-close-projection",
+            "state": "selected",
+            "required_evidence": [
+                "route_context",
+                "route_action_precheck",
+                "implementation",
+                "verification",
+                "close_ready",
+            ],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(1, "route_context", status="requested"),
+            _event(
+                2,
+                "service_route",
+                status="allowed",
+                payload={
+                    "service_id": "route.prompt_alert_bundle",
+                    "contract_evidence": [
+                        {"requirement_id": "route_context_hash"},
+                        {"requirement_id": "prompt_contract_hash"},
+                        {"requirement_id": "visible_injection_manifest"},
+                    ],
+                },
+            ),
+            _event(3, "route_action_precheck", status="requested"),
+            _event(
+                4,
+                "service_route",
+                status="allowed",
+                payload={
+                    "service_id": "route.action_precheck",
+                    "contract_evidence": [
+                        {"requirement_id": "route_context_hash"},
+                        {"requirement_id": "prompt_contract_id"},
+                        {"requirement_id": "prompt_contract_hash"},
+                        {"requirement_id": "route_action_allowed"},
+                    ],
+                },
+            ),
+            _event(
+                5,
+                "hotfix_under_action",
+                status="accepted",
+                payload={
+                    "implementation_close_evidence": {
+                        "counts_as_implementation": True,
+                        "changed_files": ["agent/governance/contract_state_runtime.py"],
+                    }
+                },
+            ),
+            _event(
+                6,
+                "independent_verification",
+                status="passed",
+                payload={"reviewer_role": "independent_qa"},
+            ),
+            _event(7, "close_ready", status="accepted"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    completed = {item["id"]: item for item in projection["completed_evidence"]}
+    assert completed["route_context"]["event_id"] == 2
+    assert completed["route_action_precheck"]["event_id"] == 4
+    assert completed["implementation"]["event_id"] == 5
+    assert completed["verification"]["event_id"] == 6
+    assert completed["close_ready"]["event_id"] == 7
+    assert projection["missing_evidence"] == []
+    assert projection["contract_complete"] is True
+    assert (
+        projection["next_legal_action"]["id"]
+        == "issue_backlog_close_route_token_then_backlog_close"
+    )
+
+
 def test_route_requirements_ignore_generic_requirement_id_batches():
     contract = {
         "contract": {

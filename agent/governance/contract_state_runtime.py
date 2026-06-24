@@ -359,6 +359,12 @@ _QA_TIMELINE_EVENT_KINDS = {
 }
 
 _QA_REQUIREMENT_EVENT_KIND_ALIASES = {
+    "verification": (
+        "independent_verification",
+        "qa_verification",
+        "qa_review",
+        "verification",
+    ),
     "independent_verification_lane": (
         "independent_verification",
         "qa_verification",
@@ -2034,9 +2040,12 @@ def _qa_verification_event_satisfies_requirement(
     event: Mapping[str, Any],
     requirement_id: str,
 ) -> bool:
-    if requirement_id not in _QA_REQUIREMENT_EVENT_KIND_ALIASES:
+    aliases = set(_QA_REQUIREMENT_EVENT_KIND_ALIASES.get(requirement_id) or ())
+    if not aliases:
         return False
     event_kind = str(event.get("event_kind") or "").strip()
+    if event_kind in aliases:
+        return True
     if event_kind != "verification":
         return False
     phase = str(event.get("phase") or "").strip().lower().replace("-", "_").replace(".", "_")
@@ -2062,6 +2071,60 @@ def _qa_verification_event_satisfies_requirement(
         _payload_declares_requirement(payload, requirement_id)
         for payload in _event_payloads(event)
     )
+
+
+def _service_route_event_satisfies_requirement(
+    event: Mapping[str, Any],
+    requirement_id: str,
+) -> bool:
+    if _event_kind(event) != "service_route":
+        return False
+    status = str(event.get("status") or "").strip().lower()
+    if status and status not in CONTRACT_PASS_STATUSES:
+        return False
+    service_id = _event_deep_text(event, {"service_id", "route_service"})
+    payloads = _event_payloads(event)
+    if requirement_id == "route_context":
+        if service_id != "route.prompt_alert_bundle":
+            return False
+        return any(
+            _payload_declares_requirement(payload, "route_context_hash")
+            and (
+                _payload_declares_requirement(payload, "prompt_contract_hash")
+                or _payload_declares_requirement(payload, "visible_injection_manifest")
+                or _payload_declares_requirement(
+                    payload,
+                    "visible_injection_manifest_hash",
+                )
+            )
+            for payload in payloads
+        )
+    if requirement_id == "route_action_precheck":
+        if service_id != "route.action_precheck":
+            return False
+        return any(
+            _payload_declares_requirement(payload, "route_action_allowed")
+            for payload in payloads
+        )
+    return False
+
+
+def _hotfix_under_action_satisfies_requirement(
+    event: Mapping[str, Any],
+    requirement_id: str,
+) -> bool:
+    if requirement_id != "implementation" or _event_kind(event) != "hotfix_under_action":
+        return False
+    status = str(event.get("status") or "").strip().lower()
+    if status and status not in CONTRACT_PASS_STATUSES:
+        return False
+    for payload in _event_payloads(event):
+        evidence = _event_deep_value(payload, {"implementation_close_evidence"})
+        if isinstance(evidence, Mapping) and _policy_truthy(
+            evidence.get("counts_as_implementation")
+        ):
+            return True
+    return False
 
 
 def _event_deep_text(event: Mapping[str, Any], field_names: set[str]) -> str:
@@ -2259,7 +2322,11 @@ def _event_satisfies_requirement(
     accepted_kinds = set(_string_list(requirement.get("accepted_event_kinds")))
     matched = event_kind in accepted_kinds
     if not matched:
-        if _qa_verification_event_satisfies_requirement(event, requirement_id):
+        if _service_route_event_satisfies_requirement(event, requirement_id):
+            matched = True
+        elif _hotfix_under_action_satisfies_requirement(event, requirement_id):
+            matched = True
+        elif _qa_verification_event_satisfies_requirement(event, requirement_id):
             matched = True
         elif not _requirement_requires_event_kind_match(requirement):
             matched = any(
