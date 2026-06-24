@@ -59,6 +59,23 @@ def _definition(**overrides):
     return payload
 
 
+def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str):
+    state = record["execution_state"]
+    guide = record["runtime_guide"]
+    return {
+        "project_id": record["project_id"],
+        "backlog_id": record["backlog_id"],
+        "contract_execution_id": record["contract_execution_id"],
+        "definition_hash": record["definition_hash"],
+        "instruction_bundle_hash": record["instruction_bundle_hash"],
+        "execution_state_revision": state["execution_state_revision"],
+        "runtime_guide_hash": guide["runtime_guide_hash"],
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "actor_role": actor_role,
+    }
+
+
 def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
     service = ContractCrudService(tmp_path)
 
@@ -355,3 +372,189 @@ def test_default_crud_service_uses_source_definition_root_without_legacy_cutover
     legacy_ids = {template["template_id"] for template in list_contract_templates()}
     assert "mf_workflow_runtime.v1" in legacy_ids
     assert "contract_crud_runtime_integration" not in legacy_ids
+
+
+def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_path():
+    service = ContractCrudService()
+
+    result = service.read("mf_parallel.v1")
+    assert result["ok"] is True
+    definition = result["data"]["definition"]
+    assert definition["contract_id"] == "mf_parallel"
+    assert definition["role"] == "observer"
+    assert definition["contract_type"] == "parallel_worker"
+    assert definition["compat_aliases"] == ["mf_parallel.v1", "parallel_worker.v1"]
+
+    read_model = definition["read_model"]
+    assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
+    assert [
+        (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
+        for line in read_model["rule_lines"]
+    ] == [
+        (
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "observer",
+            "contract_binding",
+        ),
+        (
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "observer",
+            "dispatch_bounded_worker",
+        ),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub", "read_receipt"),
+        ("worker_startup", "worker_startup", "mf_sub", "mf_subagent_startup"),
+        ("worker_context", "worker_graph_context", "mf_sub", "graph_trace"),
+        (
+            "worker_implementation",
+            "worker_implementation",
+            "mf_sub",
+            "implementation",
+        ),
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "mf_sub",
+            "record_finish_time_worker_attestation",
+        ),
+        (
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_sub",
+            "mf_subagent_finish_gate",
+        ),
+        (
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+        ),
+        ("observer_integration", "observer_merge", "observer", "merge"),
+        ("observer_integration", "observer_reconcile", "observer", "reconcile"),
+        ("observer_integration", "observer_close_ready", "observer", "close_ready"),
+    ]
+
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id="AC-CLAUDE-PARALLEL-CLOSE-RECONCILE-GUIDE-GAP-20260623",
+        contract_execution_id="cex-mf-parallel-runtime-path-test",
+        actor_role="observer",
+        route_token_ref="rtok-test",
+    )
+    assert record["runtime_guide"]["next_legal_action"] == {
+        "stage_id": "orchestration",
+        "line_id": "observer_prefill_child_contracts",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "contract_binding",
+        "required": True,
+    }
+    assert (
+        "mf_sub workers own read receipt"
+        in record["runtime_guide"]["instructions"]["inline"][2]
+    )
+
+    record = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="orchestration",
+            line_id="observer_prefill_child_contracts",
+        ),
+    )["record"]
+    record = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="dispatch",
+            line_id="observer_dispatch_bounded_workers",
+        ),
+    )["record"]
+
+    rejected_observer_worker_evidence = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="worker_read",
+            line_id="worker_read_runtime_guide",
+        ),
+    )
+    assert rejected_observer_worker_evidence["ok"] is False
+    assert "cannot write line" in rejected_observer_worker_evidence["decision"]["errors"][0]
+
+    for stage_id, line_id in [
+        ("worker_read", "worker_read_runtime_guide"),
+        ("worker_startup", "worker_startup"),
+        ("worker_context", "worker_graph_context"),
+        ("worker_implementation", "worker_implementation"),
+        ("worker_attestation", "worker_finish_time_attestation"),
+        ("worker_finish", "worker_finish_gate"),
+    ]:
+        runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="mf_sub")
+        record = runtime.store.get("cex-mf-parallel-runtime-path-test")
+        accepted = runtime.submit_line_write(
+            "cex-mf-parallel-runtime-path-test",
+            _runtime_write_from(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="observer")
+    record = runtime.store.get("cex-mf-parallel-runtime-path-test")
+    rejected_observer_qa_evidence = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )
+    assert rejected_observer_qa_evidence["ok"] is False
+    assert "cannot write line" in rejected_observer_qa_evidence["decision"]["errors"][0]
+
+    runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="qa")
+    record = runtime.store.get("cex-mf-parallel-runtime-path-test")
+    accepted_qa = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="qa",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )
+    assert accepted_qa["ok"] is True
+    record = accepted_qa["record"]
+
+    for stage_id, line_id in [
+        ("observer_integration", "observer_merge"),
+        ("observer_integration", "observer_reconcile"),
+        ("observer_integration", "observer_close_ready"),
+    ]:
+        runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="observer")
+        record = runtime.store.get("cex-mf-parallel-runtime-path-test")
+        accepted = runtime.submit_line_write(
+            "cex-mf-parallel-runtime-path-test",
+            _runtime_write_from(
+                record,
+                actor_role="observer",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    assert record["runtime_guide"]["next_legal_action"] is None
