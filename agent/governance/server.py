@@ -30431,6 +30431,22 @@ def _observer_root_route_merge_identity(
     return merged
 
 
+def _observer_root_route_prefer_identity(
+    base: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> dict[str, str]:
+    merged = {
+        field: str(candidate.get(field) or base.get(field) or "").strip()
+        for field in observer_session.ROOT_ROUTE_CONTEXT_CANONICAL_IDENTITY_FIELDS
+    }
+    route_token_ref = str(
+        candidate.get("route_token_ref") or base.get("route_token_ref") or ""
+    ).strip()
+    if route_token_ref:
+        merged["route_token_ref"] = route_token_ref
+    return merged
+
+
 def _observer_root_route_direct_identity(value: Mapping[str, Any]) -> dict[str, str]:
     identity = {
         field: str(value.get(field) or "").strip()
@@ -32494,7 +32510,7 @@ def _observer_root_route_context_state(
     )
     route_token_ref_identity = route_token_ref_projection.get("identity") or {}
     if route_token_ref_identity:
-        route_context_for_bootstrap = _observer_root_route_merge_identity(
+        route_context_for_bootstrap = _observer_root_route_prefer_identity(
             route_context_for_bootstrap,
             route_token_ref_identity,
         )

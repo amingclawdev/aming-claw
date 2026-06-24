@@ -11,6 +11,7 @@ def _event(
     *,
     status: str = "passed",
     payload=None,
+    verification=None,
     project_id: str = "",
 ):
     return {
@@ -21,7 +22,7 @@ def _event(
         "phase": "contract",
         "status": status,
         "payload": payload or {},
-        "verification": {},
+        "verification": verification or {},
         "artifact_refs": {},
     }
 
@@ -154,6 +155,122 @@ def test_independent_verification_lane_hint_is_qa_owned_and_appendable():
         "independent_verification_lane"
     ]
     assert completed["missing_evidence"] == []
+
+
+def test_parallel_root_qa_hint_keeps_parent_route_identity_after_child_worker_events():
+    root_route = {
+        "route_id": "route-root",
+        "route_context_hash": "sha256:root-context",
+        "prompt_contract_id": "rprompt-root",
+        "prompt_contract_hash": "sha256:root-prompt",
+        "visible_injection_manifest_hash": "sha256:root-visible",
+        "route_token_ref": "rtok-root",
+    }
+    child_route = {
+        "route_id": "route-child",
+        "route_context_hash": "sha256:child-context",
+        "prompt_contract_id": "rprompt-child",
+        "prompt_contract_hash": "sha256:child-prompt",
+        "visible_injection_manifest_hash": "sha256:child-visible",
+        "route_token_ref": "rtok-child",
+    }
+    repair_route = {
+        "route_id": "event.route_action.pre_mutation",
+        "route_context_hash": "sha256:repair-context",
+        "prompt_contract_id": "rprompt-repair",
+        "prompt_contract_hash": "sha256:repair-prompt",
+        "visible_injection_manifest_hash": "sha256:repair-visible",
+        "route_token_ref": "rtok-repair",
+    }
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v1",
+            "contract_template_id": "mf_parallel.v1",
+            "contract_execution_id": "cex-parallel-root",
+            "state": "selected",
+            "required_evidence": [
+                "route_context",
+                "route_action_precheck",
+                "bounded_implementation_worker_dispatch",
+                "mf_subagent_startup",
+                "mf_subagent_finish_gate",
+                "independent_verification",
+            ],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(1, "route_context", payload={"route_identity": root_route}),
+            _event(2, "route_action_precheck", payload=root_route),
+            _event(3, "bounded_implementation_worker_dispatch", payload=root_route),
+            _event(4, "mf_subagent_startup", payload=root_route),
+            _event(
+                5,
+                "route_token_gate",
+                payload={
+                    **child_route,
+                    "route_token_gate": {
+                        **child_route,
+                        "parent_route_lineage": root_route,
+                    }
+                },
+                verification=child_route,
+            ),
+            _event(
+                6,
+                "implementation",
+                payload={**child_route, "parent_route_lineage": root_route},
+            ),
+            _event(
+                7,
+                "mf_subagent_finish_gate",
+                payload={
+                    "mf_subagent_finish_gate": {
+                        "close_ready": True,
+                        "receipt_gate": {
+                            "status": "passed",
+                            "read_receipt_present": True,
+                            "startup_present": True,
+                        },
+                    },
+                    **child_route,
+                },
+            ),
+            _event(
+                8,
+                "independent_verification",
+                status="failed",
+                payload={
+                    **root_route,
+                    "route_identity": root_route,
+                    "route_action_scope_lineage": {
+                        "child_route_identity": root_route,
+                        "child_route_lineage": root_route,
+                        "parent_route_lineage": repair_route,
+                    },
+                    "parent_route_lineage": repair_route,
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": "AC-CONTRACT-RUNTIME",
+            "task_id": "AC-CONTRACT-RUNTIME",
+        },
+    )
+
+    action = projection["next_legal_action"]
+    hint = action["timeline_append_hint"]
+    assert action["id"] == "independent_verification"
+    assert action["route_token_ref"] == "rtok-root"
+    assert hint["actor_role"] == "qa"
+    assert hint["route_identity"] == root_route
+    assert hint["payload"]["route_identity"] == root_route
+    assert hint["payload"]["route_token_ref"] == "rtok-root"
+    assert projection["active_contract_execution"]["route_token_ref"] == "rtok-root"
+    assert projection["runtime_contract_hints"]["route_identity"] == root_route
 
 
 def test_focused_verification_hint_uses_appendable_qa_event_kind():

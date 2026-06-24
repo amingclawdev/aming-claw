@@ -1026,17 +1026,48 @@ def _latest_route_binding(
         root.get("route_context"),
     )
     for event in events:
+        event_kind = _event_kind(event)
         for payload in _event_payloads(event):
-            candidate = _first_mapping(
-                payload.get("route_binding"),
-                payload.get("route_identity"),
-                payload.get("route_context"),
-                payload.get("route_token_gate"),
+            route_token_gate = _mapping(payload.get("route_token_gate"))
+            route_lineage = _mapping(route_token_gate.get("route_lineage"))
+            route_action_scope_lineage = _mapping(payload.get("route_action_scope_lineage"))
+            parent_route_lineage = _first_mapping(
+                payload.get("parent_route_lineage"),
+                route_token_gate.get("parent_route_lineage"),
+                route_lineage.get("parent_route_lineage"),
             )
-            for field in _ROUTE_BINDING_FIELD_NAMES:
-                value = payload.get(field)
-                if value:
-                    candidate[field] = value
+            overlay_payload_route_fields = True
+            if event_kind in _QA_TIMELINE_EVENT_KINDS:
+                candidate = _first_mapping(
+                    payload.get("route_binding"),
+                    payload.get("route_identity"),
+                    payload.get("route_context"),
+                    route_action_scope_lineage.get("child_route_identity"),
+                    route_action_scope_lineage.get("child_route_lineage"),
+                    route_token_gate,
+                )
+            elif parent_route_lineage:
+                candidate = parent_route_lineage
+                overlay_payload_route_fields = False
+            elif event_kind == "route_token_gate":
+                continue
+            elif event_kind in _WORKER_TIMELINE_EVENT_KINDS or event_kind in {
+                "mf_subagent_startup_refusal",
+                *_QA_TIMELINE_EVENT_KINDS,
+            }:
+                continue
+            else:
+                candidate = _first_mapping(
+                    payload.get("route_binding"),
+                    payload.get("route_identity"),
+                    payload.get("route_context"),
+                    payload.get("route_token_gate"),
+                )
+            if overlay_payload_route_fields:
+                for field in _ROUTE_BINDING_FIELD_NAMES:
+                    value = payload.get(field)
+                    if value:
+                        candidate[field] = value
             if not candidate:
                 continue
             binding.update(
