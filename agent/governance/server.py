@@ -40773,11 +40773,18 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
             else {}
         )
         missing_lane_ownership = lane_ownership_gate.get("missing_lane_ownership_ids") or []
+        close_commit_gate = (
+            verification.get("close_commit_evidence_gate")
+            if isinstance(verification.get("close_commit_evidence_gate"), dict)
+            else {}
+        )
+        missing_close_commit = close_commit_gate.get("missing_requirement_ids") or []
         missing = ", ".join([
             *missing_event_kinds,
             *missing_contract,
             *missing_route_context,
             *missing_lane_ownership,
+            *missing_close_commit,
         ])
         if not missing:
             missing = "timeline gate failed"
@@ -40785,6 +40792,15 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
             "mf_timeline_gate_failed",
             f"MF backlog close requires task timeline evidence before FIXED; missing: {missing}",
             422,
+            {
+                "timeline_gate": verification,
+                "failed_gates": verification.get("failed_gates") or [],
+                "missing_event_kinds": missing_event_kinds,
+                "missing_contract_requirement_ids": missing_contract,
+                "missing_route_context_requirement_ids": missing_route_context,
+                "missing_lane_ownership_ids": missing_lane_ownership,
+                "missing_close_commit_requirement_ids": missing_close_commit,
+            },
         )
     return verification
 

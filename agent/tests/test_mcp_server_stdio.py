@@ -210,6 +210,38 @@ def test_governance_mcp_hotfix_enter_dispatches_to_runtime_facade(monkeypatch):
     ]
 
 
+def test_governance_mcp_mf_timeline_precheck_forwards_close_commit(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "can_close": False}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "mf_timeline_precheck",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-COMMIT",
+            "view": "repair",
+            "include_events": True,
+            "limit": 25,
+            "commit_sha": "abc123",
+        },
+    )
+
+    assert result == {"ok": True, "can_close": False}
+    assert calls == [
+        (
+            "GET",
+            "/api/backlog/aming-claw/BUG-COMMIT/timeline-gate?"
+            "include_events=true&view=repair&limit=25&commit_sha=abc123",
+            None,
+        )
+    ]
+
+
 def test_tool_dispatcher_hotfix_enter_posts_runtime_facade():
     calls = []
 
@@ -266,6 +298,25 @@ def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():
     assert "route_token_ref" in properties
     assert "route_waiver" in properties
     assert "route_token_waiver" in properties
+
+
+def test_mcp_stdio_mf_timeline_precheck_schema_exposes_close_commit_aliases():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = responses[0]["result"]["tools"]
+    precheck = next(tool for tool in tools if tool["name"] == "mf_timeline_precheck")
+    properties = precheck["inputSchema"]["properties"]
+    assert {
+        "close_commit",
+        "commit",
+        "commit_sha",
+        "target_head_commit",
+        "head_commit",
+    }.issubset(properties)
 
 
 def test_mcp_stdio_observer_route_context_issue_schema_is_listed():
@@ -617,6 +668,43 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
                 "route_token_ref": "rtok-close-test",
                 "route_waiver": route_waiver,
             },
+        )
+    ]
+
+
+def test_mcp_mf_timeline_precheck_forwards_close_commit_aliases():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "mf_timeline_precheck",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-COMMIT",
+            "view": "repair",
+            "include_events": True,
+            "limit": 25,
+            "close_commit": "abc123",
+        },
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            "GET",
+            "/api/backlog/aming-claw/BUG-COMMIT/timeline-gate?"
+            "view=repair&include_events=true&limit=25&close_commit=abc123",
+            None,
         )
     ]
 

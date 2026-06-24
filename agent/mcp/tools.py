@@ -870,6 +870,11 @@ TOOLS: list[dict] = [
                 },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
+                "close_commit": {"type": "string", "description": "Optional close commit to plan against; activates commit-scoped close evidence guidance."},
+                "commit": {"type": "string", "description": "Alias for close_commit."},
+                "commit_sha": {"type": "string", "description": "Alias for close_commit."},
+                "target_head_commit": {"type": "string", "description": "Alias for close_commit."},
+                "head_commit": {"type": "string", "description": "Alias for close_commit."},
             },
             "required": ["project_id", "bug_id"],
         },
@@ -2227,6 +2232,10 @@ class ToolDispatcher:
                 query["include_events"] = "true" if args.get("include_events") else "false"
             if args.get("limit"):
                 query["limit"] = str(_int_arg(args, "limit", 1000, minimum=1, maximum=1000))
+            for key in ("close_commit", "commit", "commit_sha", "target_head_commit", "head_commit"):
+                value = str(args.get(key) or "").strip()
+                if value:
+                    query[key] = value
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
 

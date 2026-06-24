@@ -12403,6 +12403,74 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(raised.exception.code, "mf_timeline_gate_failed")
         self.assertIn("dashboard_e2e", str(raised.exception))
 
+    def test_backlog_close_handler_names_missing_close_commit_evidence(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.errors import GovernanceError
+
+        bug_id = "BUG-MF-COMMIT-CLOSE"
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": bug_id},
+                body={
+                    "title": "MF commit close",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        "parallel_contract": {
+                            "template_id": "mf_parallel.v1",
+                            "contract_instance_id": bug_id,
+                        }
+                    },
+                },
+                method="POST",
+            )
+        )
+        old_commit = "de32274600000000000000000000000000000000"
+        close_commit = "a643d3ff00000000000000000000000000000000"
+        for kind, phase, status in (
+            ("implementation", "implementation", "accepted"),
+            ("verification", "verification", "passed"),
+            ("close_ready", "close", "accepted"),
+        ):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=bug_id,
+                event_type=f"mf.{kind}",
+                phase=phase,
+                event_kind=kind,
+                status=status,
+                commit_sha=old_commit,
+            )
+        self.conn.commit()
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_backlog_close(
+                _ctx(
+                    path_params={"bug_id": bug_id},
+                    body={
+                        "actor": "observer",
+                        "commit": close_commit,
+                        "route_waiver": _route_waiver("backlog_close", bug_id),
+                    },
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "mf_timeline_gate_failed")
+        self.assertIn("matching_close_commit_timeline_evidence", str(raised.exception))
+        self.assertEqual(
+            raised.exception.details["missing_close_commit_requirement_ids"],
+            ["matching_close_commit_timeline_evidence"],
+        )
+        self.assertEqual(
+            raised.exception.details["timeline_gate"]["close_commit_evidence_gate"][
+                "close_commit"
+            ],
+            close_commit,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Observer cannot self-clear judge blockers (regression #3092)
