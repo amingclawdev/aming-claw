@@ -31296,6 +31296,18 @@ def _observer_root_route_contract_state_action_has_priority(
     action: Mapping[str, Any],
 ) -> bool:
     action_id = str(action.get("id") or action.get("action") or "").strip()
+    precedence = str(action.get("precedence") or "").strip().lower()
+    if precedence == "legacy_hotfix_direct_followup" and action_id in {
+        "independent_verification_lane",
+        "independent_verification",
+        "independent_qa",
+        "independent_qa_lane",
+        "qa_review",
+        "qa_verification",
+        "verification",
+        "close_ready",
+    }:
+        return True
     if not action_id or action_id in {"close_ready", "successor_contract_complete"}:
         return False
     if action_id in {
@@ -31317,7 +31329,6 @@ def _observer_root_route_contract_state_action_has_priority(
     ordered_steps = action.get("ordered_missing_steps")
     if isinstance(ordered_steps, list) and ordered_steps:
         return True
-    precedence = str(action.get("precedence") or "").strip().lower()
     missing_source = str(action.get("ordered_missing_steps_source") or "").strip().lower()
     if "successor" in precedence and (
         "missing_step" in precedence or "contract_selection" in precedence

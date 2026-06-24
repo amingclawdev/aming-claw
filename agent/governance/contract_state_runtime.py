@@ -416,6 +416,11 @@ _WORKER_TIMELINE_EVENT_KINDS = {
     "worker_progress",
 }
 
+_LEGACY_HOTFIX_DIRECT_OBSERVER_SUPPRESSED_REQUIREMENTS = {
+    "bounded_implementation_worker_dispatch",
+    "mf_subagent_startup",
+}
+
 _CONDITION_JSON_CONTEXT_FIELDS = (
     "chain_trigger_json",
     "target_json",
@@ -3331,6 +3336,21 @@ def build_contract_state_projection(
     if not binding_state and (contract_id or current_revision_id) and not legacy_no_contract:
         binding_state = "bound"
     state = binding_state or str(projection.get("status") or "no_contract")
+    latest_legacy_hotfix_entered: dict[str, Any] = {}
+    legacy_direct_hotfix_followup_active = False
+    if legacy_no_contract and not requirements_explicit:
+        latest_legacy_hotfix_entered = _latest_passing_event_with_kind(
+            rows,
+            "hotfix_entered",
+        )
+        if latest_legacy_hotfix_entered:
+            legacy_direct_hotfix_followup_active = True
+            requirement_steps = [
+                step
+                for step in requirement_steps
+                if str(step.get("id") or "").strip()
+                not in _LEGACY_HOTFIX_DIRECT_OBSERVER_SUPPRESSED_REQUIREMENTS
+            ]
 
     completed_sources: dict[str, dict[str, Any]] = {}
     for requirement in requirement_steps:
@@ -3362,6 +3382,10 @@ def build_contract_state_projection(
         missing_steps,
         key=lambda step: int(step.get("order") or 0),
     )
+    if legacy_direct_hotfix_followup_active:
+        for step in ordered_next_steps:
+            step["precedence"] = "legacy_hotfix_direct_followup"
+            step["legacy_direct_hotfix_followup"] = True
     attempt_bridge_step = _multiple_attempt_lineage_bridge_step(
         active_rows,
         backlog_id=backlog_id,
@@ -3372,7 +3396,7 @@ def build_contract_state_projection(
         ordered_next_steps = [attempt_bridge_step, *ordered_next_steps]
     contract_first_runtime_step: dict[str, Any] = {}
     if legacy_no_contract:
-        latest_hotfix_entered = _latest_passing_event_with_kind(
+        latest_hotfix_entered = latest_legacy_hotfix_entered or _latest_passing_event_with_kind(
             rows,
             "hotfix_entered",
         )
@@ -3404,7 +3428,9 @@ def build_contract_state_projection(
     )
     next_legal_action: dict[str, Any] | None = None
     if (
-        requirement_contract_active or contract_first_runtime_step
+        requirement_contract_active
+        or contract_first_runtime_step
+        or legacy_direct_hotfix_followup_active
     ) and ordered_next_steps:
         first = ordered_next_steps[0]
         next_legal_action = {
@@ -3413,7 +3439,12 @@ def build_contract_state_projection(
             "detail": first.get("detail")
             or f"record contract evidence for {first['id']}",
             "source": first.get("source") or "contract_state",
-            "precedence": first.get("precedence") or "active_contract_missing_step",
+            "precedence": first.get("precedence")
+            or (
+                "legacy_hotfix_direct_followup"
+                if legacy_direct_hotfix_followup_active
+                else "active_contract_missing_step"
+            ),
             "blocked_by": first.get("blocked_by") or [],
             "ordered_missing_steps_source": "contract_state",
             "ordered_missing_steps": ordered_next_steps,

@@ -421,6 +421,128 @@ def test_close_gate_projection_events_complete_hotfix_contract_state():
     )
 
 
+def test_legacy_direct_hotfix_followup_skips_worker_only_default_requirements():
+    default_required = [
+        "route_context",
+        "route_action_precheck",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "independent_verification_lane",
+        "implementation",
+        "verification",
+        "close_ready",
+    ]
+
+    projection = build_contract_state_projection(
+        [
+            _event(1, "hotfix_entered", status="accepted"),
+            _event(
+                2,
+                "service_route",
+                status="allowed",
+                payload={
+                    "service_id": "route.prompt_alert_bundle",
+                    "contract_evidence": [
+                        {"requirement_id": "route_context_hash"},
+                        {"requirement_id": "prompt_contract_hash"},
+                    ],
+                },
+            ),
+            _event(
+                3,
+                "service_route",
+                status="allowed",
+                payload={
+                    "service_id": "route.action_precheck",
+                    "contract_evidence": [
+                        {"requirement_id": "route_action_allowed"},
+                    ],
+                },
+            ),
+            _event(
+                4,
+                "hotfix_under_action",
+                status="accepted",
+                payload={
+                    "implementation_close_evidence": {
+                        "counts_as_implementation": True,
+                        "changed_files": ["agent/governance/contract_state_runtime.py"],
+                    }
+                },
+            ),
+        ],
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        default_required_evidence=default_required,
+    )
+
+    assert "bounded_implementation_worker_dispatch" not in projection["required_evidence"]
+    assert "mf_subagent_startup" not in projection["required_evidence"]
+    assert "bounded_implementation_worker_dispatch" not in projection["missing_evidence"]
+    assert "mf_subagent_startup" not in projection["missing_evidence"]
+    assert projection["missing_evidence"] == [
+        "independent_verification_lane",
+        "verification",
+        "close_ready",
+    ]
+    assert projection["next_legal_action"]["id"] == "independent_verification_lane"
+    assert (
+        projection["next_legal_action"]["precedence"]
+        == "legacy_hotfix_direct_followup"
+    )
+
+    qa_projection = build_contract_state_projection(
+        [
+            _event(1, "hotfix_entered", status="accepted"),
+            _event(
+                2,
+                "service_route",
+                status="allowed",
+                payload={
+                    "service_id": "route.prompt_alert_bundle",
+                    "contract_evidence": [
+                        {"requirement_id": "route_context_hash"},
+                        {"requirement_id": "prompt_contract_hash"},
+                    ],
+                },
+            ),
+            _event(
+                3,
+                "service_route",
+                status="allowed",
+                payload={
+                    "service_id": "route.action_precheck",
+                    "contract_evidence": [
+                        {"requirement_id": "route_action_allowed"},
+                    ],
+                },
+            ),
+            _event(
+                4,
+                "hotfix_under_action",
+                status="accepted",
+                payload={
+                    "implementation_close_evidence": {
+                        "counts_as_implementation": True,
+                        "changed_files": ["agent/governance/contract_state_runtime.py"],
+                    }
+                },
+            ),
+            _event(5, "qa_verification", status="accepted"),
+        ],
+        contract={},
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+        default_required_evidence=default_required,
+    )
+
+    assert qa_projection["missing_evidence"] == ["close_ready"]
+    assert qa_projection["next_legal_action"]["id"] == "close_ready"
+    assert (
+        qa_projection["next_legal_action"]["precedence"]
+        == "legacy_hotfix_direct_followup"
+    )
+
+
 def test_route_requirements_ignore_generic_requirement_id_batches():
     contract = {
         "contract": {

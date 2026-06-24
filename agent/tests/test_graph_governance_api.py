@@ -21789,6 +21789,150 @@ def test_observer_root_route_context_work_mode_gate_precedes_dispatch_action(con
     ] == "dispatch_bounded_worker"
 
 
+def test_observer_root_route_context_legacy_hotfix_prompts_qa_then_close_ready(conn):
+    backlog_id = "AC-ROOT-ROUTE-CONTEXT-HOTFIX-QA-NEXT"
+    task_id = "root-route-context-hotfix-qa-next-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    route_identity = {
+        "route_id": "route-hotfix-qa-next",
+        "route_context_hash": _fake_sha("hotfix-qa-next-route"),
+        "prompt_contract_id": "rprompt-hotfix-qa-next",
+        "prompt_contract_hash": _fake_sha("hotfix-qa-next-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("hotfix-qa-next-visible"),
+    }
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="service.route.completed",
+        event_kind="service_route",
+        phase="route_service",
+        actor="service-router",
+        status="allowed",
+        payload={
+            "service_id": "route.prompt_alert_bundle",
+            "route_evidence": route_identity,
+            "contract_evidence": [
+                {"requirement_id": "route_context_hash"},
+                {"requirement_id": "prompt_contract_hash"},
+                {"requirement_id": "visible_injection_manifest"},
+            ],
+        },
+        verification=route_identity,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="service.route.completed",
+        event_kind="service_route",
+        phase="route_service",
+        actor="service-router",
+        status="allowed",
+        payload={
+            "service_id": "route.action_precheck",
+            "route_evidence": route_identity,
+            "contract_evidence": [
+                {"requirement_id": "route_action_allowed"},
+                {"requirement_id": "prompt_contract_hash"},
+            ],
+        },
+        verification=route_identity,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="hotfix.entered",
+        event_kind="hotfix_entered",
+        phase="hotfix",
+        actor="observer",
+        status="accepted",
+        payload={**route_identity, "route_token_ref": "rtok-hotfix-qa-next"},
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="hotfix.under_action",
+        event_kind="hotfix_under_action",
+        phase="hotfix",
+        actor="observer",
+        status="accepted",
+        payload={
+            **route_identity,
+            "route_token_ref": "rtok-hotfix-qa-next",
+            "implementation_close_evidence": {
+                "counts_as_implementation": True,
+                "changed_files": ["agent/governance/contract_state_runtime.py"],
+            },
+        },
+    )
+    conn.commit()
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        caller_graph_query_schema_trace_id="gqt-20260624-hotfixqa",
+    )
+
+    assert result["work_mode"] == observer_session.WORK_MODE_LOOK_BEFORE_ACT
+    assert result["contract_state"]["legacy_no_contract"] is True
+    assert "bounded_implementation_worker_dispatch" not in result["contract_state"][
+        "missing_evidence"
+    ]
+    assert "mf_subagent_startup" not in result["contract_state"]["missing_evidence"]
+    assert result["contract_state"]["next_legal_action"]["id"] == (
+        "independent_verification_lane"
+    )
+    assert result["next_legal_action"]["id"] == "independent_verification_lane"
+    assert result["next_legal_action"]["precedence"] == (
+        "legacy_hotfix_direct_followup"
+    )
+    assert result["next_legal_action"]["deferred_missing_prerequisites"] == [
+        "observer_work_mode_transition"
+    ]
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="mf.qa_verification",
+        event_kind="qa_verification",
+        phase="verification",
+        actor="qa:test",
+        status="accepted",
+        payload={
+            "requirement_ids": ["verification", "independent_qa"],
+            "reviewer_role": "qa",
+        },
+    )
+    conn.commit()
+
+    after_qa = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        caller_graph_query_schema_trace_id="gqt-20260624-hotfixqa",
+    )
+
+    assert after_qa["contract_state"]["missing_evidence"] == ["close_ready"]
+    assert after_qa["next_legal_action"]["id"] == "close_ready"
+    assert after_qa["next_legal_action"]["precedence"] == (
+        "legacy_hotfix_direct_followup"
+    )
+
+
 def test_observer_root_route_context_dirty_no_contract_reports_recovery(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-DIRTY-NO-CONTRACT"
     _insert_simple_mf_close_backlog(conn, backlog_id)
