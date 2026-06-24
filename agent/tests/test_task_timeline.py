@@ -12714,6 +12714,26 @@ def test_close_gate_ignores_failed_qa_as_protected_cross_ref_evidence():
     assert gate["rejected_cross_ref_evidence"] == []
 
 
+def test_close_gate_does_not_promote_coordination_events_by_phase():
+    from agent.governance import task_timeline
+
+    hotfix_entered = {
+        "event_kind": "hotfix_entered",
+        "event_type": "observer.hotfix_entered",
+        "phase": "implementation",
+        "status": "accepted",
+    }
+    blocker = {
+        "event_kind": "record_blocker",
+        "event_type": "observer.blocker",
+        "phase": "implementation",
+        "status": "passed",
+    }
+
+    assert task_timeline.is_protected_close_evidence(hotfix_entered) is False
+    assert task_timeline.is_protected_close_evidence(blocker) is False
+
+
 def test_close_gate_normalizes_structured_scope_for_same_row():
     from agent.governance import task_timeline
 

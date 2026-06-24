@@ -1152,7 +1152,7 @@ def test_non_onboard_contract_uses_same_projection_path():
     assert projection["next_legal_action"]["id"] == "verification"
 
 
-def test_default_mf_parallel_requirements_still_drive_next_action_order():
+def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
     contract = {
         "contract": {
             "contract_id": "mf_parallel.v1",
@@ -1173,18 +1173,91 @@ def test_default_mf_parallel_requirements_still_drive_next_action_order():
         ],
     )
 
-    assert projection["requirements_explicit"] is False
+    assert projection["requirements_explicit"] is True
     assert projection["missing_evidence"] == [
-        "implementation",
-        "verification",
-        "close_ready",
+        "observer_prefill_child_contracts",
+        "observer_dispatch_bounded_workers",
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
     ]
-    assert projection["next_legal_action"]["id"] == "implementation"
+    assert projection["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+    assert projection["next_legal_action"]["timeline_append_hint"]["event_kind"] == (
+        "contract_binding"
+    )
+    assert projection["next_legal_action"]["timeline_append_hint"]["actor_role"] == (
+        "observer"
+    )
     assert projection["next_legal_action"]["contract_execution_id"] == projection[
         "active_contract_execution"
     ]["contract_execution_id"]
     assert projection["active_lane_contract"]["next_legal_action"]["id"] == (
-        "implementation"
+        "observer_prefill_child_contracts"
+    )
+
+    worker_read = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    action = worker_read["next_legal_action"]
+    assert action["id"] == "worker_read_runtime_guide"
+    assert action["timeline_append_hint"]["event_kind"] == "mf_subagent_read_receipt"
+    assert action["timeline_append_hint"]["actor_role"] == "mf_sub"
+    assert action["timeline_append_hint"]["meta_contract_gate"]["allowed"] is True
+
+    qa = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "record_finish_time_worker_attestation"),
+            _event(8, "mf_subagent_finish_gate"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert qa["next_legal_action"]["id"] == "qa_independent_verification"
+    assert qa["next_legal_action"]["timeline_append_hint"]["event_kind"] == (
+        "independent_verification"
+    )
+    assert qa["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
+
+    merge = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "record_finish_time_worker_attestation"),
+            _event(8, "mf_subagent_finish_gate"),
+            _event(9, "independent_verification"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert merge["next_legal_action"]["id"] == "observer_merge"
+    assert merge["next_legal_action"]["timeline_append_hint"]["event_kind"] == "merge"
+    assert merge["next_legal_action"]["timeline_append_hint"]["actor_role"] == (
+        "observer"
     )
 
 

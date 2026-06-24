@@ -3022,13 +3022,73 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
         },
     }
     events = [
+        (
+            "contract_binding",
+            "contract",
+            "passed",
+            {"requirement_id": "observer_prefill_child_contracts"},
+            {},
+        ),
         ("route_context", "dispatch", "passed", {"route_context": route_context}, {}),
         ("route_action_precheck", "pre_mutation", "allowed", {}, route_action_precheck),
+        (
+            "mf_subagent_read_receipt",
+            "worker_read",
+            "passed",
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": bug_id,
+                "worker_role": "mf_sub",
+                "fence_token": "fence-runtime-text-lineage",
+                "read_receipt_hash": _fake_sha("runtime-text-read-receipt"),
+            },
+            {},
+        ),
         (
             "mf_subagent_startup",
             "startup_gate",
             "passed",
             {"mf_subagent_startup_gate": startup_payload},
+            {},
+        ),
+        (
+            "graph_trace",
+            "worker_context",
+            "passed",
+            {
+                "graph_trace_ids": ["gqt-runtime-text-lineage"],
+                "query_source": "mf_subagent",
+                "task_id": task_id,
+                "parent_task_id": bug_id,
+                "fence_token": "fence-runtime-text-lineage",
+            },
+            {},
+        ),
+        ("implementation", "implementation", "accepted", {}, {}),
+        (
+            "record_finish_time_worker_attestation",
+            "worker_attestation",
+            "passed",
+            {
+                "worker_self_attestation": startup_payload["worker_self_attestation"],
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": bug_id,
+            },
+            {},
+        ),
+        (
+            "mf_subagent_finish_gate",
+            "finish_gate",
+            "passed",
+            {
+                **startup_payload,
+                "status": "passed",
+                "review_ready": True,
+                "owned_changed_files": ["agent/observer_runtime.py"],
+                "test_results": {"status": "passed"},
+            },
             {},
         ),
         (
@@ -3043,11 +3103,24 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
                 "tests_run": ["pytest focused"],
             },
         ),
-        ("implementation", "implementation", "accepted", {}, {}),
+        ("merge", "merge", "passed", {}, {"merge_commit": "merge-lineage"}),
+        ("reconcile", "reconcile", "passed", {}, {"snapshot_id": "scope-lineage"}),
         ("verification", "verification", "passed", {}, {"tests_run": ["pytest focused"]}),
         ("close_ready", "close", "accepted", {}, {}),
     ]
     for event_kind, phase, status, payload, verification in events:
+        actor = "observer"
+        if event_kind in {
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+            "graph_trace",
+            "implementation",
+            "record_finish_time_worker_attestation",
+            "mf_subagent_finish_gate",
+        }:
+            actor = "mf-sub-worker"
+        elif event_kind == "independent_verification":
+            actor = "qa-reviewer"
         task_timeline.record_event(
             conn,
             project_id=PID,
@@ -3056,6 +3129,7 @@ def test_observer_runtime_text_prepare_records_child_dispatch_route_lineage_for_
             event_type=f"mf.{event_kind}",
             event_kind=event_kind,
             phase=phase,
+            actor=actor,
             status=status,
             payload=payload,
             verification=verification,

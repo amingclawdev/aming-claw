@@ -220,6 +220,7 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "design_review",
     "dispatch_bounded_worker",
     "forbidden_attempt_recorded",
+    "graph_trace",
     "hotfix_entered",
     "hotfix_under_action",
     "implementation",
@@ -228,6 +229,8 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "merge",
     "merge_preview",
     "merge_queue_entry",
+    "mf_subagent_finish_gate",
+    "mf_subagent_read_receipt",
     "mf_subagent_startup",
     "no_progress_timeout",
     "observer_command",
@@ -236,7 +239,9 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "plan_precheck",
     "qa_review",
     "qa_verification",
+    "read_receipt",
     "reconcile",
+    "record_finish_time_worker_attestation",
     "record_blocker",
     "review_lane",
     "route_action_precheck",
@@ -300,8 +305,11 @@ _META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
         "forbidden_attempt_recorded",
     },
     "mf_sub": {
+        "mf_subagent_read_receipt",
         "read_receipt",
         "mf_subagent_startup",
+        "mf_subagent_finish_gate",
+        "finish_gate",
         "record_finish_time_worker_attestation",
         "implementation",
         "review_ready",
@@ -406,8 +414,11 @@ _WORKER_REQUIREMENT_EVENT_KIND_ALIASES = {
 }
 
 _WORKER_TIMELINE_EVENT_KINDS = {
+    "finish_gate",
     "graph_trace",
     "implementation",
+    "mf_subagent_finish_gate",
+    "mf_subagent_read_receipt",
     "mf_subagent_startup",
     "patch",
     "read_receipt",
@@ -420,6 +431,145 @@ _LEGACY_HOTFIX_DIRECT_OBSERVER_SUPPRESSED_REQUIREMENTS = {
     "bounded_implementation_worker_dispatch",
     "mf_subagent_startup",
 }
+
+_MF_PARALLEL_CONTRACT_IDS = {
+    "mf_parallel",
+    "mf_parallel.v1",
+    "parallel_worker.v1",
+}
+
+_MF_PARALLEL_DEFAULT_REQUIREMENTS = [
+    {
+        "id": "observer_prefill_child_contracts",
+        "action": "record_contract_binding",
+        "detail": (
+            "record parent mf_parallel contract binding, route identity, child "
+            "contract plan, owned_files fences, tests, merge queue identity, and "
+            "route_token_ref before dispatch"
+        ),
+        "accepted_event_kinds": ["contract_binding", "contract_revision_created"],
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "order": 100,
+    },
+    {
+        "id": "observer_dispatch_bounded_workers",
+        "action": "dispatch_bounded_worker",
+        "detail": (
+            "record bounded worker dispatch evidence with task_id, parent_task_id, "
+            "runtime_context_id, branch/worktree/fence, owned_files, and merge_queue_id"
+        ),
+        "accepted_event_kinds": [
+            "dispatch_bounded_worker",
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_dispatch",
+        ],
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "requires": ["observer_prefill_child_contracts"],
+        "order": 200,
+    },
+    {
+        "id": "worker_read_runtime_guide",
+        "action": "record_worker_read_receipt",
+        "detail": "mf_sub worker records a runtime_context_worker_guide read receipt",
+        "accepted_event_kinds": ["mf_subagent_read_receipt", "read_receipt"],
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "requires": ["observer_dispatch_bounded_workers"],
+        "order": 300,
+    },
+    {
+        "id": "worker_startup",
+        "action": "record_mf_subagent_startup",
+        "detail": "mf_sub worker records actual startup inside its assigned runtime context",
+        "accepted_event_kinds": ["mf_subagent_startup", "mf_subagent_startup_gate"],
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "requires": ["worker_read_runtime_guide"],
+        "order": 400,
+    },
+    {
+        "id": "worker_graph_context",
+        "action": "record_worker_graph_trace",
+        "detail": "mf_sub worker records graph_trace evidence from query_source=mf_subagent",
+        "accepted_event_kinds": ["graph_trace", "mf_subagent_graph_trace"],
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "requires": ["worker_startup"],
+        "order": 450,
+    },
+    {
+        "id": "worker_implementation",
+        "action": "record_worker_implementation",
+        "detail": "mf_sub worker records bounded implementation evidence for owned files",
+        "accepted_event_kinds": ["implementation"],
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "requires": ["worker_graph_context"],
+        "order": 500,
+    },
+    {
+        "id": "worker_finish_time_attestation",
+        "action": "record_finish_time_worker_attestation",
+        "detail": "mf_sub worker records finish-time self-attestation before finish gate",
+        "accepted_event_kinds": ["record_finish_time_worker_attestation"],
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "requires": ["worker_implementation"],
+        "order": 550,
+    },
+    {
+        "id": "worker_finish_gate",
+        "action": "record_mf_subagent_finish_gate",
+        "detail": "mf_sub worker records the close-satisfying finish gate and stops at review_ready or waiting_merge",
+        "accepted_event_kinds": ["mf_subagent_finish_gate", "finish_gate", "review_ready"],
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "requires": ["worker_finish_time_attestation"],
+        "order": 600,
+    },
+    {
+        "id": "qa_independent_verification",
+        "action": "record_independent_verification",
+        "detail": "QA records independent_verification after worker finish gate evidence exists",
+        "accepted_event_kinds": ["independent_verification"],
+        "owner_role": "qa",
+        "allowed_writer_roles": ["qa"],
+        "requires": ["worker_finish_gate"],
+        "order": 700,
+    },
+    {
+        "id": "observer_merge",
+        "action": "record_merge",
+        "detail": "observer records merge evidence for QA-accepted worker candidates",
+        "accepted_event_kinds": ["merge", "live_merge", "merge_preview"],
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "requires": ["qa_independent_verification"],
+        "order": 800,
+    },
+    {
+        "id": "observer_reconcile",
+        "action": "record_reconcile",
+        "detail": "observer records graph reconcile/update evidence after merge lands",
+        "accepted_event_kinds": ["reconcile"],
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "requires": ["observer_merge"],
+        "order": 850,
+    },
+    {
+        "id": "observer_close_ready",
+        "action": "record_close_ready",
+        "detail": "observer records close_ready after merge, verification, reconcile, and close-gate prerequisites are satisfied",
+        "accepted_event_kinds": ["close_ready"],
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "requires": ["observer_reconcile"],
+        "order": 900,
+    },
+]
 
 _IMPLEMENTATION_FRESHNESS_ANCHOR_REQUIREMENT_IDS = {
     "implementation",
@@ -1995,7 +2145,7 @@ def _requirement_steps(
     root: Mapping[str, Any],
     backlog_row: Mapping[str, Any],
     *,
-    default_required_evidence: list[str],
+    default_required_evidence: list[Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     raw = root.get("evidence_requirements") or root.get("required_evidence") or []
     raw_from_default = False
@@ -2044,6 +2194,17 @@ def _requirement_steps(
             if active:
                 required.extend(steps)
     return required, conditional_groups
+
+
+def _contract_is_mf_parallel(contract_id: str, template_id: str) -> bool:
+    return bool(
+        str(contract_id or "").strip() in _MF_PARALLEL_CONTRACT_IDS
+        or str(template_id or "").strip() in _MF_PARALLEL_CONTRACT_IDS
+    )
+
+
+def _mf_parallel_default_requirements() -> list[dict[str, Any]]:
+    return [dict(item) for item in _MF_PARALLEL_DEFAULT_REQUIREMENTS]
 
 
 def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int = 0) -> bool:
@@ -3127,7 +3288,7 @@ def _contract_requirements_state(
     *,
     root: Mapping[str, Any],
     backlog_row: Mapping[str, Any],
-    default_required_evidence: list[str],
+    default_required_evidence: list[Any],
     contract_execution_id: str = "",
     scope_start_event_id: int = 0,
     missing_precedence: str = "active_contract_missing_step",
@@ -3318,7 +3479,7 @@ def build_contract_state_projection(
     | list[Mapping[str, Any]]
     | tuple[Mapping[str, Any], ...]
     | None = None,
-    default_required_evidence: list[str] | None = None,
+    default_required_evidence: list[Any] | None = None,
     schema_version: str = CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     """Fold backlog contract JSON and timeline rows into a read-only state view."""
@@ -3367,6 +3528,20 @@ def build_contract_state_projection(
         or root.get("contract_instance_id")
         or ""
     ).strip()
+    root_has_requirements = bool(
+        root.get("required_evidence")
+        or root.get("evidence_requirements")
+        or root.get("conditional_required_evidence")
+    )
+    if (
+        not root_has_requirements
+        and _contract_is_mf_parallel(contract_id, template_id)
+    ):
+        root = {
+            **root,
+            "evidence_requirements": _mf_parallel_default_requirements(),
+            "requirements_source": "builtin_mf_parallel_contract_defaults",
+        }
     current_revision_id = str(
         binding.get("contract_revision_id")
         or binding.get("current_revision_id")

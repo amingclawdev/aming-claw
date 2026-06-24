@@ -98,6 +98,14 @@ MF_CLOSE_REQUIRED_EVENT_KINDS = {
     "close_ready",
 }
 
+MF_NON_CLOSE_COORDINATION_EVENT_KINDS = {
+    "forbidden_attempt_recorded",
+    "hotfix_entered",
+    "no_progress_timeout",
+    "record_blocker",
+    "route_identity_cleanup",
+}
+
 MF_CLOSE_PASS_STATUSES = {
     "accepted",
     "ok",
@@ -398,11 +406,14 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
 
     if not isinstance(event, dict):
         return False
+    event_kind = _text(event.get("event_kind")).lower().replace("-", "_")
+    if event_kind in MF_NON_CLOSE_COORDINATION_EVENT_KINDS:
+        return False
     status = _text(event.get("status") or event.get("decision")).lower()
     if status and status not in MF_CLOSE_PASS_STATUSES:
         return False
     tokens = {
-        _text(event.get("event_kind")).lower().replace("-", "_"),
+        event_kind,
         _text(event.get("phase")).lower().replace("-", "_"),
     }
     event_type = _text(event.get("event_type")).lower().replace("-", "_")
