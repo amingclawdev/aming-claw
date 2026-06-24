@@ -1637,12 +1637,30 @@ def _canonical_contract_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def _event_numeric_id(event: dict[str, Any]) -> int:
-    value = event.get("id", event.get("event_id"))
+def _numeric_event_id_value(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        pass
+    text = str(value or "").strip()
+    prefix, separator, suffix = text.partition(":")
+    if separator and suffix.startswith("finish_projection:") and prefix.isdigit():
+        return int(prefix)
+    return 0
+
+
+def _event_numeric_id(event: dict[str, Any]) -> int:
+    for key in ("id", "event_id", "source_event_id"):
+        event_id = _numeric_event_id_value(event.get(key))
+        if event_id:
+            return event_id
+    for container_key in ("payload", "verification", "artifact_refs"):
+        event_id = _numeric_event_id_value(
+            _mapping(event.get(container_key)).get("source_event_id")
+        )
+        if event_id:
+            return event_id
+    return 0
 
 
 def _event_is_implementation_freshness_anchor(

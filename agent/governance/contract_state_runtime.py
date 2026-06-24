@@ -587,12 +587,28 @@ def _first_condition_value(
     return None
 
 
+def _numeric_event_id_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        pass
+    text = str(value or "").strip()
+    prefix, separator, suffix = text.partition(":")
+    if separator and suffix.startswith("finish_projection:") and prefix.isdigit():
+        return int(prefix)
+    return 0
+
+
 def _event_numeric_id(event: Mapping[str, Any]) -> int:
     for key in ("id", "event_id"):
-        try:
-            return int(event.get(key) or 0)
-        except (TypeError, ValueError):
-            continue
+        event_id = _numeric_event_id_value(event.get(key))
+        if event_id:
+            return event_id
+    for container_key in ("payload", "verification", "artifact_refs"):
+        container = _json_mapping(event.get(container_key))
+        event_id = _numeric_event_id_value(container.get("source_event_id"))
+        if event_id:
+            return event_id
     return 0
 
 
@@ -609,10 +625,9 @@ def _event_id_at_or_after(event: Mapping[str, Any], start_event_id: int) -> bool
 
 def _source_event_numeric_id(value: Mapping[str, Any]) -> int:
     for key in ("source_event_id", "id", "event_id"):
-        try:
-            return int(value.get(key) or 0)
-        except (TypeError, ValueError):
-            continue
+        event_id = _numeric_event_id_value(value.get(key))
+        if event_id:
+            return event_id
     return 0
 
 
