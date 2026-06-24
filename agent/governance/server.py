@@ -33960,6 +33960,13 @@ def _record_bounded_worker_dispatch_event(
         prepared.get("observer_command_id"),
         context.get("observer_command_id"),
     )
+    dispatch_actor = _first_text(
+        body.get("actor"),
+        prepared.get("actor"),
+        body.get("caller_role"),
+        prepared.get("caller_role"),
+        "observer",
+    )
     branch_ref = _first_text(
         body.get("branch"),
         body.get("branch_ref"),
@@ -34337,7 +34344,7 @@ def _record_bounded_worker_dispatch_event(
         event_type="mf_subagent.dispatch",
         phase="dispatch",
         event_kind="bounded_implementation_worker_dispatch",
-        actor=source,
+        actor=dispatch_actor,
         status="accepted",
         payload=payload,
         artifact_refs={

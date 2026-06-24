@@ -1886,6 +1886,7 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert revision["route_identity"]["route_token_ref"] == "rtok-allocate-contract"
     assert revision["payload"]["observer_command_id"] == "cmd-allocate-contract"
     assert revision["payload"]["owned_files"] == ["agent/governance/server.py"]
+    assert created["dispatch_timeline_event"]["status"] == "recorded"
 
     latest = get_latest_branch_contract_revision(
         conn,
@@ -1896,6 +1897,24 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert latest.revision_id == revision["revision_id"]
     assert latest.route_identity["route_token_ref"] == "rtok-allocate-contract"
     assert latest.payload["owned_files"] == ["agent/governance/server.py"]
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-ALLOCATE-CONTRACT",
+        task_id="allocate-contract-task",
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch = recorded_dispatch[0]
+    assert dispatch["actor"] == "observer"
+    assert dispatch["payload"]["dispatch_source"] == "parallel_branch_allocate"
+    assert dispatch["payload"]["bounded_implementation_worker_dispatch"][
+        "service_generated"
+    ] is True
+    assert dispatch["payload"]["meta_contract_gate"]["role"] == "observer"
+    assert dispatch["payload"]["meta_contract_gate"]["action"] == (
+        "dispatch_bounded_worker"
+    )
 
     current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
