@@ -1,0 +1,99 @@
+{
+  "compat_aliases": [
+    "observer_hotfix_direct_mutation.v1"
+  ],
+  "contract_id": "observer_hotfix",
+  "contract_type": "observer_hotfix",
+  "instruction_layer": {
+    "inline": [
+      "This is a successor execution under a completed observer onboarding root.",
+      "The compiled ContractRuntime guide is the source of the next legal action.",
+      "Observer may record hotfix entry and under-action evidence only; independent QA must author independent_verification evidence.",
+      "Do not author QA evidence as observer and do not rebind the root onboarding execution."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "legacy_template_id": "observer_hotfix_direct_mutation.v1",
+    "runtime_cutover": true
+  },
+  "revision": "rev1",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer records the human-approved hotfix entry reason.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Human-approved hotfix entry with successor contract lineage.",
+            "evidence_kind": "hotfix_entered",
+            "line_id": "hotfix_pre_reason",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "pre_mutation"
+      },
+      {
+        "description": "Observer records bounded under-hotfix action evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Summary of the bounded action taken under the hotfix profile.",
+            "evidence_kind": "hotfix_under_action",
+            "line_id": "hotfix_post_action_summary",
+            "owner_role": "observer",
+            "requires": [
+              "hotfix_pre_reason"
+            ]
+          }
+        ],
+        "stage_id": "mutation"
+      },
+      {
+        "description": "Independent QA verifies the hotfix result.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "QA-authored independent verification for the hotfix successor execution.",
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "requires": [
+              "hotfix_post_action_summary"
+            ]
+          }
+        ],
+        "stage_id": "qa"
+      },
+      {
+        "description": "Observer records close-ready only after independent QA evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer close-ready evidence after independent QA accepts the hotfix.",
+            "evidence_kind": "close_ready",
+            "line_id": "observer_close_ready",
+            "owner_role": "observer",
+            "requires": [
+              "qa_independent_verification"
+            ]
+          }
+        ],
+        "stage_id": "observer_close"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "successors": [],
+  "version": "v1"
+}

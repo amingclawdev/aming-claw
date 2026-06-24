@@ -21816,6 +21816,71 @@ def _insert_simple_mf_close_backlog(conn, backlog_id: str) -> None:
     conn.commit()
 
 
+def _insert_source_backed_onboarding_backlog(conn, backlog_id: str) -> None:
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "contract": {
+                        "root_contract_definition_id": "onboard_contract",
+                        "contract_id": "onboard_contract",
+                        "contract_revision_id": "rev1",
+                        "state": "bound",
+                    }
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+
+def _complete_source_backed_onboarding(conn, contract_execution_id: str) -> dict:
+    runtime = server._contract_runtime(conn)
+    line_specs = [
+        ("graph_context", "graph_query_schema_trace", "graph_query_schema_trace"),
+        ("backlog_review", "related_backlog_review", "related_backlog_review"),
+        (
+            "runtime_state",
+            "observer_root_route_context_read",
+            "observer_root_route_context_read",
+        ),
+        (
+            "runtime_state",
+            "contract_state_projection_read",
+            "contract_state_projection_read",
+        ),
+        ("route_binding", "route_context", "route_context"),
+        ("route_binding", "route_action_precheck", "route_action_precheck"),
+        (
+            "work_mode",
+            "observer_work_mode_transition",
+            "observer_work_mode_transition",
+        ),
+    ]
+    record = runtime.store.get(contract_execution_id)
+    for stage_id, line_id, evidence_kind in line_specs:
+        runtime.current_guide(contract_execution_id, actor_role="observer")
+        record = runtime.store.get(contract_execution_id)
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            server._contract_runtime_write_from_record(
+                record,
+                actor_role="observer",
+                stage_id=stage_id,
+                line_id=line_id,
+                evidence_kind=evidence_kind,
+            ),
+            actor_role="observer",
+        )
+        assert result["ok"] is True
+        record = result["record"]
+    assert record["runtime_guide"]["next_legal_action"] is None
+    return record
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
@@ -22110,6 +22175,40 @@ def test_observer_root_route_context_includes_contract_state_projection(conn):
     assert result["contract_state"]["current_revision_id"] == "crev-root-1"
     assert result["contract_state"]["state"] == "bound"
     assert result["contract_state"]["legacy_no_contract"] is False
+
+
+def test_observer_root_route_context_source_backed_next_action_from_contract_runtime(conn):
+    backlog_id = "AC-ROOT-ROUTE-SOURCE-BACKED-RUNTIME"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        route_token_ref="rtok-source-backed-root",
+        caller_graph_query_schema_trace_id="gqt-20260624-sourcebacked",
+    )
+
+    assert result["contract_runtime"]["active"] is True
+    assert result["runtime_guide"]["contract"]["contract_id"] == "onboard_contract"
+    assert result["contract_runtime_current_state"]["execution_state_revision"] == 1
+    assert result["next_legal_action"]["id"] == "graph_query_schema_trace"
+    assert result["next_legal_action"]["action"] == "record_graph_query_schema_trace"
+    assert result["next_legal_action"]["source"] == "contract_runtime"
+    assert result["next_legal_action"]["precedence"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert result["next_legal_action"]["meta_contract_gate_decision_source"] is False
+    assert result["next_legal_action"]["route_token_ref"] == "rtok-source-backed-root"
+
+    row = conn.execute(
+        "SELECT contract_id, execution_state_revision FROM contract_runtime_executions "
+        "WHERE contract_execution_id = ?",
+        (result["contract_runtime"]["contract_execution_id"],),
+    ).fetchone()
+    assert row["contract_id"] == "onboard_contract"
+    assert row["execution_state_revision"] == 1
 
 
 def test_observer_root_route_context_contract_first_for_no_contract_row(conn):
@@ -24124,6 +24223,110 @@ def test_hotfix_enter_records_timeline_event(conn):
         "hotfix_entered"
     )
     assert result["event"]["payload"]["meta_contract_gate"]["allowed"] is True
+
+
+def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
+    backlog_id = "AC-HOTFIX-SOURCE-BACKED-SUCCESSOR"
+    task_id = "hotfix-source-backed-task"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    root = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        route_token_ref="rtok-hotfix-source",
+        caller_graph_query_schema_trace_id="gqt-20260624-abcdef1234",
+    )
+    parent_record = _complete_source_backed_onboarding(
+        conn,
+        root["contract_runtime"]["contract_execution_id"],
+    )
+
+    result = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "actor_role": "qa",
+                "reason": "Human approved emergency runtime successor repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-hotfix-source",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["schema_version"] == "hotfix_enter.runtime_contract_response.v1"
+    assert result["successor_contract_execution_id"] == result["contract_execution_id"]
+    assert result["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert result["contract_chain_id"] == parent_record["contract_chain_id"]
+    assert result["runtime_guide"]["contract"]["contract_id"] == "observer_hotfix"
+    assert result["execution_state_revision"] == 2
+    assert result["execution_state_hash"].startswith("sha256:")
+    assert result["route_token_ref"] == "rtok-hotfix-source"
+    assert result["route_token_ref_guidance"] == {
+        "route_token_ref": "rtok-hotfix-source",
+        "raw_route_token_required": False,
+        "pass_ref_to_next_runtime_write": True,
+    }
+    assert result["next_legal_action"]["id"] == "hotfix_post_action_summary"
+    assert result["next_legal_action"]["source"] == "contract_runtime"
+    assert result["next_legal_action"]["evidence_kind"] == "hotfix_under_action"
+    assert result["qa_independent_verification"] == {
+        "required": True,
+        "actor_role": "qa",
+        "observer_must_not_author": True,
+    }
+
+    successor_contract = result["event"]["payload"]["successor_contract"]
+    assert successor_contract["contract_chain_id"] == parent_record["contract_chain_id"]
+    assert successor_contract["parent_contract_execution_id"] == (
+        parent_record["contract_execution_id"]
+    )
+    assert successor_contract["successor_contract_execution_id"] == (
+        result["successor_contract_execution_id"]
+    )
+    assert successor_contract["handoff_event_id"].startswith("handoff-")
+    assert successor_contract["handoff_reason"].startswith("Human approved")
+    assert "successor_contract_execution_id" not in result["event"]["payload"].keys() - {
+        "successor_contract"
+    }
+    assert result["event"]["payload"]["body_role_claim_ignored"] == "qa"
+    assert result["event"]["payload"]["derived_actor_role"] == "observer"
+    assert result["event"]["payload"]["meta_contract_gate_decision_source"] is False
+
+    row = conn.execute(
+        "SELECT parent_contract_execution_id, contract_chain_id, execution_state_revision "
+        "FROM contract_runtime_executions WHERE contract_execution_id = ?",
+        (result["successor_contract_execution_id"],),
+    ).fetchone()
+    assert row["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert row["contract_chain_id"] == parent_record["contract_chain_id"]
+    assert row["execution_state_revision"] == 2
+
+
+def test_hotfix_enter_source_backed_rejects_body_forged_role(conn):
+    backlog_id = "AC-HOTFIX-SOURCE-BACKED-FORGED-ROLE"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+
+    with pytest.raises(PermissionDeniedError):
+        server.handle_project_hotfix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "qa",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "actor_role": "observer",
+                    "reason": "Human approved emergency runtime successor repair.",
+                    "backlog_id": backlog_id,
+                    "route_token_ref": "rtok-hotfix-source",
+                },
+            )
+        )
 
 
 def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):

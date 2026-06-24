@@ -83,6 +83,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     names = {tool["name"] for tool in responses[0]["result"]["tools"]}
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
     assert {
+        "observer_hotfix_enter",
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
@@ -169,6 +170,85 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
                 "ttl_seconds": 1200,
             },
         ),
+    ]
+
+
+def test_governance_mcp_hotfix_enter_dispatches_to_runtime_facade(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "successor_contract_execution_id": "cex-hotfix"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "observer_hotfix_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-HOTFIX",
+            "task_id": "hotfix-task",
+            "reason": "Human approved runtime repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-hotfix",
+        },
+    )
+
+    assert result["successor_contract_execution_id"] == "cex-hotfix"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/hotfix/enter",
+            {
+                "backlog_id": "AC-HOTFIX",
+                "task_id": "hotfix-task",
+                "reason": "Human approved runtime repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-hotfix",
+            },
+        )
+    ]
+
+
+def test_tool_dispatcher_hotfix_enter_posts_runtime_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "successor_contract_execution_id": "cex-hotfix"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "observer_hotfix_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-HOTFIX",
+            "task_id": "hotfix-task",
+            "reason": "Human approved runtime repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-hotfix",
+        },
+    )
+
+    assert result["successor_contract_execution_id"] == "cex-hotfix"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/hotfix/enter",
+            {
+                "backlog_id": "AC-HOTFIX",
+                "task_id": "hotfix-task",
+                "reason": "Human approved runtime repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-hotfix",
+            },
+        )
     ]
 
 

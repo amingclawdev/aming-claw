@@ -62,6 +62,7 @@ def _definition(**overrides):
 def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str):
     state = record["execution_state"]
     guide = record["runtime_guide"]
+    next_action = guide.get("next_legal_action") or {}
     return {
         "project_id": record["project_id"],
         "backlog_id": record["backlog_id"],
@@ -73,6 +74,7 @@ def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str)
         "stage_id": stage_id,
         "line_id": line_id,
         "actor_role": actor_role,
+        "evidence_kind": next_action.get("evidence_kind") or "",
     }
 
 
@@ -558,3 +560,123 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
         record = accepted["record"]
 
     assert record["runtime_guide"]["next_legal_action"] is None
+
+
+def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
+    service = ContractCrudService()
+
+    onboarding = service.read("onboard_contract.v1")
+    assert onboarding["ok"] is True
+    onboard_definition = onboarding["data"]["definition"]
+    assert onboard_definition["contract_id"] == "onboard_contract"
+    assert onboard_definition["contract_type"] == "observer_onboarding"
+    assert onboard_definition["successors"] == [
+        {
+            "contract_id": "observer_hotfix",
+            "reason": "Successor hotfix execution after observer onboarding is complete.",
+            "version": "v1",
+        }
+    ]
+    assert [
+        (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
+        for line in onboard_definition["read_model"]["rule_lines"]
+    ] == [
+        (
+            "graph_context",
+            "graph_query_schema_trace",
+            "observer",
+            "graph_query_schema_trace",
+        ),
+        (
+            "backlog_review",
+            "related_backlog_review",
+            "observer",
+            "related_backlog_review",
+        ),
+        (
+            "runtime_state",
+            "observer_root_route_context_read",
+            "observer",
+            "observer_root_route_context_read",
+        ),
+        (
+            "runtime_state",
+            "contract_state_projection_read",
+            "observer",
+            "contract_state_projection_read",
+        ),
+        ("route_binding", "route_context", "observer", "route_context"),
+        (
+            "route_binding",
+            "route_action_precheck",
+            "observer",
+            "route_action_precheck",
+        ),
+        (
+            "work_mode",
+            "observer_work_mode_transition",
+            "observer",
+            "observer_work_mode_transition",
+        ),
+    ]
+
+    runtime = ContractRuntime(service.registry)
+    onboard_record = runtime.start_execution(
+        "onboard_contract",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-HOTFIX-CUTOVER-HANDOFF-20260624",
+        contract_execution_id="cex-onboard-default-registry-test",
+        actor_role="observer",
+        route_token_ref="rtok-onboard-test",
+    )
+    assert onboard_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "graph_query_schema_trace"
+    )
+
+    hotfix = service.read("observer_hotfix_direct_mutation.v1")
+    assert hotfix["ok"] is True
+    hotfix_definition = hotfix["data"]["definition"]
+    assert hotfix_definition["contract_id"] == "observer_hotfix"
+    assert [
+        (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
+        for line in hotfix_definition["read_model"]["rule_lines"]
+    ] == [
+        ("pre_mutation", "hotfix_pre_reason", "observer", "hotfix_entered"),
+        (
+            "mutation",
+            "hotfix_post_action_summary",
+            "observer",
+            "hotfix_under_action",
+        ),
+        (
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+        ),
+        ("observer_close", "observer_close_ready", "observer", "close_ready"),
+    ]
+
+    hotfix_record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-HOTFIX-CUTOVER-HANDOFF-20260624",
+        contract_execution_id="cex-hotfix-default-registry-test",
+        actor_role="observer",
+        parent_contract_execution_id="cex-onboard-default-registry-test",
+        root_contract_execution_id="cex-onboard-default-registry-test",
+        contract_chain_id="cchain-default-registry-test",
+        route_token_ref="rtok-onboard-test",
+    )
+    assert hotfix_record["parent_contract_execution_id"] == (
+        "cex-onboard-default-registry-test"
+    )
+    assert hotfix_record["contract_chain_id"] == "cchain-default-registry-test"
+    assert hotfix_record["runtime_guide"]["next_legal_action"] == {
+        "stage_id": "pre_mutation",
+        "line_id": "hotfix_pre_reason",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "hotfix_entered",
+        "required": True,
+    }

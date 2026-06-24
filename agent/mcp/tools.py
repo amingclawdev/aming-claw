@@ -875,6 +875,29 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_hotfix_enter",
+        "description": "Enter source-backed observer_hotfix successor runtime after onboarding completion.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "human_reason": {"type": "string"},
+                "hotfix_reason": {"type": "string"},
+                "actor": {"type": "string"},
+                "actor_role": {
+                    "type": "string",
+                    "description": "Audit-only claim; HTTP facade derives effective role from token/session.",
+                },
+                "route_token_ref": {"type": "string"},
+            },
+            "required": ["project_id", "reason"],
+        },
+    },
+    {
         "name": "observer_repair_run_plan",
         "description": "Build a read-only replayable observer repair-run plan for cross-system recovery. Does not authorize protected writes.",
         "inputSchema": {
@@ -2159,6 +2182,15 @@ class ToolDispatcher:
                 query["limit"] = str(_int_arg(args, "limit", 1000, minimum=1, maximum=1000))
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
+
+        if name == "observer_hotfix_enter":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api("POST", f"/api/projects/{pid}/hotfix/enter", body)
 
         if name == "observer_repair_run_plan":
             pid = args["project_id"]

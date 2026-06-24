@@ -1,0 +1,148 @@
+{
+  "compat_aliases": [
+    "onboard_contract.v1",
+    "observer_onboarding.v1"
+  ],
+  "contract_id": "onboard_contract",
+  "contract_type": "observer_onboarding",
+  "instruction_layer": {
+    "inline": [
+      "The compiled ContractRuntime guide is the source of the observer-facing next legal action.",
+      "Preserve the legacy onboarding evidence order exactly: graph query schema trace, related backlog review, observer root route context read, contract state projection read, route context, route action precheck, and observer work-mode transition.",
+      "Legacy task_timeline and meta_contract_gate projections are audit/backstop only and must not decide the agent-facing next action for this source-backed runtime execution.",
+      "When onboarding completes, bind successor contracts under this root execution instead of rebinding the root."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "legacy_template_id": "onboard_contract.v1",
+    "runtime_cutover": true
+  },
+  "revision": "rev1",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer gathers graph-first runtime context.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Audited query_schema trace for the observer onboarding route.",
+            "evidence_kind": "graph_query_schema_trace",
+            "line_id": "graph_query_schema_trace",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "graph_context"
+      },
+      {
+        "description": "Observer reviews the related backlog row before mutation.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read the related backlog row and owned scope before any successor or mutation.",
+            "evidence_kind": "related_backlog_review",
+            "line_id": "related_backlog_review",
+            "owner_role": "observer",
+            "requires": [
+              "graph_query_schema_trace"
+            ]
+          }
+        ],
+        "stage_id": "backlog_review"
+      },
+      {
+        "description": "Observer reads route/current-state projections.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read observer root route context for the canonical route identity.",
+            "evidence_kind": "observer_root_route_context_read",
+            "line_id": "observer_root_route_context_read",
+            "owner_role": "observer",
+            "requires": [
+              "related_backlog_review"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read the contract state projection before route action.",
+            "evidence_kind": "contract_state_projection_read",
+            "line_id": "contract_state_projection_read",
+            "owner_role": "observer",
+            "requires": [
+              "observer_root_route_context_read"
+            ]
+          }
+        ],
+        "stage_id": "runtime_state"
+      },
+      {
+        "description": "Observer binds canonical route action evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record canonical route_context evidence for the observer route.",
+            "evidence_kind": "route_context",
+            "line_id": "route_context",
+            "owner_role": "observer",
+            "requires": [
+              "contract_state_projection_read"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record route_action_precheck evidence for the next observer action.",
+            "evidence_kind": "route_action_precheck",
+            "line_id": "route_action_precheck",
+            "owner_role": "observer",
+            "requires": [
+              "route_context"
+            ]
+          }
+        ],
+        "stage_id": "route_binding"
+      },
+      {
+        "description": "Observer moves into execution-supervisor mode after route action is bound.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record observer_work_mode_transition after route_context and route_action_precheck.",
+            "evidence_kind": "observer_work_mode_transition",
+            "line_id": "observer_work_mode_transition",
+            "owner_role": "observer",
+            "requires": [
+              "route_action_precheck"
+            ]
+          }
+        ],
+        "stage_id": "work_mode"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "successors": [
+    {
+      "contract_id": "observer_hotfix",
+      "reason": "Successor hotfix execution after observer onboarding is complete.",
+      "version": "v1"
+    }
+  ],
+  "version": "v1"
+}

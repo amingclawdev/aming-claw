@@ -23,7 +23,7 @@ _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from .errors import GovernanceError, ValidationError
+from .errors import GovernanceError, PermissionDeniedError, ValidationError
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 import logging
 import sqlite3
@@ -47,6 +47,12 @@ from .models import Evidence, MemoryEntry, NodeDef
 from .enums import VerifyStatus
 from .impact_analyzer import ImpactAnalyzer
 from .models import ImpactAnalysisRequest, FileHitPolicy
+from .contracts.registry import ContractDefinitionRegistry
+from .contracts.runtime import (
+    ContractRuntime,
+    ContractRuntimeError,
+    SQLiteContractExecutionStore,
+)
 
 import os
 import shutil
@@ -32967,6 +32973,338 @@ def _observer_root_route_ordered_missing_steps(
     return steps
 
 
+def _source_backed_onboarding_enabled(contract: Mapping[str, Any]) -> bool:
+    if not isinstance(contract, Mapping):
+        return False
+    candidates: list[str] = []
+    nested = contract.get("contract")
+    if isinstance(nested, Mapping):
+        for key in (
+            "root_contract_definition_id",
+            "contract_definition_id",
+            "source_contract_id",
+            "contract_id",
+        ):
+            value = str(nested.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+    for key in (
+        "root_contract_definition_id",
+        "contract_definition_id",
+        "source_contract_id",
+    ):
+        value = str(contract.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+    return "onboard_contract" in candidates
+
+
+def _contract_runtime_store(conn) -> SQLiteContractExecutionStore:
+    return SQLiteContractExecutionStore(conn)
+
+
+def _contract_runtime(conn) -> ContractRuntime:
+    return ContractRuntime(ContractDefinitionRegistry(), store=_contract_runtime_store(conn))
+
+
+def _contract_runtime_stable_id(prefix: str, *parts: Any) -> str:
+    raw = "|".join(str(part or "") for part in parts)
+    return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]}"
+
+
+def _runtime_next_action_from_guide(
+    guide: Mapping[str, Any],
+    *,
+    source: str = "contract_runtime",
+) -> dict[str, Any]:
+    next_line = guide.get("next_legal_action")
+    if not isinstance(next_line, Mapping):
+        return {}
+    execution = guide.get("execution") if isinstance(guide.get("execution"), Mapping) else {}
+    evidence_kind = str(next_line.get("evidence_kind") or "")
+    line_id = str(next_line.get("line_id") or "")
+    action = f"record_{evidence_kind}" if evidence_kind else "record_contract_line"
+    return {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": line_id,
+        "action": action,
+        "source": source,
+        "precedence": "contract_runtime_first_missing_line",
+        "contract_execution_id": str(execution.get("contract_execution_id") or ""),
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+        "execution_state_revision": int(
+            execution.get("execution_state_revision") or 0
+        ),
+        "execution_state_hash": str(execution.get("execution_state_hash") or ""),
+        "route_token_ref": str(execution.get("route_token_ref") or ""),
+        "stage_id": str(next_line.get("stage_id") or ""),
+        "line_id": line_id,
+        "owner_role": str(next_line.get("owner_role") or ""),
+        "allowed_writer_roles": list(next_line.get("allowed_writer_roles") or []),
+        "evidence_kind": evidence_kind,
+        "required": bool(next_line.get("required", True)),
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    state = record.get("execution_state") if isinstance(record.get("execution_state"), Mapping) else {}
+    return {
+        "schema_version": "contract_runtime_current_state.v1",
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(record.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
+        "contract_id": str(record.get("contract_id") or ""),
+        "execution_state_revision": int(
+            record.get("execution_state_revision")
+            or state.get("execution_state_revision")
+            or 0
+        ),
+        "execution_state_hash": str(state.get("execution_state_hash") or ""),
+        "route_token_ref": str(record.get("route_token_ref") or ""),
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+        "next_legal_action": _runtime_next_action_from_guide(guide),
+    }
+
+
+def _observer_onboarding_runtime_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract: Mapping[str, Any],
+    actor_role: str,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    if not _source_backed_onboarding_enabled(contract):
+        return {
+            "schema_version": "observer_onboarding_runtime_projection.v1",
+            "active": False,
+            "reason": "source_backed_onboarding_not_bound",
+        }
+    runtime = _contract_runtime(conn)
+    store = runtime.store
+    root_execution_id = _contract_runtime_stable_id(
+        "cex-onboard", project_id, backlog_id, "onboard_contract", "rev1"
+    )
+    chain_id = _contract_runtime_stable_id(
+        "cchain", project_id, backlog_id, "onboard_contract"
+    )
+    try:
+        record = store.get(root_execution_id)
+        if route_token_ref and not str(record.get("route_token_ref") or ""):
+            record["route_token_ref"] = route_token_ref
+            runtime.store.update(root_execution_id, record)
+    except ContractRuntimeError:
+        record = runtime.start_execution(
+            "onboard_contract",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=actor_role,
+            contract_execution_id=root_execution_id,
+            root_contract_execution_id=root_execution_id,
+            contract_chain_id=chain_id,
+            route_token_ref=route_token_ref,
+            role_binding={
+                "observer": actor_role,
+                "binding_source": "observer_root_route_context",
+            },
+            backlog_lineage={
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+            },
+        )
+    guide = runtime.current_guide(root_execution_id, actor_role=actor_role)
+    record = store.get(root_execution_id)
+    current_state = _runtime_current_state_from_record(record)
+    return {
+        "schema_version": "observer_onboarding_runtime_projection.v1",
+        "active": True,
+        "contract_execution_id": root_execution_id,
+        "root_contract_execution_id": str(record.get("root_contract_execution_id") or ""),
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
+        "contract_id": "onboard_contract",
+        "runtime_guide": guide,
+        "current_state": current_state,
+        "next_legal_action": _runtime_next_action_from_guide(guide),
+        "execution_state_revision": current_state["execution_state_revision"],
+        "execution_state_hash": current_state["execution_state_hash"],
+        "route_token_ref": str(record.get("route_token_ref") or ""),
+        "decision_source": "contract_runtime_first_missing_line",
+        "legacy_meta_contract_gate": "audit_backstop_only",
+    }
+
+
+def _contract_runtime_write_from_record(
+    record: Mapping[str, Any],
+    *,
+    actor_role: str,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+) -> dict[str, Any]:
+    state = record.get("execution_state") if isinstance(record.get("execution_state"), Mapping) else {}
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    return {
+        "project_id": record.get("project_id"),
+        "backlog_id": record.get("backlog_id"),
+        "contract_execution_id": record.get("contract_execution_id"),
+        "definition_hash": record.get("definition_hash"),
+        "instruction_bundle_hash": record.get("instruction_bundle_hash"),
+        "execution_state_revision": state.get("execution_state_revision"),
+        "runtime_guide_hash": guide.get("runtime_guide_hash"),
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "actor_role": actor_role,
+        "evidence_kind": evidence_kind,
+    }
+
+
+def _runtime_record_is_complete(record: Mapping[str, Any]) -> bool:
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    return guide.get("next_legal_action") is None
+
+
+def _observer_hotfix_successor_runtime_enter(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    parent_record: Mapping[str, Any],
+    actor_role: str,
+    route_token_ref: str,
+    reason: str,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    store = runtime.store
+    parent_execution_id = str(parent_record.get("contract_execution_id") or "")
+    root_execution_id = str(
+        parent_record.get("root_contract_execution_id") or parent_execution_id
+    )
+    chain_id = str(parent_record.get("contract_chain_id") or "")
+    successor_execution_id = _contract_runtime_stable_id(
+        "cex-hotfix", project_id, backlog_id, parent_execution_id, "observer_hotfix"
+    )
+    handoff_event_id = _contract_runtime_stable_id(
+        "handoff", project_id, backlog_id, parent_execution_id, successor_execution_id
+    )
+    try:
+        successor = store.get(successor_execution_id)
+    except ContractRuntimeError:
+        successor = runtime.start_execution(
+            "observer_hotfix",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=actor_role,
+            contract_execution_id=successor_execution_id,
+            parent_contract_execution_id=parent_execution_id,
+            root_contract_execution_id=root_execution_id,
+            contract_chain_id=chain_id,
+            route_token_ref=route_token_ref,
+            role_binding={
+                "observer": actor_role,
+                "qa": "qa",
+                "qa_independent": True,
+            },
+            backlog_lineage={
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            metadata={
+                "handoff_reason": reason,
+                "handoff_event_id": handoff_event_id,
+            },
+        )
+    else:
+        if route_token_ref and not str(successor.get("route_token_ref") or ""):
+            successor["route_token_ref"] = route_token_ref
+            store.update(successor_execution_id, successor)
+    successor_contract = {
+        "schema_version": "contract_successor_handoff.v1",
+        "contract_chain_id": chain_id,
+        "parent_contract_execution_id": parent_execution_id,
+        "successor_contract_execution_id": successor_execution_id,
+        "handoff_event_id": handoff_event_id,
+        "handoff_reason": reason,
+        "successor_contract_id": "observer_hotfix",
+        "root_contract_execution_id": root_execution_id,
+        "role_binding": {
+            "observer": actor_role,
+            "qa": "qa",
+            "qa_independent": True,
+        },
+        "backlog_lineage": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+    }
+    runtime.current_guide(successor_execution_id, actor_role=actor_role)
+    successor = store.get(successor_execution_id)
+    next_line = (
+        successor.get("runtime_guide", {}).get("next_legal_action")
+        if isinstance(successor.get("runtime_guide"), Mapping)
+        else None
+    )
+    write_result: dict[str, Any] | None = None
+    if (
+        isinstance(next_line, Mapping)
+        and str(next_line.get("stage_id") or "") == "pre_mutation"
+        and str(next_line.get("line_id") or "") == "hotfix_pre_reason"
+    ):
+        write_result = runtime.submit_line_write(
+            successor_execution_id,
+            _contract_runtime_write_from_record(
+                successor,
+                actor_role=actor_role,
+                stage_id="pre_mutation",
+                line_id="hotfix_pre_reason",
+                evidence_kind="hotfix_entered",
+            ),
+            actor_role=actor_role,
+        )
+        successor = write_result["record"]
+    runtime.current_guide(successor_execution_id, actor_role=actor_role)
+    successor = store.get(successor_execution_id)
+    current_state = _runtime_current_state_from_record(successor)
+    runtime_guide = successor.get("runtime_guide") or {}
+    return {
+        "schema_version": "observer_hotfix_successor_runtime_enter.v1",
+        "successor_contract": successor_contract,
+        "contract_execution_id": successor_execution_id,
+        "successor_contract_execution_id": successor_execution_id,
+        "parent_contract_execution_id": parent_execution_id,
+        "root_contract_execution_id": root_execution_id,
+        "contract_chain_id": chain_id,
+        "runtime_guide": runtime_guide,
+        "current_state": current_state,
+        "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
+        "execution_state_revision": current_state["execution_state_revision"],
+        "execution_state_hash": current_state["execution_state_hash"],
+        "route_token_ref": str(successor.get("route_token_ref") or ""),
+        "route_token_ref_guidance": {
+            "route_token_ref": str(successor.get("route_token_ref") or ""),
+            "raw_route_token_required": False,
+            "pass_ref_to_next_runtime_write": True,
+        },
+        "write_result": write_result,
+        "qa_independent_verification": {
+            "required": True,
+            "actor_role": "qa",
+            "observer_must_not_author": True,
+        },
+    }
+
+
 def _observer_root_route_context_state(
     conn,
     project_id: str,
@@ -33079,6 +33417,14 @@ def _observer_root_route_context_state(
     if token_ref:
         route_context_for_bootstrap["route_token_ref"] = token_ref
     route_context_for_bootstrap["graph_query_schema_trace_id"] = graph_trace_id
+    runtime_projection = _observer_onboarding_runtime_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract=contract,
+        actor_role="observer",
+        route_token_ref=token_ref,
+    )
 
     transition_gate = observer_session.work_mode_transition_gate(
         events,
@@ -33446,6 +33792,26 @@ def _observer_root_route_context_state(
                 "deferred_contract_state_next_action": deferred_contract_action,
             }
         context["next_legal_action"] = close_next_legal_action
+    if runtime_projection.get("active"):
+        context["contract_runtime"] = runtime_projection
+        context["runtime_guide"] = runtime_projection.get("runtime_guide") or {}
+        context["contract_runtime_current_state"] = {
+            "schema_version": "contract_runtime_current_state.v1",
+            "contract_execution_id": runtime_projection.get(
+                "contract_execution_id", ""
+            ),
+            "execution_state_revision": runtime_projection.get(
+                "execution_state_revision", 0
+            ),
+            "execution_state_hash": runtime_projection.get(
+                "execution_state_hash", ""
+            ),
+            "route_token_ref": runtime_projection.get("route_token_ref", ""),
+            "next_legal_action": runtime_projection.get("next_legal_action") or {},
+        }
+        context["next_legal_action"] = dict(
+            runtime_projection.get("next_legal_action") or {}
+        )
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),
         "passed": bool(route_context_gate.get("passed")),
@@ -39664,7 +40030,7 @@ def _contains_under_hotfix(value: Any) -> bool:
 
 @route("POST", "/api/projects/{project_id}/hotfix/enter")
 def handle_project_hotfix_enter(ctx: RequestContext):
-    """Record audit-only entry into a HOTFIX profile."""
+    """Record entry into HOTFIX and, for source-backed rows, bind successor runtime."""
     project_id = ctx.get_project_id()
     body = ctx.body or {}
     reason = str(
@@ -39682,27 +40048,102 @@ def handle_project_hotfix_enter(ctx: RequestContext):
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     task_id = str(body.get("task_id") or "").strip()
     actor = str(body.get("actor") or "api").strip()
-    payload = {
-        "schema_version": "hotfix_entered.v1",
-        "profile": "HOTFIX",
-        "reason": reason,
-        "actor": actor,
-        "backlog_id": backlog_id,
-        "task_id": task_id,
-    }
-    payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
-        {
-            "event_type": "hotfix.entered",
-            "event_kind": "hotfix_entered",
-            "phase": "hotfix",
+    body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
+    route_token_ref = str(body.get("route_token_ref") or "").strip()
+    successor_runtime: dict[str, Any] = {}
+    source_backed = False
+    derived_actor_role = ""
+    with DBContext(project_id) as conn:
+        row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+        ).fetchone()
+        contract: dict[str, Any] = {}
+        if row is not None:
+            contract = backlog_runtime.parse_json_object(
+                _row_get(row, "chain_trigger_json", "{}")
+            )
+        source_backed = _source_backed_onboarding_enabled(contract)
+        if source_backed:
+            session = ctx.require_auth(conn)
+            derived_actor_role = str(session.get("role") or "").strip()
+            if derived_actor_role != "observer":
+                raise PermissionDeniedError(
+                    derived_actor_role,
+                    "hotfix_enter",
+                    {
+                        "body_role_claim": body_role_claim,
+                        "role_source": "request_session",
+                    },
+                )
+            root_projection = _observer_onboarding_runtime_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract=contract,
+                actor_role=derived_actor_role,
+                route_token_ref=route_token_ref,
+            )
+            parent_record = _contract_runtime_store(conn).get(
+                str(root_projection.get("contract_execution_id") or "")
+            )
+            if not _runtime_record_is_complete(parent_record):
+                current_state = _runtime_current_state_from_record(parent_record)
+                raise ValidationError(
+                    "observer onboarding contract must complete before hotfix successor",
+                    {
+                        "contract_execution_id": parent_record.get(
+                            "contract_execution_id"
+                        ),
+                        "next_legal_action": current_state.get("next_legal_action")
+                        or {},
+                    },
+                )
+            successor_runtime = _observer_hotfix_successor_runtime_enter(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                parent_record=parent_record,
+                actor_role=derived_actor_role,
+                route_token_ref=route_token_ref,
+                reason=reason,
+            )
+        payload = {
+            "schema_version": "hotfix_entered.v1",
+            "profile": "HOTFIX",
+            "reason": reason,
             "actor": actor,
-            "status": "accepted",
-            "payload": payload,
             "backlog_id": backlog_id,
             "task_id": task_id,
         }
-    )
-    with DBContext(project_id) as conn:
+        if source_backed:
+            payload.update(
+                {
+                    "runtime_cutover": True,
+                    "derived_actor_role": derived_actor_role,
+                    "body_role_claim_ignored": body_role_claim,
+                    "successor_contract": successor_runtime.get(
+                        "successor_contract"
+                    )
+                    or {},
+                    "agent_facing_decision_source": (
+                        "contract_runtime_first_missing_line"
+                    ),
+                    "meta_contract_gate_decision_source": False,
+                }
+            )
+        payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
+            {
+                "event_type": "hotfix.entered",
+                "event_kind": "hotfix_entered",
+                "phase": "hotfix",
+                "actor": actor,
+                "status": "accepted",
+                "payload": payload,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            }
+        )
         event = task_timeline.record_event(
             conn,
             project_id=project_id,
@@ -39718,16 +40159,63 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                 "profile": "HOTFIX",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "successor_contract_execution_id": successor_runtime.get(
+                    "successor_contract_execution_id", ""
+                ),
             },
         )
         conn.commit()
-    return {
+    response = {
         "ok": True,
         "project_id": project_id,
         "profile": "HOTFIX",
         "event": event,
         "hotfix_ref": f"timeline:{event['id']}",
     }
+    if source_backed:
+        response.update(
+            {
+                "schema_version": "hotfix_enter.runtime_contract_response.v1",
+                "contract_execution_id": successor_runtime.get(
+                    "contract_execution_id", ""
+                ),
+                "successor_contract_execution_id": successor_runtime.get(
+                    "successor_contract_execution_id", ""
+                ),
+                "parent_contract_execution_id": successor_runtime.get(
+                    "parent_contract_execution_id", ""
+                ),
+                "root_contract_execution_id": successor_runtime.get(
+                    "root_contract_execution_id", ""
+                ),
+                "contract_chain_id": successor_runtime.get(
+                    "contract_chain_id", ""
+                ),
+                "runtime_guide": successor_runtime.get("runtime_guide") or {},
+                "contract_runtime_current_state": successor_runtime.get(
+                    "current_state"
+                )
+                or {},
+                "next_legal_action": successor_runtime.get("next_legal_action")
+                or {},
+                "execution_state_revision": successor_runtime.get(
+                    "execution_state_revision", 0
+                ),
+                "execution_state_hash": successor_runtime.get(
+                    "execution_state_hash", ""
+                ),
+                "route_token_ref": successor_runtime.get("route_token_ref", ""),
+                "route_token_ref_guidance": successor_runtime.get(
+                    "route_token_ref_guidance"
+                )
+                or {},
+                "qa_independent_verification": successor_runtime.get(
+                    "qa_independent_verification"
+                )
+                or {},
+            }
+        )
+    return response
 
 
 @route("GET", "/api/projects/{project_id}/hotfix/usage")

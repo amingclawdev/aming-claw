@@ -64,13 +64,21 @@ def validate_contract_write(
             line = find_line(definition, stage_id=stage_id, line_id=line_id)
         except ContractDefinitionError as exc:
             errors.append(str(exc))
-    if line is not None and actor_role:
-        allowed = set(str(item) for item in line.get("allowed_writer_roles") or [])
-        if actor_role not in allowed:
-            errors.append(
-                f"actor_role {actor_role!r} cannot write line {line_id!r}; "
-                f"allowed_writer_roles={sorted(allowed)!r}"
-            )
+    if line is not None:
+        if actor_role:
+            allowed = set(str(item) for item in line.get("allowed_writer_roles") or [])
+            if actor_role not in allowed:
+                errors.append(
+                    f"actor_role {actor_role!r} cannot write line {line_id!r}; "
+                    f"allowed_writer_roles={sorted(allowed)!r}"
+                )
+        expected_evidence_kind = str(line.get("evidence_kind") or "")
+        write_evidence_kind = str(write.get("evidence_kind") or "")
+        if expected_evidence_kind:
+            if "evidence_kind" not in write or not write_evidence_kind:
+                errors.append("missing evidence_kind")
+            elif write_evidence_kind != expected_evidence_kind:
+                errors.append("evidence_kind mismatch")
 
     next_action = execution_state.get("next_action")
     if require_next_action and isinstance(next_action, Mapping):

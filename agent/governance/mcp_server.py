@@ -496,6 +496,29 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_hotfix_enter",
+        "description": "Enter source-backed observer_hotfix successor runtime after onboarding completion.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "human_reason": {"type": "string"},
+                "hotfix_reason": {"type": "string"},
+                "actor": {"type": "string"},
+                "actor_role": {
+                    "type": "string",
+                    "description": "Accepted for audit only; HTTP facade derives the effective role from the session/token.",
+                },
+                "route_token_ref": {"type": "string"},
+            },
+            "required": ["project_id", "reason"],
+        },
+    },
+    {
         "name": "runtime_context_current",
         "description": "Read the Runtime Context Service current-state projection. mf_sub callers receive only the role-filtered worker view.",
         "inputSchema": {
@@ -876,6 +899,15 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             query["limit"] = str(_int_arg(args, "limit", 1000, minimum=1, maximum=1000))
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         return _http("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
+
+    if name == "observer_hotfix_enter":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        return _http("POST", f"/api/projects/{pid}/hotfix/enter", body)
 
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
         pid = args["project_id"]
