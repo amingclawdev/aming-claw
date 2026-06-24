@@ -2311,6 +2311,83 @@ def test_parallel_branch_allocate_blocks_same_owner_token_for_identity_mismatch(
     assert reloaded.session_token_hash == ""
 
 
+def test_parallel_branch_allocate_blocks_existing_worktree_branch_mismatch(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    base = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    existing_worktree = repo / ".worktrees" / "focus-ui" / "existing-focus-ui"
+    existing_worktree.parent.mkdir(parents=True, exist_ok=True)
+    actual_branch = "dpl-focus-ui/dpl-today-focus-reminders-focus-ui"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", actual_branch, str(existing_worktree), "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    task_id = "DPL-TODAY-FOCUS-REMINDERS-20260624-focus-ui-repair-qa25"
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "parent_task_id": "DPL-TODAY-FOCUS-REMINDERS-20260624",
+                "backlog_id": "DPL-TODAY-FOCUS-REMINDERS-20260624",
+                "worker_id": "focus-ui-repair-lane",
+                "agent_id": "focus-ui-repair-lane",
+                "allocation_owner": "focus-ui-repair-lane",
+                "workspace_root": str(repo),
+                "worktree_path": str(existing_worktree),
+                "branch_prefix": "dpl-focus-ui-repair",
+                "fence_token": "fence-focus-ui-repair",
+                "base_commit": base,
+                "target_head_commit": base,
+                "merge_queue_id": "mq-focus-ui-repair",
+                "issue_same_owner_session_token": True,
+                "create_worktree": False,
+                "owned_files": [
+                    "index.html",
+                    "styles.css",
+                    "src/app.js",
+                    "tests/planner.test.mjs",
+                ],
+                "route_id": "route-focus-ui-repair",
+                "route_context_hash": "sha256:route-focus-ui-repair",
+                "prompt_contract_id": "rprompt-focus-ui-repair",
+                "prompt_contract_hash": "sha256:prompt-focus-ui-repair",
+                "route_token_ref": "rtok-focus-ui-repair",
+                "visible_injection_manifest_hash": "sha256:visible-focus-ui-repair",
+            },
+        )
+    )
+
+    assert status == 409
+    assert allocated["ok"] is False
+    assert allocated["status"] == "worktree_branch_mismatch"
+    assert allocated["actual_branch"] == actual_branch
+    assert allocated["expected_branch"] == (
+        "refs/heads/dpl-focus-ui-repair/"
+        "dpl-today-focus-reminders-20260624-focus-ui-repair-qa25"
+    )
+    assert allocated["blocker"]["must_stop_before_spawn"] is True
+    assert "same_owner_worker_session" not in allocated
+    assert get_branch_context(conn, PID, task_id) is None
+    assert allocated["repair"]["fresh_worktree_retry"]["set_create_worktree"] is True
+    assert (
+        allocated["repair"]["adoption_retry"][
+            "requires_audited_checkout_or_adoption_evidence"
+        ]
+        is True
+    )
+
+
 def test_observer_runtime_text_prepare_resolves_persisted_runtime_context_id(conn, tmp_path):
     raw_fence_token = "fence-runtime-text-api"
     raw_session_token = "runtime-text-session-secret"

@@ -6365,6 +6365,127 @@ def _parallel_branch_allocate_identity_mismatches(
     ]
 
 
+def _parallel_branch_allocate_branch_name(branch_ref: str) -> str:
+    text = str(branch_ref or "").strip()
+    prefix = "refs/heads/"
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def _parallel_branch_allocate_actual_worktree_branch(
+    worktree_path: str,
+) -> tuple[str, str]:
+    worktree = Path(str(worktree_path or "")).expanduser()
+    if not worktree.exists():
+        return "", "missing_worktree"
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "", "branch_probe_failed"
+    if proc.returncode != 0:
+        return "", "not_git_worktree"
+    return proc.stdout.strip(), "ok"
+
+
+def _parallel_branch_allocate_worktree_branch_mismatch_payload(
+    *,
+    project_id: str,
+    task_id: str,
+    context: Any,
+    actual_branch: str,
+    probe_status: str,
+) -> dict[str, Any]:
+    expected_branch = str(getattr(context, "branch_ref", "") or "").strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    return {
+        "ok": False,
+        "status": "worktree_branch_mismatch",
+        "error": "assigned_worktree_branch_mismatch",
+        "message": (
+            "The assigned worktree is checked out on a different branch than "
+            "the planned branch runtime context. No runtime context, dispatch "
+            "event, or worker session token was issued."
+        ),
+        "project_id": project_id,
+        "task_id": task_id,
+        "runtime_context_id": str(getattr(context, "runtime_context_id", "") or ""),
+        "worktree_path": worktree_path,
+        "actual_branch": actual_branch,
+        "expected_branch": expected_branch,
+        "probe_status": probe_status,
+        "blocker": {
+            "id": "assigned_worktree_branch_mismatch",
+            "actual_branch": actual_branch,
+            "expected_branch": expected_branch,
+            "worktree_path": worktree_path,
+            "must_stop_before_spawn": True,
+        },
+        "repair": {
+            "schema_version": "parallel_branch_allocate.worktree_branch_repair.v1",
+            "recoverable": True,
+            "next_actions": [
+                "allocate a fresh clean worktree for the planned branch runtime context",
+                "or run an audited branch-adoption/checkout recovery before preparing runtime text",
+            ],
+            "fresh_worktree_retry": {
+                "set_create_worktree": True,
+                "omit_final_worktree_path": True,
+                "preserve_fields": [
+                    "task_id",
+                    "parent_task_id",
+                    "backlog_id",
+                    "branch_prefix",
+                    "base_commit",
+                    "target_head_commit",
+                    "merge_queue_id",
+                    "fence_token",
+                    "owned_files or target_files",
+                    "route_token_ref",
+                ],
+            },
+            "adoption_retry": {
+                "requires_audited_checkout_or_adoption_evidence": True,
+                "current_worktree_branch": actual_branch,
+                "planned_branch_ref": expected_branch,
+            },
+        },
+    }
+
+
+def _parallel_branch_allocate_worktree_branch_mismatch(
+    *,
+    context: Any,
+    create_worktree: bool,
+) -> dict[str, Any]:
+    if create_worktree:
+        return {}
+    expected_branch = _parallel_branch_allocate_branch_name(
+        str(getattr(context, "branch_ref", "") or "")
+    )
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    if not expected_branch or not worktree_path:
+        return {}
+    actual_branch, probe_status = _parallel_branch_allocate_actual_worktree_branch(
+        worktree_path
+    )
+    if probe_status != "ok" or not actual_branch:
+        return {}
+    if _parallel_branch_allocate_branch_name(actual_branch) == expected_branch:
+        return {}
+    return _parallel_branch_allocate_worktree_branch_mismatch_payload(
+        project_id=str(getattr(context, "project_id", "") or ""),
+        task_id=str(getattr(context, "task_id", "") or ""),
+        context=context,
+        actual_branch=actual_branch,
+        probe_status=probe_status,
+    )
+
+
 def _parallel_branch_allocate_identity_repair_payload(
     *,
     project_id: str,
@@ -6596,6 +6717,13 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ctx.body,
         worktree_root=worktree_root,
     )
+    create_worktree = _query_bool(ctx.body, "create_worktree", False)
+    branch_mismatch = _parallel_branch_allocate_worktree_branch_mismatch(
+        context=context,
+        create_worktree=create_worktree,
+    )
+    if branch_mismatch:
+        return 409, branch_mismatch
     same_owner_worker_session: dict[str, Any] = {}
     requested_agent_id = str(ctx.body.get("agent_id") or "").strip()
     issue_same_owner_session_token = _body_bool(
@@ -6614,7 +6742,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
         with sqlite_write_lock():
-            if not _query_bool(ctx.body, "create_worktree", False):
+            if not create_worktree:
                 existing = get_branch_context(conn, project_id, task_id)
                 if (
                     should_issue_same_owner_session_token
@@ -6642,7 +6770,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             conn.commit()
 
         worktree_result: dict[str, Any] | None = None
-        if _query_bool(ctx.body, "create_worktree", False):
+        if create_worktree:
             worktree_result = materialize_branch_worktree(
                 conn,
                 project_id=project_id,
