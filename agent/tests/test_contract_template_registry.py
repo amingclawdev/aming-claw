@@ -172,6 +172,36 @@ def test_mf_parallel_template_declares_route_topology_and_worker_prompt_boundary
     assert "observer_only_context" in worker_prompt_contract["forbidden_context_sources"]
 
 
+def test_mf_parallel_template_is_discoverable_by_runtime_filters():
+    templates = list_contract_templates(task_type="mf_parallel")
+    ids = {template["template_id"] for template in templates}
+
+    assert "mf_parallel.v1" in ids
+    assert "mf_workflow_runtime.v1" in ids
+    assert resolve_contract_template(template_id="mf_parallel.v1", task_type="mf_parallel")[
+        "template_id"
+    ] == "mf_parallel.v1"
+
+
+def test_mf_workflow_runtime_template_is_discoverable_by_merge_stage():
+    templates = list_contract_templates(stage="merge_preview")
+    ids = {template["template_id"] for template in templates}
+
+    assert "mf_workflow_runtime.v1" in ids
+    assert "mf_parallel.v1" not in ids
+    assert resolve_contract_template(
+        template_id="mf_workflow_runtime.v1",
+        task_type="mf_parallel",
+        stage="merge_preview",
+    )["template_id"] == "mf_workflow_runtime.v1"
+    assert resolve_contract_template(task_type="mf_parallel", stage="merge_preview")[
+        "template_id"
+    ] == "mf_workflow_runtime.v1"
+    assert resolve_contract_template(task_type="manual_fix", stage="merge_preview")[
+        "template_id"
+    ] == "mf_workflow_runtime.v1"
+
+
 def test_observer_hotfix_direct_mutation_template_declares_pre_and_post_timeline_contract():
     template = get_contract_template("observer_hotfix_direct_mutation.v1")
     timeline_contract = template["timeline_contract"]

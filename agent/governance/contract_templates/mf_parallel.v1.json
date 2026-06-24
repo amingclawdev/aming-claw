@@ -1,7 +1,22 @@
 {
   "schema_version": "mf_contract_template.v1",
   "template_id": "mf_parallel.v1",
+  "version": "v1",
   "description": "Template for observer-led manual-fix work split across parallel agents. Observer instantiates this template into backlog chain_trigger_json before delegation.",
+  "task_types": [
+    "mf_parallel",
+    "manual_fix",
+    "chain_rescue"
+  ],
+  "stages": [
+    "contract_draft",
+    "parallel_planning",
+    "worker_dispatch",
+    "worker_implementation",
+    "worker_review",
+    "qa_handoff",
+    "observer_merge_close_gate"
+  ],
   "required_instance_fields": [
     "contract_instance_id",
     "workers",

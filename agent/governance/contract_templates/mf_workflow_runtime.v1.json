@@ -1,7 +1,27 @@
 {
   "schema_version": "mf_workflow_runtime_contract.v1",
   "template_id": "mf_workflow_runtime.v1",
+  "version": "v1",
   "description": "Contract for deterministic MF workflow workers that call a unified local precheck/gate service for each privileged stage.",
+  "task_types": [
+    "mf_parallel",
+    "mf_workflow",
+    "manual_fix",
+    "chain_rescue"
+  ],
+  "stages": [
+    "dispatch",
+    "startup_gate",
+    "implementation_wait",
+    "handoff_gate",
+    "merge_gate",
+    "merge_queue_entry",
+    "merge_preview",
+    "live_merge",
+    "reconcile",
+    "close_gate",
+    "pre_close_gate"
+  ],
   "contract_instance_id": "",
   "control_plane": {
     "observer_role": "monitoring_requirements_design_exception_handling",
