@@ -413,6 +413,26 @@ def _observer_hotfix_contract_events_with_current_post_schema_projection():
     return events
 
 
+def _observer_hotfix_contract_events_with_pending_qa_projection():
+    events = _observer_hotfix_contract_events()
+    events[1] = {
+        **events[1],
+        "payload": {
+            **events[1]["payload"],
+            "implementation_close_evidence": {
+                "counts_as_implementation": True,
+                "changed_files": ["agent/governance/task_timeline.py"],
+                "verification_evidence_refs": [],
+                "qa_lineage": {
+                    "required": True,
+                    "status": "pending_successor_qa",
+                },
+            },
+        },
+    }
+    return events
+
+
 def _observer_hotfix_contract_events_with_generic_implementation_alias():
     events = _observer_hotfix_contract_events()
     events[1] = {
@@ -8237,7 +8257,7 @@ class TestTaskTimeline(unittest.TestCase):
             blocked["ignored_required_events"][0]["implementation_close_projection"][
                 "missing_fields"
             ],
-            ["changed_files", "verification_evidence_refs", "qa_lineage"],
+            ["changed_files", "qa_lineage"],
         )
 
     def test_observer_hotfix_under_action_can_implement_with_explicit_policy_evidence(self):
@@ -8274,6 +8294,25 @@ class TestTaskTimeline(unittest.TestCase):
 
         self.assertTrue(ready["passed"], ready)
         self.assertNotIn("implementation", ready["missing_event_kinds"])
+        self.assertEqual(ready["ignored_required_events"], [])
+
+    def test_observer_hotfix_under_action_can_use_later_row_verification(self):
+        from agent.governance import task_timeline
+
+        contract = {"template_id": "observer_hotfix_direct_mutation.v1"}
+        events = [
+            {"id": 2001, "event_kind": "verification", "phase": "verification", "status": "passed"},
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+            *_route_context_consumption_events()[:2],
+            *_observer_hotfix_contract_events_with_pending_qa_projection(),
+            _route_context_qa_verification_event(),
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertNotIn("implementation", ready["missing_event_kinds"])
+        self.assertTrue(ready["independent_qa_gate"]["passed"], ready)
         self.assertEqual(ready["ignored_required_events"], [])
 
     def test_observer_hotfix_successor_policy_overrides_onboard_root_template(self):

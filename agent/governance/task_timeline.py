@@ -3172,9 +3172,28 @@ def _nonempty_evidence_ref(value: Any) -> bool:
     return bool(_string_list(value))
 
 
+def _row_level_verification_refs_for_hotfix(close_rows: list[dict[str, Any]]) -> list[str]:
+    refs: list[str] = []
+    for event in close_rows:
+        if not isinstance(event, dict):
+            continue
+        status = str(event.get("status") or event.get("decision") or "").strip().lower()
+        if status not in MF_CLOSE_PASS_STATUSES:
+            continue
+        kind = str(event.get("event_kind") or "").strip()
+        phase = str(event.get("phase") or "").strip()
+        if kind not in {"verification", "qa_verification", "independent_verification"} and phase != "verification":
+            continue
+        event_id = event.get("id") or event.get("event_id")
+        refs.append(f"timeline:{event_id}" if event_id else kind or phase)
+    return _dedupe_nonempty(refs)
+
+
 def _hotfix_under_action_implementation_projection(
     event: dict[str, Any],
     contract_close_policy: Mapping[str, Any],
+    *,
+    row_level_verification_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     marker = _route_marker(
         event.get("event_kind") or event.get("event_type") or event.get("phase")
@@ -3233,13 +3252,15 @@ def _hotfix_under_action_implementation_projection(
                 str(qa_lineage.get("successor_contract_execution_id") or "").strip()
                 or str(qa_lineage.get("required_gate") or "").strip()
                 or str(qa_lineage.get("event_kind") or "").strip()
+                or str(qa_lineage.get("status") or "").strip()
             )
         )
     )
+    row_level_refs = _dedupe_nonempty(row_level_verification_refs or [])
     missing: list[str] = []
     if not changed_files:
         missing.append("changed_files")
-    if not _nonempty_evidence_ref(verification_refs):
+    if not _nonempty_evidence_ref(verification_refs) and not row_level_refs:
         missing.append("verification_evidence_refs")
     if _policy_bool(policy.get("qa_lineage_required"), True) and not qa_lineage_present:
         missing.append("qa_lineage")
@@ -3254,6 +3275,7 @@ def _hotfix_under_action_implementation_projection(
         "reason": "explicit_hotfix_implementation_close_policy",
         "changed_files": changed_files,
         "verification_evidence_refs": verification_refs,
+        "row_level_verification_refs": row_level_refs,
         "qa_lineage": qa_lineage,
         "event_id": event.get("id") or event.get("event_id"),
     }
@@ -8552,6 +8574,7 @@ def mf_close_gate_verification(
             contract,
             _route_topology_policy(contract),
         )
+        row_level_verification_refs = _row_level_verification_refs_for_hotfix(close_rows)
         for event in close_rows:
             if not isinstance(event, dict):
                 continue
@@ -8562,6 +8585,7 @@ def mf_close_gate_verification(
             hotfix_projection = _hotfix_under_action_implementation_projection(
                 event,
                 close_policy,
+                row_level_verification_refs=row_level_verification_refs,
             )
             if (
                 "implementation" in required_event_kinds
