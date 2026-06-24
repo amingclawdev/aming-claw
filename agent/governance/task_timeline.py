@@ -1256,6 +1256,102 @@ def _independent_qa_verdict_refs(event: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(refs))
 
 
+def _independent_qa_role_token(value: Any) -> bool:
+    raw = _text(value).strip().lower()
+    token = _normalize_token(raw)
+    return bool(
+        raw == "qa"
+        or raw.startswith(("qa:", "qa.", "qa-", "qa_"))
+        or token in {"independent_qa", "qa_reviewer", "qa_verifier"}
+        or token.startswith("qa_subagent")
+    )
+
+
+def _independent_qa_reviewer_or_actor_is_qa(event: dict[str, Any]) -> bool:
+    if _independent_qa_role_token(event.get("actor")):
+        return True
+    if _independent_qa_role_token(_independent_qa_reviewer_identity(event)):
+        return True
+    for value in _event_field_values(
+        event,
+        {"reviewer_role", "qa_role", "verifier_role", "lane_role"},
+    ):
+        if _independent_qa_role_token(value):
+            return True
+    return False
+
+
+def _independent_qa_meta_gate_matches(event: dict[str, Any]) -> bool:
+    if not _independent_qa_reviewer_or_actor_is_qa(event):
+        return False
+    allowed_actions = {"qa_verification", "independent_verification", "qa_review"}
+    for raw_gate in _field_values(event, {"meta_contract_gate"}):
+        gate = _mapping(raw_gate)
+        if not gate:
+            continue
+        role = _route_marker(gate.get("role"))
+        action = _route_marker(gate.get("action"))
+        status = _text(gate.get("status") or gate.get("decision")).strip().lower()
+        if (
+            role == "qa"
+            and action in allowed_actions
+            and (_truthy(gate.get("allowed")) or status in MF_ROUTE_CONTEXT_PASS_STATUSES)
+        ):
+            return True
+    return False
+
+
+def _independent_qa_schema_matches(event: dict[str, Any]) -> bool:
+    for schema in _event_field_values(event, {"schema_version"}):
+        if "qa_canonical_verification" in _normalize_token(schema):
+            return True
+    return False
+
+
+def _independent_qa_requirement_token_present(value: Any, *, depth: int = 0) -> bool:
+    if depth > 5:
+        return False
+    if isinstance(value, dict):
+        for key, child in value.items():
+            marker = _normalize_token(key)
+            if marker in {
+                "independent_verification",
+                "independent_verification_lane",
+            }:
+                return True
+            if _independent_qa_requirement_token_present(child, depth=depth + 1):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _independent_qa_requirement_token_present(child, depth=depth + 1)
+            for child in value
+        )
+    else:
+        marker = _normalize_token(value)
+        return marker in {"independent_verification", "independent_verification_lane"}
+    return False
+
+
+def _independent_qa_requirement_evidence_matches(event: dict[str, Any]) -> bool:
+    return any(
+        _independent_qa_requirement_token_present(_mapping(event.get(container_key)))
+        for container_key in ("payload", "verification", "artifact_refs")
+    )
+
+
+def _independent_qa_semantic_evidence_matches(event: dict[str, Any]) -> bool:
+    if _independent_qa_meta_gate_matches(event):
+        return True
+    qa_actor_or_reviewer = _independent_qa_reviewer_or_actor_is_qa(event)
+    return bool(
+        qa_actor_or_reviewer
+        and (
+            _independent_qa_schema_matches(event)
+            or _independent_qa_requirement_evidence_matches(event)
+        )
+    )
+
+
 def _independent_qa_event_kind_matches(event: dict[str, Any]) -> bool:
     for key in ("event_kind", "event_type", "phase"):
         token = _normalize_token(event.get(key))
@@ -1263,6 +1359,9 @@ def _independent_qa_event_kind_matches(event: dict[str, Any]) -> bool:
             marker in token
             for marker in ("qa_review", "qa_verification", "independent_verification")
         ):
+            return True
+        route_marker = _route_marker(event.get(key))
+        if "verification" in route_marker and _independent_qa_semantic_evidence_matches(event):
             return True
     return False
 

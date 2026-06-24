@@ -9886,6 +9886,273 @@ class TestTaskTimeline(unittest.TestCase):
             ]
         )
 
+    def test_mf_parallel_close_gate_accepts_qa_canonical_verification_child_route(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-QA-CANONICAL-VERIFICATION-ROW-SCOPED"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": bug_id,
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "independent_verification_required": True,
+            },
+        }
+        parent_identity = {
+            "route_id": "route-qa-canonical-parent",
+            "route_context_hash": "sha256:qa-canonical-parent-route",
+            "prompt_contract_id": "rprompt-qa-canonical-parent",
+            "prompt_contract_hash": "sha256:qa-canonical-parent-contract",
+        }
+        child_identity = {
+            "route_id": "route-qa-canonical-child",
+            "route_context_hash": "sha256:qa-canonical-child-route",
+            "prompt_contract_id": "rprompt-qa-canonical-child",
+            "prompt_contract_hash": "sha256:qa-canonical-child-contract",
+        }
+        qa_event = {
+            "id": 6579,
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "qa:Sagan",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-qa-canonical-verification",
+            "payload": {
+                "schema_version": "qa_canonical_verification.v1",
+                "meta_contract_gate": {
+                    "action": "qa_verification",
+                    "role": "qa",
+                    "status": "passed",
+                    "allowed": True,
+                },
+                "contract_evidence": {
+                    "independent_verification": {"status": "passed"},
+                    "focused_tests": ["agent/tests/test_task_timeline.py"],
+                },
+            },
+            "verification": {
+                "contract_evidence": [
+                    {
+                        "requirement_id": "independent_verification_lane",
+                        "status": "passed",
+                        "reviewer_role": "qa",
+                    },
+                    {"requirement_id": "focused_tests", "status": "passed"},
+                ]
+            },
+        }
+        _attach_server_action_scope_route_token_lineage(
+            qa_event,
+            child_identity,
+            parent_identity=parent_identity,
+            route_token_ref="rtok-qa-canonical-verification",
+            acceptance_source="server_route_token_action_scope",
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                {
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-worker-qa-canonical",
+                },
+                {
+                    "event_kind": "close_ready",
+                    "phase": "close",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-worker-qa-canonical",
+                },
+                *_route_context_consumption_events(parent_identity),
+                qa_event,
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
+        self.assertEqual(ready["cross_ref_gate"]["rejected_cross_ref_evidence"], [])
+        accepted_action_events = {
+            item["event"]["id"]
+            for item in ready["route_context_gate"]["accepted_action_scope_lineages"]
+        }
+        self.assertIn(6579, accepted_action_events)
+
+    def test_cross_ref_rejects_non_qa_generic_verification_spoofed_schema_child_route(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-NON-QA-GENERIC-VERIFICATION-CHILD-ROUTE"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": bug_id,
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "independent_verification_required": True,
+            },
+        }
+        parent_identity = {
+            "route_id": "route-non-qa-parent",
+            "route_context_hash": "sha256:non-qa-parent-route",
+            "prompt_contract_id": "rprompt-non-qa-parent",
+            "prompt_contract_hash": "sha256:non-qa-parent-contract",
+        }
+        child_identity = {
+            "route_id": "route-non-qa-child",
+            "route_context_hash": "sha256:non-qa-child-route",
+            "prompt_contract_id": "rprompt-non-qa-child",
+            "prompt_contract_hash": "sha256:non-qa-child-contract",
+        }
+        verification = {
+            "id": 6580,
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "worker-codex",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-generic-verification-child",
+            "payload": {
+                "schema_version": "qa_canonical_verification.v1",
+                "meta_contract_gate": {
+                    "action": "worker_progress",
+                    "role": "mf_sub",
+                    "status": "passed",
+                    "allowed": True,
+                },
+            },
+        }
+        _attach_server_action_scope_route_token_lineage(
+            verification,
+            child_identity,
+            parent_identity=parent_identity,
+            route_token_ref="rtok-non-qa-generic-verification",
+            acceptance_source="server_route_token_action_scope",
+        )
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                {
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-worker-non-qa",
+                },
+                {
+                    "event_kind": "close_ready",
+                    "phase": "close",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-worker-non-qa",
+                },
+                *_route_context_consumption_events(parent_identity),
+                verification,
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        rejected = blocked["cross_ref_gate"]["rejected_cross_ref_evidence"]
+        self.assertEqual([item["id"] for item in rejected], [6580])
+        self.assertIn(
+            "runtime_context_id",
+            rejected[0]["route_token_child_lineage"]["missing_fields"],
+        )
+
+    def test_cross_ref_rejects_non_qa_generic_verification_spoofed_qa_meta_gate_child_route(self):
+        from agent.governance import task_timeline
+
+        bug_id = "BUG-NON-QA-GENERIC-VERIFICATION-QA-META-SPOOF"
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": bug_id,
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "independent_verification_required": True,
+            },
+        }
+        parent_identity = {
+            "route_id": "route-non-qa-meta-parent",
+            "route_context_hash": "sha256:non-qa-meta-parent-route",
+            "prompt_contract_id": "rprompt-non-qa-meta-parent",
+            "prompt_contract_hash": "sha256:non-qa-meta-parent-contract",
+        }
+        child_identity = {
+            "route_id": "route-non-qa-meta-child",
+            "route_context_hash": "sha256:non-qa-meta-child-route",
+            "prompt_contract_id": "rprompt-non-qa-meta-child",
+            "prompt_contract_hash": "sha256:non-qa-meta-child-contract",
+        }
+        verification = {
+            "id": 6581,
+            "event_type": "mf.verification",
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "worker-codex",
+            "backlog_id": bug_id,
+            "project_id": "aming-claw",
+            "task_id": "cex-generic-verification-meta-spoof",
+            "payload": {
+                "schema_version": "qa_canonical_verification.v1",
+                "meta_contract_gate": {
+                    "action": "qa_verification",
+                    "role": "qa",
+                    "status": "passed",
+                    "allowed": True,
+                },
+            },
+        }
+        _attach_server_action_scope_route_token_lineage(
+            verification,
+            child_identity,
+            parent_identity=parent_identity,
+            route_token_ref="rtok-non-qa-generic-verification-meta-spoof",
+            acceptance_source="server_route_token_action_scope",
+        )
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                {
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-worker-non-qa-meta-spoof",
+                },
+                {
+                    "event_kind": "close_ready",
+                    "phase": "close",
+                    "status": "accepted",
+                    "backlog_id": bug_id,
+                    "project_id": "aming-claw",
+                    "task_id": "cex-worker-non-qa-meta-spoof",
+                },
+                *_route_context_consumption_events(parent_identity),
+                verification,
+            ],
+            contract=contract,
+        )
+
+        self.assertFalse(blocked["passed"], blocked)
+        rejected = blocked["cross_ref_gate"]["rejected_cross_ref_evidence"]
+        self.assertEqual([item["id"] for item in rejected], [6581])
+        self.assertIn(
+            "runtime_context_id",
+            rejected[0]["route_token_child_lineage"]["missing_fields"],
+        )
+
     def test_contract_state_projection_accepts_hotfix_row_scoped_qa_replaced_lane(self):
         from agent.governance import task_timeline
 
