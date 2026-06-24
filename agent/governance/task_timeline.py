@@ -7111,10 +7111,41 @@ def _event_has_subagent_identity(event: dict[str, Any]) -> bool:
     return False
 
 
+def _event_has_structured_subagent_identity(event: dict[str, Any]) -> bool:
+    for value in _event_field_values(event, {"worker_role", "role"}):
+        role = _normalize_token(value)
+        if role in {"mf_sub", "implementation_worker", "subagent"}:
+            return True
+    for key in (
+        "bounded_implementation_subagent_id",
+        "subagent_id",
+        "agent_id",
+        "worker_id",
+    ):
+        if _first_event_string(event, {key}):
+            return True
+    return False
+
+
+def _event_dispatch_text(event: dict[str, Any]) -> str:
+    fields: list[Any] = [
+        event.get("event_type"),
+        event.get("phase"),
+        event.get("event_kind"),
+        event.get("decision"),
+    ]
+    fields.extend(
+        value
+        for value in _event_field_values(event, {"required_dispatch_key"})
+        if not isinstance(value, (dict, list))
+    )
+    return _normalize_token(" ".join(str(field or "") for field in fields))
+
+
 def _is_subagent_dispatch_event(event: dict[str, Any]) -> bool:
     if not _event_passed(event):
         return False
-    text = _event_lane_text(event)
+    text = _event_dispatch_text(event)
     if any(
         _normalize_token(value) == "bounded_subagent_dispatch"
         for value in _event_field_values(event, {"required_dispatch_key"})
@@ -7130,7 +7161,20 @@ def _is_subagent_dispatch_event(event: dict[str, Any]) -> bool:
         )
     ):
         return True
-    return "dispatch" in text and _event_has_subagent_identity(event)
+    return "dispatch" in text and (
+        _event_has_structured_subagent_identity(event)
+        or any(
+            marker in text
+            for marker in (
+                "bounded_subagent",
+                "bounded_implementation_subagent",
+                "implementation_worker",
+                "mf_sub",
+                "mf_subagent",
+                "subagent",
+            )
+        )
+    )
 
 
 def _is_subagent_review_ready_event(event: dict[str, Any]) -> bool:

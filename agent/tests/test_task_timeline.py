@@ -11041,6 +11041,88 @@ class TestTaskTimeline(unittest.TestCase):
             ["bounded_implementation_subagent.review_ready"],
         )
 
+    def test_finish_gate_review_ready_not_dispatch_from_parent_task_text(self):
+        from agent.governance import task_timeline
+
+        parent_task_id = "AC-CONTRACT-RUNTIME-WORKER-DISPATCH-NO-PROGRESS-20260624"
+        worker_task_id = f"{parent_task_id}-worker-1"
+        contract = {
+            "route_id": "route-lane-required",
+            "route_context_hash": "sha256:lane-required",
+            "required_lanes": [
+                {"id": "bounded_implementation_subagent", "role": "implementation_worker"},
+            ],
+        }
+        events = [
+            {
+                "id": 6832,
+                "event_type": "mf_subagent.dispatch",
+                "event_kind": "mf_subagent_dispatch",
+                "phase": "bounded_subagent_dispatch",
+                "actor": "codex-observer",
+                "status": "accepted",
+                "payload": {
+                    "required_dispatch_key": "bounded_subagent_dispatch",
+                    "worker_role": "mf_sub",
+                    "worker_id": "worker-1",
+                },
+            },
+            {
+                "id": 6833,
+                "event_type": "mf_subagent.finish_gate",
+                "event_kind": "mf_subagent_finish_gate",
+                "phase": "finish_gate",
+                "actor": "worker-1",
+                "status": "passed",
+                "task_id": worker_task_id,
+                "backlog_id": parent_task_id,
+                "trace_id": "trace-worker-dispatch-no-progress",
+                "payload": {
+                    "mf_subagent_finish_gate": {
+                        "schema_version": "mf_subagent_finish_gate.v1",
+                        "status": "passed",
+                        "review_ready": True,
+                        "waiting_merge": True,
+                        "close_ready": True,
+                        "worker_role": "mf_sub",
+                        "worker_id": "worker-1",
+                        "worker_slot_id": "worker-1",
+                        "runtime_context_id": "mfrctx-worker-1",
+                        "task_id": worker_task_id,
+                        "parent_task_id": parent_task_id,
+                        "lane_ownership_projection": {
+                            "review_ready": True,
+                            "waiting_merge": True,
+                            "present_lane_ownership_ids": [
+                                "bounded_implementation_subagent.review_ready",
+                            ],
+                            "missing_lane_ownership_ids": [],
+                        },
+                    }
+                },
+            },
+        ]
+
+        ready = task_timeline.mf_lane_ownership_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(
+            ready["present_lane_ownership_ids"],
+            [
+                "bounded_implementation_subagent.dispatch",
+                "bounded_implementation_subagent.review_ready",
+            ],
+        )
+        self.assertEqual(ready["missing_lane_ownership_ids"], [])
+        self.assertEqual(
+            [
+                event["id"]
+                for event in ready["evidence_events"]
+                if event["evidence_id"] == "bounded_implementation_subagent.review_ready"
+            ],
+            [6833],
+        )
+
     def test_mf_close_gate_accepts_subagent_dispatch_and_review_ready(self):
         from agent.governance import task_timeline
 
