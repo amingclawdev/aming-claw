@@ -15837,6 +15837,197 @@ def _require_parallel_branch_merge_route_gate(
         return gate
 
 
+def _parallel_branch_parent_scope_from_recorded_merge(
+    recorded: Mapping[str, Any] | None,
+    *,
+    body: Mapping[str, Any] | None = None,
+    fallback_task_id: str = "",
+) -> dict[str, str]:
+    payload = recorded if isinstance(recorded, Mapping) else {}
+    request = body if isinstance(body, Mapping) else {}
+    context = payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
+    queue_item = payload.get("queue_item") if isinstance(payload.get("queue_item"), Mapping) else {}
+    task_id = str(
+        queue_item.get("task_id")
+        or context.get("task_id")
+        or request.get("task_id")
+        or fallback_task_id
+        or ""
+    ).strip()
+    backlog_id = str(
+        request.get("backlog_id")
+        or request.get("bug_id")
+        or context.get("backlog_id")
+        or ""
+    ).strip()
+    parent_task_id = str(
+        request.get("parent_task_id")
+        or context.get("root_task_id")
+        or context.get("chain_id")
+        or context.get("stage_task_id")
+        or backlog_id
+        or task_id
+        or ""
+    ).strip()
+    if not backlog_id:
+        backlog_id = parent_task_id or task_id
+    return {
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "parent_task_id": parent_task_id or backlog_id or task_id,
+        "runtime_context_id": str(context.get("runtime_context_id") or "").strip(),
+        "merge_queue_id": str(
+            queue_item.get("merge_queue_id")
+            or context.get("merge_queue_id")
+            or request.get("merge_queue_id")
+            or ""
+        ).strip(),
+        "queue_item_id": str(
+            queue_item.get("queue_item_id") or request.get("queue_item_id") or ""
+        ).strip(),
+    }
+
+
+def _parallel_branch_contract_evidence_item(
+    requirement_id: str,
+    *,
+    evidence_refs: list[str] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "requirement_id": requirement_id,
+        "status": "passed",
+    }
+    refs = [str(ref) for ref in (evidence_refs or []) if str(ref or "").strip()]
+    if refs:
+        item["evidence_refs"] = refs
+    if isinstance(extra, Mapping):
+        item.update({key: value for key, value in extra.items() if value not in (None, "", [], {})})
+    return item
+
+
+def _record_parallel_branch_merge_contract_timeline_events(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    result: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not (result.get("ok") and result.get("executed") and not result.get("dry_run")):
+        return []
+
+    from . import task_timeline
+
+    recorded = result.get("recorded") if isinstance(result.get("recorded"), Mapping) else {}
+    scope = _parallel_branch_parent_scope_from_recorded_merge(
+        recorded,
+        body=body,
+        fallback_task_id=str(body.get("task_id") or ""),
+    )
+    if not scope.get("backlog_id"):
+        return []
+
+    preview = result.get("preview") if isinstance(result.get("preview"), Mapping) else {}
+    gate_plan = result.get("gate_plan") if isinstance(result.get("gate_plan"), Mapping) else {}
+    queue_item = (
+        recorded.get("queue_item") if isinstance(recorded.get("queue_item"), Mapping) else {}
+    )
+    merge_commit = str(
+        result.get("merge_commit")
+        or queue_item.get("merge_commit")
+        or queue_item.get("target_head_after_merge")
+        or ""
+    ).strip()
+    route_gate_payload = dict(route_gate or {})
+    common_payload = {
+        "schema_version": "mf_parallel_merge_contract_evidence.v1",
+        "parent_task_id": scope["parent_task_id"],
+        "child_task_id": scope["task_id"],
+        "runtime_context_id": scope["runtime_context_id"],
+        "merge_queue_id": scope["merge_queue_id"],
+        "queue_item_id": scope["queue_item_id"],
+        "merge_commit": merge_commit,
+        "target_head_before_merge": str(queue_item.get("target_head_before_merge") or "").strip(),
+        "target_head_after_merge": str(queue_item.get("target_head_after_merge") or "").strip(),
+        "route_token_gate": route_gate_payload,
+    }
+    actor = str(body.get("contract_actor") or "codex-observer").strip()
+    requested_by_actor = str(body.get("actor") or "").strip()
+    events: list[dict[str, Any]] = []
+
+    preview_ref = str(preview.get("evidence_id") or "").strip()
+    preview_evidence = _parallel_branch_contract_evidence_item(
+        "merge_preview",
+        evidence_refs=[preview_ref] if preview_ref else [],
+        extra={
+            "preview_status": preview.get("status"),
+            "target_commit": preview.get("target_commit"),
+            "branch_commit": preview.get("branch_commit"),
+            "preview_tree": preview.get("preview_tree"),
+        },
+    )
+    events.append(
+        task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=scope["backlog_id"],
+            task_id=scope["parent_task_id"],
+            event_type="parallel.merge_preview",
+            event_kind="merge_preview",
+            phase="merge_preview",
+            actor=actor,
+            status="passed",
+            payload={
+                **common_payload,
+                "requirement_id": "merge_preview",
+                "contract_evidence": [preview_evidence],
+                "merge_preview": dict(preview),
+                "gate_plan": dict(gate_plan),
+                "requested_by_actor": requested_by_actor,
+            },
+            commit_sha=str(
+                preview.get("target_commit")
+                or queue_item.get("target_head_before_merge")
+                or ""
+            ),
+        )
+    )
+
+    live_ref = f"merge_execute:{merge_commit}" if merge_commit else ""
+    live_evidence = _parallel_branch_contract_evidence_item(
+        "live_merge",
+        evidence_refs=[live_ref] if live_ref else [],
+        extra={
+            "merge_commit": merge_commit,
+            "target_head_after_merge": queue_item.get("target_head_after_merge"),
+            "queue_status": queue_item.get("status"),
+        },
+    )
+    events.append(
+        task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=scope["backlog_id"],
+            task_id=scope["parent_task_id"],
+            event_type="parallel.live_merge",
+            event_kind="live_merge",
+            phase="live_merge",
+            actor=actor,
+            status="passed",
+            payload={
+                **common_payload,
+                "requirement_id": "live_merge",
+                "contract_evidence": [live_evidence],
+                "recorded_merge": dict(recorded),
+                "requested_by_actor": requested_by_actor,
+            },
+            commit_sha=merge_commit,
+        )
+    )
+    return events
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
 def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     """Enter one branch runtime context into the durable merge queue."""
@@ -16247,12 +16438,33 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                     task_id=str(ctx.body.get("task_id") or ""),
                     commit_sha=str(result.get("merge_commit") or ""),
                 )
+            timeline_events = _record_parallel_branch_merge_contract_timeline_events(
+                conn,
+                project_id=project_id,
+                body=ctx.body,
+                result=result,
+                route_gate=route_gate,
+            )
             conn.commit()
         return {
             "ok": bool(result.get("ok")),
             "project_id": project_id,
             "route_token_gate": route_gate or None,
             **result,
+            "timeline_events_recorded": [
+                {
+                    "id": event.get("id"),
+                    "ref": f"timeline:{event.get('id')}",
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "status": event.get("status"),
+                    "requirement_ids": (
+                        event.get("payload", {}).get("requirement_ids")
+                        or event.get("payload", {}).get("requirement_id")
+                    ),
+                }
+                for event in timeline_events
+            ],
             "decision": {
                 "scenario_id": decision.scenario_id,
                 "mergeable_task_ids": list(decision.mergeable_task_ids),
@@ -20625,6 +20837,109 @@ def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
         conn.close()
 
 
+def _contract_timeline_scope_from_graph_body(body: Mapping[str, Any]) -> dict[str, str]:
+    evidence = body.get("evidence") if isinstance(body.get("evidence"), Mapping) else {}
+    backlog_id = str(
+        body.get("backlog_id")
+        or body.get("bug_id")
+        or evidence.get("backlog_id")
+        or evidence.get("bug_id")
+        or evidence.get("parent_task_id")
+        or ""
+    ).strip()
+    task_id = str(
+        body.get("task_id")
+        or evidence.get("task_id")
+        or evidence.get("parent_task_id")
+        or backlog_id
+        or ""
+    ).strip()
+    actor = str(
+        body.get("contract_actor")
+        or evidence.get("contract_actor")
+        or "codex-observer"
+    ).strip()
+    return {
+        "backlog_id": backlog_id,
+        "task_id": task_id or backlog_id,
+        "actor": actor,
+    }
+
+
+def _record_pending_scope_reconcile_contract_event(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    result: Mapping[str, Any],
+    target_commit_sha: str,
+) -> dict[str, Any]:
+    if not isinstance(result, Mapping) or result.get("ok") is False:
+        return {}
+    scope = _contract_timeline_scope_from_graph_body(body)
+    if not scope["backlog_id"]:
+        return {}
+
+    from . import task_timeline
+
+    snapshot_id = str(
+        result.get("snapshot_id")
+        or result.get("active_snapshot_id")
+        or result.get("candidate_snapshot_id")
+        or ""
+    ).strip()
+    evidence_ref = f"reconcile:{snapshot_id}" if snapshot_id else ""
+    contract_evidence = _parallel_branch_contract_evidence_item(
+        "reconcile",
+        evidence_refs=[evidence_ref] if evidence_ref else [],
+        extra={
+            "target_commit_sha": target_commit_sha,
+            "snapshot_id": snapshot_id,
+            "reconcile_status": result.get("status") or result.get("snapshot_status") or "",
+            "active": bool(
+                result.get("snapshot_status") == "active" or result.get("active_snapshot_id")
+            ),
+        },
+    )
+    return task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=scope["backlog_id"],
+        task_id=scope["task_id"],
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor=scope["actor"],
+        status="passed",
+        payload={
+            "schema_version": "graph_reconcile_contract_evidence.v1",
+            "requirement_id": "reconcile",
+            "contract_evidence": [contract_evidence],
+            "requested_by_actor": str(body.get("actor") or "").strip(),
+            "target_commit_sha": target_commit_sha,
+            "snapshot_id": snapshot_id,
+            "result_status": result.get("status") or result.get("snapshot_status") or "",
+            "graph_reconcile_result": {
+                key: value
+                for key, value in dict(result).items()
+                if key
+                in {
+                    "ok",
+                    "status",
+                    "reason",
+                    "snapshot_id",
+                    "active_snapshot_id",
+                    "snapshot_status",
+                    "target_commit_sha",
+                    "target_commit_inferred",
+                    "pending_count",
+                }
+            },
+        },
+        commit_sha=target_commit_sha,
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/index")
 def handle_graph_governance_index_build(ctx: RequestContext):
     """Build and persist governance index artifacts without source mutation."""
@@ -21024,6 +21339,22 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                             identity=identity,
                         ),
                     )
+            timeline_event = _record_pending_scope_reconcile_contract_event(
+                conn,
+                project_id=project_id,
+                body=body,
+                result=result,
+                target_commit_sha=target_commit,
+            )
+            if timeline_event:
+                result["timeline_event_recorded"] = {
+                    "id": timeline_event.get("id"),
+                    "ref": f"timeline:{timeline_event.get('id')}",
+                    "event_kind": timeline_event.get("event_kind"),
+                    "phase": timeline_event.get("phase"),
+                    "status": timeline_event.get("status"),
+                    "requirement_id": "reconcile",
+                }
         conn.commit()
         return 201, result
     finally:

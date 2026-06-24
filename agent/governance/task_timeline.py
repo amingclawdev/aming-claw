@@ -6573,6 +6573,31 @@ def _explicit_observer_visual_smoke_event(
     return bool(meta_valid and actor in _INDEPENDENT_QA_PLAIN_OBSERVER_TOKENS)
 
 
+def _event_is_worker_implementation(event: dict[str, Any], markers: set[str]) -> bool:
+    if "implementation" not in markers:
+        return False
+    payload = _mapping(event.get("payload"))
+    worker_role = str(payload.get("worker_role") or "").strip().lower().replace("-", "_")
+    if worker_role in {"mf_sub", "mf_subagent", "bounded_implementation_worker"}:
+        return True
+    if payload.get("runtime_context_id") and payload.get("parent_task_id"):
+        return True
+    return False
+
+
+def _finish_gate_has_worker_graph_trace_evidence(event: dict[str, Any]) -> bool:
+    gate = _mf_subagent_finish_gate_projection(event)
+    if not gate:
+        gate = _first_deep_mapping(event, "mf_subagent_finish_gate")
+    if not gate:
+        return False
+    trace_ids = _string_list(_first_deep_value(gate, "trace_ids"))
+    if not trace_ids:
+        trace_ids = _string_list(_first_deep_value(gate, "graph_trace_ids"))
+    missing_trace_ids = _string_list(_first_deep_value(gate, "missing_trace_ids"))
+    return bool(trace_ids and not missing_trace_ids)
+
+
 def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str]:
     """Return stable evidence ids implied by accepted canonical timeline events."""
 
@@ -6609,10 +6634,18 @@ def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str
         ids.add("service_route")
     if "implementation" in markers:
         ids.add("implementation")
+        if _event_is_worker_implementation(event, markers):
+            ids.add("worker_implementation_evidence")
     if "verification" in markers or markers.intersection(
         {"qa_verification", "independent_verification", "qa_review"}
     ):
         ids.add("verification")
+    if "merge_preview" in markers:
+        ids.add("merge_preview")
+    if "live_merge" in markers:
+        ids.add("live_merge")
+    if "reconcile" in markers:
+        ids.add("reconcile")
     if "close_ready" in markers:
         ids.add("close_ready")
     if "merge" in markers:
@@ -6620,12 +6653,25 @@ def canonical_contract_evidence_ids_from_event(event: dict[str, Any]) -> set[str
     if _explicit_observer_visual_smoke_event(event, markers):
         ids.add("observer_visual_smoke")
 
-    gate = _mf_subagent_finish_gate_projection(event)
+    gate = _mf_subagent_finish_gate_projection(event) or _first_deep_mapping(
+        event,
+        "mf_subagent_finish_gate",
+    )
     if gate:
         ids.add("mf_subagent_finish_gate")
-        ids.update(_string_list(_mapping(gate.get("lane_ownership_projection")).get("evidence_ids")))
+        ids.update(
+            _string_list(
+                _mapping(gate.get("lane_ownership_projection")).get("evidence_ids")
+            )
+        )
         ids.add(MF_BOUNDED_SUBAGENT_REVIEW_READY_ID)
         ids.update(_mf_subagent_finish_gate_projected_event_kinds(event))
+        if _finish_gate_has_worker_graph_trace_evidence(event):
+            ids.add("mf_subagent_graph_trace")
+            ids.add("worker_implementation_evidence")
+
+    if MF_ROUTE_CONTEXT_INDEPENDENT_VERIFICATION_ID in categories:
+        ids.add("independent_verification")
 
     return ids
 

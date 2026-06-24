@@ -188,6 +188,27 @@ def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():
     assert "route_token_waiver" in properties
 
 
+def test_mcp_stdio_observer_route_context_issue_schema_is_listed():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = responses[0]["result"]["tools"]
+    route_issue = next(tool for tool in tools if tool["name"] == "observer_route_context_issue")
+    properties = route_issue["inputSchema"]["properties"]
+    assert {
+        "caller_role",
+        "backlog_id",
+        "task_id",
+        "target_files",
+        "allowed_actions",
+        "evidence_refs",
+        "close_commit",
+    }.issubset(properties)
+
+
 def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
@@ -515,6 +536,52 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
                 "route_token": route_token,
                 "route_token_ref": "rtok-close-test",
                 "route_waiver": route_waiver,
+            },
+        )
+    ]
+
+
+def test_mcp_observer_route_context_issue_forwards_token_request():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "route_token_ref": "rtok-test"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "observer_route_context_issue",
+        {
+            "project_id": "aming-claw",
+            "caller_role": "observer",
+            "backlog_id": "BUG-ROUTE",
+            "task_id": "BUG-ROUTE",
+            "target_files": ["src/app.py"],
+            "allowed_actions": ["backlog_close"],
+            "evidence_refs": ["timeline:1"],
+            "close_commit": "abc123",
+        },
+    )
+
+    assert result == {"ok": True, "route_token_ref": "rtok-test"}
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/route-context/issue",
+            {
+                "caller_role": "observer",
+                "backlog_id": "BUG-ROUTE",
+                "task_id": "BUG-ROUTE",
+                "target_files": ["src/app.py"],
+                "allowed_actions": ["backlog_close"],
+                "evidence_refs": ["timeline:1"],
+                "close_commit": "abc123",
             },
         )
     ]

@@ -352,6 +352,34 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_route_context_issue",
+        "description": (
+            "Mint a server-registered observer route token ref for protected writes "
+            "such as merge, task_timeline_append, and backlog_close."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "caller_role": {"type": "string", "description": "Must be observer."},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "target_files": {"type": "array", "items": {"type": "string"}},
+                "owned_files": {"type": "array", "items": {"type": "string"}},
+                "allowed_actions": {"type": "array", "items": {"type": "string"}},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                "parent_route_identity": {"type": "object"},
+                "close_commit": {"type": "string"},
+                "commit": {"type": "string"},
+                "commit_sha": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "head_commit": {"type": "string"},
+            },
+            "required": ["project_id", "caller_role", "task_id"],
+        },
+    },
+    {
         "name": "observer_command_list",
         "description": "List durable observer command queue rows for a project, including observer-consumer recovery diagnostics for notified execute_backlog_row commands.",
         "inputSchema": {
@@ -1955,6 +1983,15 @@ class ToolDispatcher:
                 f"/api/projects/{pid}/observer-sessions/{sid}/revoke",
                 {"session_token": args["session_token"]},
             )
+
+        if name == "observer_route_context_issue":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api("POST", f"/api/projects/{pid}/observer/route-context/issue", body)
 
         if name == "observer_command_list":
             pid = args["project_id"]

@@ -11426,6 +11426,33 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     assert live["recorded"]["context"]["status"] == "merged"
     assert live["decision"]["rows"][0]["queue_state"] == "merged"
     assert live["decision"]["rows"][0]["target_graph_activation_allowed"] is True
+    assert [
+        event["phase"] for event in live["timeline_events_recorded"]
+    ] == ["merge_preview", "live_merge"]
+    assert [
+        event["requirement_ids"] for event in live["timeline_events_recorded"]
+    ] == ["merge_preview", "live_merge"]
+    timeline = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION",
+        limit=20,
+    )
+    recorded_phases = [
+        event["phase"]
+        for event in timeline
+        if event["event_type"].startswith("parallel.")
+    ]
+    assert recorded_phases == ["merge_preview", "live_merge"]
+    recorded_requirement_ids = [
+        (
+            event["verification"].get("contract_evidence")
+            or event["payload"].get("contract_evidence")
+        )[0]["requirement_id"]
+        for event in timeline
+        if event["event_type"].startswith("parallel.")
+    ]
+    assert recorded_requirement_ids == ["merge_preview", "live_merge"]
     assert (repo / "live.txt").read_text(encoding="utf-8") == "live\n"
     assert subprocess.run(
         ["git", "log", "-1", "--format=%B"],
@@ -17740,6 +17767,8 @@ def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monk
                 "parent_commit_sha": "old",
                 "actor": "dashboard",
                 "activate": True,
+                "backlog_id": "BUG-RECONCILE",
+                "task_id": "BUG-RECONCILE",
             },
         )
     )
@@ -17752,6 +17781,10 @@ def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monk
 
     final_rows = store.list_pending_scope_reconcile(conn, PID, commit_shas=["head"])
     assert final_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
+    assert result["timeline_event_recorded"]["requirement_id"] == "reconcile"
+    timeline = task_timeline.list_events(conn, PID, backlog_id="BUG-RECONCILE", limit=10)
+    assert [event["phase"] for event in timeline] == ["reconcile"]
+    assert timeline[0]["payload"]["contract_evidence"][0]["requirement_id"] == "reconcile"
 
 
 def test_pending_scope_materialize_candidate_only_guides_finalize_without_rebuild(conn, tmp_path, monkeypatch):

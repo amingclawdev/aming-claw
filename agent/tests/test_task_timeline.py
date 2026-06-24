@@ -15075,5 +15075,128 @@ def test_validate_receipt_error_message_names_projection_schema():
     assert "mf_subagent read-receipt append rejected" in msg, msg
 
 
+def test_parallel_parent_contract_gate_accepts_child_lane_and_merge_events_without_rollup():
+    from agent.governance import task_timeline
+
+    contract = {
+        "contract": {
+            "template_id": "mf_parallel.v1",
+            "evidence_requirements": [
+                {"id": "mf_subagent_graph_trace"},
+                {"id": "worker_implementation_evidence"},
+                {"id": "independent_verification"},
+                {"id": "merge_preview"},
+                {"id": "live_merge"},
+                {"id": "reconcile"},
+            ],
+        }
+    }
+    events = [
+        {
+            "id": 1,
+            "backlog_id": "PARENT",
+            "task_id": "PARENT-worker-a",
+            "event_type": "mf.implementation",
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "actor": "worker-a",
+            "status": "passed",
+            "payload": {
+                "runtime_context_id": "mfrctx-a",
+                "parent_task_id": "PARENT",
+                "worker_role": "mf_sub",
+            },
+        },
+        {
+            "id": 2,
+            "backlog_id": "PARENT",
+            "task_id": "PARENT-worker-a",
+            "event_type": "mf_subagent.finish_gate",
+            "event_kind": "mf_subagent_finish_gate",
+            "phase": "finish_gate",
+            "actor": "worker-a",
+            "status": "passed",
+            "payload": {
+                "mf_subagent_finish_gate": {
+                    "graph_trace_evidence": {
+                        "trace_ids": ["gqt-worker-a"],
+                        "missing_trace_ids": [],
+                    },
+                    "lane_ownership_projection": {"evidence_ids": []},
+                }
+            },
+        },
+        {
+            "id": 3,
+            "backlog_id": "PARENT",
+            "task_id": "PARENT-worker-a",
+            "event_type": "independent_verification.completed",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "independent-qa",
+            "status": "passed",
+            "payload": {"requirement_id": "independent_verification_lane"},
+        },
+        {
+            "id": 4,
+            "backlog_id": "PARENT",
+            "task_id": "PARENT",
+            "event_type": "parallel.merge_preview",
+            "event_kind": "merge_preview",
+            "phase": "merge_preview",
+            "actor": "codex-observer",
+            "status": "passed",
+            "payload": {
+                "contract_evidence": [
+                    {"requirement_id": "merge_preview", "status": "passed"}
+                ]
+            },
+        },
+        {
+            "id": 5,
+            "backlog_id": "PARENT",
+            "task_id": "PARENT",
+            "event_type": "parallel.live_merge",
+            "event_kind": "live_merge",
+            "phase": "live_merge",
+            "actor": "codex-observer",
+            "status": "passed",
+            "payload": {
+                "contract_evidence": [
+                    {"requirement_id": "live_merge", "status": "passed"}
+                ]
+            },
+        },
+        {
+            "id": 6,
+            "backlog_id": "PARENT",
+            "task_id": "PARENT",
+            "event_type": "graph.reconcile",
+            "event_kind": "reconcile",
+            "phase": "reconcile",
+            "actor": "codex-observer",
+            "status": "passed",
+            "payload": {
+                "contract_evidence": [
+                    {"requirement_id": "reconcile", "status": "passed"}
+                ]
+            },
+        },
+    ]
+
+    result = task_timeline.mf_contract_gate_verification(events, contract)
+
+    assert result["passed"] is True
+    assert result["missing_requirement_ids"] == []
+    assert set(result["present_requirement_ids"]) >= {
+        "mf_subagent_graph_trace",
+        "worker_implementation_evidence",
+        "independent_verification",
+        "merge_preview",
+        "live_merge",
+        "reconcile",
+    }
+
+
 if __name__ == "__main__":
     unittest.main()
