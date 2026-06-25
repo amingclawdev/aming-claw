@@ -107,6 +107,38 @@ def _persist_append_route_token_ref(
     )
 
 
+def _persist_backlog_close_route_token_ref(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    evidence_refs: list[str],
+) -> None:
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            "route_id": f"route-{route_token_ref}",
+            "route_context_hash": _fake_sha(f"{route_token_ref}:context"),
+            "prompt_contract_id": f"prompt-{route_token_ref}",
+            "prompt_contract_hash": _fake_sha(f"{route_token_ref}:prompt"),
+            "visible_injection_manifest_hash": _fake_sha(f"{route_token_ref}:manifest"),
+            "route_token_ref": route_token_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["backlog_close"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": evidence_refs,
+        },
+    )
+
+
 class _NoCloseConn:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -1259,6 +1291,160 @@ def test_backlog_close_response_includes_asset_drift_summary_for_changed_orphan_
     assert check["coverage_claim_allowed_by_kind"]["doc"] is False
     assert check["changed_untrusted_assets_sample"][0]["path"] == "skills/external-protocol/SKILL.md"
     assert "not trusted impact-scope coverage" in " ".join(check["required_actions"])
+
+
+def test_audit_recovery_backlog_close_uses_archive_and_qa_without_mf_worker_gate(conn, monkeypatch):
+    root_id = "BUG-ROOT-AUDIT-ARCHIVED"
+    recovery_id = "BUG-AUDIT-RECOVERY"
+    close_commit = "c-audit-recovery"
+    audit_archive = {
+        "schema_version": "backlog_audit_archive.v1",
+        "status": "audit_archived",
+        "row_status": "WAIVED",
+        "implementation_commit": close_commit,
+        "audit_close_gate": {
+            "schema_version": "audit_close_gate.v1",
+            "passed": True,
+            "status": "passed",
+            "normal_close_gate_can_close": False,
+            "close_ready_emitted": False,
+            "historical_evidence_reconstructed": False,
+        },
+        "qa_acceptance": {
+            "schema_version": "audit_close_qa_acceptance.v1",
+            "passed": True,
+            "reviewer": "qa-reviewer",
+            "reviewer_role": "qa",
+            "tests": ["pytest focused"],
+            "artifacts": ["timeline:qa"],
+            "startup_or_close_ready_reconstructed": False,
+        },
+        "normal_close_gate": {
+            "can_close": False,
+            "close_ready_emitted": False,
+        },
+    }
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, takeover_json,
+            "commit", created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            root_id,
+            "Root audit archived row",
+            "WAIVED",
+            "chain_rescue",
+            json.dumps({"mf_type": "chain_rescue"}),
+            json.dumps({"audit_archive": audit_archive}),
+            close_commit,
+            "now",
+            "now",
+        ),
+    )
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            recovery_id,
+            "Audit recovery close row",
+            "OPEN",
+            "audit_recovery",
+            json.dumps({"mf_type": "audit_recovery"}),
+            "now",
+            "now",
+        ),
+    )
+    task_timeline.ensure_schema(conn)
+    qa_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=recovery_id,
+        task_id="audit-recovery-qa",
+        event_type="qa.verification",
+        event_kind="independent_verification",
+        phase="qa",
+        status="passed",
+        actor="qa-reviewer",
+        payload={"reviewer": "qa-reviewer", "reviewer_role": "qa"},
+        commit_sha=close_commit,
+    )
+    close_ref = "rtok-audit-recovery-close"
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=recovery_id,
+        task_id="audit-recovery-close",
+        route_token_ref=close_ref,
+        evidence_refs=[f"audit_archive:{root_id}", f"timeline:{qa_event['id']}"],
+    )
+    conn.commit()
+
+    assert server.backlog_runtime.normalize_mf_type("audit_recovery") == "audit_recovery"
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    result = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": recovery_id},
+            method="POST",
+            body={
+                "commit": close_commit,
+                "actor": "test",
+                "route_token_ref": close_ref,
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "FIXED"
+    assert result["gate_summary"]["can_close"] is True
+    assert result["gate_summary"]["missing_event_kinds"] == []
+    row = conn.execute(
+        "SELECT status, mf_type FROM backlog_bugs WHERE bug_id = ?",
+        (recovery_id,),
+    ).fetchone()
+    assert row["status"] == "FIXED"
+    assert row["mf_type"] == "audit_recovery"
+
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "BUG-ORDINARY-MF-NO-TIMELINE",
+            "Ordinary MF still needs timeline",
+            "OPEN",
+            "chain_rescue",
+            json.dumps({"mf_type": "chain_rescue"}),
+            "now",
+            "now",
+        ),
+    )
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id="BUG-ORDINARY-MF-NO-TIMELINE",
+        task_id="ordinary-close",
+        route_token_ref="rtok-ordinary-close",
+        evidence_refs=["test:ordinary-mf"],
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": "BUG-ORDINARY-MF-NO-TIMELINE"},
+                method="POST",
+                body={
+                    "commit": close_commit,
+                    "actor": "test",
+                    "route_token_ref": "rtok-ordinary-close",
+                },
+            )
+        )
+    assert exc_info.value.code == "mf_timeline_gate_failed"
 
 
 def test_backlog_list_compact_includes_observer_command_terminal_projection(conn):

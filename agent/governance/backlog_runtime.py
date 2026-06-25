@@ -19,7 +19,8 @@ log = logging.getLogger(__name__)
 GRAPH_BYPASS_MODES = {"bypass", "off", "disabled", "manual_fix", "manual-fix"}
 MF_TYPE_CHAIN_RESCUE = "chain_rescue"
 MF_TYPE_SYSTEM_RECOVERY = "system_recovery"
-MF_TYPES = {MF_TYPE_CHAIN_RESCUE, MF_TYPE_SYSTEM_RECOVERY}
+MF_TYPE_AUDIT_RECOVERY = "audit_recovery"
+MF_TYPES = {MF_TYPE_CHAIN_RESCUE, MF_TYPE_SYSTEM_RECOVERY, MF_TYPE_AUDIT_RECOVERY}
 
 
 def utc_now() -> str:
@@ -81,6 +82,8 @@ def normalize_mf_type(raw: Any = "", existing_policy: dict[str, Any] | None = No
         value = str((existing_policy or {}).get("mf_type", "") or "").strip().lower()
     if value in {"system-recovery", "system recovery", "recovery"}:
         value = MF_TYPE_SYSTEM_RECOVERY
+    if value in {"audit-recovery", "audit recovery", "audit_archive_recovery"}:
+        value = MF_TYPE_AUDIT_RECOVERY
     if value in {
         "chain-rescue",
         "chain rescue",

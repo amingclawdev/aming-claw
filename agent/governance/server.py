@@ -40781,7 +40781,14 @@ def handle_backlog_close(ctx: RequestContext):
             body=body,
             commit_sha=commit_sha,
         )
-        timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
+        timeline_gate = _verify_mf_close_timeline_gate(
+            conn,
+            pid,
+            bug_id,
+            row,
+            body,
+            route_gate=route_gate,
+        )
         identity_block = _backlog_close_route_waiver_identity_block(
             route_gate,
             timeline_gate,
@@ -40891,10 +40898,195 @@ def handle_backlog_close(ctx: RequestContext):
         conn.close()
 
 
-def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body: dict) -> dict:
+def _audit_recovery_route_refs(route_gate: Mapping[str, Any], body: Mapping[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for value in body.get("references") or []:
+        if isinstance(value, str):
+            refs.append(value)
+    for value in body.get("evidence_refs") or []:
+        if isinstance(value, str):
+            refs.append(value)
+    for value in route_gate.get("evidence_refs") or []:
+        if isinstance(value, str):
+            refs.append(value)
+    return refs
+
+
+def _audit_recovery_root_ids(route_gate: Mapping[str, Any], body: Mapping[str, Any]) -> list[str]:
+    roots: list[str] = []
+    for key in (
+        "audit_archive_backlog_id",
+        "root_backlog_id",
+        "source_backlog_id",
+        "archived_backlog_id",
+    ):
+        value = str(body.get(key) or "").strip()
+        if value:
+            roots.append(value)
+    for ref in _audit_recovery_route_refs(route_gate, body):
+        if ref.startswith("audit_archive:"):
+            roots.append(ref.split(":", 1)[1].strip())
+    return [item for item in dict.fromkeys(roots) if item]
+
+
+def _audit_recovery_close_commit(row, body: Mapping[str, Any]) -> str:
+    for key in ("commit", "commit_sha", "close_commit", "head_commit", "target_head_commit"):
+        value = str(body.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("commit", "commit_sha", "close_commit", "head_commit", "target_head_commit"):
+        value = str(_row_get(row, key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _passed_audit_recovery_qa_events(events: list[dict], close_commit: str) -> list[dict]:
+    passed: list[dict] = []
+    for event in events:
+        kind = str(event.get("event_kind") or "").strip()
+        if kind not in {"independent_verification", "qa_verification"}:
+            continue
+        status = str(event.get("status") or event.get("decision") or "").strip().lower()
+        if status not in {"pass", "passed", "accepted", "approved", "pass_with_followups"}:
+            continue
+        event_commit = str(event.get("commit_sha") or "").strip()
+        if close_commit and event_commit and event_commit != close_commit:
+            continue
+        passed.append(event)
+    return passed
+
+
+def _verify_audit_recovery_close_gate(
+    conn,
+    project_id: str,
+    bug_id: str,
+    row,
+    body: dict,
+    *,
+    route_gate: Mapping[str, Any],
+) -> dict:
+    from . import task_timeline
+
+    close_commit = _audit_recovery_close_commit(row, body)
+    root_ids = _audit_recovery_root_ids(route_gate, body)
+    events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
+    qa_events = _passed_audit_recovery_qa_events(events, close_commit)
+    accepted_archives: list[dict] = []
+    rejected_archives: list[dict] = []
+    missing: list[str] = []
+
+    if not close_commit:
+        missing.append("close_commit")
+    if not root_ids:
+        missing.append("audit_archive_reference")
+
+    for root_id in root_ids:
+        root_row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+            (root_id,),
+        ).fetchone()
+        if not root_row:
+            rejected_archives.append({"bug_id": root_id, "reason": "not_found"})
+            continue
+        audit_archive = _backlog_row_audit_archive(root_row)
+        audit_close_gate = _json_object_field(audit_archive.get("audit_close_gate"))
+        qa_acceptance = _json_object_field(audit_archive.get("qa_acceptance"))
+        archive_commit = str(audit_archive.get("implementation_commit") or "").strip()
+        root_status = str(_row_get(root_row, "status", "") or "").strip()
+        archive_ok = (
+            root_status == "WAIVED"
+            and str(audit_archive.get("status") or "") == "audit_archived"
+            and bool(audit_close_gate.get("passed"))
+            and _qa_acceptance_passed(qa_acceptance)
+            and (not close_commit or not archive_commit or archive_commit == close_commit)
+        )
+        archive_summary = {
+            "bug_id": root_id,
+            "row_status": root_status,
+            "audit_archive_status": str(audit_archive.get("status") or ""),
+            "audit_close_gate_passed": bool(audit_close_gate.get("passed")),
+            "qa_acceptance_passed": _qa_acceptance_passed(qa_acceptance),
+            "implementation_commit": archive_commit,
+        }
+        if archive_ok:
+            accepted_archives.append(archive_summary)
+        else:
+            if close_commit and archive_commit and archive_commit != close_commit:
+                archive_summary["reason"] = "implementation_commit_mismatch"
+            else:
+                archive_summary["reason"] = "audit_archive_not_accepted"
+            rejected_archives.append(archive_summary)
+
+    if not accepted_archives:
+        missing.append("accepted_audit_archive")
+    if not qa_events:
+        missing.append("independent_qa_evidence")
+
+    passed = not missing
+    verification = {
+        "schema_version": "audit_recovery_close_gate.v1",
+        "passed": passed,
+        "can_close": passed,
+        "status": "passed" if passed else "failed",
+        "applicable": True,
+        "audit_recovery": True,
+        "bug_id": bug_id,
+        "close_commit": close_commit,
+        "required_event_kinds": ["independent_verification"],
+        "present_event_kinds": ["independent_verification"] if qa_events else [],
+        "missing_event_kinds": [] if qa_events else ["independent_verification"],
+        "missing_requirement_ids": missing,
+        "accepted_audit_archives": accepted_archives,
+        "rejected_audit_archives": rejected_archives,
+        "qa_event_ids": [event.get("id") for event in qa_events if event.get("id")],
+        "route_token_gate": {
+            "status": route_gate.get("status"),
+            "action": route_gate.get("action"),
+            "route_token_ref": route_gate.get("route_token_ref"),
+            "registry_verified": bool(route_gate.get("registry_verified")),
+        },
+        "checks": {
+            "has_close_commit": bool(close_commit),
+            "has_audit_archive_reference": bool(root_ids),
+            "has_accepted_audit_archive": bool(accepted_archives),
+            "has_independent_qa": bool(qa_events),
+        },
+    }
+    if not passed:
+        raise GovernanceError(
+            "audit_recovery_close_gate_failed",
+            (
+                "audit_recovery backlog close requires accepted audit archive "
+                f"and independent QA evidence; missing: {', '.join(missing)}"
+            ),
+            422,
+            {"audit_recovery_close_gate": verification},
+        )
+    return verification
+
+
+def _verify_mf_close_timeline_gate(
+    conn,
+    project_id: str,
+    bug_id: str,
+    row,
+    body: dict,
+    *,
+    route_gate: Mapping[str, Any] | None = None,
+) -> dict:
     """Require append-only timeline evidence before observer/MF backlog close."""
 
     applicability = _mf_close_timeline_applicability(row)
+    if applicability.get("is_audit_recovery"):
+        return _verify_audit_recovery_close_gate(
+            conn,
+            project_id,
+            bug_id,
+            row,
+            body,
+            route_gate=route_gate or {},
+        )
     if not applicability["is_mf"]:
         return {}
 
@@ -41350,12 +41542,13 @@ def _mf_close_timeline_applicability(row) -> dict:
     contract_reasons = _contract_state_backlog_applicability_reasons(chain_trigger)
     raw_mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
     mf_type = backlog_runtime.normalize_mf_type(raw_mf_type, policy) if raw_mf_type else ""
+    is_audit_recovery = mf_type == backlog_runtime.MF_TYPE_AUDIT_RECOVERY
     chain_stage = str(_row_get(row, "chain_stage", "") or "").strip()
     chain_stage_key = chain_stage.lower().replace("_", "-")
     prior_status = str(_row_get(row, "status", "") or "").strip()
     is_mf = bool(
         prior_status == "MF_IN_PROGRESS"
-        or mf_type
+        or (mf_type and not is_audit_recovery)
         or chain_stage_key in {"manual-fix", "observer-hotfix", "chain-rescue"}
         or contract_reasons
     )
@@ -41369,6 +41562,7 @@ def _mf_close_timeline_applicability(row) -> dict:
     reasons.extend(contract_reasons)
     return {
         "is_mf": is_mf,
+        "is_audit_recovery": is_audit_recovery,
         "reason": ", ".join(reasons) if reasons else "not an MF/observer backlog row",
     }
 
