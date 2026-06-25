@@ -1908,9 +1908,30 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     dispatch = recorded_dispatch[0]
     assert dispatch["actor"] == "observer"
     assert dispatch["payload"]["dispatch_source"] == "parallel_branch_allocate"
-    assert dispatch["payload"]["bounded_implementation_worker_dispatch"][
-        "service_generated"
-    ] is True
+    dispatch_payload = dispatch["payload"]["bounded_implementation_worker_dispatch"]
+    assert dispatch_payload["service_generated"] is True
+    assert dispatch_payload["runtime_context_id"] == context["runtime_context_id"]
+    assert dispatch_payload["task_id"] == "allocate-contract-task"
+    assert dispatch_payload["parent_task_id"] == "AC-ALLOCATE-CONTRACT"
+    assert dispatch_payload["observer_command_id"] == "cmd-allocate-contract"
+    assert dispatch_payload["worker_id"] == "contract-worker"
+    assert dispatch_payload["worker_slot_id"] == "contract-worker"
+    assert dispatch_payload["worktree_path"] == str(worktree)
+    assert dispatch_payload["branch"] == context["branch_ref"]
+    assert dispatch_payload["branch_ref"] == context["branch_ref"]
+    assert dispatch_payload["fence_token"] == "fence-allocate-contract"
+    assert dispatch_payload["base_commit"] == "base-allocate-contract"
+    assert dispatch_payload["target_head_commit"] == "target-allocate-contract"
+    assert dispatch_payload["merge_queue_id"] == "mq-allocate-contract"
+    assert dispatch_payload["owned_files"] == ["agent/governance/server.py"]
+    assert dispatch_payload["route_id"] == "route-allocate-contract"
+    assert dispatch_payload["route_context_hash"] == "sha256:route-allocate-contract"
+    assert dispatch_payload["prompt_contract_id"] == "rprompt-allocate-contract"
+    assert dispatch_payload["prompt_contract_hash"] == "sha256:prompt-allocate-contract"
+    assert dispatch_payload["route_token_ref"] == "rtok-allocate-contract"
+    assert dispatch_payload["visible_injection_manifest_hash"] == (
+        "sha256:visible-allocate-contract"
+    )
     assert dispatch["payload"]["meta_contract_gate"]["role"] == "observer"
     assert dispatch["payload"]["meta_contract_gate"]["action"] == (
         "dispatch_bounded_worker"
@@ -1955,6 +1976,83 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
         "worker_constraints"
     ]["scope"]["owned_files"] == ["agent/governance/server.py"]
+
+
+def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
+    conn,
+    tmp_path,
+):
+    workspace = tmp_path / "workers"
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "allocate-incomplete-task",
+                "parent_task_id": "AC-ALLOCATE-INCOMPLETE",
+                "backlog_id": "AC-ALLOCATE-INCOMPLETE",
+                "observer_command_id": "cmd-allocate-incomplete",
+                "workspace_root": str(workspace),
+                "worker_id": "contract-worker",
+                "fence_token": "fence-allocate-incomplete",
+                "base_commit": "base-allocate-incomplete",
+                "target_head_commit": "target-allocate-incomplete",
+                "merge_queue_id": "mq-allocate-incomplete",
+                "route_id": "route-allocate-incomplete",
+                "route_context_hash": "sha256:route-allocate-incomplete",
+                "prompt_contract_id": "rprompt-allocate-incomplete",
+                "prompt_contract_hash": "sha256:prompt-allocate-incomplete",
+                "route_token_ref": "rtok-allocate-incomplete",
+                "visible_injection_manifest_hash": "sha256:visible-allocate-incomplete",
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 201
+    context = created["context"]
+    dispatch_event = created["dispatch_timeline_event"]
+    assert dispatch_event["status"] == "skipped"
+    assert dispatch_event["reason"] == "bounded_worker_dispatch_evidence_incomplete"
+    assert dispatch_event["runtime_context_id"] == context["runtime_context_id"]
+    assert dispatch_event["task_id"] == "allocate-incomplete-task"
+    assert dispatch_event["observer_command_id"] == "cmd-allocate-incomplete"
+    assert dispatch_event["worker_id"] == "contract-worker"
+    assert dispatch_event["merge_queue_id"] == "mq-allocate-incomplete"
+    assert dispatch_event["route_identity"] == {
+        "route_id": "route-allocate-incomplete",
+        "route_context_hash": "sha256:route-allocate-incomplete",
+        "prompt_contract_id": "rprompt-allocate-incomplete",
+        "prompt_contract_hash": "sha256:prompt-allocate-incomplete",
+        "route_token_ref": "rtok-allocate-incomplete",
+        "visible_injection_manifest_hash": "sha256:visible-allocate-incomplete",
+    }
+    assert dispatch_event["missing_fields"] == ["owned_files"]
+    next_action = dispatch_event["recovery"]["next_legal_action"]
+    assert next_action["action"] == "repair_runtime_text_payload"
+    assert next_action["deterministic_order"] == [
+        "repair_runtime_text_payload",
+        "retry_with_new_worker",
+        "authorize_explicit_hotfix_exception",
+    ]
+    assert next_action["runtime_context_id"] == context["runtime_context_id"]
+    assert next_action["task_id"] == "allocate-incomplete-task"
+    assert next_action["observer_command_id"] == "cmd-allocate-incomplete"
+    assert next_action["worker_id"] == "contract-worker"
+    assert next_action["merge_queue_id"] == "mq-allocate-incomplete"
+    assert next_action["route_identity"] == dispatch_event["route_identity"]
+    assert next_action["missing_fields"] == ["owned_files"]
+    payload_shape = dispatch_event["recovery"]["payload_shape"]
+    assert payload_shape["runtime_context_id"] == context["runtime_context_id"]
+    assert payload_shape["task_id"] == "allocate-incomplete-task"
+    assert payload_shape["observer_command_id"] == "cmd-allocate-incomplete"
+    assert payload_shape["merge_queue_id"] == "mq-allocate-incomplete"
+    assert payload_shape["route_id"] == "route-allocate-incomplete"
+    assert payload_shape["route_context_hash"] == "sha256:route-allocate-incomplete"
+    assert payload_shape["prompt_contract_id"] == "rprompt-allocate-incomplete"
+    assert payload_shape["prompt_contract_hash"] == "sha256:prompt-allocate-incomplete"
+    assert payload_shape["route_token_ref"] == "rtok-allocate-incomplete"
 
 
 def test_parallel_branch_allocate_issues_same_owner_scoped_session_token(conn, tmp_path):
@@ -2093,6 +2191,40 @@ def test_runtime_text_prepare_accepts_parallel_branch_allocate_evidence(conn, tm
     assert prepared["runtime_context"]["worktree_path"] == allocated["context"]["worktree_path"]
     assert prepared["branch_runtime_evidence"]["status"] == STATE_WORKTREE_READY
     assert prepared["branch_runtime_evidence"]["registered"] is True
+    assert prepared["route_identity"] == {
+        "route_id": "route-api",
+        "route_context_hash": "sha256:route-api",
+        "prompt_contract_id": "rprompt-api",
+        "prompt_contract_hash": "sha256:prompt-api",
+        "route_token_ref": "rtok-api",
+        "visible_injection_manifest_hash": "sha256:visible-api",
+    }
+    assert prepared["branch_identity"]["observer_command_id"] == "cmd-runtime-api"
+    assert prepared["branch_identity"]["task_id"] == allocated["context"]["task_id"]
+    assert prepared["branch_identity"]["runtime_context_id"] == (
+        allocation_evidence["runtime_context_id"]
+    )
+    assert prepared["branch_identity"]["branch_ref"] == allocated["context"]["branch_ref"]
+    assert prepared["branch_identity"]["worktree_path"] == (
+        allocated["context"]["worktree_path"]
+    )
+    assert prepared["branch_identity"]["merge_queue_id"] == "mq-runtime-text-api"
+    assert prepared["startup_recording"]["observer_command_id"] == "cmd-runtime-api"
+    assert prepared["startup_recording"]["owned_files"] == ["agent/observer_runtime.py"]
+    assert prepared["startup_recording"]["worktree_path"] == (
+        allocated["context"]["worktree_path"]
+    )
+    assert prepared["startup_recording"]["branch_ref"] == allocated["context"]["branch_ref"]
+    launch_payload = prepared["executable_worker_launch"]["payload"]
+    assert launch_payload["observer_command_id"] == "cmd-runtime-api"
+    assert launch_payload["runtime_context_id"] == allocation_evidence["runtime_context_id"]
+    assert launch_payload["owned_files"] == ["agent/observer_runtime.py"]
+    assert launch_payload["route_context_hash"] == "sha256:route-api"
+    assert launch_payload["prompt_contract_id"] == "rprompt-api"
+    assert launch_payload["route_token_ref"] == "rtok-api"
+    assert launch_payload["worktree_path"] == allocated["context"]["worktree_path"]
+    assert launch_payload["branch_ref"] == allocated["context"]["branch_ref"]
+    assert launch_payload["merge_queue_id"] == "mq-runtime-text-api"
     assert prepared["dispatch_gate_validation"]["startup_intent_event_generated"] is True
 
 
@@ -2861,8 +2993,24 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
         "bounded_implementation_worker_dispatch"
     ]
     assert dispatch_payload["runtime_context_id"] == context["runtime_context_id"]
+    assert dispatch_payload["task_id"] == context["task_id"]
+    assert dispatch_payload["parent_task_id"] == context["root_task_id"]
+    assert dispatch_payload["observer_command_id"] == "cmd-runtime-text-api"
+    assert dispatch_payload["worker_id"] == context["worker_id"]
+    assert dispatch_payload["worker_slot_id"] == context["worker_id"]
+    assert dispatch_payload["worktree_path"] == context["worktree_path"]
+    assert dispatch_payload["branch"] == context["branch_ref"]
+    assert dispatch_payload["branch_ref"] == context["branch_ref"]
+    assert dispatch_payload["fence_token"] == context["fence_token"]
+    assert dispatch_payload["base_commit"] == "base-api"
+    assert dispatch_payload["target_head_commit"] == "target-api"
+    assert dispatch_payload["merge_queue_id"] == "mq-runtime-text-api"
+    assert dispatch_payload["route_id"] == "route-api"
     assert dispatch_payload["route_context_hash"] == "sha256:route-api"
     assert dispatch_payload["prompt_contract_id"] == "rprompt-api"
+    assert dispatch_payload["prompt_contract_hash"] == "sha256:prompt-api"
+    assert dispatch_payload["route_token_ref"] == "rtok-api"
+    assert dispatch_payload["visible_injection_manifest_hash"] == "sha256:visible-api"
     assert dispatch_payload["owned_files"] == ["agent/observer_runtime.py"]
     assert dispatch_payload["raw_private_context_exposed"] is False
 

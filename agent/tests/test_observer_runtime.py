@@ -591,6 +591,29 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert blocker["route_identity"]["route_context_hash"] == "sha256:route-a3"
     assert blocker["route_identity"]["prompt_contract_hash"] == "sha256:prompt-a3"
     assert blocker["runtime_context_id"] == allocation_evidence["runtime_context_id"]
+    assert blocker["worker_id"] == "worker-a3"
+    assert blocker["worker_agent_id"].startswith("host_adapter_agent:codex_cli:")
+    worker_agent_id = blocker["worker_agent_id"]
+    next_action = blocker["next_legal_action"]
+    assert next_action["schema_version"] == "bounded_worker_no_progress_next_action.v1"
+    assert next_action["runtime_context_id"] == allocation_evidence["runtime_context_id"]
+    assert next_action["task_id"] == "task-a3"
+    assert next_action["parent_task_id"] == "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
+    assert next_action["observer_command_id"] == "task-a3"
+    assert next_action["worker_id"] == "worker-a3"
+    assert next_action["worker_agent_id"] == worker_agent_id
+    assert next_action["merge_queue_id"] == "mq-route-gate-fixture-parity-a3"
+    assert next_action["next_action"] == "retry_with_new_worker"
+    assert next_action["deterministic_order"] == [
+        "retry_with_new_worker",
+        "repair_runtime_text_payload",
+        "authorize_explicit_hotfix_exception",
+    ]
+    assert [action["id"] for action in blocker["next_legal_actions"]] == [
+        "retry_with_new_worker",
+        "repair_runtime_text_payload",
+        "authorize_explicit_hotfix_exception",
+    ]
     assert blocker["worktree_diff_scope"]["no_diff"] is True
     assert blocker["runtime_monitor_summary"]["present"] is True
     assert blocker["runtime_monitor_summary"]["progress_observed"] is False
@@ -651,6 +674,11 @@ def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_
     assert payload["timeout_no_progress"]["blocker_id"] == (
         "codex_cli_worker_no_progress_no_read_receipt"
     )
+    assert payload["next_legal_action"]["next_action"] == "retry_with_new_worker"
+    assert payload["next_legal_action"]["runtime_context_id"] == (
+        allocation_evidence["runtime_context_id"]
+    )
+    assert payload["next_legal_action"]["worker_agent_id"] == worker_agent_id
     assert (
         "executable_worker_launch_payload"
         in payload["command_projection"]["terminal_evidence_refs"]

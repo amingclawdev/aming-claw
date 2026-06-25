@@ -81,6 +81,9 @@ OBSERVER_EXECUTABLE_HANDOFF_PACKET_SCHEMA_VERSION = (
 OBSERVER_RUNTIME_TEXT_NEXT_LEGAL_ACTION_SCHEMA_VERSION = (
     "observer_runtime_text.next_legal_action.v1"
 )
+BOUNDED_WORKER_NO_PROGRESS_NEXT_ACTION_SCHEMA_VERSION = (
+    "bounded_worker_no_progress_next_action.v1"
+)
 OBSERVER_EXECUTABLE_LAUNCH_ENV_POLICY_SCHEMA_VERSION = (
     "observer_executable_worker_launch.env_policy.v1"
 )
@@ -1888,6 +1891,8 @@ def _dogfood_terminal_blocker_timeline_event(
     event_payload = {
         "schema_version": "observer_dogfood_terminal_blocker_event_payload.v1",
         "terminal_blocker": dict(blocker),
+        "next_legal_action": dict(blocker.get("next_legal_action") or {}),
+        "next_legal_actions": list(blocker.get("next_legal_actions") or []),
         "route_identity": dict(route_identity),
         "task_identity": {
             "project_id": str(blocker.get("project_id") or ""),
@@ -1955,6 +1960,65 @@ def _dogfood_terminal_blocker_timeline_event(
             "blocker_id": str(blocker.get("blocker_id") or ""),
         },
         "commit_sha": str(diff_scope.get("head_commit") or ""),
+    }
+
+
+def _bounded_worker_no_progress_next_legal_action(
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    observer_command_id: str,
+    worker_id: str,
+    worker_agent_id: str,
+    merge_queue_id: str,
+    route_identity: Mapping[str, Any],
+    missing_launch_fields: Sequence[str],
+    reason: str,
+) -> dict[str, Any]:
+    missing = [str(item) for item in missing_launch_fields if str(item or "").strip()]
+    primary = "repair_runtime_text_payload" if missing else "retry_with_new_worker"
+    deterministic_order: list[str] = []
+    for action_id in (
+        primary,
+        "retry_with_new_worker",
+        "repair_runtime_text_payload",
+        "authorize_explicit_hotfix_exception",
+    ):
+        if action_id not in deterministic_order:
+            deterministic_order.append(action_id)
+    return {
+        "schema_version": BOUNDED_WORKER_NO_PROGRESS_NEXT_ACTION_SCHEMA_VERSION,
+        "status": "blocked",
+        "reason": reason,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "observer_command_id": observer_command_id,
+        "worker_id": worker_id,
+        "worker_agent_id": worker_agent_id,
+        "merge_queue_id": merge_queue_id,
+        "route_identity": dict(route_identity),
+        "missing_launch_fields": missing,
+        "next_action": primary,
+        "deterministic_order": deterministic_order,
+        "actions": [
+            {
+                "id": "retry_with_new_worker",
+                "action": "dispatch_bounded_worker",
+                "reason": "start a fresh bounded worker lane for the same runtime context contract",
+            },
+            {
+                "id": "repair_runtime_text_payload",
+                "action": "observer_runtime_text_prepare",
+                "reason": "repair missing launch or dispatch evidence before retrying the worker lane",
+            },
+            {
+                "id": "authorize_explicit_hotfix_exception",
+                "action": "authorize_observer_hotfix_exception",
+                "reason": "only for an explicit audited operator exception",
+            },
+        ],
     }
 
 
@@ -3656,6 +3720,45 @@ def _dogfood_cli_timeout_blocker(
             executable_worker_launch.get("missing_fields") or []
         ),
     }
+    executable_payload = (
+        executable_worker_launch.get("payload")
+        if isinstance(executable_worker_launch.get("payload"), Mapping)
+        else {}
+    )
+    registered_spawn = (
+        executable_payload.get("registered_host_adapter_spawn")
+        if isinstance(executable_payload.get("registered_host_adapter_spawn"), Mapping)
+        else {}
+    )
+    worker_id = str(
+        request.worker_id
+        or getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    )
+    worker_agent_id = str(
+        registered_spawn.get("actual_host_worker_id")
+        or registered_spawn.get("worker_agent_id")
+        or registered_spawn.get("agent_id")
+        or executable_payload.get("actual_host_worker_id")
+        or executable_payload.get("worker_agent_id")
+        or executable_payload.get("agent_id")
+        or worker_id
+    )
+    missing_launch_fields = list(terminal_projection["missing_launch_fields"])
+    next_legal_action = _bounded_worker_no_progress_next_legal_action(
+        runtime_context_id=runtime_context_id,
+        task_id=str(context.task_id or request.task_id or ""),
+        parent_task_id=parent_task_id,
+        observer_command_id=observer_command_id,
+        worker_id=worker_id,
+        worker_agent_id=worker_agent_id,
+        merge_queue_id=str(context.merge_queue_id or request.merge_queue_id or ""),
+        route_identity=route_identity,
+        missing_launch_fields=missing_launch_fields,
+        reason=blocker_id,
+    )
+    terminal_projection["next_legal_action"] = next_legal_action
     blocker = {
         "schema_version": (
             "observer_cli_no_progress_blocker.v1"
@@ -3673,6 +3776,9 @@ def _dogfood_cli_timeout_blocker(
         "status": "blocked",
         "observer_command_id": observer_command_id,
         "task_id": context.task_id,
+        "worker_id": worker_id,
+        "worker_agent_id": worker_agent_id,
+        "actual_host_worker_id": worker_agent_id,
         "attempt_num": context.attempt,
         **route_identity,
         "route_identity": route_identity,
@@ -3716,6 +3822,8 @@ def _dogfood_cli_timeout_blocker(
         "runtime_monitor_summary": _runtime_monitor_summary(runtime_monitor),
         "worktree_diff_scope": diff_scope,
         "terminal_contract_projection": terminal_projection,
+        "next_legal_action": next_legal_action,
+        "next_legal_actions": list(next_legal_action["actions"]),
         "reason": (
             "CLI backend reached a terminal timeout/no-finish condition after "
             "durable startup/read receipt evidence was recorded; the isolated "

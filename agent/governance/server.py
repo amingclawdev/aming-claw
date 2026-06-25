@@ -34898,12 +34898,79 @@ def _bounded_worker_dispatch_recovery_payload(
     project_id: str,
     missing_fields: Sequence[str] | None = None,
     error: str = "",
+    runtime_context_id: str = "",
+    task_id: str = "",
+    observer_command_id: str = "",
+    worker_id: str = "",
+    merge_queue_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     missing = [str(item) for item in (missing_fields or []) if str(item or "").strip()]
+    route_identity = route_identity if isinstance(route_identity, Mapping) else {}
+    repair_payload = {
+        "runtime_context_id": runtime_context_id or "<mfrctx-...>",
+        "task_id": task_id or "<worker-task-id>",
+        "parent_task_id": "<observer-or-root-task-id>",
+        "observer_command_id": observer_command_id or "<observer-command-id>",
+        "route_id": str(route_identity.get("route_id") or "<route-id>"),
+        "route_context_hash": str(
+            route_identity.get("route_context_hash") or "<sha256:...>"
+        ),
+        "prompt_contract_id": str(
+            route_identity.get("prompt_contract_id") or "<rprompt-...>"
+        ),
+        "prompt_contract_hash": str(
+            route_identity.get("prompt_contract_hash") or "<sha256:...>"
+        ),
+        "route_token_ref": str(route_identity.get("route_token_ref") or "<rtok-...>"),
+        "visible_injection_manifest_hash": str(
+            route_identity.get("visible_injection_manifest_hash") or "<sha256:...>"
+        ),
+        "owned_files": ["<repo-relative-owned-file>"],
+        "fence_token": "<fence-token>",
+        "worktree_path": "<absolute-worker-worktree>",
+        "branch_ref": "<refs/heads/...>",
+        "base_commit": "<base-sha>",
+        "target_head_commit": "<target-head-sha>",
+        "merge_queue_id": merge_queue_id or "<merge-queue-id>",
+    }
     return {
         "schema_version": "bounded_worker_dispatch_recovery.v1",
         "recoverable": True,
         "next_action": "prepare_runtime_text_with_dispatch_evidence",
+        "next_legal_action": {
+            "schema_version": "bounded_worker_dispatch.next_legal_action.v1",
+            "action": "repair_runtime_text_payload",
+            "deterministic_order": [
+                "repair_runtime_text_payload",
+                "retry_with_new_worker",
+                "authorize_explicit_hotfix_exception",
+            ],
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "observer_command_id": observer_command_id,
+            "worker_id": worker_id,
+            "merge_queue_id": merge_queue_id,
+            "route_identity": dict(route_identity),
+            "missing_fields": missing,
+        },
+        "next_legal_actions": [
+            {
+                "id": "repair_runtime_text_payload",
+                "action": "observer_runtime_text_prepare",
+                "reason": "bounded worker dispatch evidence is missing required launch fields",
+            },
+            {
+                "id": "retry_with_new_worker",
+                "action": "dispatch_bounded_worker",
+                "reason": "use after repairing payload or when the current lane is terminal",
+            },
+            {
+                "id": "authorize_explicit_hotfix_exception",
+                "action": "authorize_observer_hotfix_exception",
+                "reason": "only for an explicit audited operator exception",
+            },
+        ],
         "message": (
             "Supply the missing bounded-worker dispatch fields through runtime-text "
             "prepare; the service will retry dispatch evidence auto-recording."
@@ -34928,23 +34995,7 @@ def _bounded_worker_dispatch_recovery_payload(
             "merge_queue_id",
             "owned_files or target_files",
         ],
-        "payload_shape": {
-            "runtime_context_id": "<mfrctx-...>",
-            "task_id": "<worker-task-id>",
-            "parent_task_id": "<observer-or-root-task-id>",
-            "observer_command_id": "<observer-command-id>",
-            "route_context_hash": "<sha256:...>",
-            "prompt_contract_id": "<rprompt-...>",
-            "prompt_contract_hash": "<sha256:...>",
-            "route_token_ref": "<rtok-...>",
-            "owned_files": ["<repo-relative-owned-file>"],
-            "fence_token": "<fence-token>",
-            "worktree_path": "<absolute-worker-worktree>",
-            "branch_ref": "<refs/heads/...>",
-            "base_commit": "<base-sha>",
-            "target_head_commit": "<target-head-sha>",
-            "merge_queue_id": "<merge-queue-id>",
-        },
+        "payload_shape": repair_payload,
         "error": error,
     }
 
@@ -34974,6 +35025,43 @@ def _record_bounded_worker_dispatch_event(
         if isinstance(branch_runtime_evidence.get("context"), Mapping)
         else {}
     )
+    prepared_runtime_context = (
+        prepared.get("runtime_context")
+        if isinstance(prepared.get("runtime_context"), Mapping)
+        else {}
+    )
+    persistent_evidence = (
+        prepared.get("persistent_evidence")
+        if isinstance(prepared.get("persistent_evidence"), Mapping)
+        else {}
+    )
+    startup_recording = (
+        prepared.get("startup_recording")
+        if isinstance(prepared.get("startup_recording"), Mapping)
+        else persistent_evidence.get("startup_recording")
+        if isinstance(persistent_evidence.get("startup_recording"), Mapping)
+        else {}
+    )
+    dispatch_gate = (
+        prepared.get("dispatch_gate")
+        if isinstance(prepared.get("dispatch_gate"), Mapping)
+        else {}
+    )
+    executable_worker_launch = (
+        prepared.get("executable_worker_launch")
+        if isinstance(prepared.get("executable_worker_launch"), Mapping)
+        else {}
+    )
+    executable_payload = (
+        executable_worker_launch.get("payload")
+        if isinstance(executable_worker_launch.get("payload"), Mapping)
+        else {}
+    )
+    worker_launch_pack = (
+        prepared.get("worker_launch_pack")
+        if isinstance(prepared.get("worker_launch_pack"), Mapping)
+        else {}
+    )
     route_identity = _parallel_branch_runtime_contract_route_identity(prepared, body)
 
     def _first_text(*values: Any) -> str:
@@ -34981,6 +35069,28 @@ def _record_bounded_worker_dispatch_event(
             text = str(value or "").strip()
             if text:
                 return text
+        return ""
+
+    source_maps = (
+        body,
+        prepared,
+        startup_recording,
+        dispatch_gate,
+        executable_payload,
+        worker_launch_pack,
+        prepared_runtime_context,
+        context,
+        branch_runtime_evidence,
+    )
+
+    def _first_field(*keys: str) -> str:
+        for source_map in source_maps:
+            if not isinstance(source_map, Mapping):
+                continue
+            for key in keys:
+                text = _first_text(source_map.get(key))
+                if text:
+                    return text
         return ""
 
     def _string_values(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> list[str]:
@@ -34993,43 +35103,23 @@ def _record_bounded_worker_dispatch_event(
                     return values
         return []
 
-    task_id = _first_text(
-        prepared.get("task_id"),
-        context.get("task_id"),
-        body.get("task_id"),
-    )
-    backlog_id = _first_text(
-        prepared.get("backlog_id"),
-        context.get("backlog_id"),
-        body.get("backlog_id"),
-    )
+    task_id = _first_field("task_id", "stage_task_id")
+    backlog_id = _first_field("backlog_id")
     parent_task_id = _first_text(
         body.get("parent_task_id"),
         prepared.get("parent_task_id"),
+        startup_recording.get("parent_task_id"),
+        dispatch_gate.get("parent_task_id"),
         context.get("root_task_id"),
+        prepared_runtime_context.get("root_task_id"),
         context.get("chain_id"),
+        prepared_runtime_context.get("chain_id"),
         context.get("backlog_id"),
         backlog_id,
     )
-    runtime_context_id = _first_text(
-        prepared.get("runtime_context_id"),
-        context.get("runtime_context_id"),
-        branch_runtime_evidence.get("runtime_context_id"),
-        body.get("runtime_context_id"),
-    )
-    worker_slot_id = _first_text(
-        body.get("worker_slot_id"),
-        body.get("worker_id"),
-        prepared.get("worker_slot_id"),
-        prepared.get("worker_id"),
-        context.get("worker_slot_id"),
-        context.get("worker_id"),
-    )
-    observer_command_id = _first_text(
-        body.get("observer_command_id"),
-        prepared.get("observer_command_id"),
-        context.get("observer_command_id"),
-    )
+    runtime_context_id = _first_field("runtime_context_id")
+    worker_slot_id = _first_field("worker_slot_id", "worker_id")
+    observer_command_id = _first_field("observer_command_id")
     dispatch_actor = _first_text(
         body.get("actor"),
         prepared.get("actor"),
@@ -35037,24 +35127,10 @@ def _record_bounded_worker_dispatch_event(
         prepared.get("caller_role"),
         "observer",
     )
-    branch_ref = _first_text(
-        body.get("branch"),
-        body.get("branch_ref"),
-        prepared.get("branch"),
-        prepared.get("branch_ref"),
-        context.get("branch_ref"),
-    )
-    worktree_path = _first_text(
-        body.get("worktree_path"),
-        body.get("assigned_worktree"),
-        prepared.get("worktree_path"),
-        prepared.get("assigned_worktree"),
-        context.get("worktree_path"),
-    )
+    branch_ref = _first_field("branch", "branch_ref")
+    worktree_path = _first_field("worktree_path", "assigned_worktree", "worktree")
     owned_files = _string_values(
-        body,
-        prepared,
-        context,
+        *source_maps,
         keys=("owned_files", "target_files"),
     )
     dispatch = {
@@ -35075,38 +35151,22 @@ def _record_bounded_worker_dispatch_event(
         "worker_role": "mf_sub",
         "worker_slot_id": worker_slot_id,
         "worker_id": worker_slot_id,
-        "fence_token": _first_text(
-            body.get("fence_token"),
-            prepared.get("fence_token"),
-            context.get("fence_token"),
+        "agent_id": _first_field("agent_id", "allocation_owner"),
+        "actual_host_worker_id": _first_field(
+            "actual_host_worker_id",
+            "host_worker_id",
+            "worker_agent_id",
         ),
+        "fence_token": _first_field("fence_token", "worker_fence_token"),
         "worktree_path": worktree_path,
         "branch": branch_ref,
         "branch_ref": branch_ref,
-        "base_commit": _first_text(
-            body.get("base_commit"),
-            prepared.get("base_commit"),
-            context.get("base_commit"),
-        ),
-        "target_head_commit": _first_text(
-            body.get("target_head_commit"),
-            prepared.get("target_head_commit"),
-            context.get("target_head_commit"),
-        ),
-        "merge_queue_id": _first_text(
-            body.get("merge_queue_id"),
-            prepared.get("merge_queue_id"),
-            context.get("merge_queue_id"),
-        ),
+        "base_commit": _first_field("base_commit"),
+        "target_head_commit": _first_field("target_head_commit"),
+        "merge_queue_id": _first_field("merge_queue_id"),
         "owned_files": owned_files,
-        "read_receipt_event_id": _first_text(
-            body.get("read_receipt_event_id"),
-            prepared.get("read_receipt_event_id"),
-        ),
-        "startup_event_id": _first_text(
-            body.get("startup_event_id"),
-            prepared.get("startup_event_id"),
-        ),
+        "read_receipt_event_id": _first_field("read_receipt_event_id"),
+        "startup_event_id": _first_field("startup_event_id"),
     }
     for key in (
         "route_id",
@@ -35356,16 +35416,39 @@ def _record_bounded_worker_dispatch_event(
         field for field in required if dispatch.get(field) in ("", None, [], {})
     ]
     if missing:
+        missing_route_identity = {
+            key: dispatch.get(key) or ""
+            for key in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
+            )
+        }
         return {
             "ok": False,
             "status": "skipped",
             "reason": "bounded_worker_dispatch_evidence_incomplete",
             "missing_fields": missing,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "observer_command_id": observer_command_id,
+            "worker_id": worker_slot_id,
+            "merge_queue_id": dispatch.get("merge_queue_id") or "",
+            "route_identity": missing_route_identity,
             "close_satisfying": False,
             "actionable": True,
             "recovery": _bounded_worker_dispatch_recovery_payload(
                 project_id=project_id,
                 missing_fields=missing,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                observer_command_id=observer_command_id,
+                worker_id=worker_slot_id,
+                merge_queue_id=str(dispatch.get("merge_queue_id") or ""),
+                route_identity=missing_route_identity,
             ),
         }
 
