@@ -35047,12 +35047,18 @@ def _contract_runtime_close_meta_compat_gate(
 
 def _contract_runtime_close_audit_meta_gate(
     meta_contract_gate: Mapping[str, Any],
+    *,
+    authority_source: str = "contract_runtime",
 ) -> dict[str, Any]:
+    authority = str(authority_source or "").strip() or "contract_runtime"
     return {
         **dict(meta_contract_gate),
         "compatibility_only": True,
+        "legacy_audit_only": True,
         "primary_decision_source": False,
         "decision_source": "legacy_meta_contract_audit_only",
+        "authority_decision_source": authority,
+        "source_of_authority": authority,
         "contract_runtime_primary_decision_source": True,
         "meta_contract_gate_decision_source": False,
     }
@@ -35330,6 +35336,16 @@ def handle_task_timeline_append(ctx: RequestContext):
                 meta_contract_gate = _contract_runtime_close_audit_meta_gate(
                     meta_contract_gate
                 )
+        elif route_action_scope_lineage:
+            meta_contract_gate = _contract_runtime_close_audit_meta_gate(
+                meta_contract_gate,
+                authority_source="route_action_scope_lineage",
+            )
+        elif route_gate:
+            meta_contract_gate = _contract_runtime_close_audit_meta_gate(
+                meta_contract_gate,
+                authority_source="route_token_gate",
+            )
         norm_payload = {
             **(norm_payload if isinstance(norm_payload, dict) else {}),
             "meta_contract_gate": meta_contract_gate,

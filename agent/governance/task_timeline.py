@@ -580,12 +580,18 @@ def _contract_runtime_meta_error_can_be_audit_only(
 
 def _contract_runtime_audit_only_meta_gate(
     gate: Mapping[str, Any],
+    *,
+    authority_source: str = "contract_runtime",
 ) -> dict[str, Any]:
+    authority = _text(authority_source) or "contract_runtime"
     return {
         **dict(gate),
         "compatibility_only": True,
+        "legacy_audit_only": True,
         "primary_decision_source": False,
         "decision_source": "legacy_meta_contract_audit_only",
+        "authority_decision_source": authority,
+        "source_of_authority": authority,
         "contract_runtime_primary_decision_source": True,
         "meta_contract_gate_decision_source": False,
     }
@@ -610,6 +616,48 @@ def _contract_runtime_compat_rejected_meta_gate(
         "event_kind": _text(event.get("event_kind")),
         "actor": _text(event.get("actor")),
     }
+
+
+def _legacy_meta_audit_authority_source(
+    payload: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    artifact_refs: Mapping[str, Any],
+) -> str:
+    """Return the new-system authority that makes meta-contract audit-only."""
+
+    for source in (payload, verification, artifact_refs):
+        runtime_gate = _first_deep_mapping(
+            source,
+            "contract_runtime_close_evidence_gate",
+        )
+        if (
+            runtime_gate.get("schema_version")
+            == "contract_runtime_close_evidence_gate.v1"
+            and _truthy(runtime_gate.get("accepted") or runtime_gate.get("allowed"))
+            and _truthy(runtime_gate.get("primary_decision_source"))
+        ):
+            return "contract_runtime"
+
+    for source in (payload, verification, artifact_refs):
+        route_lineage = _first_deep_mapping(source, "route_action_scope_lineage")
+        if _truthy(route_lineage.get("accepted") or route_lineage.get("allowed")):
+            return "route_action_scope_lineage"
+
+    for source in (payload, verification, artifact_refs):
+        route_gate = _first_deep_mapping(source, "route_token_gate")
+        if _truthy(route_gate.get("allowed") or route_gate.get("accepted")):
+            return "route_token_gate"
+
+    for source in (payload, verification, artifact_refs):
+        route_evidence = _first_deep_mapping(source, "route_evidence")
+        if (
+            route_evidence.get("schema_version") == "service_route_evidence.v1"
+            and _text(route_evidence.get("status")) == "passed"
+            and _text(route_evidence.get("decision")) == "allow"
+        ):
+            return "service_route"
+
+    return ""
 
 
 def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, Any]:
@@ -657,9 +705,19 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
         else:
             raise
     else:
-        if _contract_runtime_primary_close_gate_accepted(payload):
+        authority_source = (
+            "contract_runtime"
+            if _contract_runtime_primary_close_gate_accepted(payload)
+            else _legacy_meta_audit_authority_source(
+                payload,
+                verification,
+                artifact_refs,
+            )
+        )
+        if authority_source:
             meta_contract_gate = _contract_runtime_audit_only_meta_gate(
-                meta_contract_gate
+                meta_contract_gate,
+                authority_source=authority_source,
             )
     payload["meta_contract_gate"] = meta_contract_gate
     with sqlite_write_lock():

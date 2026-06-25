@@ -24096,6 +24096,41 @@ def test_task_timeline_record_event_meta_contract_allows_explicit_internal_syste
     assert gate["allowed"] is True
 
 
+def test_task_timeline_record_event_service_route_marks_meta_contract_audit_only(conn):
+    route_evidence = {
+        "schema_version": "service_route_evidence.v1",
+        "status": "passed",
+        "decision": "allow",
+        "service_id": "route.action_precheck",
+        "route_context_hash": _fake_sha("service-route-audit-only-route"),
+        "prompt_contract_id": "rprompt-service-route-audit-only",
+    }
+
+    event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        event_type="service.route.completed",
+        event_kind="service_route",
+        phase="service_router",
+        actor="service-router",
+        status="allowed",
+        payload={
+            "service_router_suppress": True,
+            "route_evidence": route_evidence,
+        },
+    )
+
+    gate = event["payload"]["meta_contract_gate"]
+    assert gate["role"] == "system"
+    assert gate["action"] == "service_route"
+    assert gate["allowed"] is True
+    assert gate["legacy_audit_only"] is True
+    assert gate["primary_decision_source"] is False
+    assert gate["authority_decision_source"] == "service_route"
+    assert gate["source_of_authority"] == "service_route"
+    assert gate["meta_contract_gate_decision_source"] is False
+
+
 def test_timeline_append_rejects_forged_meta_contract_gate(conn):
     backlog_id = "AC-META-CONTRACT-FORGED-GATE-API"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -24562,6 +24597,11 @@ def test_timeline_append_ref_only_independent_verification_projects_server_linea
     )
 
     assert result["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    result_gate = result["meta_contract_gate"]
+    assert result_gate["legacy_audit_only"] is True
+    assert result_gate["primary_decision_source"] is False
+    assert result_gate["authority_decision_source"] == "route_action_scope_lineage"
+    assert result_gate["source_of_authority"] == "route_action_scope_lineage"
     listed = task_timeline.list_events(
         conn,
         PID,
@@ -24570,6 +24610,11 @@ def test_timeline_append_ref_only_independent_verification_projects_server_linea
     )
     assert len(listed) == 1
     payload = listed[0]["payload"]
+    payload_gate = payload["meta_contract_gate"]
+    assert payload_gate["legacy_audit_only"] is True
+    assert payload_gate["primary_decision_source"] is False
+    assert payload_gate["authority_decision_source"] == "route_action_scope_lineage"
+    assert payload_gate["source_of_authority"] == "route_action_scope_lineage"
     lineage = payload["route_action_scope_lineage"]
     assert lineage["source"] == "server_route_token_action_scope"
     assert lineage["route_token_ref"] == child_issue["route_token_ref"]
@@ -24654,7 +24699,7 @@ def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_pro
         token=unbound_issue["route_token"],
     )
 
-    server.handle_task_timeline_append(
+    result = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "qa",
@@ -24695,6 +24740,11 @@ def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_pro
         )
     )
 
+    result_gate = result["meta_contract_gate"]
+    assert result_gate["legacy_audit_only"] is True
+    assert result_gate["primary_decision_source"] is False
+    assert result_gate["authority_decision_source"] == "route_token_gate"
+    assert result_gate["source_of_authority"] == "route_token_gate"
     listed = task_timeline.list_events(
         conn,
         PID,
@@ -24705,6 +24755,11 @@ def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_pro
     payload = listed[0]["payload"]
     assert "route_action_scope_lineage" not in payload
     assert payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    payload_gate = payload["meta_contract_gate"]
+    assert payload_gate["legacy_audit_only"] is True
+    assert payload_gate["primary_decision_source"] is False
+    assert payload_gate["authority_decision_source"] == "route_token_gate"
+    assert payload_gate["source_of_authority"] == "route_token_gate"
     serialized_payload = json.dumps(payload, sort_keys=True)
     assert "caller_forged_server_lineage" not in serialized_payload
     assert "caller_nested_action_scope" not in serialized_payload
