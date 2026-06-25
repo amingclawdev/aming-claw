@@ -1136,11 +1136,15 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "contract_add_start",
         "contract_add_current",
         "contract_add_submit_line",
+        "contract_update_start",
+        "contract_update_current",
+        "contract_update_submit_line",
         "contract_runtime_current",
         "contract_runtime_guide",
         "contract_runtime_submit_line",
     }.issubset(tool_by_name)
     assert "contract_add_create" not in tool_by_name
+    assert "contract_update_create" not in tool_by_name
     assert "contract_definition_create" not in tool_by_name
     assert "contract_definition_update" not in tool_by_name
     assert "contract_execution_id" not in tool_by_name["onboard_contract_start"][
@@ -1151,6 +1155,10 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "contract_execution_id",
     ]
     assert tool_by_name["contract_add_submit_line"]["inputSchema"]["required"] == [
+        "project_id",
+        "contract_execution_id",
+    ]
+    assert tool_by_name["contract_update_submit_line"]["inputSchema"]["required"] == [
         "project_id",
         "contract_execution_id",
     ]
@@ -1168,6 +1176,9 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "contract_add_start",
         "contract_add_current",
         "contract_add_submit_line",
+        "contract_update_start",
+        "contract_update_current",
+        "contract_update_submit_line",
         "contract_runtime_current",
         "contract_runtime_guide",
         "contract_runtime_submit_line",
@@ -1255,6 +1266,36 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         },
     )["ok"] is True
     assert dispatcher.dispatch(
+        "contract_update_start",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-CONTRACT-UPDATE",
+            "observer_session_id": "obs-contract-update",
+            "observer_route_token_ref": "rtok-contract-update",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_update_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-contract-update",
+            "observer_session_id": "obs-contract-update",
+            "observer_route_token_ref": "rtok-contract-update",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_update_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-contract-update",
+            "stage_id": "worker_previous_source",
+            "line_id": "worker_previous_source_proof",
+            "evidence_kind": "contract_previous_source_proof",
+            "observer_session_id": "obs-contract-update",
+            "observer_route_token_ref": "rtok-contract-update",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
         "contract_runtime_current",
         {
             "project_id": "aming-claw",
@@ -1335,6 +1376,31 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
                 "evidence_kind": "contract_draft_precheck",
                 "observer_session_id": "obs-contract-add",
                 "observer_route_token_ref": "rtok-contract-add",
+            },
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-update/start",
+            {
+                "backlog_id": "AC-CONTRACT-UPDATE",
+                "observer_session_id": "obs-contract-update",
+                "observer_route_token_ref": "rtok-contract-update",
+            },
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-update/cex-contract-update/current-state?observer_session_id=obs-contract-update&observer_route_token_ref=rtok-contract-update",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-update/cex-contract-update/line-writes",
+            {
+                "stage_id": "worker_previous_source",
+                "line_id": "worker_previous_source_proof",
+                "evidence_kind": "contract_previous_source_proof",
+                "observer_session_id": "obs-contract-update",
+                "observer_route_token_ref": "rtok-contract-update",
             },
         ),
         (

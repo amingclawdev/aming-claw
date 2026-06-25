@@ -1,0 +1,256 @@
+{
+  "compat_aliases": [
+    "contract_update.v1",
+    "update_contract.v1"
+  ],
+  "contract_id": "contract_update",
+  "contract_type": "contract_update",
+  "instruction_layer": {
+    "inline": [
+      "The compiled ContractRuntime guide is authoritative for contract_update next legal action ordering.",
+      "Only the thin contract_update start/read/submit-line facade is agent-facing; generic CRUD remains internal.",
+      "Observer owns update request, acceptance, and close-ready lines only.",
+      "mf_sub owns previous-source read, draft revision precheck, new source revision proof, runtime visibility proof, and asset-binding proposal or waiver evidence.",
+      "QA owns independent verification and must not be authored by observer or mf_sub.",
+      "Contract semantic changes must be represented as a new source revision with definition_hash and source_sha256 evidence; same-revision active semantic mutation is invalid."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "backlog_id": "AC-CONTRACT-SYSTEM-CRUD-REGISTRY-MIN-PATH-20260623",
+    "dogfood_contract": "onboard_contract.v1.rev2",
+    "runtime_dogfood": true
+  },
+  "revision": "rev1",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer requests a source-backed contract revision and binds route, backlog, scope, previous source hash, target source path, and role plan.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer-authored update request with previous contract identity, expected previous hash, target revision, target roles, owned files, and acceptance criteria.",
+            "evidence_kind": "contract_update_request",
+            "line_id": "observer_request_contract_update",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "observer_request"
+      },
+      {
+        "description": "The bounded worker reads the previous source definition and validates the expected hash before drafting a new revision.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored proof of previous source path, previous raw source_sha256, previous definition_hash, and expected_previous_hash match or explicit block.",
+            "evidence_kind": "contract_previous_source_proof",
+            "line_id": "worker_previous_source_proof",
+            "owner_role": "mf_sub",
+            "requires": [
+              "observer_request_contract_update"
+            ]
+          }
+        ],
+        "stage_id": "worker_previous_source"
+      },
+      {
+        "description": "The bounded worker validates the draft revision shape before writing or adopting the new source revision.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored precheck showing schema validation, successor graph impact, role-bound lines, lifecycle decision, and same-revision mutation rejection evidence.",
+            "evidence_kind": "contract_revision_precheck",
+            "line_id": "worker_revision_precheck",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_previous_source_proof"
+            ]
+          }
+        ],
+        "stage_id": "worker_precheck"
+      },
+      {
+        "description": "The worker writes or adopts the new source-controlled revision.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored new source revision proof with source path, raw source_sha256, definition_hash, previous revision, new revision, successor changes, and CRUD update result.",
+            "evidence_kind": "contract_revision_source_proof",
+            "line_id": "worker_revision_source_proof",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_revision_precheck"
+            ]
+          }
+        ],
+        "stage_id": "worker_source"
+      },
+      {
+        "description": "The worker proves the new revision is visible through registry and runtime guide/current-state paths without breaking pinned previous executions.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored runtime visibility proof for latest-revision resolution, pinned previous revision reads, start/read/current-state, source hash pinning, and next action ordering.",
+            "evidence_kind": "contract_update_runtime_visibility",
+            "line_id": "worker_runtime_visibility_proof",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_revision_source_proof"
+            ]
+          }
+        ],
+        "stage_id": "worker_runtime_visibility"
+      },
+      {
+        "description": "The worker records how changed source assets are bound or explicitly waived without direct graph DB writes.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored asset-binding proposal/review/materialize evidence, follow-up backlog evidence, or explicit waiver for unbound source assets.",
+            "evidence_kind": "asset_binding_proposal_or_waiver",
+            "line_id": "worker_asset_binding_proposal_or_waiver",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_runtime_visibility_proof"
+            ]
+          }
+        ],
+        "stage_id": "worker_asset_binding"
+      },
+      {
+        "description": "Independent QA verifies the previous hash, new revision, runtime path, role gates, pinned execution behavior, and asset-binding evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "QA-authored independent verification; observer and mf_sub writes are rejected for this line.",
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "requires": [
+              "worker_asset_binding_proposal_or_waiver"
+            ]
+          }
+        ],
+        "stage_id": "qa"
+      },
+      {
+        "description": "Observer accepts the verified contract update and records close-ready handoff evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer acceptance after QA verification, including merge/reconcile/backlog close policy and any waivers or follow-ups.",
+            "evidence_kind": "contract_update_accept",
+            "line_id": "observer_accept_contract_update",
+            "owner_role": "observer",
+            "requires": [
+              "qa_independent_verification"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer close-ready evidence for the contract_update execution after acceptance.",
+            "evidence_kind": "close_ready",
+            "line_id": "observer_close_ready",
+            "owner_role": "observer",
+            "requires": [
+              "observer_accept_contract_update"
+            ]
+          }
+        ],
+        "stage_id": "observer_accept"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "denied_reason": "contract_update must be reached through an approved successor flow, not as a root entrypoint",
+      "requires_parent_execution": true,
+      "root_start_default": "deny"
+    },
+    "successor_policy": {
+      "allow_successor_start": false,
+      "allowed_parent_contracts": [],
+      "allowed_successors": [
+        {
+          "contract_id": "qa_evidence_gate_review.v1",
+          "version": "v1"
+        },
+        {
+          "contract_id": "observer_hotfix",
+          "version": "v1"
+        }
+      ],
+      "requires_contract_chain_id": true,
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true,
+      "successor_start_default": "deny_until_parent_path_is_source_backed"
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "mutable_completed_lines_trust_root": false,
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state"
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "formatting_only_drift_must_remain_visible": true,
+      "independent_review_required": true,
+      "same_revision_semantic_change_allowed": false,
+      "semantic_change_requires_new_revision": true
+    },
+    "graph_binding_policy": {
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true,
+      "source_asset_materialization_required": true
+    }
+  },
+  "successors": [
+    {
+      "contract_id": "qa_evidence_gate_review.v1",
+      "reason": "Run stricter QA evidence review if contract_update verification finds ambiguous evidence.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "observer_hotfix",
+      "reason": "Use a bounded observer hotfix only for tiny runtime/facade repairs found while executing contract_update.",
+      "version": "v1"
+    }
+  ],
+  "version": "v1"
+}

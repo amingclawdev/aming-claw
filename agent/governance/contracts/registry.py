@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from .hash import canonical_json, file_sha256, stable_sha256
@@ -81,9 +82,14 @@ class ContractDefinitionRegistry:
         if not matches:
             raise UnknownContractDefinitionError(f"unknown contract definition: {contract_id}")
         if len(matches) > 1 and revision is None:
-            active = [definition for definition in matches if definition["status"] == "active"]
-            if len(active) == 1:
-                return active[0]
+            active = [
+                definition
+                for definition in matches
+                if definition["status"] == "active"
+            ]
+            candidates = active or matches
+            if _same_contract_version(candidates):
+                return max(candidates, key=_revision_sort_key)
             raise ContractDefinitionError(
                 "ambiguous contract definition: "
                 + ", ".join(
@@ -214,6 +220,25 @@ def _definition_key(definition: Mapping[str, Any]) -> tuple[str, str, str]:
         str(definition.get("version") or ""),
         str(definition.get("revision") or ""),
     )
+
+
+def _same_contract_version(definitions: Sequence[Mapping[str, Any]]) -> bool:
+    keys = {
+        (
+            str(definition.get("contract_id") or ""),
+            str(definition.get("version") or ""),
+        )
+        for definition in definitions
+    }
+    return len(keys) == 1
+
+
+def _revision_sort_key(definition: Mapping[str, Any]) -> tuple[int, int, str]:
+    revision = str(definition.get("revision") or "")
+    match = re.fullmatch(r"rev(\d+)", revision)
+    if match:
+        return (1, int(match.group(1)), revision)
+    return (0, 0, revision)
 
 
 def _matches(

@@ -33082,6 +33082,7 @@ def _contract_runtime_stale_recovery_id(
     prefix = {
         ONBOARD_CONTRACT_ID: "cex-onboard-recovery",
         CONTRACT_ADD_CONTRACT_ID: "cex-contract-add-recovery",
+        CONTRACT_UPDATE_CONTRACT_ID: "cex-contract-update-recovery",
         MF_PARALLEL_RECORD_CONTRACT_ID: "cex-mf-parallel-recovery",
     }.get(contract_id, "cex-contract-recovery")
     current_definition_hash = (
@@ -33106,6 +33107,8 @@ def _contract_runtime_recovery_start_endpoint(contract_id: str) -> str:
         return "onboard-contract/start"
     if contract_id == CONTRACT_ADD_CONTRACT_ID:
         return "contract-add/start"
+    if contract_id == CONTRACT_UPDATE_CONTRACT_ID:
+        return "contract-update/start"
     return "contract-runtime/recover"
 
 
@@ -34027,6 +34030,214 @@ def _contract_add_effective_actor_role(
     conn,
     *,
     action: str = "contract_add_facade",
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+) -> str:
+    return _contract_runtime_effective_actor_role(
+        ctx,
+        conn,
+        action=action,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+    )
+
+
+CONTRACT_UPDATE_CONTRACT_ID = "contract_update"
+
+
+def _contract_update_execution_id(
+    project_id: str,
+    backlog_id: str,
+    *,
+    contract_execution_id: str = "",
+) -> str:
+    return contract_execution_id or _contract_runtime_stable_id(
+        "cex-contract-update",
+        project_id,
+        backlog_id,
+        CONTRACT_UPDATE_CONTRACT_ID,
+        "rev1",
+    )
+
+
+def _contract_update_response(record: Mapping[str, Any]) -> dict[str, Any]:
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    current_state = _runtime_current_state_from_record(record)
+    return {
+        "schema_version": "contract_update.runtime_facade_response.v1",
+        "ok": True,
+        "project_id": str(record.get("project_id") or ""),
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "contract_id": str(record.get("contract_id") or ""),
+        "contract_runtime_current_state": current_state,
+        "runtime_guide": guide,
+        "next_legal_action": _runtime_next_action_from_guide(guide),
+        "route_token_ref": str(record.get("route_token_ref") or ""),
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+    }
+
+
+def _contract_update_require_contract_record(
+    record: Mapping[str, Any],
+    *,
+    contract_execution_id: str,
+    action: str,
+) -> None:
+    if str(record.get("contract_id") or "") == CONTRACT_UPDATE_CONTRACT_ID:
+        return
+    raise ValidationError(
+        f"contract_update facade can only {action} contract_update executions",
+        {
+            "contract_execution_id": contract_execution_id,
+            "contract_id": str(record.get("contract_id") or ""),
+        },
+    )
+
+
+def _contract_update_start(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    actor_role: str,
+    route_token_ref: str = "",
+    contract_execution_id: str = "",
+    metadata: Mapping[str, Any] | None = None,
+    recovery_policy: str = "",
+    stale_contract_execution_id: str = "",
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    execution_id = _contract_update_execution_id(
+        project_id,
+        backlog_id,
+        contract_execution_id=contract_execution_id,
+    )
+    try:
+        record = runtime.store.get(execution_id)
+        _contract_update_require_contract_record(
+            record,
+            contract_execution_id=execution_id,
+            action="enter/read",
+        )
+        if route_token_ref and not str(record.get("route_token_ref") or ""):
+            record["route_token_ref"] = route_token_ref
+            runtime.store.update(execution_id, record)
+    except ContractRuntimeError:
+        if _contract_runtime_recovery_requested(recovery_policy):
+            raise ValidationError(
+                "contract_update recovery requested but no stale execution exists",
+                {
+                    "contract_execution_id": execution_id,
+                    "recovery_policy": recovery_policy,
+                },
+            )
+        record = runtime.start_execution(
+            CONTRACT_UPDATE_CONTRACT_ID,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=actor_role,
+            contract_execution_id=execution_id,
+            route_token_ref=route_token_ref,
+            role_binding={
+                "observer": "observer",
+                "mf_sub": "mf_sub",
+                "qa": "qa",
+                "binding_source": "contract_update_facade",
+            },
+            backlog_lineage={
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+            },
+            metadata={
+                "facade": "contract_update",
+                "generic_crud_exposed": False,
+                **dict(metadata or {}),
+            },
+        )
+    try:
+        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+    except StalePinnedContractExecutionError as exc:
+        if not _contract_runtime_recovery_requested(recovery_policy):
+            raise
+        if stale_contract_execution_id and stale_contract_execution_id != execution_id:
+            raise ValidationError(
+                "stale_contract_execution_id does not match the contract_update execution",
+                {
+                    "stale_contract_execution_id": stale_contract_execution_id,
+                    "contract_execution_id": execution_id,
+                },
+            )
+        recovery_execution_id = _contract_runtime_stale_recovery_id(exc)
+        try:
+            record = runtime.store.get(recovery_execution_id)
+            _contract_update_require_contract_record(
+                record,
+                contract_execution_id=recovery_execution_id,
+                action="enter/read",
+            )
+            if route_token_ref and not str(record.get("route_token_ref") or ""):
+                record["route_token_ref"] = route_token_ref
+                runtime.store.update(recovery_execution_id, record)
+        except ContractRuntimeError:
+            record = runtime.start_execution(
+                CONTRACT_UPDATE_CONTRACT_ID,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                contract_execution_id=recovery_execution_id,
+                route_token_ref=route_token_ref,
+                role_binding={
+                    "observer": "observer",
+                    "mf_sub": "mf_sub",
+                    "qa": "qa",
+                    "binding_source": "contract_update_recovery_facade",
+                },
+                backlog_lineage={
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "stale_contract_execution_id": execution_id,
+                },
+                metadata={
+                    "facade": "contract_update",
+                    "generic_crud_exposed": False,
+                    "recovery_policy": "start_new_execution",
+                    "stale_contract_execution_id": execution_id,
+                    "recovery_reason": "stale_pinned_execution",
+                    **dict(metadata or {}),
+                },
+            )
+        execution_id = recovery_execution_id
+        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+    record = runtime.store.get(execution_id)
+    record["runtime_guide"] = guide
+    return record
+
+
+def _contract_update_read(
+    conn,
+    *,
+    contract_execution_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    _contract_update_require_contract_record(
+        record,
+        contract_execution_id=contract_execution_id,
+        action="enter/read",
+    )
+    guide = runtime.current_guide(contract_execution_id, actor_role=actor_role)
+    record = runtime.store.get(contract_execution_id)
+    record["runtime_guide"] = guide
+    return record
+
+
+def _contract_update_effective_actor_role(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str = "contract_update_facade",
     backlog_id: str = "",
     contract_execution_id: str = "",
 ) -> str:
@@ -42021,8 +42232,13 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
     from .mf_subagent_contract import validate_meta_contract_timeline_event
 
     with DBContext(project_id) as conn:
-        session = ctx.require_auth(conn)
-        derived_actor_role = str(session.get("role") or "").strip()
+        root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
+        derived_actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="mf_parallel_enter",
+            backlog_id=backlog_id,
+        )
         if derived_actor_role != "observer":
             raise PermissionDeniedError(
                 derived_actor_role,
@@ -42030,10 +42246,9 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 {
                     "required_role": "observer",
                     "body_role_claim": body_role_claim,
-                    "role_source": "request_session",
+                    "role_source": "contract_runtime_effective_actor_role",
                 },
             )
-        root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
         try:
             parent_record = _onboard_contract_parent_for_successor(
                 conn,
@@ -42500,6 +42715,172 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
     }
     if isinstance(result.get("record"), Mapping):
         response.update(_contract_add_response(result["record"]))
+        response["ok"] = bool(result.get("ok"))
+        response["decision"] = result.get("decision") or {}
+        response["actor_role"] = actor_role
+    return response
+
+
+@route("POST", "/api/projects/{project_id}/contract-update/start")
+@route("POST", "/api/projects/{project_id}/contract-update/enter")
+def handle_project_contract_update_start(ctx: RequestContext):
+    """Start or enter the thin source-backed contract_update runtime facade."""
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    if not backlog_id:
+        raise ValidationError("contract_update start requires backlog_id")
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    contract_execution_id = str(body.get("contract_execution_id") or "").strip()
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    recovery_policy = str(body.get("recovery_policy") or "").strip()
+    stale_contract_execution_id = str(
+        body.get("stale_contract_execution_id") or ""
+    ).strip()
+    with DBContext(project_id) as conn:
+        effective_execution_id = _contract_update_execution_id(
+            project_id,
+            backlog_id,
+            contract_execution_id=contract_execution_id,
+        )
+        actor_role = _contract_update_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_update_start",
+            backlog_id=backlog_id,
+            contract_execution_id=effective_execution_id,
+        )
+        if actor_role != "observer":
+            raise PermissionDeniedError(
+                actor_role,
+                "contract_update_start",
+                {"required_role": "observer"},
+            )
+        try:
+            record = _contract_update_start(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                route_token_ref=route_token_ref,
+                contract_execution_id=contract_execution_id,
+                metadata=metadata,
+                recovery_policy=recovery_policy,
+                stale_contract_execution_id=stale_contract_execution_id,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_update_start",
+                route_token_ref=route_token_ref,
+                actor_role=actor_role,
+            )
+        conn.commit()
+    return _contract_update_response(record)
+
+
+@route("GET", "/api/projects/{project_id}/contract-update/{contract_execution_id}/current-state")
+@route("GET", "/api/projects/{project_id}/contract-update/{contract_execution_id}/guide")
+def handle_project_contract_update_current_state(ctx: RequestContext):
+    """Read contract_update runtime guide/current-state without exposing CRUD."""
+    project_id = ctx.get_project_id()
+    contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        raise ValidationError("contract_execution_id is required")
+    with DBContext(project_id) as conn:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+        actor_role = _contract_update_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_update_current",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+        )
+        try:
+            record = _contract_update_read(
+                conn,
+                contract_execution_id=contract_execution_id,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_update_current",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+        conn.commit()
+    response = _contract_update_response(record)
+    response["actor_role"] = actor_role
+    return response
+
+
+@route("POST", "/api/projects/{project_id}/contract-update/{contract_execution_id}/line-writes")
+def handle_project_contract_update_line_write(ctx: RequestContext):
+    """Submit one role-bound contract_update evidence line via ContractRuntime."""
+    project_id = ctx.get_project_id()
+    contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        raise ValidationError("contract_execution_id is required")
+    body = dict(ctx.body or {})
+    with DBContext(project_id) as conn:
+        runtime = _contract_runtime(conn)
+        record = runtime.store.get(contract_execution_id)
+        _contract_update_require_contract_record(
+            record,
+            contract_execution_id=contract_execution_id,
+            action="write",
+        )
+        actor_role = _contract_update_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_update_submit_line",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+        )
+        try:
+            runtime.current_guide(contract_execution_id, actor_role=actor_role)
+            record = runtime.store.get(contract_execution_id)
+            write = _contract_runtime_line_write_body(
+                record,
+                actor_role=actor_role,
+                body=body,
+            )
+            result = runtime.submit_line_write(
+                contract_execution_id,
+                write,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            response = _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_update_submit_line",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+            response["decision"] = {
+                "ok": False,
+                "errors": [str(exc)],
+            }
+            return response
+        conn.commit()
+    response = {
+        "schema_version": "contract_update.line_write_response.v1",
+        "ok": bool(result.get("ok")),
+        "project_id": project_id,
+        "contract_execution_id": contract_execution_id,
+        "actor_role": actor_role,
+        "decision": result.get("decision") or {},
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+    }
+    if isinstance(result.get("record"), Mapping):
+        response.update(_contract_update_response(result["record"]))
         response["ok"] = bool(result.get("ok"))
         response["decision"] = result.get("decision") or {}
         response["actor_role"] = actor_role

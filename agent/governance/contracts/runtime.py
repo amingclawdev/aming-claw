@@ -66,6 +66,12 @@ class StalePinnedContractExecutionError(ContractRuntimeError):
             "current_definition_hash": str(
                 self.definition.get("definition_hash") or ""
             ),
+            "pinned_definition_source_sha256": str(
+                self.record.get("definition_source_sha256") or ""
+            ),
+            "current_definition_source_sha256": str(
+                self.definition.get("source_sha256") or ""
+            ),
         }
 
 
@@ -426,6 +432,7 @@ class ContractRuntime:
             "version": definition["version"],
             "revision": definition["revision"],
             "definition_hash": definition["definition_hash"],
+            "definition_source_sha256": str(definition.get("source_sha256") or ""),
             "instruction_bundle_hash": instruction_bundle["instruction_bundle_hash"],
             "route_token_ref": route_token_ref,
             "completed_lines": [],
@@ -561,6 +568,15 @@ class ContractRuntime:
             record=record,
             definition=definition,
         )
+        pinned_source_sha256 = str(record.get("definition_source_sha256") or "")
+        if pinned_source_sha256:
+            _assert_hash(
+                "definition_source_sha256",
+                pinned_source_sha256,
+                definition.get("source_sha256"),
+                record=record,
+                definition=definition,
+            )
         return definition
 
 

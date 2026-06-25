@@ -22884,6 +22884,85 @@ def test_contract_add_facade_starts_guided_runtime_and_rejects_forged_roles(conn
     )
 
 
+def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-FACADE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    started = server.handle_project_contract_update_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-update",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    assert started["contract_id"] == "contract_update"
+    assert started["next_legal_action"]["id"] == "observer_request_contract_update"
+    assert started["next_legal_action"]["source"] == "contract_runtime"
+    execution_id = started["contract_execution_id"]
+    record = server._contract_runtime(conn).store.get(execution_id)
+    assert record["definition_source_sha256"].startswith("sha256:")
+
+    forged = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "actor_role": "observer",
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_update",
+                "evidence_kind": "contract_update_request",
+            },
+        )
+    )
+    assert forged["ok"] is False
+    assert "cannot write line" in forged["decision"]["errors"][0]
+
+    accepted = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_update",
+                "evidence_kind": "contract_update_request",
+                "payload": {
+                    "previous_revision": "rev1",
+                    "new_revision": "rev2",
+                    "source_path": (
+                        "agent/governance/contract_definitions/"
+                        "onboard_contract.v1.rev2.json"
+                    ),
+                },
+            },
+        )
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["actor_role"] == "observer"
+    assert accepted["next_legal_action"]["id"] == "worker_previous_source_proof"
+    assert accepted["next_legal_action"]["allowed_writer_roles"] == ["mf_sub"]
+
+    current = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="GET",
+        )
+    )
+    assert current["actor_role"] == "mf_sub"
+    assert current["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_previous_source_proof"
+    )
+
+
 def test_contract_add_facade_denies_coordinator_without_observer_proof(conn):
     backlog_id = "AC-CONTRACT-ADD-COORDINATOR-DENIED"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -25965,6 +26044,64 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     )
     assert forged_worker_read["ok"] is False
     assert "cannot write line" in forged_worker_read["decision"]["errors"][0]
+
+
+def test_mf_parallel_enter_accepts_verified_observer_route_ref(conn):
+    backlog_id = "AC-MF-PARALLEL-OBSERVER-REF"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-ref-root",
+            },
+        )
+    )
+    parent_record = _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-parallel-ref",
+    )
+    route_token_ref = "rtok-mf-parallel-observer-ref"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "actor": "operator",
+                "actor_role": "mf_sub",
+                "reason": "Human approved parallel worker repair with observer ref.",
+                "backlog_id": backlog_id,
+                "task_id": "parallel-observer-ref-task",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "worker_fence": {
+                    "fence_token": "fence-parallel-observer-ref",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert result["event"]["payload"]["derived_actor_role"] == "observer"
+    assert result["event"]["payload"]["body_role_claim_ignored"] == "mf_sub"
+    assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
 
 
 def test_mf_parallel_enter_blocks_incomplete_onboard_root(conn):

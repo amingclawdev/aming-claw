@@ -15,7 +15,10 @@ from agent.governance.contracts import (
     ContractDefinitionRegistry,
     ContractRuntime,
 )
-from agent.governance.contracts.runtime import ContractRuntimeError
+from agent.governance.contracts.runtime import (
+    ContractRuntimeError,
+    StalePinnedContractExecutionError,
+)
 
 
 _SYSTEM_LAYER_POLICY_NAMES = [
@@ -271,6 +274,72 @@ def test_crud_service_preserves_registry_lifecycle_rules(tmp_path: Path):
         "status": "draft",
     }
     assert not Path(draft["data"]["path"]).exists()
+
+
+def test_registry_resolves_latest_active_revision_and_runtime_pins_source_hash(
+    tmp_path: Path,
+):
+    service = ContractCrudService(tmp_path)
+    created = service.create(_definition())
+    rev1_hash = created["data"]["definition"]["definition_hash"]
+
+    rev2 = service.update(
+        _definition(
+            revision="rev2",
+            metadata={"revision_reason": "add legal successor graph edge"},
+        ),
+        expected_previous_hash=None,
+    )
+    assert rev2["ok"] is True
+
+    latest = service.read("observer_hotfix_direct_mutation.v1")
+    assert latest["ok"] is True
+    assert latest["data"]["definition"]["revision"] == "rev2"
+
+    explicit_rev1 = service.read(
+        "observer_hotfix_direct_mutation.v1",
+        revision="rev1",
+    )
+    assert explicit_rev1["ok"] is True
+    assert explicit_rev1["data"]["definition"]["definition_hash"] == rev1_hash
+
+    runtime = ContractRuntime(service.registry)
+    old_record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-UPDATE-SOURCE-HASH",
+        contract_execution_id="cex-observer-hotfix-rev1-pinned",
+        actor_role="observer",
+        revision="rev1",
+        route_token_ref="rtok-source-hash",
+    )
+    assert old_record["revision"] == "rev1"
+    assert old_record["definition_hash"] == rev1_hash
+    assert old_record["definition_source_sha256"].startswith("sha256:")
+
+    latest_record = runtime.start_execution(
+        "observer_hotfix_direct_mutation.v1",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-UPDATE-LATEST-REVISION",
+        contract_execution_id="cex-observer-hotfix-latest-revision",
+        actor_role="observer",
+        route_token_ref="rtok-latest-revision",
+    )
+    assert latest_record["revision"] == "rev2"
+    assert latest_record["definition_source_sha256"].startswith("sha256:")
+
+    source_path = Path(explicit_rev1["data"]["definition"]["_source_path"])
+    source_path.write_text(
+        source_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StalePinnedContractExecutionError) as exc:
+        runtime.current_guide(
+            "cex-observer-hotfix-rev1-pinned",
+            actor_role="observer",
+        )
+    assert exc.value.field == "definition_source_sha256"
 
 
 def test_crud_service_returns_structured_failure_results(tmp_path: Path):
@@ -783,6 +852,188 @@ def test_default_registry_exposes_contract_add_definition_and_runtime_path():
     assert record["runtime_guide"]["next_legal_action"] is None
 
 
+def test_default_registry_exposes_contract_update_definition_and_runtime_path():
+    service = ContractCrudService()
+
+    result = service.read("contract_update.v1")
+    assert result["ok"] is True
+    definition = result["data"]["definition"]
+    assert definition["contract_id"] == "contract_update"
+    assert definition["role"] == "observer"
+    assert definition["contract_type"] == "contract_update"
+    assert definition["compat_aliases"] == ["contract_update.v1", "update_contract.v1"]
+
+    read_model = definition["read_model"]
+    _assert_explicit_system_layer(definition, allow_root_start=False)
+    assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
+    assert [
+        (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
+        for line in read_model["rule_lines"]
+    ] == [
+        (
+            "observer_request",
+            "observer_request_contract_update",
+            "observer",
+            "contract_update_request",
+        ),
+        (
+            "worker_previous_source",
+            "worker_previous_source_proof",
+            "mf_sub",
+            "contract_previous_source_proof",
+        ),
+        (
+            "worker_precheck",
+            "worker_revision_precheck",
+            "mf_sub",
+            "contract_revision_precheck",
+        ),
+        (
+            "worker_source",
+            "worker_revision_source_proof",
+            "mf_sub",
+            "contract_revision_source_proof",
+        ),
+        (
+            "worker_runtime_visibility",
+            "worker_runtime_visibility_proof",
+            "mf_sub",
+            "contract_update_runtime_visibility",
+        ),
+        (
+            "worker_asset_binding",
+            "worker_asset_binding_proposal_or_waiver",
+            "mf_sub",
+            "asset_binding_proposal_or_waiver",
+        ),
+        ("qa", "qa_independent_verification", "qa", "independent_verification"),
+        (
+            "observer_accept",
+            "observer_accept_contract_update",
+            "observer",
+            "contract_update_accept",
+        ),
+        ("observer_accept", "observer_close_ready", "observer", "close_ready"),
+    ]
+    assert "same-revision active semantic mutation is invalid" in (
+        definition["instruction_layer"]["inline"][5]
+    )
+
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "contract_update",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-SYSTEM-CRUD-REGISTRY-MIN-PATH-20260623",
+        contract_execution_id="cex-contract-update-runtime-path-test",
+        actor_role="observer",
+        route_token_ref="rtok-contract-update-test",
+    )
+    assert record["definition_source_sha256"].startswith("sha256:")
+    assert record["runtime_guide"]["next_legal_action"] == {
+        "stage_id": "observer_request",
+        "line_id": "observer_request_contract_update",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "contract_update_request",
+        "required": True,
+    }
+
+    record = runtime.submit_line_write(
+        "cex-contract-update-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="observer_request",
+            line_id="observer_request_contract_update",
+        ),
+    )["record"]
+
+    rejected_observer_worker_evidence = runtime.submit_line_write(
+        "cex-contract-update-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="worker_previous_source",
+            line_id="worker_previous_source_proof",
+        ),
+    )
+    assert rejected_observer_worker_evidence["ok"] is False
+    assert "cannot write line" in rejected_observer_worker_evidence["decision"]["errors"][0]
+
+    for stage_id, line_id in [
+        ("worker_previous_source", "worker_previous_source_proof"),
+        ("worker_precheck", "worker_revision_precheck"),
+        ("worker_source", "worker_revision_source_proof"),
+        ("worker_runtime_visibility", "worker_runtime_visibility_proof"),
+        ("worker_asset_binding", "worker_asset_binding_proposal_or_waiver"),
+    ]:
+        runtime.current_guide(
+            "cex-contract-update-runtime-path-test",
+            actor_role="mf_sub",
+        )
+        record = runtime.store.get("cex-contract-update-runtime-path-test")
+        accepted = runtime.submit_line_write(
+            "cex-contract-update-runtime-path-test",
+            _runtime_write_from(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    runtime.current_guide("cex-contract-update-runtime-path-test", actor_role="observer")
+    record = runtime.store.get("cex-contract-update-runtime-path-test")
+    rejected_observer_qa_evidence = runtime.submit_line_write(
+        "cex-contract-update-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )
+    assert rejected_observer_qa_evidence["ok"] is False
+    assert "cannot write line" in rejected_observer_qa_evidence["decision"]["errors"][0]
+
+    runtime.current_guide("cex-contract-update-runtime-path-test", actor_role="qa")
+    record = runtime.store.get("cex-contract-update-runtime-path-test")
+    record = runtime.submit_line_write(
+        "cex-contract-update-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="qa",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )["record"]
+
+    for stage_id, line_id in [
+        ("observer_accept", "observer_accept_contract_update"),
+        ("observer_accept", "observer_close_ready"),
+    ]:
+        runtime.current_guide(
+            "cex-contract-update-runtime-path-test",
+            actor_role="observer",
+        )
+        record = runtime.store.get("cex-contract-update-runtime-path-test")
+        accepted = runtime.submit_line_write(
+            "cex-contract-update-runtime-path-test",
+            _runtime_write_from(
+                record,
+                actor_role="observer",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    assert record["runtime_guide"]["next_legal_action"] is None
+
+
 def test_contract_add_worker_asset_binding_payload_is_visible_to_qa():
     service = ContractCrudService()
     runtime = ContractRuntime(service.registry)
@@ -1000,9 +1251,27 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
     assert onboarding["ok"] is True
     onboard_definition = onboarding["data"]["definition"]
     assert onboard_definition["contract_id"] == "onboard_contract"
+    assert onboard_definition["revision"] == "rev2"
     assert onboard_definition["contract_type"] == "observer_onboarding"
     _assert_explicit_system_layer(onboard_definition, allow_root_start=True)
     assert onboard_definition["successors"] == [
+        {
+            "contract_id": "observer_hotfix",
+            "reason": "Successor hotfix execution after observer onboarding is complete.",
+            "version": "v1",
+        },
+        {
+            "contract_id": "mf_parallel",
+            "reason": (
+                "Observer-owned parallel worker orchestration successor after "
+                "observer onboarding is complete."
+            ),
+            "version": "v1",
+        }
+    ]
+    explicit_rev1 = service.read("onboard_contract.v1", revision="rev1")
+    assert explicit_rev1["ok"] is True
+    assert explicit_rev1["data"]["definition"]["successors"] == [
         {
             "contract_id": "observer_hotfix",
             "reason": "Successor hotfix execution after observer onboarding is complete.",
@@ -1064,6 +1333,8 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
     assert onboard_record["runtime_guide"]["next_legal_action"]["line_id"] == (
         "graph_query_schema_trace"
     )
+    assert onboard_record["revision"] == "rev2"
+    assert onboard_record["definition_source_sha256"].startswith("sha256:")
 
     hotfix = service.read("observer_hotfix_direct_mutation.v1")
     assert hotfix["ok"] is True

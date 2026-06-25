@@ -1,0 +1,215 @@
+{
+  "compat_aliases": [
+    "onboard_contract.v1",
+    "observer_onboarding.v1"
+  ],
+  "contract_id": "onboard_contract",
+  "contract_type": "observer_onboarding",
+  "instruction_layer": {
+    "inline": [
+      "The compiled ContractRuntime guide is the source of the observer-facing next legal action.",
+      "Preserve the legacy onboarding evidence order exactly: graph query schema trace, related backlog review, observer root route context read, contract state projection read, route context, route action precheck, and observer work-mode transition.",
+      "Legacy task_timeline and meta_contract_gate projections are audit/backstop only and must not decide the agent-facing next action for this source-backed runtime execution.",
+      "When onboarding completes, bind successor contracts under this root execution instead of rebinding the root.",
+      "mf_parallel is an observer-owned orchestration successor only; worker lanes are mf_sub bound child evidence and QA remains independent verification."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "legacy_template_id": "onboard_contract.v1",
+    "previous_revision": "rev1",
+    "revision_reason": "Add mf_parallel as a legal observer successor after completed onboarding.",
+    "runtime_cutover": true,
+    "updated_by_contract": "contract_update.v1"
+  },
+  "revision": "rev2",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer gathers graph-first runtime context.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Audited query_schema trace for the observer onboarding route.",
+            "evidence_kind": "graph_query_schema_trace",
+            "line_id": "graph_query_schema_trace",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "graph_context"
+      },
+      {
+        "description": "Observer reviews the related backlog row before mutation.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read the related backlog row and owned scope before any successor or mutation.",
+            "evidence_kind": "related_backlog_review",
+            "line_id": "related_backlog_review",
+            "owner_role": "observer",
+            "requires": [
+              "graph_query_schema_trace"
+            ]
+          }
+        ],
+        "stage_id": "backlog_review"
+      },
+      {
+        "description": "Observer reads route/current-state projections.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read observer root route context for the canonical route identity.",
+            "evidence_kind": "observer_root_route_context_read",
+            "line_id": "observer_root_route_context_read",
+            "owner_role": "observer",
+            "requires": [
+              "related_backlog_review"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Read the contract state projection before route action.",
+            "evidence_kind": "contract_state_projection_read",
+            "line_id": "contract_state_projection_read",
+            "owner_role": "observer",
+            "requires": [
+              "observer_root_route_context_read"
+            ]
+          }
+        ],
+        "stage_id": "runtime_state"
+      },
+      {
+        "description": "Observer binds canonical route action evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record canonical route_context evidence for the observer route.",
+            "evidence_kind": "route_context",
+            "line_id": "route_context",
+            "owner_role": "observer",
+            "requires": [
+              "contract_state_projection_read"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record route_action_precheck evidence for the next observer action.",
+            "evidence_kind": "route_action_precheck",
+            "line_id": "route_action_precheck",
+            "owner_role": "observer",
+            "requires": [
+              "route_context"
+            ]
+          }
+        ],
+        "stage_id": "route_binding"
+      },
+      {
+        "description": "Observer moves into execution-supervisor mode after route action is bound.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record observer_work_mode_transition after route_context and route_action_precheck.",
+            "evidence_kind": "observer_work_mode_transition",
+            "line_id": "observer_work_mode_transition",
+            "owner_role": "observer",
+            "requires": [
+              "route_action_precheck"
+            ]
+          }
+        ],
+        "stage_id": "work_mode"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": true,
+      "allowed_entrypoints": [
+        "onboard_contract"
+      ],
+      "root_start_default": "deny_except_explicit_onboarding_root"
+    },
+    "successor_policy": {
+      "allow_successor_start": false,
+      "allowed_parent_contracts": [],
+      "allowed_successors": [
+        {
+          "contract_id": "observer_hotfix",
+          "version": "v1"
+        },
+        {
+          "contract_id": "mf_parallel",
+          "version": "v1"
+        }
+      ],
+      "requires_contract_chain_id": true,
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "mutable_completed_lines_trust_root": false,
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state"
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "formatting_only_drift_must_remain_visible": true,
+      "independent_review_required": true,
+      "same_revision_semantic_change_allowed": false,
+      "semantic_change_requires_new_revision": true
+    },
+    "graph_binding_policy": {
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true,
+      "source_asset_materialization_required": true
+    }
+  },
+  "successors": [
+    {
+      "contract_id": "observer_hotfix",
+      "reason": "Successor hotfix execution after observer onboarding is complete.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "mf_parallel",
+      "reason": "Observer-owned parallel worker orchestration successor after observer onboarding is complete.",
+      "version": "v1"
+    }
+  ],
+  "version": "v1"
+}
