@@ -303,3 +303,102 @@ def test_compatibility_entrypoints_export_existing_implementation():
     assert CompatCache is LLMCache
     assert CompatClusterReport is ClusterReport
     assert compat_process is process_cluster_with_ai
+
+
+def test_symbol_cluster_candidate_scan_observability_reports_parallel_evidence():
+    from agent.governance.symbol_cluster_processor import (
+        summarize_candidate_scanning_observability,
+    )
+
+    summary = summarize_candidate_scanning_observability({
+        "run_id": "phase-run-1",
+        "steps": [
+            {
+                "name": "ast_candidate_scanning",
+                "elapsed_ms": "12",
+                "metrics": {
+                    "parallel": "true",
+                    "worker_count": "4",
+                    "module_count": "3",
+                    "function_count": "8",
+                    "candidate_count": "5",
+                },
+            },
+            {
+                "name": "dfs_coloring",
+                "elapsed_ms": 7,
+                "metrics": {
+                    "workers": 1,
+                    "colored_function_count": 6,
+                    "entry_count": 2,
+                },
+            },
+        ],
+    })
+
+    assert summary["schema_version"] == "symbol_cluster.candidate_scanning_observability.v1"
+    assert summary["phase_trace_run_id"] == "phase-run-1"
+    assert summary["phase_step_count"] == 2
+    assert summary["any_parallelized"] is True
+    assert summary["ast_candidate_scanning"] == {
+        "scan_kind": "ast_candidate_scan",
+        "step_name": "ast_candidate_scanning",
+        "elapsed_ms": 12,
+        "parallelized": True,
+        "parallel_evidence": "parallel",
+        "worker_count": 4,
+        "module_count": 3,
+        "function_count": 8,
+        "entry_count": 0,
+        "colored_function_count": 0,
+        "candidate_count": 5,
+    }
+    assert summary["dfs_candidate_scanning"]["parallelized"] is False
+    assert summary["dfs_candidate_scanning"]["parallel_evidence"] == "not_reported"
+    assert summary["dfs_candidate_scanning"]["worker_count"] == 1
+    assert summary["dfs_candidate_scanning"]["candidate_count"] == 0
+
+
+def test_symbol_cluster_candidate_scan_observability_marks_missing_steps():
+    from agent.governance.symbol_cluster_processor import (
+        summarize_candidate_scanning_observability,
+    )
+
+    summary = summarize_candidate_scanning_observability({"steps": [{"name": "other"}]})
+
+    assert summary["phase_step_count"] == 1
+    assert summary["any_parallelized"] is False
+    assert summary["ast_candidate_scanning"]["parallel_evidence"] == "missing_phase_step"
+    assert summary["dfs_candidate_scanning"]["parallel_evidence"] == "missing_phase_step"
+
+
+def test_symbol_cluster_candidate_scan_observability_uses_worker_count_evidence():
+    from agent.governance.symbol_cluster_processor import (
+        summarize_candidate_scanning_observability,
+    )
+
+    summary = summarize_candidate_scanning_observability({
+        "steps": [
+            {
+                "name": "dfs_candidate_scanning",
+                "metrics": {"workers": "2", "entry_count": "3"},
+            },
+        ],
+    })
+
+    assert summary["any_parallelized"] is True
+    assert summary["dfs_candidate_scanning"]["parallelized"] is True
+    assert summary["dfs_candidate_scanning"]["parallel_evidence"] == "workers"
+    assert summary["dfs_candidate_scanning"]["worker_count"] == 2
+
+
+def test_symbol_cluster_candidate_scan_observability_ignores_non_mapping_trace():
+    from agent.governance.symbol_cluster_processor import (
+        summarize_candidate_scanning_observability,
+    )
+
+    summary = summarize_candidate_scanning_observability(["not", "a", "mapping"])
+
+    assert summary["phase_trace_run_id"] == ""
+    assert summary["phase_step_count"] == 0
+    assert summary["any_parallelized"] is False
