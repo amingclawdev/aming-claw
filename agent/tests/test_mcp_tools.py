@@ -1022,6 +1022,69 @@ def test_mcp_graph_query_schema_exposes_mf_sub_runtime_identity_fields():
         assert key in properties
 
 
+def test_mcp_contract_runtime_generic_tools_route_to_facade():
+    names = _tool_names()
+    assert {
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_submit_line",
+    }.issubset(names)
+    submit_properties = _tool_properties("contract_runtime_submit_line")
+    assert "execution_state_revision" in submit_properties
+    assert "runtime_guide_hash" in submit_properties
+
+    recorder = _Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        manager_api_fn=recorder.api,
+        workspace="/repo",
+    )
+
+    dispatcher.dispatch(
+        "contract_runtime_current",
+        {"project_id": "aming-claw", "contract_execution_id": "cex-onboard"},
+    )
+    dispatcher.dispatch(
+        "contract_runtime_guide",
+        {"project_id": "aming-claw", "contract_execution_id": "cex-onboard"},
+    )
+    dispatcher.dispatch(
+        "contract_runtime_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "execution_state_revision": 1,
+            "stage_id": "graph_context",
+            "line_id": "graph_query_schema_trace",
+            "evidence_kind": "graph_query_schema_trace",
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state",
+            None,
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/line-writes",
+            {
+                "execution_state_revision": 1,
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+            },
+        ),
+    ]
+
+
 def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     allocate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_allocate")
     startup = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_startup")

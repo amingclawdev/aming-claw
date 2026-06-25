@@ -1025,6 +1025,9 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "contract_add_start",
         "contract_add_current",
         "contract_add_submit_line",
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_submit_line",
     }.issubset(tool_by_name)
     assert "contract_add_create" not in tool_by_name
     assert "contract_definition_create" not in tool_by_name
@@ -1033,6 +1036,13 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "project_id",
         "contract_execution_id",
     ]
+    assert tool_by_name["contract_runtime_submit_line"]["inputSchema"]["required"] == [
+        "project_id",
+        "contract_execution_id",
+    ]
+    assert "execution_state_revision" in tool_by_name["contract_runtime_submit_line"][
+        "inputSchema"
+    ]["properties"]
 
 
 def test_mcp_contract_add_dispatches_to_guided_http_facade():
@@ -1074,6 +1084,31 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade():
             "evidence_kind": "contract_draft_precheck",
         },
     )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_runtime_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_runtime_guide",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
+        "contract_runtime_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "execution_state_revision": 1,
+            "stage_id": "graph_context",
+            "line_id": "graph_query_schema_trace",
+            "evidence_kind": "graph_query_schema_trace",
+        },
+    )["ok"] is True
 
     assert calls == [
         (
@@ -1096,6 +1131,26 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade():
                 "stage_id": "worker_precheck",
                 "line_id": "worker_draft_precheck",
                 "evidence_kind": "contract_draft_precheck",
+            },
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state",
+            None,
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/line-writes",
+            {
+                "execution_state_revision": 1,
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
             },
         ),
     ]

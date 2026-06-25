@@ -575,6 +575,51 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "contract_runtime_current",
+        "description": "Read a source-backed ContractRuntime execution current-state through the generic facade.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
+        "name": "contract_runtime_guide",
+        "description": "Read a source-backed ContractRuntime execution guide through the generic facade.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
+        "name": "contract_runtime_submit_line",
+        "description": "Submit one role-bound generic ContractRuntime evidence line via ContractRuntime.submit_line_write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "execution_state_revision": {"type": "integer"},
+                "runtime_guide_hash": {"type": "string"},
+                "stage_id": {"type": "string"},
+                "line_id": {"type": "string"},
+                "evidence_kind": {"type": "string"},
+                "payload": {"type": "object"},
+                "artifact_refs": {"type": "object"},
+                "trace_id": {"type": "string"},
+                "commit_sha": {"type": "string"},
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
         "name": "runtime_context_current",
         "description": "Read the Runtime Context Service current-state projection. mf_sub callers receive only the role-filtered worker view.",
         "inputSchema": {
@@ -994,6 +1039,29 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         return _http(
             "POST",
             f"/api/projects/{pid}/contract-add/{execution_id}/line-writes",
+            body,
+        )
+
+    if name in {"contract_runtime_current", "contract_runtime_guide"}:
+        pid = args["project_id"]
+        execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        suffix = "guide" if name == "contract_runtime_guide" else "current-state"
+        return _http(
+            "GET",
+            f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}",
+        )
+
+    if name == "contract_runtime_submit_line":
+        pid = args["project_id"]
+        execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        body = {
+            key: value
+            for key, value in args.items()
+            if key not in {"project_id", "contract_execution_id"} and value is not None
+        }
+        return _http(
+            "POST",
+            f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
             body,
         )
 

@@ -22484,6 +22484,171 @@ def test_contract_add_facade_rejects_non_contract_add_execution_on_enter_and_rea
         )
 
 
+def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-GENERIC-ONBOARD"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    record = runtime.start_execution(
+        "onboard_contract",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-generic-onboard",
+        route_token_ref="rtok-generic-onboard",
+    )
+    conn.commit()
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": record["contract_execution_id"]},
+            "observer",
+            method="GET",
+        )
+    )
+    assert current["contract_id"] == "onboard_contract"
+    assert current["next_legal_action"]["id"] == "graph_query_schema_trace"
+
+    accepted = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": record["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+                "payload": {"trace_id": "gqt-generic-onboard"},
+            },
+        )
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["schema_version"] == "contract_runtime.runtime_facade_response.v1"
+    assert accepted["actor_role"] == "observer"
+    assert accepted["next_legal_action"]["id"] == "related_backlog_review"
+    assert accepted["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+
+
+def test_contract_runtime_generic_facade_preserves_role_and_order_gates(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-GENERIC-GATES"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    contract_add = runtime.start_execution(
+        "contract_add",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-generic-contract-add",
+    )
+    hotfix = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-generic-hotfix",
+    )
+    conn.commit()
+
+    wrong_order = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_add["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "worker_precheck",
+                "line_id": "worker_draft_precheck",
+                "evidence_kind": "contract_draft_precheck",
+            },
+        )
+    )
+    assert wrong_order["ok"] is False
+    assert "cannot write line" in wrong_order["decision"]["errors"][0]
+    assert any(
+        "write does not match next legal action" in error
+        for error in wrong_order["decision"]["errors"]
+    )
+
+    stale = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_add["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "execution_state_revision": 999,
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_add",
+                "evidence_kind": "contract_add_request",
+            },
+        )
+    )
+    assert stale["ok"] is False
+    assert "execution_state_revision mismatch" in stale["decision"]["errors"]
+
+    accepted_observer = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_add["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_add",
+                "evidence_kind": "contract_add_request",
+            },
+        )
+    )
+    assert accepted_observer["ok"] is True
+
+    forged_worker = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_add["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "worker_precheck",
+                "line_id": "worker_draft_precheck",
+                "evidence_kind": "contract_draft_precheck",
+            },
+        )
+    )
+    assert forged_worker["ok"] is False
+    assert "cannot write line" in forged_worker["decision"]["errors"][0]
+
+    for stage_id, line_id, evidence_kind in (
+        ("pre_mutation", "hotfix_pre_reason", "hotfix_entered"),
+        ("mutation", "hotfix_post_action_summary", "hotfix_under_action"),
+    ):
+        result = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                },
+            )
+        )
+        assert result["ok"] is True
+
+    forged_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+            },
+        )
+    )
+    assert forged_qa["ok"] is False
+    assert "cannot write line" in forged_qa["decision"]["errors"][0]
+
+
 def test_observer_root_route_context_contract_first_for_no_contract_row(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-CONTRACT-FIRST"
     _insert_simple_mf_close_backlog(conn, backlog_id)

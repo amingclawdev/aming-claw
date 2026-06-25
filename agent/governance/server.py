@@ -33167,6 +33167,76 @@ def _contract_runtime_write_from_record(
     }
 
 
+def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    current_state = _runtime_current_state_from_record(record)
+    return {
+        "schema_version": "contract_runtime.runtime_facade_response.v1",
+        "ok": True,
+        "project_id": str(record.get("project_id") or ""),
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "contract_id": str(record.get("contract_id") or ""),
+        "contract_runtime_current_state": current_state,
+        "runtime_guide": guide,
+        "next_legal_action": _runtime_next_action_from_guide(guide),
+        "route_token_ref": str(record.get("route_token_ref") or ""),
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+    }
+
+
+def _contract_runtime_read(
+    conn,
+    *,
+    contract_execution_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    runtime.current_guide(contract_execution_id, actor_role=actor_role)
+    record = runtime.store.get(contract_execution_id)
+    return record
+
+
+def _contract_runtime_effective_actor_role(ctx: RequestContext, conn) -> str:
+    session = ctx.require_auth(conn)
+    return str(session.get("role") or "").strip()
+
+
+def _contract_runtime_line_write_body(
+    record: Mapping[str, Any],
+    body: Mapping[str, Any],
+    *,
+    actor_role: str,
+) -> dict[str, Any]:
+    next_line = (
+        record.get("runtime_guide", {}).get("next_legal_action")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    write = _contract_runtime_write_from_record(
+        record,
+        actor_role=actor_role,
+        stage_id=str(body.get("stage_id") or (next_line or {}).get("stage_id") or ""),
+        line_id=str(body.get("line_id") or (next_line or {}).get("line_id") or ""),
+        evidence_kind=str(
+            body.get("evidence_kind")
+            or (next_line or {}).get("evidence_kind")
+            or ""
+        ),
+    )
+    for key in (
+        "execution_state_revision",
+        "runtime_guide_hash",
+        "payload",
+        "artifact_refs",
+        "trace_id",
+        "commit_sha",
+    ):
+        if key in body:
+            write[key] = body[key]
+    return write
+
+
 CONTRACT_ADD_CONTRACT_ID = "contract_add"
 
 
@@ -40505,25 +40575,11 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
         )
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
-        next_line = (
-            record.get("runtime_guide", {}).get("next_legal_action")
-            if isinstance(record.get("runtime_guide"), Mapping)
-            else {}
-        )
-        write = _contract_runtime_write_from_record(
+        write = _contract_runtime_line_write_body(
             record,
             actor_role=actor_role,
-            stage_id=str(body.get("stage_id") or (next_line or {}).get("stage_id") or ""),
-            line_id=str(body.get("line_id") or (next_line or {}).get("line_id") or ""),
-            evidence_kind=str(
-                body.get("evidence_kind")
-                or (next_line or {}).get("evidence_kind")
-                or ""
-            ),
+            body=body,
         )
-        for key in ("payload", "artifact_refs", "trace_id", "commit_sha"):
-            if key in body:
-                write[key] = body[key]
         result = runtime.submit_line_write(
             contract_execution_id,
             write,
@@ -40541,6 +40597,68 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
     }
     if isinstance(result.get("record"), Mapping):
         response.update(_contract_add_response(result["record"]))
+        response["ok"] = bool(result.get("ok"))
+        response["decision"] = result.get("decision") or {}
+        response["actor_role"] = actor_role
+    return response
+
+
+@route("GET", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/current-state")
+@route("GET", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/guide")
+def handle_project_contract_runtime_current_state(ctx: RequestContext):
+    """Read a source-backed ContractRuntime execution through the generic facade."""
+    project_id = ctx.get_project_id()
+    contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        raise ValidationError("contract_execution_id is required")
+    with DBContext(project_id) as conn:
+        actor_role = _contract_runtime_effective_actor_role(ctx, conn)
+        record = _contract_runtime_read(
+            conn,
+            contract_execution_id=contract_execution_id,
+            actor_role=actor_role,
+        )
+        conn.commit()
+    response = _contract_runtime_response(record)
+    response["actor_role"] = actor_role
+    return response
+
+
+@route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-writes")
+def handle_project_contract_runtime_line_write(ctx: RequestContext):
+    """Submit one role-bound source-backed ContractRuntime line write."""
+    project_id = ctx.get_project_id()
+    contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        raise ValidationError("contract_execution_id is required")
+    body = dict(ctx.body or {})
+    with DBContext(project_id) as conn:
+        actor_role = _contract_runtime_effective_actor_role(ctx, conn)
+        runtime = _contract_runtime(conn)
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+        write = _contract_runtime_line_write_body(
+            record,
+            actor_role=actor_role,
+            body=body,
+        )
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        conn.commit()
+    response = {
+        "schema_version": "contract_runtime.line_write_response.v1",
+        "ok": bool(result.get("ok")),
+        "project_id": project_id,
+        "contract_execution_id": contract_execution_id,
+        "actor_role": actor_role,
+        "decision": result.get("decision") or {},
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+    }
+    if isinstance(result.get("record"), Mapping):
+        response.update(_contract_runtime_response(result["record"]))
         response["ok"] = bool(result.get("ok"))
         response["decision"] = result.get("decision") or {}
         response["actor_role"] = actor_role
