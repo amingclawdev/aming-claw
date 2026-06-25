@@ -34800,6 +34800,374 @@ def _legacy_contract_route_gate(body: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION = (
+    "contract_runtime_close_evidence_gate.v1"
+)
+
+_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS = (
+    "contract_execution_id",
+    "successor_contract_execution_id",
+    "active_contract_execution_id",
+)
+
+_CONTRACT_RUNTIME_CONTAINER_KEYS = (
+    "artifact_refs",
+    "contract_runtime",
+    "contract_runtime_current_state",
+    "current_state",
+    "payload",
+    "selected_successor_contract",
+    "successor_contract",
+    "successor_contract_binding",
+    "verification",
+)
+
+_CONTRACT_RUNTIME_CLOSE_EVENT_KIND_TOKENS = {
+    "close_ready",
+    "hotfix_under_action",
+    "implementation",
+    "independent_verification",
+    "qa_verification",
+    "verification",
+}
+
+
+def _contract_runtime_close_mapping_containers(
+    *values: Any,
+) -> list[Mapping[str, Any]]:
+    containers: list[Mapping[str, Any]] = []
+    queue = [value for value in values if isinstance(value, Mapping)]
+    seen: set[int] = set()
+    while queue and len(containers) < 200:
+        value = queue.pop(0)
+        marker = id(value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        containers.append(value)
+        for key, child in value.items():
+            if isinstance(child, Mapping) and key in _CONTRACT_RUNTIME_CONTAINER_KEYS:
+                queue.append(child)
+        for key in _CONTRACT_RUNTIME_CONTAINER_KEYS:
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                queue.append(child)
+    return containers
+
+
+def _contract_runtime_close_execution_id(body: Mapping[str, Any]) -> str:
+    for container in _contract_runtime_close_mapping_containers(body):
+        for key in _CONTRACT_RUNTIME_EXECUTION_ID_FIELDS:
+            token = str(container.get(key) or "").strip()
+            if token and token.startswith("cex-"):
+                return token
+    return ""
+
+
+def _contract_runtime_close_event_kind_supported(event_kind: str) -> bool:
+    return (
+        _contract_runtime_close_normalized(event_kind)
+        in _CONTRACT_RUNTIME_CLOSE_EVENT_KIND_TOKENS
+    )
+
+
+def _contract_runtime_close_actor_role(body: Mapping[str, Any]) -> str:
+    actor = str(body.get("actor") or "").strip().lower()
+    actor_token = actor.replace("-", "_").replace(".", "_")
+    if actor == "observer" or actor.startswith(("observer:", "observer.", "observer-")):
+        return "observer"
+    if actor == "qa" or actor.startswith(("qa:", "qa.", "qa-", "qa_")):
+        return "qa"
+    if actor_token.startswith(("mf_sub", "mfsub", "worker")):
+        return "mf_sub"
+
+    containers = _contract_runtime_close_mapping_containers(body)
+    for key in ("worker_role", "lane_role"):
+        for container in containers:
+            role = str(container.get(key) or "").strip().lower()
+            if role in {"mf_sub", "mfsub", "worker"}:
+                return "mf_sub"
+            if role in {"qa", "independent_qa", "qa_verifier"}:
+                return "qa"
+    return actor_token if actor_token in {"observer", "qa", "mf_sub"} else ""
+
+
+def _contract_runtime_close_explicit_line(
+    body: Mapping[str, Any],
+) -> dict[str, str]:
+    for container in _contract_runtime_close_mapping_containers(body):
+        line = container.get("contract_runtime_line")
+        if isinstance(line, Mapping):
+            return {
+                "stage_id": str(line.get("stage_id") or "").strip(),
+                "line_id": str(line.get("line_id") or "").strip(),
+                "evidence_kind": str(line.get("evidence_kind") or "").strip(),
+            }
+    stage_id = str(body.get("stage_id") or "").strip()
+    line_id = str(body.get("line_id") or "").strip()
+    evidence_kind = str(body.get("evidence_kind") or "").strip()
+    if stage_id or line_id or evidence_kind:
+        return {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "evidence_kind": evidence_kind,
+        }
+    return {}
+
+
+def _contract_runtime_close_normalized(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _observer_hotfix_line_for_event(event_kind: str) -> dict[str, str]:
+    token = _contract_runtime_close_normalized(event_kind)
+    if token in {
+        "hotfix_under_action",
+        "hotfix_post_action_summary",
+        "implementation",
+        "under_hotfix",
+    }:
+        return {
+            "stage_id": "mutation",
+            "line_id": "hotfix_post_action_summary",
+            "evidence_kind": "hotfix_under_action",
+        }
+    if token in {"independent_verification", "qa_verification", "verification"}:
+        return {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+        }
+    if token == "close_ready":
+        return {
+            "stage_id": "observer_close",
+            "line_id": "observer_close_ready",
+            "evidence_kind": "close_ready",
+        }
+    return {}
+
+
+def _contract_runtime_close_line_for_event(
+    record: Mapping[str, Any],
+    *,
+    event_kind: str,
+    body: Mapping[str, Any],
+) -> dict[str, str]:
+    explicit = _contract_runtime_close_explicit_line(body)
+    if explicit:
+        return explicit
+    contract_id = str(record.get("contract_id") or "").strip()
+    if contract_id == "observer_hotfix":
+        mapped = _observer_hotfix_line_for_event(event_kind)
+        if mapped:
+            return mapped
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    next_line = guide.get("next_legal_action") if isinstance(guide.get("next_legal_action"), Mapping) else {}
+    if not next_line:
+        return {}
+    next_evidence_kind = _contract_runtime_close_normalized(
+        next_line.get("evidence_kind")
+    )
+    event_token = _contract_runtime_close_normalized(event_kind)
+    compatible_tokens = {next_evidence_kind}
+    if next_evidence_kind == "hotfix_under_action":
+        compatible_tokens.add("implementation")
+    if next_evidence_kind == "independent_verification":
+        compatible_tokens.update({"qa_verification", "verification"})
+    if event_token in compatible_tokens:
+        return {
+            "stage_id": str(next_line.get("stage_id") or ""),
+            "line_id": str(next_line.get("line_id") or ""),
+            "evidence_kind": str(next_line.get("evidence_kind") or ""),
+        }
+    return {}
+
+
+def _contract_runtime_close_contains_truthy_key(
+    value: Any,
+    keys: set[str],
+) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if str(key) in keys and _truthy_flag(child):
+                return True
+            if _contract_runtime_close_contains_truthy_key(child, keys):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _contract_runtime_close_contains_truthy_key(item, keys)
+            for item in value
+        )
+    return False
+
+
+def _contract_runtime_close_meta_error_is_hard(
+    error_message: str,
+    event_payload: Mapping[str, Any],
+) -> bool:
+    message = error_message.lower()
+    if _contract_runtime_close_contains_truthy_key(
+        event_payload,
+        {"self_attesting", "worker_self_attesting"},
+    ):
+        return True
+    hard_markers = (
+        "self_attesting",
+        "surrogate_startup",
+        "forbidden_always rejected flag",
+        "forbidden_always rejected action",
+        "unknown timeline action",
+        "observer_work_mode_transition missing",
+    )
+    if "author_worker_evidence" in message and "requires on_behalf_of" in message:
+        return False
+    return any(marker in message for marker in hard_markers)
+
+
+def _contract_runtime_close_meta_compat_gate(
+    *,
+    error_message: str,
+    event_kind: str,
+    actor: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "meta_contract_timeline_gate.v1",
+        "allowed": False,
+        "status": "compatibility_rejected",
+        "compatibility_only": True,
+        "primary_decision_source": False,
+        "contract_runtime_primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+        "error": error_message,
+        "code": "meta_contract_whitelist_rejected",
+        "event_kind": event_kind,
+        "actor": actor,
+    }
+
+
+def _contract_runtime_close_audit_meta_gate(
+    meta_contract_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        **dict(meta_contract_gate),
+        "compatibility_only": True,
+        "primary_decision_source": False,
+        "decision_source": "legacy_meta_contract_audit_only",
+        "contract_runtime_primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _contract_runtime_close_gate(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    event_kind: str,
+    norm_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    contract_execution_id = _contract_runtime_close_execution_id(body)
+    if not contract_execution_id:
+        return {}
+    actor_role = _contract_runtime_close_actor_role(body)
+    if not actor_role:
+        raise GovernanceError(
+            "contract_runtime_close_evidence_rejected",
+            "ContractRuntime close evidence requires a role-bound actor",
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+                "accepted": False,
+                "contract_execution_id": contract_execution_id,
+                "error": "actor_role_unresolved",
+            },
+        )
+    runtime = _contract_runtime(conn)
+    try:
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_runtime_close_evidence_rejected",
+            str(exc),
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+                "accepted": False,
+                "contract_execution_id": contract_execution_id,
+                "actor_role": actor_role,
+                "error": str(exc),
+            },
+        ) from exc
+    line = _contract_runtime_close_line_for_event(
+        record,
+        event_kind=event_kind,
+        body=body,
+    )
+    if not line:
+        line = {"stage_id": "", "line_id": "", "evidence_kind": ""}
+    write = _contract_runtime_write_from_record(
+        record,
+        actor_role=actor_role,
+        stage_id=line["stage_id"],
+        line_id=line["line_id"],
+        evidence_kind=line["evidence_kind"],
+    )
+    write["payload"] = dict(norm_payload)
+    for key in ("artifact_refs", "verification", "trace_id", "commit_sha"):
+        if key in body:
+            write[key] = body[key]
+    result = runtime.submit_line_write(
+        contract_execution_id,
+        write,
+        actor_role=actor_role,
+    )
+    if not result.get("ok"):
+        raise GovernanceError(
+            "contract_runtime_close_evidence_rejected",
+            "ContractRuntime rejected protected close evidence line write",
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+                "accepted": False,
+                "primary_decision_source": True,
+                "agent_facing_decision_source": (
+                    "contract_runtime_first_missing_line"
+                ),
+                "contract_execution_id": contract_execution_id,
+                "actor_role": actor_role,
+                "requested_event_kind": event_kind,
+                "stage_id": line.get("stage_id", ""),
+                "line_id": line.get("line_id", ""),
+                "evidence_kind": line.get("evidence_kind", ""),
+                "decision": result.get("decision") or {},
+            },
+        )
+    updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
+    guide = updated.get("runtime_guide") if isinstance(updated.get("runtime_guide"), Mapping) else {}
+    current_state = _runtime_current_state_from_record(updated) if updated else {}
+    return {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+        "accepted": True,
+        "status": "passed",
+        "primary_decision_source": True,
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": contract_execution_id,
+        "contract_id": str(updated.get("contract_id") or record.get("contract_id") or ""),
+        "actor_role": actor_role,
+        "requested_event_kind": event_kind,
+        "stage_id": line.get("stage_id", ""),
+        "line_id": line.get("line_id", ""),
+        "evidence_kind": line.get("evidence_kind", ""),
+        "decision": result.get("decision") or {},
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+        "execution_state_revision": current_state.get("execution_state_revision", 0),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+    }
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
@@ -34894,6 +35262,11 @@ def handle_task_timeline_append(ctx: RequestContext):
         norm_payload = _strip_top_level_timeline_role_fields(norm_payload)
         validation_payload = dict(norm_payload)
         validation_payload.pop("meta_contract_gate", None)
+        contract_runtime_close_evidence_requested = bool(
+            _contract_runtime_close_execution_id(ctx.body or {})
+            and _contract_runtime_close_event_kind_supported(norm_event_kind)
+        )
+        meta_contract_error_message = ""
         try:
             meta_contract_gate = validate_meta_contract_timeline_event(
                 {
@@ -34910,22 +35283,65 @@ def handle_task_timeline_append(ctx: RequestContext):
                 }
             )
         except MfSubagentContractError as exc:
-            raise GovernanceError(
-                "meta_contract_whitelist_rejected",
-                str(exc),
-                422,
-                {
-                    "error": str(exc),
-                    "code": "meta_contract_whitelist_rejected",
-                    "event_type": ctx.body.get("event_type", ""),
-                    "event_kind": norm_event_kind,
-                    "actor": ctx.body.get("actor", ""),
-                },
+            meta_contract_error_message = str(exc)
+            if (
+                not contract_runtime_close_evidence_requested
+                or _contract_runtime_close_meta_error_is_hard(
+                    meta_contract_error_message,
+                    {
+                        "payload": validation_payload,
+                        "verification": ctx.body.get("verification") or {},
+                        "artifact_refs": ctx.body.get("artifact_refs") or {},
+                    },
+                )
+            ):
+                raise GovernanceError(
+                    "meta_contract_whitelist_rejected",
+                    str(exc),
+                    422,
+                    {
+                        "error": str(exc),
+                        "code": "meta_contract_whitelist_rejected",
+                        "event_type": ctx.body.get("event_type", ""),
+                        "event_kind": norm_event_kind,
+                        "actor": ctx.body.get("actor", ""),
+                    },
+                )
+            meta_contract_gate = _contract_runtime_close_meta_compat_gate(
+                error_message=meta_contract_error_message,
+                event_kind=norm_event_kind,
+                actor=str(ctx.body.get("actor") or ""),
             )
+        contract_runtime_close_evidence_gate = {}
+        if contract_runtime_close_evidence_requested:
+            contract_runtime_close_evidence_gate = _contract_runtime_close_gate(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+                event_kind=norm_event_kind,
+                norm_payload=validation_payload,
+            )
+            if meta_contract_error_message:
+                meta_contract_gate = {
+                    **meta_contract_gate,
+                    "contract_runtime_close_evidence_gate_status": "accepted",
+                }
+            else:
+                meta_contract_gate = _contract_runtime_close_audit_meta_gate(
+                    meta_contract_gate
+                )
         norm_payload = {
             **(norm_payload if isinstance(norm_payload, dict) else {}),
             "meta_contract_gate": meta_contract_gate,
         }
+        if contract_runtime_close_evidence_gate:
+            norm_payload["contract_runtime_close_evidence_gate"] = (
+                contract_runtime_close_evidence_gate
+            )
+            norm_payload["agent_facing_decision_source"] = (
+                "contract_runtime_first_missing_line"
+            )
+            norm_payload["meta_contract_gate_decision_source"] = False
         if route_gate:
             _record_route_token_gate_event(
                 conn,
@@ -34974,6 +35390,14 @@ def handle_task_timeline_append(ctx: RequestContext):
         if route_gate:
             result["route_token_gate"] = route_gate
         result["meta_contract_gate"] = meta_contract_gate
+        if contract_runtime_close_evidence_gate:
+            result["contract_runtime_close_evidence_gate"] = (
+                contract_runtime_close_evidence_gate
+            )
+            result["agent_facing_decision_source"] = (
+                "contract_runtime_first_missing_line"
+            )
+            result["meta_contract_gate_decision_source"] = False
         return result
 
 

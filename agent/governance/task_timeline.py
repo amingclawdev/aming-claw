@@ -532,6 +532,86 @@ def _test_scenario_policy(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]
     return str(raw or "").strip(), {}
 
 
+def _contract_runtime_primary_close_gate_accepted(
+    payload: Mapping[str, Any],
+) -> bool:
+    gate = payload.get("contract_runtime_close_evidence_gate")
+    if not isinstance(gate, Mapping):
+        return False
+    return bool(
+        gate.get("schema_version") == "contract_runtime_close_evidence_gate.v1"
+        and _truthy(gate.get("accepted") or gate.get("allowed"))
+        and _truthy(gate.get("primary_decision_source"))
+        and str(gate.get("agent_facing_decision_source") or "")
+        == "contract_runtime_first_missing_line"
+    )
+
+
+def _contract_runtime_meta_contains_truthy_key(
+    value: Any,
+    keys: set[str],
+) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if str(key) in keys and _truthy(child):
+                return True
+            if _contract_runtime_meta_contains_truthy_key(child, keys):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _contract_runtime_meta_contains_truthy_key(item, keys)
+            for item in value
+        )
+    return False
+
+
+def _contract_runtime_meta_error_can_be_audit_only(
+    error_message: str,
+    event: Mapping[str, Any],
+) -> bool:
+    message = error_message.lower()
+    if _contract_runtime_meta_contains_truthy_key(
+        event,
+        {"self_attesting", "worker_self_attesting"},
+    ):
+        return False
+    return bool("author_worker_evidence" in message and "requires on_behalf_of" in message)
+
+
+def _contract_runtime_audit_only_meta_gate(
+    gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        **dict(gate),
+        "compatibility_only": True,
+        "primary_decision_source": False,
+        "decision_source": "legacy_meta_contract_audit_only",
+        "contract_runtime_primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _contract_runtime_compat_rejected_meta_gate(
+    *,
+    error_message: str,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "meta_contract_timeline_gate.v1",
+        "allowed": False,
+        "status": "compatibility_rejected",
+        "compatibility_only": True,
+        "primary_decision_source": False,
+        "contract_runtime_primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+        "contract_runtime_close_evidence_gate_status": "accepted",
+        "error": error_message,
+        "code": "meta_contract_whitelist_rejected",
+        "event_kind": _text(event.get("event_kind")),
+        "actor": _text(event.get("actor")),
+    }
+
+
 def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, Any]:
     from .db import sqlite_write_lock
 
@@ -545,23 +625,42 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
     validation_payload = dict(payload)
     validation_payload.pop("meta_contract_gate", None)
     _ensure_cross_ref_bridge_meta_contract_aliases()
-    from .mf_subagent_contract import validate_meta_contract_timeline_event
-
-    meta_contract_gate = validate_meta_contract_timeline_event(
-        {
-            "event_type": event.get("event_type", ""),
-            "phase": event.get("phase", ""),
-            "event_kind": event.get("event_kind", ""),
-            "actor": event.get("actor", ""),
-            "status": event.get("status", ""),
-            "decision": event.get("decision", ""),
-            "payload": validation_payload,
-            "verification": verification,
-            "artifact_refs": artifact_refs,
-            "backlog_id": event.get("backlog_id", ""),
-            "task_id": event.get("task_id", ""),
-        }
+    from .mf_subagent_contract import (
+        MfSubagentContractError,
+        validate_meta_contract_timeline_event,
     )
+
+    meta_event = {
+        "event_type": event.get("event_type", ""),
+        "phase": event.get("phase", ""),
+        "event_kind": event.get("event_kind", ""),
+        "actor": event.get("actor", ""),
+        "status": event.get("status", ""),
+        "decision": event.get("decision", ""),
+        "payload": validation_payload,
+        "verification": verification,
+        "artifact_refs": artifact_refs,
+        "backlog_id": event.get("backlog_id", ""),
+        "task_id": event.get("task_id", ""),
+    }
+    try:
+        meta_contract_gate = validate_meta_contract_timeline_event(meta_event)
+    except MfSubagentContractError as exc:
+        if (
+            _contract_runtime_primary_close_gate_accepted(payload)
+            and _contract_runtime_meta_error_can_be_audit_only(str(exc), meta_event)
+        ):
+            meta_contract_gate = _contract_runtime_compat_rejected_meta_gate(
+                error_message=str(exc),
+                event=meta_event,
+            )
+        else:
+            raise
+    else:
+        if _contract_runtime_primary_close_gate_accepted(payload):
+            meta_contract_gate = _contract_runtime_audit_only_meta_gate(
+                meta_contract_gate
+            )
     payload["meta_contract_gate"] = meta_contract_gate
     with sqlite_write_lock():
         cur = conn.execute(

@@ -25590,6 +25590,273 @@ def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
 
 
+def _start_source_backed_hotfix_successor(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+) -> dict:
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    root = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_LOOK_BEFORE_ACT,
+        route_token_ref=route_token_ref,
+        caller_graph_query_schema_trace_id="gqt-20260624-abcdef1234",
+    )
+    _complete_source_backed_onboarding(
+        conn,
+        root["contract_runtime"]["contract_execution_id"],
+    )
+    return server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved emergency runtime successor repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+
+def test_timeline_append_contract_runtime_primary_gate_accepts_hotfix_implementation(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-IMPLEMENTATION"
+    task_id = "hotfix-runtime-implementation-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-impl",
+    )
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "changed_files": ["agent/governance/server.py"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    assert result["event_kind"] == "implementation"
+    runtime_gate = result["contract_runtime_close_evidence_gate"]
+    assert runtime_gate["accepted"] is True
+    assert runtime_gate["primary_decision_source"] is True
+    assert runtime_gate["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert runtime_gate["evidence_kind"] == "hotfix_under_action"
+    assert runtime_gate["next_legal_action"]["evidence_kind"] == (
+        "independent_verification"
+    )
+    assert result["meta_contract_gate"]["compatibility_only"] is True
+    assert result["meta_contract_gate"]["primary_decision_source"] is False
+    assert result["meta_contract_gate"]["status"] == "compatibility_rejected"
+    assert result["meta_contract_gate_decision_source"] is False
+
+    record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "qa_independent_verification"
+    )
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="implementation",
+    )[0]
+    assert event["payload"]["contract_runtime_close_evidence_gate"]["accepted"] is True
+    assert event["payload"]["meta_contract_gate"]["compatibility_only"] is True
+
+
+def test_timeline_append_contract_runtime_primary_gate_rejects_observer_qa(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-OBSERVER-QA"
+    task_id = "hotfix-runtime-observer-qa-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-observer-qa",
+    )
+    server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "changed_files": ["agent/governance/server.py"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": "qa.independent_verification",
+                    "event_kind": "independent_verification",
+                    "phase": "qa",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "contract_execution_id": successor["contract_execution_id"],
+                        "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+                    },
+                    "route_waiver": _route_waiver(
+                        "task_timeline_append",
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "contract_runtime_close_evidence_rejected"
+    assert "cannot write line" in json.dumps(exc.value.details)
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+    ) == []
+
+
+def test_timeline_append_contract_runtime_primary_gate_still_blocks_self_attesting(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-SELF-ATTEST"
+    task_id = "hotfix-runtime-self-attest-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-self-attest",
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": "implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "contract_execution_id": successor["contract_execution_id"],
+                        "changed_files": ["agent/governance/server.py"],
+                        "worker_self_attesting": True,
+                    },
+                    "route_waiver": _route_waiver(
+                        "task_timeline_append",
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "meta_contract_whitelist_rejected"
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="implementation",
+    ) == []
+    record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "hotfix_post_action_summary"
+    )
+
+
+def test_timeline_append_contract_runtime_gate_ignores_descriptive_nested_smoke_id(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-DESCRIPTIVE-SMOKE-ID"
+    task_id = "hotfix-runtime-descriptive-smoke-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "verification",
+                "event_kind": "verification",
+                "phase": "verification",
+                "actor": "observer-on-behalf-of:codex-current-session",
+                "status": "passed",
+                "payload": {
+                    "on_behalf_of": "codex-current-session",
+                    "live_smoke": {
+                        "contract_execution_id": "cex-descriptive-only",
+                        "actual_error": "contract_runtime_close_evidence_rejected",
+                    },
+                    "test_results": {"status": "passed"},
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    assert result["event_kind"] == "verification"
+    assert "contract_runtime_close_evidence_gate" not in result
+    assert result["meta_contract_gate"]["allowed"] is True
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="verification",
+    )[0]
+    assert "contract_runtime_close_evidence_gate" not in event["payload"]
+
+
 def test_hotfix_enter_adopts_completed_onboard_root_without_legacy_flag(conn):
     backlog_id = "AC-HOTFIX-ADOPT-COMPLETED-ONBOARD-ROOT"
     task_id = "hotfix-adopt-completed-root-task"
