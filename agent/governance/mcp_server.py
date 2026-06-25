@@ -537,6 +537,14 @@ TOOLS: list[dict] = [
                 "backlog_id": {"type": "string"},
                 "bug_id": {"type": "string"},
                 "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
                 "metadata": {"type": "object"},
             },
             "required": ["project_id", "backlog_id"],
@@ -550,6 +558,15 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "contract_execution_id": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -571,6 +588,15 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object"},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -586,6 +612,14 @@ TOOLS: list[dict] = [
                 "bug_id": {"type": "string"},
                 "contract_execution_id": {"type": "string"},
                 "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
                 "metadata": {"type": "object"},
             },
             "required": ["project_id", "backlog_id"],
@@ -599,6 +633,15 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "contract_execution_id": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -618,6 +661,15 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object"},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -630,6 +682,15 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "contract_execution_id": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -642,6 +703,15 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "contract_execution_id": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -663,6 +733,15 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object"},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -1074,7 +1153,18 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "onboard_contract_current":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
-        return _http("GET", f"/api/projects/{pid}/onboard-contract/{execution_id}/current-state")
+        query = {
+            key: value
+            for key, value in args.items()
+            if key
+            in {"observer_session_id", "observer_session_ref", "observer_route_token_ref", "route_token_ref"}
+            and value is not None
+        }
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http(
+            "GET",
+            f"/api/projects/{pid}/onboard-contract/{execution_id}/current-state{qs}",
+        )
 
     if name == "onboard_contract_submit_line":
         pid = args["project_id"]
@@ -1102,7 +1192,18 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "contract_add_current":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
-        return _http("GET", f"/api/projects/{pid}/contract-add/{execution_id}/current-state")
+        query = {
+            key: value
+            for key, value in args.items()
+            if key
+            in {"observer_session_id", "observer_session_ref", "observer_route_token_ref", "route_token_ref"}
+            and value is not None
+        }
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http(
+            "GET",
+            f"/api/projects/{pid}/contract-add/{execution_id}/current-state{qs}",
+        )
 
     if name == "contract_add_submit_line":
         pid = args["project_id"]
@@ -1122,9 +1223,17 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
         suffix = "guide" if name == "contract_runtime_guide" else "current-state"
+        query = {
+            key: value
+            for key, value in args.items()
+            if key
+            in {"observer_session_id", "observer_session_ref", "observer_route_token_ref", "route_token_ref"}
+            and value is not None
+        }
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         return _http(
             "GET",
-            f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}",
+            f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}{qs}",
         )
 
     if name == "contract_runtime_submit_line":

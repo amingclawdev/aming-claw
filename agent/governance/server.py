@@ -33197,9 +33197,179 @@ def _contract_runtime_read(
     return record
 
 
-def _contract_runtime_effective_actor_role(ctx: RequestContext, conn) -> str:
+def _contract_runtime_ref_value(ctx: RequestContext, *keys: str) -> str:
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    query = ctx.query if isinstance(ctx.query, Mapping) else {}
+    for key in keys:
+        value = body.get(key)
+        if value is None:
+            value = query.get(key)
+        if isinstance(value, list):
+            value = value[0] if value else ""
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _normalized_contract_runtime_action(value: str) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _resolve_contract_runtime_observer_proof(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    action: str,
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+) -> dict[str, Any] | None:
+    observer_session_id = _contract_runtime_ref_value(
+        ctx, "observer_session_id", "observer_session_ref"
+    )
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "observer_route_token_ref", "route_token_ref"
+    )
+    if not observer_session_id and not route_token_ref:
+        return None
+    if not observer_session_id or not route_token_ref:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "observer_session_id_and_route_token_ref_required",
+            },
+        )
+
+    session = observer_session.get_session(
+        conn,
+        project_id=project_id,
+        session_id=observer_session_id,
+    )
+    if not session or str(session.get("computed_status") or "") != "active":
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "observer_session_not_active",
+                "observer_session_id": observer_session_id,
+            },
+        )
+
+    from . import observer_route_context as _orc
+
+    try:
+        resolved = _orc.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+    except _orc.RouteTokenRefError as exc:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "route_token_ref_invalid",
+                "route_token_ref": route_token_ref,
+                "message": str(exc),
+            },
+        ) from exc
+    if not resolved:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "route_token_ref_unknown",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    if str(resolved.get("caller_role") or "") != "observer":
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "route_token_ref_not_observer",
+                "route_token_ref": route_token_ref,
+            },
+        )
+
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    if str(scope.get("project_id") or project_id) != project_id:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {"required_role": "observer", "proof_error": "project_scope_mismatch"},
+        )
+    if backlog_id and str(scope.get("backlog_id") or "") != backlog_id:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {"required_role": "observer", "proof_error": "backlog_scope_mismatch"},
+        )
+    if contract_execution_id and str(scope.get("task_id") or "") != contract_execution_id:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {"required_role": "observer", "proof_error": "execution_scope_mismatch"},
+        )
+
+    allowed = {
+        _normalized_contract_runtime_action(item)
+        for item in (resolved.get("allowed_actions") or [])
+    }
+    requested = _normalized_contract_runtime_action(action)
+    if requested not in allowed and "contract_runtime_facade" not in allowed:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "route_token_ref_action_not_allowed",
+                "route_token_ref": route_token_ref,
+                "allowed_actions": sorted(allowed),
+            },
+        )
+
+    return {
+        "role": "observer",
+        "role_source": "observer_session_route_token_ref",
+        "observer_session_id": observer_session_id,
+        "route_token_ref": route_token_ref,
+    }
+
+
+def _contract_runtime_effective_actor_role(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str = "contract_runtime_facade",
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+) -> str:
     session = ctx.require_auth(conn)
-    return str(session.get("role") or "").strip()
+    role = str(session.get("role") or "").strip()
+    if role == "observer":
+        return role
+    project_id = ctx.get_project_id()
+    proof = _resolve_contract_runtime_observer_proof(
+        ctx,
+        conn,
+        project_id=project_id,
+        action=action,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+    )
+    if proof:
+        return "observer"
+    return role
 
 
 def _contract_runtime_line_write_body(
@@ -33381,9 +33551,21 @@ def _onboard_contract_read(
     return record
 
 
-def _onboard_contract_effective_actor_role(ctx: RequestContext, conn) -> str:
-    session = ctx.require_auth(conn)
-    return str(session.get("role") or "").strip()
+def _onboard_contract_effective_actor_role(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str = "onboard_contract_facade",
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+) -> str:
+    return _contract_runtime_effective_actor_role(
+        ctx,
+        conn,
+        action=action,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+    )
 
 
 CONTRACT_ADD_CONTRACT_ID = "contract_add"
@@ -33510,9 +33692,21 @@ def _contract_add_read(
     return record
 
 
-def _contract_add_effective_actor_role(ctx: RequestContext, conn) -> str:
-    session = ctx.require_auth(conn)
-    return str(session.get("role") or "").strip()
+def _contract_add_effective_actor_role(
+    ctx: RequestContext,
+    conn,
+    *,
+    action: str = "contract_add_facade",
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+) -> str:
+    return _contract_runtime_effective_actor_role(
+        ctx,
+        conn,
+        action=action,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+    )
 
 
 def _runtime_record_is_complete(record: Mapping[str, Any]) -> bool:
@@ -40681,11 +40875,20 @@ def handle_project_onboard_contract_start(ctx: RequestContext):
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     if not backlog_id:
         raise ValidationError("onboard_contract start requires backlog_id")
-    route_token_ref = str(body.get("route_token_ref") or "").strip()
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
     with DBContext(project_id) as conn:
-        actor_role = _onboard_contract_effective_actor_role(ctx, conn)
+        effective_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
+        actor_role = _onboard_contract_effective_actor_role(
+            ctx,
+            conn,
+            action="onboard_contract_start",
+            backlog_id=backlog_id,
+            contract_execution_id=effective_execution_id,
+        )
         if actor_role != "observer":
             raise PermissionDeniedError(
                 actor_role,
@@ -40714,7 +40917,14 @@ def handle_project_onboard_contract_current_state(ctx: RequestContext):
     if not contract_execution_id:
         raise ValidationError("contract_execution_id is required")
     with DBContext(project_id) as conn:
-        actor_role = _onboard_contract_effective_actor_role(ctx, conn)
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+        actor_role = _onboard_contract_effective_actor_role(
+            ctx,
+            conn,
+            action="onboard_contract_current",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+        )
         record = _onboard_contract_read(
             conn,
             contract_execution_id=contract_execution_id,
@@ -40735,13 +40945,19 @@ def handle_project_onboard_contract_line_write(ctx: RequestContext):
         raise ValidationError("contract_execution_id is required")
     body = dict(ctx.body or {})
     with DBContext(project_id) as conn:
-        actor_role = _onboard_contract_effective_actor_role(ctx, conn)
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)
         _onboard_contract_require_contract_record(
             record,
             contract_execution_id=contract_execution_id,
             action="write",
+        )
+        actor_role = _onboard_contract_effective_actor_role(
+            ctx,
+            conn,
+            action="onboard_contract_submit_line",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
         )
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
@@ -40782,11 +40998,24 @@ def handle_project_contract_add_start(ctx: RequestContext):
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     if not backlog_id:
         raise ValidationError("contract_add start requires backlog_id")
-    route_token_ref = str(body.get("route_token_ref") or "").strip()
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
     with DBContext(project_id) as conn:
-        actor_role = _contract_add_effective_actor_role(ctx, conn)
+        effective_execution_id = _contract_add_execution_id(
+            project_id,
+            backlog_id,
+            contract_execution_id=contract_execution_id,
+        )
+        actor_role = _contract_add_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_add_start",
+            backlog_id=backlog_id,
+            contract_execution_id=effective_execution_id,
+        )
         if actor_role != "observer":
             raise PermissionDeniedError(
                 actor_role,
@@ -40815,7 +41044,14 @@ def handle_project_contract_add_current_state(ctx: RequestContext):
     if not contract_execution_id:
         raise ValidationError("contract_execution_id is required")
     with DBContext(project_id) as conn:
-        actor_role = _contract_add_effective_actor_role(ctx, conn)
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+        actor_role = _contract_add_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_add_current",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+        )
         record = _contract_add_read(
             conn,
             contract_execution_id=contract_execution_id,
@@ -40836,13 +41072,19 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
         raise ValidationError("contract_execution_id is required")
     body = dict(ctx.body or {})
     with DBContext(project_id) as conn:
-        actor_role = _contract_add_effective_actor_role(ctx, conn)
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)
         _contract_add_require_contract_record(
             record,
             contract_execution_id=contract_execution_id,
             action="write",
+        )
+        actor_role = _contract_add_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_add_submit_line",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
         )
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
@@ -40883,7 +41125,14 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     if not contract_execution_id:
         raise ValidationError("contract_execution_id is required")
     with DBContext(project_id) as conn:
-        actor_role = _contract_runtime_effective_actor_role(ctx, conn)
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+        actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_current",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+        )
         record = _contract_runtime_read(
             conn,
             contract_execution_id=contract_execution_id,
@@ -40904,8 +41153,15 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         raise ValidationError("contract_execution_id is required")
     body = dict(ctx.body or {})
     with DBContext(project_id) as conn:
-        actor_role = _contract_runtime_effective_actor_role(ctx, conn)
         runtime = _contract_runtime(conn)
+        record = runtime.store.get(contract_execution_id)
+        actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_submit_line",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+        )
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
         write = _contract_runtime_line_write_body(

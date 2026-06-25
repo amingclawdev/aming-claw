@@ -140,6 +140,61 @@ def _persist_backlog_close_route_token_ref(
     )
 
 
+def _insert_active_observer_session_ref(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str = "obs-contract-runtime-proof",
+) -> str:
+    observer_session.ensure_schema(conn)
+    now = observer_session._utc_now()
+    conn.execute(
+        """
+        INSERT INTO observer_sessions (
+            session_id, project_id, observer_kind, session_label, pid, cwd,
+            capabilities_json, token_hash, status, registered_at, last_seen_at,
+            closed_at, revoked_at
+        ) VALUES (?, ?, 'codex', 'contract-runtime-proof', 0, '', '{}',
+                  'ref-only-proof-no-token', ?, ?, ?, '', '')
+        """,
+        (session_id, PID, observer_session.SESSION_STATUS_ACTIVE, now, now),
+    )
+    conn.commit()
+    return session_id
+
+
+def _persist_contract_runtime_observer_route_ref(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+    allowed_actions: list[str],
+    caller_role: str = "observer",
+) -> None:
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            "route_id": f"route-{route_token_ref}",
+            "route_context_hash": _fake_sha(f"{route_token_ref}:context"),
+            "prompt_contract_id": f"prompt-{route_token_ref}",
+            "prompt_contract_hash": _fake_sha(f"{route_token_ref}:prompt"),
+            "visible_injection_manifest_hash": _fake_sha(f"{route_token_ref}:manifest"),
+            "route_token_ref": route_token_ref,
+            "caller_role": caller_role,
+            "allowed_actions": allowed_actions,
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": contract_execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["test:contract-runtime-observer-ref"],
+        },
+    )
+
+
 class _NoCloseConn:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -22746,6 +22801,275 @@ def test_contract_add_facade_starts_guided_runtime_and_rejects_forged_roles(conn
     assert current["runtime_guide"]["next_legal_action"]["line_id"] == (
         "worker_draft_precheck"
     )
+
+
+def test_contract_add_facade_denies_coordinator_without_observer_proof(conn):
+    backlog_id = "AC-CONTRACT-ADD-COORDINATOR-DENIED"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "actor_role": "observer",
+                },
+            )
+        )
+
+    assert exc.value.code == "permission_denied"
+    assert "coordinator" in exc.value.message
+    assert "contract_add_start" in exc.value.message
+
+
+def test_contract_add_facade_ignores_body_observer_role_for_worker(conn):
+    backlog_id = "AC-CONTRACT-ADD-WORKER-FORGED-START"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "actor_role": "observer",
+                },
+            )
+        )
+
+    assert exc.value.code == "permission_denied"
+    assert "mf_sub" in exc.value.message
+    assert "contract_add_start" in exc.value.message
+
+
+def test_contract_add_facade_verified_observer_ref_starts_and_writes_line(conn):
+    backlog_id = "AC-CONTRACT-ADD-VERIFIED-OBSERVER-REF"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._contract_add_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(conn)
+    route_token_ref = "rtok-contract-runtime-observer-ref"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "contract_add_start",
+            "contract_add_submit_line",
+            "contract_add_current",
+        ],
+    )
+
+    started = server.handle_project_contract_add_start(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "actor_role": "observer",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    assert started["contract_execution_id"] == execution_id
+    assert started["route_token_ref"] == route_token_ref
+
+    accepted = server.handle_project_contract_add_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            method="POST",
+            body={
+                "actor_role": "mf_sub",
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_add",
+                "evidence_kind": "contract_add_request",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["actor_role"] == "observer"
+    assert accepted["next_legal_action"]["id"] == "worker_draft_precheck"
+
+
+def test_contract_add_facade_rejects_observer_ref_without_requested_action(conn):
+    backlog_id = "AC-CONTRACT-ADD-REF-ACTION-DENIED"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._contract_add_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-contract-runtime-action-denied",
+    )
+    route_token_ref = "rtok-contract-runtime-action-denied"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_add_current"],
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.details["proof_error"] == "route_token_ref_action_not_allowed"
+
+
+def test_contract_add_facade_rejects_route_ref_with_non_observer_role(conn):
+    backlog_id = "AC-CONTRACT-ADD-REF-NON-OBSERVER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._contract_add_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-contract-runtime-non-observer-ref",
+    )
+    route_token_ref = "rtok-contract-runtime-non-observer"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_add_start"],
+        caller_role="coordinator",
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.details["proof_error"] == "route_token_ref_not_observer"
+
+
+def test_contract_add_facade_rejects_route_ref_scoped_to_other_backlog(conn):
+    backlog_id = "AC-CONTRACT-ADD-REF-BACKLOG-SCOPE"
+    other_backlog_id = "AC-CONTRACT-ADD-REF-BACKLOG-OTHER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _insert_simple_mf_close_backlog(conn, other_backlog_id)
+    execution_id = server._contract_add_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-contract-runtime-backlog-scope",
+    )
+    route_token_ref = "rtok-contract-runtime-backlog-scope"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=other_backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_add_start"],
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.details["proof_error"] in {
+        "route_token_ref_invalid",
+        "backlog_scope_mismatch",
+    }
+
+
+def test_contract_add_facade_rejects_route_ref_scoped_to_other_execution(conn):
+    backlog_id = "AC-CONTRACT-ADD-REF-EXECUTION-SCOPE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._contract_add_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-contract-runtime-execution-scope",
+    )
+    route_token_ref = "rtok-contract-runtime-execution-scope"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="cex-contract-add-other-execution",
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_add_start"],
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert execution_id != "cex-contract-add-other-execution"
+    assert exc.value.details["proof_error"] in {
+        "route_token_ref_invalid",
+        "execution_scope_mismatch",
+    }
+
+
+def test_contract_add_facade_rejects_ref_without_matching_observer_session(conn):
+    backlog_id = "AC-CONTRACT-ADD-REF-WITHOUT-SESSION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._contract_add_execution_id(PID, backlog_id)
+    route_token_ref = "rtok-contract-runtime-missing-session"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_add_start"],
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_add_start(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "observer_session_id": "obs-missing",
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.details["proof_error"] == "observer_session_not_active"
 
 
 def test_contract_add_facade_rejects_non_contract_add_execution_on_enter_and_read(conn):

@@ -1053,6 +1053,20 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     assert "execution_state_revision" in tool_by_name["contract_runtime_submit_line"][
         "inputSchema"
     ]["properties"]
+    for tool_name in (
+        "onboard_contract_start",
+        "onboard_contract_current",
+        "onboard_contract_submit_line",
+        "contract_add_start",
+        "contract_add_current",
+        "contract_add_submit_line",
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_submit_line",
+    ):
+        properties = tool_by_name[tool_name]["inputSchema"]["properties"]
+        assert "observer_session_id" in properties
+        assert "observer_route_token_ref" in properties
 
 
 def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
@@ -1077,7 +1091,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "project_id": "aming-claw",
             "backlog_id": "AC-ONBOARD",
             "contract_execution_id": "cex-must-not-forward",
-            "route_token_ref": "rtok-onboard",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
         },
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
@@ -1085,6 +1100,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         {
             "project_id": "aming-claw",
             "contract_execution_id": "cex-onboard",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
         },
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
@@ -1095,6 +1112,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "stage_id": "graph_context",
             "line_id": "graph_query_schema_trace",
             "evidence_kind": "graph_query_schema_trace",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
         },
     )["ok"] is True
     assert dispatcher.dispatch(
@@ -1102,7 +1121,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         {
             "project_id": "aming-claw",
             "backlog_id": "AC-CONTRACT-ADD",
-            "route_token_ref": "rtok-contract-add",
+            "observer_session_id": "obs-contract-add",
+            "observer_route_token_ref": "rtok-contract-add",
         },
     )["ok"] is True
     assert dispatcher.dispatch(
@@ -1110,6 +1130,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         {
             "project_id": "aming-claw",
             "contract_execution_id": "cex-contract-add",
+            "observer_session_id": "obs-contract-add",
+            "observer_route_token_ref": "rtok-contract-add",
         },
     )["ok"] is True
     assert dispatcher.dispatch(
@@ -1120,6 +1142,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "stage_id": "worker_precheck",
             "line_id": "worker_draft_precheck",
             "evidence_kind": "contract_draft_precheck",
+            "observer_session_id": "obs-contract-add",
+            "observer_route_token_ref": "rtok-contract-add",
         },
     )["ok"] is True
     assert dispatcher.dispatch(
@@ -1127,6 +1151,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         {
             "project_id": "aming-claw",
             "contract_execution_id": "cex-onboard",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
         },
     )["ok"] is True
     assert dispatcher.dispatch(
@@ -1134,6 +1160,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         {
             "project_id": "aming-claw",
             "contract_execution_id": "cex-onboard",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
         },
     )["ok"] is True
     assert dispatcher.dispatch(
@@ -1145,6 +1173,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "stage_id": "graph_context",
             "line_id": "graph_query_schema_trace",
             "evidence_kind": "graph_query_schema_trace",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
         },
     )["ok"] is True
 
@@ -1154,12 +1184,13 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "/api/projects/aming-claw/onboard-contract/start",
             {
                 "backlog_id": "AC-ONBOARD",
-                "route_token_ref": "rtok-onboard",
+                "observer_session_id": "obs-onboard",
+                "observer_route_token_ref": "rtok-onboard",
             },
         ),
         (
             "GET",
-            "/api/projects/aming-claw/onboard-contract/cex-onboard/current-state",
+            "/api/projects/aming-claw/onboard-contract/cex-onboard/current-state?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
             None,
         ),
         (
@@ -1169,6 +1200,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
                 "stage_id": "graph_context",
                 "line_id": "graph_query_schema_trace",
                 "evidence_kind": "graph_query_schema_trace",
+                "observer_session_id": "obs-onboard",
+                "observer_route_token_ref": "rtok-onboard",
             },
         ),
         (
@@ -1176,12 +1209,13 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "/api/projects/aming-claw/contract-add/start",
             {
                 "backlog_id": "AC-CONTRACT-ADD",
-                "route_token_ref": "rtok-contract-add",
+                "observer_session_id": "obs-contract-add",
+                "observer_route_token_ref": "rtok-contract-add",
             },
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-add/cex-contract-add/current-state",
+            "/api/projects/aming-claw/contract-add/cex-contract-add/current-state?observer_session_id=obs-contract-add&observer_route_token_ref=rtok-contract-add",
             None,
         ),
         (
@@ -1191,16 +1225,18 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
                 "stage_id": "worker_precheck",
                 "line_id": "worker_draft_precheck",
                 "evidence_kind": "contract_draft_precheck",
+                "observer_session_id": "obs-contract-add",
+                "observer_route_token_ref": "rtok-contract-add",
             },
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
             None,
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
             None,
         ),
         (
@@ -1211,6 +1247,8 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
                 "stage_id": "graph_context",
                 "line_id": "graph_query_schema_trace",
                 "evidence_kind": "graph_query_schema_trace",
+                "observer_session_id": "obs-onboard",
+                "observer_route_token_ref": "rtok-onboard",
             },
         ),
     ]
